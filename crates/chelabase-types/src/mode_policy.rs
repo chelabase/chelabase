@@ -32,8 +32,6 @@ impl ModePolicy {
         ("password_strength_forced", "Whether role passwords must pass the strength check."),
         ("prehashed_passwords_allowed", "Whether role passwords may be supplied pre-hashed."),
         ("ca_file_on_reveal", "Whether revealing connection details includes the dev CA path."),
-        ("cli_manages_studio_login", "Whether the CLI manages Studio's login settings in Zitadel."),
-        ("auto_create_members", "Whether a person in the tenant's org becomes a member on their first request."),
         ("default_internal_token_allowed", "Whether the services may start with the development internal bearer (a platform instance refuses to start with it)."),
     ];
 
@@ -50,7 +48,7 @@ impl ModePolicy {
     }
 
     /// Who may use `Instance` routes: self-hosted, an active tenant admin; platform, only
-    /// members of the operator organisation (nobody when it is unset).
+    /// members of the operator tenant (nobody when it is unset).
     pub fn instance_admin(&self, active_tenant_admin: bool, in_operator_org: bool) -> bool {
         match self.mode {
             Mode::SelfHosted => active_tenant_admin,
@@ -90,18 +88,6 @@ impl ModePolicy {
     }
 
     pub fn prehashed_passwords_allowed(&self) -> bool {
-        self.self_hosted()
-    }
-
-    /// Self-hosted: a person in the tenant's org with no member row is admitted on their first
-    /// request by the tenant's sign-up rule: the first one claims the admin, others become
-    /// `pending` while open sign-up is on and are refused (no row) while it is off. Platform:
-    /// members are only made explicitly.
-    pub fn auto_create_members(&self) -> bool {
-        self.self_hosted()
-    }
-
-    pub fn cli_manages_studio_login(&self) -> bool {
         self.self_hosted()
     }
 
@@ -146,7 +132,7 @@ impl ModePolicy {
         match rule {
             "instance_admin" => match self.mode {
                 Mode::SelfHosted => "active tenant admin",
-                Mode::Platform => "member of the operator organisation",
+                Mode::Platform => "member of the operator tenant",
             }
             .to_string(),
             "sign_up" => match self.sign_up() {
@@ -160,8 +146,6 @@ impl ModePolicy {
             "password_strength_forced" => b(self.password_strength_forced()),
             "prehashed_passwords_allowed" => b(self.prehashed_passwords_allowed()),
             "ca_file_on_reveal" => b(self.ca_file_on_reveal()),
-            "cli_manages_studio_login" => b(self.cli_manages_studio_login()),
-            "auto_create_members" => b(self.auto_create_members()),
             "default_internal_token_allowed" => b(self.default_internal_token_allowed()),
             other => unreachable!("rule {other} is in RULES but has no value"),
         }
@@ -175,7 +159,7 @@ mod tests {
     #[test]
     fn every_rule_per_mode() {
         type Rule = fn(&ModePolicy) -> bool;
-        let table: [(&str, Rule, bool, bool); 9] = [
+        let table: [(&str, Rule, bool, bool); 7] = [
             ("default_internal_token_allowed", ModePolicy::default_internal_token_allowed, true, false),
             ("open_signup_switchable", ModePolicy::open_signup_switchable, true, false),
             ("email_verification_default", ModePolicy::email_verification_default, false, true),
@@ -183,8 +167,6 @@ mod tests {
             ("password_strength_forced", ModePolicy::password_strength_forced, false, true),
             ("prehashed_passwords_allowed", ModePolicy::prehashed_passwords_allowed, true, false),
             ("ca_file_on_reveal", ModePolicy::ca_file_on_reveal, true, false),
-            ("cli_manages_studio_login", ModePolicy::cli_manages_studio_login, true, false),
-            ("auto_create_members", ModePolicy::auto_create_members, true, false),
         ];
         let sh = ModePolicy::new(Mode::SelfHosted);
         let pf = ModePolicy::new(Mode::Platform);

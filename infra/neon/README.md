@@ -67,7 +67,7 @@ storage reset) in `docs/superpowers/plans/2026-10-03-live-queue.md` to reclaim t
 
 Each deleted database used to leave its `timelines` rows and a tenant `Delete` pending op in the
 storage controller's database (a generation mismatch in `tenant_delete_safekeepers`). The fix
-landed in chelabase/neon-pre-replay#25 (https://github.com/chelabase/neon-pre-replay/pull/25, `NEON_REF` `8ae1b8f227e9`);
+landed in the fork before its 2026-10-04 history replay (`NEON_REF` `8ae1b8f227e9`);
 `just storage-leak-e2e` checks that the controller forgets a deleted database's tenant.
 
 ## Bump `NEON_REF`

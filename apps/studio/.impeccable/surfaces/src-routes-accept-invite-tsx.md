@@ -7,11 +7,11 @@ related_targets: ["src/components/login/sign-in-form.tsx"]
 
 # Accept invite page
 
-**Scope and mode:** Operate. The public route `/accept-invite?user={zitadel user id}&code={invite code}&t={Chelabase invite token}` (`src/routes/accept-invite.tsx`), built on the existing auth page frame (`LoginLayout`, `Field`, `Problem` from `components/login/sign-in-form.tsx`, wrapped in `LoginProviders`). It calls the auth service's `POST /auth/v1/accept-invite` (operation `acceptInvite`, login client) and, to name who invited them (Q10, user), the new public `GET /auth/v1/invite?user&t`. Shape brief (Members step T12a); the world is the inherited auth pages' (DESIGN.md: dark ground, auth pages included). The user's answers to the T12a questions are applied.
+**Scope and mode:** Operate. The public route `/accept-invite?user={identity user id}&code={invite code}&t={Chelabase invite token}` (`src/routes/accept-invite.tsx`), built on the existing auth page frame (`LoginLayout`, `Field`, `Problem` from `components/login/sign-in-form.tsx`, wrapped in `LoginProviders`). It calls the auth service's `POST /auth/v1/accept-invite` (operation `acceptInvite`, login client) and, to name who invited them (Q10, user), the new public `GET /auth/v1/invite?user&t`. Shape brief (Members step T12a); the world is the inherited auth pages' (DESIGN.md: dark ground, auth pages included). The user's answers to the T12a questions are applied.
 
 ## 1. Job and audience
 
-- A person who just clicked the link in an invite email (Zitadel sends it; Mailpit in dev). Often new to Chelabase, arriving cold from their inbox. Some are coming back after being removed (R29: they return as invited with a fresh code).
+- A person who just clicked the link in an invite email (the identity service sends it; Mailpit in dev). Often new to Chelabase, arriving cold from their inbox. Some are coming back after being removed (R29: they return as invited with a fresh code).
 - Job: set a password and land signed in, in one step.
 
 ## 2. Outcome and proof
@@ -23,7 +23,7 @@ related_targets: ["src/components/login/sign-in-form.tsx"]
   - `400 invalid_request`: wrong code or ticket, or a malformed body. `400 weak_password`: the password is refused, **with `error.accept_ticket` once the code was spent** (R13).
   - `503 invite_incomplete` with `error.accept_ticket`: a step after the code check failed; retry with the ticket instead of the spent code (R13). Tickets are one-use and last 15 minutes.
   - `410 invite_expired` / `410 invite_revoked`. `429 rate_limited`. `503 unavailable`.
-  - Q10 (user; new endpoint): `GET /auth/v1/invite?user={user}&t={t}` returns `{ inviter_name, inviter_email, tenant_name }`. `t` is a Chelabase token carried in the invite link (not the Zitadel code). Every failure is the same 404, so the page can't tell why it failed and never says.
+  - Q10 (user; new endpoint): `GET /auth/v1/invite?user={user}&t={t}` returns `{ inviter_name, inviter_email, tenant_name }`. `t` is a Chelabase token carried in the invite link (not the invite code). Every failure is the same 404, so the page can't tell why it failed and never says.
 - The password never enters the query or mutation cache: the mutation uses `SECRET` options and `reset()` after each call, as the other auth forms do; the password and the ticket live only in component state.
 
 ## 3. Selected direction
@@ -35,7 +35,7 @@ related_targets: ["src/components/login/sign-in-form.tsx"]
 
 - The page, its states, and its R13 retry behaviour (T12b test `retries_with_accept_ticket`).
 - Untouched: the other auth pages, `LoginLayout` itself.
-- Anti-goals: an email field (the invite fixes the account; the page doesn't know the email, only the Zitadel user id); a "confirm password" field (the other auth forms use one field; Zitadel's policy answers `weak_password`); asking for a name.
+- Anti-goals: an email field (the invite fixes the account; the page doesn't know the email, only the identity user id); a "confirm password" field (the other auth forms use one field; identity's policy answers `weak_password`); asking for a name.
 
 ## 5. States and ranges
 

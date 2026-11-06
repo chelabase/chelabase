@@ -16,11 +16,11 @@ A tenant's databases live in projects. Each project has a display `name` (1 to 6
 
 Another tenant's project answers 404.
 
-**Deleting a project** turns it `deleting`. Every database in it is deleted (computes, tenants, stored data), then the worker revokes the app sessions, deletes the project's Zitadel organization (when app users were on) and the project. A failure leaves the project `deleting` with `error` set, and the worker retries.
+**Deleting a project** turns it `deleting`. Every database in it is deleted (computes, tenants, stored data), then the worker revokes the app sessions, drops the project's app-user pool in the identity service (when app users were on) and deletes the project. A failure leaves the project `deleting` with `error` set, and the worker retries.
 
 Delete is refused with 409 while a database is still provisioning (`database_not_ready`), a branch is protected (`branch_protected`), or app users are being enabled or disabled (`conflict`). A wrong `confirm` is 422. A `deleting` project refuses every change with 409 `project_deleting`, and `POST /v1/databases` refuses it too.
 
-In Studio, the dashboard lists your projects and has **New project**. The project page has **Databases** and **Settings** tabs; Settings holds rename, app users and the danger zone, where deleting asks for the slug and lists the databases that go with it.
+In Studio, the dashboard lists your projects and has **New project**. The project page has **Databases**, **Access** and **Settings** tabs (and **Users** once app users are on); Settings holds rename, app users and the danger zone, where deleting asks for the slug and lists the databases that go with it.
 
 ## What a database is
 
@@ -31,15 +31,15 @@ Clients connect through Neon's proxy, never straight to a compute:
 - Postgres wire at `<endpoint>.localtest.me:5432` (a self-hosted install; 4432 on a workbench stack).
 - SQL over HTTP and WebSocket at `https://<endpoint>.localtest.me:4444/sql` (a self-hosted install; a workbench stack serves it inside its network only).
 
-Verify the proxy with its CA: a self-hosted install's is fetched with `docker compose cp proxy:/tls/ca.crt proxy-ca.crt` (`sslrootcert=proxy-ca.crt`), a workbench stack's is `.chelabase/neon/proxy-ca.crt`. If `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The domain and ports are the install's settings (`CHELABASE_PROXY_DOMAIN`, `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT`): see [Install: connect to databases](/docs/self-hosting/install#connect-to-databases).
+Verify the proxy with its CA: a self-hosted install's is fetched with `docker compose cp proxy:/tls/ca.crt proxy-ca.crt` (`sslrootcert=proxy-ca.crt`), a workbench stack's is `.chelabase/neon/proxy-ca.crt`. If `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The domain and ports are the install's settings (`CHELABASE_PROXY_DOMAIN`, `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT`): see [Install: connect to databases](/self-hosting/install#connect-to-databases).
 
 The main Postgres database is named after the database, with every character outside `[A-Za-z0-9_]` turned into `_`: "web-1 prod" gets `web_1_prod`. A database's `postgres_database` (in `GET /v1/databases/{id}`, and in each project's `databases` in `GET /v1/me`) gives that name; schema merges and the SQL tools name the Postgres database, not the display name.
 
-Every database has the data API roles `anon` (`NOLOGIN`), `authenticated` (`NOLOGIN`) and `authenticator` (`LOGIN NOINHERIT`, with its own encrypted password per branch). Main is itself a branch, created when the database is provisioned; see [Branches](/docs/using/branches).
+Every database has the data API roles `anon` (`NOLOGIN`), `authenticated` (`NOLOGIN`) and `authenticator` (`LOGIN NOINHERIT`, with its own encrypted password per branch). Main is itself a branch, created when the database is provisioned; see [Branches](/using/branches).
 
 ## Connection details
 
-`GET /v1/databases/{id}/connection` (Studio: **Connection details**) returns the owner credentials and the connection URI, and can be called any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key in the file named by `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by the dev bootstrap).
+`GET /v1/databases/{id}/connection` (Studio: the database's **Connect** panel) returns the owner credentials and the connection URI, and can be called any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key in the file named by `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by the dev bootstrap).
 
 <Callout type="warn">
 Keep the secrets key file. Without it the stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist. After `just sweep-dbs` a new key is simply adopted.
@@ -58,7 +58,7 @@ Keep the secrets key file. Without it the stored passwords can't be decrypted. T
 
 ## Settings
 
-`PATCH /v1/databases/{id}` (Studio: the database's settings) sets the history window and the branch cap; see [Branches](/docs/using/branches).
+`PATCH /v1/databases/{id}` (Studio: the database's settings) sets the history window and the branch cap; see [Branches](/using/branches).
 
 ## Reconcile
 

@@ -3,7 +3,7 @@ title: Errors
 description: DataApiError, UnsafeIntegerError and what the client throws.
 ---
 
-A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …), `message`, and `detail`, `hint` and `sqlstate` when the server sends them. Every code is listed on [Error codes](/docs/reference/errors).
+A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …), `message`, and `detail`, `hint` and `sqlstate` when the server sends them. Every code is listed on [Error codes](/reference/errors).
 
 ```ts twoslash
 import { createClient, DataApiError } from "@chelabase/client";
@@ -38,4 +38,4 @@ Its message holds the status and the first 200 characters of the body. A 2xx ans
 
 ## UnsafeIntegerError
 
-An `int8` outside JavaScript's safe range throws `UnsafeIntegerError` instead of returning a rounded number. See [Big numbers](/docs/using/client/big-numbers).
+An `int8` outside JavaScript's safe range throws `UnsafeIntegerError` instead of returning a rounded number. See [Big numbers](/using/client/big-numbers).

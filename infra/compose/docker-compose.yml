@@ -1,5 +1,5 @@
-# A self-hosted Chelabase: the infra, Neon storage and proxy, Zitadel and the app tier
-# (orchestrator, worker, gateway, auth, rest, realtime, Studio), with their wiring: images,
+# A self-hosted Chelabase: the infra, Neon storage and proxy, and the app tier (orchestrator,
+# worker, gateway, auth, identity, rest, realtime, Studio), with their wiring: images,
 # networks, volumes, secrets, healthchecks and dependencies.
 #
 #   cd infra/compose && cp .env.example .env && docker compose up -d
@@ -10,11 +10,13 @@
 #
 # Two one-shots run first: `init-secrets` makes every key, password and token (chelabase-init's
 # layout) in the named volume `secrets`, never overwriting one, and prints the setup code on the
-# run that creates it; `init-bootstrap` makes the product's Zitadel objects and writes their ids
-# into the same volume (bootstrap/). Each service mounts only its own files from that volume
+# run that creates it; `init-bootstrap` sets up the identity service's database role and its
+# members pool (its lock is in bootstrap/). Each service mounts only its own files from that volume
 # (`volume.subpath`, read-only, U10) at /run/chelabase/secrets/<path> and reads them through its
 # `*_FILE` settings or key paths; no secret is ever an environment value, an argument or in this
 # file. Every value read from .env has a default here or fails `up` naming .env.
+#
+# The identity service (auth-replacement) is internal: no published port, no gateway route.
 #
 # Two services are published: the gateway (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT) and the
 # proxy's Postgres and SQL-over-HTTP ports (CHELABASE_PROXY_ADDR, CHELABASE_PROXY_PORT and
@@ -85,12 +87,6 @@ x-app-env: &app-env
   CHELABASE_REST_URL: http://rest:8085
   CHELABASE_REALTIME_URL: http://realtime:8087
   CHELABASE_STUDIO_UPSTREAM: http://studio:3000
-  CHELABASE_ZITADEL_UPSTREAM: http://zitadel:8080
-  # #24: the apps' calls to Zitadel (keys, sessions, management) go here, in plain HTTP with the
-  # auth host as Host, never to the public auth URL: behind a TLS proxy with no port in the hosts
-  # (https://auth.example.com) that URL reaches the gateway's alias on 443 in plain HTTP and
-  # fails. A token's iss is still checked against the public issuer.
-  CHELABASE_ZITADEL_INTERNAL_URL: http://zitadel:8080
   CHELABASE_ORCHESTRATOR_ADDR: 0.0.0.0:8081
   CHELABASE_WORKER_HEALTH_ADDR: 0.0.0.0:8082
   CHELABASE_INTERNAL_ADDR: 0.0.0.0:8083
@@ -107,7 +103,6 @@ x-app-env: &app-env
   CHELABASE_COMPUTE_CONTROL_NETWORK: ${COMPOSE_PROJECT_NAME}_control
   CHELABASE_MEMBER_LOGIN_CIDRS: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:-10.214.0.10}/32
   CHELABASE_REALTIME_LOGIN_CIDRS: ${CHELABASE_REALTIME_CONTROL_IP:-10.214.0.12}/32
-  CHELABASE_ZITADEL_ACTIONS_ENDPOINT: http://orchestrator:8083/internal/zitadel/events
   CHELABASE_STORAGE_TOKEN_REFRESH_SECS: ${CHELABASE_STORAGE_TOKEN_REFRESH_SECS:-3600}
   CHELABASE_SECRETS_KEY: /run/chelabase/secrets/secrets/secrets.key
   CHELABASE_INTERNAL_SIGNING_KEY: /run/chelabase/secrets/gateway/internal-signing.pem
@@ -115,13 +110,15 @@ x-app-env: &app-env
   CHELABASE_AUTH_COOKIE_KEY: /run/chelabase/secrets/auth/cookie.key
   CHELABASE_APP_JWT_PRIVATE_KEY: /run/chelabase/secrets/auth/app-jwt.key
   CHELABASE_APP_JWT_PUBLIC_KEY: /run/chelabase/secrets/auth/app-jwt.pub
+  # auth-replacement m5: the member JWT pair (auth signs; the gateway, the orchestrator and
+  # realtime verify). Never the app-user pair: the two audiences stay apart.
+  CHELABASE_MEMBER_JWT_PRIVATE_KEY: /run/chelabase/secrets/auth/member-jwt.key
+  CHELABASE_MEMBER_JWT_PUBLIC_KEY: /run/chelabase/secrets/auth/member-jwt.pub
   CHELABASE_COMPUTE_JWT_DIR: /run/chelabase/secrets/neon
   CHELABASE_COMPUTE_CA_DIR: /run/chelabase/secrets/compute-ca
   CHELABASE_COMPUTE_CA_FILE: /run/chelabase/secrets/compute-ca/ca.crt
   CHELABASE_COMPUTE_TLS_DIR: /run/chelabase/secrets/orchestrator-tls
   CHELABASE_REALTIME_TLS_DIR: /run/chelabase/secrets/realtime-tls
-  CHELABASE_ZITADEL_ADMIN_PAT_FILE: /run/chelabase/secrets/zitadel-pats/admin.pat
-  CHELABASE_AUTH_TOKEN_FILE: /run/chelabase/secrets/zitadel-pats/login-client.pat
 
 services:
   # --- The one-shots -----------------------------------------------------------------------
@@ -129,14 +126,14 @@ services:
   # changes nothing then. Starts as root only to give the `secrets` volume's root (a new named
   # volume is root's) to the app user and to copy .env (often 0600, the host user's) where that
   # user can read it; then runs as 10001 in the groups of the third-party readers (postgres 70;
-  # Valkey, Zitadel and Neon 1000), so each file gets the owner and group the services read it
-  # as. It also checks the entry settings (Compose can't derive a host's name and port, so .env
-  # carries them twice) and writes Zitadel's database settings from the two password files.
+  # Valkey and Neon 1000), so each file gets the owner and group the services read it as. It also
+  # checks the entry settings (Compose can't derive a host's name and port, so .env carries them
+  # twice). An install from before #126 keeps its retired files in the volume, untouched.
   # The setup code: `docker compose logs init-secrets` after the first run; to print it again,
   # `docker compose run --rm --no-deps --user 10001:10001 --entrypoint chelabase-init init-secrets setup-code --dir /var/lib/chelabase/secrets`
   # (the code is in the logs of the container that made it; a recreated init-secrets has none).
   init-secrets:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:f1129ed38bcaac909efec6a0fe457055cc7f0605e28334ae427af73d9036ed0d}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:80e82d1fbdefe0f1306bfacf09181a687d7095abcf80778cb4f000e41bab19e0}
     restart: "no"
     user: "0"
     network_mode: none
@@ -150,7 +147,6 @@ services:
       CHELABASE_AUTH_HOST_NAME: ${CHELABASE_AUTH_HOST_NAME:-auth.chelabase.localhost}
       CHELABASE_PUBLIC_PORT: ${CHELABASE_PUBLIC_PORT:-8000}
       CHELABASE_PUBLIC_SECURE: ${CHELABASE_PUBLIC_SECURE:-false}
-      CHELABASE_ZITADEL_TLS_MODE: ${CHELABASE_ZITADEL_TLS_MODE:-disabled}
     entrypoint:
       - /bin/sh
       - -c
@@ -170,8 +166,8 @@ services:
           fi
         }
         case "$$CHELABASE_PUBLIC_SCHEME" in
-          http) secure=false; tls=disabled; default_port=80 ;;
-          https|"") secure=true; tls=external; default_port=443 ;;
+          http) secure=false; default_port=80 ;;
+          https|"") secure=true; default_port=443 ;;
           *) echo "init-secrets: CHELABASE_PUBLIC_SCHEME in .env must be http or https" >&2; exit 1 ;;
         esac
         check_host CHELABASE_STUDIO_HOST "$$CHELABASE_STUDIO_HOST" CHELABASE_STUDIO_HOST_NAME "$$CHELABASE_STUDIO_HOST_NAME"
@@ -179,8 +175,6 @@ services:
         check_host CHELABASE_AUTH_HOST "$$CHELABASE_AUTH_HOST" CHELABASE_AUTH_HOST_NAME "$$CHELABASE_AUTH_HOST_NAME"
         [ "$$CHELABASE_PUBLIC_SECURE" = "$$secure" ] ||
           { echo "init-secrets: set CHELABASE_PUBLIC_SECURE=$$secure in .env (the scheme)" >&2; bad=1; }
-        [ "$$CHELABASE_ZITADEL_TLS_MODE" = "$$tls" ] ||
-          { echo "init-secrets: set CHELABASE_ZITADEL_TLS_MODE=$$tls in .env (the scheme)" >&2; bad=1; }
         [ "$$bad" = 0 ] || exit 1
         S=/var/lib/chelabase/secrets
         [ "$$(stat -c %u:%g "$$S")" = 10001:10001 ] || chown 10001:10001 "$$S"
@@ -201,16 +195,9 @@ services:
         S=/var/lib/chelabase/secrets
         chelabase-init secrets --dir "$$S" --seeds /run/chelabase/tmp/init/seeds.env
         rm -f /run/chelabase/tmp/init/seeds.env
-        # Zitadel's PATs and the bootstrap's outputs live here too, each in its own dir.
-        for d in zitadel-pats bootstrap zitadel-config; do
+        # The bootstrap's dir (its lock) lives here too.
+        for d in bootstrap; do
           [ -d "$$S/$$d" ] || mkdir -m 0700 "$$S/$$d"
-        done
-        # Zitadel creates its PATs 0644 (a fixed mode in its FirstInstance step) but keeps the
-        # mode of a file that exists, so each is made empty at 0600 first. An existing PAT
-        # (Zitadel's 0644 from an older install, too) is set back to 0600: they are ours (10001).
-        for f in admin.pat login-client.pat; do
-          [ -e "$$S/zitadel-pats/$$f" ] || (umask 077 && : >"$$S/zitadel-pats/$$f")
-          chmod 0600 "$$S/zitadel-pats/$$f"
         done
         # The object-store identity `storage` (bucket chelabase-storage only) beside Neon's `s3/`
         # pair (chelabase-init makes that one), and SeaweedFS's gRPC mutual TLS: one CA and a
@@ -253,18 +240,6 @@ services:
           mv -f "$$T/$$f.crt.tmp" "$$T/$$f.crt"
         done
         chgrp 1000 "$$T/ca.crt"
-        # Zitadel takes its database passwords only from its environment or a config file: the
-        # file, rendered from the two password files (no quote or backslash can be in them).
-        umask 077
-        IFS= read -r user_pw <"$$S/db/zitadel-user.password" || [ -n "$$user_pw" ]
-        IFS= read -r admin_pw <"$$S/db/zitadel-admin.password" || [ -n "$$admin_pw" ]
-        t="$$S/zitadel-config/.database.yaml.tmp"
-        printf 'Database:\n  Postgres:\n    User:\n      Password: "%s"\n    Admin:\n      Password: "%s"\n' \
-          "$$user_pw" "$$admin_pw" >"$$t"
-        unset user_pw admin_pw
-        chgrp 1000 "$$t"
-        chmod 0640 "$$t"
-        mv -f "$$t" "$$S/zitadel-config/database.yaml"
     volumes:
       - {type: volume, source: secrets, target: /var/lib/chelabase/secrets}
       # The install's .env, for its CHELABASE_SEED_* values (m12): a mount only, never an env
@@ -276,11 +251,11 @@ services:
         bind: {create_host_path: false}
       - {type: tmpfs, target: /run/chelabase/tmp}
 
-  # Makes the product's Zitadel objects and binds the seeded tenant (chelabase-init bootstrap,
-  # m4); retries readiness on its own and is never restarted, so `up --wait` reports a failure.
-  # Writes only bootstrap/ in the secrets volume.
+  # Sets up the identity service's database role and members pool once the orchestrator has
+  # migrated the metadata database (chelabase-init bootstrap); retries readiness on its own and
+  # is never restarted, so `up --wait` reports a failure. Writes only bootstrap/ (its lock).
   init-bootstrap:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:f1129ed38bcaac909efec6a0fe457055cc7f0605e28334ae427af73d9036ed0d}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:80e82d1fbdefe0f1306bfacf09181a687d7095abcf80778cb4f000e41bab19e0}
     restart: "no"
     group_add: ["70"]
     command: ["chelabase-init", "bootstrap", "--out", "/run/chelabase/secrets/bootstrap"]
@@ -290,35 +265,28 @@ services:
       CHELABASE_STUDIO_HOST: ${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}
       CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
       CHELABASE_AUTH_HOST: ${CHELABASE_AUTH_HOST:-auth.chelabase.localhost:8000}
-      CHELABASE_ZITADEL_UPSTREAM: http://zitadel:8080
-      CHELABASE_ZITADEL_ADMIN_PAT_FILE: /run/chelabase/secrets/zitadel-pats/admin.pat
       CHELABASE_METADATA_DATABASE_URL: postgres://chelabase@metadata-db:5432/chelabase_metadata
       CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
       CHELABASE_ORCHESTRATOR_HEALTH_URL: http://orchestrator:8083/health
-      CHELABASE_ZITADEL_ACTIONS_ENDPOINT: http://orchestrator:8083/internal/zitadel/events
-      # Optional SMTP for Zitadel's emails; the password from a file on the host
-      # (CHELABASE_SMTP_PASSWORD_PATH), mounted below.
-      CHELABASE_SMTP_HOST: ${CHELABASE_SMTP_HOST:-}
-      CHELABASE_SMTP_PORT: ${CHELABASE_SMTP_PORT:-}
-      CHELABASE_SMTP_USER: ${CHELABASE_SMTP_USER:-}
-      CHELABASE_SMTP_FROM: ${CHELABASE_SMTP_FROM:-}
-      CHELABASE_SMTP_PASSWORD_FILE: ${CHELABASE_SMTP_USER:+/run/chelabase/smtp.password}
+      # The identity step (auth-replacement m5): the chelabase_identity role and its password
+      # (identity/db.password), the identity_admin functions, then the members pool through the
+      # service's pool route, with the bootstrap's own token (identity lets it create a pool and
+      # nothing else).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_DB_PASSWORD_FILE: /run/chelabase/secrets/identity/db.password
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/bootstrap-identity.token
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap, volume: {subpath: bootstrap}}
-      - type: bind
-        source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
-        target: /run/chelabase/smtp.password
-        read_only: true
-        bind: {create_host_path: false}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/db.password, read_only: true, volume: {subpath: identity/db.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/bootstrap-identity.token, read_only: true, volume: {subpath: tokens/bootstrap-identity.token}}
     depends_on:
       init-secrets:
         condition: service_completed_successfully
-      zitadel:
-        condition: service_healthy
       orchestrator:
         condition: service_started
+      identity:
+        condition: service_healthy
 
   # --- Infra -------------------------------------------------------------------------------
   metadata-db:
@@ -388,87 +356,6 @@ services:
     depends_on:
       init-secrets:
         condition: service_completed_successfully
-
-  zitadel-db:
-    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD_FILE: /run/chelabase/secrets/db/zitadel-admin.password
-    volumes:
-      - zitadel_pg_data:/var/lib/postgresql/data
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/db/zitadel-admin.password, read_only: true, volume: {subpath: db/zitadel-admin.password}}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    depends_on:
-      init-secrets:
-        condition: service_completed_successfully
-
-  # Zitadel v4: sign-in pages are Studio's own (/login …), served by auth. On a fresh
-  # zitadel_pg_data volume FirstInstance writes admin.pat and login-client.pat once into
-  # zitadel-pats/ (its only writable mount); the orchestrator, the worker, auth and the bootstrap
-  # mount only the PATs they use. It runs as the app user (so the PATs are theirs, whatever mode
-  # Zitadel gives them) in group 1000 (its masterkey, steps file and database settings).
-  zitadel:
-    image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
-    restart: unless-stopped
-    user: "10001:1000"
-    command: start-from-init --config /run/chelabase/zitadel/database.yaml --steps /run/chelabase/zitadel/steps.yaml --masterkeyFile /run/chelabase/zitadel/masterkey --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:-disabled}
-    environment:
-      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
-      ZITADEL_DATABASE_POSTGRES_PORT: 5432
-      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
-      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
-      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
-      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
-      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
-      # Zitadel's public address is the auth host (CHELABASE_AUTH_HOST), set apart here: its
-      # name, the public port and whether the scheme is https (init-secrets checks they match).
-      ZITADEL_EXTERNALSECURE: "${CHELABASE_PUBLIC_SECURE:-false}"
-      ZITADEL_EXTERNALDOMAIN: "${CHELABASE_AUTH_HOST_NAME:-auth.chelabase.localhost}"
-      ZITADEL_EXTERNALPORT: "${CHELABASE_PUBLIC_PORT:-8000}"
-      # The TLS mode is `disabled` or `external` (TLS ends in front of the gateway), so Zitadel
-      # serves plain HTTP; `zitadel ready` (the healthcheck) reads this, not the start flag.
-      ZITADEL_TLS_ENABLED: "false"
-      # Zitadel's own registration is off: sign-up goes only through Chelabase's rules.
-      ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_ALLOWREGISTER: "false"
-      ZITADEL_FIRSTINSTANCE_PATPATH: /zitadel-bootstrap/admin.pat
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: chelabase-bootstrap
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Chelabase Bootstrap
-      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
-      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
-      ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /zitadel-bootstrap/login-client.pat
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Chelabase auth
-      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
-      # The login UI is Studio, at its public origin (scheme and CHELABASE_STUDIO_HOST).
-      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: "${CHELABASE_PUBLIC_SCHEME:-http}://${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}/"
-      ZITADEL_OIDC_DEFAULTLOGINURLV2: "${CHELABASE_PUBLIC_SCHEME:-http}://${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}/login?authRequest="
-      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "${CHELABASE_PUBLIC_SCHEME:-http}://${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}/logout?post_logout_redirect="
-      # Actions call the orchestrator by service name (a private address on the stack network,
-      # allowed); loopback and link-local stay blocked.
-      ZITADEL_HTTPCLIENT_DENYLIST: "localhost,0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,::1/128"
-    volumes:
-      - {type: volume, source: secrets, target: /run/chelabase/zitadel/masterkey, read_only: true, volume: {subpath: zitadel/masterkey}}
-      - {type: volume, source: secrets, target: /run/chelabase/zitadel/steps.yaml, read_only: true, volume: {subpath: zitadel/steps.yaml}}
-      - {type: volume, source: secrets, target: /run/chelabase/zitadel/database.yaml, read_only: true, volume: {subpath: zitadel-config/database.yaml}}
-      - {type: volume, source: secrets, target: /zitadel-bootstrap, volume: {subpath: zitadel-pats}}
-    depends_on:
-      zitadel-db:
-        condition: service_healthy
-      init-secrets:
-        condition: service_completed_successfully
-    # The image has no shell or HTTP client; `zitadel ready` asks its own /debug/ready.
-    healthcheck:
-      test: ["CMD", "/app/zitadel", "ready"]
-      interval: 5s
-      timeout: 5s
-      retries: 60
-      start_period: 30s
 
   # --- Neon storage ------------------------------------------------------
   # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
@@ -963,23 +850,102 @@ services:
   # name. The gateway is the one way in from the host for HTTP (the proxy for Postgres). CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick the images (docker-compose.build.yml builds them from the clone).
 
+  # The identity service (auth-replacement; Better Auth behind its own JSON API). Internal only: on the project network, no published port, no
+  # gateway route. auth, the orchestrator, the worker and the bootstrap call it, each with its
+  # own bearer (tokens/<caller>-identity.token), which it checks per route.
+  # Its database is the metadata server's, as `chelabase_identity`: no CREATE on the database and
+  # no grant on Chelabase's schemas; it owns only its pool schemas (identity_members,
+  # identity_app_<hex>), made through identity_admin's SECURITY DEFINER functions. The bootstrap
+  # makes the role and sets its password from identity/db.password (so the service answers its
+  # health route before that, and its first database call waits for the bootstrap). The service
+  # takes its database URL only from a file: the entrypoint writes it from the password file
+  # (base64url, checked) into a private tmpfs. Outgoing mail: .env's CHELABASE_SMTP_* (the
+  # password from the host file CHELABASE_SMTP_PASSWORD_PATH: uid 10001, mode 0600).
+  # Its image is a pinned release image like the apps' (CHELABASE_IMAGE_REPO and
+  # CHELABASE_IMAGE_TAG pick it too).
+  identity:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:8c789749d5d1b7f355dc1649405354dff6f521f7c4738c275977a65d574b492f}
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        umask 077
+        pw=""
+        IFS= read -r pw <"$$CHELABASE_IDENTITY_DB_PASSWORD_FILE" || [ -n "$$pw" ]
+        case "$$pw" in
+          "" | *[!A-Za-z0-9_-]*)
+            echo "identity: $$CHELABASE_IDENTITY_DB_PASSWORD_FILE must hold one base64url line" >&2
+            exit 1 ;;
+        esac
+        # The user info is one argument: no password is ever in this file's text.
+        printf 'postgres://%s@%s/%s\n' "$$CHELABASE_IDENTITY_DB_USER:$$pw" \
+          "$$CHELABASE_IDENTITY_DB_HOST" "$$CHELABASE_IDENTITY_DB_NAME" >/run/identity/database.url
+        unset pw
+        export CHELABASE_IDENTITY_DATABASE_URL_FILE=/run/identity/database.url
+        exec "$$@"
+      - identity
+    command: ["node", "src/main.ts"]
+    environment:
+      CHELABASE_IDENTITY_HOST: 0.0.0.0
+      CHELABASE_IDENTITY_PORT: "8080"
+      CHELABASE_IDENTITY_DB_USER: chelabase_identity
+      CHELABASE_IDENTITY_DB_HOST: metadata-db:5432
+      CHELABASE_IDENTITY_DB_NAME: chelabase_metadata
+      CHELABASE_IDENTITY_DB_PASSWORD_FILE: /run/chelabase/secrets/identity/db.password
+      CHELABASE_IDENTITY_SECRET_FILE: /run/chelabase/secrets/identity/secret
+      CHELABASE_IDENTITY_AUTH_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
+      CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
+      CHELABASE_IDENTITY_WORKER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      CHELABASE_IDENTITY_BOOTSTRAP_TOKEN_FILE: /run/chelabase/secrets/tokens/bootstrap-identity.token
+      CHELABASE_IDENTITY_POOL_CACHE_SIZE: ${CHELABASE_IDENTITY_POOL_CACHE_SIZE:-256}
+      # Optional SMTP (unset: no email; codes go back to the caller only).
+      CHELABASE_SMTP_HOST: ${CHELABASE_SMTP_HOST:-}
+      CHELABASE_SMTP_PORT: ${CHELABASE_SMTP_PORT:-}
+      CHELABASE_SMTP_TLS: ${CHELABASE_SMTP_TLS:-}
+      CHELABASE_SMTP_USER: ${CHELABASE_SMTP_USER:-}
+      CHELABASE_SMTP_FROM: ${CHELABASE_SMTP_FROM:-}
+      CHELABASE_SMTP_PASSWORD_FILE: ${CHELABASE_SMTP_USER:+/run/chelabase/smtp.password}
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/secret, read_only: true, volume: {subpath: identity/secret}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/db.password, read_only: true, volume: {subpath: identity/db.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/auth-identity.token, read_only: true, volume: {subpath: tokens/auth-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/bootstrap-identity.token, read_only: true, volume: {subpath: tokens/bootstrap-identity.token}}
+      - type: bind
+        source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
+        target: /run/chelabase/smtp.password
+        read_only: true
+        bind: {create_host_path: false}
+      - {type: tmpfs, target: /tmp}
+    # The entrypoint writes the database URL here as uid 10001: a long-form tmpfs mount is
+    # root's, so this one is set with its owner.
+    tmpfs:
+      - /run/identity:uid=10001,gid=10001,mode=0700
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      metadata-db:
+        condition: service_healthy
+
   orchestrator:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:7b025a936a3c9c899bf0109720acc8089f4819d23a5d242c987372599c455b5b}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:ccd2a25c3edaf129413b5fc7bd2827b521fff0a2d0c6d98f0a395f061abb901d}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
     command: ["orchestrator"]
-    # RT1 T1 (S1, S27): its own credentials, from its own files below. The bootstrap's outputs
-    # are read as they appear (it starts before the bootstrap, which waits for it), so it mounts
-    # bootstrap/ whole: the ids (ids/), the Actions signing key it verifies Zitadel's calls with,
-    # and the SMTP password's salted digest.
+    # RT1 T1 (S1, S27): its own credentials, from its own files below.
     environment:
       <<: *app-env
       CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
       CHELABASE_SETUP_CODE_FILE: /run/chelabase/secrets/setup/setup.code
-      CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE: /run/chelabase/secrets/bootstrap/actions-signing-key
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
       # Where clients reach the proxy (the connection details): <endpoint>.<domain> on the
       # proxy's published ports, and the name of the CA file the docs fetch it to.
       CHELABASE_PROXY_DOMAIN: ${CHELABASE_PROXY_DOMAIN:-localtest.me}
@@ -992,6 +958,7 @@ services:
       CHELABASE_BRANCH_DATA_API_DATABASE_CAP: ${CHELABASE_BRANCH_DATA_API_DATABASE_CAP:-}
       CHELABASE_PASSWORD_STRENGTH: ${CHELABASE_PASSWORD_STRENGTH:-}
       CHELABASE_APP_REFRESH_TTL_SECS: ${CHELABASE_APP_REFRESH_TTL_SECS:-}
+      CHELABASE_MEMBER_SESSION_CHECK_SECS: ${CHELABASE_MEMBER_SESSION_CHECK_SECS:-}
       CHELABASE_NATS_USER: orchestrator
       CHELABASE_NATS_PASSWORD_FILE: /run/chelabase/secrets/nats/orchestrator.password
       CHELABASE_NATS_INBOX_PREFIX: _INBOX_orchestrator
@@ -1005,6 +972,9 @@ services:
       CHELABASE_STORAGE_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/storage-internal.token
       CHELABASE_PROXY_API_TOKEN_FILE: /run/chelabase/secrets/tokens/proxy-api.token
       CHELABASE_STORCON_HOOK_TOKEN_FILE: /run/chelabase/secrets/tokens/storcon-hook.token
+      # auth-replacement m5: its identity bearer.
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
     # The default network for the apps, `control` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute` (P4): computes call its hooks listener
     # (8083) as `orchestrator`.
@@ -1028,11 +998,11 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storage-internal.token, read_only: true, volume: {subpath: tokens/storage-internal.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storcon-hook.token, read_only: true, volume: {subpath: tokens/storcon-hook.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, read_only: true, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/setup/setup.code, read_only: true, volume: {subpath: setup/setup.code}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap, read_only: true, volume: {subpath: bootstrap}}
       - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
     healthcheck:
       <<: *app-health
@@ -1048,11 +1018,9 @@ services:
         condition: service_healthy
       storage-controller:
         condition: service_healthy
-      zitadel:
-        condition: service_healthy
 
   worker:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:d06e3da222111b988c119d3a85aada99521bc82f49bf4f0919c6088853b0e260}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:e094169ef1a5de1f58ea51540be48a00c82534232b18a8f99450ee66281b99a6}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1076,8 +1044,10 @@ services:
       CHELABASE_PASSWORD_STRENGTH: ${CHELABASE_PASSWORD_STRENGTH:-}
       CHELABASE_APP_USERS_RECONCILE_SECS: ${CHELABASE_APP_USERS_RECONCILE_SECS:-}
       CHELABASE_MEMBER_ROLES_SWEEP_SECS: ${CHELABASE_MEMBER_ROLES_SWEEP_SECS:-}
-      CHELABASE_IDENTITY_SWEEP_SECS: ${CHELABASE_IDENTITY_SWEEP_SECS:-}
       CHELABASE_WORKER_REMOVE_ORPHANS: ${CHELABASE_WORKER_REMOVE_ORPHANS:-}
+      # auth-replacement m5: its identity bearer (pool lifecycle, the users sync).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
     # P4: it dials computes (compute_ctl) on the compute network.
     networks:
       default: {}
@@ -1089,11 +1059,11 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/nats/worker.password, read_only: true, volume: {subpath: nats/worker.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/valkey/control.password, read_only: true, volume: {subpath: valkey/control.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/pg.password, read_only: true, volume: {subpath: realtime/pg.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca, volume: {subpath: compute-ca}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, volume: {subpath: realtime-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
     healthcheck:
       <<: *app-health
@@ -1119,16 +1089,14 @@ services:
         condition: service_healthy
       register-safekeepers:
         condition: service_completed_successfully
-      zitadel:
-        condition: service_healthy
 
   # The front door for HTTP, published on CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT. It listens on the
   # public port inside too and answers every host on the network (the aliases), so one URL works
-  # from the host and from a container when the hosts are plain http. The apps reach Zitadel
-  # directly (CHELABASE_ZITADEL_INTERNAL_URL), never through these aliases.
-  # Liveness only in its healthcheck (`/_gateway/ready` waits for its backends).
+  # from the host and from a container when the hosts are plain http. The auth host names the
+  # member tokens' issuer only: the gateway serves nothing there.
+  # Liveness only in its healthcheck (`/_gateway/ready` waits for its member verify key).
   gateway:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:f20a6dfd39684a3836ca65a43ea35b36e69826e3da5e709ad5968dd27b0b9d0d}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:6cf4faae8cc8f778ba116f5802a3a9a349600b3ca4cecad62c7acfbbff484776}
     restart: unless-stopped
     # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
     environment:
@@ -1137,8 +1105,6 @@ services:
       CHELABASE_GATEWAY_TRUSTED_PROXIES: ${CHELABASE_GATEWAY_TRUSTED_PROXIES:-}
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
     ports:
       - "${CHELABASE_HTTP_ADDR:-127.0.0.1}:${CHELABASE_HTTP_PORT:-${CHELABASE_PUBLIC_PORT:-8000}}:${CHELABASE_PUBLIC_PORT:-8000}"
     networks:
@@ -1150,16 +1116,13 @@ services:
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-signing.pem, read_only: true, volume: {subpath: gateway/internal-signing.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/data-keys.token, read_only: true, volume: {subpath: tokens/data-keys.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
-      # The bootstrap's ids (never its signing key), as a dir: a rewritten id is seen at once.
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${CHELABASE_PUBLIC_PORT:-8000}/_gateway/health"]
     depends_on:
-      zitadel:
-        condition: service_healthy
       init-bootstrap:
         condition: service_completed_successfully
 
@@ -1167,18 +1130,19 @@ services:
   # computes reach it directly: only the gateway's X-Forwarded-For counts
   # (CHELABASE_AUTH_TRUSTED_PROXY=gateway, ruling (e)).
   auth:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:83a1a1768e9ea5a1a0d17206148e720b2955045a5aa695c5a4a9da3ff7cd7eb4}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:4aedee119845b4374eb290edadadf9238cad53ea3bd651fca7d1f412c963e2cc}
     restart: unless-stopped
     # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
     environment:
       <<: *app-env
       CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-auth.token
-      CHELABASE_ZITADEL_ORG_ID_FILE: /run/chelabase/secrets/bootstrap/ids/org-id
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
-      CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/studio-client-id
       # .env's tunables (blank = the service's default).
       CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
       CHELABASE_APP_ACCESS_TTL_SECS: ${CHELABASE_APP_ACCESS_TTL_SECS:-}
+      CHELABASE_MEMBER_ACCESS_TTL_SECS: ${CHELABASE_MEMBER_ACCESS_TTL_SECS:-}
+      # auth-replacement m5: its identity bearer (member and app-user flows).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
     networks:
       default: {}
       compute: {}
@@ -1186,23 +1150,21 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/cookie.key, read_only: true, volume: {subpath: auth/cookie.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.key, read_only: true, volume: {subpath: auth/app-jwt.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.key, read_only: true, volume: {subpath: auth/member-jwt.key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-auth.token, read_only: true, volume: {subpath: tokens/app-auth.token}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/login-client.pat, read_only: true, volume: {subpath: zitadel-pats/login-client.pat}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/auth-identity.token, read_only: true, volume: {subpath: tokens/auth-identity.token}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8084/health"]
     depends_on:
-      zitadel:
-        condition: service_healthy
       init-bootstrap:
         condition: service_completed_successfully
 
   rest:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:437324a0d2f90799f91792c79bc0bccd84c91a5a46c46420348876c8f0f7d92a}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:c4d1bb83f449fa38ce6b69633288346e4d74acceb4ac1e33f9218b91d67150b4}
     restart: unless-stopped
     # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
     environment:
@@ -1230,7 +1192,7 @@ services:
   # /health, which waits for the OIDC audiences. It verifies the gateway's identity on ticket
   # requests.
   realtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:51bb75b8a099e88946b8b82755ceed2b1a62cd7b3eee18383bf5880c83816dbf}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:174a6a48ade5404f037bf0ec33cb039ffa999deb4b90b4e0b3ab454c4a8339c6}
     restart: unless-stopped
     # S1: its own credentials, from its own files below; Valkey TLS is platform mode's (S7).
     environment:
@@ -1244,8 +1206,6 @@ services:
       CHELABASE_REALTIME_PG_PASSWORD_FILE: /run/chelabase/secrets/realtime/pg.password
       CHELABASE_REALTIME_TICKET_KEY_FILE: /run/chelabase/secrets/realtime/ticket.key
       CHELABASE_REALTIME_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/realtime/internal.token
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
     # Realtime's replication connection dials the compute's `replication_host` on `control`
     # (from its static address, in the chelabase_realtime login rule); its check connections and
     # the compute's other listeners are reached on `compute`.
@@ -1263,7 +1223,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/ticket.key, read_only: true, volume: {subpath: realtime/ticket.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/internal.token, read_only: true, volume: {subpath: realtime/internal.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, read_only: true, volume: {subpath: realtime-tls}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/health"]
@@ -1278,7 +1238,7 @@ services:
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:7a4737761e00da98b69c6586104eb12ed2485fddc57b5ccd01e4ed1acba2c754}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-7379bf77435a@sha256:d0cc116a80b3df9697bf821587d29af6bd45b9a6b294d06bc178003a40e7ebc1}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
@@ -1298,20 +1258,19 @@ networks:
   # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
   # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
   # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime).
-  # Never NATS, Valkey, a database, Zitadel, Mailpit, SeaweedFS, the storage broker or controller,
+  # Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the storage broker or controller,
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).
   compute: {}
 
 volumes:
-  # Every key, password and token, chelabase-init's layout (plus zitadel-pats/, bootstrap/ and
-  # zitadel-config/). Never delete it while the databases' volumes exist: stored passwords can't
+  # Every key, password and token, chelabase-init's layout (plus bootstrap/). Never delete it
+  # while the databases' volumes exist: stored passwords can't
   # be decrypted without secrets/secrets.key, and the databases keep their first passwords.
   secrets:
   metadata_pg_data:
   nats_data:
   valkey_data:
-  zitadel_pg_data:
   neon_seaweedfs_data:
   neon_pageserver_data:
   neon_safekeeper1_data:

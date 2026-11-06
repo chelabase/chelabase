@@ -4,14 +4,18 @@
 //! (P10).
 //!
 //! - `POST /internal/realtime/authorize {token, target}`: may this member watch this table
-//!   target? The member's raw OIDC token is verified here (R10); the member is **read**, never
+//!   target? The member's raw member token is verified here (R10); the member is **read**, never
 //!   made (no admission, no first-member admin claim, no tenant binding); then the console's
 //!   own access check and gates (R3), mapped to S13's reasons. Always 200 past the bearer and
 //!   the body's shape.
 //! - `POST /internal/realtime/projects {token}`: the projects (and their live databases) the
 //!   member may see, for realtime's project channels.
-//! - `POST /internal/realtime/member {sub, org_id}` (T8-1, D7): may this person get a Studio
-//!   ticket now? `{allowed}` (with `reason: "forbidden"` when not).
+//! - `POST /internal/realtime/member {sub, tenant_id, sid}` (T8-1, D7): may this person get a
+//!   Studio ticket now? `{allowed}` (with `reason: "forbidden"` when not).
+//!
+//! Every route that takes a member token, and `/member` with its `sid`, also requires the
+//! token's identity session to be live ([`crate::member_sessions`]): an ended one is
+//! `forbidden`, and identity unable to say is `unavailable`.
 //! - `POST /internal/realtime/visible {…}`: the owner's privilege probe and key conversion
 //!   (R19, W2, W4, P7, S12) on the console's owner pool, by relation OID with the keys bound.
 //!   With `convert: true` (T8, owner deletes) it only prints `keys` in the owner session's form
@@ -30,7 +34,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router, middleware};
-use chelabase_auth::{AuthError, JwtVerifier, VerifiedClaims};
+use chelabase_auth::member_token::{MemberClaims, MemberTokenError, MemberTokenVerifier};
 
 use chelabase_metadata::{BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseRecord};
 use chelabase_nats::rt::{AccessEvent, ProjectEvent};
@@ -41,11 +45,12 @@ use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{ProjectId, TenantId};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::BoxFuture;
 use crate::access::{Target, authorize};
+use crate::member_sessions::Liveness;
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort};
 use chelabase_routes::orchestrator as ep;
 
@@ -74,12 +79,13 @@ impl RtEvents for async_nats::Client {
 }
 
 /// What the `/internal/realtime/*` routes check: realtime's bearer
-/// (`CHELABASE_REALTIME_INTERNAL_TOKEN[_FILE]`) and the members' OIDC tokens (the gateway's
-/// issuer and JWKS settings).
+/// (`CHELABASE_REALTIME_INTERNAL_TOKEN[_FILE]`) and the members' tokens.
 #[derive(Clone)]
 pub struct RealtimeAuth {
     pub token: String,
-    pub verifier: JwtVerifier,
+    /// Member tokens signed by auth (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119); `None` refuses
+    /// them all.
+    pub member: Option<MemberTokenVerifier>,
 }
 
 /// Shared by both states.
@@ -220,38 +226,26 @@ impl Refusal {
     }
 }
 
-/// The member's token verified (R10): expiry is `token_expired`, a JWKS or configuration
-/// failure `unavailable`, anything else (a bad signature, another issuer, no org) `forbidden`.
-async fn verify(verifier: &JwtVerifier, token: &str) -> Result<VerifiedClaims, Refusal> {
-    verifier.verify(token).await.map_err(|err| match err {
-        AuthError::Expired => Refusal::TokenExpired,
-        AuthError::Jwks(e) => {
-            warn!("realtime: the member token can't be checked (JWKS): {e}");
-            Refusal::Unavailable
-        }
-        AuthError::Config(e) => {
-            error!("realtime: the OIDC verifier is misconfigured: {e}");
-            Refusal::Unavailable
-        }
-        // #22: the audiences aren't written yet: refused, never checked without them.
-        AuthError::NotReady(e) => {
-            warn!("realtime: the member token can't be checked yet: {e}");
-            Refusal::Unavailable
-        }
-        AuthError::Unauthorized | AuthError::InvalidToken(_) => Refusal::Forbidden,
-    })
-}
-
-/// The verified member, read only (R10): an org no tenant is bound to is `forbidden`; a
-/// person with no member row gets `member: None`, which the access check refuses. A metadata
-/// failure is `unavailable`.
-async fn principal<M, J>(state: &AppState<M, J>, token: &str) -> Result<(AuthPrincipal, VerifiedClaims), Refusal>
+/// The verified member, read only (R10): a token that doesn't verify, or whose tenant is gone,
+/// is `forbidden` (`token_expired` once expired); a person with no member row gets `member:
+/// None`, which the access check refuses. A metadata failure is `unavailable`.
+async fn principal<M, J>(state: &AppState<M, J>, token: &str) -> Result<(AuthPrincipal, MemberClaims), Refusal>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let claims = verify(&state.realtime.verifier, token).await?;
-    match crate::read_only_principal(state, &claims).await {
+    let member = state.realtime.member.as_ref().ok_or(Refusal::Forbidden)?;
+    let claims = member.verify(token).map_err(|err| match err {
+        MemberTokenError::Expired => Refusal::TokenExpired,
+        MemberTokenError::Invalid => Refusal::Forbidden,
+    })?;
+    // Review fix 1: an ended identity session (logout, a reset) refuses like a bad token.
+    match state.member_sessions.check(&claims.sub, Some(&claims.sid)).await {
+        Liveness::Live => {}
+        Liveness::Ended => return Err(Refusal::Forbidden),
+        Liveness::Unavailable => return Err(Refusal::Unavailable),
+    }
+    match crate::read_only_member_principal(state, &claims).await {
         Ok(Some(principal)) => Ok((principal, claims)),
         Ok(None) => Err(Refusal::Forbidden),
         Err(err) => {
@@ -370,11 +364,10 @@ where
         return refused(r);
     }
     let member = principal.member.as_ref();
-    let name = claims
-        .name
-        .clone()
+    let name = Some(claims.name.clone())
+        .filter(|n| !n.is_empty())
         .or_else(|| member.map(|m| m.display_name.clone()).filter(|n| !n.is_empty()));
-    let email = claims.email.clone().or_else(|| member.and_then(|m| m.email.clone()));
+    let email = Some(claims.email.clone()).filter(|e| !e.is_empty()).or_else(|| member.and_then(|m| m.email.clone()));
     Json(json!({
         "allowed": true,
         "tenant_id": principal.tenant_id.as_uuid(),
@@ -446,14 +439,19 @@ where
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     sub: String,
-    org_id: String,
+    /// The member token's tenant (#119).
+    tenant_id: Uuid,
+    /// The member token's identity session (review fix 1); none is refused.
+    #[serde(default)]
+    sid: Option<String>,
 }
 
 /// T8-1, D7: realtime asks before it issues a Studio ticket, with the gateway's identity
-/// (`sub`, `org_id`). `{allowed: true}` only for a member of the org's tenant in good standing
-/// (active, not offboarded); a suspended, offboarded, pending, invited or removed member, a
-/// person with no row, or an org no tenant is bound to is `{allowed: false, reason:
-/// "forbidden"}`. The member is read, never made. A metadata failure is 503.
+/// (`sub`, `tenant_id`, and the member token's `sid`, which must be live). `{allowed: true}`
+/// only for a member of that tenant in good standing (active, not offboarded); a suspended,
+/// offboarded, pending, invited or removed member, a person with no row, an unknown tenant, or
+/// an ended session is `{allowed: false, reason: "forbidden"}`. The member is read, never made.
+/// A metadata failure, or identity unable to check the session, is 503.
 async fn member_route<M, J>(State(state): State<Arc<AppState<M, J>>>, bytes: Bytes) -> Response
 where
     M: MetadataPort,
@@ -466,15 +464,18 @@ where
     let refused = || {
         Json(json!({ "allowed": false, "reason": Refusal::Forbidden.reason() })).into_response()
     };
-    let tenant = match state.metadata.get_tenant_by_zitadel_org_id(&request.org_id).await {
-        Ok(Some(tenant)) => tenant,
-        Ok(None) => return refused(),
-        Err(err) => {
-            warn!("realtime member check: the tenant lookup failed: {err}");
-            return Refusal::Unavailable.response();
-        }
-    };
-    match state.metadata.member_by_zitadel(tenant, &request.sub).await {
+    if request.tenant_id.is_nil() {
+        return refused();
+    }
+    // Review fix 1: an ended identity session gets no ticket.
+    match state.member_sessions.check(&request.sub, request.sid.as_deref()).await {
+        Liveness::Live => {}
+        Liveness::Ended => return refused(),
+        Liveness::Unavailable => return Refusal::Unavailable.response(),
+    }
+    // The membership read below is what admits it; an unknown tenant has none.
+    let tenant = chelabase_types::TenantId(request.tenant_id);
+    match state.metadata.member_by_identity_user(tenant, &request.sub).await {
         Ok(Some(member)) if member.in_good_standing() => {
             Json(json!({ "allowed": true })).into_response()
         }

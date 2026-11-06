@@ -77,7 +77,7 @@ sdb <<'SQL'
 INSERT INTO tenants (id, slug) VALUES ('00000000-0000-0000-0000-0000000000a1', 'sweep-t');
 INSERT INTO projects (id, tenant_id, slug, name) VALUES
   ('00000000-0000-0000-0000-0000000000a2', '00000000-0000-0000-0000-0000000000a1', 'sweep-p', 'sweep-p');
-INSERT INTO members (id, tenant_id, zitadel_user_id, status) VALUES
+INSERT INTO members (id, tenant_id, identity_user_id, status) VALUES
   ('00000000-0000-0000-0000-0000000000a3', '00000000-0000-0000-0000-0000000000a1', 'z-1', 'active');
 INSERT INTO teams (id, tenant_id, name) VALUES
   ('00000000-0000-0000-0000-0000000000a4', '00000000-0000-0000-0000-0000000000a1', 'sweep-team');
@@ -122,7 +122,7 @@ INSERT INTO project_auth (project_id, status, database_id, pg_database) VALUES
   ('00000000-0000-0000-0000-0000000000a2', 'enabled', '00000000-0000-0000-0000-0000000000b1', 'app');
 INSERT INTO branch_auth_sync (branch_id, pg_database, password_sealed) VALUES
   ('00000000-0000-0000-0000-0000000000b1', 'app', 'sealed-6');
-INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash, grace_refresh_sealed, grace_until, expires_at) VALUES
+INSERT INTO app_sessions (id, project_id, user_id, identity_session_id, refresh_hash, grace_refresh_sealed, grace_until, expires_at) VALUES
   (gen_random_uuid(), '00000000-0000-0000-0000-0000000000a2', gen_random_uuid(), 'zs', '\x00',
    'sealed-7', now() + interval '1 hour', now() + interval '1 day');
 SQL

@@ -13,10 +13,10 @@ gateway ──identity token──▶ orchestrator ──job (JetStream)──�
 
 ## What the orchestrator owns
 
-- **The Management API.** Projects, databases, branches, merges, login roles, data API keys and settings, members and teams, app users, saved queries, the SQL editor and the table API. Each route is declared in `chelabase-routes`, like every other public endpoint (see [Gateway](/docs/architecture/gateway#one-declaration-per-endpoint)); the reference is generated from `openapi/management.json`.
-- **Access decisions.** The gateway proves who is calling; the orchestrator decides whether they may. For each request it checks, in order: that the caller is an admitted member, that the target is in the caller's tenant, the branch's protection, and the member's effective grant, read fresh on every request. Answers that don't depend on the target come first, so a refusal doesn't reveal whether the target exists. [Access per route](/docs/reference/access) lists the level each route needs.
+- **The Management API.** Projects, databases, branches, merges, login roles, data API keys and settings, members and teams, app users, saved queries, the SQL editor and the table API. Each route is declared in `chelabase-routes`, like every other public endpoint (see [Gateway](/architecture/gateway#one-declaration-per-endpoint)); the reference is generated from `openapi/management.json`.
+- **Access decisions.** The gateway proves who is calling; the orchestrator decides whether they may. For each request it checks, in order: that the caller is an admitted member, that the target is in the caller's tenant, the branch's protection, and the member's effective grant, read fresh on every request. Answers that don't depend on the target come first, so a refusal doesn't reveal whether the target exists. [Access per route](/reference/access) lists the level each route needs.
 - **The metadata store.** A Postgres database (not one of your databases) holds tenants, projects, databases, branches, members, grants, keys and encrypted credentials. The orchestrator and the worker both run its migrations at start-up, and both refuse to start if the secrets key doesn't match the one the store was encrypted with.
-- **The internal listener.** A second listener, on `127.0.0.1:8083` by default, serves the machines that call the control plane: Neon's proxy, `compute_ctl`, the storage controller, and the gateway, `rest` and `auth` for their lookups. It never goes through the gateway, and each caller has its own bearer token. See [Neon: the internal listener](/docs/architecture/neon#the-internal-listener).
+- **The internal listener.** A second listener, on `127.0.0.1:8083` by default, serves the machines that call the control plane: Neon's proxy, `compute_ctl`, the storage controller, and the gateway, `rest`, `auth` and realtime for their lookups. It never goes through the gateway, and each caller has its own bearer token. See [Neon: the internal listener](/architecture/neon#the-internal-listener).
 
 ## How a database is created
 
@@ -24,7 +24,7 @@ gateway ──identity token──▶ orchestrator ──job (JetStream)──�
 2. It writes the database's row as `pending` and publishes a provision job to JetStream.
 3. It answers straight away. If the job can't be queued, the row is marked `failed` and the answer is 503 `worker_unavailable`.
 4. The worker picks up the job and marks the database `provisioning`. It creates the Neon tenant and timeline, waits until the storage controller reports the tenant attached, starts the compute container, and runs the database's bootstrap SQL as its owner role.
-5. The worker marks the database `ready`. Studio sees each status change through [realtime](/docs/architecture/realtime)'s project events.
+5. The worker marks the database `ready`. Studio sees each status change through [realtime](/architecture/realtime)'s project events.
 
 Branches, resets, restores, merges and deletes follow the same shape: the orchestrator records the intent and queues a job; the worker does the work and writes the outcome.
 
@@ -49,7 +49,7 @@ The worker has no public API. It listens to NATS in two ways.
 **Background loops** keep the system converging without being asked:
 
 - **Reconcile**, every 30 seconds, compares each branch's recorded status with its compute and fixes the difference: it recreates a compute that is missing or stopped (backing off when one keeps failing), finishes interrupted switches, and hands a merge whose worker went silent back to the queue.
-- Separate sweeps reconcile member roles and app users, revoke the logins of members who were deactivated or deleted in the identity provider, renew compute certificates and refresh storage tokens before they expire.
+- Separate sweeps reconcile member roles and app users, renew compute certificates and refresh storage tokens before they expire. Removing or suspending a member revokes their logins inline, with no sweep.
 
 The worker serves only `/health`, on `127.0.0.1:8082` by default.
 

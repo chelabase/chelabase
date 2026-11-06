@@ -15,6 +15,10 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
 ## Mode A — propose (no `APPROVED`)
 
 1. Explore the code the goal touches. If the goal is `#<n>`, read that issue once.
+   Where services must tell each other something (revocation, lifecycle events, cache
+   invalidation, reconciles), weigh a NATS event (`crates/chelabase-nats`) against polling,
+   reconcile loops or direct database reads, and record the choice in the design sketch
+   (Approach or Rejected).
 2. Pick a kebab-case slug (≤ 30 chars) and an epic title `type(area): summary`.
 3. Cut milestones. Each one:
    - lands in one build run (aim ≤ ~400 changed lines);

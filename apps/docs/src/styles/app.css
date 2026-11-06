@@ -15,3 +15,8 @@ html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
 }
+
+/* Inline code with no spaces (URLs, env names) wraps inside the column instead of running past a phone's edge. */
+.prose :not(pre) > code {
+  overflow-wrap: anywhere;
+}

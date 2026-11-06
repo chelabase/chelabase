@@ -13,7 +13,7 @@ Mode: **Persuade**. The public landing page; Studio is the console it links to.
 
 - Developers choosing a Postgres platform they can run themselves.
 - Theme: **Manage, collaborate, iterate**: Postgres made easy to manage, shared with a team through roles Postgres enforces, and changed safely with branches and merges; built in Rust, end to end.
-- Job: know what Chelabase is, see what it offers against the alternatives, then **Get started** (the docs Quickstart: `${VITE_DOCS_URL}/docs/using/quickstart`, falling back to `quickstart.mdx` on GitHub) or **Visit GitHub** (`https://github.com/chelabase/chelabase`). No Studio links, no auth state.
+- Job: know what Chelabase is, see what it offers against the alternatives, then **Get started** (the docs Quickstart: `${VITE_DOCS_URL}/using/quickstart`, falling back to `quickstart.mdx` on GitHub) or **Visit GitHub** (`https://github.com/chelabase/chelabase`). No Studio links, no auth state.
 - Proof is demonstration and sourced fact only: the hero animation, the real Docker Compose install, real `@chelabase/client` code, the service map, and a comparison drawn from each product's docs (dated, caveats in its footnote). Synthetic illustrations are labelled. No customers, logos, benchmark numbers or invented claims; platform mode is not pitched. The CLI (an installable setup and management script) and S3-compatible object storage (SeaweedFS) are **Coming soon**.
 
 ## Sections
@@ -29,6 +29,7 @@ Hero → Run it on your machine (`git clone` → `cd chelabase/infra/compose` �
 - Hero motion: scuttle and fork. The crab walks main; at each fork a smaller crab splits off down its branch, leaving a footprint trail; one branch then resets (its crab walks back to the fork and out again).
 - Hero must scale: lagoon, sun and palms visible on 24" (1920–2560 wide) and 34" ultrawide (3440 wide) screens, and on phones.
 - Compare keeps the wireframe idea but loses the grid lines.
+- Superseded (user, 2026-11-04): Compare has column rules and zebra rows (ink/channel), no row rules, one continuous zebra (no group subheads: the user rejected them); Chelabase's column is a sand band; a competitor's other approach is a short note, not "Different model"; a right-edge fade shows while columns are hidden.
 
 ## Decisions (user, 2026-10-30)
 
@@ -37,6 +38,17 @@ Hero → Run it on your machine (`git clone` → `cd chelabase/infra/compose` �
 - Grounds below the hero: bands alternate raised (`--deep`) and ink, starting raised; a low swell with a sand tideline crest replaces the tall waves; no seafoam or sand bands. Basalt (`--shallows`) washed out the comparison and was dropped.
 - The comparison was re-surveyed from each product's docs on 2026-10-30; PlanetScale is split because only its MySQL (Vitess) databases merge schema (deploy requests).
 - Mobile polish is deferred.
+
+## Decisions (user, 2026-11-02)
+
+- Manage and Bring your team in open with their notes in two columns, then the Studio screenshot at column width; their illustrative SQL insets are gone (the screenshots show the real SQL and grant). Text-left, code-right stays the rule for the split sections.
+- Manage drops the RLS-warning strip; the Security in plain view note carries it. Every Studio screenshot is a whole 1152×800 window (Team scrolls to its project access), retaken with `pnpm capture-studio` whenever Studio's shell changes.
+- Branch it leads with one wide tide gauge that holds the definitions: tabs on top, drawing and slider on the left, the picked verb's definition and what it did on the right. The separate definition list is gone; the branches screenshot follows at full width.
+- A screenshot opens larger in a dialog over the page; Esc, a close button or a click anywhere closes it. It never navigates to the raw file.
+- The hero scene stays hidden until it has measured its box, so a wide screen never paints the server's guessed width first.
+- Public contact is hello@chelabase.com, in the footer.
+- Alpha everywhere: a tag and line under the hero actions (and "self-hosted alpha" in the footer), worded as the README, docs and Studio's top bar say it.
+- Mobile polish: below a 700px column the hero tells a one-branch story (user, 2026-11-02): a single smaller crab forks off down staging, resets, then merges and burrows; smaller crabs, sun and palms, narrower trails, everything above the Replay row and on screen, the merge note shortened to "merged into main", the comparison's row names stay put while the products scroll, and the tide gauge sets its text larger.
 
 ## Direction contract
 

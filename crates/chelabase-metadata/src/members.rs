@@ -92,7 +92,7 @@ pub enum Admission {
 /// ([`MetadataClient::ensure_member_first_comer_for_tests`] against [`MetadataClient::admit_member`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminClaim {
-    /// Only the Zitadel user the tenant's `setup_claims` row binds (a code-gated sign-up).
+    /// Only the identity user the tenant's `setup_claims` row binds (a code-gated sign-up).
     /// No row: nobody. What every service uses.
     SetupBound,
     /// Whoever asks first: the tests' and tools' shortcut. No service calls it.
@@ -102,8 +102,8 @@ enum AdminClaim {
 /// A tenant's fresh-install claim ([`MetadataClient::setup_claim`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupClaim {
-    /// The Zitadel user the claim binds.
-    pub zitadel_user_id: String,
+    /// The identity user the claim binds.
+    pub identity_user_id: String,
     pub created_at: DateTime<Utc>,
     /// Whether that user has a member row in the tenant (any status).
     pub has_member_row: bool,
@@ -125,20 +125,19 @@ pub enum SetupClaimOutcome {
 pub struct MemberRecord {
     pub id: Uuid,
     pub tenant_id: TenantId,
-    pub zitadel_user_id: String,
+    pub identity_user_id: String,
     /// Lowercased and trimmed. `None` when unknown or stale (R8: the newest claim of an email
     /// wins, so a member whose address another member claimed since has none until its own next
     /// request brings its current one). For T5: show such a member without an email. For T7:
-    /// matching an invite by email never matches a `None`, and Zitadel stays the truth for who
+    /// matching an invite by email never matches a `None`, and identity stays the truth for who
     /// holds an address.
     pub email: Option<String>,
     pub display_name: String,
     pub tenant_admin: bool,
     pub status: MemberStatus,
     pub accepted_at: Option<DateTime<Utc>>,
-    /// D7: the member's Zitadel user was deactivated, locked or removed (the Actions webhook's
-    /// or the identity sweep's mark, `members.offboarded_at`); cleared when Zitadel shows the
-    /// user active again. Independent of `status`.
+    /// D7: the member's identity user was offboarded (`members.offboarded_at`); cleared when an
+    /// accepted invite shows the user back. Independent of `status`.
     pub offboarded: bool,
     /// D10: when the member was suspended (`members.suspended_at`); `None` unless suspended.
     pub suspended_at: Option<DateTime<Utc>>,
@@ -174,6 +173,8 @@ impl std::ops::Deref for MemberListing {
 /// What an open invite tells the person holding its link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteDescription {
+    /// The tenant whose member the invite is for: accepting it activates that row.
+    pub tenant_id: TenantId,
     /// SHA-256 of the invite's token; `None` for an invite made before tokens existed.
     pub token_hash: Option<Vec<u8>>,
     /// The inviter's display name; empty when they have none.
@@ -331,7 +332,7 @@ pub enum AccessAction {
     MemberApproved,
     /// An admin declined a pending sign-up (R40).
     MemberDeclined,
-    /// A person already in the tenant's Zitadel org was invited: added active, no invite code.
+    /// A person who already has an identity account was invited: added active, no invite code.
     MemberAdded,
     /// A tenant admin suspended an active member (members hub D5).
     MemberSuspended,
@@ -674,7 +675,7 @@ pub(crate) async fn member_observed_tx(tx: &mut Tx, member: Uuid) -> Result<Vec<
 struct MemberRaw {
     id: Uuid,
     tenant_id: Uuid,
-    zitadel_user_id: String,
+    identity_user_id: String,
     email: Option<String>,
     display_name: String,
     tenant_admin: bool,
@@ -691,7 +692,7 @@ impl TryFrom<MemberRaw> for MemberRecord {
         Ok(MemberRecord {
             id: raw.id,
             tenant_id: TenantId(raw.tenant_id),
-            zitadel_user_id: raw.zitadel_user_id,
+            identity_user_id: raw.identity_user_id,
             email: raw.email,
             display_name: raw.display_name,
             tenant_admin: raw.tenant_admin,
@@ -914,7 +915,7 @@ fn override_json(o: &OverrideRow) -> Value {
 
 macro_rules! member_columns {
     () => {
-        "id, tenant_id, zitadel_user_id, email, display_name, tenant_admin, status, accepted_at,
+        "id, tenant_id, identity_user_id, email, display_name, tenant_admin, status, accepted_at,
          offboarded_at IS NOT NULL AS offboarded, suspended_at, suspended_by"
     };
 }
@@ -953,13 +954,13 @@ type Stamp = Option<DateTime<Utc>>;
 pub type InviteState = (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// An open invite's token hash, inviter name and email, tenant slug and display name.
-type InviteDescriptionRow = (Option<Vec<u8>>, String, Option<String>, String, Option<String>);
+type InviteDescriptionRow = (Uuid, Option<Vec<u8>>, String, Option<String>, String, Option<String>);
 
-/// The person [`MetadataClient::create_invited_member`] invites: their Zitadel user, email, the
+/// The person [`MetadataClient::create_invited_member`] invites: their identity user, email, the
 /// invite's expiry and token hash, and the grants they get once active.
 #[derive(Debug, Clone, Copy)]
 pub struct NewInvite<'a> {
-    pub zitadel_user_id: &'a str,
+    pub identity_user_id: &'a str,
     pub email: &'a str,
     pub expires_at: DateTime<Utc>,
     pub token_hash: [u8; 32],
@@ -1090,18 +1091,18 @@ pub(crate) async fn lock_tenant(tx: &mut Tx, tenant: Uuid) -> Result<bool, sqlx:
     )
 }
 
-pub(crate) async fn lock_member_by_zitadel(
+pub(crate) async fn lock_member_by_identity_user(
     tx: &mut Tx,
     tenant: Uuid,
-    zitadel_user_id: &str,
+    identity_user_id: &str,
 ) -> Result<Option<MemberRecord>, sqlx::Error> {
     sqlx::query_as::<_, MemberRow>(concat!(
         "SELECT ",
         member_columns!(),
-        " FROM members WHERE tenant_id = $1 AND zitadel_user_id = $2 FOR NO KEY UPDATE"
+        " FROM members WHERE tenant_id = $1 AND identity_user_id = $2 FOR NO KEY UPDATE"
     ))
     .bind(tenant)
-    .bind(zitadel_user_id)
+    .bind(identity_user_id)
     .fetch_optional(&mut **tx)
     .await?
     .map(MemberRecord::try_from)
@@ -1589,41 +1590,78 @@ async fn delete_team_memberships(tx: &mut Tx, member: Uuid) -> Result<Value, sql
     ))
 }
 
+/// An identity user's other member rows, from [`MetadataClient::other_memberships`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OtherMemberships {
+    /// One is `active`: the account's sessions serve that tenant.
+    pub active: bool,
+    /// One isn't `removed` (invited, pending, active or suspended): the account is still needed.
+    pub live: bool,
+}
+
 fn members_from(rows: Vec<MemberRow>) -> Result<Vec<MemberRecord>, sqlx::Error> {
     rows.into_iter().map(MemberRecord::try_from).collect()
 }
 
 impl MetadataClient {
-    pub async fn member_by_zitadel(
+    pub async fn member_by_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<MemberRecord>, MetadataError> {
         Ok(sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
-            " FROM members WHERE tenant_id = $1 AND zitadel_user_id = $2"
+            " FROM members WHERE tenant_id = $1 AND identity_user_id = $2"
         ))
         .bind(tenant.as_uuid())
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .fetch_optional(&self.pool)
         .await?
         .map(MemberRecord::try_from)
         .transpose()?)
     }
 
-    /// Whether `member`'s Zitadel user has another member row, in any tenant, that isn't
-    /// removed: a removal then leaves the user active (only its sessions end). An unknown
-    /// `member` is `false`.
-    pub async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM members m JOIN members o
-                              ON o.zitadel_user_id = m.zitadel_user_id AND o.id <> m.id
-                            WHERE m.id = $1 AND o.status <> 'removed')",
+    /// The tenants this identity user is an active or pending member of, by tenant id. What
+    /// `auth` picks a sign-in's tenant from, and what `/auth/v1/token` re-reads before it mints.
+    pub async fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, MemberStatus)>, MetadataError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT tenant_id, status FROM members
+              WHERE identity_user_id = $1 AND status IN ('active', 'pending')
+              ORDER BY tenant_id",
         )
-        .bind(member)
+        .bind(identity_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant, status)| {
+                let status = if status == "active" { MemberStatus::Active } else { MemberStatus::Pending };
+                (TenantId(tenant), status)
+            })
+            .collect())
+    }
+
+    /// Where `identity_user_id`'s member rows stand in every tenant, `except` one row (the row
+    /// being removed, declined or revoked; `None` counts them all). A removal ends the account's
+    /// sessions unless another row is `active`, and bans it only when no other row is `live`.
+    pub async fn other_memberships(
+        &self,
+        identity_user_id: &str,
+        except: Option<Uuid>,
+    ) -> Result<OtherMemberships, MetadataError> {
+        let (active, live): (bool, bool) = sqlx::query_as(
+            "SELECT COALESCE(bool_or(status = 'active'), false), count(*) > 0 FROM members
+              WHERE identity_user_id = $1 AND status <> 'removed' AND ($2::uuid IS NULL OR id <> $2)",
+        )
+        .bind(identity_user_id)
+        .bind(except)
         .fetch_one(&self.pool)
-        .await?)
+        .await?;
+        Ok(OtherMemberships { active, live })
     }
 
     /// The caller's member row, made on its first request. Runs on every request, so an active
@@ -1652,39 +1690,39 @@ impl MetadataClient {
     pub async fn ensure_member_first_comer_for_tests(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
     ) -> Result<MemberRecord, MetadataError> {
-        self.ensure_member_as(tenant, zitadel_user_id, email, name, admission, AdminClaim::FirstComer)
+        self.ensure_member_as(tenant, identity_user_id, email, name, admission, AdminClaim::FirstComer)
             .await
     }
 
     /// [`MetadataClient::ensure_member_first_comer_for_tests`] as the orchestrator runs it on
-    /// every request: while the tenant has no active admin, only the Zitadel user its `setup_claims` row binds (the
+    /// every request: while the tenant has no active admin, only the identity user its `setup_claims` row binds (the
     /// account a sign-up with the right setup code created) claims `tenant_admin`, and only
-    /// from no row at all. Without a claim row nobody does. Anyone else (Zitadel's
-    /// FirstInstance human, a machine user, the loser of a sign-up race, a member left after the
+    /// from no row at all. Without a claim row nobody does. Anyone else (an
+    /// account made outside the claim, the loser of a sign-up race, a member left after the
     /// sole admin was suspended) is a newcomer like any other and becomes what `admission`
     /// says. The claim row is read in the same transaction, under the tenant lock that
     /// [`MetadataClient::claim_setup`] takes too.
     pub async fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
     ) -> Result<MemberRecord, MetadataError> {
-        self.ensure_member_as(tenant, zitadel_user_id, email, name, admission, AdminClaim::SetupBound)
+        self.ensure_member_as(tenant, identity_user_id, email, name, admission, AdminClaim::SetupBound)
             .await
     }
 
     async fn ensure_member_as(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
@@ -1703,10 +1741,10 @@ impl MetadataClient {
             member_columns!(),
             ", email IS NOT DISTINCT FROM lower(btrim($3)) AS email_same,
                display_name = $4 AS name_same
-             FROM members WHERE tenant_id = $1 AND zitadel_user_id = $2"
+             FROM members WHERE tenant_id = $1 AND identity_user_id = $2"
         ))
         .bind(tenant.as_uuid())
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .bind(email)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -1743,7 +1781,7 @@ impl MetadataClient {
         if !lock_tenant(&mut tx, tenant_id).await? {
             return Err(MetadataError::TenantNotFound(tenant));
         }
-        let member = match lock_member_by_zitadel(&mut tx, tenant_id, zitadel_user_id).await? {
+        let member = match lock_member_by_identity_user(&mut tx, tenant_id, identity_user_id).await? {
             // S6: the row may have been suspended since the read above; the catch-all arm below
             // would otherwise activate it when it has an open invite.
             Some(m)
@@ -1816,10 +1854,10 @@ impl MetadataClient {
                     "SELECT NOT EXISTS (SELECT 1 FROM members
                                          WHERE tenant_id = $1 AND status = 'active' AND tenant_admin)
                         AND ($3 OR EXISTS (SELECT 1 FROM setup_claims
-                                            WHERE tenant_id = $1 AND zitadel_user_id = $2))",
+                                            WHERE tenant_id = $1 AND identity_user_id = $2))",
                 )
                 .bind(tenant_id)
-                .bind(zitadel_user_id)
+                .bind(identity_user_id)
                 .bind(claim == AdminClaim::FirstComer)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -1831,7 +1869,7 @@ impl MetadataClient {
                 let id = Uuid::new_v4();
                 release_email(&mut tx, tenant_id, id, email).await?;
                 let inserted = sqlx::query_as::<_, MemberRow>(concat!(
-                    "INSERT INTO members (id, tenant_id, zitadel_user_id, email, display_name,
+                    "INSERT INTO members (id, tenant_id, identity_user_id, email, display_name,
                                           tenant_admin, status)
                      VALUES ($1, $2, $3, lower(btrim($4)), $5, $6, $7)
                      RETURNING ",
@@ -1839,7 +1877,7 @@ impl MetadataClient {
                 ))
                 .bind(id)
                 .bind(tenant.as_uuid())
-                .bind(zitadel_user_id)
+                .bind(identity_user_id)
                 .bind(email)
                 .bind(name)
                 .bind(claims)
@@ -2078,29 +2116,30 @@ impl MetadataClient {
         .transpose()?)
     }
 
-    /// What the link of the Zitadel user's open invite shows: `None` when the user has no open
+    /// What the link of the identity user's open invite shows: `None` when the user has no open
     /// (neither revoked, accepted nor expired) invite of an `invited` member. The caller checks
     /// the token against `token_hash` in constant time.
     pub async fn open_invite_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<InviteDescription>, MetadataError> {
         let row: Option<InviteDescriptionRow> = sqlx::query_as(
-            "SELECT i.token_hash, inviter.display_name, inviter.email, t.slug, t.display_name
+            "SELECT m.tenant_id, i.token_hash, inviter.display_name, inviter.email, t.slug, t.display_name
              FROM invites i
              JOIN members m ON m.id = i.member_id
              JOIN tenants t ON t.id = m.tenant_id
              JOIN members inviter ON inviter.id = i.invited_by
-             WHERE i.zitadel_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
+             WHERE i.identity_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
                AND i.expires_at > now() AND m.status = 'invited'
              ORDER BY i.created_at DESC, i.id LIMIT 1",
         )
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
-            |(token_hash, inviter_name, inviter_email, tenant_slug, tenant_display_name)| {
+            |(tenant_id, token_hash, inviter_name, inviter_email, tenant_slug, tenant_display_name)| {
                 InviteDescription {
+                    tenant_id: TenantId(tenant_id),
                     token_hash,
                     inviter_name,
                     inviter_email,
@@ -2111,26 +2150,46 @@ impl MetadataClient {
         ))
     }
 
-    /// The stored expiry of this Zitadel user's invite that isn't revoked or accepted, while its
+    /// The stored expiry of this identity user's invite that isn't revoked or accepted, while its
     /// member is still invited, and whether it is open (`expires_at > now()`, the database clock,
     /// as [`Self::open_invite_for_user`] decides). An open invite wins over a newer expired one
     /// (in another tenant), so a user with any open invite is answered open; with none open, the
     /// latest answers its past expiry. Read-only.
     pub async fn invite_expiry_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
         Ok(sqlx::query_as(
             "SELECT i.expires_at, i.expires_at > now()
              FROM invites i
              JOIN members m ON m.id = i.member_id
-             WHERE i.zitadel_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
+             WHERE i.identity_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
                AND m.status = 'invited'
              ORDER BY (i.expires_at > now()) DESC, i.created_at DESC, i.id LIMIT 1",
         )
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// `(tenant, token_hash)` of every accepted invite of this identity user, newest first: an
+    /// accept retried after a later step failed finds its tenant here by comparing the hash in
+    /// constant time (the open invite is gone by then).
+    pub async fn accepted_invites_for_user(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, Option<Vec<u8>>)>, MetadataError> {
+        let rows: Vec<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT m.tenant_id, i.token_hash
+             FROM invites i
+             JOIN members m ON m.id = i.member_id
+             WHERE i.identity_user_id = $1 AND i.accepted_at IS NOT NULL
+             ORDER BY i.accepted_at DESC, i.id",
+        )
+        .bind(identity_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t, h)| (TenantId(t), h)).collect())
     }
 
     /// A member by id, whatever its status (callers check its tenant).
@@ -2256,11 +2315,11 @@ impl MetadataClient {
         Ok(ProjectAccess { grants, overrides, teams })
     }
 
-    /// Adds a person who is already in the tenant's Zitadel org, active and with a password
+    /// Adds a person who already has an identity account, active and with a password
     /// (an invite that needs no code): an `active` member with these grants, one
     /// `member_added` event (with the project when there is exactly one grant). The email takes
-    /// the address from any other live holder (R8: Zitadel is the truth for who holds it). Any
-    /// member row with that Zitadel user, a removed one included (R29: a removed member comes
+    /// the address from any other live holder (R8: identity is the truth for who holds it). Any
+    /// member row with that identity user, a removed one included (R29: a removed member comes
     /// back only through an invite code), or a grant naming `owner` (R7), is `Conflict`; a
     /// project that isn't active in the tenant, or a missing tenant, `NotFound`.
     #[allow(clippy::too_many_arguments)] // the pinned signature (P25)
@@ -2268,7 +2327,7 @@ impl MetadataClient {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
@@ -2283,7 +2342,7 @@ impl MetadataClient {
         if !lock_tenant(&mut tx, tenant_id).await? {
             return Err(AccessWriteError::NotFound);
         }
-        if lock_member_by_zitadel(&mut tx, tenant_id, zitadel_user_id)
+        if lock_member_by_identity_user(&mut tx, tenant_id, identity_user_id)
             .await?
             .is_some()
         {
@@ -2295,14 +2354,14 @@ impl MetadataClient {
         let id = Uuid::new_v4();
         release_email(&mut tx, tenant_id, id, email).await?;
         let raw = sqlx::query_as::<_, ListingRaw>(concat!(
-            "INSERT INTO members (id, tenant_id, zitadel_user_id, email, display_name,
+            "INSERT INTO members (id, tenant_id, identity_user_id, email, display_name,
                                   status, invited_by, accepted_at)
              VALUES ($1, $2, $3, lower(btrim($4)), $5, 'active', $6, now()) RETURNING ",
             returning_listing!()
         ))
         .bind(id)
         .bind(tenant_id)
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .bind(email)
         .bind(name)
         .bind(actor)
@@ -2380,7 +2439,7 @@ impl MetadataClient {
     }
 
     /// Declines a pending member (R40): `removed`; one `member_declined` event. A member that
-    /// isn't pending is `Conflict` (a removed or missing one `NotFound`). Returns the Zitadel user
+    /// isn't pending is `Conflict` (a removed or missing one `NotFound`). Returns the identity user
     /// to deactivate.
     pub async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, AccessWriteError> {
         let tenant = member_tenant(&self.pool, member)
@@ -2410,7 +2469,7 @@ impl MetadataClient {
             .await?;
         revoke_logins(&mut tx, Some(actor), member, RevokeReason::MemberRemoved).await?;
         tx.commit().await?;
-        Ok(m.zitadel_user_id)
+        Ok(m.identity_user_id)
     }
 
     pub async fn active_tenant_admins(
@@ -2922,8 +2981,8 @@ impl MetadataClient {
     }
 
     /// Stores an `invited` member with its grants (inert until it is active) and an invite.
-    /// A removed member with the same Zitadel user is invited again (same row, `tenant_admin`
-    /// false, old grants gone). A live member with that Zitadel user or email, an empty email,
+    /// A removed member with the same identity user is invited again (same row, `tenant_admin`
+    /// false, old grants gone). A live member with that identity user or email, an empty email,
     /// a grant naming `owner` (R7), or a project twice is `Conflict`; a project that isn't active
     /// in the tenant, or a missing tenant, `NotFound`.
     pub async fn create_invited_member(
@@ -2932,7 +2991,7 @@ impl MetadataClient {
         tenant: TenantId,
         new: NewInvite<'_>,
     ) -> Result<(MemberListing, Uuid), AccessWriteError> {
-        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants, teams } = new;
+        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams } = new;
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
         }
@@ -2946,7 +3005,7 @@ impl MetadataClient {
         if !lock_tenant(&mut tx, tenant_id).await? {
             return Err(AccessWriteError::NotFound);
         }
-        let existing = lock_member_by_zitadel(&mut tx, tenant_id, zitadel_user_id).await?;
+        let existing = lock_member_by_identity_user(&mut tx, tenant_id, identity_user_id).await?;
         if existing
             .as_ref()
             .is_some_and(|m| m.status != MemberStatus::Removed)
@@ -2985,13 +3044,13 @@ impl MetadataClient {
             }
             None => {
                 sqlx::query_as::<_, ListingRaw>(concat!(
-                    "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, invited_by)
+                    "INSERT INTO members (id, tenant_id, identity_user_id, email, status, invited_by)
                      VALUES ($1, $2, $3, lower(btrim($4)), 'invited', $5) RETURNING ",
                     returning_listing!()
                 ))
                 .bind(Uuid::new_v4())
                 .bind(tenant_id)
-                .bind(zitadel_user_id)
+                .bind(identity_user_id)
                 .bind(email)
                 .bind(actor)
                 .fetch_one(&mut *tx)
@@ -3009,12 +3068,12 @@ impl MetadataClient {
         let grants_json = insert_grants(&mut tx, tenant_id, member.id, actor, grants).await?;
         let invite = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO invites (id, member_id, zitadel_user_id, invited_by, expires_at, token_hash)
+            "INSERT INTO invites (id, member_id, identity_user_id, invited_by, expires_at, token_hash)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(invite)
         .bind(member.id)
-        .bind(zitadel_user_id)
+        .bind(identity_user_id)
         .bind(actor)
         .bind(expires_at)
         .bind(&token_hash[..])
@@ -3094,7 +3153,7 @@ impl MetadataClient {
     }
 
     /// Revokes an open invite: the member becomes `removed` and its grants and overrides are
-    /// deleted. Returns the never-activated Zitadel user to delete. A revoked or accepted
+    /// deleted. Returns the never-activated identity user to delete. A revoked or accepted
     /// invite, or a member no longer invited, is `Conflict`.
     pub async fn revoke_invite(
         &self,
@@ -3126,12 +3185,12 @@ impl MetadataClient {
         let m = lock_member(&mut tx, member)
             .await?
             .ok_or(AccessWriteError::NotFound)?;
-        let (zitadel_user_id, revoked, accepted): (
+        let (identity_user_id, revoked, accepted): (
             String,
             Option<DateTime<Utc>>,
             Option<DateTime<Utc>>,
         ) = sqlx::query_as(
-            "SELECT zitadel_user_id, revoked_at, accepted_at FROM invites WHERE id = $1 FOR UPDATE",
+            "SELECT identity_user_id, revoked_at, accepted_at FROM invites WHERE id = $1 FOR UPDATE",
         )
         .bind(invite)
         .fetch_one(&mut *tx)
@@ -3179,7 +3238,7 @@ impl MetadataClient {
         .await?;
         revoke_logins(&mut tx, Some(actor), member, RevokeReason::MemberRemoved).await?;
         tx.commit().await?;
-        Ok(zitadel_user_id)
+        Ok(identity_user_id)
     }
 
     /// Whether the tenant's admin was claimed (first sign-in, `admin_claimed`) after `since`:
@@ -3231,29 +3290,29 @@ impl MetadataClient {
     pub async fn setup_claim(&self, tenant: TenantId) -> Result<Option<SetupClaim>, MetadataError> {
         #[derive(sqlx::FromRow)]
         struct Row {
-            zitadel_user_id: String,
+            identity_user_id: String,
             created_at: DateTime<Utc>,
             has_member_row: bool,
         }
         Ok(sqlx::query_as::<_, Row>(
-            "SELECT c.zitadel_user_id, c.created_at,
+            "SELECT c.identity_user_id, c.created_at,
                     EXISTS (SELECT 1 FROM members m
                              WHERE m.tenant_id = c.tenant_id
-                               AND m.zitadel_user_id = c.zitadel_user_id) AS has_member_row
+                               AND m.identity_user_id = c.identity_user_id) AS has_member_row
                FROM setup_claims c WHERE c.tenant_id = $1",
         )
         .bind(tenant.as_uuid())
         .fetch_optional(&self.pool)
         .await?
         .map(|r| SetupClaim {
-            zitadel_user_id: r.zitadel_user_id,
+            identity_user_id: r.identity_user_id,
             created_at: r.created_at,
             has_member_row: r.has_member_row,
         }))
     }
 
     /// Spends a live setup-claim nonce of `tenant` and binds the tenant's claim to
-    /// `zitadel_user_id`, in one transaction under the tenant lock (the lock
+    /// `identity_user_id`, in one transaction under the tenant lock (the lock
     /// [`MetadataClient::admit_member`] reads the claim under):
     ///
     /// - No live nonce with this hash for this tenant (none, expired, spent, another tenant's):
@@ -3261,16 +3320,16 @@ impl MetadataClient {
     /// - The tenant has an active admin: the nonce is spent, `AlreadyClaimed`, no row.
     /// - No claim yet, or one of this same user: `Bound`.
     /// - A claim of another user: replaced (`Bound`, the old user kept in `replaced_user_id`)
-    ///   only when the caller found that user gone from Zitadel (`replace_stale` names it) and
+    ///   only when the caller found that user gone from identity (`replace_stale` names it) and
     ///   it still has no member row; otherwise `AlreadyClaimed`, the claim unchanged.
     pub async fn claim_setup(
         &self,
         tenant: TenantId,
         nonce_hash: [u8; 32],
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> Result<SetupClaimOutcome, MetadataError> {
-        if zitadel_user_id.is_empty() {
+        if identity_user_id.is_empty() {
             return Ok(SetupClaimOutcome::Refused);
         }
         let tenant_id = tenant.as_uuid();
@@ -3302,10 +3361,10 @@ impl MetadataClient {
             return Ok(SetupClaimOutcome::AlreadyClaimed);
         }
         let current: Option<(String, bool)> = sqlx::query_as(
-            "SELECT c.zitadel_user_id,
+            "SELECT c.identity_user_id,
                     EXISTS (SELECT 1 FROM members m
                              WHERE m.tenant_id = c.tenant_id
-                               AND m.zitadel_user_id = c.zitadel_user_id)
+                               AND m.identity_user_id = c.identity_user_id)
                FROM setup_claims c WHERE c.tenant_id = $1 FOR UPDATE",
         )
         .bind(tenant_id)
@@ -3313,23 +3372,23 @@ impl MetadataClient {
         .await?;
         let outcome = match current {
             None => {
-                sqlx::query("INSERT INTO setup_claims (tenant_id, zitadel_user_id) VALUES ($1, $2)")
+                sqlx::query("INSERT INTO setup_claims (tenant_id, identity_user_id) VALUES ($1, $2)")
                     .bind(tenant_id)
-                    .bind(zitadel_user_id)
+                    .bind(identity_user_id)
                     .execute(&mut *tx)
                     .await?;
                 SetupClaimOutcome::Bound
             }
-            Some((user, _)) if user == zitadel_user_id => SetupClaimOutcome::Bound,
+            Some((user, _)) if user == identity_user_id => SetupClaimOutcome::Bound,
             Some((user, false)) if replace_stale == Some(user.as_str()) => {
                 sqlx::query(
                     "UPDATE setup_claims
-                        SET zitadel_user_id = $2, replaced_user_id = zitadel_user_id,
+                        SET identity_user_id = $2, replaced_user_id = identity_user_id,
                             created_at = now()
                       WHERE tenant_id = $1",
                 )
                 .bind(tenant_id)
-                .bind(zitadel_user_id)
+                .bind(identity_user_id)
                 .execute(&mut *tx)
                 .await?;
                 SetupClaimOutcome::Bound
@@ -3466,7 +3525,7 @@ impl MetadataClient {
         Ok(rows.into_iter().map(AccessEvent::from).collect())
     }
 
-    /// Makes `zitadel_user_id` an active tenant admin (the bootstrap command): inserted, or
+    /// Makes `identity_user_id` an active tenant admin (the bootstrap command): inserted, or
     /// activated and promoted. It reactivates any status, a suspended member included: it is
     /// the operator's recovery path (S6), unlike a sign-in; revoked personal logins stay
     /// revoked. Event `admin_set` with no actor, only when the status or the flag changed. A
@@ -3475,7 +3534,7 @@ impl MetadataClient {
     pub async fn bootstrap_admin(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
     ) -> Result<MemberRecord, MetadataError> {
         let email = claim_email(email);
@@ -3484,7 +3543,7 @@ impl MetadataClient {
         if !lock_tenant(&mut tx, tenant_id).await? {
             return Err(MetadataError::TenantNotFound(tenant));
         }
-        let existing = lock_member_by_zitadel(&mut tx, tenant_id, zitadel_user_id).await?;
+        let existing = lock_member_by_identity_user(&mut tx, tenant_id, identity_user_id).await?;
         let member = match &existing {
             Some(m) => {
                 release_email(&mut tx, tenant_id, m.id, email).await?;
@@ -3511,13 +3570,13 @@ impl MetadataClient {
                 let id = Uuid::new_v4();
                 release_email(&mut tx, tenant_id, id, email).await?;
                 let raw = sqlx::query_as::<_, MemberRow>(concat!(
-                    "INSERT INTO members (id, tenant_id, zitadel_user_id, email, tenant_admin, status)
+                    "INSERT INTO members (id, tenant_id, identity_user_id, email, tenant_admin, status)
                      VALUES ($1, $2, $3, lower(btrim($4)), true, 'active') RETURNING ",
                     member_columns!()
                 ))
                 .bind(id)
                 .bind(tenant_id)
-                .bind(zitadel_user_id)
+                .bind(identity_user_id)
                 .bind(email)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -3725,7 +3784,7 @@ mod tests {
         MemberRaw {
             id: Uuid::from_u128(1),
             tenant_id: Uuid::from_u128(2),
-            zitadel_user_id: "z1".into(),
+            identity_user_id: "z1".into(),
             email: Some("a@x.com".into()),
             display_name: "A".into(),
             tenant_admin: true,
@@ -3767,7 +3826,7 @@ mod tests {
             MemberRecord {
                 id: Uuid::from_u128(1),
                 tenant_id: TenantId(Uuid::from_u128(2)),
-                zitadel_user_id: "z1".into(),
+                identity_user_id: "z1".into(),
                 email: Some("a@x.com".into()),
                 display_name: "A".into(),
                 tenant_admin: true,

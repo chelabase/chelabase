@@ -81,7 +81,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -168,7 +168,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -306,7 +306,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -392,7 +392,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -499,7 +499,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -621,7 +621,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -718,7 +718,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -856,7 +856,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -973,7 +973,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1140,7 +1140,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1267,7 +1267,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `permission_denied` or `role_not_allowed`; a Viewer's write (`insert`, `update`, `delete`, `call`, or a batch holding one) is refused with `required: \"developer\"`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `permission_denied` or `role_not_allowed`; a Viewer's write (`insert`, `update`, `delete`, `call`, or a batch holding one) is refused with `required: \"developer\"`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1444,7 +1444,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `role_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`role_refused`: the worker's check refused the role: it doesn't exist, or it is owner-level (the message says which); the data API's `role_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1591,7 +1591,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1806,7 +1806,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden` as on `createKey`: `required` is `developer` below Developer, `role:<name>` when the role isn't one you may use (in your roles, or reachable through a granted role) or is a personal login, or `admin` for a LOGIN or owner-level role; `no_access_yet`, `pending_approval`, `member_suspended`, `member_offboarded` for those member states; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden` as on `createKey`: `required` is `developer` below Developer, `role:<name>` when the role isn't one you may use (in your roles, or reachable through a granted role) or is a personal login, or `admin` for a LOGIN or owner-level role; `no_access_yet`, `pending_approval`, `member_suspended`, `member_offboarded` for those member states; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -1968,7 +1968,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2077,7 +2077,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2185,7 +2185,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2311,7 +2311,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2432,7 +2432,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2538,7 +2538,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use (in your roles, or reachable through a granted role), or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`required` is `role:<name>` when the key's role isn't one you may use (in your roles, or reachable through a granted role), or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2689,7 +2689,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2816,7 +2816,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2944,7 +2944,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3103,7 +3103,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3251,7 +3251,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3409,7 +3409,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3587,7 +3587,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3715,7 +3715,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -3909,7 +3909,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project; `permission_denied`: the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: the database owner may not read the catalog; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4040,7 +4040,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4168,7 +4168,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4296,7 +4296,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4435,7 +4435,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4574,7 +4574,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4733,7 +4733,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -4885,7 +4885,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5002,7 +5002,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5168,7 +5168,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5324,7 +5324,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5481,7 +5481,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the caller isn't an Admin of the project; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the caller isn't an Admin of the project; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5622,7 +5622,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5770,7 +5770,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -5919,7 +5919,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `permission_denied`: the role may not make this change (SQLSTATE 42501, with `op_index`). Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer` on an unprotected branch, below `admin` on a protected one, or the requested role isn't in your set (the owner, a LOGIN role or an owner-level role need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`permission_denied`: the role may not make this change (SQLSTATE 42501, with `op_index`). Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer` on an unprotected branch, below `admin` on a protected one, or the requested role isn't in your set (the owner, a LOGIN role or an owner-level role need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6068,7 +6068,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant. Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6217,7 +6217,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the run was started by someone else and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the run was started by someone else and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6344,7 +6344,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant. Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6520,7 +6520,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6687,7 +6687,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project, or the role isn't in your set; `role_refused`: the worker refuses the role (an owner-level role; below Developer only); `permission_denied`: the role may not read the column (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project, or the role isn't in your set; `role_refused`: the worker refuses the role (an owner-level role; below Developer only); `permission_denied`: the role may not read the column (SQLSTATE 42501); `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6864,7 +6864,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Developer on the project, or the role isn't in your set; `permission_denied`: the role may not insert (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Developer on the project, or the role isn't in your set; `permission_denied`: the role may not insert (SQLSTATE 42501); `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7012,7 +7012,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: your login may not connect to this database, or the database owner may not read the catalog; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7141,7 +7141,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7253,7 +7253,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7352,7 +7352,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7459,7 +7459,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: acknowledging (or un-acknowledging) a security step needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: acknowledging (or un-acknowledging) a security step needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7598,7 +7598,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7718,7 +7718,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: a plan with a security step (BYPASSRLS, owner-level) needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: a plan with a security step (BYPASSRLS, owner-level) needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7857,7 +7857,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7977,7 +7977,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8116,7 +8116,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8236,7 +8236,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8386,7 +8386,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8525,7 +8525,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: a retry that runs a plan with a security step again needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: a retry that runs a plan with a security step again needs an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8644,7 +8644,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your account was offboarded; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8773,7 +8773,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your account was offboarded; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8872,7 +8872,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only the project's Admins and tenant admins may (`required`); `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only the project's Admins and tenant admins may (`required`); `member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8964,7 +8964,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9045,7 +9045,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9167,7 +9167,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9264,7 +9264,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9393,7 +9393,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9482,7 +9482,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9589,7 +9589,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the query isn't yours (or has no author) and you aren't an Admin (`required: \"admin\"`); `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9685,7 +9685,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant (and isn't the operator org); `forbidden`: only an instance admin may (`required`: `instance admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only an instance admin may (`required`: `instance admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9770,7 +9770,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant (and isn't the operator org); `not_available_in_platform_mode`: open sign-up can't be switched on in platform mode; `forbidden`: only an instance admin may (`required`: `instance admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`not_available_in_platform_mode`: open sign-up can't be switched on in platform mode; `forbidden`: only an instance admin may (`required`: `instance admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9843,7 +9843,7 @@
           "members"
         ],
         "summary": "Invite a person",
-        "description": "Matches the email to a person: an existing member just gets the grants, all or none (200); an active user of the organisation who has a password and was never a member becomes an active member (201, `added`, no mail); anyone else, a removed member or a deactivated or passwordless user of the organisation included, gets a Zitadel invite mail with a link to Studio's `/accept-invite` and is `invited` until they accept (201); one who already has a way to sign in (a removed member invited again) gets Zitadel's password-reset mail with the same link marked `reset=1`, since Zitadel makes no invite code for them. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only when the invite makes the Zitadel user, or the user has never had a way to sign in (password, passkey, OTP, U2F, IdP link); else 409 `link_not_allowed`, send by email) nothing is mailed (no email provider needed): the response carries the link as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
+        "description": "Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only for a new person, or an account with no password and an unverified email that no other tenant holds by an invite or a membership; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
         "operationId": "createInvite",
         "requestBody": {
           "content": {
@@ -9897,7 +9897,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9917,7 +9917,7 @@
             }
           },
           "409": {
-            "description": "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: a grant's project is being deleted",
+            "description": "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account, or whom another tenant holds (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: a grant's project is being deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -9956,6 +9956,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -9967,7 +9977,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -9990,7 +10000,7 @@
           "members"
         ],
         "summary": "Can invites be emailed?",
-        "description": "Asks Zitadel whether an email provider is active. Without one, invite by link (`delivery: \"link\"`). A Zitadel that can't be asked is not an error: the answer is `email_available: false` with the reason.",
+        "description": "Asks the identity service whether SMTP is configured. Without it, invite by link (`delivery: \"link\"`). An identity service that can't be asked is not an error: the answer is `email_available: false` with the reason.",
         "operationId": "getInviteDelivery",
         "responses": {
           "200": {
@@ -10014,7 +10024,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet` or `not_available_in_platform_mode`: the caller is no active member; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet` or `not_available_in_platform_mode`: the caller is no active member; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10057,7 +10067,7 @@
           "members"
         ],
         "summary": "Revoke an invite",
-        "description": "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.",
+        "description": "The member becomes `removed` and its grants go; then the invitee's account is deleted when it never set a password; an account with a password, or one that is still a member of another tenant, is left as it is. Revoking an invite whose member is still removed retries that step.",
         "operationId": "revokeInvite",
         "parameters": [
           {
@@ -10096,7 +10106,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10136,7 +10146,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel isn't configured (nothing changed), or can't be reached after the revoke (revoke again to retry)",
+            "description": "`identity_unavailable`: revoked in Chelabase, but the identity service couldn't be reached for the account; `unavailable`: revoked, but their other memberships couldn't be read. Either way, revoke again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -10159,7 +10169,7 @@
           "members"
         ],
         "summary": "Send an invite again",
-        "description": "Zitadel mails a new code (the old one stops working), or with `delivery: \"link\"` (only for an invitee with no way to sign in yet; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. The body may be left out (then `email`).",
+        "description": "A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: \"link\"` (only for an invitee with no password and an unverified email whom no other tenant holds; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).",
         "operationId": "resendInvite",
         "parameters": [
           {
@@ -10221,7 +10231,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10241,7 +10251,7 @@
             }
           },
           "409": {
-            "description": "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee who can sign in",
+            "description": "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee with an account, or whom another tenant holds; `conflict`: email delivery with no SMTP configured",
             "content": {
               "application/json": {
                 "schema": {
@@ -10270,6 +10280,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -10281,7 +10301,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -10307,7 +10327,7 @@
         "operationId": "getMe",
         "responses": {
           "200": {
-            "description": "The signed-in user, their membership and what they may use, and, once their org is bound, the tenant with the projects and databases they may use",
+            "description": "The signed-in user, their membership and what they may use, and the tenant with the projects and databases they may use",
             "content": {
               "application/json": {
                 "schema": {
@@ -10317,7 +10337,17 @@
             }
           },
           "401": {
-            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "description": "`unauthorized`: no credential, a bad token or internal identity, or a member token whose tenant no longer exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`no_access_yet` (self-hosted) or `not_available_in_platform_mode` (platform): a member token whose subject has no member row in the tenant it names",
             "content": {
               "application/json": {
                 "schema": {
@@ -10377,7 +10407,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10420,7 +10450,7 @@
           "members"
         ],
         "summary": "Remove a member",
-        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end, and when no other tenant holds them at all (an open invite, a pending sign-up or a suspension counts) the account is banned too. While they are an active member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Every step runs even when one fails; removing a removed member again redoes every step after the removal.",
         "operationId": "removeMember",
         "parameters": [
           {
@@ -10459,7 +10489,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10499,7 +10529,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: removed in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); remove again to retry",
+            "description": "`identity_unavailable`: removed in Chelabase (refused at once), but the identity service couldn't end the sessions or ban the account; `unavailable`: removed, but revoking the personal logins or reading their other memberships failed. Either way, remove again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -10576,7 +10606,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10715,7 +10745,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10798,7 +10828,7 @@
           "members"
         ],
         "summary": "Decline a sign-up",
-        "description": "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+        "description": "The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked, their account's sessions end when they are an active member of no other tenant, and the account is banned when no other tenant holds them at all. A still-valid token is refused at once. Every step runs even when one fails; declining a removed member again redoes those steps.",
         "operationId": "declineMember",
         "parameters": [
           {
@@ -10837,7 +10867,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10877,7 +10907,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: declined in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); decline again to retry",
+            "description": "`identity_unavailable`: declined in Chelabase, but the identity service couldn't end the sessions or ban the account; `unavailable`: declined, but revoking the personal logins or reading their other memberships failed. Either way, decline again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -10946,7 +10976,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10989,7 +11019,7 @@
           "members"
         ],
         "summary": "Reinstate a suspended member",
-        "description": "The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.",
+        "description": "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. An account banned for any other reason is 409 `conflict` and nothing changes: the member stays suspended until that ban is lifted. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
         "operationId": "reinstateMember",
         "parameters": [
           {
@@ -11035,7 +11065,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11055,7 +11085,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the member isn't suspended (invited, pending or removed)",
+            "description": "`conflict`: the member isn't suspended (invited, pending or removed), or their account is banned for a reason Chelabase didn't set (nothing changes; lift that ban first)",
             "content": {
               "application/json": {
                 "schema": {
@@ -11075,7 +11105,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: reinstated in Chelabase, but Zitadel couldn't unlock the user (or isn't configured); reinstate again to retry",
+            "description": "`identity_unavailable`: the identity service couldn't read the account (nothing changes), or the member was reinstated in Chelabase but it couldn't lift the ban; reinstate again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -11144,7 +11174,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11187,7 +11217,7 @@
           "members"
         ],
         "summary": "Suspend a member",
-        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.",
         "operationId": "suspendMember",
         "parameters": [
           {
@@ -11233,7 +11263,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11273,7 +11303,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry",
+            "description": "`identity_unavailable`: suspended in Chelabase (refused at once), but the identity service couldn't end the sessions; `unavailable`: suspended, but their other memberships couldn't be read. Either way, suspend again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -11345,7 +11375,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11414,7 +11444,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11499,7 +11529,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11617,7 +11647,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11714,7 +11744,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -11851,7 +11881,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12011,7 +12041,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12099,7 +12129,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12150,7 +12180,7 @@
           "app-users"
         ],
         "summary": "Enable app users, or change their settings",
-        "description": "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's Zitadel org, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
+        "description": "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202), and so does pressing it on a disable on hold (`disabling` with an `error`: its pool still has users), which keeps the pool and its users. Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
         "operationId": "putAppUsers",
         "parameters": [
           {
@@ -12216,7 +12246,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12236,7 +12266,7 @@
             }
           },
           "409": {
-            "description": "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled",
+            "description": "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled (and the disable isn't on hold)",
             "content": {
               "application/json": {
                 "schema": {
@@ -12307,7 +12337,7 @@
           "app-users"
         ],
         "summary": "Disable app users",
-        "description": "Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.",
+        "description": "Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.",
         "operationId": "disableAppUsers",
         "parameters": [
           {
@@ -12353,7 +12383,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12393,7 +12423,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -12465,7 +12495,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12574,7 +12604,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12704,7 +12734,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12833,7 +12863,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -12962,7 +12992,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13071,7 +13101,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13091,7 +13121,7 @@
             }
           },
           "409": {
-            "description": "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: the project is being deleted",
+            "description": "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account, or whom another tenant holds (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: the project is being deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -13130,6 +13160,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -13141,7 +13181,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13213,7 +13253,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13320,7 +13360,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13370,7 +13410,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13391,7 +13431,7 @@
           "app-users"
         ],
         "summary": "Create a user",
-        "description": "Writes the user's row to the users table first (the table's own constraints can refuse it), then creates the Zitadel user, then commits. Columns of your own get their defaults.",
+        "description": "Creates the identity user, then writes the user's row to the users table and commits. When the table refuses the row (its own constraints) the identity user is deleted again. Columns of your own get their defaults.",
         "operationId": "createAppUser",
         "parameters": [
           {
@@ -13447,7 +13487,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13517,7 +13557,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service or the users table can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached; `unavailable`: the users table can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13595,7 +13635,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13635,7 +13675,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13656,7 +13696,7 @@
           "app-users"
         ],
         "summary": "Delete a user",
-        "description": "Deletes the Zitadel user and ends their sessions; the users table's row follows the project's `on_delete` setting.",
+        "description": "Ends the user's sessions and deletes the identity user; the users table's row follows the project's `on_delete` setting. The sessions are revoked first, so a `503` still ended them.",
         "operationId": "deleteAppUser",
         "parameters": [
           {
@@ -13705,7 +13745,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13745,7 +13785,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13765,8 +13805,8 @@
         "tags": [
           "app-users"
         ],
-        "summary": "Change a user's email or password",
-        "description": "A new password ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. The users table follows through the sync job.",
+        "summary": "Change a user's email",
+        "description": "Sending `email` ends the user's sessions, also when it's the address they already have, so a retry finishes a change whose answer was an error. A `5xx` for a new address may mean the address changed: send the same request again. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.",
         "operationId": "updateAppUser",
         "parameters": [
           {
@@ -13832,7 +13872,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -13852,7 +13892,7 @@
             }
           },
           "409": {
-            "description": "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email; `conflict`: the user service refused the change in the user's current state",
+            "description": "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email",
             "content": {
               "application/json": {
                 "schema": {
@@ -13882,7 +13922,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: nothing to change, the email or password is invalid, or `email_verified: false` without a new email for a verified address; `weak_password`: the password doesn't meet the policy",
+            "description": "`invalid_request`: nothing to change, the email is invalid, an unknown field such as `password`, or `email_verified: false` without a new email for a verified address",
             "content": {
               "application/json": {
                 "schema": {
@@ -13902,7 +13942,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13925,7 +13965,7 @@
           "app-users"
         ],
         "summary": "Deactivate a user",
-        "description": "The user can't sign in, and their sessions end.",
+        "description": "Bans the user: they can't sign in, and their sessions end. The sessions are revoked first, so a `503` still ended them.",
         "operationId": "deactivateAppUser",
         "parameters": [
           {
@@ -13981,7 +14021,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14021,7 +14061,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14099,7 +14139,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14139,7 +14179,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14220,7 +14260,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14260,7 +14300,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14329,7 +14369,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14369,7 +14409,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14419,7 +14459,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14504,7 +14544,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14633,7 +14673,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14713,7 +14753,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14830,7 +14870,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -14979,7 +15019,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -15109,7 +15149,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -15228,7 +15268,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -15338,7 +15378,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -15445,7 +15485,7 @@
             }
           },
           "403": {
-            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: only a tenant admin may (`required`: `tenant admin`); `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -15787,8 +15827,7 @@
         "type": "string",
         "enum": [
           "active",
-          "inactive",
-          "locked"
+          "inactive"
         ]
       },
       "AppUsersSettings": {
@@ -15802,8 +15841,7 @@
           "schema",
           "table",
           "email_verification",
-          "on_delete",
-          "zitadel_org_id"
+          "on_delete"
         ],
         "properties": {
           "database_id": {
@@ -15818,7 +15856,7 @@
               "string",
               "null"
             ],
-            "description": "Why enabling failed; `null` otherwise."
+            "description": "Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool\ngone from the identity service, a branch it couldn't upgrade); `null` otherwise."
           },
           "on_delete": {
             "$ref": "#/components/schemas/OnDelete"
@@ -15834,13 +15872,6 @@
           },
           "table": {
             "type": "string"
-          },
-          "zitadel_org_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "`null` until the worker has created the project's Zitadel org."
           }
         }
       },
@@ -17852,9 +17883,8 @@
         "type": "string",
         "description": "Why invites can't be emailed.",
         "enum": [
-          "no_email_provider",
-          "zitadel_unavailable",
-          "zitadel_not_configured"
+          "email_not_configured",
+          "identity_unavailable"
         ]
       },
       "Dependent": {
@@ -17964,7 +17994,7 @@
         "enum": [
           "unauthorized",
           "forbidden",
-          "tenant_not_bound",
+          "tenant_required",
           "not_found",
           "method_not_allowed",
           "invalid_request",
@@ -18049,8 +18079,6 @@
           "member_role_reconcile_failed",
           "link_not_allowed",
           "signup_pending",
-          "email_ambiguous",
-          "email_in_use_elsewhere",
           "invite_closed",
           "permission_denied",
           "dependents_changed",
@@ -18067,7 +18095,8 @@
           "member_suspended",
           "member_offboarded",
           "invalid_successor",
-          "exposure_unconfirmed"
+          "exposure_unconfirmed",
+          "identity_unavailable"
         ]
       },
       "ErrorEnvelope": {
@@ -18553,7 +18582,7 @@
         "properties": {
           "email_available": {
             "type": "boolean",
-            "description": "Whether Zitadel has an active email provider, so `email` delivery works."
+            "description": "Whether an SMTP server is configured, so `email` delivery works."
           },
           "reason": {
             "oneOf": [
@@ -18596,7 +18625,6 @@
         "description": "What an invite did.",
         "enum": [
           "invited",
-          "added",
           "existing_member"
         ]
       },
@@ -18768,7 +18796,7 @@
           },
           "instance_admin": {
             "type": "boolean",
-            "description": "Whether the caller may use instance routes (self-hosted: an active tenant admin;\nplatform: a member of the operator organisation)."
+            "description": "Whether the caller may use instance routes (self-hosted: an active tenant admin;\nplatform: a member of the operator tenant)."
           },
           "member": {
             "oneOf": [
@@ -18849,13 +18877,9 @@
       "MeUser": {
         "type": "object",
         "required": [
-          "sub",
-          "org_id"
+          "sub"
         ],
         "properties": {
-          "org_id": {
-            "type": "string"
-          },
           "sub": {
             "type": "string"
           }
@@ -18863,7 +18887,7 @@
       },
       "Member": {
         "type": "object",
-        "description": "A member of the tenant: a person in its Zitadel organisation.",
+        "description": "A member of the tenant: a person of the members pool.",
         "required": [
           "id",
           "email",
@@ -21247,7 +21271,7 @@
               "string",
               "null"
             ],
-            "description": "What deleting a user in Zitadel does to its row: `delete` (default) or `mark`."
+            "description": "What deleting a user does to its row: `delete` (default) or `mark`."
           },
           "pg_database": {
             "type": [
@@ -22884,14 +22908,7 @@
               "boolean",
               "null"
             ],
-            "description": "With `email`, whether the new address is verified (default true); alone, sets the flag\non the current address (false sends the user a verification code)."
-          },
-          "password": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A new password; the user's sessions end."
+            "description": "With `email`, whether the new address is verified (default true); alone, sets the flag\non the current address."
           }
         },
         "additionalProperties": false

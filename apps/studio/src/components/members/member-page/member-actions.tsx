@@ -98,7 +98,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
     } catch (err) {
       if (err instanceof ApiError && err.code === "invite_closed") setInviteError("This invite was revoked or accepted in the meantime.");
       else if (err instanceof ApiError && err.code === "link_not_allowed") {
-        setInviteError(`${email} already has a way to sign in, so a link can't be used. Resend the invite by email.`);
+        setInviteError(`${email} already has an account or a pending invite elsewhere, so a link can't be used. Resend the invite by email.`);
       } else setInviteError(errorText(err));
     } finally {
       setInviteBusy(false);

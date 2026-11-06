@@ -34,8 +34,6 @@ pub enum Rule {
     Secret,
     /// The object store's access key, an identifier: at least [`MIN_ACCESS_KEY_LEN`].
     AccessKey,
-    /// Zitadel's masterkey: exactly [`MASTERKEY_LEN`] characters.
-    Masterkey,
 }
 
 /// One seedable file of [`crate::secrets::LAYOUT`].
@@ -51,22 +49,12 @@ const fn s(key: &'static str, path: &'static str, rule: Rule) -> SeedKey {
 }
 
 /// Every seedable file: the layout's plain generated values (passwords, the S3 credentials, the
-/// masterkey, the internal bearer tokens). Key pairs, certificates, signing keys, raw keys,
-/// derived files, `zitadel/steps.yaml` and the setup code are not seedable.
+/// internal bearer tokens). Key pairs, certificates, signing keys, raw keys, derived files and
+/// the setup code are not seedable.
 pub const SEED_KEYS: &[SeedKey] = &[
     s(
         "CHELABASE_SEED_METADATA_DB_PASSWORD",
         "db/metadata.password",
-        Rule::Secret,
-    ),
-    s(
-        "CHELABASE_SEED_ZITADEL_DB_PASSWORD",
-        "db/zitadel-user.password",
-        Rule::Secret,
-    ),
-    s(
-        "CHELABASE_SEED_ZITADEL_DB_ADMIN_PASSWORD",
-        "db/zitadel-admin.password",
         Rule::Secret,
     ),
     s(
@@ -83,11 +71,6 @@ pub const SEED_KEYS: &[SeedKey] = &[
         "CHELABASE_SEED_S3_SECRET_KEY",
         "s3/secret-key",
         Rule::Secret,
-    ),
-    s(
-        "CHELABASE_SEED_ZITADEL_MASTERKEY",
-        "zitadel/masterkey",
-        Rule::Masterkey,
     ),
     s(
         "CHELABASE_SEED_NATS_ORCHESTRATOR_PASSWORD",
@@ -187,8 +170,6 @@ pub const MAX_LEN: usize = 1024;
 pub const MIN_SECRET_LEN: usize = 16;
 /// The access key's shortest length (MinIO's minimum).
 pub const MIN_ACCESS_KEY_LEN: usize = 3;
-/// Zitadel's masterkey length.
-pub const MASTERKEY_LEN: usize = 32;
 /// The characters a value may hold: printable ASCII but space, quotes, backslash, backtick and
 /// `$` (compose would interpolate a `$` in `.env` itself). This is wider than the generator's
 /// base64url and alphanumeric on purpose, so chosen passwords can meet outside policies: a value
@@ -380,9 +361,6 @@ fn check_value(rule: Rule, v: &str) -> std::result::Result<(), String> {
         Rule::AccessKey if n < MIN_ACCESS_KEY_LEN => {
             Err(format!("is shorter than {MIN_ACCESS_KEY_LEN} characters"))
         }
-        Rule::Masterkey if n != MASTERKEY_LEN => Err(format!(
-            "must be exactly {MASTERKEY_LEN} characters (Zitadel's masterkey)"
-        )),
         _ => Ok(()),
     }
 }
@@ -563,14 +541,14 @@ mod tests {
             exportCHELABASE_NOT_STRIPPED=1\n\
               CHELABASE_SEED_S3_ACCESS_KEY = spaced-key   # inline comment\n\
             CHELABASE_SEED_S3_SECRET_KEY=hash#inside-not-a-comment\n\
-            # CHELABASE_SEED_ZITADEL_MASTERKEY=commented-out-so-ignored\n\
+            # CHELABASE_SEED_STORCON_DB_PASSWORD=commented-out-so-ignored\n\
             OTHER_MULTILINE=\"first line\n\
             CHELABASE_SEED_DATA_KEYS_TOKEN=inside-a-quoted-value\n\
             last line\"\n\
             OTHER='$NOT_INTERPOLATED'\n\
             NOVALUE\n\
             chelabase_seed_lowercase=ignored\n\
-            CHELABASE_SEED_ZITADEL_MASTERKEY=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+            CHELABASE_SEED_STORCON_DB_PASSWORD=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
         let seeds = Seeds::parse(text).unwrap();
         assert_eq!(
             value(&seeds, "tokens/app-auth.token"),
@@ -584,13 +562,13 @@ mod tests {
             seeds.keys().collect::<Vec<_>>(),
             [
                 "CHELABASE_SEED_METADATA_DB_PASSWORD",
+                "CHELABASE_SEED_STORCON_DB_PASSWORD",
                 "CHELABASE_SEED_NATS_WORKER_PASSWORD",
                 "CHELABASE_SEED_S3_ACCESS_KEY",
                 "CHELABASE_SEED_S3_SECRET_KEY",
                 "CHELABASE_SEED_APP_AUTH_TOKEN",
                 "CHELABASE_SEED_APP_SESSIONS_TOKEN",
                 "CHELABASE_SEED_VALKEY_PROXY_PASSWORD",
-                "CHELABASE_SEED_ZITADEL_MASTERKEY",
             ]
         );
         assert_eq!(
@@ -605,7 +583,7 @@ mod tests {
         assert_eq!(value(&seeds, "s3/access-key"), "spaced-key");
         assert_eq!(value(&seeds, "s3/secret-key"), "hash#inside-not-a-comment");
         assert_eq!(
-            value(&seeds, "zitadel/masterkey"),
+            value(&seeds, "db/storcon.password"),
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
         );
         assert!(seeds.get("tokens/data-keys.token").is_none());
@@ -664,16 +642,6 @@ mod tests {
                 "CHELABASE_SEED_S3_ACCESS_KEY=ab".into(),
                 "CHELABASE_SEED_S3_ACCESS_KEY",
                 "shorter than 3",
-            ),
-            (
-                format!("CHELABASE_SEED_ZITADEL_MASTERKEY={}", "M".repeat(31)),
-                "CHELABASE_SEED_ZITADEL_MASTERKEY",
-                "exactly 32",
-            ),
-            (
-                format!("CHELABASE_SEED_ZITADEL_MASTERKEY={}", "M".repeat(33)),
-                "CHELABASE_SEED_ZITADEL_MASTERKEY",
-                "exactly 32",
             ),
             (
                 format!("CHELABASE_SEED_APP_AUTH_TOKEN={long}"),
@@ -807,10 +775,5 @@ mod tests {
                 k.key
             );
         }
-        let masterkey = SEED_KEYS
-            .iter()
-            .find(|k| k.path == "zitadel/masterkey")
-            .unwrap();
-        assert_eq!(masterkey.rule, Rule::Masterkey);
     }
 }

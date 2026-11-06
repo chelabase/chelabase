@@ -3,8 +3,7 @@
 //! be read back without a running gateway binary.
 
 use chelabase_auth::internal::{generate_keypair_pem, InternalSigner, IDENTITY_HEADER};
-use chelabase_auth::test_support::MockJwks;
-use chelabase_auth::JwtVerifier;
+use chelabase_auth::test_support::MemberKeys;
 use chelabase_types::entry::Scheme;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
@@ -24,17 +23,17 @@ const ONE_HOUR: Duration = Duration::from_secs(3600);
 /// Deliberately not 60 s or 1 h, so a timeout can only come from the code under test.
 const API_TIMEOUT: Duration = Duration::from_secs(7);
 
-async fn gateway() -> (Gateway, MockJwks) {
-    let jwks = MockJwks::start().await;
+async fn gateway() -> (Gateway, MemberKeys) {
+    let jwks = MemberKeys::new();
     let (private_pem, _public) = generate_keypair_pem();
     let pipeline = Pipeline::new(
         Arc::new(SharedRegistry::new(Registry::new([API]))),
         "http://studio.test".to_string(),
-        JwtVerifier::new(jwks.config(vec![])),
         InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
         Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
         Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
-    );
+    )
+    .with_member_tokens(Some(jwks.verifier()));
     let upstreams = Upstreams::new("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap();
     (Gateway::new(pipeline, upstreams, API_TIMEOUT, Scheme::Http), jwks)
 }

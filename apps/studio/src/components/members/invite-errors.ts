@@ -24,20 +24,12 @@ export function inviteFailure(err: unknown, email: string, rows: readonly GrantR
   const row = projectId ? rows.find((r) => r.projectId === projectId) : undefined;
   const name = (id: string) => projects.find((p) => p.id === id)?.name ?? "The project";
   switch (err.code) {
-    case "unavailable":
-      return { form: "Couldn't reach the identity provider, so no invite was sent. Try again." };
     case "link_not_allowed":
       return err.extra.email_available === true
-        ? { delivery: `${email} already has a way to sign in, so a link can't be used. Send the invite by email.`, switchToEmail: true }
-        : { delivery: `${email} already has a way to sign in, so a link can't be used. Ask them to sign in with their existing account instead.` };
+        ? { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Send the invite by email.`, switchToEmail: true }
+        : { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Ask them to sign in with their existing account instead.` };
     case "signup_pending":
       return { email: `${email} signed up and is waiting for approval. Approve them under Requests.` };
-    case "email_ambiguous":
-      return { email: `More than one account in this organisation uses ${email}. Fix it in the identity provider first.` };
-    case "email_in_use_elsewhere":
-      return {
-        email: `Another account outside this organisation already uses ${email}. Use a different email, or fix the account in the identity provider.`,
-      };
     case "project_deleting":
       if (row) return { rows: { [row.projectId]: { message: `${name(row.projectId)} is being deleted.` } } };
       break;

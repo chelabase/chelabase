@@ -202,7 +202,7 @@ pub(crate) fn page_params(query: PrivilegesQuery) -> Result<PageParams, ApiError
         (status = 200, description = "One page of the role's privileges; `next_after` names the next page, `null` on the last", body = PrivilegesPage),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`forbidden`: below Viewer on the project; `permission_denied`: the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: below Viewer on the project; `permission_denied`: the database owner may not read the catalog", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist (only the branch's recorded databases are read), or the role isn't one the read lists", body = ErrorEnvelope),
         (status = 409, description = "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the query string is malformed, `role` is missing or empty, `limit` isn't 1 to 500, or `after` isn't a `next_after`", body = ErrorEnvelope),

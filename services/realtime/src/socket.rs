@@ -77,7 +77,7 @@ const SINK_QUEUE: usize = 256;
 const PROJECT_REFRESH_GAP: Duration = Duration::from_millis(250);
 /// RFC 6455 "policy violation": the client stopped reading.
 const CLOSE_TOO_SLOW: u16 = 1008;
-/// RFC 6455 "try again later": the token can't be checked now (JWKS down) or Valkey is down.
+/// RFC 6455 "try again later": the token can't be checked now (no member-token key) or Valkey is down.
 const CLOSE_TRY_LATER: u16 = 1013;
 
 fn unix_ms() -> u64 {
@@ -149,7 +149,11 @@ pub(crate) async fn tickets(State(shared): State<Arc<Shared>>, headers: HeaderMa
     }
     // T8-1, D7: a suspended or offboarded member (or one no longer a member) gets no ticket;
     // the orchestrator decides, and one that can't answer is a 503.
-    match shared.orch.member_allowed(&claims.sub, &claims.org_id).await {
+    match shared
+        .orch
+        .member_allowed(&claims.sub, claims.tenant_id, claims.sid.as_deref())
+        .await
+    {
         Some(true) => {}
         Some(false) => return StatusCode::FORBIDDEN.into_response(),
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -286,6 +290,8 @@ enum Auth {
     Member {
         token: Arc<str>,
         exp_at: Instant,
+        /// The token's identity session: re-authorization answers are shared only within it.
+        sid: Arc<str>,
     },
     /// An app socket (RT2): never sends `auth`.
     App,
@@ -551,6 +557,14 @@ impl Session {
         match &self.auth {
             Auth::Member { token, .. } => Some(token.clone()),
             _ => None,
+        }
+    }
+
+    /// The current token's identity session (empty before the first `auth` frame).
+    fn sid(&self) -> Arc<str> {
+        match &self.auth {
+            Auth::Member { sid, .. } => sid.clone(),
+            _ => Arc::from(""),
         }
     }
 
@@ -822,7 +836,7 @@ impl Session {
         let member = match verified {
             Ok(m) => m,
             Err(TokenError::Unavailable) => {
-                tracing::warn!("a socket's token can't be checked now (JWKS)");
+                tracing::warn!("a socket's token can't be checked now (the member-token verifier)");
                 self.close(CLOSE_TRY_LATER, "the token can't be checked now")
                     .await;
                 return Flow::Stop;
@@ -850,6 +864,7 @@ impl Session {
                 self.auth = Auth::Member {
                     token,
                     exp_at: instant_of_exp(member.exp),
+                    sid: Arc::from(member.sid),
                 };
                 Flow::Go
             }
@@ -862,7 +877,7 @@ impl Session {
             Ok(m) => m,
             Err(TokenError::Unavailable) => {
                 // Not a failed renewal: the token in hand stands until its own exp.
-                tracing::warn!("a renewal can't be checked now (JWKS): the current token stands");
+                tracing::warn!("a renewal can't be checked now (the member-token verifier): the current token stands");
                 return Flow::Go;
             }
             Err(_) => {
@@ -900,6 +915,7 @@ impl Session {
                 self.auth = Auth::Member {
                     token,
                     exp_at: instant_of_exp(member.exp),
+                    sid: Arc::from(member.sid),
                 };
                 self.reauthorize(Fresh::Always);
                 Flow::Go
@@ -966,11 +982,12 @@ impl Session {
                     pg_database: channel.pg_database.clone(),
                     role: role.clone(),
                 };
-                let sub = self.ticket.sub.clone();
+                let (sub, sid) = (self.ticket.sub.clone(), self.sid());
                 let id = id.clone();
                 TaskGuard::spawn(async move {
                     let result =
-                        table_join_work(&shared, &sub, &channel, &role, &token, &target).await;
+                        table_join_work(&shared, (&sub, &sid), &channel, &role, &token, &target)
+                            .await;
                     let _ = done.send(Done::Table {
                         id,
                         r#ref,
@@ -1322,9 +1339,9 @@ impl Session {
             })
             .collect();
         let (shared, done) = (self.shared.clone(), self.done_tx.clone());
-        let sub = self.ticket.sub.clone();
+        let (sub, sid) = (self.ticket.sub.clone(), self.sid());
         self.reauth_task = Some(TaskGuard::spawn(async move {
-            let answers = reauth_work(&shared, &sub, &token, fresh, asks).await;
+            let answers = reauth_work(&shared, (&sub, &sid), &token, fresh, asks).await;
             let _ = done.send(Done::Reauth(answers));
         }));
     }
@@ -1450,14 +1467,14 @@ enum Ask {
 /// A table join's `/authorize` (a fresh answer for the cycle cache) and watch.
 async fn table_join_work(
     shared: &Arc<Shared>,
-    sub: &str,
+    (sub, sid): (&str, &str),
     channel: &TableChannel,
     role: &Option<String>,
     token: &Arc<str>,
     target: &AuthTarget,
 ) -> Result<Box<TableJoined>, (ErrorCode, String)> {
     let outcome = shared.orch.authorize(token, target).await;
-    shared.fresh_answer(sub, target, &outcome);
+    shared.fresh_answer(sub, sid, target, &outcome);
     let (tenant_id, member) = match outcome {
         AuthorizeOutcome::Allowed { tenant_id, member } => (tenant_id, member),
         refusal => {
@@ -1513,7 +1530,7 @@ async fn project_join_work(
 /// Every channel's re-authorization answer (all concurrently), and an allowed table's reprobe.
 async fn reauth_work(
     shared: &Arc<Shared>,
-    sub: &str,
+    (sub, sid): (&str, &str),
     token: &Arc<str>,
     fresh: Fresh,
     asks: Vec<(String, u64, Ask)>,
@@ -1523,7 +1540,7 @@ async fn reauth_work(
             Ask::Table(target, handle) => {
                 let outcome = match fresh {
                     Fresh::Cycle(cycle) => {
-                        let cached = shared.cycle_cache.lock().unwrap().get(sub, &target, cycle);
+                        let cached = shared.cycle_cache.lock().unwrap().get(sub, sid, &target, cycle);
                         match cached {
                             Some(o) => o,
                             None => {
@@ -1532,19 +1549,20 @@ async fn reauth_work(
                                     .cycle_cache
                                     .lock()
                                     .unwrap()
-                                    .put(sub, &target, cycle, o.clone());
+                                    .put(sub, sid, &target, cycle, o.clone());
                                 o
                             }
                         }
                     }
                     Fresh::Always => {
                         let o = shared.orch.authorize(token, &target).await;
-                        shared.fresh_answer(sub, &target, &o);
+                        shared.fresh_answer(sub, sid, &target, &o);
                         o
                     }
                     Fresh::Burst(burst) => {
                         let answer = shared.cycle_cache.lock().unwrap().burst(
                             sub,
+                            sid,
                             &target,
                             burst,
                             || {
@@ -1554,7 +1572,7 @@ async fn reauth_work(
                             },
                         );
                         let o = answer.await;
-                        shared.fresh_answer(sub, &target, &o);
+                        shared.fresh_answer(sub, sid, &target, &o);
                         o
                     }
                 };

@@ -15,10 +15,12 @@ export interface AppHeaderProps {
   menuButtonRef?: RefObject<HTMLButtonElement | null>;
 }
 
+const ALPHA_NOTICE = "Chelabase is early, pre-release software and not ready for production data.";
+
 const focusRing =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sand";
 
-/** The top bar of the signed-in shell: the breadcrumbs, a context slot (`#app-header-context`, filled by `HeaderContext`) and the profile menu. */
+/** The top bar of the signed-in shell: the breadcrumbs, a context slot (`#app-header-context`, filled by `HeaderContext`), the alpha tag and the profile menu. */
 export function AppHeader({ profile, onSignOut, onMenu, menuOpen = false, menuControlsId, menuButtonRef }: AppHeaderProps) {
   const queryClient = useQueryClient();
   const label = profile.name || profile.email;
@@ -47,6 +49,14 @@ export function AppHeader({ profile, onSignOut, onMenu, menuOpen = false, menuCo
         data-slot="context"
         className="flex min-w-0 flex-1 items-center px-3 sm:has-[>*]:min-w-[20rem] max-[40rem]:order-last max-[40rem]:-mx-4 max-[40rem]:basis-[calc(100%+2rem)] max-[40rem]:overflow-x-auto max-[40rem]:border-t max-[40rem]:border-line max-[40rem]:px-4 max-[40rem]:py-2 max-[40rem]:empty:hidden"
       />
+      {/* Every signed-in screen says it: the same notice the README, docs and landing page carry. */}
+      <span
+        title={ALPHA_NOTICE}
+        className="mr-2 shrink-0 cursor-default border border-sand/60 px-1.5 py-px text-xs font-medium uppercase tracking-wide text-sand"
+      >
+        Alpha
+        <span className="sr-only">: {ALPHA_NOTICE}</span>
+      </span>
       <Menu.Root>
         <Menu.Trigger
           aria-label={label ? undefined : "Account"}

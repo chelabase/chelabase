@@ -12,8 +12,8 @@ use crate::data_api::{BOOTSTRAP_LOCK_KEY, LOCK_TIMEOUT_SECS, quote_ident, quote_
 pub const USERS_SYNC_ROLE: &str = "chelabase_auth_sync";
 
 /// The users table's columns Chelabase manages; every other column is the app's.
-pub const MANAGED_COLUMNS: [&str; 5] =
-    ["id", "email", "email_verified", "created_at", "deleted_at"];
+pub const MANAGED_COLUMNS: [&str; 6] =
+    ["id", "email", "email_verified", "created_at", "deleted_at", "banned_at"];
 
 /// `^[a-z_][a-z0-9_]{0,62}$`: a schema or table name app users accepts.
 pub fn valid_identifier(s: &str) -> bool {
@@ -34,7 +34,8 @@ pub fn valid_identifier(s: &str) -> bool {
 /// (and on every repair): the `chelabase_auth_sync` login with `sync_verifier` (the password's
 /// SCRAM-SHA-256 verifier, so the password itself never reaches the compute), the claim
 /// helpers, the users table `schema.table` (created RLS-locked with two own-row policies
-/// only when missing; an existing table is adopted as it is), its guard triggers, the sync
+/// only when missing; an existing table is adopted as it is, plus any managed column added
+/// since, which must not collide with one of the app's), its guard triggers, the sync
 /// functions, and the protect event triggers. One transaction under [`BOOTSTRAP_LOCK_KEY`].
 ///
 /// Sign-up data is opt-in per column (P34): every run takes a table-level `INSERT` away from
@@ -87,7 +88,8 @@ DO $$ BEGIN
       email text NOT NULL,
       email_verified boolean NOT NULL DEFAULT false,
       created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
-      deleted_at timestamptz
+      deleted_at timestamptz,
+      banned_at timestamptz
     );
     ALTER TABLE {s}.{t} OWNER TO {owner};
     REVOKE ALL ON {s}.{t} FROM anon;
@@ -99,6 +101,16 @@ DO $$ BEGIN
       USING (id OPERATOR(pg_catalog.=) chelabase.user_id()) WITH CHECK (id OPERATOR(pg_catalog.=) chelabase.user_id());
   END IF;
 END $$;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_attribute a
+      WHERE a.attrelid OPERATOR(pg_catalog.=) {qualified}::pg_catalog.regclass
+        AND a.attname OPERATOR(pg_catalog.=) 'banned_at' AND NOT a.attisdropped
+        AND a.atttypid OPERATOR(pg_catalog.<>) 'pg_catalog.timestamptz'::pg_catalog.regtype) THEN
+    RAISE EXCEPTION USING ERRCODE = '42701',
+      MESSAGE = pg_catalog.format('column banned_at of %s is managed by Chelabase app users and must be timestamptz: rename yours', {qualified});
+  END IF;
+END $$;
+ALTER TABLE {s}.{t} ADD COLUMN IF NOT EXISTS banned_at timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key ON {s}.{t} (pg_catalog.lower(email)) WHERE deleted_at IS NULL;
 DO $$ DECLARE r pg_catalog.name; BEGIN
   FOR r IN SELECT g.rolname FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
@@ -147,6 +159,9 @@ BEGIN
   IF NEW.deleted_at IS DISTINCT FROM OLD.deleted_at THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'column deleted_at is managed by Chelabase app users';
   END IF;
+  IF NEW.banned_at IS DISTINCT FROM OLD.banned_at THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'column banned_at is managed by Chelabase app users';
+  END IF;
   RETURN NULL;
 END
 $f$;
@@ -158,7 +173,8 @@ CREATE OR REPLACE TRIGGER chelabase_users_guard_truncate BEFORE TRUNCATE ON {s}.
   FOR EACH STATEMENT EXECUTE FUNCTION chelabase.users_guard();
 ALTER TABLE {s}.{t} ENABLE ALWAYS TRIGGER chelabase_users_guard;
 ALTER TABLE {s}.{t} ENABLE ALWAYS TRIGGER chelabase_users_guard_truncate;
-CREATE OR REPLACE FUNCTION chelabase.app_users_upsert(p_id uuid, p_email text, p_verified boolean, p_created timestamptz, p_data jsonb)
+DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+CREATE OR REPLACE FUNCTION chelabase.app_users_upsert(p_id uuid, p_email text, p_verified boolean, p_banned boolean, p_created timestamptz, p_data jsonb)
   RETURNS text LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
 $f$
 DECLARE
@@ -173,8 +189,8 @@ BEGIN
   tbl := format('%I.%I', cfg.schema_name, cfg.table_name);
   EXECUTE format('SELECT count(*) FROM %s WHERE id = $1', tbl) INTO n USING p_id;
   IF n > 0 THEN
-    EXECUTE format('UPDATE %s SET email = $2, email_verified = $3 WHERE id = $1 AND (email IS DISTINCT FROM $2 OR email_verified IS DISTINCT FROM $3)', tbl)
-      USING p_id, p_email, p_verified;
+    EXECUTE format('UPDATE %s SET email = $2, email_verified = $3, banned_at = CASE WHEN $4 THEN coalesce(banned_at, now()) END WHERE id = $1 AND (email IS DISTINCT FROM $2 OR email_verified IS DISTINCT FROM $3 OR (banned_at IS NOT NULL) IS DISTINCT FROM $4)', tbl)
+      USING p_id, p_email, p_verified, p_banned;
     RETURN 'updated';
   END IF;
   IF p_data IS NOT NULL THEN
@@ -185,22 +201,23 @@ BEGIN
       FROM pg_attribute a
      WHERE a.attrelid = tbl::regclass AND a.attnum > 0 AND NOT a.attisdropped
        AND a.attgenerated = '' AND a.attidentity <> 'a'
-       AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at']::name[])
+       AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])
        AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')
        AND p_data ? a.attname::text;
     IF cols IS NOT NULL THEN
       BEGIN
-        EXECUTE format('INSERT INTO %1$s (id, email, email_verified, created_at, %2$s) SELECT $1, $2, $3, $4, %3$s FROM jsonb_populate_record(NULL::%1$s, $5) r', tbl, cols, vals)
+        EXECUTE format('INSERT INTO %1$s (id, email, email_verified, banned_at, created_at, %2$s) SELECT $1, $2, $3, CASE WHEN $6 THEN now() END, $4, %3$s FROM jsonb_populate_record(NULL::%1$s, $5) r', tbl, cols, vals)
           USING p_id, p_email, p_verified, p_created,
-            (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(p_data) e WHERE e.key = ANY (names));
+            (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(p_data) e WHERE e.key = ANY (names)),
+            p_banned;
         RETURN 'inserted';
       EXCEPTION WHEN integrity_constraint_violation OR data_exception THEN
         NULL;
       END;
     END IF;
   END IF;
-  EXECUTE format('INSERT INTO %s (id, email, email_verified, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING', tbl)
-    USING p_id, p_email, p_verified, p_created;
+  EXECUTE format('INSERT INTO %s (id, email, email_verified, banned_at, created_at) VALUES ($1, $2, $3, CASE WHEN $5 THEN now() END, $4) ON CONFLICT (id) DO NOTHING', tbl)
+    USING p_id, p_email, p_verified, p_created, p_banned;
   RETURN 'inserted_managed';
 END
 $f$;
@@ -231,16 +248,16 @@ DECLARE
   r jsonb;
 BEGIN
   SELECT schema_name, table_name INTO STRICT cfg FROM chelabase.app_users_table;
-  EXECUTE format('SELECT coalesce(jsonb_agg(jsonb_build_object(''id'', id, ''email'', email, ''email_verified'', email_verified, ''deleted_at'', deleted_at)), ''[]''::jsonb) FROM %I.%I',
+  EXECUTE format('SELECT coalesce(jsonb_agg(jsonb_build_object(''id'', id, ''email'', email, ''email_verified'', email_verified, ''deleted_at'', deleted_at, ''banned_at'', banned_at)), ''[]''::jsonb) FROM %I.%I',
     cfg.schema_name, cfg.table_name) INTO r;
   RETURN r;
 END
 $f$;
-ALTER FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb) OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb) OWNER TO CURRENT_USER;
 ALTER FUNCTION chelabase.app_users_gone(uuid, boolean) OWNER TO CURRENT_USER;
 ALTER FUNCTION chelabase.app_users_rows() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() TO chelabase_auth_sync;
+REVOKE ALL ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() TO chelabase_auth_sync;
 CREATE OR REPLACE FUNCTION chelabase.users_protect() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
 $f$
@@ -249,8 +266,8 @@ DECLARE
   obj record;
   rel oid;
   found_type text;
-  managed text[] := ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at'];
-  types text[] := ARRAY['uuid', 'text', 'boolean', 'timestamp with time zone', 'timestamp with time zone'];
+  managed text[] := ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at'];
+  types text[] := ARRAY['uuid', 'text', 'boolean', 'timestamp with time zone', 'timestamp with time zone', 'timestamp with time zone'];
 BEGIN
   IF to_regclass('chelabase.app_users_table') IS NULL THEN RETURN; END IF;
   SELECT schema_name, table_name, table_oid INTO cfg FROM chelabase.app_users_table;
@@ -345,6 +362,7 @@ DO $$ DECLARE cfg record; BEGIN
 END $$;
 DROP FUNCTION IF EXISTS chelabase.users_guard();
 DROP FUNCTION IF EXISTS chelabase.users_protect();
+DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb);
 DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
 DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
 DROP FUNCTION IF EXISTS chelabase.app_users_rows();
@@ -408,24 +426,26 @@ pub fn users_table_exists_sql(schema: &str, table: &str) -> String {
 }
 
 /// Applies one user's state as the sync role: `chelabase.app_users_upsert` prints `updated`,
-/// `inserted` or `inserted_managed` (the app columns of `data` were left out).
+/// `inserted` or `inserted_managed` (the app columns of `data` were left out). `banned_at` keeps
+/// the time the sync first saw the ban, and goes when the user is reactivated.
 pub fn upsert_call_sql(
     id: Uuid,
     email: &str,
     verified: bool,
+    banned: bool,
     created: DateTime<Utc>,
     data: Option<&serde_json::Value>,
 ) -> String {
     let data = data.map_or_else(|| "NULL".to_string(), |d| quote_literal(&d.to_string()));
     format!(
-        "BEGIN; SET LOCAL ROLE {USERS_SYNC_ROLE}; SELECT chelabase.app_users_upsert({}, {}, {verified}, {}, {data}); COMMIT;",
+        "BEGIN; SET LOCAL ROLE {USERS_SYNC_ROLE}; SELECT chelabase.app_users_upsert({}, {}, {verified}, {banned}, {}, {data}); COMMIT;",
         quote_literal(&id.to_string()),
         quote_literal(email),
         quote_literal(&created.to_rfc3339()),
     )
 }
 
-/// A user gone from Zitadel, as the sync role: marked deleted (`mark`) or its row deleted.
+/// A user gone from the pool, as the sync role: marked deleted (`mark`) or its row deleted.
 /// `chelabase.app_users_gone` prints `changed` or `unchanged`.
 pub fn gone_call_sql(id: Uuid, mark: bool) -> String {
     format!(
@@ -434,8 +454,13 @@ pub fn gone_call_sql(id: Uuid, mark: bool) -> String {
     )
 }
 
+/// Prints `t` when the branch's machinery is older than this worker's (the column and function
+/// [`users_bootstrap_sql`] added last are missing), so reconcile runs the bootstrap on it. The
+/// script is one transaction: the new upsert means everything else in it is there too.
+pub const USERS_OUTDATED_SQL: &str = "SET search_path = pg_catalog, pg_temp; SELECT pg_catalog.to_regprocedure('chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb)') IS NULL;";
+
 /// Every row's managed state, as the sync role: one jsonb array of
-/// `{id, email, email_verified, deleted_at}`.
+/// `{id, email, email_verified, deleted_at, banned_at}`.
 pub const USERS_ROWS_SQL: &str =
     "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_rows(); COMMIT;";
 
@@ -497,7 +522,8 @@ DO $$ BEGIN
       email text NOT NULL,
       email_verified boolean NOT NULL DEFAULT false,
       created_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
-      deleted_at timestamptz
+      deleted_at timestamptz,
+      banned_at timestamptz
     );
     ALTER TABLE "public"."users" OWNER TO "postgres";
     REVOKE ALL ON "public"."users" FROM anon;
@@ -509,6 +535,16 @@ DO $$ BEGIN
       USING (id OPERATOR(pg_catalog.=) chelabase.user_id()) WITH CHECK (id OPERATOR(pg_catalog.=) chelabase.user_id());
   END IF;
 END $$;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_attribute a
+      WHERE a.attrelid OPERATOR(pg_catalog.=) '"public"."users"'::pg_catalog.regclass
+        AND a.attname OPERATOR(pg_catalog.=) 'banned_at' AND NOT a.attisdropped
+        AND a.atttypid OPERATOR(pg_catalog.<>) 'pg_catalog.timestamptz'::pg_catalog.regtype) THEN
+    RAISE EXCEPTION USING ERRCODE = '42701',
+      MESSAGE = pg_catalog.format('column banned_at of %s is managed by Chelabase app users and must be timestamptz: rename yours', '"public"."users"');
+  END IF;
+END $$;
+ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS banned_at timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key ON "public"."users" (pg_catalog.lower(email)) WHERE deleted_at IS NULL;
 DO $$ DECLARE r pg_catalog.name; BEGIN
   FOR r IN SELECT g.rolname FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
@@ -557,6 +593,9 @@ BEGIN
   IF NEW.deleted_at IS DISTINCT FROM OLD.deleted_at THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'column deleted_at is managed by Chelabase app users';
   END IF;
+  IF NEW.banned_at IS DISTINCT FROM OLD.banned_at THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'column banned_at is managed by Chelabase app users';
+  END IF;
   RETURN NULL;
 END
 $f$;
@@ -568,7 +607,8 @@ CREATE OR REPLACE TRIGGER chelabase_users_guard_truncate BEFORE TRUNCATE ON "pub
   FOR EACH STATEMENT EXECUTE FUNCTION chelabase.users_guard();
 ALTER TABLE "public"."users" ENABLE ALWAYS TRIGGER chelabase_users_guard;
 ALTER TABLE "public"."users" ENABLE ALWAYS TRIGGER chelabase_users_guard_truncate;
-CREATE OR REPLACE FUNCTION chelabase.app_users_upsert(p_id uuid, p_email text, p_verified boolean, p_created timestamptz, p_data jsonb)
+DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
+CREATE OR REPLACE FUNCTION chelabase.app_users_upsert(p_id uuid, p_email text, p_verified boolean, p_banned boolean, p_created timestamptz, p_data jsonb)
   RETURNS text LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
 $f$
 DECLARE
@@ -583,8 +623,8 @@ BEGIN
   tbl := format('%I.%I', cfg.schema_name, cfg.table_name);
   EXECUTE format('SELECT count(*) FROM %s WHERE id = $1', tbl) INTO n USING p_id;
   IF n > 0 THEN
-    EXECUTE format('UPDATE %s SET email = $2, email_verified = $3 WHERE id = $1 AND (email IS DISTINCT FROM $2 OR email_verified IS DISTINCT FROM $3)', tbl)
-      USING p_id, p_email, p_verified;
+    EXECUTE format('UPDATE %s SET email = $2, email_verified = $3, banned_at = CASE WHEN $4 THEN coalesce(banned_at, now()) END WHERE id = $1 AND (email IS DISTINCT FROM $2 OR email_verified IS DISTINCT FROM $3 OR (banned_at IS NOT NULL) IS DISTINCT FROM $4)', tbl)
+      USING p_id, p_email, p_verified, p_banned;
     RETURN 'updated';
   END IF;
   IF p_data IS NOT NULL THEN
@@ -595,22 +635,23 @@ BEGIN
       FROM pg_attribute a
      WHERE a.attrelid = tbl::regclass AND a.attnum > 0 AND NOT a.attisdropped
        AND a.attgenerated = '' AND a.attidentity <> 'a'
-       AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at']::name[])
+       AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])
        AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')
        AND p_data ? a.attname::text;
     IF cols IS NOT NULL THEN
       BEGIN
-        EXECUTE format('INSERT INTO %1$s (id, email, email_verified, created_at, %2$s) SELECT $1, $2, $3, $4, %3$s FROM jsonb_populate_record(NULL::%1$s, $5) r', tbl, cols, vals)
+        EXECUTE format('INSERT INTO %1$s (id, email, email_verified, banned_at, created_at, %2$s) SELECT $1, $2, $3, CASE WHEN $6 THEN now() END, $4, %3$s FROM jsonb_populate_record(NULL::%1$s, $5) r', tbl, cols, vals)
           USING p_id, p_email, p_verified, p_created,
-            (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(p_data) e WHERE e.key = ANY (names));
+            (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(p_data) e WHERE e.key = ANY (names)),
+            p_banned;
         RETURN 'inserted';
       EXCEPTION WHEN integrity_constraint_violation OR data_exception THEN
         NULL;
       END;
     END IF;
   END IF;
-  EXECUTE format('INSERT INTO %s (id, email, email_verified, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING', tbl)
-    USING p_id, p_email, p_verified, p_created;
+  EXECUTE format('INSERT INTO %s (id, email, email_verified, banned_at, created_at) VALUES ($1, $2, $3, CASE WHEN $5 THEN now() END, $4) ON CONFLICT (id) DO NOTHING', tbl)
+    USING p_id, p_email, p_verified, p_created, p_banned;
   RETURN 'inserted_managed';
 END
 $f$;
@@ -641,16 +682,16 @@ DECLARE
   r jsonb;
 BEGIN
   SELECT schema_name, table_name INTO STRICT cfg FROM chelabase.app_users_table;
-  EXECUTE format('SELECT coalesce(jsonb_agg(jsonb_build_object(''id'', id, ''email'', email, ''email_verified'', email_verified, ''deleted_at'', deleted_at)), ''[]''::jsonb) FROM %I.%I',
+  EXECUTE format('SELECT coalesce(jsonb_agg(jsonb_build_object(''id'', id, ''email'', email, ''email_verified'', email_verified, ''deleted_at'', deleted_at, ''banned_at'', banned_at)), ''[]''::jsonb) FROM %I.%I',
     cfg.schema_name, cfg.table_name) INTO r;
   RETURN r;
 END
 $f$;
-ALTER FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb) OWNER TO CURRENT_USER;
+ALTER FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb) OWNER TO CURRENT_USER;
 ALTER FUNCTION chelabase.app_users_gone(uuid, boolean) OWNER TO CURRENT_USER;
 ALTER FUNCTION chelabase.app_users_rows() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() TO chelabase_auth_sync;
+REVOKE ALL ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb), chelabase.app_users_gone(uuid, boolean), chelabase.app_users_rows() TO chelabase_auth_sync;
 CREATE OR REPLACE FUNCTION chelabase.users_protect() RETURNS event_trigger
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
 $f$
@@ -659,8 +700,8 @@ DECLARE
   obj record;
   rel oid;
   found_type text;
-  managed text[] := ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at'];
-  types text[] := ARRAY['uuid', 'text', 'boolean', 'timestamp with time zone', 'timestamp with time zone'];
+  managed text[] := ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at'];
+  types text[] := ARRAY['uuid', 'text', 'boolean', 'timestamp with time zone', 'timestamp with time zone', 'timestamp with time zone'];
 BEGIN
   IF to_regclass('chelabase.app_users_table') IS NULL THEN RETURN; END IF;
   SELECT schema_name, table_name, table_oid INTO cfg FROM chelabase.app_users_table;
@@ -792,6 +833,7 @@ DO $$ DECLARE cfg record; BEGIN
 END $$;
 DROP FUNCTION IF EXISTS chelabase.users_guard();
 DROP FUNCTION IF EXISTS chelabase.users_protect();
+DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb);
 DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
 DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
 DROP FUNCTION IF EXISTS chelabase.app_users_rows();
@@ -1025,7 +1067,7 @@ COMMIT;
         assert!(f.contains(
             "AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')"
         ));
-        assert!(f.contains("AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at']::name[])"));
+        assert!(f.contains("AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])"));
         assert!(f.contains("SECURITY INVOKER") && !f.contains("SECURITY DEFINER"));
     }
 
@@ -1035,6 +1077,24 @@ COMMIT;
         assert!(bootstrap().contains(
             "CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key ON \"public\".\"users\" (pg_catalog.lower(email)) WHERE deleted_at IS NULL;\n"
         ));
+    }
+
+    /// B1: `banned_at` follows every rule of a managed column, on new and existing tables.
+    #[test]
+    fn banned_at_is_a_managed_column() {
+        let sql = bootstrap();
+        assert!(sql.contains("deleted_at timestamptz,\n      banned_at timestamptz\n    );"));
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS banned_at timestamptz;"));
+        assert!(MANAGED_COLUMNS.contains(&"banned_at"));
+        assert!(function_text(&sql, "users_guard").contains("column banned_at is managed"));
+        assert!(function_text(&sql, "users_protect").contains("'deleted_at', 'banned_at']"));
+        assert!(function_text(&sql, "app_users_rows").contains("''banned_at'', banned_at"));
+        // The old upsert goes, so an upgraded branch has one; the outdated check names the new.
+        assert!(sql.contains(
+            "DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);\n"
+        ));
+        assert!(USERS_OUTDATED_SQL.contains("app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb)"));
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb)"));
     }
 
     #[test]
@@ -1050,15 +1110,15 @@ COMMIT;
         let id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         let created = Utc.with_ymd_and_hms(2026, 10, 3, 10, 0, 0).unwrap();
         assert_eq!(
-            upsert_call_sql(id, "o'neil@example.com", true, created, None),
+            upsert_call_sql(id, "o'neil@example.com", true, false, created, None),
             "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_upsert(\
-             '11111111-2222-3333-4444-555555555555', 'o''neil@example.com', true, '2026-10-03T10:00:00+00:00', NULL); COMMIT;"
+             '11111111-2222-3333-4444-555555555555', 'o''neil@example.com', true, false, '2026-10-03T10:00:00+00:00', NULL); COMMIT;"
         );
         let data = serde_json::json!({"display_name": "it's me"});
         assert_eq!(
-            upsert_call_sql(id, "a@example.com", false, created, Some(&data)),
+            upsert_call_sql(id, "a@example.com", false, true, created, Some(&data)),
             "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_upsert(\
-             '11111111-2222-3333-4444-555555555555', 'a@example.com', false, '2026-10-03T10:00:00+00:00', \
+             '11111111-2222-3333-4444-555555555555', 'a@example.com', false, true, '2026-10-03T10:00:00+00:00', \
              '{\"display_name\":\"it''s me\"}'); COMMIT;"
         );
     }
@@ -1105,7 +1165,7 @@ COMMIT;
         assert_eq!(USERS_SYNC_ROLE, "chelabase_auth_sync");
         assert_eq!(
             MANAGED_COLUMNS,
-            ["id", "email", "email_verified", "created_at", "deleted_at"]
+            ["id", "email", "email_verified", "created_at", "deleted_at", "banned_at"]
         );
     }
 }

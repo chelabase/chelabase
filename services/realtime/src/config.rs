@@ -9,7 +9,7 @@
 //! | `CHELABASE_REALTIME_INTERNAL_TOKEN` / `_FILE` | required |
 //! | `CHELABASE_REALTIME_TICKET_KEY_FILE` | required, 32 raw bytes |
 //! | `CHELABASE_INTERNAL_VERIFY_KEY` | the gateway's public key (identity on ticket requests) |
-//! | `CHELABASE_AUTH_HOST`, `CHELABASE_ZITADEL_INTERNAL_URL`, `CHELABASE_ZITADEL_JWKS_URL`, `CHELABASE_ZITADEL_AUDIENCES` | the gateway's OIDC settings |
+//! | `CHELABASE_AUTH_HOST` | required: the member tokens' issuer |
 //! | `CHELABASE_NATS_*` | `chelabase_nats::NatsConfig` (user `realtime`, inbox `_INBOX_realtime`) |
 //! | `CHELABASE_VALKEY_URL`, `_USER`, `_PASSWORD[_FILE]`, `CHELABASE_VALKEY_TLS` | `redis://127.0.0.1:6379`, none, none, `off` |
 //! | `CHELABASE_REALTIME_INSTANCE_ID` | a random UUID per start |
@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use chelabase_auth::ZitadelAuthConfig;
 use chelabase_nats::NatsConfig;
 
 use crate::limits::SOCKET_REFRESH;
@@ -111,8 +110,9 @@ pub struct Config {
     pub ticket_key: TicketKey,
     /// The gateway's identity verify key (read by [`crate::app::build`]).
     pub verify_key: PathBuf,
-    /// The gateway's OIDC settings (`None` until [`Config::from_lookup`] reads them).
-    pub oidc: Option<ZitadelAuthConfig>,
+    /// The member tokens' issuer, from `CHELABASE_AUTH_HOST` (`None` until
+    /// [`Config::from_lookup`] reads it).
+    pub issuer: Option<String>,
     pub nats: NatsConfig,
     pub valkey: ValkeyConfig,
     pub instance_id: String,
@@ -130,6 +130,9 @@ pub struct Config {
     /// replication session logs in with, and the `ca.crt` it verifies the compute against; the
     /// worker writes and renews it.
     pub realtime_tls_dir: PathBuf,
+    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (#119): auth's member-token public key; tokens must name
+    /// the auth host's issuer. `None`: every member token is refused.
+    pub member_jwt_public_key: Option<PathBuf>,
 }
 
 fn default_addr() -> SocketAddr {
@@ -156,7 +159,7 @@ fn read_secret_text(var: &str, path: &str) -> anyhow::Result<String> {
 }
 
 impl Config {
-    /// The defaults of the table above with this key and token (no OIDC settings, anonymous
+    /// The defaults of the table above with this key and token (no member-token key, anonymous
     /// NATS and Valkey); tests set the rest.
     pub fn with_defaults(ticket_key: TicketKey, internal_token: &str) -> Self {
         Self {
@@ -167,7 +170,7 @@ impl Config {
             internal_token: internal_token.to_string(),
             ticket_key,
             verify_key: PathBuf::new(),
-            oidc: None,
+            issuer: None,
             nats: NatsConfig {
                 url: chelabase_nats::DEFAULT_NATS_URL.to_string(),
                 user: None,
@@ -187,6 +190,7 @@ impl Config {
             max_slots_per_compute: 10,
             compute_ca: None,
             realtime_tls_dir: PathBuf::new(),
+            member_jwt_public_key: None,
         }
     }
 
@@ -245,8 +249,9 @@ impl Config {
             bail!("CHELABASE_INTERNAL_VERIFY_KEY is required (the gateway's identity verify key)");
         };
 
-        let oidc = ZitadelAuthConfig::from_lookup(get)
-            .map_err(|e| anyhow::anyhow!("the gateway's OIDC settings: {e}"))?;
+        let issuer = chelabase_types::entry::issuer_from_lookup(get)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .context("CHELABASE_AUTH_HOST is required (the member tokens' issuer)")?;
 
         let nats = NatsConfig::from_lookup(get).map_err(|e| anyhow::anyhow!(e))?;
         let valkey = valkey_from_lookup(&get)?;
@@ -275,7 +280,7 @@ impl Config {
             internal_token,
             ticket_key,
             verify_key: PathBuf::from(verify_key),
-            oidc: Some(oidc),
+            issuer: Some(issuer),
             nats,
             valkey,
             instance_id,
@@ -285,6 +290,9 @@ impl Config {
             max_slots_per_compute,
             compute_ca: get("CHELABASE_COMPUTE_CA_FILE").map(PathBuf::from),
             realtime_tls_dir: PathBuf::from(realtime_tls_dir),
+            member_jwt_public_key: get("CHELABASE_MEMBER_JWT_PUBLIC_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| PathBuf::from(v.trim())),
         })
     }
 }

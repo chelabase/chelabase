@@ -15,19 +15,20 @@ The branch gets its public key when it first becomes ready. It can't be revoked 
 
 ## Secret keys
 
-Create one with `POST /v1/databases/{id}/branches/{bid}/keys`, or in Studio's Data API view. The body takes a `name` (1 to 63 characters), optionally a `role` (default `authenticated`) and a [`databases` allow-list](/docs/using/data-api/allow-lists).
+Create one with `POST /v1/databases/{id}/branches/{bid}/keys`, or in Studio's Data API view. The body takes a `name` (1 to 63 characters), optionally a `role` (default `authenticated`) and a [`databases` allow-list](/using/data-api/allow-lists).
 
 The role is checked and granted to `authenticator` when the key is created. A refused role is a 422 `role_refused` whose message says why. A role is refused when it:
 
 - isn't a valid role name (a letter or `_`, then letters, digits, `_` or `$`; at most 63 characters);
-- is `authenticator`, `chelabase_admin` or `chelabase_auth_sync` (roles Chelabase owns), or any `pg_*` role;
+- is `authenticator`, `chelabase_admin`, `chelabase_auth_sync` or `chelabase_realtime` (roles Chelabase owns), or any `pg_*` role;
+- is a member's personal login role;
 - doesn't exist in the branch's database;
 - is a superuser, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`;
 - is owner-level: it has `CREATEROLE`, `CREATEDB` or `REPLICATION` (`the role <name> has CREATEROLE, CREATEDB or REPLICATION (owner-level roles can't back a secret key; use a role without CREATEROLE, CREATEDB, REPLICATION or neon_superuser: BYPASSRLS is allowed)`).
 
-Any role that exists can back a key, with or without a password or `LOGIN`: the usual one is a `NOLOGIN` role made for the data API.
+Any other role can back a key, with or without a password: the usual one is a `NOLOGIN` role made for the data API. You need Developer access and a role you may use; a `LOGIN` role needs Admin. Otherwise the answer is 403, naming the role you'd need. A role that is, or is a member of, a role with the members hub's "all rows" policy is refused with 422 `exposes_data_api`.
 
-A role with `BYPASSRLS` can back a secret key: requests with that key read and write past row-level security, like a service role. The key list marks such a key with `bypasses_rls: true` (Studio shows "bypasses RLS"); the mark follows the role, so it changes within a few seconds when `BYPASSRLS` is granted or taken away in SQL. A key whose role was given `BYPASSRLS` in SQL before this release, and was refused for it until now, works from this release on and is marked as soon as the worker starts.
+A role with `BYPASSRLS` can back a secret key: requests with that key read and write past row-level security, like a service role. The key list marks such a key with `bypasses_rls: true` (Studio shows "bypasses RLS"); the mark follows the role, so it changes within a few seconds when `BYPASSRLS` is granted or taken away in SQL.
 
 The same rules hold on every request. A role made owner-level in SQL after its key was made (`ALTER ROLE … CREATEDB`, say, or a `GRANT` that reaches `neon_superuser` or one of the system roles above) stops working: requests get a 403 `role_not_allowed`, within about 30 seconds of the change, until the attribute is taken away again. The key list marks such a key with `role_blocked: true`.
 
@@ -39,7 +40,7 @@ SQL can't drop a key's role (or drop and create it again in one transaction) unt
 
 ## Revocation
 
-Revoking a key takes effect within 30 seconds, the gateway's cache lifetime. A key that was never valid is cached for 30 seconds too. Cache misses (lookups that reach the orchestrator) are limited per client IP address; see [Limits](/docs/using/data-api/limits).
+Revoking a key takes effect within 30 seconds, the gateway's cache lifetime. A key that was never valid is cached for 30 seconds too. Cache misses (lookups that reach the orchestrator) are limited per client IP address; see [Limits](/using/data-api/limits).
 
 ## Lifecycle
 

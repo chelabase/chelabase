@@ -32,7 +32,7 @@ const PROJECTS = [
 ];
 
 export function meFor(caller: Caller): MeResponse {
-  const base = { sub: "u", instance_admin: false, tenant_admins: [], tenant_id: "t1", user: { sub: "u", org_id: "o" } };
+  const base = { sub: "u", instance_admin: false, tenant_admins: [], tenant_id: "t1", user: { sub: "u" } };
   const mp = (id: string, platform_role: string, roles: string[] | "all") => ({ project_id: id, platform_role, roles, databases: [] });
   return caller === "tenant_admin"
     ? ({ ...base, email: "mara@x.test", name: "Mara", member: { id: MARA, status: "active", tenant_admin: true }, projects: [mp(P1, "admin", "all"), mp(P2, "admin", "all")], tenant: { id: "t1", slug: "demo", display_name: null, projects: PROJECTS } } as unknown as MeResponse)

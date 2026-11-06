@@ -1,9 +1,10 @@
-//! Auth's refusal mapping against the real stack (#61, #78): the stack's auth, orchestrator and
-//! Zitadel v4.19.1, through the gateway as Studio and an app reach them. The unit tests prove
-//! the arms against the mock; these prove the real Zitadel's answers reach them.
+//! Auth against the real stack: the stack's auth, orchestrator and identity service, through the
+//! gateway as Studio and an app reach them. The unit tests prove the arms against the fakes;
+//! these prove the real services' answers reach them.
 //!
-//! Runs in the workbench runner, which has `demo.env` (the issuer, the admin PAT), the gateway's
-//! entry URLs, `CHELABASE_CLI` (`chelabase dev token`: the demo tenant admin) and the metadata
+//! Runs in the workbench runner, which has the gateway's entry URLs, `CHELABASE_CLI`
+//! (`chelabase dev token`: the demo tenant admin), the identity service's URL and auth's token
+//! for it (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`) and the metadata
 //! database's URL:
 //!
 //! ```text
@@ -22,19 +23,16 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use chelabase_zitadel::client::{UserState, Zitadel};
+use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
+use chelabase_identity::{CodeKind, CodeRequest, Delivery, Identity, Pool};
 use reqwest::Method;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const DEMO_TENANT_ID: &str = "00000000-0000-4000-8000-000000000001";
 
-/// Passes Zitadel's default password policy and auth's own checks.
+/// Passes auth's password rule.
 const STRONG: &str = "Live-pass-12!";
-/// Passes auth's own checks (a Unicode lowercase letter counts there) but not Zitadel's default
-/// policy, which wants an ASCII one: the answer is Zitadel's refusal (`DOMAIN-co3Xw` on a set,
-/// `COMMA-co3Xw` on a create), which auth maps by its id.
-const ZITADEL_WEAK: &str = "ÉCOLE#2026é";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -129,71 +127,40 @@ fn code_of(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("")
 }
 
-/// Zitadel with the admin PAT, at `CHELABASE_ZITADEL_INTERNAL_URL` (else the `zitadel` service)
-/// with the issuer's host as `Host`, as the apps call it.
-struct Admin {
-    base: String,
-    host: String,
-    pat: String,
+/// The identity service as auth calls it (auth's token): codes returned instead of mailed, user
+/// reads and deletes.
+fn identity() -> Identity {
+    let file = PathBuf::from(need("CHELABASE_IDENTITY_TOKEN_FILE"));
+    let file = if file.is_relative() { workspace_root().join(file) } else { file };
+    Identity::from_token_file(&need("CHELABASE_IDENTITY_URL"), &file).expect("auth's identity token")
 }
 
-fn admin() -> Admin {
-    let issuer = need("CHELABASE_ZITADEL_ISSUER");
-    let host = issuer
-        .split_once("://")
-        .map(|(_, rest)| rest.trim_end_matches('/').to_string())
-        .expect("the issuer has a host");
-    let base =
-        env("CHELABASE_ZITADEL_INTERNAL_URL").unwrap_or_else(|| "http://zitadel:8080".into());
-    let file = PathBuf::from(need("CHELABASE_ZITADEL_ADMIN_PAT_FILE"));
-    let file = if file.is_relative() {
-        workspace_root().join(file)
-    } else {
-        file
-    };
-    Admin {
-        base: base.trim_end_matches('/').to_string(),
-        host,
-        pat: std::fs::read_to_string(file).unwrap().trim().to_string(),
-    }
-}
-
-impl Admin {
-    fn client(&self) -> Zitadel {
-        Zitadel::new(&self.base, &self.pat).with_host(Some(&self.host))
-    }
-
-    /// A password-reset code for the user, returned instead of mailed (anyone can have one
-    /// mailed, a deactivated user too).
-    async fn reset_code(&self, user: &str) -> String {
-        let resp = reqwest::Client::new()
-            .post(format!("{}/v2/users/{user}/password_reset", self.base))
-            .header(reqwest::header::HOST, &self.host)
-            .bearer_auth(&self.pat)
-            .json(&json!({"returnCode": {}}))
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        assert_eq!(status, 200, "a reset code for {user}: {body}");
-        body["verificationCode"]
-            .as_str()
-            .expect("verificationCode")
-            .to_string()
-    }
-
-    async fn state(&self, user: &str) -> UserState {
-        self.client()
-            .get_user(user)
-            .await
-            .unwrap()
-            .expect("the user exists")
-            .state
-    }
+/// A code of `kind` for the member `user`, handed back instead of mailed.
+async fn code_for(user: &str, kind: CodeKind) -> String {
+    identity()
+        .create_code(&Pool::Members, &CodeRequest::new(user, kind, Delivery::Return))
+        .await
+        .unwrap_or_else(|e| panic!("a {kind:?} code for {user}: {e}"))
+        .code
+        .expect("a returned code")
 }
 
 /// One statement against the metadata database, as the e2e scripts' `metadata_sql` runs it.
+/// [`metadata_sql`] that reports a failure instead of panicking, for cleanups.
+async fn try_metadata_sql(sql: &str) -> Result<String, String> {
+    let out = tokio::process::Command::new("psql")
+        .arg(need("CHELABASE_METADATA_DATABASE_URL"))
+        .args(["-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("{sql}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{sql}: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 async fn metadata_sql(sql: &str) -> String {
     let out = tokio::process::Command::new("psql")
         .arg(need("CHELABASE_METADATA_DATABASE_URL"))
@@ -215,8 +182,10 @@ async fn metadata_sql(sql: &str) -> String {
 struct Invited {
     member: String,
     invite: Uuid,
+    email: String,
     user: String,
     code: String,
+    t: String,
 }
 
 fn query_param(url: &str, name: &str) -> String {
@@ -229,7 +198,7 @@ fn query_param(url: &str, name: &str) -> String {
 }
 
 /// Invites a fresh person by link, runs `checks`, then removes the member and deletes their
-/// Zitadel user, pass or fail.
+/// identity user, pass or fail.
 async fn with_invitee<F, Fut>(name: &str, checks: F)
 where
     F: FnOnce(Invited) -> Fut,
@@ -256,8 +225,10 @@ where
             .unwrap()
             .parse()
             .unwrap(),
+        email: email.clone(),
         user: query_param(url, "user"),
         code: query_param(url, "code"),
+        t: query_param(url, "t"),
     };
     let outcome = tokio::spawn(checks(invited.clone())).await;
     let _ = api(
@@ -266,37 +237,246 @@ where
         None,
     )
     .await;
-    let _ = admin().client().delete_user(&invited.user).await;
+    let _ = identity().delete_user(&Pool::Members, &invited.user).await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
 }
 
-fn accept(user: &str, code: &str, password: &str) -> Value {
-    json!({"user": user, "code": code, "reset": false, "password": password})
+/// `POST /auth/v1/<path>` as Studio's session calls make it, with `cookie`: the status, the body
+/// and the `name=value` of `chelabase_session` if it was set.
+async fn session_call(path: &str, cookie: Option<&str>, body: Option<Value>) -> (u16, Value, Option<String>) {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/auth/v1/{path}", gateway()))
+        .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
+        .header("x-chelabase-studio", "1");
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.expect("the gateway answers");
+    let status = resp.status().as_u16();
+    let set = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter(|c| c.starts_with("chelabase_session=") && !c.starts_with("chelabase_session=;"))
+        .map(|c| c.split(';').next().unwrap().to_string())
+        .next();
+    let body = resp.json().await.unwrap_or(Value::Null);
+    (status, body, set)
 }
 
-fn reset_accept(user: &str, code: &str, password: &str) -> Value {
-    json!({"user": user, "code": code, "reset": true, "password": password})
+/// Every person `member_sign_in_live` signs up, this run's and any an earlier run left behind.
+const LIVE_MEMBERS: &str = "auth-live-member-%@example.com";
+
+/// Undoes what `member_sign_in_live` changes, whatever state a run stopped in, and never panics
+/// midway: the demo tenant's open sign-up goes back first, then each member is removed through the
+/// API as an admin would (`access_events` is append-only and names the row, so it is never
+/// deleted), then their identity users go. Returns what failed.
+///
+/// Open sign-up goes back to the demo tenant's baseline, `false` (the column's default; the
+/// seed never sets it), never to a value read at the start: a run killed after switching it on
+/// would otherwise make `true` the next run's "original".
+async fn member_sign_in_cleanup() -> Vec<String> {
+    let mut failed = Vec::new();
+    if let Err(e) = try_metadata_sql(&format!("UPDATE tenants SET open_signup = false WHERE id = '{DEMO_TENANT_ID}'")).await {
+        failed.push(e);
+    }
+    let ids = try_metadata_sql(&format!(
+        "SELECT id FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email LIKE '{LIVE_MEMBERS}' AND status <> 'removed'"
+    ))
+    .await;
+    match ids {
+        Ok(ids) => {
+            for id in ids.lines().filter(|l| !l.is_empty()) {
+                let path = format!("/v1/members/{id}");
+                match tokio::spawn(async move { api(Method::DELETE, &path, None).await }).await {
+                    // 503: removed here, only identity's follow-up steps failed.
+                    Ok((204 | 503, _)) => {}
+                    Ok((status, body)) => failed.push(format!("removing member {id}: {status} {body}")),
+                    Err(e) => failed.push(format!("removing member {id}: {e}")),
+                }
+            }
+        }
+        Err(e) => failed.push(e),
+    }
+    if let Err(e) = try_metadata_sql(&format!(r#"DELETE FROM identity_members."user" WHERE email LIKE '{LIVE_MEMBERS}'"#)).await {
+        failed.push(e);
+    }
+    failed
 }
 
-/// An invitee whose Zitadel user was deleted gets 410 `invite_revoked` (AC 1).
+/// Review fix 1 against the stack, the review's own probe: a member token minted before logout
+/// stops working on the management API once the orchestrator's session-check window
+/// (`CHELABASE_MEMBER_SESSION_CHECK_SECS`, at most 30 s) has passed. Same setup and cleanup as
+/// [`member_sign_in_live`].
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the metadata database"]
+async fn member_token_stops_after_logout_live() {
+    let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
+    let stale = member_sign_in_cleanup().await;
+    assert!(stale.is_empty(), "cleaning up an earlier run: {stale:?}");
+    let run = email.clone();
+    let outcome = tokio::spawn(async move {
+        let email = run;
+        metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
+        let creds = json!({"email": email, "password": STRONG});
+        let mut sign_up = creds.clone();
+        sign_up["givenName"] = json!("Live");
+        sign_up["familyName"] = json!("Logout");
+        assert_eq!(session_call("sign-up", None, Some(sign_up)).await.0, 200, "sign-up");
+        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        let (status, body, cookie) = session_call("sign-in", None, Some(creds)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "sign-in");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let token = body["access_token"].as_str().expect("a token").to_string();
+        let me = || async { send(reqwest::Client::new().get(format!("{}/v1/me", gateway())).bearer_auth(&token)).await };
+        let (status, body) = me().await;
+        assert_eq!(status, 200, "/v1/me before logout: {body}");
+
+        assert_eq!(session_call("logout", Some(&cookie), Some(json!({}))).await.0, 200);
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
+        // The token itself is still unexpired; the orchestrator refuses it once its cached
+        // "live" answer (from the call above) is older than the window. One call a second.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut last = (0, Value::Null);
+        while tokio::time::Instant::now() < deadline {
+            tick.tick().await;
+            last = me().await;
+            if last.0 != 200 {
+                break;
+            }
+        }
+        assert_eq!(last.0, 401, "/v1/me with the pre-logout token, past the window: {}", last.1);
+    })
+    .await;
+    let failed = member_sign_in_cleanup().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+    assert!(failed.is_empty(), "cleanup: {failed:?}");
+}
+
+/// #121 AC 1 against the stack: an open sign-up waits as pending, and once active the member signs
+/// in, gets a token the gateway and orchestrator accept, and loses it at logout. Open sign-up is
+/// switched on for the demo tenant meanwhile; [`member_sign_in_cleanup`] runs afterwards, pass or
+/// fail.
+#[tokio::test]
+#[ignore = "needs the workbench stack and the metadata database"]
+async fn member_sign_in_live() {
+    let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
+    // Leftovers of an earlier run first: their pending rows and users would get in the way.
+    let stale = member_sign_in_cleanup().await;
+    assert!(stale.is_empty(), "cleaning up an earlier run: {stale:?}");
+    let run = email.clone();
+    let outcome = tokio::spawn(async move {
+        let email = run;
+        metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
+        let creds = json!({"email": email, "password": STRONG});
+        let mut sign_up = creds.clone();
+        sign_up["givenName"] = json!("Live");
+        sign_up["familyName"] = json!("Member");
+        let (status, body, _) = session_call("sign-up", None, Some(sign_up)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "pending"})), "sign-up");
+        let status_of = |email: String| async move {
+            metadata_sql(&format!("SELECT status FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await
+        };
+        assert_eq!(status_of(email.clone()).await, "pending");
+        let (_, body, _) = session_call("sign-in", None, Some(creds.clone())).await;
+        assert_eq!(body, json!({"next": "pending"}), "before approval");
+
+        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        let (status, body, cookie) = session_call("sign-in", None, Some(creds.clone())).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "sign-in");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let token = body["access_token"].as_str().expect("a token").to_string();
+        let (status, me) = send(reqwest::Client::new().get(format!("{}/v1/me", gateway())).bearer_auth(&token)).await;
+        assert_eq!(status, 200, "/v1/me: {me}");
+        assert_eq!(me["tenant_id"], DEMO_TENANT_ID);
+        assert_eq!(me["member"]["status"], "active");
+
+        // Suspended: `/token` stops at once, whatever the session.
+        metadata_sql(&format!("UPDATE members SET status = 'suspended', suspended_at = now() WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "suspended");
+        metadata_sql(&format!("UPDATE members SET status = 'active', suspended_at = NULL WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 200);
+
+        // Without Studio's header, and after logout with the same bytes.
+        let bare = reqwest::Client::new()
+            .post(format!("{}/auth/v1/token", gateway()))
+            .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
+            .header("cookie", &cookie);
+        assert_eq!(send(bare).await.0, 403);
+        assert_eq!(session_call("logout", Some(&cookie), Some(json!({}))).await.0, 200);
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
+    })
+    .await;
+    let failed = member_sign_in_cleanup().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+    assert!(failed.is_empty(), "cleanup: {failed:?}");
+}
+
+fn accept(inv: &Invited, code: &str, password: &str) -> Value {
+    json!({"user": inv.user, "t": inv.t, "code": code, "password": password})
+}
+
+/// `POST /auth/v1/accept-invite` as Studio sends it: the status, the body and the session cookie
+/// if one was set.
+async fn accept_call(body: Value) -> (u16, Value, Option<String>) {
+    session_call("accept-invite", None, Some(body)).await
+}
+
+/// #124 AC 1 against the stack: the link's code sets the first password and verifies the email,
+/// the member row turns active, and the session cookie mints a token for the demo tenant. The
+/// code is single use.
+#[tokio::test]
+#[ignore = "needs the workbench stack and the identity service"]
+async fn invite_accept_live() {
+    with_invitee("accept", |inv| async move {
+        let (status, body, cookie) = accept_call(accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "accept");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let user = identity().get_user(&Pool::Members, &inv.user).await.unwrap();
+        assert!(user.email_verified, "the code verified the email");
+        let row = metadata_sql(&format!("SELECT status FROM members WHERE id = '{}'", inv.member)).await;
+        assert_eq!(row, "active");
+        let (status, body, cookie) = accept_call(accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!((status, code_of(&body), cookie), (400, "invalid_request", None), "the code again: {body}");
+    })
+    .await;
+}
+
+/// #124: an invitee whose identity user was deleted gets 410
+/// `invite_revoked`.
+#[tokio::test]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn accept_invite_for_a_deleted_user_is_revoked() {
     with_invitee("deleted", |inv| async move {
-        admin().client().delete_user(&inv.user).await.unwrap();
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        identity().delete_user(&Pool::Members, &inv.user).await.unwrap();
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!((status, code_of(&body)), (410, "invite_revoked"), "{body}");
     })
     .await;
 }
 
-/// Zitadel answers a wrong and an expired code alike (`COMMAND-Wgn4q`): the stored invite tells
-/// them apart. A wrong code on an invite whose stored expiry passed is 410 `invite_expired`; the
-/// same code once it is open again is 400 `invalid_request`; the right code still works (AC 2).
+/// The stored invite tells an expired link from a wrong code: a wrong code on an invite whose
+/// stored expiry passed is 410 `invite_expired`; once it is open again, 400 `invalid_request`;
+/// the right code still works (ported to the identity service's codes, #124).
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
     with_invitee("expiry", |inv| async move {
         let set_expiry = |interval: &'static str| {
@@ -307,97 +487,73 @@ async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
             }
         };
         assert_eq!(set_expiry("- interval '1 minute'").await, inv.invite.to_string());
-        let (status, body) = ui("accept-invite", accept(&inv.user, "WRONG1", STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, "000000", STRONG)).await;
         assert_eq!((status, code_of(&body)), (410, "invite_expired"), "{body}");
         set_expiry("+ interval '1 day'").await;
-        let (status, body) = ui("accept-invite", accept(&inv.user, "WRONG1", STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, "000000", STRONG)).await;
         assert_eq!((status, code_of(&body)), (400, "invalid_request"), "{body}");
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!(status, 200, "the right code: {body}");
     })
     .await;
 }
 
-/// A password Zitadel's policy refuses (by `DOMAIN-` id) is `weak_password` in accept-invite:
-/// after the code (with a ticket to finish), and in a reset before anything changes (AC 1).
+/// #124: a weak password is refused (`weak_password`) before the code is used, with no ticket, so the same code then
+/// sets a strong one; and a reset's confirm refuses it before anything changes.
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
-async fn zitadel_policy_refusals_are_weak_passwords_in_accept_invite() {
+#[ignore = "needs the workbench stack and the identity service"]
+async fn weak_passwords_keep_the_invite_code_live() {
     with_invitee("weak", |inv| async move {
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, ZITADEL_WEAK)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, "weakpass")).await;
         assert_eq!((status, code_of(&body)), (400, "weak_password"), "{body}");
-        let ticket = body["error"]["accept_ticket"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no ticket: {body}"));
+        assert!(body["error"].get("accept_ticket").is_none(), "nothing was spent: {body}");
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!(status, 200, "the same code: {body}");
+        let code = code_for(&inv.user, CodeKind::Reset).await;
         let (status, body) = ui(
-            "accept-invite",
-            json!({"user": inv.user, "acceptTicket": ticket, "reset": false, "password": STRONG}),
-        )
-        .await;
-        assert_eq!(status, 200, "finishing with the ticket: {body}");
-        // A reset code: the policy refuses the password, and the old one still signs in.
-        let code = admin().reset_code(&inv.user).await;
-        let (status, body) = ui(
-            "accept-invite",
-            reset_accept(&inv.user, &code, ZITADEL_WEAK),
+            "password-reset/confirm",
+            json!({"email": inv.email, "code": code, "password": "weakpass"}),
         )
         .await;
         assert_eq!((status, code_of(&body)), (400, "weak_password"), "{body}");
-        admin()
-            .client()
-            .create_session(&inv.user, STRONG)
+        identity()
+            .sign_in(&Pool::Members, &inv.email, STRONG)
             .await
             .expect("the password is unchanged");
     })
     .await;
 }
 
-/// #78: a removed member asks for a reset code (anyone can) and uses it on accept-invite. The
-/// code checks out, but with no open invite they stay inactive and get no session.
+/// #78, ported to the identity service (#124): a removed member (banned with our reason) asks for
+/// a reset code (anyone can) and uses it. The reset sets the password, but nothing lifts the ban:
+/// the code accepts no invite, sign-in sets no session, and the ban keeps its reason.
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn a_removed_members_own_reset_code_never_reactivates() {
     with_invitee("removed", |inv| async move {
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!(status, 200, "accept: {body}");
         let (status, body) =
             api(Method::DELETE, &format!("/v1/members/{}", inv.member), None).await;
         assert!(status == 200 || status == 204, "remove: {status} {body}");
-        let z = admin();
-        assert_eq!(
-            z.state(&inv.user).await,
-            UserState::Inactive,
-            "removal deactivates"
-        );
-        let code = z.reset_code(&inv.user).await;
-        let resp = reqwest::Client::new()
-            .post(format!("{}/auth/v1/accept-invite", gateway()))
-            .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
-            .json(&reset_accept(&inv.user, &code, "Other-pass-34!"))
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        let cookies: Vec<String> = resp
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .map(|v| v.to_str().unwrap_or("").to_string())
-            .collect();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        assert_eq!((status, code_of(&body)), (400, "invalid_request"), "{body}");
-        assert!(
-            !cookies
-                .iter()
-                .any(|c| c.starts_with("chelabase_session=") && !c.contains("Max-Age=0")),
-            "{cookies:?}"
-        );
-        assert_eq!(
-            z.state(&inv.user).await,
-            UserState::Inactive,
-            "still inactive"
-        );
+        let banned = || async {
+            let d = identity().user_detail(&Pool::Members, &inv.user).await.unwrap();
+            (d.user.banned, d.ban_reason)
+        };
+        assert_eq!(banned().await, (true, Some(MEMBER_REMOVED_BAN_REASON.to_string())), "removal bans");
+        let code = code_for(&inv.user, CodeKind::Reset).await;
+        let (status, body, cookie) = accept_call(accept(&inv, &code, "Other-pass-34!")).await;
+        assert_eq!((status, code_of(&body), cookie), (400, "invalid_request", None), "{body}");
+        let (status, body) = ui(
+            "password-reset/confirm",
+            json!({"email": inv.email, "code": code, "password": "Other-pass-34!"}),
+        )
+        .await;
+        assert_eq!(status, 200, "the reset itself: {body}");
+        let (status, body, cookie) =
+            session_call("sign-in", None, Some(json!({"email": inv.email, "password": "Other-pass-34!"}))).await;
+        assert_eq!((status, code_of(&body), cookie), (401, "invalid_credentials", None), "{body}");
+        assert_eq!(banned().await, (true, Some(MEMBER_REMOVED_BAN_REASON.to_string())), "still banned");
     })
     .await;
 }
@@ -461,7 +617,8 @@ where
         let (status, body) = api(
             Method::PUT,
             &format!("/v1/projects/{project_id}/app-users"),
-            Some(json!({"database_id": db})),
+            // Sign-up signs in at once: the live tests read no mail.
+            Some(json!({"database_id": db, "email_verification": false})),
         )
         .await;
         if status != 202 {
@@ -503,43 +660,56 @@ where
     }
 }
 
-/// A password Zitadel's policy refuses is `weak_password` in app-user sign-up (by its `COMMA-`
-/// id) and reset (by its `DOMAIN-` id) (AC 3).
+/// An app-user call made as a signed-in user: the `Chelabase-User` header carries the access
+/// token, as the SDK sends it.
+async fn app_as(key: &str, access: &str, path: &str, body: Value) -> (u16, Value) {
+    send(
+        reqwest::Client::new()
+            .post(format!("{}/auth/v1/app/{path}", gateway()))
+            .bearer_auth(key)
+            .header("chelabase-user", access)
+            .json(&body),
+    )
+    .await
+}
+
+/// #123: app users live in the project's identity pool. Sign-up, sign-in and refresh run there
+/// (refresh checks the identity session behind the app session), and a password change on one
+/// device ends the other's session at its next refresh. Auth's own password rule answers
+/// first.
 #[tokio::test]
-#[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
-async fn zitadel_policy_refusals_are_weak_passwords_for_app_users() {
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn app_user_sessions_live_in_the_identity_pool() {
     with_app_users(|key| async move {
         let tag = &Uuid::new_v4().simple().to_string()[..8];
-        let (status, body) = app(
-            &key,
-            "sign-up",
-            json!({"email": format!("weak-{tag}@example.com"), "password": ZITADEL_WEAK}),
-        )
-        .await;
-        assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
         let email = format!("user-{tag}@example.com");
-        let (status, body) =
-            app(&key, "sign-up", json!({"email": email, "password": STRONG})).await;
-        assert_eq!(status, 201, "sign-up: {body}");
-        let user = body["user"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no user id: {body}"))
-            .to_string();
-        let code = admin().reset_code(&user).await;
-        let (status, body) = app(
+        let (status, one) = app(&key, "sign-up", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 201, "sign-up: {one}");
+        let one_access = one["access_token"].as_str().unwrap_or_else(|| panic!("no tokens: {one}"));
+        let (status, two) = app(&key, "sign-in", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 200, "sign-in: {two}");
+        let (status, two) = app(&key, "refresh", json!({"refresh_token": two["refresh_token"]})).await;
+        assert_eq!(status, 200, "refresh: {two}");
+        let (status, wrong) = app(&key, "sign-in", json!({"email": email, "password": "Wrong-pass-12!"})).await;
+        assert_eq!((status, code_of(&wrong)), (401, "invalid_credentials"), "{wrong}");
+        // Device one changes the password: device two's next refresh is refused.
+        let new_password = "Other-pass-34!";
+        let (status, changed) = app_as(
             &key,
-            "password-reset/confirm",
-            json!({"email": email, "code": code, "password": ZITADEL_WEAK}),
+            one_access,
+            "change-password",
+            json!({"current_password": STRONG, "password": new_password}),
         )
         .await;
-        assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
-        let (status, body) = app(
-            &key,
-            "password-reset/confirm",
-            json!({"email": email, "code": code, "password": "Other-pass-34!"}),
-        )
-        .await;
-        assert_eq!(status, 204, "the code wasn't spent: {body}");
+        assert_eq!(status, 200, "change-password: {changed}");
+        let (status, body) = app(&key, "refresh", json!({"refresh_token": two["refresh_token"]})).await;
+        assert_eq!(status, 401, "the other device's refresh: {body}");
+        let (status, body) = app(&key, "refresh", json!({"refresh_token": changed["refresh_token"]})).await;
+        assert_eq!(status, 200, "the new session's refresh: {body}");
+        let (status, _) = app(&key, "sign-in", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 401, "the old password");
+        let (status, body) = app(&key, "sign-in", json!({"email": email, "password": new_password})).await;
+        assert_eq!(status, 200, "the new password: {body}");
     })
     .await;
 }

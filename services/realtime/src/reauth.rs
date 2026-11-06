@@ -1,9 +1,10 @@
 //! Re-authorization (spec §4, R15, W19, W28, P13, S13): every joined channel is re-authorized
 //! on each `auth` renewal, on an access event for its member or tenant (coalesced per member
 //! on the instance: one run at once, then at most one trailing run per 1 s window; each run is
-//! a burst whose answers the member's sockets share, one `/authorize` per target), and every
-//! 60 s (answers cached per (member, target) for the cycle and shared by the instance's
-//! sockets; a fresh answer — a renewal's, a join's, a burst's — replaces the cycle's). Only
+//! a burst whose answers the sockets of each of the member's sessions share, one `/authorize`
+//! per target), and every 60 s (answers cached per (member, session, target) for the cycle and
+//! shared by the instance's sockets of that session, so an ended session never borrows a live
+//! one's answer; a fresh answer — a renewal's, a join's, a burst's — replaces the cycle's). Only
 //! `forbidden` and `not_found` leave a channel; `token_expired` waits for the renewal;
 //! `unavailable` degrades it, and the third in a row leaves it with `unavailable`.
 
@@ -153,13 +154,15 @@ impl<K: Hash + Eq + Clone> Coalescer<K> {
 /// One access burst's `/authorize`, shared by the member's sockets.
 pub type BurstAnswer = Shared<BoxFuture<'static, AuthorizeOutcome>>;
 
-/// W28: `/authorize` answers per (member sub, target) for one 60 s cycle, and each target's
-/// answer of the member's latest access burst (one call, however many sockets ask).
+/// W28: `/authorize` answers per (member sub, identity session, target) for one 60 s cycle,
+/// and each target's answer of the member's latest access burst (one call, however many of the
+/// session's sockets ask). Answers are never shared across sessions: one that has ended (a
+/// logout, a reset) is refused even while another session of the member is allowed.
 #[derive(Default)]
 pub struct CycleCache {
     cycle: u64,
-    answers: HashMap<(String, AuthTarget), AuthorizeOutcome>,
-    bursts: HashMap<(String, AuthTarget), (u64, BurstAnswer)>,
+    answers: HashMap<(String, String, AuthTarget), AuthorizeOutcome>,
+    bursts: HashMap<(String, String, AuthTarget), (u64, BurstAnswer)>,
 }
 
 impl std::fmt::Debug for CycleCache {
@@ -177,16 +180,29 @@ impl CycleCache {
         Self::default()
     }
     /// The answer stored for this cycle, `None` for another cycle's.
-    pub fn get(&self, sub: &str, target: &AuthTarget, cycle: u64) -> Option<AuthorizeOutcome> {
+    pub fn get(
+        &self,
+        sub: &str,
+        sid: &str,
+        target: &AuthTarget,
+        cycle: u64,
+    ) -> Option<AuthorizeOutcome> {
         if cycle != self.cycle {
             return None;
         }
         self.answers
-            .get(&(sub.to_string(), target.clone()))
+            .get(&(sub.to_string(), sid.to_string(), target.clone()))
             .cloned()
     }
     /// Stores an answer; a new cycle drops every older one.
-    pub fn put(&mut self, sub: &str, target: &AuthTarget, cycle: u64, outcome: AuthorizeOutcome) {
+    pub fn put(
+        &mut self,
+        sub: &str,
+        sid: &str,
+        target: &AuthTarget,
+        cycle: u64,
+        outcome: AuthorizeOutcome,
+    ) {
         if cycle < self.cycle {
             return;
         }
@@ -195,19 +211,20 @@ impl CycleCache {
             self.cycle = cycle;
         }
         self.answers
-            .insert((sub.to_string(), target.clone()), outcome);
+            .insert((sub.to_string(), sid.to_string(), target.clone()), outcome);
     }
-    /// The answer of access burst `burst` for (sub, target): the one in flight or given, or
-    /// `ask`'s (started now, replacing an older burst's). Every socket of the member awaits the
-    /// same call.
+    /// The answer of access burst `burst` for (sub, sid, target): the one in flight or given,
+    /// or `ask`'s (started now, replacing an older burst's). Every socket of the member's
+    /// session awaits the same call.
     pub fn burst(
         &mut self,
         sub: &str,
+        sid: &str,
         target: &AuthTarget,
         burst: u64,
         ask: impl FnOnce() -> BoxFuture<'static, AuthorizeOutcome>,
     ) -> BurstAnswer {
-        let key = (sub.to_string(), target.clone());
+        let key = (sub.to_string(), sid.to_string(), target.clone());
         match self.bursts.get(&key) {
             Some((b, answer)) if *b == burst => answer.clone(),
             _ => {
@@ -220,7 +237,7 @@ impl CycleCache {
     /// Forgets the burst answers of `sub` older than `burst` (a member whose sockets are gone
     /// keeps nothing for long: called with each new burst).
     pub fn prune_bursts(&mut self, sub: &str, burst: u64) {
-        self.bursts.retain(|(s, _), (b, _)| s != sub || *b >= burst);
+        self.bursts.retain(|(s, _, _), (b, _)| s != sub || *b >= burst);
     }
     pub fn len(&self) -> usize {
         self.answers.len()

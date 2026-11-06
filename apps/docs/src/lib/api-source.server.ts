@@ -54,9 +54,9 @@ async function build() {
       baseUrl: docsRoute,
       plugins: [
         lucideIconsPlugin(),
+        // One is enough: it labels every OpenAPI page, whichever document made it. One per document
+        // labelled each operation in the sidebar once per document.
         apis.management.loaderPlugin(),
-        apis.login.loaderPlugin(),
-        apis.data.loaderPlugin(),
       ],
     },
   );

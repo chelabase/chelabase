@@ -1,6 +1,6 @@
 //! Gateway-minted internal identity tokens.
 //!
-//! The gateway verifies an external credential (a Zitadel JWT today), then
+//! The gateway verifies an external credential (a member token or a data key), then
 //! signs a short-lived EdDSA JWT describing the caller for exactly one
 //! upstream service (`aud`). Services verify it with the gateway's public key
 //! and never talk to the identity provider. Asymmetric keys mean a service can
@@ -58,12 +58,10 @@ pub struct DataIdentity {
     pub server_vouched: bool,
 }
 
-/// The caller, as established by the gateway. For a data key, `sub` is the key id and
-/// `org_id` is empty.
+/// The caller, as established by the gateway. For a data key, `sub` is the key id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub sub: String,
-    pub org_id: String,
     pub auth: AuthMethod,
     pub request_id: String,
     pub data: Option<DataIdentity>,
@@ -80,7 +78,9 @@ pub struct InternalClaims {
     pub iat: u64,
     pub exp: u64,
     pub sub: String,
-    pub org_id: String,
+    /// The member's tenant, from a member token's `tid` (#119). `None` for a data key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     pub auth: AuthMethod,
     /// Gateway request id, for following one request across services.
     pub rid: String,
@@ -90,6 +90,10 @@ pub struct InternalClaims {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The member token's identity session (`sid`): the orchestrator checks it is still live.
+    /// Always set with `tenant_id`; `None` for a data key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 pub struct InternalSigner {
@@ -124,13 +128,42 @@ impl InternalSigner {
         identity: &Identity,
         issued_at: u64,
     ) -> Result<String, AuthError> {
+        self.sign_claims(audience, identity, None, issued_at)
+    }
+
+    /// Sign for a member whose token named `tenant` (`tid`, #119) and identity session `sid`;
+    /// never the nil tenant, never an empty session.
+    pub fn sign_for_tenant(
+        &self,
+        audience: &str,
+        identity: &Identity,
+        tenant: Uuid,
+        sid: &str,
+    ) -> Result<String, AuthError> {
+        if tenant.is_nil() {
+            return Err(AuthError::Config("a member identity names a tenant".into()));
+        }
+        if sid.trim().is_empty() {
+            return Err(AuthError::Config("a member identity names its session".into()));
+        }
+        self.sign_claims(audience, identity, Some((tenant, sid)), now_secs())
+    }
+
+    fn sign_claims(
+        &self,
+        audience: &str,
+        identity: &Identity,
+        member: Option<(Uuid, &str)>,
+        issued_at: u64,
+    ) -> Result<String, AuthError> {
         let claims = InternalClaims {
+            tenant_id: member.map(|(tenant, _)| tenant),
+            sid: member.map(|(_, sid)| sid.to_string()),
             iss: INTERNAL_ISSUER.to_string(),
             aud: audience.to_string(),
             iat: issued_at,
             exp: issued_at + INTERNAL_TOKEN_TTL_SECS,
             sub: identity.sub.clone(),
-            org_id: identity.org_id.clone(),
             auth: identity.auth,
             rid: identity.request_id.clone(),
             data: identity.data.clone(),
@@ -174,9 +207,14 @@ impl InternalVerifier {
         validation.set_audience(&[audience]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.leeway = LEEWAY_SECS;
-        decode::<InternalClaims>(token, &self.key, &validation)
+        let claims = decode::<InternalClaims>(token, &self.key, &validation)
             .map(|data| data.claims)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+        // #119: a member never names the nil tenant.
+        if claims.tenant_id.is_some_and(|t| t.is_nil()) {
+            return Err(AuthError::InvalidToken("an identity names the nil tenant".into()));
+        }
+        Ok(claims)
     }
 }
 

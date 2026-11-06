@@ -472,7 +472,6 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_LANDING_HOST_NAME", "landing.feat-x.chelabase.localhost"),
         ("CHELABASE_PUBLIC_PORT", "8137"),
         ("CHELABASE_PUBLIC_SECURE", "false"),
-        ("CHELABASE_ZITADEL_TLS_MODE", "disabled"),
         ("CHELABASE_ENTRY_STUDIO_URL", "http://studio.feat-x.chelabase.localhost:8137"),
         ("CHELABASE_ENTRY_API_URL", "http://api.feat-x.chelabase.localhost:8137"),
         ("CHELABASE_ENTRY_AUTH_URL", "http://auth.feat-x.chelabase.localhost:8137"),
@@ -497,7 +496,6 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_AUTH_URL", "http://auth:8084"),
         ("CHELABASE_REST_URL", "http://rest:8085"),
         ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
-        ("CHELABASE_ZITADEL_UPSTREAM", "http://zitadel:8080"),
         ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
         ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
         ("CHELABASE_LANDING_UPSTREAM", "http://landing:3002"),
@@ -512,11 +510,7 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083"),
         // RT1 T1 (P4/W14): computes get the stack's own network.
         ("CHELABASE_COMPUTE_NETWORK", "chelabase-feat-x_compute"),
-        (
-            "CHELABASE_ZITADEL_ACTIONS_ENDPOINT",
-            "http://orchestrator:8083/internal/zitadel/events",
-        ),
-        ("CHELABASE_ZITADEL_DIR", "/m/.chelabase/stacks/feat-x/zitadel"),
+        ("CHELABASE_BOOTSTRAP_DIR", "/m/.chelabase/stacks/feat-x/bootstrap"),
         ("CHELABASE_SECRETS_DIR", "/m/.chelabase/secrets"),
         ("CHELABASE_AUTH_DIR", "/m/.chelabase/auth"),
         ("CHELABASE_NEON_DIR", "/m/.chelabase/neon"),
@@ -589,7 +583,6 @@ fn an_https_example_makes_a_secure_stack() {
     let env = parse(&render_stack_env(&example, &input()));
     assert_eq!(env["CHELABASE_PUBLIC_SCHEME"], "https");
     assert_eq!(env["CHELABASE_PUBLIC_SECURE"], "true");
-    assert_eq!(env["CHELABASE_ZITADEL_TLS_MODE"], "external");
     assert_eq!(
         env["CHELABASE_ENTRY_API_URL"],
         "https://api.feat-x.chelabase.localhost:8137"
@@ -778,16 +771,30 @@ fn the_stack_env_carries_realtimes_addresses() {
     }
 }
 
-// `up` builds, records and restarts realtime with the other Rust apps; it starts after the first
-// bootstrap with the late apps and reads demo.env (the OIDC audiences) like the gateway.
+// `up` builds, records and restarts realtime with the other Rust apps; it starts with the late
+// apps.
 #[test]
 fn realtime_is_one_of_the_stacks_rust_apps() {
-    use super::commands::{APPS, DEMO_ENV_READERS, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    use super::commands::{APPS, INFRA, LATE_APPS, RUST_APPS, restart_targets};
     assert!(RUST_APPS.contains(&"realtime"), "{RUST_APPS:?}");
     assert!(APPS.contains(&"realtime"), "{APPS:?}");
     assert!(LATE_APPS.contains(&"realtime"), "{LATE_APPS:?}");
-    assert!(DEMO_ENV_READERS.contains(&"realtime"), "{DEMO_ENV_READERS:?}");
     assert!(!INFRA.contains(&"realtime"));
     assert!(restart_targets(&[]).unwrap().contains(&"realtime".to_string()), "restart with no app named");
     assert_eq!(restart_targets(&["realtime".into()]).unwrap(), ["realtime"]);
+}
+
+// auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be
+// healthy before the bootstrap (which creates its members pool through it); it is an app of the
+// stack (restartable, checked by `test --stack`), not a Rust app (no binary).
+#[test]
+fn identity_starts_before_the_bootstrap() {
+    use super::commands::{APPS, FRONT, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    assert!(FRONT.contains(&"identity"), "{FRONT:?}");
+    assert!(APPS.contains(&"identity"), "{APPS:?}");
+    assert!(!LATE_APPS.contains(&"identity"), "{LATE_APPS:?}");
+    assert!(!RUST_APPS.contains(&"identity"), "{RUST_APPS:?}");
+    assert!(!INFRA.contains(&"identity"));
+    assert_eq!(restart_targets(&["identity".into()]).unwrap(), ["identity"]);
+    assert!(!restart_targets(&[]).unwrap().contains(&"identity".to_string()));
 }

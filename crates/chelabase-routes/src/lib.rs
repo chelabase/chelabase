@@ -87,7 +87,7 @@ pub enum Scope {
 pub enum Auth {
     /// No credential required.
     Public,
-    /// Zitadel-issued management token (developers / operators).
+    /// A member access token from `POST /auth/v1/token` (Studio, the CLI).
     Management,
     /// A data API key of either kind (`chk_pub_` or `chk_sec_`).
     DataKey,
@@ -731,7 +731,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Removes a member: grants gone, Zitadel user deactivated, sessions ended.
+    /// Removes a member: grants gone, identity user banned, sessions ended.
     pub const REMOVE_MEMBER: Endpoint = key_endpoint(
         "orchestrator.remove_member",
         Method::Delete,
@@ -747,7 +747,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Declines a pending sign-up: removed, its Zitadel user deactivated (R40).
+    /// Declines a pending sign-up: removed, its identity user banned (R40).
     pub const DECLINE_MEMBER: Endpoint = key_endpoint(
         "orchestrator.decline_member",
         Method::Post,
@@ -767,7 +767,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Revokes an open invite (the never-activated Zitadel user is deleted).
+    /// Revokes an open invite (the never-activated identity user is deleted).
     pub const REVOKE_INVITE: Endpoint = key_endpoint(
         "orchestrator.revoke_invite",
         Method::Delete,
@@ -851,7 +851,7 @@ pub mod orchestrator {
         Access::Instance,
     );
 
-    /// Whether Zitadel can email invites (an active email provider).
+    /// Whether identity can email invites (SMTP is configured).
     pub const GET_INVITE_DELIVERY: Endpoint = key_endpoint(
         "orchestrator.get_invite_delivery",
         Method::Get,
@@ -905,7 +905,7 @@ pub mod orchestrator {
         Access::TenantMember,
     );
 
-    /// Suspends a member (D5): refused everywhere, logins revoked, Zitadel user locked.
+    /// Suspends a member (D5): refused everywhere, logins revoked, identity user banned.
     pub const SUSPEND_MEMBER: Endpoint = key_endpoint(
         "orchestrator.suspend_member",
         Method::Post,
@@ -1145,14 +1145,15 @@ pub mod auth {
         }
     }
 
-    pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
     /// Whether the instance is unclaimed (the sign-up page asks for the setup code).
     pub const INSTANCE: Endpoint = Endpoint { method: Method::Get, ..post("auth.instance", "/auth/v1/instance") };
-    /// Studio's runtime config (its Zitadel ids and public URLs), read before it mounts.
+    /// Studio's runtime config (its public URLs), read before it mounts.
     pub const STUDIO_CONFIG: Endpoint =
         Endpoint { method: Method::Get, ..post("auth.studio_config", "/auth/v1/studio-config") };
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
+    /// A member access token from the session cookie. Public here: auth checks the cookie.
+    pub const TOKEN: Endpoint = post("auth.token", "/auth/v1/token");
     pub const ACCEPT_INVITE: Endpoint = post("auth.accept_invite", "/auth/v1/accept-invite");
     /// Who invited the visitor and to what, for the accept page (`{user, t}` in the body, never a URL). Public: the link's
     /// token is the credential.
@@ -1464,7 +1465,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     rest::QUERY,
     rest::SCHEMA,
     rest::TYPES,
-    auth::AUTH_REQUEST,
+    auth::TOKEN,
     auth::INSTANCE,
     auth::STUDIO_CONFIG,
     auth::SIGN_IN,
@@ -2410,7 +2411,7 @@ mod tests {
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.
-            ("auth.auth_request", Access::Public),
+            ("auth.token", Access::Public),
             ("auth.instance", Access::Public),
             ("auth.studio_config", Access::Public),
             ("auth.sign_in", Access::Public),

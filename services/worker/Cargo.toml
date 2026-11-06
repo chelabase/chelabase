@@ -24,7 +24,7 @@ chelabase-neon = { workspace = true, features = ["metadata"] }
 chelabase-nats = { workspace = true }
 chelabase-schema = { workspace = true }
 chelabase-types = { workspace = true }
-chelabase-zitadel = { workspace = true }
+chelabase-identity = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -57,7 +57,7 @@ sqlx = { workspace = true }
 base64 = { workspace = true }
 proptest = { workspace = true }
 chelabase-neon = { workspace = true, features = ["fake"] }
-chelabase-zitadel = { workspace = true, features = ["mock"] }
+chelabase-identity = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }
 # The storage API live tests: the object store's blobs, and streamed (throttled, failing,
 # stalled) upload bodies.

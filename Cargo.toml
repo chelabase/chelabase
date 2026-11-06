@@ -20,7 +20,7 @@ members = [
     "crates/chelabase-neon",
     "crates/chelabase-query",
     "crates/chelabase-schema",
-    "crates/chelabase-zitadel",
+    "crates/chelabase-identity",
     "crates/chelabase-init",
     "crates/chelabase-http",
     "crates/chelabase-typegen",
@@ -45,7 +45,7 @@ chelabase-neon = { path = "crates/chelabase-neon" }
 chelabase-query = { path = "crates/chelabase-query" }
 chelabase-http = { path = "crates/chelabase-http" }
 chelabase-schema = { path = "crates/chelabase-schema" }
-chelabase-zitadel = { path = "crates/chelabase-zitadel" }
+chelabase-identity = { path = "crates/chelabase-identity" }
 chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
 chelabase-storage = { path = "crates/chelabase-storage" }

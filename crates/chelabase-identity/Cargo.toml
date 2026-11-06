@@ -1,0 +1,28 @@
+[package]
+name = "chelabase-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed client for the identity service and an in-memory fake of it for tests"
+
+[features]
+# An in-memory stand-in for the identity service's HTTP API (axum), for tests.
+mock = ["dep:axum", "dep:tokio"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+chelabase-http = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chelabase-http = { workspace = true }
+tokio = { workspace = true }
+# Enables the fake for this crate's own tests.
+chelabase-identity = { path = ".", features = ["mock"] }

@@ -38,6 +38,8 @@ use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole, PlatformRo
 /// The test identity's subject: the default caller, an active tenant admin of every tenant
 /// `bind_org` binds (so tests written before members keep their meaning).
 const DEFAULT_SUB: &str = "user-1";
+/// The identity session every test token names (review fix 1).
+const DEFAULT_SID: &str = "00000000-0000-4000-8000-00000000051d";
 
 type KeyRow = (DataKeyRecord, [u8; 32]);
 /// A key store, a key id and the role name it takes.
@@ -83,6 +85,10 @@ struct FakeMetadata {
     /// Calls to `project_auth` and to `project_auth_statuses`.
     /// `revoke_user_sessions` fails while set.
     fail_revoke: Arc<Mutex<bool>>,
+    /// Makes the offboarding write of a removal fail.
+    fail_offboard: Arc<Mutex<bool>>,
+    /// Makes `other_memberships` fail.
+    fail_other_memberships: Arc<Mutex<bool>>,
     project_auth_reads: Arc<AtomicUsize>,
     project_auth_batch_reads: Arc<AtomicUsize>,
     /// Saved queries with their (database, user).
@@ -107,7 +113,7 @@ struct FakeMetadata {
     /// fills it, the fake does to test the per-role levels, T2).
     #[allow(clippy::type_complexity)]
     team_grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), Vec<Grant>>>>,
-    /// Reads of a member row (`member_by_zitadel` and `admit_member` each read it once).
+    /// Reads of a member row (`member_by_identity_user` and `admit_member` each read it once).
     member_reads: Arc<AtomicUsize>,
     /// Reads of a branch's roles (`list_roles`).
     role_reads: Arc<AtomicUsize>,
@@ -185,7 +191,7 @@ struct FakeLogin {
 struct FakeInvite {
     id: uuid::Uuid,
     member_id: uuid::Uuid,
-    zitadel_user_id: String,
+    identity_user_id: String,
     expires_at: chrono::DateTime<chrono::Utc>,
     /// SHA-256 of the link's token.
     token_hash: [u8; 32],
@@ -256,7 +262,8 @@ fn main_for(record: &DatabaseRecord) -> BranchRecord {
 }
 
 impl FakeMetadata {
-    /// Binds the org to the tenant; the default caller becomes an active tenant admin there.
+    /// Test-only: names `tenant_id` by a short label the request helpers take (`token_for`,
+    /// `send_as`); the default caller becomes an active tenant admin there.
     fn bind_org(&self, org_id: &str, tenant_id: TenantId) {
         self.tenants_by_org
             .lock()
@@ -273,7 +280,7 @@ impl FakeMetadata {
             .lock()
             .unwrap()
             .iter()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == sub)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == sub)
             .cloned()
     }
 
@@ -284,7 +291,7 @@ impl FakeMetadata {
         self.members.lock().unwrap().push(MemberRecord {
             id,
             tenant_id: tenant,
-            zitadel_user_id: sub.into(),
+            identity_user_id: sub.into(),
             email: Some(format!("{sub}@example.test")),
             display_name: sub.into(),
             tenant_admin,
@@ -324,36 +331,31 @@ impl FakeMetadata {
         let mut members = self.members.lock().unwrap();
         let m = members
             .iter_mut()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == sub)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == sub)
             .expect("member");
         change(m);
     }
 
     /// An open invite for `member` (an `invited` one the test made with `add_member`).
     fn add_open_invite(&self, member: uuid::Uuid) {
-        let zitadel_user_id = self
+        let identity_user_id = self
             .members
             .lock()
             .unwrap()
             .iter()
             .find(|m| m.id == member)
             .expect("member")
-            .zitadel_user_id
+            .identity_user_id
             .clone();
         self.invites.lock().unwrap().push(FakeInvite {
             id: uuid::Uuid::new_v4(),
             member_id: member,
-            zitadel_user_id,
+            identity_user_id,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(72),
             token_hash: [3; 32],
             revoked: false,
             accepted: false,
         });
-    }
-
-    /// Sets (or clears) when the tenant's admin was claimed.
-    fn set_setup_claim(&self, tenant: TenantId, user: &str) {
-        self.setup_claims.lock().unwrap().insert(tenant, user.into());
     }
 
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
@@ -614,11 +616,12 @@ fn sample_database(tenant_id: TenantId) -> Db {
 }
 
 impl MetadataPort for FakeMetadata {
-    async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        Ok(self.tenants_by_org.lock().unwrap().get(zitadel_org_id).copied())
+
+    /// #119: a tenant exists once it has a label, has members or has an overview.
+    async fn tenant_exists(&self, tenant: TenantId) -> Result<bool, MetadataError> {
+        Ok(self.tenants_by_org.lock().unwrap().values().any(|t| *t == tenant)
+            || self.members.lock().unwrap().iter().any(|m| m.tenant_id == tenant)
+            || self.overviews.lock().unwrap().contains_key(&tenant))
     }
 
     async fn insert_database_pending(
@@ -1440,7 +1443,8 @@ impl MetadataPort for FakeMetadata {
                 && existing.pg_database == new.pg_database
                 && existing.schema_name == new.schema_name
                 && existing.table_name == new.table_name;
-            if existing.status == AppUsersStatus::Failed && same {
+            let on_hold = existing.status == AppUsersStatus::Disabling && existing.error.is_some();
+            if (existing.status == AppUsersStatus::Failed || on_hold) && same {
                 existing.status = AppUsersStatus::Enabling;
                 existing.error = None;
                 existing.email_verification = new.email_verification;
@@ -1456,7 +1460,6 @@ impl MetadataPort for FakeMetadata {
                 project_id: new.project_id,
                 status: AppUsersStatus::Enabling,
                 error: None,
-                zitadel_org_id: None,
                 database_id: new.database_id,
                 pg_database: new.pg_database.to_string(),
                 schema_name: new.schema_name.to_string(),
@@ -1840,9 +1843,9 @@ impl MetadataPort for FakeMetadata {
         Ok(self.busy(branch))
     }
 
-    async fn member_by_zitadel(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<Option<MemberRecord>, MetadataError> {
+    async fn member_by_identity_user(&self, tenant: TenantId, identity_user_id: &str) -> Result<Option<MemberRecord>, MetadataError> {
         self.member_reads.fetch_add(1, Ordering::SeqCst);
-        Ok(self.member(tenant, zitadel_user_id))
+        Ok(self.member(tenant, identity_user_id))
     }
 
     /// As the real one: a removed or pending member is returned as is, an invited one is
@@ -1851,7 +1854,7 @@ impl MetadataPort for FakeMetadata {
     async fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: chelabase_metadata::members::Admission,
@@ -1860,7 +1863,7 @@ impl MetadataPort for FakeMetadata {
         self.member_reads.fetch_add(1, Ordering::SeqCst);
         let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
         let mut members = self.members.lock().unwrap();
-        if let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id) {
+        if let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id) {
             // S6: a suspended member is returned as is, like a removed or pending one.
             if !matches!(m.status, MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended) {
                 if m.status == MemberStatus::Invited {
@@ -1890,7 +1893,7 @@ impl MetadataPort for FakeMetadata {
             .iter()
             .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin);
         let bound = self.setup_claims.lock().unwrap().get(&tenant).cloned();
-        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == zitadel_user_id);
+        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == identity_user_id);
         let status = match (claims, admission) {
             (true, _) | (false, Admission::Active) => MemberStatus::Active,
             (false, Admission::Pending) => MemberStatus::Pending,
@@ -1899,7 +1902,7 @@ impl MetadataPort for FakeMetadata {
         let record = MemberRecord {
             id: uuid::Uuid::new_v4(),
             tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             email,
             display_name: name.into(),
             tenant_admin: claims,
@@ -2606,16 +2609,6 @@ impl FakeCache {
     }
 }
 
-/// A verifier for apps that don't test realtime: its JWKS URL is the discard port.
-fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
-    chelabase_auth::ZitadelAuthConfig {
-        issuer: "http://issuer.invalid".into(),
-        jwks_url: "http://127.0.0.1:9/oauth/v2/keys".into(),
-        jwks_host: None,
-        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
-    }
-}
-
 /// A running orchestrator plus the signer standing in for the gateway.
 struct TestApp {
     base: String,
@@ -2635,24 +2628,34 @@ struct TestApp {
 }
 
 impl TestApp {
-    /// An internal identity token for `org_id`, as the gateway would mint it.
+    /// An internal identity token for the default caller in the tenant labelled `org_id`, as
+    /// the gateway mints it from a member token.
     fn token_for_org(&self, org_id: &str) -> String {
-        self.signer
-            .sign(Service::Orchestrator.name(), &identity(org_id))
-            .unwrap()
+        self.token_for(DEFAULT_SUB, org_id)
     }
 
-    /// An internal identity token for person `sub` in `org_id`.
+    /// An internal identity token for person `sub` in the tenant labelled `org_id`
+    /// ([`FakeMetadata::bind_org`]); an unknown label names no tenant (the orchestrator answers
+    /// 401).
     fn token_for(&self, sub: &str, org_id: &str) -> String {
-        self.signer
-            .sign(Service::Orchestrator.name(), &identity_of(sub, org_id))
-            .unwrap()
+        let tenant = self.state.metadata.tenants_by_org.lock().unwrap().get(org_id).copied();
+        self.sign(&identity_of(sub), tenant)
     }
 
-    /// Sends a request with this identity.
+    /// The gateway's internal token for `identity` in `tenant` (`None`: no tenant).
+    fn sign(&self, identity: &Identity, tenant: Option<TenantId>) -> String {
+        match tenant {
+            Some(t) => self.signer.sign_for_tenant(Service::Orchestrator.name(), identity, t.as_uuid(), DEFAULT_SID),
+            None => self.signer.sign(Service::Orchestrator.name(), identity),
+        }
+        .unwrap()
+    }
+
+    /// Sends a request with this identity, in the tenant labelled `org_id`.
     #[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
-    async fn send_identity(&self, identity: &Identity, method: Method, path: &str) -> reqwest::Response {
-        let token = self.signer.sign(Service::Orchestrator.name(), identity).unwrap();
+    async fn send_identity(&self, identity: &Identity, org_id: &str, method: Method, path: &str) -> reqwest::Response {
+        let tenant = self.state.metadata.tenants_by_org.lock().unwrap().get(org_id).copied();
+        let token = self.sign(identity, tenant);
         reqwest::Client::new()
             .request(method, format!("{}{path}", self.base))
             .header(IDENTITY_HEADER, token)
@@ -2674,15 +2677,10 @@ impl TestApp {
     }
 }
 
-fn identity(org_id: &str) -> Identity {
-    identity_of(DEFAULT_SUB, org_id)
-}
-
-/// The identity of person `sub` in `org_id`, with an email and name claim.
-fn identity_of(sub: &str, org_id: &str) -> Identity {
+/// The identity of person `sub`, with an email and name claim.
+fn identity_of(sub: &str) -> Identity {
     Identity {
         sub: sub.into(),
-        org_id: org_id.into(),
         auth: AuthMethod::ManagementJwt,
         request_id: "test-rid".into(),
         data: None,
@@ -2715,7 +2713,6 @@ async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, 
         rest_url,
         mode,
         cap,
-        None,
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
     )
     .await
@@ -2727,10 +2724,9 @@ async fn spawn_app_parts(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
 ) -> TestApp {
-    spawn_app_custom(metadata, jobs, rest_url, mode, cap, zitadel, users_db, None).await
+    spawn_app_custom(metadata, jobs, rest_url, mode, cap, users_db).await
 }
 
 /// The path of a probe route that only passes the `Instance` access check (no instance route
@@ -2741,20 +2737,16 @@ async fn instance_probe(principal: orchestrator::InstancePrincipal) -> String {
     principal.sub
 }
 
-/// Like [`spawn_app_parts`], with `CHELABASE_OPERATOR_ORG_ID` set and the instance probe route.
-#[allow(clippy::too_many_arguments)]
+/// Like [`spawn_app_parts`], with the instance probe route.
 async fn spawn_app_custom(
     metadata: FakeMetadata,
     jobs: FakeJobs,
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
 ) -> TestApp {
-    spawn_app_with_compute_tls(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, None)
-        .await
+    spawn_app_with_compute_tls(metadata, jobs, rest_url, mode, cap, users_db, None).await
 }
 
 /// Like [`spawn_app_custom`], with the orchestrator's compute client pair (`None`: plain
@@ -2766,35 +2758,31 @@ async fn spawn_app_with_compute_tls(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
 ) -> TestApp {
-    spawn_app_core(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, unused_oidc())
-        .await
+    spawn_app_core(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None).await
 }
 
-/// RT1 T6: an app whose realtime routes verify members' tokens against `oidc` (a mock JWKS).
+/// An app whose app-user admin routes call `identity_service` (the fake's client, or `None`),
+/// with the users-table writer and the compute client pair given.
 #[allow(dead_code)]
-async fn spawn_app_oidc(
+async fn spawn_app_identity(
     metadata: FakeMetadata,
     jobs: FakeJobs,
-    rest_url: &str,
-    mode: Mode,
-    oidc: chelabase_auth::ZitadelAuthConfig,
+    identity_service: Option<chelabase_identity::Identity>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
 ) -> TestApp {
     spawn_app_core(
         metadata,
         jobs,
-        rest_url,
-        mode,
+        "http://127.0.0.1:9",
+        Mode::SelfHosted,
         10,
-        None,
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-        None,
-        oidc,
+        users_db,
+        compute_tls,
+        identity_service,
     )
     .await
 }
@@ -2806,11 +2794,81 @@ async fn spawn_app_core(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
-    oidc: chelabase_auth::ZitadelAuthConfig,
+    identity_service: Option<chelabase_identity::Identity>,
+) -> TestApp {
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None, None, identity_service, None)
+        .await
+}
+
+/// #119: an app whose realtime routes take member tokens checked by `members`.
+#[allow(dead_code)]
+async fn spawn_app_member_tokens(
+    metadata: FakeMetadata,
+    mode: Mode,
+    members: chelabase_auth::member_token::MemberTokenVerifier,
+) -> TestApp {
+    spawn_app_member_tokens_with(metadata, FakeJobs::default(), "http://127.0.0.1:9", mode, members).await
+}
+
+/// [`spawn_app_member_tokens`] with the jobs and rest given.
+#[allow(dead_code)]
+async fn spawn_app_member_tokens_with(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    members: chelabase_auth::member_token::MemberTokenVerifier,
+) -> TestApp {
+    spawn_app_core_with(
+        metadata,
+        jobs,
+        rest_url,
+        mode,
+        10,
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        None,
+        None,
+        Some(members),
+        None,
+        None,
+    )
+    .await
+}
+
+/// #119: an app whose platform operator tenant (`CHELABASE_OPERATOR_TENANT_ID`) is `tenant`.
+#[allow(dead_code)]
+async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: Option<TenantId>) -> TestApp {
+    spawn_app_core_with(
+        metadata,
+        FakeJobs::default(),
+        "http://127.0.0.1:9",
+        mode,
+        10,
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        None,
+        tenant,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_app_core_with(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    cap: u32,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
+    operator_tenant: Option<TenantId>,
+    member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
+    identity_service: Option<chelabase_identity::Identity>,
+    member_sessions: Option<Arc<orchestrator::member_sessions::MemberSessions>>,
 ) -> TestApp {
     let rt_events = FakeRtEvents::default();
     // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in
@@ -2832,12 +2890,14 @@ async fn spawn_app_core(
             http: chelabase_http::client_builder().build().unwrap(),
         },
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
-        operator_org: operator_org.map(str::to_string),
+        operator_tenant,
         proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
         console: Console::default(),
-        zitadel,
+        member_sessions: member_sessions
+            .unwrap_or_else(|| Arc::new(orchestrator::member_sessions::MemberSessions::assume_live())),
+        identity_service,
         users_db,
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
@@ -2845,7 +2905,7 @@ async fn spawn_app_core(
         compute_tls,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: REALTIME_TOKEN.into(),
-            verifier: chelabase_auth::JwtVerifier::new(oidc),
+            member: member_tokens,
         },
         rt_events: Arc::new(rt_events.clone()),
         proxy_cache: Arc::new(cache.clone()),
@@ -3092,7 +3152,7 @@ impl FakeMetadata {
             if i.revoked || i.accepted {
                 return Err(AccessWriteError::Conflict("the invite is no longer open".into()));
             }
-            (i.member_id, i.zitadel_user_id.clone())
+            (i.member_id, i.identity_user_id.clone())
         };
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().unwrap();
         if m.status != MemberStatus::Invited {
@@ -3691,6 +3751,32 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(out)
     }
 
+    async fn revoke_logins_for_identity_user(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        if *self.fail_offboard.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
+        let Some(member) = self.member(tenant, identity_user_id).map(|m| m.id) else {
+            return Ok(Vec::new());
+        };
+        // As the store: the mark first, then every live login, by the offboarding reason.
+        self.members.lock().unwrap().iter_mut().filter(|m| m.id == member).for_each(|m| m.offboarded = true);
+        self.revoke_member_logins(member, chelabase_metadata::personal_logins::RevokeReason::IdentityOffboarded);
+        orchestrator::members::MembersPort::member_login_endpoints(self, member).await
+    }
+
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
+        let mut members = self.members.lock().unwrap();
+        let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id && m.offboarded) else {
+            return Ok(false);
+        };
+        m.offboarded = false;
+        Ok(true)
+    }
+
     async fn member_login_endpoints(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
         let mut out: Vec<_> = self
             .personal_logins
@@ -4038,11 +4124,11 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         new: chelabase_metadata::members::NewInvite<'_>,
     ) -> FakeWrite<(chelabase_metadata::members::MemberListing, uuid::Uuid)> {
         use chelabase_metadata::members::{AccessWriteError, NewInvite};
-        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants, teams } = new;
+        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams } = new;
         // P25: the teams must still be what the check read, or nothing is written.
         self.teams_seen_hold(tenant, teams)?;
         let email = email.trim().to_lowercase();
-        let existing = self.member(tenant, zitadel_user_id);
+        let existing = self.member(tenant, identity_user_id);
         if existing.as_ref().is_some_and(|m| m.status != MemberStatus::Removed) {
             return Err(AccessWriteError::Conflict("already a member".into()));
         }
@@ -4057,13 +4143,15 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         let record = MemberRecord {
             id,
             tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             email: Some(email.clone()),
             display_name: String::new(),
             tenant_admin: false,
             status: MemberStatus::Invited,
             accepted_at: None,
-            offboarded: false, suspended_at: None, suspended_by: None,
+            // As the store: only `clear_offboarded` takes the mark away.
+            offboarded: existing.as_ref().is_some_and(|m| m.offboarded),
+            suspended_at: None, suspended_by: None,
         };
         {
             let mut members = self.members.lock().unwrap();
@@ -4074,7 +4162,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         self.invites.lock().unwrap().push(FakeInvite {
             id: invite,
             member_id: id,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             expires_at,
             token_hash,
             revoked: false,
@@ -4088,54 +4176,6 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             member: record,
         };
         Ok((listing, invite))
-    }
-
-    async fn add_existing_user(
-        &self,
-        actor: uuid::Uuid,
-        tenant: TenantId,
-        zitadel_user_id: &str,
-        email: &str,
-        name: &str,
-        grants: &[(uuid::Uuid, GrantRow)],
-        teams: &[chelabase_metadata::members::TeamSeen],
-    ) -> FakeWrite<chelabase_metadata::members::MemberListing> {
-        use chelabase_metadata::members::AccessWriteError;
-        // P25: the teams must still be what the check read, or nothing is written.
-        self.teams_seen_hold(tenant, teams)?;
-        let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
-        // R29: any row with the user, a removed one included, comes back only by invite code.
-        if self.member(tenant, zitadel_user_id).is_some() {
-            return Err(AccessWriteError::Conflict("already a member, or removed".into()));
-        }
-        let id = uuid::Uuid::new_v4();
-        self.insert_member_grants(tenant, id, grants)?;
-        let record = MemberRecord {
-            id,
-            tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
-            email: email.clone(),
-            display_name: name.into(),
-            tenant_admin: false,
-            status: MemberStatus::Active,
-            accepted_at: Some(chrono::Utc::now()),
-            offboarded: false, suspended_at: None, suspended_by: None,
-        };
-        {
-            let mut members = self.members.lock().unwrap();
-            for m in members.iter_mut().filter(|m| m.tenant_id == tenant && m.id != id && m.email == email) {
-                m.email = None;
-            }
-            members.retain(|m| m.id != id);
-            members.push(record.clone());
-        }
-        self.log(Change::new(tenant, Some(actor), "member_added", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
-        self.add_team_memberships(actor, tenant, id, teams);
-        Ok(chelabase_metadata::members::MemberListing {
-            created_at: self.created_at(record.id),
-            has_access: !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty()),
-            member: record,
-        })
     }
 
     async fn resend_invite(&self, actor: uuid::Uuid, invite: uuid::Uuid, expires_at: chrono::DateTime<chrono::Utc>, token_hash: [u8; 32]) -> FakeWrite<()> {
@@ -4209,12 +4249,19 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         })
     }
 
-    async fn has_other_membership(&self, member: uuid::Uuid) -> Result<bool, MetadataError> {
+    async fn other_memberships(&self, identity_user_id: &str, except: Option<uuid::Uuid>) -> Result<chelabase_metadata::members::OtherMemberships, MetadataError> {
+        if *self.fail_other_memberships.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
         let members = self.members.lock().unwrap();
-        let Some(user) = members.iter().find(|m| m.id == member).map(|m| m.zitadel_user_id.clone()) else {
-            return Ok(false);
-        };
-        Ok(members.iter().any(|m| m.id != member && m.zitadel_user_id == user && m.status != MemberStatus::Removed))
+        let others: Vec<_> = members
+            .iter()
+            .filter(|m| Some(m.id) != except && m.identity_user_id == identity_user_id && m.status != MemberStatus::Removed)
+            .collect();
+        Ok(chelabase_metadata::members::OtherMemberships {
+            active: others.iter().any(|m| m.status == MemberStatus::Active),
+            live: !others.is_empty(),
+        })
     }
 
     async fn decline_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<String> {
@@ -4227,7 +4274,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().status = MemberStatus::Removed;
         self.log(Change::new(m.tenant_id, Some(actor), "member_declined", Some(member)).before(json!({ "status": "pending" })).after(json!({ "status": "removed" })));
-        Ok(m.zitadel_user_id)
+        Ok(m.identity_user_id)
     }
 
     async fn set_tenant_display_name(
@@ -4665,7 +4712,7 @@ impl FakeMetadata {
             .iter()
             .map(|id| {
                 let m = self.members.lock().unwrap().iter().find(|m| m.id == *id).cloned().ok_or(TeamWriteError::MemberNotFound)?;
-                Ok((m.id, m.zitadel_user_id))
+                Ok((m.id, m.identity_user_id))
             })
             .collect::<TeamWriteResult<_>>()?;
         let reached = TeamWrite { changed: false, affected: affected.clone(), projects: projects.clone() };
@@ -4873,4 +4920,22 @@ async fn api_add_to_team(app: &TestApp, team: uuid::Uuid, member: uuid::Uuid) {
     let status = resp.status().as_u16();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     assert_eq!(status, 200, "PUT {path}: {body}");
+}
+
+/// A member token (#119) of `sub` in `tenant` signed with `keys`, living `ttl` seconds from now
+/// (negative: expired that long ago), with an email and name claim.
+#[allow(dead_code)]
+fn signed_member_token(
+    keys: &chelabase_auth::test_support::MemberKeys,
+    sub: &str,
+    tenant: TenantId,
+    ttl: i64,
+) -> String {
+    let mut claims = keys.claims(sub, tenant.as_uuid(), 300);
+    let now = claims.iat;
+    claims.iat = if ttl < 0 { now - 300 } else { now };
+    claims.exp = (now as i64 + ttl) as u64;
+    claims.email = format!("{sub}@mail.test");
+    claims.name = format!("Name of {sub}");
+    keys.sign(&claims)
 }

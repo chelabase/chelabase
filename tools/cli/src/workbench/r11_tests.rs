@@ -4,7 +4,6 @@
 
 use super::env::{StackEnvInput, render_stack_env};
 use super::service_auth::{render_nats_auth, render_valkey_acl, write_auth_files};
-use crate::dev::env_files::{DemoEnv, render_demo_env};
 use crate::dev::stack_secrets;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -458,35 +457,6 @@ fn the_example_sets_no_development_bearer() {
             !PER_SERVICE_KEYS.contains(&k.as_str()),
             ".env.example sets {k}"
         );
-    }
-}
-
-#[test]
-fn demo_env_holds_no_internal_bearer() {
-    let text = render_demo_env(&DemoEnv {
-        issuer: "http://auth.chelabase.localhost:8000",
-        audiences: "p1,c1",
-        org_id: "o",
-        project_id: "p1",
-        api_client_id: "c1",
-        demo_user_id: "u",
-        demo_tenant: "t",
-        signing_key: "/s",
-        verify_key: "/v",
-        secrets_key: "/k",
-        auth_token_file: "/tok",
-        auth_cookie_key: "/cookie",
-        compute_jwt_dir: "/abs/neon",
-        admin_pat_file: "/z/admin.pat",
-        app_jwt_private_key: "/a/k",
-        app_jwt_public_key: "/a/p",
-    });
-    for (k, v) in keys_of(&text) {
-        assert!(
-            !PER_SERVICE_KEYS.contains(&k.as_str()),
-            "{k} is in demo.env"
-        );
-        assert!(!v.contains("chelabase-dev-"), "{k}={v} in demo.env");
     }
 }
 

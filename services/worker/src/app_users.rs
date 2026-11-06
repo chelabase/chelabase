@@ -1,11 +1,13 @@
-//! App users jobs: enabling and disabling a project's app users, syncing users from Zitadel
-//! (the source of truth) into the users table on every live branch of the auth database,
-//! reconcile, and the location check the orchestrator asks for before an enable.
+//! App users jobs: enabling and disabling a project's app users (its identity pool
+//! `app-<project>`), syncing users from the pool (the source of truth) into the users table on
+//! every live branch of the auth database, reconcile, and the location check the orchestrator
+//! asks for before an enable.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
+use chelabase_identity::{Identity, IdentityError, Missing, Pool, User};
 use chelabase_metadata::{
     AppUsersStatus, BranchKind, BranchRecord, BranchStatus, OnDelete, ProjectAuth,
 };
@@ -13,15 +15,14 @@ use chelabase_nats::{AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppU
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
-use chelabase_zitadel::client::{UserState, ZError, ZUser, Zitadel};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::app_users_sql::{
-    USERS_ROWS_SQL, USERS_SYNC_ROLE, USERS_TEARDOWN_SQL, claim_helpers_sql, gone_call_sql,
-    upsert_call_sql, users_bootstrap_sql, users_table_exists_sql,
+    USERS_OUTDATED_SQL, USERS_ROWS_SQL, USERS_SYNC_ROLE, USERS_TEARDOWN_SQL, claim_helpers_sql,
+    gone_call_sql, upsert_call_sql, users_bootstrap_sql, users_table_exists_sql,
 };
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{OWNER_ROLE, Worker, credentials};
@@ -41,13 +42,21 @@ pub struct UserRow {
     pub email: String,
     pub email_verified: bool,
     pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub banned_at: Option<DateTime<Utc>>,
 }
 
-/// The users whose row on one branch differs from Zitadel, in order: users without a row or
-/// with a stale email or verified flag (Zitadel's order), then rows whose user is gone
+/// The project's app-user pool. Only ever built from the project's own id, so a drop can't
+/// name another project's pool.
+pub(crate) fn app_pool(project: ProjectId) -> Pool {
+    Pool::App(project.as_uuid())
+}
+
+/// The users whose row on one branch differs from the pool, in order: users without a row or
+/// with a stale email, verified flag or ban (the pool's order), then rows whose user is gone
 /// (`delete`: every such row; `mark`: those not marked deleted yet). Users whose id isn't a
-/// uuid were made outside Chelabase and are skipped (P15).
-pub fn plan_app_users_sync(users: &[ZUser], rows: &[UserRow], on_delete: OnDelete) -> Vec<Uuid> {
+/// uuid (a pool made before ids were uuids) are skipped (P15).
+pub fn plan_app_users_sync(users: &[User], rows: &[UserRow], on_delete: OnDelete) -> Vec<Uuid> {
     let mut plan = Vec::new();
     let mut known = HashSet::new();
     for user in users {
@@ -58,7 +67,11 @@ pub fn plan_app_users_sync(users: &[ZUser], rows: &[UserRow], on_delete: OnDelet
         let current = rows
             .iter()
             .find(|r| r.id == id)
-            .is_some_and(|r| r.email == user.email && r.email_verified == user.email_verified);
+            .is_some_and(|r| {
+                r.email == user.email
+                    && r.email_verified == user.email_verified
+                    && r.banned_at.is_some() == user.banned
+            });
         if !current {
             plan.push(id);
         }
@@ -88,6 +101,14 @@ fn parse_rows(output: &str) -> anyhow::Result<Vec<UserRow>> {
     serde_json::from_str(line).context("reading the users table's rows")
 }
 
+/// Drops the project's pool. Idempotent: a pool already gone is done.
+pub(crate) async fn drop_pool(identity: &Identity, project: ProjectId) -> Result<(), String> {
+    match identity.drop_pool(&app_pool(project)).await {
+        Ok(()) | Err(IdentityError::NotFound(Missing::Pool)) => Ok(()),
+        Err(e) => Err(format!("dropping the app-user pool: {e}")),
+    }
+}
+
 /// Enabled or still enabling: the users table is (being) installed.
 fn active(auth: &ProjectAuth) -> bool {
     matches!(
@@ -99,10 +120,10 @@ fn active(auth: &ProjectAuth) -> bool {
 impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: SpecPusher>
     Worker<M, S, C, N, P>
 {
-    /// The admin Zitadel client; its absence fails the job, which is retried (P2).
-    fn admin_zitadel(&self) -> Result<&Zitadel, String> {
-        self.zitadel.as_ref().ok_or_else(|| {
-            "Zitadel admin access isn't configured (CHELABASE_AUTH_HOST and CHELABASE_ZITADEL_ADMIN_PAT_FILE)"
+    /// The identity client; its absence fails the job, which is retried (P2).
+    pub(crate) fn identity(&self) -> Result<&Identity, String> {
+        self.identity.as_ref().ok_or_else(|| {
+            "the identity service isn't configured (CHELABASE_IDENTITY_URL and CHELABASE_IDENTITY_TOKEN_FILE)"
                 .to_string()
         })
     }
@@ -238,7 +259,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Enables app users on an `enabling` row. Any failure ends it `failed` and acks (P27);
-    /// only a missing Zitadel client or metadata trouble retries.
+    /// only a missing identity client or metadata trouble retries.
     async fn enable_app_users(&self, project: ProjectId) -> Result<(), String> {
         let auth = self
             .metadata
@@ -248,8 +269,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(auth) = auth.filter(|a| a.status == AppUsersStatus::Enabling) else {
             return Ok(());
         };
-        let zitadel = self.admin_zitadel()?;
-        let outcome = self.enable_steps(&auth, zitadel).await;
+        let identity = self.identity()?;
+        let outcome = self.enable_steps(&auth, identity).await;
         match &outcome {
             Ok(()) => info!(%project, "app users enabled"),
             Err(e) => warn!(%project, "enabling app users failed: {e}"),
@@ -261,17 +282,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| e.to_string())
     }
 
-    async fn enable_steps(&self, auth: &ProjectAuth, zitadel: &Zitadel) -> Result<(), String> {
+    async fn enable_steps(&self, auth: &ProjectAuth, identity: &Identity) -> Result<(), String> {
         let project = auth.project_id;
-        let org = project.to_string();
-        zitadel
-            .ensure_org(&org, &format!("chelabase-app-{org}"))
+        // Idempotent: an enable run again keeps the pool and its users.
+        identity
+            .create_pool(&app_pool(project))
             .await
-            .map_err(|e| format!("creating the Zitadel organization: {e}"))?;
-        self.metadata
-            .set_app_users_org(project, &org)
+            .map_err(|e| format!("creating the app-user pool: {e}"))?;
+        // The project's delete removes the row, then drops the pool: if the row went while this
+        // create was on its way, the pool it made is this job's to drop. Should that fail the
+        // pool stays, empty: nothing can have signed up, and no row names it.
+        let current = self
+            .metadata
+            .project_auth(project)
             .await
-            .map_err(|e| format!("recording the Zitadel organization: {e}"))?;
+            .map_err(|e| e.to_string())?;
+        if current.is_none() {
+            drop_pool(identity, project).await?;
+            return Err("the app users settings were deleted while enabling".to_string());
+        }
         for (branch, ep) in self.live_branches(auth.database_id).await? {
             self.bootstrap_users_on(&branch, &ep, auth)
                 .await
@@ -312,7 +341,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Disables app users on a `disabling` row: the teardown on every live branch, the
-    /// sessions revoked, the org deleted, then the row. Any failure is retried.
+    /// sessions revoked, the pool dropped (idempotent, and only while it holds no users), then
+    /// the row. Any failure is retried.
+    /// The row goes last, so a new enable can't start until the drop is done. Disables can run
+    /// twice at once (the consumer, the periodic pass, a repeated request): the row is read
+    /// again before the drop and only a `disabling` row is deleted, so a slow copy leaves an
+    /// enable that started after the other copy finished alone.
     async fn disable_app_users(&self, project: ProjectId) -> Result<(), String> {
         let auth = self
             .metadata
@@ -322,10 +356,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(auth) = auth.filter(|a| a.status == AppUsersStatus::Disabling) else {
             return Ok(());
         };
-        let zitadel = match &auth.zitadel_org_id {
-            Some(_) => Some(self.admin_zitadel()?),
-            None => None,
-        };
+        let identity = self.identity()?;
         for (branch, ep) in self.live_branches(auth.database_id).await? {
             self.computes
                 .admin_sql(&ep, &auth.pg_database, USERS_TEARDOWN_SQL)
@@ -336,23 +367,71 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .revoke_project_sessions(project)
             .await
             .map_err(|e| format!("revoking the app sessions: {e}"))?;
-        if let (Some(org), Some(zitadel)) = (&auth.zitadel_org_id, zitadel) {
-            zitadel
-                .delete_org(org)
-                .await
-                .map_err(|e| format!("deleting the Zitadel organization: {e}"))?;
-        }
-        self.metadata
-            .delete_project_auth(project)
+        let current = self
+            .metadata
+            .project_auth(project)
             .await
             .map_err(|e| e.to_string())?;
-        info!(%project, "app users disabled");
+        if current.is_none_or(|a| a.status != AppUsersStatus::Disabling) {
+            return Ok(());
+        }
+        // Review S5: the orchestrator checked the pool was empty before the disable began, but
+        // a sign-up that raced it can still have made a user. The drop is irreversible, so the
+        // pool is counted again: one with users is kept, and the row stays `disabling` with the
+        // reason (acked: a retry can't empty it; the periodic pass tries again).
+        match identity.list_users(&app_pool(project), 1, 0).await {
+            Ok(page) if page.total > 0 => {
+                let error = format!(
+                    "the app-user pool {} still holds {} user(s), who signed up while app users were being disabled; the pool is kept. Enable app users again, delete those users, then disable",
+                    app_pool(project),
+                    page.total
+                );
+                warn!(%project, "{error}");
+                return self
+                    .metadata
+                    .set_app_users_error(project, Some(&error))
+                    .await
+                    .map_err(|e| e.to_string());
+            }
+            Ok(_) | Err(IdentityError::NotFound(Missing::Pool)) => {}
+            Err(e) => return Err(format!("counting the app-user pool's users before the drop: {e}")),
+        }
+        drop_pool(identity, project).await?;
+        let finished = self
+            .metadata
+            .finish_disable_app_users(project)
+            .await
+            .map_err(|e| e.to_string())?;
+        if finished {
+            info!(%project, "app users disabled");
+        } else {
+            // The residual window: a finished copy plus a new enable took the row between the
+            // re-read and the drop, so the drop may have hit the enable's pool. Reconcile
+            // records a pool gone from an `enabled` row (`pool_gone`).
+            warn!(%project, "the app users row changed under the disable after its re-read; its pool drop may have hit a newer enable's pool");
+        }
         Ok(())
     }
 
-    /// Applies one user's Zitadel state to the users table on every live branch of the auth
-    /// database (state-based, so duplicates and reordering are harmless). A branch that fails
-    /// is logged and left to reconcile; only Zitadel or metadata trouble retries.
+    /// An `enabled` project whose pool is gone from the identity service (the disable/enable
+    /// window above, or a pool dropped by hand): no retry can bring it back, so the job is
+    /// acked with the error on the row, where `GET …/app-users` and Studio show it, and in
+    /// the log. A pool back in place clears it on the next reconcile pass.
+    async fn pool_gone(&self, project: ProjectId) -> Result<(), String> {
+        let error = format!(
+            "the app-user pool {} is gone from the identity service; its users can't sign in or be synced",
+            app_pool(project)
+        );
+        error!(%project, "{error}");
+        self.metadata
+            .set_app_users_error(project, Some(&error))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Applies one user's state in the pool to the users table on every live branch of the
+    /// auth database (state-based, so duplicates and reordering are harmless). A branch that
+    /// fails is logged and left to reconcile; only identity or metadata trouble retries.
     pub async fn handle_app_users_sync(&self, job: &AppUsersSyncJob) -> Result<(), String> {
         self.sync_user(job, None).await
     }
@@ -371,27 +450,30 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(auth) = auth.filter(active) else {
             return Ok(());
         };
-        let Some(org) = auth.zitadel_org_id.as_deref() else {
-            return Ok(());
-        };
-        let zitadel = self.admin_zitadel()?;
+        let identity = self.identity()?;
         let user_id = job.user_id;
-        let user = zitadel
-            .get_user(&user_id.to_string())
+        // Read in this project's pool only: a user of another pool is not found here.
+        let user = match identity
+            .get_user(&app_pool(job.project_id), &user_id.to_string())
             .await
-            .map_err(|e| format!("reading user {user_id}: {e}"))?;
-        // A user of another org never reaches this project's table.
-        if let Some(other) = user.as_ref().filter(|u| u.org_id != org) {
-            warn!(project = %job.project_id, %user_id, org = %other.org_id, "sync for a user of another organization; dropped");
-            return Ok(());
-        }
-        // Deactivated, locked or gone (deleted in the console, by the webhook or found by
-        // reconcile; N1): their sessions end with it.
-        if user
-            .as_ref()
-            .is_none_or(|u| matches!(u.state, UserState::Inactive | UserState::Locked))
         {
-            self.revoke_user(job.project_id, user_id, zitadel).await?;
+            Ok(user) => Some(user),
+            Err(IdentityError::NotFound(Missing::User)) => None,
+            // Before the enable made the pool there is nothing to sync yet; once enabled a
+            // missing pool is trouble, never "every user is gone".
+            Err(IdentityError::NotFound(Missing::Pool)) => {
+                return if auth.status == AppUsersStatus::Enabling {
+                    Ok(())
+                } else {
+                    self.pool_gone(job.project_id).await
+                };
+            }
+            Err(e) => return Err(format!("reading user {user_id}: {e}")),
+        };
+        // Banned or gone (found by reconcile, or a job for an admin delete; N1): their app
+        // sessions end with it. The ban or delete already ended their identity sessions.
+        if user.as_ref().is_none_or(|u| u.banned) {
+            self.revoke_user(job.project_id, user_id).await?;
         }
         let gone = gone_call_sql(user_id, auth.on_delete == OnDelete::Mark);
         for (branch, ep) in self.live_branches(auth.database_id).await? {
@@ -404,13 +486,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         .data
                         .as_ref()
                         .filter(|_| job.origin_branch_id != Some(branch.id));
-                    upsert_call_sql(
-                        user_id,
-                        &u.email,
-                        u.email_verified,
-                        u.created_at.unwrap_or_else(Utc::now),
-                        data,
-                    )
+                    upsert_call_sql(user_id, &u.email, u.email_verified, u.banned, u.created_at, data)
                 }
                 None => gone.clone(),
             };
@@ -421,28 +497,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(())
     }
 
-    /// A deactivated, locked or deleted user: their app sessions revoked and their Zitadel
-    /// sessions deleted (best effort).
-    async fn revoke_user(
-        &self,
-        project: ProjectId,
-        user: Uuid,
-        zitadel: &Zitadel,
-    ) -> Result<(), String> {
-        let revoked = self
-            .metadata
+    /// A banned or deleted user: their app sessions revoked. (The worker may not revoke
+    /// identity sessions; a ban or delete in the pool already did.)
+    async fn revoke_user(&self, project: ProjectId, user: Uuid) -> Result<(), String> {
+        self.metadata
             .revoke_user_sessions(project, user, None, None)
             .await
-            .map_err(|e| format!("revoking the user's sessions: {e}"))?;
-        for session in revoked {
-            if let Err(e) = zitadel
-                .delete_session_admin(&session.zitadel_session_id)
-                .await
-            {
-                warn!(%project, %user, session = %session.id, "deleting the Zitadel session: {e}");
-            }
-        }
-        Ok(())
+            .map(drop)
+            .map_err(|e| format!("revoking the user's sessions: {e}"))
     }
 
     /// Whether `schema.table` is free on every live branch of the database (enable's
@@ -484,8 +546,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// Compares every live branch's users table with the org's users and syncs each
-    /// difference inline. A branch whose rows can't be read is logged and skipped.
+    /// Compares every live branch's users table with the pool's users and syncs each
+    /// difference inline. A branch whose rows can't be read is logged and skipped, and one
+    /// still on an older users bootstrap is brought up to date first ([`USERS_OUTDATED_SQL`]). A
+    /// user a concurrent change shifted out of the paged listing is re-read by its sync before
+    /// any delete, so it is never removed by mistake.
+    ///
+    /// Every banned user's app sessions are revoked on every pass, matching row or not: a
+    /// sign-in that raced the ban leaves a session no row difference shows.
+    ///
+    /// What a pass can't put right is on the row's `error` (`GET …/app-users`, Studio): a
+    /// pool gone from the identity service ([`Worker::pool_gone`]), or the first branch it
+    /// couldn't upgrade (a `banned_at` column of another type, say). A pass that upgrades
+    /// every branch clears it.
     pub async fn reconcile_app_users(&self, project: ProjectId) -> Result<(), String> {
         let auth = self
             .metadata
@@ -495,33 +568,57 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(auth) = auth.filter(active) else {
             return Ok(());
         };
-        let Some(org) = auth.zitadel_org_id.as_deref() else {
-            return Ok(());
-        };
-        let zitadel = self.admin_zitadel()?;
+        let identity = self.identity()?;
+        let pool = app_pool(project);
         let mut users = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0u32;
         loop {
-            let page = zitadel
-                .list_users(org, None, offset, PAGE)
-                .await
-                .map_err(|e: ZError| format!("listing the org's users: {e}"))?;
+            let page = match identity.list_users(&pool, PAGE, offset).await {
+                Ok(page) => page,
+                // Before the enable made the pool there is nothing to reconcile yet.
+                Err(IdentityError::NotFound(Missing::Pool)) => {
+                    return if auth.status == AppUsersStatus::Enabling {
+                        Ok(())
+                    } else {
+                        self.pool_gone(project).await
+                    };
+                }
+                Err(e) => return Err(format!("listing the pool's users: {e}")),
+            };
+            let n = page.users.len() as u32;
             users.extend(page.users);
-            match page.next_offset {
-                Some(next) => offset = next,
-                None => break,
+            offset += n;
+            if n == 0 || u64::from(offset) >= page.total {
+                break;
             }
         }
         let listed: HashSet<Uuid> = users
             .iter()
             .filter_map(|u| Uuid::parse_str(&u.id).ok())
             .collect();
+        for user in users.iter().filter(|u| u.banned) {
+            if let Ok(id) = Uuid::parse_str(&user.id) {
+                self.revoke_user(project, id).await?;
+            }
+        }
         // Listed users that differ somewhere are synced everywhere; a gone user only on the
         // branches whose own plan deletes them (M1).
         let mut seen = HashSet::new();
         let mut stale = Vec::new();
         let mut gone: Vec<(Uuid, HashSet<BranchId>)> = Vec::new();
+        // The first branch the pass couldn't upgrade, for the row.
+        let mut not_upgraded: Option<String> = None;
         for (branch, ep) in self.live_branches(auth.database_id).await? {
+            if let Err(e) = self.upgrade_users_on(&branch, &ep, &auth).await {
+                warn!(branch = %branch.id, %project, "upgrading the users machinery; skipped: {e:#}");
+                not_upgraded.get_or_insert_with(|| {
+                    format!(
+                        "upgrading the users machinery on branch {}: {e:#}",
+                        branch.name
+                    )
+                });
+                continue;
+            }
             let rows = self
                 .computes
                 .admin_sql(&ep, &auth.pg_database, USERS_ROWS_SQL)
@@ -538,10 +635,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 plan_app_users_sync(&users, &rows, auth.on_delete)
                     .into_iter()
                     .partition(|id| listed.contains(id));
-            // N4: a listing that would remove most of the table (an empty org, or an admin PAT
-            // that lost its rights and sees a filtered listing) isn't trusted for this branch's
-            // deletes; the webhook and the API path still delete one by one. In `mark` mode
-            // only the rows not marked yet count.
+            // N4: a listing that would remove most of the table (an empty pool, say one
+            // recreated by mistake) isn't trusted for this branch's deletes; the admin API still
+            // deletes one by one. In `mark` mode only the rows not marked yet count.
             let live_rows = match auth.on_delete {
                 OnDelete::Mark => rows.iter().filter(|r| r.deleted_at.is_none()).count(),
                 OnDelete::Delete => rows.len(),
@@ -564,6 +660,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
         }
+        if not_upgraded.is_some() || auth.error.is_some() {
+            self.metadata
+                .set_app_users_error(project, not_upgraded.as_deref())
+                .await
+                .map_err(|e| format!("recording the reconcile outcome: {e}"))?;
+        }
         let job = |user_id| AppUsersSyncJob {
             project_id: project,
             user_id,
@@ -575,6 +677,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         for (user_id, branches) in gone {
             self.sync_user(&job(user_id), Some(&branches)).await?;
+        }
+        Ok(())
+    }
+
+    /// The users bootstrap again on a branch that's still on an older version of it. Branches
+    /// otherwise run it only when created or when their compute is re-created.
+    async fn upgrade_users_on(
+        &self,
+        branch: &BranchRecord,
+        ep: &str,
+        auth: &ProjectAuth,
+    ) -> anyhow::Result<()> {
+        let out = self
+            .computes
+            .admin_sql(ep, &auth.pg_database, USERS_OUTDATED_SQL)
+            .await?;
+        if out.lines().any(|l| l.trim() == "t") {
+            info!(branch = %branch.id, project = %auth.project_id, "upgrading the users machinery");
+            self.bootstrap_users_on(branch, ep, auth).await?;
         }
         Ok(())
     }
@@ -632,11 +753,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use chelabase_identity::mock::FakeIdentity;
+    use chelabase_identity::{IdentityError, Missing, Pool};
     use chelabase_metadata::{AppUsersStatus, BranchKind, DataApiState, ProjectStatus};
     use chelabase_secrets::{open_role_password, seal_role_password};
     use chelabase_types::DatabaseId;
-    use chelabase_zitadel::client::{UserState, Zitadel};
-    use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User};
     use serde_json::json;
 
     use super::*;
@@ -654,7 +775,7 @@ pub(crate) mod tests {
     pub(crate) struct Setup {
         pub w: FakeWorker,
         pub journal: Journal,
-        pub mock: MockZitadel,
+        pub fake: FakeIdentity,
         pub project: ProjectId,
         pub db: DatabaseId,
         pub main: BranchRecord,
@@ -662,42 +783,64 @@ pub(crate) mod tests {
     }
 
     impl Setup {
-        pub fn org(&self) -> String {
-            self.project.to_string()
+        /// The project's app-user pool.
+        pub fn pool(&self) -> Pool {
+            Pool::App(self.project.as_uuid())
         }
 
-        /// The org exists in Zitadel and is recorded on the row.
-        pub fn with_org(&self) {
-            self.mock.add_org(&self.org());
-            self.w
-                .metadata
-                .state()
-                .project_auth
-                .get_mut(&self.project)
-                .unwrap()
-                .zitadel_org_id = Some(self.org());
+        /// The project's pool exists in the identity service.
+        pub fn with_pool(&self) {
+            self.fake.with_pool(&self.pool());
         }
 
-        /// A user in the project's org with a uuid id.
+        /// A verified user in the project's pool.
         pub fn add_user(&self, email: &str) -> Uuid {
-            self.add_user_in(&self.org(), email)
+            self.add_user_in(&self.pool(), email)
         }
 
-        pub fn add_user_in(&self, org: &str, email: &str) -> Uuid {
-            let id = Uuid::new_v4();
-            self.mock.inner.lock().unwrap().users.push(User {
-                id: id.to_string(),
-                email: email.into(),
-                password: "Passw0rd!".into(),
-                verified: true,
-                locked: false,
-                org_id: org.into(),
-                username: id.to_string(),
-                display_name: String::new(),
-                inactive: false,
-                created_at: "2026-10-03T10:00:00Z".into(),
-            });
-            id
+        pub fn add_user_in(&self, pool: &Pool, email: &str) -> Uuid {
+            self.fake
+                .with_user(pool, email, "Passw0rd!")
+                .parse()
+                .unwrap()
+        }
+
+        /// Whether the project's pool exists.
+        pub async fn pool_exists(&self) -> bool {
+            match self.fake.client().list_users(&self.pool(), 1, 0).await {
+                Ok(_) => true,
+                Err(IdentityError::NotFound(Missing::Pool)) => false,
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        /// The user's upsert as the sync writes it, with the pool's `created_at`.
+        pub async fn upsert(
+            &self,
+            user: Uuid,
+            email: &str,
+            data: Option<&serde_json::Value>,
+        ) -> String {
+            let u = self
+                .fake
+                .client()
+                .get_user(&self.pool(), &user.to_string())
+                .await
+                .unwrap();
+            upsert_call_sql(user, email, u.email_verified, u.banned, u.created_at, data)
+        }
+
+        /// The identity calls on the project's pool, `"METHOD path"` with the pool elided.
+        pub fn pool_calls(&self) -> Vec<String> {
+            let prefix = format!("/internal/v1/pools/{}", self.pool());
+            self.fake
+                .calls()
+                .iter()
+                .filter_map(|c| {
+                    let (method, path) = c.split_once(' ')?;
+                    Some(format!("{method} {}", path.strip_prefix(&prefix)?))
+                })
+                .collect()
         }
 
         pub fn set_on_delete(&self, on_delete: OnDelete) {
@@ -712,12 +855,12 @@ pub(crate) mod tests {
     }
 
     /// A project whose database `app` (main and `dev`, both ready) is its auth database, with
-    /// a `project_auth` row in `status`; Zitadel is the mock with the admin token. The journal
-    /// and the SQL log start empty.
+    /// a `project_auth` row in `status`; the identity service is the fake. The journal and the
+    /// SQL log start empty.
     pub(crate) async fn setup(status: AppUsersStatus) -> Setup {
         let (mut w, journal) = worker();
-        let mock = MockZitadel::start().await;
-        w.zitadel = Some(Zitadel::new(&mock.base, ADMIN_TOKEN));
+        let fake = FakeIdentity::start().await;
+        w.identity = Some(fake.client());
         let project = w.metadata.insert_project();
         let db = ready_database(&w).await;
         w.metadata.move_to_project(db, project);
@@ -730,7 +873,7 @@ pub(crate) mod tests {
         Setup {
             w,
             journal,
-            mock,
+            fake,
             project,
             db,
             main,
@@ -797,6 +940,54 @@ pub(crate) mod tests {
         entries(journal).iter().filter(|e| *e == entry).count()
     }
 
+    /// Everything logged on this thread while the guard lives, as plain text (no colours).
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl std::fmt::Display for Logs {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&String::from_utf8_lossy(&self.0.lock().unwrap()))
+        }
+    }
+
+    impl Logs {
+        /// `#[tokio::test]` runs on one thread, so a thread-local default sees the whole test.
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The lines at `level` containing every one of `needles`.
+        fn lines_with(&self, level: &str, needles: &[&str]) -> usize {
+            self.to_string()
+                .lines()
+                .filter(|l| l.contains(level) && needles.iter().all(|n| l.contains(n)))
+                .count()
+        }
+    }
+
     fn enable(s: &Setup) -> AppUsersJob {
         AppUsersJob::Enable {
             project_id: s.project,
@@ -818,8 +1009,57 @@ pub(crate) mod tests {
 
     // --- Enable -----------------------------------------------------------------------
 
+    /// AC 1: enabling creates pool `app-<project>`; enabling again is a no-op on the pool.
     #[tokio::test]
-    async fn enable_creates_org_bootstraps_every_branch_and_helpers() {
+    async fn enable_creates_pool_idempotent() {
+        let s = setup(AppUsersStatus::Enabling).await;
+        assert!(!s.pool_exists().await);
+
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!(auth.status, AppUsersStatus::Enabled, "{:?}", auth.error);
+        assert!(s.pool_exists().await);
+        let writes = |s: &Setup| -> Vec<String> {
+            s.pool_calls()
+                .into_iter()
+                .filter(|c| !c.starts_with("GET "))
+                .collect()
+        };
+        assert_eq!(writes(&s), ["POST "]);
+
+        // Enabling again (a redelivery, or the periodic pass) keeps the pool and its users.
+        let user = s.add_user("ada@example.com");
+        s.w.metadata
+            .state()
+            .project_auth
+            .get_mut(&s.project)
+            .unwrap()
+            .status = AppUsersStatus::Enabling;
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+        assert_eq!(
+            s.w.metadata.auth(s.project).unwrap().status,
+            AppUsersStatus::Enabled
+        );
+        assert_eq!(writes(&s), ["POST ", "POST "]);
+        s.fake
+            .client()
+            .get_user(&s.pool(), &user.to_string())
+            .await
+            .unwrap();
+        // Another project's pool is never named.
+        assert!(
+            s.fake
+                .calls()
+                .iter()
+                .all(|c| c.contains(&s.pool().to_string())),
+            "{:?}",
+            s.fake.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_creates_pool_bootstraps_every_branch_and_helpers() {
         let s = setup(AppUsersStatus::Enabling).await;
         // Another served database on the auth database's main branch, and a second database
         // of the project.
@@ -842,15 +1082,9 @@ pub(crate) mod tests {
 
         s.w.handle_app_users_job(&enable(&s)).await.unwrap();
 
-        assert!(s.mock.orgs().contains(&s.org()), "{:?}", s.mock.orgs());
-        assert!(
-            s.mock
-                .calls()
-                .contains(&"POST /v2/organizations".to_string())
-        );
+        assert!(s.pool_exists().await);
         let auth = s.w.metadata.auth(s.project).unwrap();
         assert_eq!(auth.status, AppUsersStatus::Enabled, "{:?}", auth.error);
-        assert_eq!(auth.zitadel_org_id.as_deref(), Some(s.org().as_str()));
         for b in [&s.main, &s.dev] {
             let (pg_database, pw) = sync_password(&s.w, b);
             assert_eq!(pg_database, "app");
@@ -897,17 +1131,17 @@ pub(crate) mod tests {
         assert!(error.contains("bootstrapping app users"), "{error}");
         assert!(error.contains("injected failure"), "{error}");
 
-        // Zitadel's org call failing is final too.
+        // The pool create failing is final too.
         let s = setup(AppUsersStatus::Enabling).await;
-        s.mock.set_down(true);
+        s.fake.set_down(true);
         s.w.handle_app_users_job(&enable(&s)).await.unwrap();
         let auth = s.w.metadata.auth(s.project).unwrap();
         assert_eq!(auth.status, AppUsersStatus::Failed);
         assert!(scripts(&s.w, &ep(&s.main), "app", BOOTSTRAP).is_empty());
 
-        // Without the admin client the job is retried and the row stays enabling.
+        // Without the identity client the job is retried and the row stays enabling.
         let mut s = setup(AppUsersStatus::Enabling).await;
-        s.w.zitadel = None;
+        s.w.identity = None;
         s.w.handle_app_users_job(&enable(&s)).await.unwrap_err();
         assert_eq!(
             s.w.metadata.auth(s.project).unwrap().status,
@@ -924,7 +1158,7 @@ pub(crate) mod tests {
             s.w.handle_app_users_job(&enable(&s)).await.unwrap();
             assert_eq!(s.w.metadata.auth(s.project).unwrap().status, status);
             assert!(s.w.computes.sql.lock().unwrap().is_empty());
-            assert!(s.mock.calls().is_empty());
+            assert!(s.fake.calls().is_empty());
         }
         let s = setup(AppUsersStatus::Enabling).await;
         s.w.handle_app_users_job(&AppUsersJob::Enable {
@@ -932,7 +1166,7 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
-        assert!(s.mock.calls().is_empty());
+        assert!(s.fake.calls().is_empty());
     }
 
     #[tokio::test]
@@ -1055,10 +1289,88 @@ pub(crate) mod tests {
 
     // --- Disable ----------------------------------------------------------------------
 
+    // Review S5: a user who signed up while the disable was under way (auth's cached
+    // `enabled`, before its uncached check) is never dropped with the pool: the worker counts
+    // again right before the drop, keeps the pool and leaves the row `disabling` with the
+    // reason on it, where `GET …/app-users` shows it. Once the pool is empty a later pass
+    // finishes.
     #[tokio::test]
-    async fn disable_tears_down_revokes_deletes_org_and_row() {
+    async fn disable_keeps_a_pool_that_still_has_users() {
         let s = setup(AppUsersStatus::Disabling).await;
-        s.with_org();
+        s.with_pool();
+        let late = s.add_user("late@example.com");
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .expect("acked: retrying can't empty the pool");
+        assert!(s.pool_exists().await, "the pool was dropped with a user in it");
+        assert!(
+            !s.fake.calls().iter().any(|c| c.starts_with("DELETE ") && c.ends_with(&s.pool().to_string())),
+            "{:?}",
+            s.fake.calls()
+        );
+        {
+            let state = s.w.metadata.state();
+            let row = &state.project_auth[&s.project];
+            assert_eq!(row.status, AppUsersStatus::Disabling);
+            let error = row.error.as_deref().expect("the reason is on the row");
+            assert!(error.contains("1 user"), "{error}");
+        }
+        // The user is gone: the next pass finishes.
+        s.fake
+            .client()
+            .delete_user(&s.pool(), &late.to_string())
+            .await
+            .unwrap();
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+        assert!(!s.pool_exists().await);
+        assert!(!s.w.metadata.state().project_auth.contains_key(&s.project));
+    }
+
+    // The recovery for a disable on hold: the admin enables again (the orchestrator moves the
+    // row back to `enabling` and clears the error), the enable reinstalls on the kept pool
+    // with its user, the admin deletes the user, and the next disable finishes.
+    #[tokio::test]
+    async fn a_disable_on_hold_re_enables_then_finishes() {
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        let late = s.add_user("late@example.com");
+        s.w.handle_app_users_job(&AppUsersJob::Disable { project_id: s.project }).await.unwrap();
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some(), "on hold");
+
+        // `PUT …/app-users` on the stuck row (begin_enable_app_users' Retry).
+        {
+            let mut state = s.w.metadata.state();
+            let row = state.project_auth.get_mut(&s.project).unwrap();
+            row.status = AppUsersStatus::Enabling;
+            row.error = None;
+        }
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!((auth.status, auth.error.as_deref()), (AppUsersStatus::Enabled, None));
+        assert!(
+            !scripts(&s.w, &ep(&s.main), "app", BOOTSTRAP).is_empty(),
+            "the users machinery is back on the branch"
+        );
+        s.fake.client().get_user(&s.pool(), &late.to_string()).await.expect("the pool and its user were kept");
+
+        // The admin deletes the user, then disables again.
+        s.fake.client().delete_user(&s.pool(), &late.to_string()).await.unwrap();
+        s.w.metadata.state().project_auth.get_mut(&s.project).unwrap().status = AppUsersStatus::Disabling;
+        s.w.handle_app_users_job(&AppUsersJob::Disable { project_id: s.project }).await.unwrap();
+        assert!(!s.pool_exists().await);
+        assert!(!s.w.metadata.state().project_auth.contains_key(&s.project));
+    }
+
+    #[tokio::test]
+    async fn disable_tears_down_revokes_drops_pool_and_row() {
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
         let session = s.w.metadata.add_session(s.project, Uuid::new_v4(), "zs1");
 
         s.w.handle_app_users_job(&AppUsersJob::Disable {
@@ -1086,7 +1398,8 @@ pub(crate) mod tests {
             );
             assert!(!state.project_auth.contains_key(&s.project));
         }
-        assert!(!s.mock.orgs().contains(&s.org()));
+        assert!(!s.pool_exists().await);
+        assert!(s.pool_calls().contains(&"DELETE ".to_string()));
         let journal = entries(&s.journal);
         let revoked = journal
             .iter()
@@ -1094,13 +1407,13 @@ pub(crate) mod tests {
             .unwrap();
         let deleted = journal
             .iter()
-            .position(|e| e == "metadata.delete_project_auth")
+            .position(|e| e == "metadata.finish_disable_app_users")
             .unwrap();
         assert!(revoked < deleted);
 
-        // A teardown failure is retried, and the row stays.
+        // A teardown failure is retried, and the row and the pool stay.
         let s = setup(AppUsersStatus::Disabling).await;
-        s.with_org();
+        s.with_pool();
         s.w.computes.fail_when("-- chelabase:users-teardown");
         s.w.handle_app_users_job(&AppUsersJob::Disable {
             project_id: s.project,
@@ -1111,7 +1424,33 @@ pub(crate) mod tests {
             s.w.metadata.auth(s.project).unwrap().status,
             AppUsersStatus::Disabling
         );
-        assert!(s.mock.orgs().contains(&s.org()));
+        assert!(s.pool_exists().await);
+
+        // The drop is idempotent: a pool already gone (a redelivery after the drop) still
+        // finishes the disable.
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+        assert!(s.w.metadata.auth(s.project).is_none());
+
+        // The identity service down: retried, the row stays.
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        s.fake.set_down(true);
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            s.w.metadata.auth(s.project).unwrap().status,
+            AppUsersStatus::Disabling
+        );
+        s.fake.set_down(false);
+        assert!(s.pool_exists().await);
 
         // Only a disabling row is torn down.
         let s = setup(AppUsersStatus::Enabled).await;
@@ -1124,12 +1463,162 @@ pub(crate) mod tests {
         assert!(s.w.metadata.auth(s.project).is_some());
     }
 
+    /// S1: a duplicate disable already past its status check leaves a new enable alone: the
+    /// row is read again before the drop, and only a `disabling` row is deleted.
+    #[tokio::test]
+    async fn a_stalled_disable_leaves_a_new_enable_alone() {
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        // Between the first read and the drop, another copy finished and an enable began.
+        s.w.metadata.state().after_auth_read = Some(Some(AppUsersStatus::Enabling));
+
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            s.w.metadata.auth(s.project).map(|a| a.status),
+            Some(AppUsersStatus::Enabling)
+        );
+        assert!(s.pool_exists().await, "the new enable's pool was dropped");
+    }
+
+    /// Re-audit S1: the residual window is between the re-read and the drop. A copy overtaken
+    /// there drops the new enable's pool and `finish_disable_app_users` finds no `disabling`
+    /// row; the disable says so at warn, naming the project, instead of "app users disabled".
+    #[tokio::test]
+    async fn a_disable_overtaken_after_its_reread_warns() {
+        let (logs, _guard) = Logs::capture();
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        // The first read and the re-read both see `disabling`; the row changes just after.
+        {
+            let mut state = s.w.metadata.state();
+            state.after_auth_read = Some(Some(AppUsersStatus::Enabling));
+            state.after_auth_read_skip = 1;
+        }
+
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            s.w.metadata.auth(s.project).map(|a| a.status),
+            Some(AppUsersStatus::Enabling),
+            "the enable's row is left alone"
+        );
+        assert!(
+            !s.pool_exists().await,
+            "the window: the enable's pool is dropped"
+        );
+        assert_eq!(
+            logs.lines_with(
+                "WARN",
+                &[&s.project.to_string(), "changed under the disable"]
+            ),
+            1,
+            "{logs}"
+        );
+        assert_eq!(logs.lines_with("INFO", &["app users disabled"]), 0, "{logs}");
+    }
+
+    /// Re-audit S2 (the auditor's `adv_enabled_without_a_pool_is_silent_and_permanent`,
+    /// inverted): an `enabled` project whose pool is gone has the error recorded on its row,
+    /// at error level in the log, and its jobs acked rather than redelivered for ever. A pool
+    /// back in place clears it on the next pass.
+    #[tokio::test]
+    async fn an_enabled_project_whose_pool_is_gone_records_the_error() {
+        let (logs, _guard) = Logs::capture();
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+
+        s.w.app_users_reconcile_once().await;
+        s.w.app_users_reconcile_once().await;
+
+        assert!(!s.pool_exists().await);
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!(auth.status, AppUsersStatus::Enabled);
+        let error = auth.error.expect("the gone pool is on the row");
+        assert!(error.contains(&s.pool().to_string()), "{error}");
+        assert_eq!(
+            logs.lines_with("ERROR", &[&s.project.to_string(), &s.pool().to_string()]),
+            2,
+            "{logs}"
+        );
+        // The jobs are acked: nothing a redelivery could do.
+        s.w.handle_app_users_job(&AppUsersJob::Reconcile {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+        s.w.handle_app_users_sync(&sync_job(&s, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, Some(error));
+
+        // The pool back (an operator's repair): the next pass clears the error.
+        s.with_pool();
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, None);
+    }
+
+    /// Re-audit S2: a branch reconcile can't upgrade (a `banned_at` collision, say) is on the
+    /// row, naming the branch, until a pass upgrades it.
+    #[tokio::test]
+    async fn a_branch_reconcile_cannot_upgrade_is_on_the_row() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+        s.w.computes.answer_at(&ep(&s.dev), "to_regprocedure", "t\n");
+        *s.w.computes.fail_sql_containing.lock().unwrap() = Some((
+            BOOTSTRAP.into(),
+            "column \"banned_at\" of relation \"users\" already exists".into(),
+        ));
+
+        s.w.reconcile_app_users(s.project).await.unwrap();
+
+        let error =
+            s.w.metadata
+                .auth(s.project)
+                .unwrap()
+                .error
+                .expect("the skipped branch is on the row");
+        assert!(
+            error.contains("dev") && error.contains("upgrading") && error.contains("banned_at"),
+            "{error}"
+        );
+
+        // The upgrade goes through: cleared.
+        *s.w.computes.fail_sql_containing.lock().unwrap() = None;
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, None);
+        // The failed script isn't on the fake's log; the one that went through is.
+        assert_eq!(scripts(&s.w, &ep(&s.dev), "app", BOOTSTRAP).len(), 1);
+    }
+
+    /// S2: an enable whose row went while it made the pool (the project's delete ran) drops
+    /// what it made, so no pool outlives the project.
+    #[tokio::test]
+    async fn an_enable_racing_a_delete_drops_the_pool_it_made() {
+        let s = setup(AppUsersStatus::Enabling).await;
+        s.w.metadata.state().after_auth_read = Some(None);
+
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+
+        assert!(!s.pool_exists().await, "the pool outlives the project");
+        assert!(scripts(&s.w, &ep(&s.main), "app", BOOTSTRAP).is_empty());
+    }
+
     // --- Sync -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn sync_upserts_on_every_branch_with_data_except_origin() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
         let data = json!({"name": "Ada"});
         let job = AppUsersSyncJob {
@@ -1142,28 +1631,16 @@ pub(crate) mod tests {
 
         assert_eq!(
             scripts(&s.w, &ep(&s.main), "app", "BEGIN;"),
-            [upsert_call_sql(
-                user,
-                "ada@example.com",
-                true,
-                created(),
-                Some(&data)
-            )]
+            [s.upsert(user, "ada@example.com", Some(&data)).await]
         );
         assert_eq!(
             scripts(&s.w, &ep(&s.dev), "app", "BEGIN;"),
-            [upsert_call_sql(
-                user,
-                "ada@example.com",
-                true,
-                created(),
-                None
-            )]
+            [s.upsert(user, "ada@example.com", None).await]
         );
 
         // An enabling project is synced too (the enable may be filling other branches).
         let s = setup(AppUsersStatus::Enabling).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("bob@example.com");
         s.w.handle_app_users_sync(&sync_job(&s, user))
             .await
@@ -1174,7 +1651,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sync_gone_deletes_or_marks() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let gone = Uuid::new_v4();
         s.w.handle_app_users_sync(&sync_job(&s, gone))
             .await
@@ -1198,92 +1675,61 @@ pub(crate) mod tests {
         }
     }
 
+    /// A banned user's app sessions are revoked (the ban already ended their identity
+    /// sessions); the row still follows the pool.
     #[tokio::test]
-    async fn sync_inactive_revokes_sessions() {
-        for state in [UserState::Inactive, UserState::Locked] {
-            let s = setup(AppUsersStatus::Enabled).await;
-            s.with_org();
-            let user = s.add_user("ada@example.com");
-            let other = s.add_user("bob@example.com");
-            {
-                let mut inner = s.mock.inner.lock().unwrap();
-                let u = inner
-                    .users
-                    .iter_mut()
-                    .find(|u| u.id == user.to_string())
-                    .unwrap();
-                match state {
-                    UserState::Inactive => u.inactive = true,
-                    _ => u.locked = true,
-                }
-                inner
-                    .sessions
-                    .insert("zs1".into(), (user.to_string(), "t1".into()));
-                inner
-                    .sessions
-                    .insert("zs2".into(), (user.to_string(), "t2".into()));
-                inner
-                    .sessions
-                    .insert("zs3".into(), (other.to_string(), "t3".into()));
-            }
-            let a = s.w.metadata.add_session(s.project, user, "zs1");
-            let b = s.w.metadata.add_session(s.project, user, "zs2");
-            let c = s.w.metadata.add_session(s.project, other, "zs3");
+    async fn sync_banned_revokes_sessions() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        let user = s.add_user("ada@example.com");
+        let other = s.add_user("bob@example.com");
+        s.fake.ban(&s.pool(), &user.to_string());
+        let a = s.w.metadata.add_session(s.project, user, "s1");
+        let b = s.w.metadata.add_session(s.project, user, "s2");
+        let c = s.w.metadata.add_session(s.project, other, "s3");
 
-            s.w.handle_app_users_sync(&sync_job(&s, user))
-                .await
-                .unwrap();
+        s.w.handle_app_users_sync(&sync_job(&s, user))
+            .await
+            .unwrap();
 
-            let revoked = |id: Uuid| {
-                s.w.metadata
-                    .state()
-                    .app_sessions
-                    .iter()
-                    .find(|x| x.id == id)
-                    .unwrap()
-                    .revoked_at
-                    .is_some()
-            };
-            assert!(revoked(a) && revoked(b) && !revoked(c), "{state:?}");
-            let sessions = s.mock.inner.lock().unwrap().sessions.clone();
-            assert!(!sessions.contains_key("zs1") && !sessions.contains_key("zs2"));
-            assert!(sessions.contains_key("zs3"));
-            // Once, not per branch; and the row still follows Zitadel.
-            assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 1);
-            for b in [&s.main, &s.dev] {
-                assert_eq!(
-                    scripts(&s.w, &ep(b), "app", "BEGIN;"),
-                    [upsert_call_sql(
-                        user,
-                        "ada@example.com",
-                        true,
-                        created(),
-                        None
-                    )]
-                );
-            }
+        let revoked = |id: Uuid| {
+            s.w.metadata
+                .state()
+                .app_sessions
+                .iter()
+                .find(|x| x.id == id)
+                .unwrap()
+                .revoked_at
+                .is_some()
+        };
+        assert!(revoked(a) && revoked(b) && !revoked(c));
+        // Once, not per branch; and the row is marked banned on every branch (AC 3).
+        assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 1);
+        let upsert = s.upsert(user, "ada@example.com", None).await;
+        assert!(upsert.contains(", true, true, "), "{upsert}");
+        for b in [&s.main, &s.dev] {
+            assert_eq!(scripts(&s.w, &ep(b), "app", "BEGIN;"), std::slice::from_ref(&upsert));
         }
+
+        // Reactivated: the same call says so, and sessions aren't touched.
+        s.fake.client().unban(&s.pool(), &user.to_string()).await.unwrap();
+        s.w.computes.sql.lock().unwrap().clear();
+        s.w.handle_app_users_sync(&sync_job(&s, user)).await.unwrap();
+        let upsert = s.upsert(user, "ada@example.com", None).await;
+        assert!(upsert.contains(", true, false, "), "{upsert}");
+        assert_eq!(scripts(&s.w, &ep(&s.main), "app", "BEGIN;"), [upsert]);
+        assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 1);
     }
 
-    /// N1: a user deleted outside Chelabase's API (Zitadel console, webhook, reconcile) loses
-    /// their sessions too, not only their row.
+    /// N1: a user gone from the pool loses their sessions too, not only their row.
     #[tokio::test]
     async fn sync_gone_user_revokes_sessions() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let gone = Uuid::new_v4();
         let other = s.add_user("bob@example.com");
-        {
-            let mut inner = s.mock.inner.lock().unwrap();
-            inner
-                .sessions
-                .insert("zs1".into(), (gone.to_string(), "t1".into()));
-            inner
-                .sessions
-                .insert("zs2".into(), (other.to_string(), "t2".into()));
-        }
-        let a = s.w.metadata.add_session(s.project, gone, "zs1");
-        let b = s.w.metadata.add_session(s.project, other, "zs2");
+        let a = s.w.metadata.add_session(s.project, gone, "s1");
+        let b = s.w.metadata.add_session(s.project, other, "s2");
 
         s.w.handle_app_users_sync(&sync_job(&s, gone)).await.unwrap();
 
@@ -1298,8 +1744,6 @@ pub(crate) mod tests {
                 .is_some()
         };
         assert!(revoked(a) && !revoked(b));
-        let sessions = s.mock.inner.lock().unwrap().sessions.clone();
-        assert!(!sessions.contains_key("zs1") && sessions.contains_key("zs2"));
         assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 1);
         for b in [&s.main, &s.dev] {
             assert_eq!(
@@ -1309,41 +1753,70 @@ pub(crate) mod tests {
         }
     }
 
+    /// A user of another project's pool is not this project's: read in this pool only, it is
+    /// gone here, and the other pool is never asked.
     #[tokio::test]
-    async fn sync_other_org_user_is_dropped() {
+    async fn sync_user_of_another_pool_is_gone_here() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
-        let stranger = s.add_user_in("o1", "eve@example.com");
+        s.with_pool();
+        let elsewhere = Pool::App(Uuid::new_v4());
+        let stranger = s.add_user_in(&elsewhere, "eve@example.com");
         s.w.handle_app_users_sync(&sync_job(&s, stranger))
             .await
             .unwrap();
-        assert!(s.w.computes.sql.lock().unwrap().is_empty());
-        assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 0);
+        for b in [&s.main, &s.dev] {
+            assert_eq!(
+                scripts(&s.w, &ep(b), "app", "BEGIN;"),
+                [gone_call_sql(stranger, false)]
+            );
+        }
+        assert!(
+            s.fake
+                .calls()
+                .iter()
+                .all(|c| !c.contains(&elsewhere.to_string()))
+        );
 
-        // So is any job while app users aren't enabled or enabling, or without an org.
+        // Any job while app users aren't enabled or enabling is dropped.
         for status in [AppUsersStatus::Disabling, AppUsersStatus::Failed] {
             let s = setup(status).await;
-            s.with_org();
+            s.with_pool();
             let user = s.add_user("ada@example.com");
             s.w.handle_app_users_sync(&sync_job(&s, user))
                 .await
                 .unwrap();
             assert!(s.w.computes.sql.lock().unwrap().is_empty());
-            assert!(s.mock.calls().is_empty(), "{status:?}");
+            assert!(s.fake.calls().is_empty(), "{status:?}");
         }
+    }
+
+    /// No pool: while enabling (before the enable made it) there is nothing to sync yet; once
+    /// enabled it is an error, retried, and never read as "every user is gone".
+    #[tokio::test]
+    async fn sync_without_a_pool() {
+        let s = setup(AppUsersStatus::Enabling).await;
+        s.w.handle_app_users_sync(&sync_job(&s, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(s.w.computes.sql.lock().unwrap().is_empty());
+
+        // Enabled without a pool: acked with the error on the row; no session is revoked and
+        // no row is touched (the user isn't "gone", the pool is).
         let s = setup(AppUsersStatus::Enabled).await;
-        let user = s.add_user("ada@example.com");
+        let user = Uuid::new_v4();
+        s.w.metadata.add_session(s.project, user, "s1");
         s.w.handle_app_users_sync(&sync_job(&s, user))
             .await
             .unwrap();
         assert!(s.w.computes.sql.lock().unwrap().is_empty());
-        assert!(s.mock.calls().is_empty());
+        assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 0);
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some());
     }
 
     #[tokio::test]
     async fn sync_branch_failure_is_logged_not_retried() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
         // The first branch's call fails; the second still gets the row.
         *s.w.computes.sql_failures_left.lock().unwrap() = 1;
@@ -1354,33 +1827,24 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|b| scripts(&s.w, &ep(b), "app", "BEGIN;"))
             .collect();
-        assert_eq!(
-            ran,
-            [upsert_call_sql(
-                user,
-                "ada@example.com",
-                true,
-                created(),
-                None
-            )]
-        );
+        assert_eq!(ran, [s.upsert(user, "ada@example.com", None).await]);
     }
 
     #[tokio::test]
-    async fn sync_zitadel_unavailable_naks() {
+    async fn sync_identity_unavailable_naks() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
-        s.mock.set_down(true);
+        s.fake.set_down(true);
         s.w.handle_app_users_sync(&sync_job(&s, user))
             .await
             .unwrap_err();
         assert!(s.w.computes.sql.lock().unwrap().is_empty());
 
         let mut s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
-        s.w.zitadel = None;
+        s.w.identity = None;
         s.w.handle_app_users_sync(&sync_job(&s, user))
             .await
             .unwrap_err();
@@ -1389,16 +1853,15 @@ pub(crate) mod tests {
 
     // --- Reconcile --------------------------------------------------------------------
 
-    fn zuser(id: &str, email: &str, verified: bool) -> ZUser {
-        ZUser {
+    fn zuser(id: &str, email: &str, verified: bool) -> chelabase_identity::User {
+        chelabase_identity::User {
             id: id.into(),
-            org_id: "org".into(),
             email: email.into(),
+            name: String::new(),
             email_verified: verified,
-            display_name: String::new(),
-            state: UserState::Active,
-            created_at: None,
-            has_password: true,
+            banned: false,
+            created_at: created(),
+            updated_at: created(),
         }
     }
 
@@ -1408,6 +1871,7 @@ pub(crate) mod tests {
             email: email.into(),
             email_verified: verified,
             deleted_at: deleted.then(created),
+            banned_at: None,
         }
     }
 
@@ -1426,7 +1890,7 @@ pub(crate) mod tests {
             zuser(&stale_email.to_string(), "new@x.io", true),
             zuser(&stale_verified.to_string(), "v@x.io", true),
             zuser(&equal.to_string(), "e@x.io", false),
-            // Not a uuid: made outside Chelabase, skipped (P15).
+            // Not a uuid (a pool made before ids were uuids): skipped (P15).
             zuser("312345678901234567", "console@x.io", true),
         ];
         let rows = [
@@ -1449,16 +1913,74 @@ pub(crate) mod tests {
         assert!(plan_app_users_sync(&[], &[], OnDelete::Mark).is_empty());
     }
 
+    /// AC 3: the ban is part of what's compared, both ways.
+    #[test]
+    fn plan_app_users_sync_compares_the_ban() {
+        let (banned, reactivated, settled) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let ban = |id: Uuid, email: &str| chelabase_identity::User {
+            banned: true,
+            ..zuser(&id.to_string(), email, true)
+        };
+        let users = [
+            ban(banned, "b@x.io"),
+            zuser(&reactivated.to_string(), "r@x.io", true),
+            ban(settled, "s@x.io"),
+        ];
+        let rows = [
+            row(banned, "b@x.io", true, false),
+            UserRow { banned_at: Some(created()), ..row(reactivated, "r@x.io", true, false) },
+            UserRow { banned_at: Some(created()), ..row(settled, "s@x.io", true, false) },
+        ];
+        assert_eq!(
+            plan_app_users_sync(&users, &rows, OnDelete::Delete),
+            [banned, reactivated]
+        );
+    }
+
+    /// B1: reconcile brings a branch on an older bootstrap up to date before reading its rows,
+    /// and a branch already current isn't touched.
     #[tokio::test]
-    async fn reconcile_pages_through_zitadel() {
+    async fn reconcile_upgrades_a_branch_on_an_older_bootstrap() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+        s.w.computes.answer_at(&ep(&s.dev), "to_regprocedure", "t\n");
+
+        s.w.reconcile_app_users(s.project).await.unwrap();
+
+        assert_eq!(scripts(&s.w, &ep(&s.dev), "app", BOOTSTRAP).len(), 1);
+        assert!(scripts(&s.w, &ep(&s.main), "app", BOOTSTRAP).is_empty());
+        let journal = entries(&s.journal);
+        let at = |needle: String| journal.iter().position(|e| e.starts_with(&needle)).unwrap();
+        assert!(
+            at(format!("compute.sql {} app {BOOTSTRAP}", ep(&s.dev)))
+                < at(format!("compute.sql {} app BEGIN;", ep(&s.dev))),
+            "{journal:?}"
+        );
+
+        // An upgrade that fails skips that branch only.
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+        s.w.computes.answer_at(&ep(&s.dev), "to_regprocedure", "t\n");
+        s.w.computes.fail_when(BOOTSTRAP);
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert!(scripts(&s.w, &ep(&s.dev), "app", USERS_ROWS_SQL).is_empty());
+        assert_eq!(scripts(&s.w, &ep(&s.main), "app", USERS_ROWS_SQL).len(), 1);
+    }
+
+    /// AC 6: the reconcile reads every page of the pool and makes each branch's table match
+    /// it: missing and stale users upserted, gone ones deleted, equal rows left alone.
+    #[tokio::test]
+    async fn reconcile_from_pool() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
         let users: Vec<Uuid> = (0..101)
             .map(|i| s.add_user(&format!("u{i}@example.com")))
             .collect();
-        // A user made in the console with a non-uuid id is skipped.
-        s.mock
-            .add_user_in(&s.org(), "console@example.com", "Passw0rd!", true);
+        // Another project's pool is never read.
+        let elsewhere = Pool::App(Uuid::new_v4());
+        s.add_user_in(&elsewhere, "other@example.com");
         let ghost = Uuid::new_v4();
         let rows = json!([
             {"id": users[0], "email": "u0@example.com", "email_verified": true, "deleted_at": null},
@@ -1471,13 +1993,15 @@ pub(crate) mod tests {
 
         s.w.reconcile_app_users(s.project).await.unwrap();
 
-        let lists = s
-            .mock
-            .calls()
-            .iter()
-            .filter(|c| *c == "POST /v2/users")
-            .count();
+        let lists = s.pool_calls().iter().filter(|c| *c == "GET /users").count();
         assert_eq!(lists, 2, "two pages of 100");
+        assert!(
+            s.fake
+                .calls()
+                .iter()
+                .all(|c| !c.contains(&elsewhere.to_string()))
+        );
+        let u1 = s.upsert(users[1], "u1@example.com", None).await;
         for b in [&s.main, &s.dev] {
             assert_eq!(scripts(&s.w, &ep(b), "app", USERS_ROWS_SQL).len(), 1);
             let ran = scripts(
@@ -1492,23 +2016,28 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(upserts.len(), 100, "every user but the equal one");
             assert!(!ran.iter().any(|x| x.contains(&users[0].to_string())));
-            assert!(ran.contains(&upsert_call_sql(
-                users[1],
-                "u1@example.com",
-                true,
-                created(),
-                None
-            )));
+            assert!(ran.contains(&u1));
             assert!(ran.contains(&gone_call_sql(ghost, false)));
         }
+
+        // A pool that is gone while the project is enabled is an error on the row, not an
+        // empty listing: no row is touched.
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.w.computes.answer(
+            "chelabase.app_users_rows()",
+            &json!([{"id": Uuid::new_v4(), "email": "a@x.io", "email_verified": true, "deleted_at": null}]).to_string(),
+        );
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert!(scripts(&s.w, &ep(&s.main), "app", "BEGIN;").is_empty());
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some());
     }
 
-    /// N4: a listing that would delete most rows (an empty org, or a PAT that lost its rights
-    /// and sees a filtered listing) deletes nothing; stale rows of listed users still sync.
+    /// N4: a listing that would delete most rows (an empty pool) deletes nothing; stale rows
+    /// of listed users still sync.
     #[tokio::test]
-    async fn reconcile_leaves_mass_deletes_to_the_webhook() {
+    async fn reconcile_leaves_mass_deletes_to_the_admin_api() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let kept = s.add_user("kept@example.com");
         let (g1, g2) = (Uuid::new_v4(), Uuid::new_v4());
         let rows = json!([
@@ -1522,17 +2051,22 @@ pub(crate) mod tests {
         s.w.reconcile_app_users(s.project).await.unwrap();
 
         for b in [&s.main, &s.dev] {
-            let ran = scripts(&s.w, &ep(b), "app", "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_");
-            assert!(ran.contains(&upsert_call_sql(kept, "kept@example.com", true, created(), None)));
+            let ran = scripts(
+                &s.w,
+                &ep(b),
+                "app",
+                "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_",
+            );
+            assert!(ran.contains(&s.upsert(kept, "kept@example.com", None).await));
             assert!(
                 !ran.iter().any(|x| x.contains("app_users_gone")),
                 "two of three rows would go: {ran:?}"
             );
         }
 
-        // An org listing no one at all deletes nothing either.
+        // A pool listing no one at all deletes nothing either.
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let rows = json!([
             {"id": g1, "email": "g1@example.com", "email_verified": true, "deleted_at": null},
         ]);
@@ -1550,7 +2084,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reconcile_plans_deletes_per_branch() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let kept = s.add_user("kept@example.com");
         let also = s.add_user("also@example.com");
         let (g1, g2) = (Uuid::new_v4(), Uuid::new_v4());
@@ -1579,7 +2113,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reconcile_threshold_counts_only_unmarked_rows_in_mark_mode() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         s.set_on_delete(OnDelete::Mark);
         let kept = s.add_user("kept@example.com");
         let marked = |id: Uuid| json!({"id": id, "email": "m@x", "email_verified": true, "deleted_at": "2026-10-03T10:00:00+00:00"});
@@ -1597,6 +2131,30 @@ pub(crate) mod tests {
         for b in [&s.main, &s.dev] {
             assert!(scripts(&s.w, &ep(b), "app", "BEGIN;").iter().all(|x| !x.contains("app_users_gone")));
         }
+    }
+
+    /// B5: a sign-in that raced the ban and a lost sync job don't survive reconcile, even when
+    /// the row itself already matches the pool.
+    #[tokio::test]
+    async fn reconcile_revokes_a_banned_users_session() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        let user = s.add_user("ada@example.com");
+        s.fake.ban(&s.pool(), &user.to_string());
+        let raced = s.w.metadata.add_session(s.project, user, "s1");
+        let rows = json!([{"id": user, "email": "ada@example.com", "email_verified": true,
+            "deleted_at": null, "banned_at": "2026-10-03T10:00:00+00:00"}]);
+        s.w.computes
+            .answer("chelabase.app_users_rows()", &rows.to_string());
+
+        s.w.reconcile_app_users(s.project).await.unwrap();
+
+        let state = s.w.metadata.state();
+        let session = state.app_sessions.iter().find(|x| x.id == raced).unwrap();
+        assert!(
+            session.revoked_at.is_some(),
+            "a banned user's raced session survives every reconcile"
+        );
     }
 
     #[tokio::test]
@@ -1649,7 +2207,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn branch_create_bootstraps_users_on_auth_database_branch() {
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
         // Every branch's table is empty.
         s.w.computes.answer("chelabase.app_users_rows()", "[]");
@@ -1675,13 +2233,8 @@ pub(crate) mod tests {
         assert!(order.is_sorted(), "{journal:?}");
         // Then the users are reconciled onto it.
         assert!(
-            scripts(&s.w, &ep(&feat), "app", "BEGIN;").contains(&upsert_call_sql(
-                user,
-                "ada@example.com",
-                true,
-                created(),
-                None
-            ))
+            scripts(&s.w, &ep(&feat), "app", "BEGIN;")
+                .contains(&s.upsert(user, "ada@example.com", None).await)
         );
 
         // A failing users bootstrap fails the branch.
@@ -1818,7 +2371,7 @@ pub(crate) mod tests {
     async fn reconcile_reruns_stale_transitions_and_project_deletes() {
         // An enabled project with a user missing from its (empty) table.
         let s = setup(AppUsersStatus::Enabled).await;
-        s.with_org();
+        s.with_pool();
         let user = s.add_user("ada@example.com");
         s.w.computes.answer("chelabase.app_users_rows()", "[]");
 
@@ -1862,13 +2415,11 @@ pub(crate) mod tests {
 
         s.w.app_users_reconcile_once().await;
 
+        let upsert = s.upsert(user, "ada@example.com", None).await;
         for b in [&s.main, &s.dev] {
             assert_eq!(
                 scripts(&s.w, &ep(b), "app", "BEGIN;"),
-                [
-                    USERS_ROWS_SQL.to_string(),
-                    upsert_call_sql(user, "ada@example.com", true, created(), None)
-                ]
+                [USERS_ROWS_SQL.to_string(), upsert.clone()]
             );
         }
         let state = s.w.metadata.state();

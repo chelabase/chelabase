@@ -12,7 +12,7 @@ import { renderWithQuery } from "@/test/render";
 function renderRegister(routes: Record<string, FakeHandler>) {
   const f = fakeFetch(routes);
   configureLoginClient({ baseUrl: "http://studio.test", fetchImpl: f });
-  renderWithQuery(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} />, { fetch: f });
+  renderWithQuery(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, { fetch: f });
   return f;
 }
 
@@ -42,7 +42,7 @@ describe("register: setup code", () => {
     await create();
     await waitFor(async () =>
       expect(await signUpBody(f)).toEqual({
-        authRequest: "V2_1", email: "ada@example.com", password: "Secret-pass1", givenName: "Ada", familyName: "Lovelace",
+        email: "ada@example.com", password: "Secret-pass1", givenName: "Ada", familyName: "Lovelace",
         setupCode: "abcd-efgh-jkmn-pqrs-tuvw",
       }),
     );

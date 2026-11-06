@@ -3,7 +3,7 @@ title: "The schema merge engine"
 description: "How a schema merge matches objects by OID, stores bases, applies the three-way rules, plans its phases and recovers from a crash."
 ---
 
-A schema merge moves schema changes between a branch and its parent with a three-way comparison. For how to use it, see [Merging schema between branches](/docs/using/merging-schema). This page covers how it works.
+A schema merge moves schema changes between a branch and its parent with a three-way comparison. For how to use it, see [Merging schema between branches](/using/merging-schema). This page covers how it works.
 
 The pieces:
 
@@ -25,10 +25,10 @@ Each model has a **fingerprint**, a SHA-256 of its normalized form. The merge st
 
 The exclusions are computed inside the catalog SQL and listed in `crates/chelabase-schema/src/exclusions.rs`, which a worker test checks against the worker's own constants:
 
-- schemas `chelabase` and `chelabase_merge`, and Postgres's own;
+- schemas `chelabase`, `chelabase_merge` and `chelabase_guard` (the protected-branch DDL guard), and Postgres's own;
 - objects that belong to an extension (`pg_depend` type `e`);
 - the app users table's managed columns, guard triggers, own-row policies, email index, and its grants to `authenticated` and `chelabase_auth_sync`;
-- the roles `authenticator`, `anon`, `authenticated`, `chelabase_admin`, `chelabase_auth_sync`, `cloud_admin`, `neon_superuser`, every other `chelabase_*` role and every `pg_*` role (memberships in them stay on the member);
+- the roles `authenticator`, `anon`, `authenticated`, `chelabase_admin`, `chelabase_auth_sync`, `cloud_admin`, `neon_superuser`, every other `chelabase_*` role, the hidden member logins (`cb_m_*`) and every `pg_*` role (memberships in them stay on the member);
 - the data API's default privileges (E16): its per-schema grants to `anon` and `authenticated` by the owner, and its one database-wide row, matched by shape: the owner's function-default row (`defaclnamespace = 0`, object type `f`) whose ACL is exactly the owner's own `EXECUTE`. A row of any other shape, a user's revoke for another role or with another grant included, stays in the model. `exclusions.rs` names the shape and a catalog test pins it.
 
 Leftovers of an interrupted merge (a `chelabase_merge_nn_…` check, a `chelabase_merge_ix_…` index) are reported as such and never read as user changes. Tables that inherit from another (`INHERITS`) are reported too, with their parent link, and the planner doesn't touch them.

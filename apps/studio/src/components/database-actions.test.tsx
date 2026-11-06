@@ -117,7 +117,7 @@ describe("DatabaseActions", () => {
 
   it("deletes only after the name is typed", async () => {
     const { fetch, queryClient } = setup({ [DELETE]: () => jsonResponse({ status: "deleting" }, 202) });
-    queryClient.setQueryData(getGetMeQueryKey(), { user: { sub: "u", org_id: "o" }, tenant: null });
+    queryClient.setQueryData(getGetMeQueryKey(), { user: { sub: "u" }, tenant: null });
 
     await userEvent.click(screen.getByRole("button", { name: "Delete" }));
     const confirm = screen.getByRole("button", { name: "Delete permanently" });

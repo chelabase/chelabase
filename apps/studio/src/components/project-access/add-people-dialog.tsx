@@ -39,7 +39,7 @@ export interface AddPeopleDialogProps {
 }
 
 /** A lookup that failed counts as "no email": the link always works. */
-const UNKNOWN: InviteDelivery = { email_available: false, reason: "zitadel_unavailable" };
+const UNKNOWN: InviteDelivery = { email_available: false, reason: "identity_unavailable" };
 
 /** "Add people to {project}": an email, a platform role, Postgres roles and how they get the invite. */
 export function AddPeopleDialog({ open, onOpenChange, project, suggestions, members, grants, onDone, onLink, finalFocus }: AddPeopleDialogProps) {
@@ -133,9 +133,7 @@ function AddForm({
       onDone(
         result.outcome === "existing_member"
           ? `${memberName(result.member)} now has ${role} access to ${project.name}.`
-          : result.outcome === "added"
-            ? `${address} already had an account and was added with ${role} access. No email was sent.`
-            : `Invited ${address} with ${role} access. The link in their email works for 72 hours; access counts once they accept.`,
+          : `Invited ${address} with ${role} access. The link in their email works for 72 hours; access counts once they accept.`,
       );
     } catch (err) {
       const rows = [{ projectId: project.id, platformRole, pgRoles, blocked }];

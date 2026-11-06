@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn the_demo_password_passes_the_sign_up_rule() {
-        assert!(chelabase_zitadel::rules::strong_password(DEMO_PASSWORD));
+        assert!(chelabase_identity::rules::strong_password(DEMO_PASSWORD));
     }
 
     /// Fails each request in turn, with an answer stuffed with secrets, and scans what the

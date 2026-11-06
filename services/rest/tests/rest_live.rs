@@ -442,7 +442,6 @@ impl Live {
         let key_id = Uuid::new_v4();
         let identity = Identity {
             sub: key_id.to_string(),
-            org_id: String::new(),
             auth: AuthMethod::DataKey,
             request_id: format!("live-{key_id}"),
             data: Some(DataIdentity {
@@ -481,7 +480,6 @@ impl Live {
         let key_id = Uuid::new_v4();
         let identity = Identity {
             sub: key_id.to_string(),
-            org_id: String::new(),
             auth: AuthMethod::DataKey,
             request_id: format!("live-{key_id}"),
             data: Some(DataIdentity {

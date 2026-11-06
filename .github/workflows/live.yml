@@ -1,16 +1,13 @@
 # The live suites: a workbench stack, the e2e recipes, then the stack down. Heavy (builds the
-# services, pulls the Neon images), so it runs by hand until launch, then nightly or on a label.
+# services, pulls the Neon images), so it runs nightly, by hand, or on a PR labelled `run-live`.
 name: live
 
 on:
   workflow_dispatch:
-  # enable at launch: uncomment the schedule (nightly) for this workflow
-  # schedule:
-  #   - cron: "17 3 * * *"
-  # enable at launch (optional): run on a PR carrying the `run-live` label by uncommenting this
-  # and the `if:` line on the job below
-  # pull_request:
-  #   types: [labeled]
+  schedule:
+    - cron: "17 3 * * *"
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
@@ -28,7 +25,7 @@ jobs:
     name: workbench e2e
     runs-on: ubuntu-latest
     timeout-minutes: 150
-    # if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-live')
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-live')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,6 +39,14 @@ jobs:
       - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
         with:
           auto-install: true
+
+      # proto's Rust install leaves the toolchain without rustc on the hosted runner, so let
+      # rustup install rust-toolchain.toml's channel and components itself.
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain uninstall "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" || true
+          rustup toolchain install
+          rustc -vV
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 

@@ -55,7 +55,7 @@ const PROJECTS = [
 ];
 
 export function meFor(caller: Caller): MeResponse {
-  const base = { sub: "u", instance_admin: false, tenant_admins: [], tenant_id: "t1", user: { sub: "u", org_id: "o" } };
+  const base = { sub: "u", instance_admin: false, tenant_admins: [], tenant_id: "t1", user: { sub: "u" } };
   const tenant = (ids: string[]) => ({ id: "t1", slug: "demo", display_name: null, projects: PROJECTS.filter((p) => ids.includes(p.id)) });
   const mp = (id: string, platform_role: string, roles: string[] | "all") => ({
     project_id: id,

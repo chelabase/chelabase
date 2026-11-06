@@ -171,7 +171,6 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     // m5: the gateway's storage upstream.
     ("CHELABASE_STORAGE_URL", "http://storage:8089"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
-    ("CHELABASE_ZITADEL_UPSTREAM", "http://zitadel:8080"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
     ("CHELABASE_LANDING_UPSTREAM", "http://landing:3002"),
@@ -320,10 +319,6 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         "CHELABASE_PUBLIC_SECURE",
         if secure { "true" } else { "false" },
     );
-    lines.set(
-        "CHELABASE_ZITADEL_TLS_MODE",
-        if secure { "external" } else { "disabled" },
-    );
     for (site, host) in site_hosts {
         lines.set(
             &format!("CHELABASE_ENTRY_{site}_URL"),
@@ -364,11 +359,7 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         "CHELABASE_REALTIME_LOGIN_CIDRS",
         format!("{}/32,{}/32", control.realtime_ip, control.runner_ip),
     );
-    lines.set(
-        "CHELABASE_ZITADEL_ACTIONS_ENDPOINT",
-        "http://orchestrator:8083/internal/zitadel/events",
-    );
-    lines.set("CHELABASE_ZITADEL_DIR", path(&input.state.join("zitadel")));
+    lines.set("CHELABASE_BOOTSTRAP_DIR", path(&input.state.join("bootstrap")));
     for (key, dir) in [
         ("CHELABASE_SECRETS_DIR", "secrets"),
         ("CHELABASE_AUTH_DIR", "auth"),
@@ -396,8 +387,8 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
         "CHELABASE_REALTIME_TLS_DIR",
         path(&keys_dir.join("realtime-tls")),
     );
-    // The machine keys every app reads at startup. The gateway starts before the first bootstrap
-    // (bootstrap reaches Zitadel through it), so these can't wait for demo.env.
+    // The machine keys every app reads at startup, all in stack.env: no app waits on the
+    // bootstrap.
     let gateway_dir = keys_dir.join("gateway");
     let auth_dir = keys_dir.join("auth");
     for (key, file) in [
@@ -425,13 +416,12 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
             "CHELABASE_APP_JWT_PUBLIC_KEY",
             auth_dir.join(app_keys::PUBLIC_FILE),
         ),
+        // The member JWT pair (auth-replacement m5): auth signs, the others verify.
+        ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", auth_dir.join("member-jwt.key")),
+        ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", auth_dir.join("member-jwt.pub")),
     ] {
         lines.set(key, path(&file));
     }
-    lines.set(
-        "CHELABASE_ZITADEL_JWKS_URL",
-        format!("{scheme}://{}/oauth/v2/keys", h.auth),
-    );
     lines.set(
         "CHELABASE_PROXY_CA_FILE",
         path(&input.state.join("neon").join("proxy-ca.crt")),

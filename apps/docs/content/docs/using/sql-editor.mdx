@@ -3,9 +3,9 @@ title: SQL editor
 description: Run SQL scripts against a branch from Studio, with a confirmation guard for risky statements, a role preview and saved queries.
 ---
 
-Studio's **SQL** view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. To open it, choose **SQL** on a database in the project's **Databases** tab.
+Studio's **SQL editor** runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. Open it from **SQL editor** in the left rail, or as a drawer under a table in the Table editor (**Full editor** switches to the full page; **Quick view** goes back).
 
-Running as the owner (the default for an Admin) uses the database owner's credentials. A Developer, who may not act as the owner, runs as one of the Postgres roles their grant lists, through a login role of their own that can only switch into those roles: see [Roles and schema isolation](/docs/using/roles-and-schema-isolation). Saved queries are shared within the project. Everything below is also available over the API:
+Running as the owner (the default for an Admin) uses the database owner's credentials. A Developer, who may not act as the owner, runs as one of the Postgres roles their grant lists, through a login role of their own that can only switch into those roles: see [Roles and schema isolation](/using/roles-and-schema-isolation). Saved queries are shared within the project. Everything below is also available over the API:
 
 | Request | What it does |
 |---|---|
@@ -14,11 +14,11 @@ Running as the owner (the default for an Admin) uses the database owner's creden
 | `GET /v1/databases/{id}/branches/{branch_id}/sql/schema?database=` | The schema document that feeds completion. |
 | `/v1/databases/{id}/sql-queries` and `…/{query_id}` | Saved queries. |
 
-For how the run engine, guard and schema read work inside, see [SQL editor internals](/docs/architecture/sql-editor).
+For how the run engine, guard and schema read work inside, see [SQL editor internals](/architecture/sql-editor).
 
 ## Using the editor
 
-The toolbar picks the **Branch**, the **Database** (Postgres database), the role to **Run as** and a **Timeout** (60 s, 5 min or 15 min; the API accepts any value from 100 ms to 15 min). **Ctrl/Cmd+Enter** runs the selection, or the whole buffer when nothing is selected. **Cancel** replaces **Run** while a script runs.
+The bar at the top picks the **Project**, **Database**, **Branch**, **Postgres db** and the role to **Act as**, as in the Table editor. The toolbar has a **Timeout** (60 s, 5 min or 15 min; the API accepts any value from 100 ms to 15 min), **Run**, **Refresh schema** and **Quick view**. **Ctrl/Cmd+Enter** runs the selection, or the whole buffer when nothing is selected. **Cancel** replaces **Run** while a script runs.
 
 Results appear in one tab per statement, with the command tag, and a **Messages** tab for notices and errors. A column's header shows its type on hover. The editor completes names from the branch's schema (with the Postgres language server), and falls back to keyword completion when the schema can't be loaded.
 
@@ -28,7 +28,7 @@ While you run as the owner, the editor says so: row-level security is bypassed. 
 
 - A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` and `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
 - `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block, so they are accepted only as the script's single statement.
-- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use `psql` with a [login role](/docs/using/login-roles) for it.
+- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use `psql` with a [login role](/using/login-roles) for it.
 - Row values come back as text (or `null`).
 
 ### Limits
@@ -66,7 +66,7 @@ Closing the stream, or the cancel route, sends Postgres's cancel request.
 Before running, the script is parsed (with pg_query, Postgres's own parser) and each statement is classified.
 
 - On a normal branch the guard holds back **risky** statements: `DROP` of an object, database, role, owned objects, subscription or tablespace, `TRUNCATE`, `DELETE` and `UPDATE` without a `WHERE`, and `ALTER TABLE` that drops a column or a constraint. `EXPLAIN ANALYZE` (it runs its statement) and `PREPARE` of a risky statement count as risky.
-- On a **protected** branch every statement that isn't a read is held, with reason `protected`. Reads are `SELECT` (without `INTO` or a locking clause, and without a data-modifying `WITH`), `SHOW`, and plain `EXPLAIN` of a read. Even `BEGIN`, `SET` and `COMMIT` are held. See [Branches](/docs/using/branches) for protecting a branch.
+- On a **protected** branch every statement that isn't a read is held, with reason `protected`. Reads are `SELECT` (without `INTO` or a locking clause, and without a data-modifying `WITH`), `SHOW`, and plain `EXPLAIN` of a read. Even `BEGIN`, `SET` and `COMMIT` are held. See [Branches](/using/branches) for protecting a branch.
 - A script that doesn't parse is held as `unparsed`.
 
 A held run answers 409 `sql_confirm_required` and nothing runs. The body lists the held statements (`index`, `kind`, `text_preview` of up to 200 characters, `reason` of `risky` or `protected`). Studio shows them in a dialog; **Confirm** sends the run again with `confirm: true`, which runs the whole script, held statements included.
@@ -75,17 +75,17 @@ A held run answers 409 `sql_confirm_required` and nothing runs. The body lists t
 It looks at the statement, not at what the statement calls, and a client that sends `confirm: true` skips it. On a protected branch, a `SELECT` that calls a function which writes, `SELECT … FOR UPDATE` inside a subquery or CTE, and writing functions such as `nextval` all pass as reads. On a normal branch, `EXECUTE` of a prepared risky statement, a data-modifying CTE (`WITH d AS (DELETE FROM t) …`), `MERGE`, `DO` blocks, and functions and rules that delete pass without confirmation.
 </Callout>
 
-## Run as
+## Act as
 
-The **Run as** picker (`role` in the request) runs `SET ROLE` first, to see what a role would see under row-level security. It lists only the roles you're granted: an Admin, every role of the branch and the owner (or, on a database where the Admin is narrowed, the roles kept there); a Developer, the roles their grant lists and what those reach. It is a **preview, not a security boundary**: the connection is the owner's.
+The **Act as** picker (`role` in the request) runs `SET ROLE` first, to see what a role would see under row-level security. It lists only the roles you're granted: an Admin, every role of the branch and the owner (or, on a database where the Admin is narrowed, the roles kept there); a Developer, the roles their grant lists and what those reach. Acting as a role runs through your own member login, which can only `SET ROLE` into your granted roles, so a `RESET ROLE` lands on your member login, never the owner. An Admin acting as a role a member login can't hold (a login or owner-level role) uses the owner's connection and `SET ROLE`: that case is a preview, not a security boundary.
 
-- `anon` and `authenticated` are offered only when a grant names them (an Admin's every role doesn't include them), and only where the data API was set up. Running as one without such a grant answers 403 with `required: "role:anon"`; a saved query whose role is `anon` still saves. A read-only view of what the data API's roles see comes later. The worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks the grant at most every 5 minutes per branch.
-- Other roles of the branch need no grant: roles the owner created are already its own.
-- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`) are refused (422), and a role that doesn't exist is 404.
+- `anon` and `authenticated` are offered only when a grant names them (an Admin's every role doesn't include them), and only where the data API was set up. Running as one without such a grant answers 403 with `required: "role:anon"`; a saved query whose role is `anon` still saves. A read-only view of what the data API's roles see comes later.
+- Your member login is granted each role in your grant `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without inheriting the role's privileges.
+- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`, `chelabase_realtime`) are refused (422), and a role that doesn't exist is 404.
 
 ## Saved queries and history
 
-Saved queries are private to their author, per database:
+Saved queries are shared with everyone on the project who can use the SQL editor; only the author or an Admin edits or deletes one. Per author and database:
 
 - a name of 1 to 120 characters, unique ignoring case (409 `saved_query_name_taken`);
 - up to 500 per user and database (409 `saved_query_cap`), and up to 1 MiB of SQL each;

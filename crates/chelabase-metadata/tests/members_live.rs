@@ -10,7 +10,7 @@
 
 use chelabase_metadata::members::{
     AccessAction, AccessEvent, AccessWriteError, Admission, GrantRow, MemberBranchRole,
-    MemberStatus, NewInvite, Observed, OverrideRow, TeamSeen,
+    MemberStatus, NewInvite, Observed, OtherMemberships, OverrideRow, TeamSeen,
 };
 use chelabase_metadata::personal_logins::{
     AccessEventInput, GrantVia, LoginEndpoint, LoginStatus, LoginWriteError, MemberProjectRole,
@@ -226,9 +226,32 @@ fn week() -> chrono::DateTime<Utc> {
 /// An invite token's SHA-256 (any 32 bytes will do for these tests).
 const TOKEN: [u8; 32] = [7; 32];
 
-/// An invite of `zitadel_user_id` at `email`, open for a week, with `TOKEN` and `grants`.
-fn new_invite<'a>(zitadel_user_id: &'a str, email: &'a str, grants: &'a [(Uuid, GrantRow)]) -> NewInvite<'a> {
-    NewInvite { zitadel_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[] }
+/// An invite of `identity_user_id` at `email`, open for a week, with `TOKEN` and `grants`.
+fn new_invite<'a>(identity_user_id: &'a str, email: &'a str, grants: &'a [(Uuid, GrantRow)]) -> NewInvite<'a> {
+    NewInvite { identity_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[] }
+}
+
+// #121: what sign-in and `/auth/v1/token` read: active and pending rows of every tenant.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_tenants_lists_active_and_pending() {
+    let s = Scratch::new().await;
+    let (a, b, c) = (s.tenant().await, s.tenant().await, s.tenant().await);
+    let who = format!("mt-{}", Uuid::new_v4());
+    let join = async |t, user: &str, admission| {
+        s.client.ensure_member_first_comer_for_tests(t, user, "", "N", admission).await.unwrap()
+    };
+    join(a, &who, Admission::Active).await;
+    join(b, "admin-b", Admission::Active).await;
+    join(b, &who, Admission::Pending).await;
+    join(c, "admin-c", Admission::Active).await;
+    let gone = join(c, &who, Admission::Active).await;
+    sqlx::query("UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1").bind(gone.id).execute(s.client.pool()).await.unwrap();
+    let mut want = vec![(a, MemberStatus::Active), (b, MemberStatus::Pending)];
+    want.sort_by_key(|(t, _)| t.as_uuid());
+    assert_eq!(s.client.member_tenants(&who).await.unwrap(), want);
+    assert!(s.client.member_tenants("stranger").await.unwrap().is_empty());
+    s.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -250,7 +273,7 @@ async fn first_claim_is_atomic() {
     assert_eq!(members.iter().filter(|m| m.tenant_admin).count(), 1);
     assert!(members.iter().all(|m| m.status == MemberStatus::Active));
     for m in &members {
-        let i = m.zitadel_user_id.trim_start_matches('z');
+        let i = m.identity_user_id.trim_start_matches('z');
         assert_eq!(
             m.email.as_deref(),
             Some(format!("user{i}@example.com").as_str())
@@ -544,7 +567,7 @@ async fn owner_is_never_stored() {
         matches!(invite, Err(AccessWriteError::Conflict(_))),
         "{invite:?}"
     );
-    assert!(s.client.member_by_zitadel(t, "zi").await.unwrap().is_none());
+    assert!(s.client.member_by_identity_user(t, "zi").await.unwrap().is_none());
 
     // R7: Admin implies the owner, so naming it is refused even with Admin, on a grant, an
     // invite's grant and an override alike: no row, no event.
@@ -572,7 +595,7 @@ async fn owner_is_never_stored() {
         s.client.grant_sources(m.id, p, Some(d)).await.unwrap(),
         GrantSources::default()
     );
-    assert!(s.client.member_by_zitadel(t, "zi").await.unwrap().is_none());
+    assert!(s.client.member_by_identity_user(t, "zi").await.unwrap().is_none());
     assert_eq!(s.event_count(t).await, before);
 
     // The CHECKs themselves refuse a stored `owner` in either table.
@@ -673,11 +696,11 @@ async fn invited_becomes_active_on_ensure() {
     s.finish().await;
 }
 
-// One Zitadel user in two tenants: each membership sees the other until it is removed; the
-// user's last membership has no other.
+// One identity user in two tenants: each membership sees the other until it is removed (`live`),
+// and an active one only while it is active (`active`); the user's last membership has no other.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn other_membership_is_any_tenants_non_removed_row() {
+async fn other_memberships_are_any_tenants_non_removed_rows() {
     let s = Scratch::new().await;
     let (t1, t2) = (s.tenant().await, s.tenant().await);
     let mut admins = Vec::new();
@@ -697,21 +720,29 @@ async fn other_membership_is_any_tenants_non_removed_row() {
         admins.push(admin.id);
         zs.push(z.id);
     }
-    // Someone else's row (another Zitadel user) never counts.
+    let both = OtherMemberships { active: true, live: true };
+    let none = OtherMemberships::default();
+    // Someone else's row (another identity user) never counts.
     s.client
         .ensure_member_first_comer_for_tests(t1, "y", "", "Y", Admission::Active)
         .await
         .unwrap();
-    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
-    assert!(s.client.has_other_membership(zs[1]).await.unwrap());
-    assert!(!s.client.has_other_membership(admins[0]).await.unwrap());
-    assert!(!s.client.has_other_membership(Uuid::new_v4()).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", Some(zs[0])).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("z", Some(zs[1])).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("z", None).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("nobody", None).await.unwrap(), none);
+    // A suspended row is live but not active.
+    s.client.suspend_member(admins[1], zs[1]).await.unwrap();
+    assert_eq!(
+        s.client.other_memberships("z", Some(zs[0])).await.unwrap(),
+        OtherMemberships { active: false, live: true }
+    );
     s.client.remove_member(admins[0], zs[0]).await.unwrap();
     // The removed row no longer counts for the other; the removed one still sees the other.
-    assert!(!s.client.has_other_membership(zs[1]).await.unwrap());
-    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", Some(zs[1])).await.unwrap(), none);
+    assert!(s.client.other_memberships("z", Some(zs[0])).await.unwrap().live);
     s.client.remove_member(admins[1], zs[1]).await.unwrap();
-    assert!(!s.client.has_other_membership(zs[0]).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", None).await.unwrap(), none);
     s.finish().await;
 }
 
@@ -1174,7 +1205,7 @@ async fn every_write_logs_one_event() {
     );
     assert_eq!(zid, "zi");
     assert_eq!(
-        c.member_by_zitadel(t, "zi").await.unwrap().unwrap().status,
+        c.member_by_identity_user(t, "zi").await.unwrap().unwrap().status,
         MemberStatus::Removed
     );
     let (_, invite2) = one_event!(
@@ -1410,7 +1441,7 @@ async fn reconciler_reads_grants_branches_and_forgets_rows() {
 
 async fn email_of(s: &Scratch, t: TenantId, zid: &str) -> Option<String> {
     s.client
-        .member_by_zitadel(t, zid)
+        .member_by_identity_user(t, zid)
         .await
         .unwrap()
         .unwrap()
@@ -1429,7 +1460,7 @@ async fn newest_email_claim_wins() {
         .await
         .unwrap();
     assert_eq!(a.email.as_deref(), Some("x@x.com"));
-    // A's Zitadel email moved on; Z2 signs up with A's old one.
+    // A's identity email moved on; Z2 signs up with A's old one.
     let events = s.event_count(t).await;
     let z2 = s
         .client
@@ -1561,7 +1592,7 @@ async fn concurrent_email_claims_leave_one_holder() {
     s.finish().await;
 }
 
-// M8: re-inviting a removed or revoked Zitadel user reuses its row, with nothing left over.
+// M8: re-inviting a removed or revoked identity user reuses its row, with nothing left over.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn reinvite_reuses_a_removed_row() {
@@ -1665,7 +1696,7 @@ async fn tenant_isolation_is_not_found() {
             .await,
         Err(AccessWriteError::NotFound)
     ));
-    assert!(s.client.member_by_zitadel(t, "zx").await.unwrap().is_none());
+    assert!(s.client.member_by_identity_user(t, "zx").await.unwrap().is_none());
     assert!(s.client.member_projects(m.id).await.unwrap().is_empty());
     assert_eq!(
         s.client.grant_sources(m.id, p2, Some(d2)).await.unwrap(),
@@ -1871,7 +1902,7 @@ async fn existing_user_is_added_active() {
         Err(AccessWriteError::NotFound)
     ));
     assert_eq!(s.event_count(t).await, before);
-    assert!(c.member_by_zitadel(t, "zv").await.unwrap().is_none());
+    assert!(c.member_by_identity_user(t, "zv").await.unwrap().is_none());
 
     // R29: a removed member never comes back active this way; it is re-invited with a code.
     c.set_tenant_admin(Some(a.id), u.id, true).await.unwrap();
@@ -2098,7 +2129,7 @@ async fn member_listings_report_has_access() {
     s.finish().await;
 }
 
-// T12x: an invite is described by (Zitadel user, token hash) while it is open; the hash is
+// T12x: an invite is described by (identity user, token hash) while it is open; the hash is
 // replaced by a resend and every closed invite describes as nothing.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
@@ -2127,6 +2158,28 @@ async fn invite_description_follows_the_open_invite() {
     assert!(c.open_invite_for_user("zi").await.unwrap().is_some());
     c.revoke_invite(a.id, invite).await.unwrap();
     assert!(c.open_invite_for_user("zi").await.unwrap().is_none());
+    s.finish().await;
+}
+
+// #126: the open invite names its tenant (accepting activates the row there), and once it is
+// accepted it is found among the user's accepted invites with its token hash, by tenant.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_invite_names_its_tenant_open_and_accepted() {
+    let s = Scratch::new().await;
+    let c = &s.client;
+    let zid = format!("z-{}", uuid::Uuid::new_v4().simple());
+    let t2 = s.tenant().await;
+    let a2 = c.ensure_member_first_comer_for_tests(t2, "a2", "a2@x.com", "A2", Admission::Active).await.unwrap();
+    assert!(c.accepted_invites_for_user(&zid).await.unwrap().is_empty());
+    c.create_invited_member(a2.id, t2, new_invite(&zid, "i@x.com", &[])).await.unwrap();
+    let d = c.open_invite_for_user(&zid).await.unwrap().unwrap();
+    assert_eq!(d.tenant_id, t2);
+    assert!(c.accepted_invites_for_user(&zid).await.unwrap().is_empty(), "not accepted yet");
+    let row = c.admit_member(t2, &zid, "i@x.com", "Ivy", Admission::Closed).await.unwrap();
+    assert_eq!(row.status, MemberStatus::Active);
+    assert!(c.open_invite_for_user(&zid).await.unwrap().is_none());
+    assert_eq!(c.accepted_invites_for_user(&zid).await.unwrap(), vec![(t2, Some(TOKEN.to_vec()))]);
     s.finish().await;
 }
 
@@ -2266,7 +2319,7 @@ async fn pending_member_lifecycle() {
     let before = s.event_count(t).await;
     let closed = c.ensure_member_first_comer_for_tests(t, "c", "c@x.com", "C", Admission::Closed).await;
     assert!(matches!(closed, Err(chelabase_metadata::MetadataError::NotAdmitted(_))), "{closed:?}");
-    assert!(c.member_by_zitadel(t, "c").await.unwrap().is_none());
+    assert!(c.member_by_identity_user(t, "c").await.unwrap().is_none());
     assert_eq!(s.event_count(t).await, before);
     let b = c.ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", Admission::Pending).await.unwrap();
     assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false));
@@ -2311,12 +2364,12 @@ async fn pending_member_lifecycle() {
         c.approve_member(a.id, d.id, &[(foreign, grant(PlatformRole::Viewer, &[]))], &[]).await,
         Err(AccessWriteError::NotFound)
     ));
-    assert_eq!(c.member_by_zitadel(t, "d").await.unwrap().unwrap().status, MemberStatus::Pending);
+    assert_eq!(c.member_by_identity_user(t, "d").await.unwrap().unwrap().status, MemberStatus::Pending);
     assert_eq!(s.event_count(t).await, events);
 
-    // Decline: removed, one event, the Zitadel user to deactivate; not for the active.
+    // Decline: removed, one event, the identity user to deactivate; not for the active.
     assert_eq!(c.decline_member(a.id, d.id).await.unwrap(), "d");
-    assert_eq!(c.member_by_zitadel(t, "d").await.unwrap().unwrap().status, MemberStatus::Removed);
+    assert_eq!(c.member_by_identity_user(t, "d").await.unwrap().unwrap().status, MemberStatus::Removed);
     assert_eq!(actions(t).await.last().map(String::as_str), Some("member_declined"));
     assert!(matches!(c.decline_member(a.id, d.id).await, Err(AccessWriteError::MemberNotFound)));
     assert!(matches!(c.decline_member(a.id, b.id).await, Err(AccessWriteError::Conflict(_))));
@@ -2325,7 +2378,7 @@ async fn pending_member_lifecycle() {
     // A pending member never becomes the first admin; the next person to ask claims it.
     let t2 = s.tenant().await;
     sqlx::query(
-        "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status)
+        "INSERT INTO members (id, tenant_id, identity_user_id, email, status)
          VALUES (gen_random_uuid(), $1, 'pz', 'p@x.com', 'pending')",
     )
     .bind(t2.as_uuid())
@@ -2337,52 +2390,7 @@ async fn pending_member_lifecycle() {
     assert!(c.active_tenant_admins(t2).await.unwrap().is_empty());
     let first = c.ensure_member_first_comer_for_tests(t2, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
     assert_eq!((first.status, first.tenant_admin), (MemberStatus::Active, true));
-    assert_eq!(c.member_by_zitadel(t2, "pz").await.unwrap().unwrap().status, MemberStatus::Pending);
-    s.finish().await;
-}
-
-// M2: the bootstrap's `NAME_SQL` (`chelabase-init`'s `tenant_name.sql`) names a tenant
-// once, trimmed and cut to the column's rules, and logs one event.
-#[tokio::test]
-#[ignore = "needs the workbench stack's metadata Postgres"]
-async fn bootstrap_names_the_tenant_once() {
-    const NAME_SQL: &str = include_str!("../../chelabase-init/src/bootstrap/tenant_name.sql");
-    let s = Scratch::new().await;
-    // The bootstrap's own SQL (`chelabase_init::bootstrap::tenant`), already `$1`/`$2`.
-    let sql = NAME_SQL.to_string();
-    let run = |t: TenantId, name: &str| {
-        let (sql, name, pool) = (sql.clone(), name.to_string(), s.client.pool().clone());
-        async move {
-            sqlx::query(AssertSqlSafe(sql)).bind(t.as_uuid()).bind(name).execute(&pool).await.unwrap();
-        }
-    };
-    let name_of = |t: TenantId| {
-        let pool = s.client.pool().clone();
-        async move {
-            sqlx::query_scalar::<_, Option<String>>("SELECT display_name FROM tenants WHERE id = $1")
-                .bind(t.as_uuid())
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-        }
-    };
-    let t = s.tenant().await;
-    run(t, "  Acme Corp  ").await;
-    assert_eq!(name_of(t).await.as_deref(), Some("Acme Corp"));
-    assert_eq!(s.event_count(t).await, 1);
-    // A named tenant keeps its name, and a repeat writes nothing.
-    run(t, "Other").await;
-    assert_eq!(name_of(t).await.as_deref(), Some("Acme Corp"));
-    assert_eq!(s.event_count(t).await, 1);
-    // Too long: cut to 80 and trimmed (a space at the cut would break the column's check).
-    let long = s.tenant().await;
-    run(long, &format!("{} tail", "x".repeat(79))).await;
-    assert_eq!(name_of(long).await.as_deref(), Some("x".repeat(79).as_str()));
-    // Blank: nothing.
-    let blank = s.tenant().await;
-    run(blank, "   ").await;
-    assert_eq!(name_of(blank).await, None);
-    assert_eq!(s.event_count(blank).await, 0);
+    assert_eq!(c.member_by_identity_user(t2, "pz").await.unwrap().unwrap().status, MemberStatus::Pending);
     s.finish().await;
 }
 
@@ -2454,7 +2462,7 @@ async fn member_status_write_matrix() {
             // to delete, and a refused write is seen to leave them alone).
             let id = Uuid::new_v4();
             sqlx::query(
-                "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status)
+                "INSERT INTO members (id, tenant_id, identity_user_id, email, status)
                  VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(id)
@@ -2541,7 +2549,7 @@ impl Scratch {
     /// its `suspended_at` (`members_suspended_has_at`).
     async fn member_row(&self, t: TenantId, zid: &str, status: &str, tenant_admin: bool) -> Uuid {
         self.insert_member_row(
-            "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, tenant_admin, suspended_at)
+            "INSERT INTO members (id, tenant_id, identity_user_id, email, status, tenant_admin, suspended_at)
              VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 = 'suspended' THEN now() END)",
             t,
             zid,
@@ -2555,7 +2563,7 @@ impl Scratch {
     /// drops `suspended_at` and `suspended_by` first).
     async fn member_row_before_d10(&self, t: TenantId, zid: &str, status: &str) -> Uuid {
         self.insert_member_row(
-            "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, tenant_admin)
+            "INSERT INTO members (id, tenant_id, identity_user_id, email, status, tenant_admin)
              VALUES ($1, $2, $3, $4, $5, $6)",
             t,
             zid,
@@ -2657,7 +2665,7 @@ impl Scratch {
         Hub { t, admin: admin.id, p, db, ep }
     }
 
-    /// An active member (Zitadel user and display name `zid`, email `<zid>@x.com`).
+    /// An active member (identity user and display name `zid`, email `<zid>@x.com`).
     async fn active(&self, h: &Hub, zid: &str) -> Uuid {
         self.client
             .ensure_member_first_comer_for_tests(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
@@ -3602,7 +3610,7 @@ async fn the_last_active_tenant_admin_cannot_be_suspended() {
 }
 
 // S7: suspending a suspended member and reinstating an active one succeed and write nothing
-// (a retry after a failed Zitadel lock or unlock redoes only that step).
+// (a retry after a failed identity ban or unban redoes only that step).
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn suspend_and_reinstate_are_idempotent() {
@@ -3694,7 +3702,7 @@ async fn a_retried_suspend_keeps_the_first_values_and_other_writes_leave_them_nu
     assert_eq!(suspension_of(&s, alice).await, (None, None));
 
     let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
-    c.revoke_logins_for_zitadel_user(h.t, "bob").await.unwrap();
+    c.revoke_logins_for_identity_user(h.t, "bob").await.unwrap();
     assert_eq!(suspension_of(&s, bob).await, (None, None), "offboarding doesn't touch them");
     c.remove_member(h.admin, bob).await.unwrap();
     assert_eq!(suspension_of(&s, bob).await, (None, None), "nor does removal of an active member");
@@ -3868,7 +3876,7 @@ async fn a_suspended_member_is_never_reactivated_by_sign_in() {
     assert_eq!(changed.status, MemberStatus::Suspended);
     let invite = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO invites (id, member_id, zitadel_user_id, invited_by, expires_at, token_hash)
+        "INSERT INTO invites (id, member_id, identity_user_id, invited_by, expires_at, token_hash)
          VALUES ($1, $2, 'alice', $3, now() + interval '1 day', $4)",
     )
     .bind(invite)
@@ -4046,19 +4054,19 @@ async fn remove_member_touches_personal_login_projects() {
     s.finish().await;
 }
 
-// D4: the webhook's and the sweep's write revokes every live login of the tenant's member with
-// that Zitadel user (`identity_offboarded`) and returns where their rows are; one event per
-// member, none when nothing was live (S18); an unknown user or another tenant's is untouched.
+// D4: removal's offboarding write revokes every live login of the tenant's member with that
+// identity user (`identity_offboarded`) and returns where their rows are; one event per member,
+// none when nothing was live (S18); an unknown user or another tenant's is untouched.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn zitadel_offboarding_revokes_by_user() {
+async fn offboarding_revokes_by_user() {
     let s = Scratch::new().await;
     let other = s.hub().await;
     let h = s.hub().await;
     let (child, child_ep) = s.child(h.db, "dev").await;
     let (db2, ep2) = s.ready_database(h.t, h.p).await;
     let c = &s.client;
-    // The same Zitadel user id in another tenant, with a live login there.
+    // The same identity user id in another tenant, with a live login there.
     let twin = s.granted(&other, "alice", PlatformRole::Developer).await;
     s.login(twin, other.db, "alice").await;
     let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
@@ -4067,11 +4075,8 @@ async fn zitadel_offboarding_revokes_by_user() {
     c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
     c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
     c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
-    let live = c.members_with_live_logins().await.unwrap();
-    assert!(live.contains(&(h.t, alice, "alice".to_string())), "{live:?}");
-    assert!(live.contains(&(other.t, twin, "alice".to_string())), "{live:?}");
 
-    let eps = c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
+    let eps = c.revoke_logins_for_identity_user(h.t, "alice").await.unwrap();
     assert_eq!(
         sorted(eps),
         sorted(vec![endpoint(h.db, &h.ep, "alice"), endpoint(child, &child_ep, "alice"), endpoint(db2, &ep2, "alice")])
@@ -4084,15 +4089,12 @@ async fn zitadel_offboarding_revokes_by_user() {
     assert_eq!(revoked.len(), 1, "one event for the member");
     let after = revoked[0].after.clone().unwrap();
     assert_eq!((after["count"].as_i64(), after["reason"].as_str()), (Some(2), Some("identity_offboarded")));
-    let live = c.members_with_live_logins().await.unwrap();
-    assert!(!live.iter().any(|(_, m, _)| *m == alice), "{live:?}");
-    assert!(live.contains(&(other.t, twin, "alice".to_string())), "another tenant's member is untouched");
-    assert_eq!(logins_of(&s, twin).await[0].status, LoginStatus::Active);
+    assert_eq!(logins_of(&s, twin).await[0].status, LoginStatus::Active, "another tenant's member is untouched");
 
     // S18: nothing live, nothing written; an unknown user is nobody.
     let written = s.event_count(h.t).await;
-    c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
-    assert!(c.revoke_logins_for_zitadel_user(h.t, "nobody").await.unwrap().is_empty());
+    c.revoke_logins_for_identity_user(h.t, "alice").await.unwrap();
+    assert!(c.revoke_logins_for_identity_user(h.t, "nobody").await.unwrap().is_empty());
     assert_eq!(s.event_count(h.t).await, written);
     s.finish().await;
 }
@@ -4292,8 +4294,8 @@ async fn personal_login_reads_report_status_and_qualifies() {
 
 // D7: the webhook's and the sweep's write marks the member offboarded (whether or not a login
 // was live), independently of its status; an offboarded member doesn't qualify for a login.
-// Only Zitadel showing the user active again clears the mark (`clear_offboarded`), never a
-// sign-in, and the logins stay revoked. Another tenant's member with the same Zitadel user is
+// Only an accepted invite showing the user back clears the mark (`clear_offboarded`), never a
+// sign-in, and the logins stay revoked. Another tenant's member with the same identity user is
 // untouched.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
@@ -4312,11 +4314,11 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
         .unwrap()
         .id;
 
-    c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
+    c.revoke_logins_for_identity_user(h.t, "alice").await.unwrap();
     let marked = c.member(alice).await.unwrap().unwrap();
-    assert!(marked.offboarded, "the webhook's write marks the member");
+    assert!(marked.offboarded, "the offboarding write marks the member");
     assert_eq!(marked.status, MemberStatus::Active, "the mark isn't a status");
-    c.revoke_logins_for_zitadel_user(h.t, "bob").await.unwrap();
+    c.revoke_logins_for_identity_user(h.t, "bob").await.unwrap();
     assert!(c.member(bob).await.unwrap().unwrap().offboarded, "marked without a live login too");
     assert!(!c.member(twin).await.unwrap().unwrap().offboarded, "another tenant's member");
     assert!(
@@ -4328,10 +4330,6 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
     assert!(!s.sql_qualifies(alice, h.db).await);
     let refused = c.create_personal_login(alice, h.db, "alice2", V2, in_days(90)).await;
     assert!(matches!(refused, Err(LoginWriteError::NotQualified)), "{refused:?}");
-    // By tenant, then member.
-    let mut want = vec![(h.t, alice, "alice".to_string()), (h.t, bob, "bob".to_string())];
-    want.sort_by_key(|(_, m, _)| *m);
-    assert_eq!(c.offboarded_members().await.unwrap(), want);
 
     // A sign-in never clears it.
     c.ensure_member_first_comer_for_tests(h.t, "bob", "bob@x.com", "bob", Admission::Active).await.unwrap();
@@ -4348,10 +4346,7 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
         (LoginStatus::Revoked, Some(RevokeReason::IdentityOffboarded)),
         "the login stays revoked"
     );
-    assert_eq!(
-        c.offboarded_members().await.unwrap(),
-        vec![(h.t, bob, "bob".to_string())]
-    );
+    assert!(c.member(bob).await.unwrap().unwrap().offboarded, "bob keeps his mark");
     s.finish().await;
 }
 
@@ -5941,7 +5936,7 @@ async fn setup_claim_admit_bound_to_setup_claim_user() {
     assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true));
     assert_eq!(s.last_action(t).await, "admin_claimed");
     let admins = s.client.active_tenant_admins(t).await.unwrap();
-    assert_eq!(admins.iter().map(|m| m.zitadel_user_id.as_str()).collect::<Vec<_>>(), vec!["user-a"]);
+    assert_eq!(admins.iter().map(|m| m.identity_user_id.as_str()).collect::<Vec<_>>(), vec!["user-a"]);
     s.finish().await;
 }
 
@@ -6002,7 +5997,7 @@ async fn setup_claim_nonce_refusals() {
     let n = setup_nonce(&s, t).await;
     assert_eq!(s.client.claim_setup(t, n, "u1", None).await.unwrap(), Bound);
     assert_eq!(s.client.claim_setup(t, n, "u2", None).await.unwrap(), Refused, "reused");
-    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "u1");
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().identity_user_id, "u1");
     assert_eq!(setup_claim_rows(&s, t).await, 1);
     s.finish().await;
 }
@@ -6026,13 +6021,13 @@ async fn setup_claim_race() {
         assert_eq!(outcomes, vec![AlreadyClaimed, Bound], "round {round}");
         assert_eq!(setup_claim_rows(&s, t).await, 1);
         let winner = if oa == Bound { "user-a" } else { "user-b" };
-        assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, winner);
+        assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().identity_user_id, winner);
         let (ma, mb) = (s.client.clone(), s.client.clone());
         let ra = tokio::spawn(async move { ma.admit_member(t, "user-a", "a@x.com", "A", Admission::Pending).await.unwrap() });
         let rb = tokio::spawn(async move { mb.admit_member(t, "user-b", "b@x.com", "B", Admission::Pending).await.unwrap() });
         let members = [ra.await.unwrap(), rb.await.unwrap()];
         for m in &members {
-            let bound = m.zitadel_user_id == winner;
+            let bound = m.identity_user_id == winner;
             assert_eq!(m.tenant_admin, bound, "round {round}: {m:?}");
             let want = if bound { MemberStatus::Active } else { MemberStatus::Pending };
             assert_eq!(m.status, want, "round {round}");
@@ -6041,7 +6036,7 @@ async fn setup_claim_race() {
     s.finish().await;
 }
 
-// AC 11: a claim whose user is gone (no member row; Zitadel checked by the caller) is rebound
+// AC 11: a claim whose user is gone (no member row; identity checked by the caller) is rebound
 // by a new code-gated sign-up, which then becomes admin. A claim whose user has a member row,
 // or another user than the caller checked, is not replaced.
 #[tokio::test]
@@ -6053,12 +6048,12 @@ async fn setup_claim_stale_replaced() {
     let n = setup_nonce(&s, t).await;
     assert_eq!(s.client.claim_setup(t, n, "gone", None).await.unwrap(), Bound);
     let claim = s.client.setup_claim(t).await.unwrap().unwrap();
-    assert_eq!((claim.zitadel_user_id.as_str(), claim.has_member_row), ("gone", false));
+    assert_eq!((claim.identity_user_id.as_str(), claim.has_member_row), ("gone", false));
     let n = setup_nonce(&s, t).await;
     assert_eq!(s.client.claim_setup(t, n, "new", Some("someone-else")).await.unwrap(), AlreadyClaimed);
     let n = setup_nonce(&s, t).await;
     assert_eq!(s.client.claim_setup(t, n, "new", Some("gone")).await.unwrap(), Bound);
-    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "new");
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().identity_user_id, "new");
     let replaced: Option<String> = sqlx::query_scalar("SELECT replaced_user_id FROM setup_claims WHERE tenant_id = $1")
         .bind(t.as_uuid())
         .fetch_one(s.client.pool())
@@ -6072,7 +6067,7 @@ async fn setup_claim_stale_replaced() {
     assert!(s.client.setup_claim(t).await.unwrap().unwrap().has_member_row);
     let n = setup_nonce(&s, t).await;
     assert_eq!(s.client.claim_setup(t, n, "third", Some("new")).await.unwrap(), AlreadyClaimed);
-    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "new");
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().identity_user_id, "new");
     s.finish().await;
 }
 
@@ -6130,7 +6125,7 @@ async fn setup_claim_bystander_never_blocks_stale_replacement() {
     );
     assert_eq!(s.member_count(t).await, 0);
     assert!(!s.client.tenant_has_members(t).await.unwrap(), "the gate stays open");
-    // A never signed in and is gone from Zitadel: a new code-gated sign-up replaces the claim.
+    // A never signed in and is gone from identity: a new code-gated sign-up replaces the claim.
     assert!(!s.client.setup_claim(t).await.unwrap().unwrap().has_member_row);
     let n = setup_nonce(&s, t).await;
     assert_eq!(

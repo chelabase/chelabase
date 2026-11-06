@@ -7,12 +7,14 @@
 # 3. the built-in own-row policy: each user reads only their row, the public key alone reads
 #    nothing; a developer policy USING (owner = chelabase.user_id()) works the same way;
 # 4. a new branch gets the users' rows (within 60 s);
-# 5. an email changed in Zitadel (admin API) reaches the row through the webhook (within 30 s);
+# 5. B's email changed through the platform API reaches B's row through the sync job (within
+#    30 s);
 # 6. refresh rotation; the old refresh token reused after the 10 s grace is 401
 #    refresh_token_reused, and the session's access token then gets 401 user_session_revoked
 #    (within 35 s);
 # 7. a user deleted through the platform API loses their row on both branches (within 60 s);
-# 8. deleting the project deletes its databases and its Zitadel org (gone from the org search).
+# 8. deleting the project deletes its databases and drops its identity-service pool (the pool's
+#    users answer 404 pool_not_found).
 # KEEP=1 leaves everything in place.
 set -euo pipefail
 
@@ -38,7 +40,7 @@ die() {
 }
 cleanup() {
   if [[ -n "$project_id" && "${KEEP:-}" != 1 ]]; then
-    # The cascade deletes the databases and the Zitadel org; a database still provisioning
+    # The cascade deletes the databases and the app-user pool; a database still provisioning
     # makes it refuse (409), so that one is deleted on its own first.
     if [[ -n "$db_id" ]]; then api DELETE "/v1/databases/$db_id" >/dev/null || true; fi
     api DELETE "/v1/projects/$project_id" "$(jq -nc --arg s "$slug" '{confirm: $s}')" >/dev/null || true
@@ -47,17 +49,11 @@ cleanup() {
 }
 
 [[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
-demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
-[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
-set -a
-# shellcheck disable=SC1091
-source "$demo_env"
-set +a
 ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
 [[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
-[[ -n "${CHELABASE_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELABASE_ZITADEL_ADMIN_PAT_FILE}" ]] ||
-  die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just workbench up: its bootstrap writes demo.env)"
-ZITADEL="${CHELABASE_ZITADEL_ISSUER:-$CHELABASE_ENTRY_AUTH_URL}"
+IDENTITY="${CHELABASE_IDENTITY_URL:?run through just workbench run}"
+[[ -s "${CHELABASE_IDENTITY_WORKER_TOKEN_FILE:-}" ]] ||
+  die "CHELABASE_IDENTITY_WORKER_TOKEN_FILE is unset or empty (run through just workbench run)"
 command -v pnpm >/dev/null || die "pnpm is missing"
 trap cleanup EXIT
 
@@ -68,22 +64,13 @@ ok() {
   [[ "$status" == "$3" ]] || die "$1 $2: $status (wanted $3) $(cat "$tmp/body")"
 }
 
-# zitadel <method> <path> [body]: Zitadel's API with the admin PAT; the status (body in
-# $tmp/zbody). The PAT goes through a header file, never argv.
-zitadel() {
-  printf 'Authorization: Bearer %s\n' "$(tr -d '\n' <"$CHELABASE_ZITADEL_ADMIN_PAT_FILE")" >"$tmp/zauth"
-  local args=(-sS --max-time 30 -o "$tmp/zbody" -w '%{http_code}' -X "$1" "$ZITADEL$2" -H @"$tmp/zauth")
-  if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
-  curl "${args[@]}" || true
-}
-
-# org_count <id>: how many live Zitadel orgs have this id (v2 search; v1's admin read still
-# returns a removed org).
-org_count() {
-  local status
-  status="$(zitadel POST /v2/organizations/_search "$(jq -nc --arg id "$1" '{queries: [{idQuery: {id: $id}}]}')")"
-  [[ "$status" == 200 ]] || die "Zitadel org search: $status $(cat "$tmp/zbody")"
-  jq -r '.result // [] | length' "$tmp/zbody"
+# pool_user <user id> → the status of the identity service's read of that user in the project's
+# app-user pool (body in $tmp/ibody), as the worker (the caller that drops pools). The token goes
+# through a header file, never argv.
+pool_user() {
+  printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' <"$CHELABASE_IDENTITY_WORKER_TOKEN_FILE")" >"$tmp/iauth"
+  curl -sS --max-time 30 -o "$tmp/ibody" -w '%{http_code}' -H @"$tmp/iauth" \
+    "$IDENTITY/internal/v1/pools/app-$project_id/users/$1" || true
 }
 
 # wait_db: until the database is ready.
@@ -180,8 +167,6 @@ for _ in $(seq 120); do
   sleep 1
 done
 [[ "$s" == enabled ]] || die "app users still $s after 120 s"
-[[ "$(jq -r '.zitadel_org_id' "$tmp/body")" == "$project_id" ]] || die "unexpected org: $(cat "$tmp/body")"
-[[ "$(org_count "$project_id")" == 1 ]] || die "Zitadel has no org $project_id"
 pass "project $slug, database $db_id, app users enabled"
 
 # 2. Sign-up: a NOT NULL app column, then sign-up data for it.
@@ -196,6 +181,9 @@ user_b="$(jq -r '.b.id' "$tmp/users.json")"
 email_a="$(jq -r '.a.email' "$tmp/users.json")"
 [[ "$(psql_on "$db_id" -c "SELECT display_name FROM users WHERE id = '$user_a'")" == Alice ]] ||
   die "A's row lacks display_name: $(psql_on "$db_id" -c "TABLE users")"
+s="$(pool_user "$user_b")"
+[[ "$s" == 200 ]] && jq -e --arg id "$user_b" '.user.id == $id' "$tmp/ibody" >/dev/null ||
+  die "B isn't in the project's identity pool app-$project_id: $s $(cat "$tmp/ibody")"
 pass "signed up A ($user_a) and B with display_name"
 
 # 2b. Generated types mark the users table (a secret key's role reads the schema).
@@ -223,13 +211,15 @@ r0=$SECONDS
 wait_sql "$dev_id" "SELECT count(*) FROM users WHERE id IN ('$user_a', '$user_b')" 2 60 "rows on the new branch"
 pass "branch dev has both rows after $((SECONDS - r0)) s"
 
-# 5. An email changed in Zitadel reaches the row through the webhook.
-new_email="a2-$STAMP@example.com"
-status="$(zitadel POST "/v2/users/$user_a/email" "$(jq -nc --arg e "$new_email" '{email: $e, isVerified: true}')")"
-[[ "$status" == 200 ]] || die "Zitadel set email: $status $(cat "$tmp/zbody")"
+# 5. B's email changed through the platform API reaches B's row (A keeps its session for step 6:
+# an email change ends the user's sessions).
+email_b="$(jq -r '.b.email' "$tmp/users.json")"
+new_email="b2-$STAMP@example.com"
+ok PATCH "/v1/projects/$project_id/users/$user_b" 200 "$(jq -nc --arg e "$new_email" '{email: $e}')"
+jq -e --arg e "$new_email" '.email == $e' "$tmp/body" >/dev/null || die "PATCH answered: $(cat "$tmp/body")"
 r0=$SECONDS
-wait_sql "$db_id" "SELECT email FROM users WHERE id = '$user_a'" "$new_email" 30 "A's email on main"
-pass "Zitadel email change reached main after $((SECONDS - r0)) s (was $email_a)"
+wait_sql "$db_id" "SELECT email FROM users WHERE id = '$user_b'" "$new_email" 30 "B's email on main"
+pass "email change through the platform API reached main after $((SECONDS - r0)) s (was $email_b)"
 
 # 6. Refresh rotation, reuse after the grace, and the session's access token revoked.
 sdk refresh
@@ -243,7 +233,7 @@ wait_sql "$dev_id" "SELECT count(*) FROM users WHERE id = '$user_a'" 0 60 "A's r
 [[ "$(psql_on "$db_id" -c "SELECT count(*) FROM users WHERE id = '$user_b'")" == 1 ]] || die "B's row went too"
 pass "A's row gone on main and dev after $((SECONDS - r0)) s"
 
-# 8. Delete the project: its databases end deleted and its Zitadel org is gone.
+# 8. Delete the project: its databases end deleted and its identity pool is dropped.
 [[ "${KEEP:-}" != 1 ]] || {
   echo "KEEP=1: project $slug ($project_id) left in place"
   exit 0
@@ -266,7 +256,9 @@ if [[ "$status" == 200 ]]; then
 else
   [[ "$status" == 404 ]] || die "GET /v1/databases/$db_id: $status $(cat "$tmp/body")"
 fi
-[[ "$(org_count "$project_id")" == 0 ]] || die "the Zitadel org is still there: $(cat "$tmp/zbody")"
+s="$(pool_user "$user_b")"
+[[ "$s" == 404 && "$(jq -r '.error // empty' "$tmp/ibody")" == pool_not_found ]] ||
+  die "the identity pool app-$project_id is still there: $s $(cat "$tmp/ibody")"
 project_id=""
-pass "project deleted after $((SECONDS - r0)) s: database deleted, Zitadel org gone"
+pass "project deleted after $((SECONDS - r0)) s: database deleted, identity pool dropped"
 echo "all passed ($((SECONDS - t0)) s)"

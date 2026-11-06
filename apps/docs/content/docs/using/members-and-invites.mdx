@@ -3,7 +3,7 @@ title: Members and invites
 description: Who can do what in a tenant, how people join (invites, open sign-up and approval), project grants and per-database overrides, and the access log.
 ---
 
-A tenant is one team's workspace. Everyone in it is a **member**, and what a member can do is decided by two things: the tenant-admin flag, and **grants** on projects. Studio's **Members** page (last in the rail) shows and edits all of it; every action is also an API route, listed in [Access per route](/docs/reference/access).
+A tenant is one team's workspace. Everyone in it is a **member**, and what a member can do is decided by two things: the tenant-admin flag, and **grants** on projects. Studio's **Members** page (last in the rail) shows and edits all of it; every action is also an API route, listed in [Access per route](/reference/access).
 
 ## Roles
 
@@ -14,13 +14,13 @@ A grant gives a member a **platform role** on one project:
 | Platform role | Can |
 |---|---|
 | Viewer | Read: projects, databases, branches, schemas, merges, the table editor (rows and structure, no changes), data keys' list. |
-| Developer | Everything a Viewer can, plus: create branches; change unprotected branches (reset, restore, delete, rename); run SQL as an allowed Postgres role; start and run schema merges (merges don't run as a Postgres role); create and block app users; save and run queries; create data keys bound to an allowed role. |
+| Developer | Everything a Viewer can, plus: create branches; change unprotected branches (reset, restore, delete); run SQL as an allowed Postgres role; start and run schema merges (merges don't run as a Postgres role); create and block app users; save and run queries; create data keys bound to an allowed role. |
 | Admin | Everything on the project: protected branches, connection strings and passwords, login roles, the Data API settings, grants and invites, and acting as the database owner. |
 
-A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation). The rules, in short:
+A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/using/roles-and-schema-isolation). The rules, in short:
 
 - **Admin holds every role.** An Admin on a project may act as the database owner and every other role of the project's branches, login roles included; the grant lists no roles (`GET /v1/projects/{id}/grants` and `GET /v1/me` answer `"all"`). Roles named when granting Admin are checked, then dropped. To give an Admin fewer roles on one database, narrow it there (below). Developers and Viewers can't act as the owner, and `owner` is never listed in a grant.
-- **The data API's roles only when named.** `anon` and `authenticated` aren't part of an Admin's every role: Act as and Run as offer them only to a member whose grant (or a narrowing) names them, Admins included.
+- **The data API's roles only when named.** `anon` and `authenticated` aren't part of an Admin's every role: Act as offers them only to a member whose grant (or a narrowing) names them, Admins included.
 - **A granted role includes its chain.** If you grant `billing_admin` and it can `SET ROLE billing`, the member may act as both. Studio shows the expanded set.
 - **Some roles are Admin-only**, whether you grant them, act as them or bind a data key to them: owner-level roles (superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`, or a path to `neon_superuser`), roles that can log in (`LOGIN`), reserved roles, and any role whose chain reaches one of those. A Developer can't be given such a role, and can't create a key for one. A role whose chain holds `ADMIN` on another role is refused at grant time (422), whatever the grant's level. Permissions go on `NOLOGIN` group roles, which is the Postgres convention.
 - **Saved queries are shared within the project.** Any Developer can read them; only the author or an Admin edits or deletes one.
@@ -43,7 +43,7 @@ A **team** is a named set of members that holds grants of its own. Studio's **Me
 - **Visibility.** Any member reads `GET /v1/teams` and `GET /v1/teams/{team_id}`. A tenant admin sees every project of a team; anyone else sees only the projects where they have access. A team's Postgres roles on a project are shown only to tenant admins and to Admins of that project; others get `pg_roles: null`.
 - **Removing a member** from the tenant takes them out of their teams in the same transaction, and the log's `member_removed` event records the teams they were in.
 
-The routes (all `tenant admin` to write, any member to read; see [Access per route](/docs/reference/access)):
+The routes (all `tenant admin` to write, any member to read; see [Access per route](/reference/access)):
 
 | Route | Does |
 |---|---|
@@ -76,7 +76,7 @@ curl -X PUT "$API/v1/teams/$TEAM/members/$MEMBER" -H "Authorization: Bearer $TOK
 
 ### Teams on invites and approvals
 
-A tenant admin's invite (`POST /v1/invites`) and an approval (`POST /v1/members/{id}/approve`) accept `team_ids`: up to 50 teams of the tenant (duplicates dropped; an unknown or foreign id is 422 naming it). The memberships are written in the same transaction as the grants, and the grants and teams are checked together on the combined access. This holds for a new invitee, a person already in the organization and an existing member. The **project invite** (`POST /v1/projects/{id}/invites`) refuses `team_ids` in any form, `[]` and `null` included: 422 `invalid_request`, because only a tenant admin's invite attaches teams.
+A tenant admin's invite (`POST /v1/invites`) and an approval (`POST /v1/members/{id}/approve`) accept `team_ids`: up to 50 teams of the tenant (duplicates dropped; an unknown or foreign id is 422 naming it). The memberships are written in the same transaction as the grants, and the grants and teams are checked together on the combined access. This holds for a new invitee, a person who already has an account and an existing member. The **project invite** (`POST /v1/projects/{id}/invites`) refuses `team_ids` in any form, `[]` and `null` included: 422 `invalid_request`, because only a tenant admin's invite attaches teams.
 
 ### What a member without a grant sees
 
@@ -84,38 +84,36 @@ A member with no grants anywhere gets 403 `no_access_yet` on project routes, and
 
 ## How people join
 
-Self-hosted mode has three ways in. Platform mode has no self-sign-up yet: see [Self-hosted vs platform](/docs/using/self-hosted-vs-platform).
+Self-hosted mode has three ways in. Platform mode has no self-sign-up yet: see [Self-hosted vs platform](/using/self-hosted-vs-platform).
 
 ### Invites
 
 A tenant admin invites from Members › People (`POST /v1/invites`, with the grants to start from); a project Admin invites from the project's Access tab with **Add people** (`POST /v1/projects/{id}/invites`, one grant). The grants are stored up front and count once the invitee accepts.
 
-- **By email.** Zitadel mails a one-time link to Studio's `/accept-invite`. The page names the inviter and the tenant (by its display name, falling back to its slug), and the invitee sets their own password.
-- **By link, without SMTP.** When Zitadel has no active email provider (`GET /v1/invites/delivery` says), pick **One-time link** under "How they get the invite" (`delivery: "link"`). The response carries `invite_url` **once**; hand it over yourself. It is never stored or logged, and the response is `Cache-Control: no-store`. A resend with `delivery: "link"` replaces the earlier link. A link invite is refused (409) for a person who already has a way to sign in; invite them by email instead.
-- **Someone who is already in the organization** is added as an active member at once, with no mail. An existing member just gets the grants.
+- **By email.** The identity service mails a six-digit invite code (5 tries; the invite expires after 72 hours) and a link to Studio's `/accept-invite`. The page names the inviter and the tenant (by its display name, falling back to its slug); the invitee types the code and sets their own password, which also verifies their email. The link itself carries no code.
+- **By link, without SMTP.** When no SMTP server is configured (`GET /v1/invites/delivery` says, with the reason `email_not_configured`), pick **One-time link** under "How they get the invite" (`delivery: "link"`). The response carries `invite_url` **once**, with the code in it; hand it over yourself. It is never stored or logged, and the response is `Cache-Control: no-store`. A resend with `delivery: "link"` replaces the earlier link. A link invite is refused with 409 `link_not_allowed` for a person who already has an account (the code would set their password): invite them by email instead. Asking for email delivery with no SMTP server is 409 `conflict`.
+- **Someone who already has an account** (a password and a verified email, from another tenant or an earlier membership) gets a notice by email instead of a code. Its link carries only the invite's token; they accept by signing in with their own password, and nothing asks them to choose a new one. An existing member just gets the grants (`outcome: "existing_member"`).
 - **Describe.** The `/accept-invite` page asks `POST /auth/v1/invite` with the `user` and `t` (token) from the link for the inviter and the tenant's name. It answers only for an open, unexpired invite whose token matches; anything else is the same 404 `not_found`.
-- **An invited member is activated only by an open, unexpired invite.**
-- **Resend** (in Studio, **New invite link** for a link invite) makes a new code and a new token, and the old link stops working; **revoke** invalidates the open invite and removes the never-activated user. An expired or revoked link answers 410 `invite_expired` or `invite_revoked`. If a step after the code check fails, 503 `invite_incomplete` carries an `accept_ticket` so the page can retry without the spent code.
-- **Re-inviting** a person who was removed or deactivated brings them back as `invited` with a fresh code, never straight to active. Zitadel makes no invite code for someone who already has a password (or another way to sign in), so they get Zitadel's password-reset email instead, with the same `/accept-invite` link (marked `reset=1`); setting the password with that code accepts the invite. Their old password signs nobody in meanwhile: the account stays deactivated until they accept. Any inviter may do it, and the access log records who.
-- **An inviter with no name** (a machine user, like the dev bootstrap's demo user) is shown by their email, or as "An admin" without one.
+- **An invited member is activated only by an open, unexpired invite.** Accepting signs them in.
+- **Resend** (in Studio, **New invite link** for a link invite) makes a new code and a new token, and the old link stops working; **revoke** invalidates the open invite and removes the never-activated user. An expired or revoked link answers 410 `invite_expired` or `invite_revoked`. If a step after the code check fails, 503 `invite_incomplete` carries an `accept_ticket` so the page can retry without the spent code. Invites and resends are rate limited per person (429 `rate_limited`).
+- **Re-inviting** a person who was removed brings them back as `invited`, never straight to active. Their account stays banned until they accept, so their password signs nobody in meanwhile; accepting with that password lifts the ban. Any inviter may do it, and the access log records who.
+- **An inviter with no name** is shown by their email, or as "An admin" without one.
 
 ### Open sign-up
 
-Off by default. A tenant admin turns it on on the Members page's Instance tab (`PATCH /v1/instance/settings` with `open_signup`). While it is on, the sign-in page offers **Create account**, and a person who signs up becomes a **pending** member: they can do nothing and see "Waiting for approval". `GET /v1/me` still answers 200 for them, with `member.status: "pending"`; every other route answers 403 `pending_approval`.
+Off by default. A tenant admin turns it on on the Members page's Instance tab (`PATCH /v1/instance/settings` with `open_signup`). While it is on, the sign-in page offers **Create account**, and a person who signs up becomes a **pending** member: they have no session until an admin approves them: their sign-in answers `pending`, and Studio shows "Waiting for approval".
 
 ### Approval
 
-Pending sign-ups appear under Members › People › **Requests**, with a badge on Members. A tenant admin **approves** one with its first project access (`POST /v1/members/{id}/approve`) or **declines** it (`POST /v1/members/{id}/decline`: removed, their Zitadel user deactivated). Both are logged. With open sign-up off, a sign-up is refused with 403 `sign_up_closed`.
-
-Zitadel's own registration page is turned off (`allowRegister: false`), so these routes are the only way in.
+Pending sign-ups appear under Members › People › **Requests**, with a badge on Members. A tenant admin **approves** one with its first project access (`POST /v1/members/{id}/approve`) or **declines** it (`POST /v1/members/{id}/decline`: removed, and their account banned and signed out unless another tenant holds them). Both are logged. With open sign-up off, a sign-up is refused with 403 `sign_up_closed`. Once approved, they sign in as usual.
 
 <Callout type="warn">
-**The fresh-install window.** While a tenant has no member at all, the instance is unclaimed. The first sign-up needs the setup code that `init-secrets` printed (`docker compose logs init-secrets`; see [Install](/docs/self-hosting/install#read-the-setup-code) to print it again), and that account claims the tenant admin. A sign-up with a missing or wrong code is refused (`setup_code_invalid`) and creates no account. If two people race for it with the code, only one claims the admin and the other is admitted as `pending`. Claim the instance before you expose Studio to anyone. After the claim, sign-up follows open sign-up as above. On a workbench stack (development), the stack's `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential: keep it private.
+**The fresh-install window.** While a tenant has no member at all, the instance is unclaimed. The first sign-up needs the setup code that `init-secrets` printed (`docker compose logs init-secrets`; see [Install](/self-hosting/install#read-the-setup-code) to print it again), and that account claims the tenant admin. A sign-up with a missing or wrong code is refused (`setup_code_invalid`) and creates no account. If two people race for it with the code, only one claims the admin and the other is admitted as `pending`. Claim the instance before you expose Studio to anyone. After the claim, sign-up follows open sign-up as above. On a workbench stack (development), the bootstrap claims the instance for a dev member and keeps its password in `.chelabase/stacks/<slug>/bootstrap/dev-member.json`, a tenant-admin credential: keep it private.
 </Callout>
 
 ### Removing a member
 
-Removing a member (`DELETE /v1/members/{id}`) deletes their grants and overrides, drops their Postgres roles on every branch of their projects, deactivates their Zitadel user and ends their sessions. Anything they created in a run and left behind goes to the role they last acted as; if that is gone, it is dropped. It never goes to the owner.
+Removing a member (`DELETE /v1/members/{id}`) deletes their grants and overrides, drops their Postgres roles on every branch of their projects, revokes their personal logins, and ends their sessions at once. Their account is banned unless another tenant still holds them, so their password signs nobody in until an invite brings them back. Anything they created in a run and left behind goes to the role they last acted as; if that is gone, it is dropped. It never goes to the owner.
 
 ## The tenant's name
 

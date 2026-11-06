@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
 # Offline check of the per-service secret boundary of the self-hosted install (U10, epic
 # selfhost-install m8). In the base file every secret lives in one named volume, `secrets`
-# (chelabase-init's layout, plus the dirs the stack adds: zitadel-pats/, bootstrap/,
-# zitadel-config/), and each service mounts only its own files from it with `volume.subpath`.
+# (chelabase-init's layout, plus the dir the stack adds: bootstrap/), and each service mounts
+# only its own files from it with `volume.subpath`.
 #
 # Checks, from `docker compose config` of the base file (with .env.example) and of base +
 # workbench overlay (with the fixture stack.env):
 #   1. each base service's `secrets` mounts are exactly the table below (subpath and ro/rw);
 #   2. no other volume or bind of the base reaches a secret (nothing else names `secrets`, and
 #      only init-secrets mounts the volume's root);
-#   3. per service, the machine-part files and the Zitadel PATs a base service mounts are the
-#      ones the same service sees under the workbench (its key-dir files and state-dir PATs),
-#      with the same mode. Install-part files (database, S3, Zitadel, setup code, NATS/Valkey
-#      auth files, the bootstrap's outputs) have no keys-dir counterpart: the workbench keeps
-#      them in each stack's state dir or uses its fixed dev values.
+#   3. per service, the machine-part files a base service mounts are the ones the same service
+#      sees under the workbench (its key-dir files), with the same mode. Install-part files
+#      (database, S3, setup code, NATS/Valkey auth files, the bootstrap's outputs) have no
+#      keys-dir counterpart: the workbench keeps them in each stack's state dir or uses its
+#      fixed dev values.
+#   4. the identity service's boundary (auth-replacement m5), in both renders: only `identity`
+#      mounts `identity/*` (the bootstrap also reads `identity/db.password`, self-hosted: it sets
+#      the role's password); only `auth` mounts `auth/member-jwt.key`, and the member public key
+#      goes to auth, the gateway, the orchestrator and realtime only; `gateway/internal-signing.pem`
+#      is the gateway's alone; each `tokens/<caller>-identity.token` is mounted only by its
+#      caller and `identity`. The bootstrap's own (`tokens/bootstrap-identity.token`, which
+#      identity lets create a pool and nothing else) goes to the self-hosted `init-bootstrap`
+#      and `identity`; under the workbench, to `identity` only (the workbench's bootstrap is a
+#      `docker run` of its own, checked in tools/cli). The workbench's runner, the test harness,
+#      sees the keys its live tests read and is left out of these checks, but never the
+#      bootstrap's token.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -41,15 +52,10 @@ compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
 # service <TAB> subpath ("" is the volume's root) <TAB> ro|rw, one line per `secrets` mount.
 cat >"$tmp/want" <<'EOF'
 metadata-db	db/metadata.password	ro
-zitadel-db	db/zitadel-admin.password	ro
 storcon-db	db/storcon.password	ro
 nats	nats/auth.conf	ro
 valkey	valkey/users.acl	ro
 valkey	valkey/health.password	ro
-zitadel	zitadel/masterkey	ro
-zitadel	zitadel/steps.yaml	ro
-zitadel	zitadel-config/database.yaml	ro
-zitadel	zitadel-pats	rw
 seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
 seaweedfs	storage-s3/access-key	ro
@@ -86,7 +92,14 @@ proxy	valkey/proxy.password	ro
 proxy	tokens/proxy-api.token	ro
 init-secrets		rw
 init-bootstrap	db/metadata.password	ro
-init-bootstrap	zitadel-pats/admin.pat	ro
+init-bootstrap	identity/db.password	ro
+init-bootstrap	tokens/bootstrap-identity.token	ro
+identity	identity/secret	ro
+identity	identity/db.password	ro
+identity	tokens/auth-identity.token	ro
+identity	tokens/orchestrator-identity.token	ro
+identity	tokens/worker-identity.token	ro
+identity	tokens/bootstrap-identity.token	ro
 init-bootstrap	bootstrap	rw
 orchestrator	secrets/secrets.key	ro
 orchestrator	gateway/internal-verify.pem	ro
@@ -102,36 +115,36 @@ orchestrator	tokens/app-sessions.token	ro
 orchestrator	tokens/storage-internal.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
+orchestrator	tokens/orchestrator-identity.token	ro
+orchestrator	auth/member-jwt.pub	ro
 orchestrator	orchestrator-tls	ro
 orchestrator	db/metadata.password	ro
 orchestrator	setup/setup.code	ro
-orchestrator	zitadel-pats/admin.pat	ro
-orchestrator	bootstrap	ro
 worker	secrets/secrets.key	ro
 worker	neon/compute-jwt.pem	ro
 worker	neon/compute-jwt.pub	ro
 worker	nats/worker.password	ro
 worker	valkey/control.password	ro
 worker	realtime/pg.password	ro
+worker	tokens/worker-identity.token	ro
 worker	compute-ca	rw
 worker	orchestrator-tls	rw
 worker	realtime-tls	rw
 worker	db/metadata.password	ro
-worker	zitadel-pats/admin.pat	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
+gateway	auth/member-jwt.pub	ro
 gateway	tokens/data-keys.token	ro
 gateway	tokens/app-sessions.token	ro
-gateway	bootstrap/ids	ro
 auth	auth/cookie.key	ro
 auth	auth/app-jwt.key	ro
 auth	auth/app-jwt.pub	ro
+auth	auth/member-jwt.key	ro
+auth	auth/member-jwt.pub	ro
+auth	tokens/auth-identity.token	ro
 auth	gateway/internal-verify.pem	ro
 auth	compute-ca/ca.crt	ro
 auth	tokens/app-auth.token	ro
-auth	zitadel-pats/admin.pat	ro
-auth	zitadel-pats/login-client.pat	ro
-auth	bootstrap/ids	ro
 rest	gateway/internal-verify.pem	ro
 rest	compute-ca/ca.crt	ro
 rest	tokens/rest-internal.token	ro
@@ -143,7 +156,7 @@ realtime	realtime/pg.password	ro
 realtime	realtime/ticket.key	ro
 realtime	realtime/internal.token	ro
 realtime	realtime-tls	ro
-realtime	bootstrap/ids	ro
+realtime	auth/member-jwt.pub	ro
 EOF
 
 # 1. The table.
@@ -171,15 +184,12 @@ others="$(jq -r '.services | to_entries[] | .key as $s
 # 3. The same files as under the workbench, service by service.
 keys="$(sed -n 's/^CHELABASE_KEYS_DIR=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
 state="$(sed -n 's/^CHELABASE_STACK_DIR=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
-jq -r --arg k "$keys/" --arg st "$state" --arg z "$state/zitadel" '.services | to_entries[] | .key as $s
+jq -r --arg k "$keys/" --arg st "$state" '.services | to_entries[] | .key as $s
   | (.value.volumes // [])[] | select(.type == "bind") | (if .read_only then "ro" else "rw" end) as $m
-  | if .source == $z then [$s, "zitadel-pats", $m]
-    elif (.source | startswith($z + "/")) and (.source | test("/(admin|login-client)\\.pat$"))
-      then [$s, "zitadel-pats/" + (.source | ltrimstr($z + "/")), $m]
-    elif (.source | startswith($st + "/")) then empty
+  | if (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|storage-s3/|grpc-tls/|zitadel/|zitadel-config/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|storage-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true
@@ -190,7 +200,49 @@ for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   fi
 done
 
-# 4. The object-store keys and SeaweedFS's gRPC TLS files (epic object-storage m2). The table
+# 4. The identity boundary, in the base file and under the workbench (the runner left out).
+# who <file> <render>: the services mounting <file> (or a directory above it), sorted, one line.
+who() {
+  awk -F'\t' -v f="$1" '$1 != "runner" && ($2 == f || index(f, $2 "/") == 1 || $2 == "") { print $1 }' "$2" |
+    LC_ALL=C sort -u | paste -sd' ' -
+}
+boundary() { # boundary <file> <expected services> <render label> <render file>
+  local got
+  got="$(who "$1" "$4")"
+  [[ "$got" == "$2" ]] || err "$3: $1 is mounted by [$got], expected [$2]"
+}
+for render in base wb; do
+  file="$tmp/have"
+  [[ "$render" == wb ]] && file="$tmp/wb.have"
+  # The base's init-secrets mounts the whole volume (it writes it): not a reader.
+  grep -v $'^init-secrets\t' "$file" >"$tmp/readers.$render" || true
+  boot=" init-bootstrap"
+  [[ "$render" == wb ]] && boot=""
+  boundary identity/secret "identity" "$render" "$tmp/readers.$render"
+  boundary identity/db.password "identity${boot}" "$render" "$tmp/readers.$render"
+  boundary auth/member-jwt.key "auth" "$render" "$tmp/readers.$render"
+  boundary auth/member-jwt.pub "auth gateway orchestrator realtime" "$render" "$tmp/readers.$render"
+  boundary gateway/internal-signing.pem "gateway" "$render" "$tmp/readers.$render"
+  boundary tokens/auth-identity.token "auth identity" "$render" "$tmp/readers.$render"
+  boundary tokens/orchestrator-identity.token "identity orchestrator" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-identity.token "identity worker" "$render" "$tmp/readers.$render"
+  boundary tokens/bootstrap-identity.token "identity${boot}" "$render" "$tmp/readers.$render"
+  # Nothing else under identity/ is mounted, by anyone but identity (and the bootstrap's file).
+  extra="$(awk -F'\t' '$1 != "runner" && $1 != "identity" && ($2 ~ /^identity(\/|$)/) &&
+    !($1 == "init-bootstrap" && $2 == "identity/db.password") { print $1 ": " $2 }' "$tmp/readers.$render")"
+  [[ -z "$extra" ]] || err "$render: identity/ files reach other services:"$'\n'"$extra"
+done
+# The bootstrap's token never reaches the runner (S1: init-bootstrap, the workbench's bootstrap
+# run and identity only).
+! awk -F'\t' '$1 == "runner" && $2 == "tokens/bootstrap-identity.token"' "$tmp/wb.have" | grep -q . ||
+  err "the workbench runner sees tokens/bootstrap-identity.token"
+# The workbench runner (the test harness) reads the identity files the live tests use.
+for f in identity/db.password tokens/worker-identity.token; do
+  awk -F'\t' -v f="$f" '$1 == "runner" && $2 == f' "$tmp/wb.have" | grep -q . ||
+    err "the workbench runner doesn't see $f (members_pool_idempotent reads it)"
+done
+
+# 5. The object-store keys and SeaweedFS's gRPC TLS files (epic object-storage m2). The table
 # pins who mounts which file: Neon's `s3/` pair by seaweedfs and the four Neon services,
 # `storage-s3/` and `grpc-tls/` by seaweedfs only (until the storage service lands). Here: no
 # service gets one of them from its environment or a bind (a value there shows up in `docker
@@ -209,10 +261,11 @@ for dir in storage-s3 grpc-tls; do
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
   [[ "$users" == "seaweedfs " ]] || err "services naming $dir/: got [$users], want [seaweedfs ]"
 done
-# m5: under the workbench the storage service mounts the `storage` identity too, and nobody
-# else does (the storage service is only in the overlay until its first image is published).
+# m5: under the workbench the storage service mounts the `storage` identity too, and so does the
+# worker for the blob sweep (m8); nobody else does (the storage service is only in the overlay
+# until its first image is published).
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
-[[ "$users" == "seaweedfs storage " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage ]"
+[[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
   | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
   err "an admin S3 identity or key file is back"

@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio", "identity"]
 }
 
 target "_app" {
@@ -96,4 +96,16 @@ target "studio" {
   }
   annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags       = ["${REPO}/studio:${TAG}"]
+}
+# The internal identity service (Node, Better Auth); its own Dockerfile, no cargo build.
+# In the default group (`just images`); not in the release scripts yet (publish, pin, image-inputs).
+target "identity" {
+  context    = "."
+  dockerfile = "infra/images/identity.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
+  tags        = ["${REPO}/identity:${TAG}"]
 }

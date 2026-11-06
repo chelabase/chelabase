@@ -98,7 +98,7 @@ describe("CreateDatabaseForm", () => {
       "POST /v1/databases": accepted,
       "GET /v1/databases/d1": () => jsonResponse(detail("provisioning")),
     });
-    queryClient.setQueryData(getGetMeQueryKey(), { user: { sub: "u", org_id: "o" }, tenant: null });
+    queryClient.setQueryData(getGetMeQueryKey(), { user: { sub: "u" }, tenant: null });
     expect(queryClient.getQueryState(getGetMeQueryKey())?.isInvalidated).toBe(false);
     await submit("web1");
     await vi.waitFor(() => expect(queryClient.getQueryState(getGetMeQueryKey())?.isInvalidated).toBe(true));

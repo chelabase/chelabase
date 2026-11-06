@@ -9,9 +9,8 @@
 #
 # Then derives, never reading them from the environment: CHELABASE_AUTH_HOST_NAME (the auth host
 # without its port), CHELABASE_PUBLIC_PORT (its port, else 443 for https / 80 for http),
-# CHELABASE_PUBLIC_SECURE (true iff https), CHELABASE_ZITADEL_TLS_MODE (external for https, else
-# disabled) and CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL (empty for an optional host
-# that isn't set).
+# CHELABASE_PUBLIC_SECURE (true iff https) and CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL
+# (empty for an optional host that isn't set).
 
 _entry_example="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../infra/compose" && pwd)/.env.example"
 for _entry_var in CHELABASE_PUBLIC_SCHEME CHELABASE_STUDIO_HOST CHELABASE_API_HOST CHELABASE_AUTH_HOST \
@@ -77,12 +76,10 @@ else
 fi
 if [[ "$CHELABASE_PUBLIC_SCHEME" == https ]]; then
   CHELABASE_PUBLIC_SECURE=true
-  CHELABASE_ZITADEL_TLS_MODE=external
 else
   CHELABASE_PUBLIC_SECURE=false
-  CHELABASE_ZITADEL_TLS_MODE=disabled
 fi
-export CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECURE CHELABASE_ZITADEL_TLS_MODE
+export CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECURE
 unset -f _entry_split
 unset _entry_var _entry_name _entry_port
 

@@ -3,15 +3,15 @@ title: Table editor
 description: Browse and edit rows, and change table structure without writing SQL, from Studio's Table editor.
 ---
 
-Studio's **Table editor** reads and edits rows and changes table structure. Structure changes are staged, shown as the exact SQL with a dry run, and applied together in one transaction. Open it from **Table editor** in the left rail, or from the **Tables** button on a database in the project's **Databases** tab. The rail link returns to the last place you worked: the same project, database, branch, Postgres database and schema, as long as each still exists.
+Studio's **Table editor** reads and edits rows and changes table structure. Structure changes are staged, shown as the exact SQL with a dry run, and applied together in one transaction. Open it from **Table editor** in the left rail, or from **Open** on a database in the project's **Databases** tab. The rail link returns to the last place you worked: the same project, database, branch, Postgres database and schema, as long as each still exists.
 
 The address holds the whole position: `/app/tables/{project}/{database}/{branch}/{postgres database}/{schema}/{table}`. A level you leave out gets a default, and the address is rewritten. While the levels above it are the ones you last worked in, a missing level takes your last value (when it still exists); otherwise the defaults are the first project, the project's first database, the root branch, the branch's main Postgres database and the `public` schema (else the first). No table is picked for you. The **Types** and **New table** views aren't part of the address: a reload, or another schema, returns to the table view. An id that doesn't exist shows a not-found message with the pickers still usable.
 
 ## Pickers and Act as
 
-The bar at the top has **Project**, **Database**, **Branch**, **Postgres db** and **Act as**. Each picker searches. Picking one drops the levels after it. The branch picker shows the branch tree with protected branches marked, and **New branch from …** at the end. The **Postgres db** picker marks the databases the [data API](/docs/using/data-api) serves; the system database `postgres` isn't offered.
+The bar at the top has **Project**, **Database**, **Branch**, **Postgres db** and **Act as**. Each picker searches. Picking one drops the levels after it. The branch picker shows the branch tree with protected branches marked, and **New branch from …** at the end. The **Postgres db** picker marks the databases the [data API](/using/data-api) serves; the system database `postgres` isn't offered.
 
-**Act as** is the Postgres role that reads and writes rows, and that structure changes run as. It lists only the roles you're granted. Admins can act as the owner (the default) and every role of the branch, or, on a database where they are narrowed, the owner and the roles kept there; others get the roles their grant lists (and what those reach), and the first is the default. The data API's roles `anon` and `authenticated` are offered only when a grant names them, Admins included; a read-only **View as** for what the data API sees comes later. The choice is kept per branch. Acting as the owner bypasses row-level security. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+**Act as** is the Postgres role that reads and writes rows, and that structure changes run as. It lists only the roles you're granted. Admins can act as the owner (the default) and every role of the branch, or, on a database where they are narrowed, the owner and the roles kept there; others get the roles their grant lists (and what those reach), and the first is the default. The data API's roles `anon` and `authenticated` are offered only when a grant names them, Admins included; a read-only **View as** for what the data API sees comes later. The choice is kept per branch. Acting as the owner bypasses row-level security. See [Roles and schema isolation](/using/roles-and-schema-isolation).
 
 The left list shows the tables of the picked schema, with a filter and a **Schema** picker.
 
@@ -37,7 +37,7 @@ A table has two views: **Rows** and **Structure**.
 
 ## Live rows and presence
 
-While you look at a table, Studio joins its live channel for the role you act as; changing **Act as** leaves and rejoins. The bar shows **Live** when changes are arriving, or **Live updates paused · reason** when they aren't. Live updates come from the [realtime service](/docs/architecture/realtime), which tells Studio which rows changed; Studio then reads those rows again as your role, so you see only what that role can read.
+While you look at a table, Studio joins its live channel for the role you act as; changing **Act as** leaves and rejoins. The bar shows **Live** when changes are arriving, or **Live updates paused · reason** when they aren't. Live updates come from the [realtime service](/architecture/realtime), which tells Studio which rows changed; Studio then reads those rows again as your role, so you see only what that role can read.
 
 - **A row on your page changes:** the row is replaced in place and the cells that changed flash briefly (no flash under reduced motion). A row that no longer matches your filter or your role's view fades out.
 - **A new row you aren't showing:** a chip reads **N new rows · Show**; **Show** reads the page and the count again.
@@ -82,7 +82,7 @@ Row checkboxes and the header checkbox select the loaded page. The bar then offe
 
 - **Copy** (tab-separated) and **Copy as JSON**, for the loaded rows;
 - **Delete**, which asks for confirmation with the count, and says how many rows were deleted when fewer were (rows hidden from the role you act as, or already gone);
-- **Select all N matching rows**, which selects every row beyond the page. With a filter on, N is the exact count (the data API's [`count`](/docs/using/data-api/query-language#count)), counted as your role. If the count fails, the button omits the figure. Without a filter it shows the table's estimate (`≈ N`).
+- **Select all N matching rows**, which selects every row beyond the page. With a filter on, N is the exact count (the data API's [`count`](/using/data-api/query-language#count)), counted as your role. If the count fails, the button omits the figure. Without a filter it shows the table's estimate (`≈ N`).
 
 With all matching rows selected, **Delete** deletes every row that matches the filter, not just the loaded ones; the dialog names the count (**Delete N matching rows**) when it is known, else it confirms with **Delete matching rows**. With no filter it empties the table: the dialog confirms with **Delete all rows**, and you type the table's name to confirm. Changing the table, filter or sort clears the selection, and so does the header checkbox. When the table's columns change (after an apply, say), a sort or filter on a column that's gone is dropped.
 
@@ -108,8 +108,8 @@ The changes panel lists the staged edits in order, each with its dry-run status.
 - **Changed underneath you:** if the table changes after you started (someone else altered it), Apply is blocked with "This table changed since you started" until you've reviewed a fresh dry run.
 - **Discard** drops the staged changes after a confirmation.
 
-On a protected branch, applying needs Admin: see [Branches](/docs/using/branches).
+On a protected branch, applying needs Admin: see [Branches](/using/branches).
 
 ## Row-level security
 
-The New table form has a **Turn RLS on** checkbox, unticked by default. With RLS off, in a schema the data API serves, `anon` reads every row and `authenticated` reads and writes every row (the data API's default grants). Tick it, or turn RLS on later from the banner, and add policies. A table with RLS off shows a banner over the grid and **Structure**: any role with grants reads and writes every row, with **Turn RLS on** to stage it (the change goes through the changes panel like any other). A table with RLS on and no policies says only the owner and roles that bypass RLS see rows. Policies are read-only in the editor for now. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation) and the [RLS warning](/docs/using/studio#rls-warning).
+The New table form has a **Turn RLS on** checkbox, unticked by default. With RLS off, in a schema the data API serves, `anon` reads every row and `authenticated` reads and writes every row (the data API's default grants). Tick it, or turn RLS on later from the banner, and add policies. A table with RLS off shows a banner over the grid and **Structure**: any role with grants reads and writes every row, with **Turn RLS on** to stage it (the change goes through the changes panel like any other). A table with RLS on and no policies says only the owner and roles that bypass RLS see rows. Policies are read-only in the editor for now. See [Roles and schema isolation](/using/roles-and-schema-isolation) and the [RLS warning](/using/studio#rls-warning).
