@@ -9,7 +9,9 @@
 # removed the retired identity provider's services, files and settings on purpose, so REV is now
 # its last compose commit (1e8623ac). Its fix gave the workbench orchestrator the stack's setup
 # code, so REV is now that commit (402bb861). #128 merged, so REV is now its squash commit
-# (67156a23). At a REV with only docker-compose.yml, that file alone is the reference.
+# (67156a23). The Neon services' root prelude now gives the stack's uid a passwd entry (initdb
+# needs one), so REV is now that commit (9b7d95fe). At a REV with only docker-compose.yml, that
+# file alone is the reference.
 #
 #   scripts/tests/compose-overlay-equiv.sh [--env-file <stack.env>] [--rev <git rev>]
 #
@@ -29,8 +31,8 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
-# The last intended change of the workbench shape: auth-replacement (#128), squash-merged.
-rev=67156a23
+# The last intended change of the workbench shape: the stack uid's passwd entry.
+rev=9b7d95fe
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;
