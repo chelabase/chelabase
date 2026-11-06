@@ -664,6 +664,7 @@ fn proxy_conn(ep: &str, database: &str) -> String {
         "{} is missing (run `just workbench up`)",
         ca.display()
     );
+    // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
     format!(
         "host={ep}.{domain} hostaddr={} port={port} dbname={database} sslmode=verify-full sslrootcert={}",
         proxy_hostaddr(),

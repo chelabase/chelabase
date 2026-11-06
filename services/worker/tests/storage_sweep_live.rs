@@ -142,6 +142,7 @@ impl Fx {
             .ok()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "localtest.me".into());
+        // The proxy is dialled at CHELABASE_PROXY_HOSTADDR when set; the TLS host name stays <ep>.<domain>.
         let conn = format!(
             "host={}.{domain} hostaddr={} port={port} dbname={} sslmode=verify-full sslrootcert={}",
             self.ep,
