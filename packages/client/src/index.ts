@@ -7,10 +7,35 @@
 import { createAuth, staticAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
 import { toError } from "./error.ts";
+import type { StorageOptions } from "./storage.ts";
 import type { AuthOptions, Client, DatabaseShape, TypeMap } from "./types.ts";
 
 export { DataApiError, UnsafeIntegerError } from "./error.ts";
 export { fetchTypes, type FetchTypesOptions } from "./fetch-types.ts";
+export { StorageError, type StorageErrorCode } from "./storage-errors.ts";
+export type {
+  Bucket,
+  CreateBucket,
+  DownloadOptions,
+  FileList,
+  FileObject,
+  ListOptions,
+  ObjectInfo,
+  PublicUrlOptions,
+  RelocateOptions,
+  SignedUploadUrl,
+  SignedUploadUrlOptions,
+  SignedUrl,
+  SignedUrlOptions,
+  StorageBucket,
+  StorageClient,
+  StorageOptions,
+  UpdateBucket,
+  UploadBody,
+  UploadOptions,
+  UploadProgress,
+  UploadResult,
+} from "./storage.ts";
 export type {
   AppUser,
   Auth,
@@ -55,6 +80,8 @@ export type ClientOptions = {
   fetch?: typeof fetch;
   /** The generated `types` map: which columns, arguments and returns are int8 or numeric. */
   types?: TypeMap;
+  /** Storage options: the branch id for `getPublicUrl`, and where resumable uploads are remembered. */
+  storage?: StorageOptions;
 } & (
   | {
       /** App user sessions (`db.auth`): where the refresh token is kept, and automatic refresh. */
