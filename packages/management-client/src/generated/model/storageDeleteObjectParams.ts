@@ -7,8 +7,10 @@
 
 export type StorageDeleteObjectParams = {
 /**
- * The role to act as (required; never the owner). Row level security on
- * `storage.buckets` and `storage.objects` decides what it sees and may do.
+ * The role to act as: row level security on `storage.buckets` and `storage.objects`
+ * decides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an
+ * Admin of the database only, which sees and writes past every policy (write-once buckets
+ * still hold) and writes objects with no owner (`owner` null).
  */
 role?: string;
 /**

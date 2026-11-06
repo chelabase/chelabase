@@ -60,11 +60,12 @@ pub trait Control: Send + Sync + 'static {
     fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>>;
     /// The key while it is live, for a URL signed on `branch`: a data key, or a member who
     /// minted the URL from the console while they still have Developer access to the branch's
-    /// database.
+    /// database (an Admin for a URL minted in owner mode, `owner`).
     fn live_key(
         &self,
         key_id: Uuid,
         branch: Uuid,
+        owner: bool,
     ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>>;
     /// The token's expiry as recorded (an app user's is cut to its session's), or `None` when
     /// the id is taken, the key isn't live, or the app session the claims name isn't.
@@ -88,7 +89,7 @@ pub trait Control: Send + Sync + 'static {
 pub struct Urls {
     control: Arc<dyn Control>,
     key: tokio::sync::OnceCell<UrlKey>,
-    live: moka::future::Cache<(Uuid, Uuid), Option<LiveKey>>,
+    live: moka::future::Cache<(Uuid, Uuid, bool), Option<LiveKey>>,
 }
 
 impl Urls {
@@ -135,17 +136,18 @@ impl Urls {
         &self,
         key_id: Uuid,
         branch: Uuid,
+        owner: bool,
         rid: &str,
     ) -> Result<Option<LiveKey>, Failure> {
-        if let Some(hit) = self.live.get(&(key_id, branch)).await {
+        if let Some(hit) = self.live.get(&(key_id, branch, owner)).await {
             return Ok(hit);
         }
         let live = self
             .control
-            .live_key(key_id, branch)
+            .live_key(key_id, branch, owner)
             .await
             .map_err(|e| unreachable(e, rid))?;
-        self.live.insert((key_id, branch), live.clone()).await;
+        self.live.insert((key_id, branch, owner), live.clone()).await;
         Ok(live)
     }
 }
@@ -241,9 +243,10 @@ impl Control for Orchestrator {
         &self,
         key_id: Uuid,
         branch: Uuid,
+        owner: bool,
     ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
         Box::pin(async move {
-            let path = format!("/internal/storage/keys/{key_id}?branch={branch}");
+            let path = format!("/internal/storage/keys/{key_id}?branch={branch}&owner={owner}");
             match self.call("GET", &path, None).await? {
                 (200, v) => parse(v).map(Some),
                 (404, _) => Ok(None),
@@ -310,7 +313,7 @@ mod tests {
         fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>> {
             Box::pin(async { Err(Unreachable("unused".into())) })
         }
-        fn live_key(&self, key_id: Uuid, branch: Uuid) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+        fn live_key(&self, key_id: Uuid, branch: Uuid, _owner: bool) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 Ok(Some(LiveKey {
@@ -340,18 +343,18 @@ mod tests {
         let (k1, k2, b1, b2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let lookups = || control.0.load(Ordering::SeqCst);
         for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
-            urls.live_key(k, b, "r").await.unwrap();
+            urls.live_key(k, b, false, "r").await.unwrap();
         }
         assert_eq!(lookups(), 3);
-        urls.live_key(k1, b1, "r").await.unwrap();
+        urls.live_key(k1, b1, false, "r").await.unwrap();
         assert_eq!(lookups(), 3, "cached");
         urls.forget_key(k1);
         for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
-            urls.live_key(k, b, "r").await.unwrap();
+            urls.live_key(k, b, false, "r").await.unwrap();
         }
         assert_eq!(lookups(), 5, "k1 asked again on both branches, k2 still cached");
         urls.forget_all();
-        urls.live_key(k2, b1, "r").await.unwrap();
+        urls.live_key(k2, b1, false, "r").await.unwrap();
         assert_eq!(lookups(), 6);
     }
 }

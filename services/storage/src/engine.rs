@@ -252,6 +252,10 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         request_id: &str,
         f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
     ) -> Result<(T, String), Failure> {
+        // The one place owner mode is chosen (m9): only a console owner-mode request has it.
+        if let Some(owner) = crate::internal::owner_mode() {
+            return self.as_owner(owner, data, requested, request_id, f).await;
+        }
         let served = self.served_database(data, requested).await?;
         let branch = data.branch_id;
         self.check_schema(branch, &served.name, request_id).await?;
@@ -283,6 +287,47 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             })
             .await
             .map_err(|_| Failure::unauthorized("the key names no role"))??;
+        Ok((out, served.name))
+    }
+
+    /// Owner mode ([`crate::internal::Mode::Owner`]): `f` in one transaction as storage's own
+    /// login, in the console caller's database, with the branch's statement timeout. No role
+    /// session: `BYPASSRLS` sees and writes past every policy; the schema's triggers (tickets,
+    /// write-once) still hold.
+    async fn as_owner<T>(
+        &self,
+        _owner: crate::internal::OwnerMode,
+        data: &DataIdentity,
+        requested: Option<&str>,
+        request_id: &str,
+        f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+    ) -> Result<(T, String), Failure> {
+        let served = self.served_database(data, requested).await?;
+        let branch = data.branch_id;
+        self.check_schema(branch, &served.name, request_id).await?;
+        let info = self
+            .pools
+            .info(branch)
+            .await
+            .map_err(|e| Failure::from_conn(&e))?;
+        let database = served.name.clone();
+        let out = self
+            .managed
+            .transaction(
+                branch,
+                &served.name,
+                info.settings.statement_timeout_ms,
+                request_id,
+                async |c| f(c, &database).await,
+            )
+            .await
+            .map_err(|e| match e {
+                ServiceError::Acquire(e) => {
+                    tracing::warn!(request_id, branch_id = %branch, "the storage login (owner mode): {e}");
+                    Failure::storage_unavailable()
+                }
+                ServiceError::Query(f) => Failure(f),
+            })?;
         Ok((out, served.name))
     }
 
@@ -413,6 +458,42 @@ mod tests {
         let err = engine.check_schema(a, "app", "r").await.unwrap_err();
         assert_eq!(err.0.code, "storage_unavailable");
         engine.check_schema(b, "app", "r").await.unwrap();
+    }
+
+    /// [`two_databases`](chelabase_pgsession::test_support::two_databases), counting the
+    /// lookups (nothing listens there).
+    #[derive(Clone, Default)]
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ConnSource for Counting {
+        async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, chelabase_pgsession::ConnError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(chelabase_pgsession::test_support::two_databases())
+        }
+    }
+
+    /// Owner mode (m9) runs on storage's own login only inside a console request whose caller
+    /// is owner mode: a data key's (or an app user's) identity, even one naming storage's role,
+    /// runs as a role session and never reaches storage's pool.
+    #[tokio::test]
+    async fn only_a_console_owner_caller_reaches_storages_login() {
+        let managed = Counting::default();
+        let engine = Engine::new(Pools::new(Counting::default(), 4), managed.clone());
+        let branch = Uuid::new_v4();
+        engine.schema_ok.insert((branch, "main".into()), true).await;
+        let fetched = || managed.0.load(std::sync::atomic::Ordering::SeqCst);
+        let key: DataIdentity = serde_json::from_value(serde_json::json!({
+            "branch_id": branch, "key_id": Uuid::nil(), "kind": "secret",
+            "role": crate::internal::STORAGE_ROLE, "claims": {}
+        }))
+        .unwrap();
+        let run = || engine.as_caller(&key, None, "r", async |_, _| Ok(()));
+        assert!(run().await.is_err(), "nothing listens");
+        assert_eq!(fetched(), 0, "a data key never reaches storage's login");
+        let owner = crate::internal::test_owner_caller(branch, "main");
+        let out = crate::internal::in_console(owner.clone(), engine.as_caller(&owner.data, None, "r", async |_, _| Ok(()))).await;
+        assert!(out.is_err(), "nothing listens");
+        assert!(fetched() > 0, "the console owner caller runs on storage's login");
     }
 
     /// A database OID as the caller transaction reads it (int8).

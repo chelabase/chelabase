@@ -3841,3 +3841,58 @@ async fn storage_revocation_nats_live() {
     }))
     .await;
 }
+
+impl Fx {
+    /// A console storage path on main in owner mode (no role).
+    fn owner_console(&self, tail: &str) -> String {
+        format!("/v1/databases/{}/branches/{}/storage{tail}", self.id, self.main)
+    }
+}
+
+/// Owner mode (m9, the human's option 3): with no role, an Admin's console runs as storage's
+/// own login. It lists, reads and writes objects no policy allows (there are none here), and
+/// what it writes has no owner. A write-once object stays immutable even so.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_console_owner_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        // Buckets `files` and `other`, a bucket SELECT policy and no object policy at all.
+        objects_fixture(fx, &[]).await;
+        let token = dev_token().await;
+        let text = ("content-type", "text/plain");
+        let (status, _, b) = object("POST", &fx.owner_console("/object/files/o.txt"), &token, Some(b"owned".to_vec().into()), &[text]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(fx.value("SELECT coalesce(owner::text, 'none') FROM storage.objects WHERE name = 'o.txt'").await, "none");
+        // A user acting as `authenticated` sees nothing (no policy); the owner sees it.
+        let (status, _, b) = object("POST", &fx.console("/object/list/files", Uuid::new_v4()), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+        assert_eq!((status, json_of(&b)), (200, json!([])));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/list/files"), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(json_of(&b)[0]["name"], "o.txt");
+        let (status, _, got) = object("GET", &fx.owner_console("/object/files/o.txt"), &token, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"owned"[..]));
+        // Copy, move, sign, delete, and a bucket of its own.
+        let (status, _, b) = object("POST", &fx.owner_console("/object/copy"), &token, Some(json!({ "bucket": "files", "from": "o.txt", "to": "c.txt" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/move"), &token, Some(json!({ "bucket": "files", "from": "c.txt", "to": "c.txt", "to_bucket": "other" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/sign/files/o.txt"), &token, Some(json!({ "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let url = format!("{}{}", gateway(), json_of(&b)["signed_url"].as_str().unwrap());
+        assert_eq!(reqwest::Client::new().get(&url).send().await.unwrap().status(), 200);
+        assert_eq!(object("DELETE", &fx.owner_console("/object/other/c.txt"), &token, None, &[]).await.0, 200);
+        let (status, _, b) = object("POST", &fx.owner_console("/bucket"), &token, Some(json!({ "name": "frozen", "write_once": true }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 201, "{}", json_of(&b));
+        // Write-once holds for the owner too.
+        let up = fx.owner_console("/object/frozen/a.txt");
+        assert_eq!(object("POST", &up, &token, Some(b"one".to_vec().into()), &[text]).await.0, 200);
+        let (status, _, b) = object("POST", &format!("{up}?upsert=true"), &token, Some(b"two".to_vec().into()), &[text]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (409, json!("write_once")), "{}", json_of(&b));
+        let (status, _, b) = object("DELETE", &up, &token, None, &[]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (409, json!("write_once")), "{}", json_of(&b));
+        let (status, _, got) = object("GET", &up, &token, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]));
+    }))
+    .await;
+}

@@ -6463,7 +6463,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -6536,7 +6536,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6586,7 +6586,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -6673,7 +6673,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -6754,7 +6754,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6804,7 +6804,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -6902,7 +6902,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -6975,7 +6975,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7025,7 +7025,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -7121,7 +7121,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -7202,7 +7202,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7252,7 +7252,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -7341,7 +7341,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -7422,7 +7422,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7472,7 +7472,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -7570,7 +7570,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -7651,7 +7651,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7701,7 +7701,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -7790,7 +7790,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -7871,7 +7871,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -7921,7 +7921,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -8028,7 +8028,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -8109,7 +8109,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8159,7 +8159,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -8257,7 +8257,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -8338,7 +8338,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8388,7 +8388,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -8495,7 +8495,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -8568,7 +8568,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8618,7 +8618,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -8723,7 +8723,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -8811,7 +8811,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -8861,7 +8861,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -8966,7 +8966,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -9054,7 +9054,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9104,7 +9104,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -9209,7 +9209,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -9282,7 +9282,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9332,7 +9332,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -9431,7 +9431,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -9504,7 +9504,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9554,7 +9554,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -9651,7 +9651,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -9724,7 +9724,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -9774,7 +9774,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -9873,7 +9873,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -9954,7 +9954,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10004,7 +10004,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -10114,7 +10114,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -10202,7 +10202,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10252,7 +10252,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -10359,7 +10359,7 @@
           {
             "name": "role",
             "in": "query",
-            "description": "The role to act as (required; never the owner). Row level security on\n`storage.buckets` and `storage.objects` decides what it sees and may do.",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
             "required": false,
             "schema": {
               "type": "string"
@@ -10440,7 +10440,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `developer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -10490,7 +10490,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
             "content": {
               "application/json": {
                 "schema": {

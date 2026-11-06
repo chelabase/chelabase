@@ -4,8 +4,10 @@
 //!
 //! Each request, in order, before storage is called:
 //! 1. `?role=` names the role to act as and `?claims=` the JWT claims to run with (a JSON
-//!    object, `{}` by default); without a role the access check below is asked for the owner,
-//!    then the request is refused (422): storage never runs as the owner;
+//!    object, `{}` by default). No role, `owner` or the owner's name is **owner mode** (m9,
+//!    decided by the human): Admin on the database only (R7), no claims, and storage runs it as
+//!    its own login (`BYPASSRLS`: past every policy, still held to the write-once and ticket
+//!    triggers); objects written so have no owner (`owner` NULL);
 //! 2. the member's access ([`authorize`] with the route's own `ActAs` level from
 //!    `chelabase_routes`): reads and listing need the role held at Viewer, every write, a signed
 //!    URL and a resumable upload's steps at Developer; an owner-level, LOGIN or reserved role
@@ -109,8 +111,10 @@ const RESPONSE_HEADERS: [HeaderName; 11] = [
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct StorageQuery {
-    /// The role to act as (required; never the owner). Row level security on
-    /// `storage.buckets` and `storage.objects` decides what it sees and may do.
+    /// The role to act as: row level security on `storage.buckets` and `storage.objects`
+    /// decides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an
+    /// Admin of the database only, which sees and writes past every policy (write-once buckets
+    /// still hold) and writes objects with no owner (`owner` null).
     pub role: Option<String>,
     /// The JWT claims to run with: a JSON object (at most 4 KiB), `{}` when absent. Acting as
     /// `authenticated` with `{"sub": "<user id>"}` shows what that app user sees.
@@ -192,8 +196,8 @@ where
         return unprocessable("role must not be empty").into_response();
     }
     let claims = or_answer!(parse_claims(query.claims.as_deref()));
-    // No role asks as the owner, so the access answer comes first (acting as the owner needs
-    // Admin); storage itself never runs as the owner.
+    // No role (or `owner`, or the owner's name) is owner mode: acting as the owner needs Admin
+    // on the database (R7), decided here like any act-as.
     let target = Target::Role {
         database: ids.id,
         branch: ids.branch_id,
@@ -204,12 +208,6 @@ where
             .map_or(Requested::Owner, Requested::Role),
     };
     let authorized = or_answer!(authorize(state, principal, endpoint.policy.access, target).await);
-    let Some(role) = query.role.as_deref() else {
-        return unprocessable(
-            "role is required: storage runs as a role you may act as, never the owner",
-        )
-        .into_response();
-    };
     let Some(member_id) = principal.member.as_ref().map(|m| m.id) else {
         error!("storage console: an authorized caller without a member row");
         return ApiError::internal().into_response();
@@ -222,9 +220,14 @@ where
     if branch.status != BranchStatus::Ready {
         return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
     }
-    if role == roles::owner_name(&record) {
-        return unprocessable("storage never runs as the owner: choose a role to act as")
-            .into_response();
+    // Owner mode (m9, the human's option 3): storage runs it as its own login. Claims mean
+    // nothing there (no role session), so they're refused rather than dropped.
+    let role = query
+        .role
+        .as_deref()
+        .filter(|r| Requested::from_name(r, roles::owner_name(&record)) != Requested::Owner);
+    if role.is_none() && query.claims.is_some() {
+        return unprocessable("claims apply to a role; owner mode takes none").into_response();
     }
     let rows = or_answer!(
         state
@@ -242,7 +245,9 @@ where
     if row.data_api != DataApiState::On {
         return data_api_disabled(&row.name).into_response();
     }
-    or_answer!(check_role(state, branch.id, role).await);
+    if let Some(role) = role {
+        or_answer!(check_role(state, branch.id, role).await);
+    }
 
     let Some(path) = storage_path(uri.path()) else {
         error!(
@@ -274,7 +279,7 @@ where
             user = %principal.sub,
             branch = %branch.id,
             database = %row.name,
-            role = %role,
+            role = role.unwrap_or("owner mode"),
             route = endpoint.name,
             status = response.status().as_u16(),
             "console storage write"
@@ -292,7 +297,10 @@ where
     J: JobPort,
 {
     if let Err(err) = state.js.publish_storage_event(&event).await {
-        warn!(?event, "publish the storage event (storage's cache lifetimes cover it): {err}");
+        warn!(
+            ?event,
+            "publish the storage event (storage's cache lifetimes cover it): {err}"
+        );
     }
 }
 
@@ -300,7 +308,8 @@ where
 struct Forward<'a> {
     branch: BranchId,
     database: &'a str,
-    role: &'a str,
+    /// `None`: owner mode.
+    role: Option<&'a str>,
     claims: Map<String, Value>,
     member_id: Uuid,
     request_id: &'a str,
@@ -317,15 +326,20 @@ async fn forward(
     headers: &HeaderMap,
     body: Body,
 ) -> Response {
-    let caller = json!({
+    let mut caller = json!({
         "branch_id": who.branch.as_uuid(),
         "database": who.database,
-        "role": who.role,
-        "claims": who.claims,
         "member_id": who.member_id,
         "request_id": who.request_id,
-    })
-    .to_string();
+    });
+    match who.role {
+        Some(role) => {
+            caller["role"] = json!(role);
+            caller["claims"] = json!(who.claims);
+        }
+        None => caller["owner"] = json!(true),
+    }
+    let caller = caller.to_string();
     let mut pairs = vec![("database", who.database.to_owned())];
     if let Some(upsert) = query.upsert {
         pairs.push(("upsert", upsert.to_string()));
@@ -448,12 +462,12 @@ macro_rules! storage_route {
                 (status = $ok, description = $ok_description, $(content_type = $ct,)? body = Value),
                 (status = 400, description = "`invalid_request`: a path id isn't a valid UUID; storage's `invalid_request`, `invalid_value` or `reserved_bucket_name`", body = ErrorEnvelope),
                 (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-                (status = 403, description = "`forbidden`: the route needs the role held at Developer (`required`), or acting as it needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`", body = ErrorEnvelope),
+                (status = 403, description = "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`", body = ErrorEnvelope),
                 (status = 404, description = "`not_found`: the database (or another tenant's, or one you have no access to), the branch or the Postgres database doesn't exist; storage's `bucket_not_found`, `object_not_found` or `upload_not_found`", body = ErrorEnvelope),
                 (status = 409, description = "`data_api_disabled`: the Postgres database isn't served by the data API; `backup_branch`; `branch_not_ready`; storage's `conflict` or `write_once`", body = ErrorEnvelope),
                 (status = 413, description = "storage's `too_large`: over the bucket's file size limit", body = ErrorEnvelope),
                 (status = 415, description = "storage's `mime_not_allowed`", body = ErrorEnvelope),
-                (status = 422, description = "`invalid_request`: `role` is missing, empty or the owner (storage never runs as the owner), `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed", body = ErrorEnvelope),
+                (status = 422, description = "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed", body = ErrorEnvelope),
                 (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
                 (status = 502, description = "`unavailable`: storage refused the orchestrator's credential (a server misconfiguration)", body = ErrorEnvelope),
                 (status = 503, description = "`unavailable`: object storage can't be reached right now (`Retry-After`); `worker_unavailable`; storage's `storage_unavailable` or `busy`", body = ErrorEnvelope),

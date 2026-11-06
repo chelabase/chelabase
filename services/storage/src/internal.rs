@@ -4,7 +4,8 @@
 //! as rest's).
 //!
 //! Each request names who it runs as in [`CONSOLE_HEADER`], a JSON object
-//! `{"branch_id", "database", "role", "claims", "member_id", "request_id"}`: the role and claims
+//! `{"branch_id", "database", "role", "claims", "member_id", "request_id"}` (or `"owner": true`
+//! instead of a role and claims: owner mode, [`Mode::Owner`]): the role and claims
 //! of a key whose database list is that one database, and the member as the key id (their
 //! multipart sessions are their own; a signed URL they mint lives while they still have
 //! Developer access to the branch's database). The orchestrator checked the member may act as
@@ -45,11 +46,26 @@ pub const CONSOLE_HEADER: &str = "x-chelabase-console";
 /// The longest a download URL minted from the console lives: an hour.
 pub const MAX_CONSOLE_TTL: i64 = 3600;
 
-/// A console request's caller: the identity its statements run as, and the orchestrator's
-/// request id.
+/// Storage's own login: owner mode's caller role (its tickets and sessions record it).
+pub const STORAGE_ROLE: &str = "chelabase_storage";
+
+/// How a console request runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// As a role the member may act as, in a role session (row level security decides).
+    Role,
+    /// Owner mode (m9, decided by the human): as storage's own login (`BYPASSRLS`), which the
+    /// orchestrator allows only an Admin of the database. Its statements are storage's own
+    /// fixed ones; the storage schema's triggers (tickets, write-once) still hold.
+    Owner,
+}
+
+/// A console request's caller: the identity its statements run as, how, and the
+/// orchestrator's request id.
 #[derive(Debug, Clone)]
 pub struct ConsoleCaller {
     pub data: DataIdentity,
+    pub mode: Mode,
     pub request_id: String,
 }
 
@@ -62,19 +78,39 @@ pub fn console() -> Option<ConsoleCaller> {
     CONSOLE.try_with(Clone::clone).ok()
 }
 
+/// Proof that the request being handled is an owner-mode console request: only
+/// [`owner_mode`] makes one, and only [`crate::engine::Engine::as_caller`] asks for it, so it
+/// is the one place that picks storage's login over a role session.
+pub struct OwnerMode(());
+
+/// [`OwnerMode`] when the request is a console request whose caller is owner mode: never on
+/// the public listener (the task-local is set only by the internal listener, after its
+/// bearer), for a data key or an app user, or for a role caller.
+pub fn owner_mode() -> Option<OwnerMode> {
+    CONSOLE
+        .try_with(|c| c.mode == Mode::Owner)
+        .ok()
+        .filter(|owner| *owner)
+        .map(|_| OwnerMode(()))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Wire {
     branch_id: Uuid,
     database: String,
-    role: String,
     #[serde(default)]
-    claims: Map<String, Value>,
+    role: Option<String>,
+    #[serde(default)]
+    owner: bool,
+    #[serde(default)]
+    claims: Option<Map<String, Value>>,
     member_id: Uuid,
     request_id: String,
 }
 
-/// The caller [`CONSOLE_HEADER`] names: a role and a database are required.
+/// The caller [`CONSOLE_HEADER`] names: a database, and either a role (with claims) or
+/// `"owner": true` (no role, no claims).
 pub fn caller_of(headers: &HeaderMap) -> Result<ConsoleCaller, Failure> {
     let text = headers
         .get(CONSOLE_HEADER)
@@ -82,25 +118,52 @@ pub fn caller_of(headers: &HeaderMap) -> Result<ConsoleCaller, Failure> {
         .ok_or_else(|| Failure::invalid_request("the console caller is missing"))?;
     let wire: Wire = serde_json::from_str(text)
         .map_err(|e| Failure::invalid_request(format!("the console caller: {e}")))?;
-    if wire.role.is_empty() || wire.database.is_empty() {
+    if wire.database.is_empty() {
         return Err(Failure::invalid_request(
-            "the console caller names no role or no database",
+            "the console caller names no database",
         ));
     }
+    let (mode, role, claims) = match (wire.owner, wire.role, wire.claims) {
+        (true, None, None) => (Mode::Owner, STORAGE_ROLE.to_owned(), Map::new()),
+        (false, Some(role), claims) if !role.is_empty() => {
+            (Mode::Role, role, claims.unwrap_or_default())
+        }
+        _ => {
+            return Err(Failure::invalid_request(
+                "the console caller names either a role or owner mode",
+            ));
+        }
+    };
     Ok(ConsoleCaller {
         data: DataIdentity {
             branch_id: wire.branch_id,
             key_id: wire.member_id,
             kind: DataKeyKind::Secret,
-            role: wire.role,
-            claims: Value::Object(wire.claims),
+            role,
+            claims: Value::Object(claims),
             databases: Some(vec![wire.database]),
             project_id: None,
             role_oid: None,
             server_vouched: false,
         },
+        mode,
         request_id: wire.request_id,
     })
+}
+
+/// An owner-mode caller on `branch` (tests).
+#[cfg(test)]
+pub fn test_owner_caller(branch: Uuid, database: &str) -> ConsoleCaller {
+    let mut headers = HeaderMap::new();
+    let wire = serde_json::json!({ "branch_id": branch, "database": database, "owner": true, "member_id": Uuid::nil(), "request_id": "r" });
+    headers.insert(CONSOLE_HEADER, wire.to_string().parse().unwrap());
+    caller_of(&headers).unwrap()
+}
+
+/// `f` as a console request of `caller` (tests).
+#[cfg(test)]
+pub async fn in_console<F: std::future::Future>(caller: ConsoleCaller, f: F) -> F::Output {
+    CONSOLE.scope(caller, f).await
 }
 
 /// The bearer the internal listener takes.
@@ -361,6 +424,21 @@ mod tests {
             (status, json["error"]["code"].as_str()),
             (401, Some("unauthorized"))
         );
+        // Nor an owner-mode caller (m9): owner mode is never reachable there.
+        let owner = json!({ "branch_id": Uuid::new_v4(), "database": "app", "owner": true, "member_id": Uuid::new_v4(), "request_id": "r" });
+        for (method, path) in [
+            ("GET", "/storage/v1/bucket"),
+            ("POST", "/storage/v1/object/list/b"),
+            ("GET", "/storage/v1/object/b/a.txt"),
+            ("POST", "/storage/v1/object/b/a.txt"),
+        ] {
+            let headers = [
+                ("authorization", format!("Bearer {TOKEN}")),
+                (CONSOLE_HEADER, owner.to_string()),
+            ];
+            let (status, _) = call(format!("{public}{path}"), method, &headers, json!({})).await;
+            assert_eq!(status, 401, "{method} {path}");
+        }
         // An identity header on the internal listener is no caller either.
         let (internal, _) = serve().await;
         let headers = [
@@ -407,6 +485,53 @@ mod tests {
         )
         .await;
         assert_eq!(status, 503);
+    }
+
+    /// Owner mode (m9, the human's option 3): `"owner": true` and no role names storage's own
+    /// login as the caller, with no claims (objects it writes have no owner). A role beside it,
+    /// or neither, is refused. Only this header, read after the bearer, selects it.
+    #[test]
+    fn the_header_may_name_owner_mode() {
+        let mut headers = HeaderMap::new();
+        let owner = json!({ "branch_id": Uuid::nil(), "database": "app", "owner": true, "member_id": Uuid::nil(), "request_id": "r" });
+        headers.insert(CONSOLE_HEADER, owner.to_string().parse().unwrap());
+        let c = caller_of(&headers).unwrap();
+        assert_eq!(c.mode, Mode::Owner);
+        assert_eq!(c.data.role, STORAGE_ROLE);
+        assert_eq!(c.data.claims, json!({}));
+        for bad in [
+            json!({ "branch_id": Uuid::nil(), "database": "app", "owner": true, "role": "authenticated", "member_id": Uuid::nil(), "request_id": "r" }),
+            json!({ "branch_id": Uuid::nil(), "database": "app", "owner": true, "claims": { "sub": "u" }, "member_id": Uuid::nil(), "request_id": "r" }),
+            json!({ "branch_id": Uuid::nil(), "database": "app", "member_id": Uuid::nil(), "request_id": "r" }),
+            json!({ "branch_id": Uuid::nil(), "database": "app", "owner": false, "member_id": Uuid::nil(), "request_id": "r" }),
+        ] {
+            headers.insert(CONSOLE_HEADER, bad.to_string().parse().unwrap());
+            assert!(caller_of(&headers).is_err(), "{bad}");
+        }
+        // A role caller is never owner mode, whatever its role is called.
+        let named = json!({ "branch_id": Uuid::nil(), "database": "app", "role": STORAGE_ROLE, "member_id": Uuid::nil(), "request_id": "r" });
+        headers.insert(CONSOLE_HEADER, named.to_string().parse().unwrap());
+        assert_eq!(caller_of(&headers).unwrap().mode, Mode::Role);
+    }
+
+    /// The single chokepoint: owner mode only inside a console request whose caller is owner
+    /// mode; never outside one (the public listener, a data key or an app user), nor for a role
+    /// caller.
+    #[tokio::test]
+    async fn owner_mode_is_only_a_console_owner_callers() {
+        assert!(owner_mode().is_none());
+        let mut headers = HeaderMap::new();
+        let owner = json!({ "branch_id": Uuid::nil(), "database": "app", "owner": true, "member_id": Uuid::nil(), "request_id": "r" });
+        headers.insert(CONSOLE_HEADER, owner.to_string().parse().unwrap());
+        let owner_caller = caller_of(&headers).unwrap();
+        assert!(
+            CONSOLE
+                .scope(owner_caller, async { owner_mode().is_some() })
+                .await
+        );
+        headers.insert(CONSOLE_HEADER, caller().parse().unwrap());
+        let role = caller_of(&headers).unwrap();
+        assert!(CONSOLE.scope(role, async { owner_mode().is_none() }).await);
     }
 
     /// The caller's identity: a secret key's path (the owner-level refusal applies), the

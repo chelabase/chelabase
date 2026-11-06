@@ -82,6 +82,9 @@ where
 #[derive(Deserialize)]
 struct LiveQuery {
     branch: Option<Uuid>,
+    /// The URL was minted in owner mode (m9): its member must still be an Admin.
+    #[serde(default)]
+    owner: bool,
 }
 
 /// The live key with this id (as the gateway's lookup answers it); else, for a URL minted from
@@ -104,7 +107,7 @@ where
     let Some(branch) = q.branch else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match console_signer_live(&state, key_id, BranchId(branch)).await {
+    match console_signer_live(&state, key_id, BranchId(branch), q.owner).await {
         Ok(Some(project)) => Json(json!({
             "key_id": key_id,
             "branch_id": branch,
@@ -123,11 +126,13 @@ where
 /// Whether `member` may still use a URL they minted from the console on `branch`: the branch is
 /// a normal one not being deleted, the member is active (not offboarded) in the tenant of the
 /// branch's project, and a tenant admin or holds Developer or above on the branch's database
-/// (their own and team grants, with the database's override). The project when so.
+/// (their own and team grants, with the database's override); Admin for a URL minted in owner
+/// mode (`owner`). The project when so.
 async fn console_signer_live<M, L>(
     state: &InternalState<M, L>,
     member: Uuid,
     branch: BranchId,
+    owner: bool,
 ) -> Result<Option<ProjectId>, chelabase_metadata::MetadataError>
 where
     M: NeonMetadataPort,
@@ -149,11 +154,12 @@ where
         return Ok(None);
     };
     let active = m.status == MemberStatus::Active && !m.offboarded && m.tenant_id == p.tenant_id;
-    let developer = m.tenant_admin
+    let needed = if owner { PlatformRole::Admin } else { PlatformRole::Developer };
+    let enough = m.tenant_admin
         || sources
             .effective()
-            .is_some_and(|e| e.platform_role >= PlatformRole::Developer);
-    Ok((active && developer).then_some(project))
+            .is_some_and(|e| e.platform_role >= needed);
+    Ok((active && enough).then_some(project))
 }
 
 #[derive(Deserialize)]

@@ -319,15 +319,9 @@ async fn a_role_the_member_may_not_assume_is_refused_first() {
             "{query:?}"
         );
     }
-    // No role asks as the owner: a Developer is refused (Admin only), and even a tenant admin
-    // gets no further (storage never runs as the owner).
+    // No role (owner mode) needs Admin: a Developer is refused before storage.
     let path = format!("{}/bucket", base(&w));
     assert_eq!(call(&w, "dee", "GET", &path).await.status(), 403);
-    w.metadata
-        .add_member(w.tenant, "boss", MemberStatus::Active, true);
-    assert_eq!(call(&w, "boss", "GET", &path).await.status(), 422);
-    let path = format!("{}/bucket?role=postgres", base(&w));
-    assert_eq!(call(&w, "boss", "GET", &path).await.status(), 422);
     *w.jobs.role_check.lock().unwrap() =
         Some(Ok(CheckDataRoleReply::refused("the role is owner-level")));
     let path = format!("{}/bucket?role=writer", base(&w));
@@ -467,11 +461,18 @@ async fn storage_refusing_our_bearer_is_502() {
 async fn key_and_settings_changes_tell_storage() {
     use chelabase_nats::StorageEvent;
     let (w, _storage) = world().await;
-    w.metadata.add_member(w.tenant, "boss", MemberStatus::Active, true);
+    w.metadata
+        .add_member(w.tenant, "boss", MemberStatus::Active, true);
     let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
     let made: Value = w
         .app
-        .send_as("boss", "org-1", Method::POST, &keys, Some(json!({ "name": "k1", "role": "writer" })))
+        .send_as(
+            "boss",
+            "org-1",
+            Method::POST,
+            &keys,
+            Some(json!({ "name": "k1", "role": "writer" })),
+        )
         .await
         .json()
         .await
@@ -480,34 +481,138 @@ async fn key_and_settings_changes_tell_storage() {
     let events = || w.jobs.storage_events.lock().unwrap().clone();
     assert!(events().is_empty());
     let key = format!("{keys}/{id}");
-    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &key, Some(json!({ "databases": ["web1"] }))).await;
+    let resp = w
+        .app
+        .send_as(
+            "boss",
+            "org-1",
+            Method::PATCH,
+            &key,
+            Some(json!({ "databases": ["web1"] })),
+        )
+        .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(events(), vec![StorageEvent::Key { key_id: id }]);
-    let resp = w.app.send_as("boss", "org-1", Method::POST, &format!("{key}/rotate"), None).await;
+    let resp = w
+        .app
+        .send_as(
+            "boss",
+            "org-1",
+            Method::POST,
+            &format!("{key}/rotate"),
+            None,
+        )
+        .await;
     assert_eq!(resp.status(), 201);
-    let new_id: uuid::Uuid = resp.json::<Value>().await.unwrap()["id"].as_str().unwrap().parse().unwrap();
+    let new_id: uuid::Uuid = resp.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert_eq!(events().last(), Some(&StorageEvent::Key { key_id: id }));
     let before = events().len();
-    let resp = w.app.send_as("boss", "org-1", Method::DELETE, &format!("{keys}/{new_id}"), None).await;
+    let resp = w
+        .app
+        .send_as(
+            "boss",
+            "org-1",
+            Method::DELETE,
+            &format!("{keys}/{new_id}"),
+            None,
+        )
+        .await;
     assert_eq!(resp.status(), 204);
     assert_eq!(events()[before..], [StorageEvent::Key { key_id: new_id }]);
 
     // Settings: storage's budget (or the data API's) changed: one event per branch.
     let before = events().len();
     let db = format!("/v1/databases/{}", w.db);
-    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &db, Some(json!({ "storage_max_connections": 7 }))).await;
+    let resp = w
+        .app
+        .send_as(
+            "boss",
+            "org-1",
+            Method::PATCH,
+            &db,
+            Some(json!({ "storage_max_connections": 7 })),
+        )
+        .await;
     assert_eq!(resp.status(), 200);
     let mut branches: Vec<_> = events()[before..].to_vec();
     branches.sort_by_key(|e| format!("{e:?}"));
     let mut want = vec![
-        StorageEvent::Branch { branch_id: w.dev.as_uuid() },
-        StorageEvent::Branch { branch_id: w.db.as_uuid() },
+        StorageEvent::Branch {
+            branch_id: w.dev.as_uuid(),
+        },
+        StorageEvent::Branch {
+            branch_id: w.db.as_uuid(),
+        },
     ];
     want.sort_by_key(|e| format!("{e:?}"));
     assert_eq!(branches, want);
     // The same value again, or another setting: nothing.
     let before = events().len();
-    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &db, Some(json!({ "storage_max_connections": 7, "max_rows": 500 }))).await;
+    let resp = w
+        .app
+        .send_as(
+            "boss",
+            "org-1",
+            Method::PATCH,
+            &db,
+            Some(json!({ "storage_max_connections": 7, "max_rows": 500 })),
+        )
+        .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(events().len(), before);
+}
+
+/// Owner mode (the human's option 3): no `?role=`, `?role=owner` or the owner's own name runs
+/// as storage's own login, on every route. It needs Admin on the database (a tenant admin, or
+/// an Admin grant); below it, 403 before storage is called. Storage is told owner mode and no
+/// role or claims (objects written so have no owner); no worker role check is made.
+#[tokio::test]
+async fn owner_mode_needs_admin_and_names_no_role() {
+    let (w, storage) = world().await;
+    w.metadata
+        .add_member(w.tenant, "boss", MemberStatus::Active, true);
+    w.metadata
+        .add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    for &(method, tail, _) in ROUTES {
+        for owner in ["", "?role=owner", "?role=postgres", "?claims=%7B%7D"] {
+            let path = format!("{}{tail}{owner}", base(&w));
+            for sub in ["vic", "dee"] {
+                let before = storage.calls();
+                let resp = call(&w, sub, method, &path).await;
+                assert_eq!(resp.status(), 403, "{sub} {method} {tail}{owner}");
+                assert_eq!(
+                    storage.calls(),
+                    before,
+                    "{sub} {method} {tail}{owner} reached storage"
+                );
+            }
+        }
+        for sub in ["boss", "ada"] {
+            let path = format!("{}{tail}", base(&w));
+            let checks = w.jobs.role_checks.lock().unwrap().len();
+            let resp = call(&w, sub, method, &path).await;
+            assert_eq!(resp.status(), 200, "{sub} {method} {tail}");
+            assert_eq!(
+                w.jobs.role_checks.lock().unwrap().len(),
+                checks,
+                "no role check for the owner"
+            );
+            let seen = storage.last();
+            let caller: Value =
+                serde_json::from_slice(seen.headers["x-chelabase-console"].as_bytes()).unwrap();
+            assert_eq!(caller["owner"], true, "{caller}");
+            assert!(
+                caller.get("role").is_none() && caller.get("claims").is_none(),
+                "{caller}"
+            );
+            assert_eq!(caller["database"], "web1");
+        }
+    }
+    // Claims mean nothing to the owner: refused rather than dropped silently.
+    let path = format!("{}/bucket?claims=%7B%22sub%22%3A%22u%22%7D", base(&w));
+    assert_eq!(call(&w, "boss", "GET", &path).await.status(), 422);
 }

@@ -2431,6 +2431,52 @@ async fn a_console_url_lives_while_its_member_has_developer_access() {
     }
 }
 
+/// Object storage m9: a URL minted in owner mode (`&owner=true`) lives only while its member
+/// is still an Admin of the database (or a tenant admin): a Developer's is 404.
+#[tokio::test]
+async fn an_owner_mode_url_lives_while_its_member_is_admin() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = |admin: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let grant = |role: PlatformRole| GrantSources::new(Some(Grant { platform_role: role, roles: RoleSet::all() }), Vec::new(), None);
+    for (m, sources, owner_live) in [
+        (member(false), grant(PlatformRole::Developer), false),
+        (member(false), grant(PlatformRole::Admin), true),
+        (member(true), GrantSources::new(None, Vec::new(), None), true),
+    ] {
+        let id = m.id;
+        neon.members.lock().unwrap().push((m, sources));
+        let base = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        assert_eq!(app.get(&base, Some(STORAGE_TOKEN)).await.0, 200, "a role URL of a Developer or above");
+        let (code, body) = app.get(&format!("{base}&owner=true"), Some(STORAGE_TOKEN)).await;
+        assert_eq!(code, if owner_live { 200 } else { 404 }, "{body}");
+    }
+}
+
 /// Object storage m6 fix (B1, S3): an app user's upload token (its claims carry the session's
 /// `sid`) is recorded only while that session of the key's project is live, never past the
 /// session's expiry, and is spent only while the session is still live.

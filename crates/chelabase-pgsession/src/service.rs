@@ -262,6 +262,42 @@ impl<S: ConnSource> ServicePool<S> {
         out.map_err(ServiceError::Query)
     }
 
+    /// Storage's owner mode (object-storage m9, console requests only, decided by the human):
+    /// `f` in one transaction on a reset session of the service's own login, with the
+    /// branch's statement timeout. `f` runs the service's own fixed statements (storage's
+    /// object handlers), never a caller's text. The Postgres boundary above holds as for
+    /// [`Self::query`]: the connection is checked to be the service's login with no
+    /// memberships, so nothing it runs can become another role; it reaches what that login's
+    /// grants reach. A failed reset or a cancelled call closes the connection.
+    pub async fn transaction<T>(
+        &self,
+        branch: Uuid,
+        database: &str,
+        statement_timeout_ms: i64,
+        request_id: &str,
+        f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, QueryFailure>,
+    ) -> Result<T, ServiceError> {
+        let conn = self.pools.acquire(branch, database).await?;
+        let permits = conn.permits;
+        // Declared after `permits`: dropped (pooled or closed) before they're released.
+        let mut lease = Lease::new(conn.client);
+        let timeout = statement_timeout_ms.max(0).to_string();
+        let out = with_transaction(&lease, RESET_SQL, request_id, async |c| {
+            c.query_typed(
+                "SELECT pg_catalog.set_config('statement_timeout', $1, true), pg_catalog.set_config('transaction_timeout', $1, true)",
+                &[(&timeout, Type::TEXT)],
+            )
+            .await
+            .map_err(|e| QueryFailure::from_pg(&e, request_id))?;
+            f(c).await
+        })
+        .await;
+        lease.done();
+        drop(lease);
+        drop(permits);
+        out.map_err(ServiceError::Query)
+    }
+
     /// Forgets what's held for `branch` ([`Pools::invalidate`]).
     pub async fn invalidate(&self, branch: Uuid) {
         self.pools.invalidate(branch).await;
