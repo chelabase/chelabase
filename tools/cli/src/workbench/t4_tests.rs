@@ -122,6 +122,8 @@ fn the_orchestrator_gets_exactly_the_events_publish_and_stream_rights() {
             "chelabase.member_roles.reconcile",
             "chelabase.rt.project.>",
             "chelabase.rt.access.>",
+            // Object storage m9: its cache events.
+            "chelabase.storage.>",
             "$JS.API.STREAM.INFO.CHELABASE_CONTROL",
             "$JS.API.STREAM.CREATE.CHELABASE_CONTROL",
             "$JS.API.STREAM.UPDATE.CHELABASE_CONTROL",
@@ -393,4 +395,25 @@ fn up_restarts_valkey_only_for_a_changed_acl_on_a_running_stack() {
     assert!(!valkey_needs_restart(true, false));
     assert!(!valkey_needs_restart(false, true));
     assert!(!valkey_needs_restart(false, false));
+}
+
+// Object storage m9: storage's NATS user only listens, to exactly its cache events; it can
+// publish nothing (no allow list, deny everything), so it can neither send jobs nor answer.
+#[test]
+fn storage_only_listens_to_its_cache_events() {
+    let text = rendered();
+    assert!(list(&text, "storage", "publish", "allow").is_empty());
+    assert_eq!(as_set(list(&text, "storage", "publish", "deny")), set(&[">"]));
+    for subject in ["chelabase.storage.events", "chelabase.provision", "chelabase.rpc.check_data_role", "_INBOX_storage.x"] {
+        assert!(!may_publish(&text, "storage", subject), "{subject}");
+    }
+    assert_eq!(
+        as_set(list(&text, "storage", "subscribe", "allow")),
+        set(&["chelabase.rt.project.>", "chelabase.rt.access.>", "chelabase.storage.>", "_INBOX_storage.>"])
+    );
+    // Only the orchestrator (and the runner, as it) publishes the storage events.
+    for user in ["worker", "realtime"] {
+        assert!(!may_publish(&text, user, "chelabase.storage.events"), "{user}");
+    }
+    assert!(may_publish(&text, "orchestrator", "chelabase.storage.events"));
 }

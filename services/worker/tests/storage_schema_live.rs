@@ -3728,3 +3728,171 @@ async fn storage_multipart_counted_limits_live() {
     }))
     .await;
 }
+
+// --- m9: Studio's storage routes through the gateway, as a member acting as a role -----------
+
+/// The demo member's management token (`chelabase dev token`).
+async fn dev_token() -> String {
+    let cli = std::env::var("CHELABASE_CLI").expect("CHELABASE_CLI (run through just workbench test)");
+    let out = tokio::process::Command::new(cli)
+        .args(["dev", "token"])
+        .current_dir(std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into))
+        .output()
+        .await
+        .expect("chelabase dev token");
+    assert!(out.status.success(), "chelabase dev token failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+impl Fx {
+    /// A console storage path on main acting as `authenticated` with the claims `{"sub": user}`.
+    fn console(&self, tail: &str, user: Uuid) -> String {
+        let claims = json!({ "sub": user }).to_string();
+        let sep = if tail.contains('?') { '&' } else { '?' };
+        format!(
+            "/v1/databases/{}/branches/{}/storage{tail}{sep}role=authenticated&claims={}",
+            self.id,
+            self.main,
+            claims.bytes().map(|b| if b.is_ascii_alphanumeric() || b == b'-' { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>()
+        )
+    }
+}
+
+/// AC 3, 7 and the console URL: acting as `authenticated` with a user's claims, the console
+/// uploads and lists only what row level security shows that user; another user's object is
+/// missing. An 8 MiB resumable part goes through. A console download URL lives at most an
+/// hour and serves while the member keeps access; without a role, nothing runs.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_console_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
+        let token = dev_token().await;
+        let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
+        for (user, name) in [(u1, "u1.txt"), (u2, "u2.txt")] {
+            let (status, _, b) = object("POST", &fx.console(&format!("/object/files/{name}"), user), &token, Some(name.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
+            assert_eq!(status, 200, "upload {name}: {}", json_of(&b));
+        }
+        assert_eq!(fx.value("SELECT owner FROM storage.objects WHERE name = 'u1.txt'").await, u1.to_string());
+        // AC 3: each user lists only their own.
+        for (user, mine) in [(u1, "u1.txt"), (u2, "u2.txt")] {
+            let (status, _, b) = object("POST", &fx.console("/object/list/files", user), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+            assert_eq!(status, 200, "{}", json_of(&b));
+            let names: Vec<String> = json_of(&b).as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap().to_string()).collect();
+            assert_eq!(names, vec![mine.to_string()], "{user}");
+        }
+        let (status, _, got) = object("GET", &fx.console("/object/files/u1.txt", u1), &token, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"u1.txt"[..]));
+        assert_eq!(object("GET", &fx.console("/object/files/u2.txt", u1), &token, None, &[]).await.0, 404);
+        // Without a role storage never runs (the owner is never used).
+        let bare = format!("/v1/databases/{}/branches/{}/storage/bucket", fx.id, fx.main);
+        assert_eq!(object("GET", &bare, &token, None, &[]).await.0, 422);
+        // A console URL: at most an hour; it serves without a credential.
+        let sign = fx.console("/object/sign/files/u1.txt", u1);
+        let (status, _, b) = object("POST", &sign, &token, Some(json!({ "expires_in": 3601 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 400, "{}", json_of(&b));
+        let (status, _, b) = object("POST", &sign, &token, Some(json!({ "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let url = json_of(&b)["signed_url"].as_str().unwrap().to_string();
+        let res = reqwest::Client::new().get(format!("{}{url}", gateway())).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(&res.bytes().await.unwrap()[..], b"u1.txt");
+        // AC 7: an 8 MiB part through the console, then completed.
+        let (status, _, b) = object("POST", &fx.console("/upload/files/big.bin", u1), &token, None, &[("content-type", "application/octet-stream")]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let id = json_of(&b)["id"].as_str().unwrap().to_string();
+        let part: Vec<u8> = (0..8 * MIB).map(|i| (i % 251) as u8).collect();
+        let (status, _, b) = object("PUT", &fx.console(&format!("/upload/session/{id}/1"), u1), &token, Some(part.clone().into()), &[]).await;
+        assert_eq!((status, json_of(&b)["size"].clone()), (200, json!(8 * MIB)), "{}", json_of(&b));
+        let (status, _, b) = object("POST", &fx.console(&format!("/upload/session/{id}/complete"), u1), &token, None, &[]).await;
+        assert_eq!((status, json_of(&b)["size"].clone()), (200, json!(8 * MIB)), "{}", json_of(&b));
+        let (status, _, got) = object("GET", &fx.console("/object/files/big.bin", u1), &token, None, &[]).await;
+        assert_eq!(status, 200);
+        assert!(got[..] == part[..], "the completed object differs");
+    }))
+    .await;
+}
+
+/// NATS revocation (m6's AC, moved to m9): a revoked key's signed URL fails within a second,
+/// though its liveness was cached a moment before (the cache lifetime is 5 s): the
+/// orchestrator's event reaches storage.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_revocation_nats_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let (status, body) = api("POST", &fx.keys_path(), Some(json!({ "name": "st-revoke", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let (key, id) = (body["key"].as_str().unwrap().to_string(), body["id"].as_str().unwrap().to_string());
+        let (status, _, b) = object("POST", "/storage/v1/object/files/r.txt", &key, Some(b"r".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", "/storage/v1/object/sign/files/r.txt", &key, Some(json!({ "expires_in": 600 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let url = format!("{}{}", gateway(), json_of(&b)["signed_url"].as_str().unwrap());
+        let get = || async { reqwest::Client::new().get(&url).send().await.unwrap().status().as_u16() };
+        assert_eq!(get().await, 200, "the URL serves (its key's liveness is now cached)");
+        let (status, body) = api("DELETE", &format!("{}/{id}", fx.keys_path()), None).await;
+        assert_eq!(status, 204, "{body}");
+        let revoked = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(get().await, 403, "still served {:?} after the revoke", revoked.elapsed());
+    }))
+    .await;
+}
+
+impl Fx {
+    /// A console storage path on main in owner mode (no role).
+    fn owner_console(&self, tail: &str) -> String {
+        format!("/v1/databases/{}/branches/{}/storage{tail}", self.id, self.main)
+    }
+}
+
+/// Owner mode (m9, the human's option 3): with no role, an Admin's console runs as storage's
+/// own login. It lists, reads and writes objects no policy allows (there are none here), and
+/// what it writes has no owner. A write-once object stays immutable even so.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_console_owner_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        // Buckets `files` and `other`, a bucket SELECT policy and no object policy at all.
+        objects_fixture(fx, &[]).await;
+        let token = dev_token().await;
+        let text = ("content-type", "text/plain");
+        let (status, _, b) = object("POST", &fx.owner_console("/object/files/o.txt"), &token, Some(b"owned".to_vec().into()), &[text]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(fx.value("SELECT coalesce(owner::text, 'none') FROM storage.objects WHERE name = 'o.txt'").await, "none");
+        // A user acting as `authenticated` sees nothing (no policy); the owner sees it.
+        let (status, _, b) = object("POST", &fx.console("/object/list/files", Uuid::new_v4()), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+        assert_eq!((status, json_of(&b)), (200, json!([])));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/list/files"), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(json_of(&b)[0]["name"], "o.txt");
+        let (status, _, got) = object("GET", &fx.owner_console("/object/files/o.txt"), &token, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"owned"[..]));
+        // Copy, move, sign, delete, and a bucket of its own.
+        let (status, _, b) = object("POST", &fx.owner_console("/object/copy"), &token, Some(json!({ "bucket": "files", "from": "o.txt", "to": "c.txt" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/move"), &token, Some(json!({ "bucket": "files", "from": "c.txt", "to": "c.txt", "to_bucket": "other" }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", &fx.owner_console("/object/sign/files/o.txt"), &token, Some(json!({ "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let url = format!("{}{}", gateway(), json_of(&b)["signed_url"].as_str().unwrap());
+        assert_eq!(reqwest::Client::new().get(&url).send().await.unwrap().status(), 200);
+        assert_eq!(object("DELETE", &fx.owner_console("/object/other/c.txt"), &token, None, &[]).await.0, 200);
+        let (status, _, b) = object("POST", &fx.owner_console("/bucket"), &token, Some(json!({ "name": "frozen", "write_once": true }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 201, "{}", json_of(&b));
+        // Write-once holds for the owner too.
+        let up = fx.owner_console("/object/frozen/a.txt");
+        assert_eq!(object("POST", &up, &token, Some(b"one".to_vec().into()), &[text]).await.0, 200);
+        let (status, _, b) = object("POST", &format!("{up}?upsert=true"), &token, Some(b"two".to_vec().into()), &[text]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (409, json!("write_once")), "{}", json_of(&b));
+        let (status, _, b) = object("DELETE", &up, &token, None, &[]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (409, json!("write_once")), "{}", json_of(&b));
+        let (status, _, got) = object("GET", &up, &token, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]));
+    }))
+    .await;
+}

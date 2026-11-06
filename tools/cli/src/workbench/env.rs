@@ -170,6 +170,8 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_REALTIME_URL", "http://realtime:8087"),
     // m5: the gateway's storage upstream.
     ("CHELABASE_STORAGE_URL", "http://storage:8089"),
+    // m9: the orchestrator's way to storage's console listener (Studio's storage routes).
+    ("CHELABASE_STORAGE_INTERNAL_URL", "http://storage:8090"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
@@ -183,6 +185,7 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_REALTIME_ADDR", "0.0.0.0:8087"),
     ("CHELABASE_REALTIME_INTERNAL_ADDR", "0.0.0.0:8088"),
     ("CHELABASE_STORAGE_ADDR", "0.0.0.0:8089"),
+    ("CHELABASE_STORAGE_INTERNAL_ADDR", "0.0.0.0:8090"),
 ];
 
 /// Keys in file order; setting a known key replaces its value in place.

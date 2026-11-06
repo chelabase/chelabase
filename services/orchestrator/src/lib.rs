@@ -56,6 +56,7 @@ pub mod projects;
 mod protection;
 mod roles;
 pub mod sql_editor;
+pub mod storage_console;
 mod privileges;
 mod table_api;
 mod teams;
@@ -1348,6 +1349,13 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         job: &JobEnvelope<MergeJob>,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
+    /// Object storage m9: tells every storage replica to drop what it cached
+    /// (`chelabase_nats::SUBJECT_STORAGE_EVENTS`, core NATS, best effort).
+    fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
     /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
     /// `authenticator`).
     fn check_data_role(
@@ -1591,6 +1599,17 @@ impl JobPort for NatsPorts {
             .map_err(|e| Box::new(e) as BoxError)
     }
 
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), BoxError> {
+        let payload = serde_json::to_vec(event)?;
+        self.client
+            .publish(chelabase_nats::SUBJECT_STORAGE_EVENTS, payload.into())
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
     async fn check_data_role(
         &self,
         branch_id: BranchId,
@@ -1781,6 +1800,8 @@ pub struct AppState<M, J> {
     pub proxy: ProxyAddress,
     /// The REST service's internal listener (the data API's schema).
     pub rest: RestInternal,
+    /// The storage service's console listener (m9: Studio's storage routes).
+    pub storage: storage_console::StorageInternal,
     /// Every self-hosted/platform decision (the dev CA path is revealed only self-hosted).
     pub policy: ModePolicy,
     /// `CHELABASE_OPERATOR_TENANT_ID` (#119): in platform mode, members of this tenant who come
@@ -2496,6 +2517,7 @@ where
         .merge(data_api_databases::routes())
         .merge(data_api_types::routes())
         .merge(console::routes())
+        .merge(storage_console::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())
         .merge(privileges::routes())

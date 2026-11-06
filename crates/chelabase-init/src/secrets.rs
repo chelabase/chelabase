@@ -192,6 +192,7 @@ pub const LAYOUT: &[Entry] = &[
     e("nats/worker.password", M, Gen::Text32, P),
     e("nats/realtime.password", M, Gen::Text32, P),
     e("nats/runner.password", M, Gen::Text32, P),
+    e("nats/storage.password", M, Gen::Text32, P),
     e("valkey/proxy.password", M, Gen::Text32, P),
     e("valkey/control.password", M, Gen::Text32, P),
     e("valkey/realtime.password", M, Gen::Text32, P),

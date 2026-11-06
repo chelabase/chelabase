@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "storage=info,chelabase_query=info,chelabase_pgsession=info".into()
+                "storage=info,chelabase_query=info,chelabase_pgsession=info,chelabase_nats=info".into()
             }),
         )
         .init();
@@ -46,11 +46,22 @@ async fn main() -> anyhow::Result<()> {
         inflight: storage::limits::InFlight::new(config.max_inflight_bytes)
             .with_body_idle(config.body_idle),
     });
-    let listener = tokio::net::TcpListener::bind(config.addr).await?;
-    info!(
-        "storage listening on {} (bucket {})",
-        config.addr, config.store.bucket
+    // m9: NATS cache invalidation as storage's own user (`CHELABASE_NATS_*`), in the
+    // background: storage serves on its cache lifetimes while NATS is away.
+    storage::events::spawn(
+        state.clone(),
+        chelabase_nats::NatsConfig::from_env().map_err(anyhow::Error::msg)?,
     );
-    axum::serve(listener, router(state)).await?;
+    let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    let internal = tokio::net::TcpListener::bind(config.internal_addr).await?;
+    info!(
+        "storage listening on {} and {} for the console (bucket {})",
+        config.addr, config.internal_addr, config.store.bucket
+    );
+    let console = storage::internal::internal_router(state.clone(), &config.internal_token);
+    tokio::try_join!(
+        async { axum::serve(listener, router(state)).await },
+        async { axum::serve(internal, console).await },
+    )?;
     Ok(())
 }

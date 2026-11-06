@@ -67,6 +67,21 @@ pub const CONSUMER_APP_USERS_SYNC: &str = "chelabase-worker-app-users-sync";
 pub const SUBJECT_STORAGE_SWEEP: &str = "chelabase.storage_sweep";
 pub const CONSUMER_STORAGE_SWEEP: &str = "chelabase-worker-storage-sweep";
 
+/// Object storage's cache events (m9), core NATS (not JetStream), published by the
+/// orchestrator and heard by every storage replica (`chelabase.storage.>`): a data key revoked,
+/// rotated or its database list changed ([`StorageEvent::Key`]: its signed URLs' cached
+/// liveness goes), and a branch's settings changed ([`StorageEvent::Branch`]: its connection
+/// info and pools go). Lost events are covered by storage's own short cache lifetimes.
+pub const SUBJECT_STORAGE_EVENTS: &str = "chelabase.storage.events";
+
+/// What [`SUBJECT_STORAGE_EVENTS`] carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum StorageEvent {
+    Key { key_id: Uuid },
+    Branch { branch_id: Uuid },
+}
+
 /// Core request/reply (not JetStream): check a table can hold the app-users location.
 pub const SUBJECT_APP_USERS_CHECK: &str = "chelabase.rpc.app_users.check";
 

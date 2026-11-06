@@ -5,14 +5,18 @@ use std::path::PathBuf;
 
 use chelabase_storage::StorageConfig;
 
-/// Storage's bearer for the orchestrator's internal listener (its login's connection info,
-/// and the data connection info its role sessions use).
+/// Storage's bearer, both ways: for the orchestrator's internal listener (its login's
+/// connection info, and the data connection info its role sessions use), and the one the
+/// orchestrator presents to storage's console listener.
 pub const BEARER: &str = "CHELABASE_STORAGE_INTERNAL_TOKEN";
 
 pub struct Config {
     /// `CHELABASE_STORAGE_ADDR` (default `127.0.0.1:8089`): the public listener, behind the
     /// gateway.
     pub addr: SocketAddr,
+    /// `CHELABASE_STORAGE_INTERNAL_ADDR` (default `127.0.0.1:8090`): the console's internal
+    /// listener, for the orchestrator only, behind [`BEARER`] ([`crate::internal`]).
+    pub internal_addr: SocketAddr,
     /// `CHELABASE_INTERNAL_URL`: the orchestrator's internal listener, for connection info.
     pub internal_url: String,
     /// [`BEARER`], or the file `…_FILE` names.
@@ -63,6 +67,7 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
         Ok(Config {
             addr: env_or("CHELABASE_STORAGE_ADDR", "127.0.0.1:8089").parse()?,
+            internal_addr: env_or("CHELABASE_STORAGE_INTERNAL_ADDR", "127.0.0.1:8090").parse()?,
             internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
             internal_token,
             max_connections: env_or("CHELABASE_STORAGE_MAX_CONNECTIONS", "200").parse()?,
@@ -113,6 +118,7 @@ mod tests {
     fn reads_the_settings_with_their_defaults() {
         let c = Config::from_lookup(lookup(BASE)).unwrap();
         assert_eq!(c.addr, "127.0.0.1:8089".parse().unwrap());
+        assert_eq!(c.internal_addr, "127.0.0.1:8090".parse().unwrap());
         assert_eq!(c.internal_token, "a-generated-storage-token");
         assert_eq!(c.max_connections, 200);
         assert_eq!(c.max_inflight_bytes, 1 << 30);

@@ -212,6 +212,11 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
     let (data, rid) = identity(&state, &headers)?;
     check_object_name(&name)?;
     let ttl = ttl_of(body(json)?.expires_in)?;
+    if crate::internal::console().is_some() && ttl > crate::internal::MAX_CONSOLE_TTL {
+        return Err(Failure::invalid_request(
+            "a URL minted from the console lives at most 3600 seconds (an hour)",
+        ));
+    }
     let at = state
         .engine
         .locate(&data, q.database.as_deref(), &rid)
@@ -232,7 +237,8 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
         size: Some(found.size),
         etag: Some(found.etag),
         content_type: Some(found.content_type),
-        role: None,
+        // Owner mode (m9) marks its URL: it lives only while its member is still an Admin.
+        role: crate::internal::owner_mode().map(|_| crate::internal::STORAGE_ROLE.to_owned()),
         role_oid: None,
         session_id: None,
         upsert: false,
@@ -298,7 +304,11 @@ pub async fn signed_download<S: ConnSource, M: ConnSource>(
     let claims = state
         .open_token(q.token.as_deref(), Purpose::Download, &bucket, &name, &rid)
         .await?;
-    let live = state.urls.live_key(claims.key_id, &rid).await?;
+    let owner = claims.role.as_deref() == Some(crate::internal::STORAGE_ROLE);
+    let live = state
+        .urls
+        .live_key(claims.key_id, claims.branch_id, owner, &rid)
+        .await?;
     if !live.is_some_and(|k| key_still_reaches(&k, &claims)) {
         return Err(Failure::token_refused());
     }

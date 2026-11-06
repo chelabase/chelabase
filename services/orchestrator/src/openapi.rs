@@ -64,7 +64,17 @@ pub fn openapi() -> OpenApi {
         }
     }
     document_access(&mut doc);
+    // m9: a `{*name}` tail (axum's) is the OpenAPI path parameter `{name}` (it may hold `/`).
+    doc.paths.paths = std::mem::take(&mut doc.paths.paths)
+        .into_iter()
+        .map(|(path, item)| (openapi_path(&path), item))
+        .collect();
     doc
+}
+
+/// A route path as OpenAPI writes it: a `{*name}` tail is `{name}`.
+pub fn openapi_path(path: &str) -> String {
+    path.replace("{*", "{")
 }
 
 /// Adds each operation's access answers (from its endpoint's `Access` in `chelabase_routes`,
@@ -688,6 +698,12 @@ impl JobPort for Doc {
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         match *self {}
     }
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), BoxError> {
+        match *self {}
+    }
     async fn check_data_role(
         &self,
         branch_id: BranchId,
@@ -1080,7 +1096,7 @@ mod tests {
                             | "orchestrator.openapi_json"
                     )
             })
-            .map(|e| (e.method.as_str().to_string(), e.path.to_string()))
+            .map(|e| (e.method.as_str().to_string(), openapi_path(e.path)))
             .collect();
         assert_eq!(documented, registry);
     }
@@ -1355,11 +1371,31 @@ mod tests {
             ),
             ("PUT /v1/teams/{team_id}/grants/{project_id}", "putTeamGrant"),
             ("PUT /v1/teams/{team_id}/members/{member_id}", "putTeamMember"),
+            // m9: Studio's storage routes.
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/bucket", "storageListBuckets"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/bucket", "storageCreateBucket"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}", "storageUpdateBucket"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}", "storageDeleteBucket"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/list/{bucket}", "storageListObjects"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageDownloadObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageUploadObject"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storagePutObject"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageDeleteObject"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}", "storageDeleteObjects"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/copy", "storageCopyObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/move", "storageMoveObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{name}", "storageSignObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/{bucket}/{name}", "storageCreateUpload"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/{part}", "storageUploadPart"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageListParts"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/complete", "storageCompleteUpload"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageAbortUpload"),
         ];
-        let expected: Vec<(String, String)> = expected
+        let mut expected: Vec<(String, String)> = expected
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        expected.sort();
         assert_eq!(ids, expected);
         let unique: BTreeSet<_> = ids.iter().map(|(_, id)| id).collect();
         assert_eq!(unique.len(), ids.len(), "operation ids are unique");
@@ -1383,7 +1419,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams", "storage"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(

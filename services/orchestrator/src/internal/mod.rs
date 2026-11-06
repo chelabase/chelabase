@@ -161,6 +161,14 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         db: DatabaseId,
     ) -> impl Future<Output = Result<Option<ProjectId>, MetadataError>> + Send;
+    /// Object storage m9: a member by id (any status) and their access sources on `project`,
+    /// with `database`'s override; the liveness of a URL they minted from the console.
+    fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> impl Future<Output = Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError>> + Send;
     /// The database's main branch, unless it's deleted.
     fn main_branch(
         &self,
@@ -400,6 +408,18 @@ impl NeonMetadataPort for MetadataClient {
         Ok(MetadataClient::get_database(self, db)
             .await?
             .map(|d| d.project_id))
+    }
+    async fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        let Some(record) = MetadataClient::member(self, member).await? else {
+            return Ok(None);
+        };
+        let sources = MetadataClient::grant_sources(self, member, project.as_uuid(), Some(database.as_uuid())).await?;
+        Ok(Some((record, sources)))
     }
     async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
         Ok(MetadataClient::list_branches(self, db)

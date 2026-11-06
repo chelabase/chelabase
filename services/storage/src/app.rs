@@ -77,11 +77,16 @@ async fn health() -> impl IntoResponse {
 }
 
 /// The data key behind the request, and the gateway's request id: only a token minted for
-/// [`AUDIENCE`] with a data key's identity.
+/// [`AUDIENCE`] with a data key's identity; on the console's internal listener, the caller it
+/// names ([`crate::internal`]).
 pub fn identity<S, M>(
     state: &AppState<S, M>,
     headers: &HeaderMap,
 ) -> Result<(DataIdentity, String), Failure> {
+    // The console's internal listener set its caller after its bearer (never a header here).
+    if let Some(console) = crate::internal::console() {
+        return Ok((console.data, console.request_id));
+    }
     let token = headers
         .get(IDENTITY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -213,7 +218,7 @@ mod tests {
         fn url_key(&self) -> crate::control::BoxFuture<'_, Result<crate::token::UrlKey, crate::control::Unreachable>> {
             Box::pin(async { Ok(URL_KEY) })
         }
-        fn live_key(&self, key_id: Uuid) -> crate::control::BoxFuture<'_, Result<Option<crate::control::LiveKey>, crate::control::Unreachable>> {
+        fn live_key(&self, key_id: Uuid, _branch: Uuid, _owner: bool) -> crate::control::BoxFuture<'_, Result<Option<crate::control::LiveKey>, crate::control::Unreachable>> {
             let hit = self.live.lock().unwrap().iter().find(|k| k.key_id == key_id).cloned();
             Box::pin(async move { Ok(hit) })
         }

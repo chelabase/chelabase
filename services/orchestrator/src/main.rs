@@ -160,6 +160,12 @@ async fn main() -> anyhow::Result<()> {
         secrets,
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest,
+        // m9: Studio's storage routes, behind storage's own bearer (both ways, as rest's).
+        storage: orchestrator::storage_console::StorageInternal::new(
+            &env_or("CHELABASE_STORAGE_INTERNAL_URL", "http://127.0.0.1:8090"),
+            &internal_config.storage_token,
+        )
+        .map_err(anyhow::Error::msg)?,
         policy: ModePolicy::new(mode),
         operator_tenant,
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),

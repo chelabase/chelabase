@@ -1501,6 +1501,24 @@ where
             return ApiError::internal().into_response();
         }
     }
+    // Object storage m9: a connection budget changed, so every storage replica drops each
+    // branch's connection info and pools at once (the next request reads the new budget).
+    let budget_changed = storage_max_connections.is_some_and(|v| v != record.storage_max_connections)
+        || max_connections.is_some_and(|v| v != record.max_connections);
+    if budget_changed {
+        match state.metadata.list_branches(record.database_id).await {
+            Ok(branches) => {
+                for b in branches {
+                    crate::storage_console::tell_storage(
+                        &state,
+                        chelabase_nats::StorageEvent::Branch { branch_id: b.id.as_uuid() },
+                    )
+                    .await;
+                }
+            }
+            Err(err) => warn!(database_id = %record.database_id, "list branches for storage (its cache lifetime covers it): {err}"),
+        }
+    }
     if window.is_some_and(|w| w != record.history_window) {
         let job = JobEnvelope {
             job_id: Uuid::new_v4(),

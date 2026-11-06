@@ -2095,6 +2095,8 @@ enum FakeReset {
 
 #[derive(Clone, Default)]
 struct FakeJobs {
+    /// Object storage m9: the storage cache events published.
+    storage_events: Arc<Mutex<Vec<chelabase_nats::StorageEvent>>>,
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
     deleted: Arc<Mutex<Vec<DatabaseId>>>,
     resets: Arc<Mutex<Vec<(DatabaseId, BranchId)>>>,
@@ -2223,6 +2225,14 @@ impl JobPort for FakeJobs {
             return Err("nats is down".into());
         }
         self.merge_jobs.lock().unwrap().push(job.payload.clone());
+        Ok(())
+    }
+
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.storage_events.lock().unwrap().push(event.clone());
         Ok(())
     }
 
@@ -2697,6 +2707,19 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
 }
 
 const REST_TOKEN: &str = "rest-internal-token";
+/// m9: storage's console bearer, and where the next app built on this thread sends Studio's
+/// storage routes ([`use_storage`]; nothing listens by default).
+const STORAGE_TOKEN: &str = "storage-internal-token";
+thread_local! {
+    static STORAGE_URL: std::cell::RefCell<String> = std::cell::RefCell::new("http://127.0.0.1:9".into());
+}
+fn storage_url() -> String {
+    STORAGE_URL.with(|u| u.borrow().clone())
+}
+#[allow(dead_code)]
+fn use_storage(url: &str) {
+    STORAGE_URL.with(|u| *u.borrow_mut() = url.to_owned());
+}
 
 async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
     spawn_app_in_mode(metadata, jobs, rest_url, Mode::SelfHosted).await
@@ -2889,6 +2912,11 @@ async fn spawn_app_core_with(
             // The production client (no redirects), so tests see what production sees.
             http: chelabase_http::client_builder().build().unwrap(),
         },
+        storage: orchestrator::storage_console::StorageInternal::new(
+            &storage_url(),
+            STORAGE_TOKEN,
+        )
+        .unwrap(),
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
         operator_tenant,
         proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
