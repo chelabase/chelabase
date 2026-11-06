@@ -73,6 +73,17 @@ impl ClientBuilder {
         Self(self.0.timeout(timeout))
     }
 
+    /// The longest a connection may take to open.
+    pub fn connect_timeout(self, timeout: Duration) -> Self {
+        Self(self.0.connect_timeout(timeout))
+    }
+
+    /// The longest a response may stay silent between reads (no total timeout: a streamed
+    /// body may take long as a whole).
+    pub fn read_timeout(self, timeout: Duration) -> Self {
+        Self(self.0.read_timeout(timeout))
+    }
+
     /// Headers sent on every request.
     pub fn default_headers(self, headers: reqwest::header::HeaderMap) -> Self {
         Self(self.0.default_headers(headers))

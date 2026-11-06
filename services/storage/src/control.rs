@@ -58,7 +58,14 @@ pub struct Unreachable(pub String);
 
 pub trait Control: Send + Sync + 'static {
     fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>>;
-    fn live_key(&self, key_id: Uuid) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>>;
+    /// The key while it is live, for a URL signed on `branch`: a data key, or a member who
+    /// minted the URL from the console while they still have Developer access to the branch's
+    /// database.
+    fn live_key(
+        &self,
+        key_id: Uuid,
+        branch: Uuid,
+    ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>>;
     /// The token's expiry as recorded (an app user's is cut to its session's), or `None` when
     /// the id is taken, the key isn't live, or the app session the claims name isn't.
     fn record_upload<'a>(
@@ -81,7 +88,7 @@ pub trait Control: Send + Sync + 'static {
 pub struct Urls {
     control: Arc<dyn Control>,
     key: tokio::sync::OnceCell<UrlKey>,
-    live: moka::future::Cache<Uuid, Option<LiveKey>>,
+    live: moka::future::Cache<(Uuid, Uuid), Option<LiveKey>>,
 }
 
 impl Urls {
@@ -107,17 +114,23 @@ impl Urls {
             .map_err(|e| unreachable(e, rid))
     }
 
-    /// The key while it is live (cached, a miss asks the control plane).
-    pub async fn live_key(&self, key_id: Uuid, rid: &str) -> Result<Option<LiveKey>, Failure> {
-        if let Some(hit) = self.live.get(&key_id).await {
+    /// The key while it is live for a URL signed on `branch` (cached, a miss asks the control
+    /// plane).
+    pub async fn live_key(
+        &self,
+        key_id: Uuid,
+        branch: Uuid,
+        rid: &str,
+    ) -> Result<Option<LiveKey>, Failure> {
+        if let Some(hit) = self.live.get(&(key_id, branch)).await {
             return Ok(hit);
         }
         let live = self
             .control
-            .live_key(key_id)
+            .live_key(key_id, branch)
             .await
             .map_err(|e| unreachable(e, rid))?;
-        self.live.insert(key_id, live.clone()).await;
+        self.live.insert((key_id, branch), live.clone()).await;
         Ok(live)
     }
 }
@@ -209,9 +222,13 @@ impl Control for Orchestrator {
         })
     }
 
-    fn live_key(&self, key_id: Uuid) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+    fn live_key(
+        &self,
+        key_id: Uuid,
+        branch: Uuid,
+    ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
         Box::pin(async move {
-            let path = format!("/internal/storage/keys/{key_id}");
+            let path = format!("/internal/storage/keys/{key_id}?branch={branch}");
             match self.call("GET", &path, None).await? {
                 (200, v) => parse(v).map(Some),
                 (404, _) => Ok(None),

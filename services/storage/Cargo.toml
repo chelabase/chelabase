@@ -38,6 +38,10 @@ dotenvy = { workspace = true }
 moka = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The console listener's bearer, compared in constant time.
+subtle = { workspace = true }
+# The console listener serves the storage routes at their public paths.
+chelabase-routes = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }
@@ -50,6 +54,4 @@ uuid = { workspace = true }
 proptest = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-pgsession = { workspace = true, features = ["test-support"] }
-# The OpenAPI document's registry test.
-chelabase-routes = { workspace = true }
 reqwest = { workspace = true }

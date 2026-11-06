@@ -1,17 +1,21 @@
 //! Object storage's URL routes (m6), behind storage's bearer: the key its signed URLs are
-//! signed with, whether the key that minted one is still live, and the one-time upload tokens.
+//! signed with, whether the key that minted one is still live (a data key, or the member who
+//! minted it from the console, m9), and the one-time upload tokens.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chelabase_metadata::DataKeyLookup;
+use chelabase_metadata::members::MemberStatus;
+use chelabase_metadata::{BranchKind, BranchStatus, DataKeyLookup};
+use chelabase_types::access::PlatformRole;
+use chelabase_types::{BranchId, ProjectId};
 use chelabase_neon::ComputeLocator;
 use chelabase_secrets::{Purpose, derive_key};
 use chrono::{DateTime, Utc};
@@ -74,17 +78,82 @@ where
     Json(json!({ "kid": URL_KEY_ID, "key": STANDARD.encode(key) })).into_response()
 }
 
-/// The live key with this id (as the gateway's lookup answers it); 404 for anything else.
-async fn live_key<M, L>(State(state): St<M, L>, Path(key_id): Path<Uuid>) -> Response
+/// `?branch=`: the branch the URL was signed on.
+#[derive(Deserialize)]
+struct LiveQuery {
+    branch: Option<Uuid>,
+}
+
+/// The live key with this id (as the gateway's lookup answers it); else, for a URL minted from
+/// the console (m9, the member as its key), the member while [`console_signer_live`] says so,
+/// on `?branch=`; 404 for anything else.
+async fn live_key<M, L>(
+    State(state): St<M, L>,
+    Path(key_id): Path<Uuid>,
+    Query(q): Query<LiveQuery>,
+) -> Response
 where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
     match state.metadata.live_data_key(key_id).await {
-        Ok(Some(key)) => Json(key_json(&key)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => failed("storage key liveness", err),
+        Ok(Some(key)) => return Json(key_json(&key)).into_response(),
+        Ok(None) => {}
+        Err(err) => return failed("storage key liveness", err),
     }
+    let Some(branch) = q.branch else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match console_signer_live(&state, key_id, BranchId(branch)).await {
+        Ok(Some(project)) => Json(json!({
+            "key_id": key_id,
+            "branch_id": branch,
+            "project_id": project,
+            "kind": "secret",
+            "role": "",
+            "databases": null,
+            "role_oid": null,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => failed("console URL liveness", err),
+    }
+}
+
+/// Whether `member` may still use a URL they minted from the console on `branch`: the branch is
+/// a normal one not being deleted, the member is active (not offboarded) in the tenant of the
+/// branch's project, and a tenant admin or holds Developer or above on the branch's database
+/// (their own and team grants, with the database's override). The project when so.
+async fn console_signer_live<M, L>(
+    state: &InternalState<M, L>,
+    member: Uuid,
+    branch: BranchId,
+) -> Result<Option<ProjectId>, chelabase_metadata::MetadataError>
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let Some(b) = state.metadata.get_branch(branch).await? else {
+        return Ok(None);
+    };
+    if b.kind != BranchKind::Normal || matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) {
+        return Ok(None);
+    }
+    let Some(project) = state.metadata.database_project(b.database_id).await? else {
+        return Ok(None);
+    };
+    let Some(p) = state.metadata.project_by_id(project).await? else {
+        return Ok(None);
+    };
+    let Some((m, sources)) = state.metadata.member_access(member, project, b.database_id).await? else {
+        return Ok(None);
+    };
+    let active = m.status == MemberStatus::Active && !m.offboarded && m.tenant_id == p.tenant_id;
+    let developer = m.tenant_admin
+        || sources
+            .effective()
+            .is_some_and(|e| e.platform_role >= PlatformRole::Developer);
+    Ok((active && developer).then_some(project))
 }
 
 #[derive(Deserialize)]

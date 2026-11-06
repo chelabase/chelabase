@@ -105,6 +105,8 @@ struct FakeNeon {
     /// Object storage m6: upload tokens by id (key id, claims, spent); the SQL's own rules are
     /// tested live (`live_db::storage_upload_tokens_*`).
     upload_tokens: Arc<Mutex<UploadTokens>>,
+    /// Object storage m9: members by id with their access sources (one project each here).
+    members: Arc<Mutex<Vec<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>>>,
 }
 
 /// The fake's fresh-install claim rows: a model of `claim_setup`'s rules (the real ones are
@@ -828,6 +830,16 @@ impl NeonMetadataPort for FakeNeon {
     async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
         self.check()?;
         Ok(self.app.lock().unwrap().db_projects.get(&db).copied())
+    }
+
+    async fn member_access(
+        &self,
+        member: uuid::Uuid,
+        _project: ProjectId,
+        _database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        self.check()?;
+        Ok(self.members.lock().unwrap().iter().find(|(m, _)| m.id == member).cloned())
     }
 
     async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -2345,6 +2357,78 @@ async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
     assert_eq!(body["key"]["key_id"], json!(key_id));
     assert_eq!(body["claims"], json!({ "sub": "u1" }));
     assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+}
+
+/// Object storage m9: a URL minted from the console names the member as its key. It is live,
+/// for the branch the URL was signed on, while the member is active in the database's tenant
+/// with Developer access (own grant or tenant admin) and the branch is a normal one not being
+/// deleted; a Viewer, a suspended, removed or offboarded member, another tenant's, a deleted
+/// branch or no branch at all is 404.
+#[tokio::test]
+async fn a_console_url_lives_while_its_member_has_developer_access() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    let gone = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+        rows.branches.push(branch_record(gone, db, None, BranchKind::Normal, BranchStatus::Deleting, Some("ep-2")));
+    }
+    let member = |tenant: TenantId, status: MemberStatus, admin: bool, offboarded: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status,
+        accepted_at: None,
+        offboarded,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let grant = |role: PlatformRole| GrantSources::new(Some(Grant { platform_role: role, roles: RoleSet::all() }), Vec::new(), None);
+    let none = GrantSources::new(None, Vec::new(), None);
+    let cases = [
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Developer), true),
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Admin), true),
+        (member(tenant, MemberStatus::Active, true, false), none.clone(), true),
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Viewer), false),
+        (member(tenant, MemberStatus::Active, false, false), none.clone(), false),
+        (member(tenant, MemberStatus::Suspended, false, false), grant(PlatformRole::Developer), false),
+        (member(tenant, MemberStatus::Removed, true, false), grant(PlatformRole::Admin), false),
+        (member(tenant, MemberStatus::Active, true, true), grant(PlatformRole::Admin), false),
+        (member(TenantId::new(), MemberStatus::Active, true, false), grant(PlatformRole::Admin), false),
+    ];
+    for (i, (m, sources, live)) in cases.into_iter().enumerate() {
+        let id = m.id;
+        neon.members.lock().unwrap().push((m, sources));
+        let path = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+        if live {
+            assert_eq!(code, 200, "case {i}: {body}");
+            assert_eq!(body["key_id"], json!(id));
+            assert_eq!(body["branch_id"], json!(branch.as_uuid()));
+            assert_eq!(body["databases"], Value::Null);
+            // Not on a branch being deleted, nor without a branch.
+            let on_gone = format!("/internal/storage/keys/{id}?branch={}", gone.as_uuid());
+            assert_eq!(app.get(&on_gone, Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
+            assert_eq!(app.get(&format!("/internal/storage/keys/{id}"), Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
+            for bearer in [None, Some(REST_TOKEN)] {
+                assert_eq!(app.get(&path, bearer).await.0, 401, "case {i}");
+            }
+        } else {
+            assert_eq!(code, 404, "case {i}: {body}");
+        }
+    }
 }
 
 /// Object storage m6 fix (B1, S3): an app user's upload token (its claims carry the session's

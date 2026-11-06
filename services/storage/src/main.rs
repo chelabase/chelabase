@@ -47,10 +47,15 @@ async fn main() -> anyhow::Result<()> {
             .with_body_idle(config.body_idle),
     });
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    let internal = tokio::net::TcpListener::bind(config.internal_addr).await?;
     info!(
-        "storage listening on {} (bucket {})",
-        config.addr, config.store.bucket
+        "storage listening on {} and {} for the console (bucket {})",
+        config.addr, config.internal_addr, config.store.bucket
     );
-    axum::serve(listener, router(state)).await?;
+    let console = storage::internal::internal_router(state.clone(), &config.internal_token);
+    tokio::try_join!(
+        async { axum::serve(listener, router(state)).await },
+        async { axum::serve(internal, console).await },
+    )?;
     Ok(())
 }

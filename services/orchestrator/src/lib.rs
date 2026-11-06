@@ -56,6 +56,7 @@ pub mod projects;
 mod protection;
 mod roles;
 pub mod sql_editor;
+pub mod storage_console;
 mod privileges;
 mod table_api;
 mod teams;
@@ -1781,6 +1782,8 @@ pub struct AppState<M, J> {
     pub proxy: ProxyAddress,
     /// The REST service's internal listener (the data API's schema).
     pub rest: RestInternal,
+    /// The storage service's console listener (m9: Studio's storage routes).
+    pub storage: storage_console::StorageInternal,
     /// Every self-hosted/platform decision (the dev CA path is revealed only self-hosted).
     pub policy: ModePolicy,
     /// `CHELABASE_OPERATOR_TENANT_ID` (#119): in platform mode, members of this tenant who come
@@ -2496,6 +2499,7 @@ where
         .merge(data_api_databases::routes())
         .merge(data_api_types::routes())
         .merge(console::routes())
+        .merge(storage_console::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())
         .merge(privileges::routes())
