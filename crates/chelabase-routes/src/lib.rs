@@ -1085,11 +1085,11 @@ pub mod orchestrator {
         Access::ActAs(Viewer),
     );
 
-    /// A management route callable from Studio.
-    /// m9: Studio's storage on a branch, as an Act-as role (never the owner), proxied to the
-    /// storage service's console listener. Reads and listing act as a role held at Viewer;
-    /// writes, a signed URL and a resumable upload's steps need the role at Developer. They
-    /// stream ([`super::Transfer::Stream`]).
+    /// m9: Studio's storage on a branch, proxied to the storage service's console listener, as
+    /// an Act-as role or, with no role (or `owner`), in owner mode, which needs Admin on the
+    /// database. Reads and listing act as a role held at Viewer; writes, a signed URL and a
+    /// resumable upload's steps need the role at Developer. They stream
+    /// ([`super::Transfer::Stream`]).
     pub const STORAGE_PREFIX: &str = "orchestrator.storage_";
     const ST_BUCKETS: &str = "/v1/databases/{id}/branches/{branch_id}/storage/bucket";
     const ST_BUCKET: &str = "/v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}";
@@ -1165,6 +1165,7 @@ pub mod orchestrator {
     pub const STORAGE_ABORT_UPLOAD: Endpoint =
         key_endpoint("orchestrator.storage_abort_upload", Method::Delete, ST_SESSION, Access::ActAs(Developer));
 
+    /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
             name,
