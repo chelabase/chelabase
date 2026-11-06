@@ -2104,6 +2104,11 @@ async fn storage_api_app_user_live() {
 impl Fx {
     /// An app-user access token for `user` in this project, with a live session.
     async fn user_token(&self, user: Uuid) -> String {
+        self.user_session(user, chrono::Duration::hours(1)).await.0
+    }
+
+    /// [`Fx::user_token`] with a session that lives `life`: the token and the session's id.
+    async fn user_session(&self, user: Uuid, life: chrono::Duration) -> (String, Uuid) {
         use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
         let sid = Uuid::new_v4();
         let now = chrono::Utc::now();
@@ -2116,7 +2121,7 @@ impl Fx {
                 user_id: user,
                 zitadel_session_id: "storage-live",
                 refresh_hash: hash,
-                expires_at: now + chrono::Duration::hours(1),
+                expires_at: now + life,
             })
             .await
             .expect("insert the app session");
@@ -2137,6 +2142,7 @@ impl Fx {
                 iat,
                 exp: iat + 600,
             })
+            .map(|token| (token, sid))
             .expect("sign the app token")
     }
 }
@@ -2706,12 +2712,15 @@ async fn storage_urls(fx: &Fx) {
     assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment;"), "{h:?}");
     assert_eq!(h["content-security-policy"], "sandbox");
 
-    // AC 4: overwritten, the old URL still serves the old version; deleted, it is 404.
+    // AC 4 (decided after the audit): a URL serves only the version it was signed for while
+    // it is current; overwritten, it is 404 (a fresh URL serves the new version); deleted, 404.
     put("files/docs/a b.txt", b"v2", "text/plain", true).await;
-    assert_eq!(&keyless("GET", &url, None).await.2[..], b"v1");
+    assert_eq!(keyless("GET", &url, None).await.0, 404);
+    let (_, fresh) = mint("sign", "files/docs/a b.txt", &secret, 60).await;
+    assert_eq!(&keyless("GET", &fresh, None).await.2[..], b"v2");
     let (status, _, _) = object("DELETE", "/storage/v1/object/files/docs/a%20b.txt", &secret, None, &[]).await;
     assert_eq!(status, 204);
-    assert_eq!(keyless("GET", &url, None).await.0, 404);
+    assert_eq!(keyless("GET", &fresh, None).await.0, 404);
 
     // AC 5: a private bucket's public path is 404; a public one serves with Cache-Control.
     let public = |path: &str| format!("/storage/v1/object/public/{}/{path}", fx.main);
@@ -2746,6 +2755,173 @@ async fn storage_urls(fx: &Fx) {
     assert!(status == 200 || status == 204, "revoke: {status} {body}");
     assert_eq!(keyless("GET", &durl, None).await.0, 403);
     assert_eq!(keyless("PUT", &dup, Some(b"x".to_vec())).await.0, 403);
+}
+
+// --- m6 fix round (the audit's findings) ----------------------------------------------------
+
+/// [`keyless`] with request headers.
+async fn keyless_with(method: &str, url: &str, body: Vec<u8>, headers: &[(&str, &str)]) -> (u16, Value) {
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{url}", gateway()))
+        .timeout(Duration::from_secs(60))
+        .body(body);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = req.send().await.expect("the gateway answers");
+    let status = res.status().as_u16();
+    (status, serde_json::from_slice(&res.bytes().await.unwrap_or_default()).unwrap_or(Value::Null))
+}
+
+/// `POST /storage/v1/object/{route}/{path}` with `body` and `headers`: `(status, the answer)`.
+async fn mint_with(route: &str, path: &str, key: &str, body: Value, headers: &[(&str, &str)]) -> (u16, Value) {
+    let mut all = vec![JSON];
+    all.extend_from_slice(headers);
+    let body = serde_json::to_vec(&body).unwrap();
+    let (status, _, b) = object("POST", &format!("/storage/v1/object/{route}/{path}"), key, Some(body.into()), &all).await;
+    (status, json_of(&b))
+}
+
+/// B1, S3: an app user's upload URL uploads as `authenticated` with the user's claims (the
+/// owner policy passes), lives no longer than the session, and dies with the session.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_app_user_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
+        let public = fx.public_key().await;
+        let user = Uuid::new_v4();
+        let (token, sid) = fx.user_session(user, chrono::Duration::minutes(10)).await;
+        let headers = [("chelabase-user", token.as_str())];
+        // B1: the keyless PUT runs as the user (the key's own role, anon, has no policy).
+        let (status, up) = mint_with("upload/sign", "files/mine.txt", &public, json!({ "expires_in": 3600 }), &headers).await;
+        assert_eq!(status, 200, "{up}");
+        // S3: no longer than the session's 10 minutes.
+        let exp = up["expires_at"].as_i64().unwrap();
+        assert!(exp <= chrono::Utc::now().timestamp() + 600, "{up}");
+        let (status, b) = keyless_with("PUT", up["signed_url"].as_str().unwrap(), b"mine".to_vec(), &[]).await;
+        assert_eq!(status, 200, "{b}");
+        assert_eq!(fx.value("SELECT owner FROM storage.objects WHERE name = 'mine.txt'").await, user.to_string());
+        // S3: the session is revoked, so its unused upload URL fails.
+        let (status, up) = mint_with("upload/sign", "files/later.txt", &public, json!({ "expires_in": 60 }), &headers).await;
+        assert_eq!(status, 200, "{up}");
+        assert!(fx.metadata.revoke_app_session(sid, fx.project).await.unwrap().is_some());
+        let (status, b) = keyless_with("PUT", up["signed_url"].as_str().unwrap(), b"later".to_vec(), &[]).await;
+        assert_eq!((status, b["error"]["code"].clone()), (403, json!("token_not_valid")), "{b}");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects WHERE name = 'later.txt'").await, "0");
+    }))
+    .await;
+}
+
+/// B2: a signed URL serves its version only while it is current: deleted then re-created
+/// under the same name, it stays 404.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_recreated_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        let up = |body: &'static [u8]| {
+            let secret = secret.clone();
+            async move {
+                let (status, _, b) = object("POST", "/storage/v1/object/files/s.txt", &secret, Some(body.to_vec().into()), &[("content-type", "text/plain")]).await;
+                assert_eq!(status, 200, "{}", json_of(&b));
+            }
+        };
+        up(b"SECRET-v1").await;
+        let (status, url) = mint("sign", "files/s.txt", &secret, 600).await;
+        assert_eq!(status, 200, "{url}");
+        assert_eq!(&keyless("GET", &url, None).await.2[..], b"SECRET-v1");
+        assert_eq!(object("DELETE", "/storage/v1/object/files/s.txt", &secret, None, &[]).await.0, 204);
+        up(b"public-v2").await;
+        let (status, _, b) = keyless("GET", &url, None).await;
+        assert_eq!(status, 404, "the deleted version revived: {:?}", String::from_utf8_lossy(&b));
+    }))
+    .await;
+}
+
+/// B5 (AC 6b): deleted on its branch while a child branch still holds the row and blob, the
+/// URL is 404; the child still serves its copy.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_child_branch_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/k.txt", &secret, Some(b"kept".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, url) = mint("sign", "files/k.txt", &secret, 600).await;
+        assert_eq!(status, 200, "{url}");
+        let (child, _) = fx.child("urls-child").await;
+        assert_eq!(object("DELETE", "/storage/v1/object/files/k.txt", &secret, None, &[]).await.0, 204);
+        assert_eq!(keyless("GET", &url, None).await.0, 404);
+        let (status, body) = api("POST", &format!("/v1/databases/{}/branches/{child}/keys", fx.id), Some(json!({ "name": "urls-child", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let ck = body["key"].as_str().unwrap().to_string();
+        let (status, _, got) = object("GET", "/storage/v1/object/files/k.txt", &ck, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"kept"[..]), "the child's copy");
+        // A URL minted on the child serves its copy.
+        let (status, child_url) = mint("sign", "files/k.txt", &ck, 600).await;
+        assert_eq!(status, 200, "{child_url}");
+        assert_eq!(&keyless("GET", &child_url, None).await.2[..], b"kept");
+    }))
+    .await;
+}
+
+/// B3: a Content-Type a browser would read as another type (a comma list) is refused at
+/// every upload: a direct upload, a resumable upload and an upload URL.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_content_type_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        for ct in ["text/plain;a=b,text/html", "image/png;x=1, text/html", "text/plain; charset=\"utf-8\""] {
+            let (status, _, b) = object("POST", "/storage/v1/object/files/c.txt", &secret, Some(b"<script>1</script>".to_vec().into()), &[("content-type", ct)]).await;
+            assert_eq!(status, 400, "{ct}: {}", json_of(&b));
+            assert_eq!(open_upload(&secret, "files", "c.txt", ct, &[]).await.0, 400, "{ct}");
+            let (status, up) = mint("upload/sign", "files/c.txt", &secret, 60).await;
+            assert_eq!(status, 200, "{up}");
+            assert_eq!(keyless_with("PUT", &up, b"<script>1</script>".to_vec(), &[("content-type", ct)]).await.0, 400, "{ct}");
+        }
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        // A plain type with a charset still uploads and serves inline as its essence.
+        let (status, _, b) = object("POST", "/storage/v1/object/files/ok.txt", &secret, Some(b"ok".to_vec().into()), &[("content-type", "Text/Plain; Charset=UTF-8; x=y")]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, url) = mint("sign", "files/ok.txt", &secret, 60).await;
+        assert_eq!(status, 200, "{url}");
+        let (status, h, _) = keyless("GET", &url, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(h["content-type"], "text/plain; charset=utf-8");
+        assert_eq!(h["content-disposition"], "inline");
+    }))
+    .await;
+}
+
+/// S1: whether an upload URL may overwrite is the minter's choice, bound into the token; the
+/// uploader's `x-upsert` or `?upsert=` doesn't change it.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_upsert_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/u.txt", &secret, Some(b"original".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, up) = mint("upload/sign", "files/u.txt", &secret, 60).await;
+        assert_eq!(status, 200, "{up}");
+        let (status, b) = keyless_with("PUT", &format!("{up}&upsert=true"), b"overwritten".to_vec(), &[("x-upsert", "true")]).await;
+        assert_eq!(status, 409, "{b}");
+        assert_eq!(&object("GET", "/storage/v1/object/files/u.txt", &secret, None, &[]).await.2[..], b"original");
+        // Minted with upsert, the URL overwrites.
+        let (status, up) = mint_with("upload/sign", "files/u.txt", &secret, json!({ "expires_in": 60, "upsert": true }), &[]).await;
+        assert_eq!(status, 200, "{up}");
+        let (status, b) = keyless_with("PUT", up["signed_url"].as_str().unwrap(), b"replaced".to_vec(), &[]).await;
+        assert_eq!(status, 200, "{b}");
+        assert_eq!(&object("GET", "/storage/v1/object/files/u.txt", &secret, None, &[]).await.2[..], b"replaced");
+    }))
+    .await;
 }
 
 // --- m7: resumable uploads and bucket limits ------------------------------------------------

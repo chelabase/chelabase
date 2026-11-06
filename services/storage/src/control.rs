@@ -59,15 +59,17 @@ pub struct Unreachable(pub String);
 pub trait Control: Send + Sync + 'static {
     fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>>;
     fn live_key(&self, key_id: Uuid) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>>;
-    /// False when the id is taken or the key isn't live.
+    /// The token's expiry as recorded (an app user's is cut to its session's), or `None` when
+    /// the id is taken, the key isn't live, or the app session the claims name isn't.
     fn record_upload<'a>(
         &'a self,
         token_id: Uuid,
         key_id: Uuid,
         claims: &'a Value,
         expires_at: u64,
-    ) -> BoxFuture<'a, Result<bool, Unreachable>>;
-    /// The key as it is now and the minting claims, once; `None` after (or a dead key).
+    ) -> BoxFuture<'a, Result<Option<u64>, Unreachable>>;
+    /// The key as it is now and the minting claims, once; `None` after (or a dead key, or an
+    /// app session no longer live).
     fn consume_upload(
         &self,
         token_id: Uuid,
@@ -224,15 +226,20 @@ impl Control for Orchestrator {
         key_id: Uuid,
         claims: &'a Value,
         expires_at: u64,
-    ) -> BoxFuture<'a, Result<bool, Unreachable>> {
+    ) -> BoxFuture<'a, Result<Option<u64>, Unreachable>> {
         Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Recorded {
+                expires_at: u64,
+            }
             let expires = chrono::DateTime::<chrono::Utc>::from_timestamp(expires_at as i64, 0)
                 .ok_or_else(|| Unreachable("an expiry out of range".into()))?;
             let path = "/internal/storage/upload-tokens";
             let body = json!({ "token_id": token_id, "key_id": key_id, "claims": claims, "expires_at": expires });
             match self.call("POST", path, Some(body)).await? {
-                (204, _) => Ok(true),
-                (409, _) => Ok(false),
+                // Never later than asked, whatever the answer says.
+                (200, v) => parse::<Recorded>(v).map(|r| Some(r.expires_at.min(expires_at))),
+                (409, _) => Ok(None),
                 (code, _) => Err(status(path, code)),
             }
         })

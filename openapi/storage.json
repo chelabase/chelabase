@@ -749,15 +749,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "upsert",
-            "in": "query",
-            "description": "Replace an existing object (an upload URL).",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -797,7 +788,7 @@
             }
           },
           "404": {
-            "description": "`object_not_found`: deleted since",
+            "description": "`object_not_found`: overwritten or deleted since (the signed version is no longer current)",
             "content": {
               "application/json": {
                 "schema": {
@@ -813,7 +804,7 @@
           "storage"
         ],
         "summary": "Create a signed download URL",
-        "description": "The caller must be able to read the object (row level security). The URL serves the object's current version without a key until it expires, the object is deleted or the key is revoked.",
+        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. Sign again to link to a new version.",
         "operationId": "signObject",
         "parameters": [
           {
@@ -923,7 +914,7 @@
           "storage"
         ],
         "summary": "Upload through a one-time URL",
-        "description": "No key: the token is the credential, once. Streams the body as an upload by the URL's minter.",
+        "description": "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters.",
         "operationId": "signedUpload",
         "parameters": [
           {
@@ -959,15 +950,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "upsert",
-            "in": "query",
-            "description": "Replace an existing object (an upload URL).",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "requestBody": {
@@ -994,6 +976,16 @@
               }
             }
           },
+          "400": {
+            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "401": {
             "description": "`invalid_token`, `token_expired`",
             "content": {
@@ -1005,7 +997,7 @@
             }
           },
           "403": {
-            "description": "`token_not_valid`: used already, another object's, or its key was revoked; `not_allowed`",
+            "description": "`token_not_valid`: used already, another object's, its key was revoked or its role changed, or the app user's session ended; `not_allowed`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1051,7 +1043,7 @@
           "storage"
         ],
         "summary": "Create a one-time upload URL",
-        "description": "The caller must be able to see the bucket. The URL takes one upload (`PUT`) without a key, as the caller: row level security decides then.",
+        "description": "The caller must be able to see the bucket. The URL takes one upload (`PUT`) without a key, as the caller (its role and claims): row level security decides then. Whether it may replace an existing object is fixed here (`upsert`). An app user's URL never outlives the user's session and fails once the session ends.",
         "operationId": "signUpload",
         "parameters": [
           {
@@ -1102,7 +1094,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SignBody"
+                "$ref": "#/components/schemas/SignUploadBody"
               }
             }
           },
@@ -2390,6 +2382,30 @@
             ],
             "format": "int64",
             "description": "Seconds, 1 to 604800 (7 days); default 3600.",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "SignUploadBody": {
+        "type": "object",
+        "description": "An upload URL's lifetime, and whether its upload may replace an existing object.",
+        "properties": {
+          "expires_in": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds, 1 to 604800 (7 days); default 3600. An app user's URL never outlives the\nuser's session.",
+            "default": null
+          },
+          "upsert": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The upload may replace an existing object (also `?upsert=true` or `x-upsert: true` on\nthis request). Fixed here: the uploader can't change it.",
             "default": null
           }
         },

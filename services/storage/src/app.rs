@@ -218,9 +218,9 @@ mod tests {
             let hit = self.live.lock().unwrap().iter().find(|k| k.key_id == key_id).cloned();
             Box::pin(async move { Ok(hit) })
         }
-        fn record_upload<'a>(&'a self, token_id: Uuid, key_id: Uuid, claims: &'a serde_json::Value, _: u64) -> crate::control::BoxFuture<'a, Result<bool, crate::control::Unreachable>> {
+        fn record_upload<'a>(&'a self, token_id: Uuid, key_id: Uuid, claims: &'a serde_json::Value, exp: u64) -> crate::control::BoxFuture<'a, Result<Option<u64>, crate::control::Unreachable>> {
             let ok = self.uploads.lock().unwrap().insert(token_id, (key_id, claims.clone(), false)).is_none();
-            Box::pin(async move { Ok(ok) })
+            Box::pin(async move { Ok(ok.then_some(exp)) })
         }
         fn consume_upload(&self, token_id: Uuid) -> crate::control::BoxFuture<'_, Result<Option<(crate::control::LiveKey, serde_json::Value)>, crate::control::Unreachable>> {
             let mut uploads = self.uploads.lock().unwrap();
@@ -419,6 +419,10 @@ mod tests {
             size: Some(1),
             etag: Some("e".into()),
             content_type: Some("text/html".into()),
+            role: None,
+            role_oid: None,
+            session_id: None,
+            upsert: false,
             token_id: Uuid::new_v4(),
             exp,
         }
@@ -485,6 +489,7 @@ mod tests {
             size: None,
             etag: None,
             content_type: None,
+            role: Some(data.role.clone()),
             token_id,
             ..download_claims(&data, now + 60)
         };
@@ -507,6 +512,62 @@ mod tests {
             let (status, _, json) = call(&base, &key, "POST", &format!("/storage/v1/object/{route}/b/a.txt"), body).await;
             assert_eq!(status, 400, "{route}: {json}");
         }
+    }
+
+    /// AC 1, 4, 6 over `MemoryStore` (m6 audit B2, B5): a download token serves its version
+    /// while it is the name's current one; overwritten, deleted, re-created under the same
+    /// name, deleted on its branch while another branch still holds the blob, or its database
+    /// re-created: 404, though the blob is still in the store. (Which version is current is
+    /// storage's own read on the branch: `SIGNED_ROW`.)
+    #[tokio::test]
+    async fn a_signed_download_serves_only_its_current_version() {
+        use chelabase_storage::{ObjectStore, PutOptions};
+        let store = Arc::new(chelabase_storage::MemoryStore::default());
+        let (_, public) = generate_keypair_pem();
+        let state = AppState {
+            engine: Engine::new(Pools::new(RefusedSource, 1), RefusedSource),
+            verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
+            store: store.clone(),
+            urls: Urls::new(Arc::new(FakeControl::default())),
+            inflight: crate::limits::InFlight::new(1 << 20),
+        };
+        let claims = download_claims(&data(), crate::signed::now() + 60);
+        let (datoid, version) = (claims.datoid.unwrap(), claims.version_id.unwrap());
+        let database_id = claims.database_id;
+        let key = crate::names::version_key(&crate::names::object_prefix(database_id, datoid), version);
+        store
+            .put(&key, bytes::Bytes::from_static(b"SECRET-v1"), PutOptions { content_type: None, if_none_match: false })
+            .await
+            .unwrap();
+        let found = crate::objects::Found {
+            datoid,
+            version,
+            size: 9,
+            etag: "e".into(),
+            content_type: "text/plain".into(),
+            owner: None,
+        };
+        // AC 1: current, it serves the bytes, sandboxed.
+        crate::signed::still_current(&claims, Some(datoid), Some(version)).unwrap();
+        let out = crate::objects::serve(&state, &HeaderMap::new(), database_id, &found, "a.txt", None, "r").await.unwrap();
+        assert_eq!(out.status(), 200);
+        assert_eq!(out.headers()["content-security-policy"], "sandbox");
+        let body = axum::body::to_bytes(out.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&body[..], b"SECRET-v1");
+        // AC 4, 6b: the blob stays (another branch may name it), but the URL doesn't open it.
+        for (oid, current) in [
+            (Some(datoid), Some(Uuid::new_v4())), // overwritten, or deleted and re-created
+            (Some(datoid), None),                 // deleted on its branch
+            (Some(datoid + 1), Some(version)),    // the database re-created
+            (None, Some(version)),
+        ] {
+            let err = crate::signed::still_current(&claims, oid, current).unwrap_err();
+            assert_eq!((err.0.status.as_u16(), err.0.code), (404, "object_not_found"), "{oid:?} {current:?}");
+        }
+        assert!(store.head(&key).await.is_ok());
+        // A token without a version (not a download's) never matches.
+        let upload = crate::token::Claims { version_id: None, ..claims.clone() };
+        assert!(crate::signed::still_current(&upload, Some(datoid), None).is_err());
     }
 
     /// The orchestrator says the branch doesn't exist.

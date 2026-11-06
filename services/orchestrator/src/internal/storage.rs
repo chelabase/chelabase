@@ -96,34 +96,94 @@ struct NewToken {
     expires_at: DateTime<Utc>,
 }
 
-/// Records a minted upload token: 204, or 409 when its id is taken or its key isn't live.
+/// Why an upload token's app session doesn't let it through.
+enum NotLive {
+    /// Not live, not the key's project's, or not a session id.
+    Refused,
+    /// The metadata store failed (logged).
+    Failed,
+}
+
+/// The app session an upload token's claims name (`sid`, an app user's token), if any: its
+/// expiry while it is live and in the key's project.
+async fn session_of<M, L>(
+    state: &InternalState<M, L>,
+    claims: &Value,
+    key_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, NotLive>
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let Some(sid) = claims.get("sid") else {
+        return Ok(None);
+    };
+    let sid: Uuid = sid
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or(NotLive::Refused)?;
+    let key = match state.metadata.live_data_key(key_id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return Err(NotLive::Refused),
+        Err(err) => {
+            error!("storage key liveness: {err}");
+            return Err(NotLive::Failed);
+        }
+    };
+    match state.metadata.app_session(sid).await {
+        Ok(Some(s))
+            if s.revoked_at.is_none()
+                && s.expires_at > Utc::now()
+                && s.project_id == key.project_id =>
+        {
+            Ok(Some(s.expires_at))
+        }
+        Ok(_) => Err(NotLive::Refused),
+        Err(err) => {
+            error!("an upload token's app session: {err}");
+            Err(NotLive::Failed)
+        }
+    }
+}
+
+/// Records a minted upload token: `{"expires_at"}` (seconds since the epoch), or 409 when its
+/// id is taken or its key isn't live. An app user's token (its claims carry the session's
+/// `sid`) needs that session live and in the key's project, and never outlives it: its expiry
+/// is cut to the session's.
 async fn insert_token<M, L>(State(state): St<M, L>, Json(t): Json<NewToken>) -> Response
 where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
+    let expires_at = match session_of(&state, &t.claims, t.key_id).await {
+        Ok(session) => session.map_or(t.expires_at, |s| s.min(t.expires_at)),
+        Err(NotLive::Refused) => return StatusCode::CONFLICT.into_response(),
+        Err(NotLive::Failed) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     match state
         .metadata
-        .insert_upload_token(t.token_id, t.key_id, &t.claims, t.expires_at)
+        .insert_upload_token(t.token_id, t.key_id, &t.claims, expires_at)
         .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => Json(json!({ "expires_at": expires_at.timestamp() })).into_response(),
         Ok(false) => StatusCode::CONFLICT.into_response(),
         Err(err) => failed("recording an upload token", err),
     }
 }
 
 /// Spends an upload token: `{"key", "claims"}` (the key as it is now) once; 404 after, or for
-/// an unknown or expired token or a dead key.
+/// an unknown or expired token, a dead key, or an app user's session no longer live.
 async fn consume_token<M, L>(State(state): St<M, L>, Path(token_id): Path<Uuid>) -> Response
 where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
     match state.metadata.consume_upload_token(token_id).await {
-        Ok(Some((key, claims))) => {
-            Json(json!({ "key": key_json(&key), "claims": claims })).into_response()
-        }
+        Ok(Some((key, claims))) => match session_of(&state, &claims, key.key_id).await {
+            Ok(_) => Json(json!({ "key": key_json(&key), "claims": claims })).into_response(),
+            Err(NotLive::Refused) => StatusCode::NOT_FOUND.into_response(),
+            Err(NotLive::Failed) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => failed("spending an upload token", err),
     }

@@ -530,6 +530,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         version: Uuid::new_v4(),
         datoid: 0,
     };
+    names::check_content_type(&row.content_type)?;
     limits.check_declared(&row.content_type)?;
     let (expected, datoid) = state.precheck(&data, &at, &row, upsert, &rid).await?;
     row.datoid = datoid;
@@ -693,10 +694,12 @@ fn object_headers(found: &Found, name: &str, download: Option<&str>) -> HeaderMa
         }
     };
     set(&mut h, header::ETAG, names::quoted_etag(&found.etag));
-    set(&mut h, header::CONTENT_TYPE, found.content_type.clone());
+    // Only the parsed essence (a browser takes a list's last type), never the stored text.
+    let content_type = names::served_content_type(&found.content_type);
+    set(&mut h, header::CONTENT_TYPE, content_type.clone());
     // Inline only for a safe type without `?download`; anything else is an attachment.
     let disposition = match download {
-        None if names::inline_safe(&found.content_type) => None,
+        None if names::inline_safe(&content_type) => None,
         other => Some(other.unwrap_or("")),
     };
     set(

@@ -54,6 +54,19 @@ pub struct Claims {
     pub etag: Option<String>,
     #[serde(rename = "ct", default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// An upload's minting identity: the role it ran as and that role's OID (a secret key's),
+    /// and the app session behind it (an app user's, `authenticated`). The upload runs as that
+    /// role; a key's role must still be the key's, a session must still be live.
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(rename = "ro", default, skip_serializing_if = "Option::is_none")]
+    pub role_oid: Option<i64>,
+    #[serde(rename = "sid", default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    /// Whether an upload may replace an existing object: the minter's choice, not the
+    /// uploader's.
+    #[serde(rename = "u", default, skip_serializing_if = "std::ops::Not::not")]
+    pub upsert: bool,
     /// Unique per token (an upload's one-time nonce).
     #[serde(rename = "t")]
     pub token_id: Uuid,
@@ -170,6 +183,10 @@ mod tests {
             size: Some(10),
             etag: Some("e1".into()),
             content_type: Some("image/png".into()),
+            role: Some("authenticated".into()),
+            role_oid: Some(16385),
+            session_id: Some(Uuid::new_v4()),
+            upsert: false,
             token_id: Uuid::new_v4(),
             exp: 2_000,
         }
@@ -226,6 +243,11 @@ mod tests {
         each(&|t| t.size = Some(11));
         each(&|t| t.etag = Some("e2".into()));
         each(&|t| t.content_type = Some("text/html".into()));
+        each(&|t| t.role = Some("service_role".into()));
+        each(&|t| t.role = None);
+        each(&|t| t.role_oid = Some(10));
+        each(&|t| t.session_id = None);
+        each(&|t| t.upsert = true);
         each(&|t| t.token_id = Uuid::new_v4());
         each(&|t| t.exp = 9_999);
         for t in &tampered {

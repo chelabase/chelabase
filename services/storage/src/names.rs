@@ -126,21 +126,55 @@ pub fn inline_safe(content_type: &str) -> bool {
 /// whitespace inside a part). Its lower-case essence and its parameters (names lower case),
 /// or `None`. A browser reads a comma-separated list's last type, so a `,` is never valid.
 pub fn parse_content_type(content_type: &str) -> Option<(String, Vec<(String, String)>)> {
-    let _ = content_type;
-    None
+    // RFC 9110's `tchar`: no separator (`,` `;` `"` `/` `=` space …), no control character.
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    // Optional whitespace around `;` only (space or tab).
+    fn ows(s: &str) -> &str {
+        s.trim_matches([' ', '\t'])
+    }
+    let mut parts = content_type.split(';');
+    let (kind, sub) = ows(parts.next()?).split_once('/')?;
+    if !token(kind) || !token(sub) {
+        return None;
+    }
+    let essence = format!("{kind}/{sub}").to_ascii_lowercase();
+    let params = parts
+        .map(|p| {
+            let (name, value) = ows(p).split_once('=')?;
+            (token(name) && token(value)).then(|| (name.to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((essence, params))
 }
 
 /// What a download says its Content-Type is: the essence [`inline_safe`] judged, plus a
 /// validated `charset` for `text/plain` only; never the stored text. Anything that doesn't
 /// parse is `application/octet-stream`.
 pub fn served_content_type(stored: &str) -> String {
-    stored.to_owned()
+    let Some((essence, params)) = parse_content_type(stored) else {
+        return "application/octet-stream".into();
+    };
+    // The first `charset`, as a browser reads it.
+    match params.iter().find(|(name, _)| name == "charset") {
+        Some((_, charset)) if essence == "text/plain" => {
+            format!("text/plain; charset={}", charset.to_ascii_lowercase())
+        }
+        _ => essence,
+    }
 }
 
 /// 400 unless an upload's declared Content-Type parses ([`parse_content_type`]).
 pub fn check_content_type(content_type: &str) -> Result<(), Failure> {
-    let _ = content_type;
-    Ok(())
+    match parse_content_type(content_type) {
+        Some(_) => Ok(()),
+        None => Err(Failure::invalid_request(
+            "Content-Type must be one type/subtype with unquoted name=value parameters",
+        )),
+    }
 }
 
 /// A name or bucket as URL path segments: each `/`-separated segment percent-encoded (all but
