@@ -31,6 +31,7 @@
 //! the flag, so no route can forget it.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::Json;
 use axum::body::Body;
@@ -39,7 +40,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chelabase_auth::internal::DataIdentity;
-use futures_util::StreamExt;
 use chelabase_pgsession::service::Type;
 use chelabase_pgsession::{ConnSource, NamedStatement, named_statement};
 use chelabase_query::QueryFailure;
@@ -53,7 +53,7 @@ use crate::app::{AppState, identity};
 use crate::buckets::body;
 use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
-use crate::limits::{Limits, SNIFF_BYTES, peek};
+use crate::limits::{Limits, SNIFF_BYTES, peek, until_idle};
 use crate::names::{self, Staged, check_object_name};
 use crate::openapi::StorageErrorEnvelope;
 
@@ -259,7 +259,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
             let head = chelabase_storage::collect(got.body)
                 .await
                 .map_err(|e| Failure::from_store(&e, rid))?;
-            limits.check_sniffed(&head[..head.len().min(SNIFF_BYTES)])?;
+            limits.check_sniffed(&head)?;
         }
         Ok(())
     }
@@ -538,11 +538,10 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     let _buffer = state
         .inflight
         .reserve(declared.map_or(stream_part, |d| (d.max(0) as u64).min(stream_part)))?;
-    let mut body = request.into_data_stream().boxed();
+    // A body that stalls fails the request (408), which frees the reservation.
+    let (mut body, stalled) = until_idle(request.into_data_stream(), state.inflight.body_idle());
     if limits.sniffs() {
-        let (head, again) = peek(body)
-            .await
-            .map_err(|e| Failure::invalid_request(format!("the request body: {e}")))?;
+        let (head, again) = peek(body).await.map_err(|e| e.failure())?;
         limits.check_sniffed(&head)?;
         body = again;
     }
@@ -559,6 +558,9 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     .await
     .map_err(|e| match e {
         Staged::TooLarge => Failure::too_large(limit.unwrap_or_default()),
+        Staged::Store(_) if stalled.load(Ordering::SeqCst) => {
+            Failure::body_stalled(state.inflight.body_idle())
+        }
         Staged::Store(e) => Failure::from_store(&e, &rid),
     })?;
     row.size = Some(meta.size as i64);
@@ -590,6 +592,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         (status = 400, description = "`invalid_request`", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first; `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
+        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`: over the bucket's file size limit", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`: the declared type, or the type the first bytes are recognised as, isn't on the bucket's `allowed_mime_types`", body = StorageErrorEnvelope),
         (status = 502, description = "`storage_error`: the object store failed", body = StorageErrorEnvelope),

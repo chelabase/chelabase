@@ -25,6 +25,10 @@ pub struct Config {
     /// this process (a part is held whole; a single upload holds one stream part). Past it,
     /// 503 `busy`.
     pub max_inflight_bytes: usize,
+    /// `CHELABASE_STORAGE_BODY_IDLE_SECS` (default 60, at least 1): an upload whose body
+    /// delivers no bytes for this long fails (408 `request_timeout`) and frees its share of
+    /// the upload memory.
+    pub body_idle: std::time::Duration,
     /// The object store (`CHELABASE_STORAGE_BACKEND`, `CHELABASE_STORAGE_S3_*`).
     pub store: StorageConfig,
 }
@@ -71,6 +75,10 @@ impl Config {
                 })?
                 .into(),
             max_inflight_bytes: env_or("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES", "1073741824").parse()?,
+            body_idle: match env_or("CHELABASE_STORAGE_BODY_IDLE_SECS", "60").parse::<u64>()? {
+                0 => anyhow::bail!("CHELABASE_STORAGE_BODY_IDLE_SECS is at least 1"),
+                secs => std::time::Duration::from_secs(secs),
+            },
             store: StorageConfig::from_lookup(&get)?,
         })
     }
@@ -108,7 +116,32 @@ mod tests {
         assert_eq!(c.internal_token, "a-generated-storage-token");
         assert_eq!(c.max_connections, 200);
         assert_eq!(c.max_inflight_bytes, 1 << 30);
+        assert_eq!(c.body_idle, std::time::Duration::from_secs(60));
         assert_eq!(c.store.bucket, "chelabase-storage");
+    }
+
+    /// S2: the body idle period is a setting of whole seconds, never zero.
+    #[test]
+    fn the_body_idle_period_is_a_setting() {
+        const IDLE: &[(&str, &str)] = &[
+            ("CHELABASE_STORAGE_INTERNAL_TOKEN", "a-generated-storage-token"),
+            ("CHELABASE_COMPUTE_CA_FILE", "/ca.crt"),
+            ("CHELABASE_STORAGE_BACKEND", "s3"),
+            ("CHELABASE_STORAGE_S3_REGION", "us-east-1"),
+            ("CHELABASE_STORAGE_S3_BUCKET", "chelabase-storage"),
+            ("CHELABASE_STORAGE_BODY_IDLE_SECS", "5"),
+        ];
+        let c = Config::from_lookup(lookup(IDLE)).unwrap();
+        assert_eq!(c.body_idle, std::time::Duration::from_secs(5));
+        const ZERO: &[(&str, &str)] = &[
+            ("CHELABASE_STORAGE_INTERNAL_TOKEN", "a-generated-storage-token"),
+            ("CHELABASE_COMPUTE_CA_FILE", "/ca.crt"),
+            ("CHELABASE_STORAGE_BACKEND", "s3"),
+            ("CHELABASE_STORAGE_S3_REGION", "us-east-1"),
+            ("CHELABASE_STORAGE_S3_BUCKET", "chelabase-storage"),
+            ("CHELABASE_STORAGE_BODY_IDLE_SECS", "0"),
+        ];
+        assert!(Config::from_lookup(lookup(ZERO)).is_err());
     }
 
     /// The development bearer is refused without `CHELABASE_DEV_DEFAULTS=1`; the CA is required.

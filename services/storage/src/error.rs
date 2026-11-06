@@ -127,6 +127,18 @@ impl Failure {
         )
     }
 
+    /// 408: the upload's body delivered nothing for `idle` (`CHELABASE_STORAGE_BODY_IDLE_SECS`).
+    pub fn body_stalled(idle: std::time::Duration) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            format!(
+                "no bytes of the request body arrived for {} s",
+                idle.as_secs_f64()
+            ),
+        )
+    }
+
     /// 404: no resumable upload of that id for this caller (missing, finished, aborted, or
     /// another caller's: one answer).
     pub fn upload_not_found() -> Self {
