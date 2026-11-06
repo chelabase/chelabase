@@ -259,8 +259,7 @@ mod tests {
         (base, token, key)
     }
 
-    // A plain client against a local test server (clippy.toml allows it in tests only).
-    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    // The shared no-redirect client, like every other client in the workspace.
     async fn call(
         base: &str,
         token: &str,
@@ -268,7 +267,9 @@ mod tests {
         path: &str,
         body: Vec<u8>,
     ) -> (u16, Option<String>, serde_json::Value) {
-        let res = reqwest::Client::new()
+        let res = chelabase_http::client_builder()
+            .build()
+            .unwrap()
             .request(method.parse().unwrap(), format!("{base}{path}"))
             .header(IDENTITY_HEADER, token)
             .header("content-type", "application/json")
