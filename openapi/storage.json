@@ -788,7 +788,7 @@
             }
           },
           "404": {
-            "description": "`object_not_found`: overwritten or deleted since (the signed version is no longer current)",
+            "description": "`object_not_found`: overwritten or deleted since (the signed version is no longer current; a branch reset or restore that makes it current again serves it again)",
             "content": {
               "application/json": {
                 "schema": {
@@ -804,7 +804,7 @@
           "storage"
         ],
         "summary": "Create a signed download URL",
-        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. Sign again to link to a new version.",
+        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires; to revoke a link for good, overwrite the object or delete the key that minted it. Sign again to link to a new version.",
         "operationId": "signObject",
         "parameters": [
           {
@@ -977,7 +977,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters",
+            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters (refused before the URL is spent, so it takes the corrected upload)",
             "content": {
               "application/json": {
                 "schema": {
