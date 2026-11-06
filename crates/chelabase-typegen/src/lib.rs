@@ -151,6 +151,10 @@ impl Schema {
     }
 }
 
+/// The schema's name for a `storage.object_ref` column (the storage schema's composite of
+/// `bucket_id` and `name`), typed `StorageRef`.
+const STORAGE_REF_TYPE: &str = "object_ref";
+
 /// `int8` or `numeric`: what the runtime map tracks.
 fn exact(ty: &str) -> Option<&'static str> {
     match ty {
@@ -200,6 +204,7 @@ struct Ctx<'a> {
     schema: &'a Schema,
     uses_int8: bool,
     uses_json: bool,
+    uses_storage_ref: bool,
 }
 
 impl Ctx<'_> {
@@ -225,6 +230,11 @@ impl Ctx<'_> {
             "json" | "jsonb" => {
                 self.uses_json = true;
                 "Json".into()
+            }
+            // `storage.object_ref` (object-storage m3): the data API answers it as an object.
+            STORAGE_REF_TYPE => {
+                self.uses_storage_ref = true;
+                "StorageRef".into()
             }
             // numeric, text-like, uuid, dates and times, and anything else
             _ => "string".into(),
@@ -464,6 +474,7 @@ struct Rendered {
     version: String,
     uses_int8: bool,
     uses_json: bool,
+    uses_storage_ref: bool,
 }
 
 impl Rendered {
@@ -497,6 +508,9 @@ fn header(parts: &[&Rendered], versions: &str) -> String {
     }
     if parts.iter().any(|r| r.uses_json) {
         imports.push("Json");
+    }
+    if parts.iter().any(|r| r.uses_storage_ref) {
+        imports.push("StorageRef");
     }
     imports.push("TypeMap");
     format!(
@@ -605,6 +619,7 @@ fn render_one(schema: &Schema) -> Result<Rendered> {
         schema,
         uses_int8: false,
         uses_json: false,
+        uses_storage_ref: false,
     };
 
     let mut db = String::new();
@@ -724,6 +739,7 @@ fn render_one(schema: &Schema) -> Result<Rendered> {
         version: schema.version.clone(),
         uses_int8: cx.uses_int8,
         uses_json: cx.uses_json,
+        uses_storage_ref: cx.uses_storage_ref,
     })
 }
 
@@ -1046,6 +1062,49 @@ mod tests {
             runtime.contains(r#"["__proto__"]: { returns: "int8" },"#),
             "{runtime}"
         );
+    }
+
+    /// #102 AC 1: a `storage.object_ref` column (the schema names it `object_ref`) is a
+    /// `StorageRef`, `| null` when nullable, an array of them when it's an array; the module
+    /// imports `StorageRef` only when it uses it, and the runtime map doesn't list it.
+    #[test]
+    fn object_ref_columns_are_storage_refs() {
+        let nullable = col("object_ref").replace(r#""nullable":false"#, r#""nullable":true"#);
+        let array = col("object_ref").replace(r#""array":false"#, r#""array":true"#);
+        let json = tiny(
+            "v1",
+            "public",
+            &format!(
+                r#"{{"profiles":{{"columns":{{"avatar":{nullable},"banner":{},"gallery":{array}}}}}}}"#,
+                col("object_ref")
+            ),
+            "{}",
+        );
+        let out = generate(&serde_json::from_str(&json).unwrap()).unwrap();
+        assert!(
+            out.contains("import type { StorageRef, TypeMap } from \"@chelabase/client\";"),
+            "{out}"
+        );
+        let row = &out[out.find("Row: {").unwrap()..out.find("Insert: {").unwrap()];
+        assert!(row.contains("avatar: StorageRef | null;"), "{row}");
+        assert!(row.contains("banner: StorageRef;"), "{row}");
+        assert!(row.contains("gallery: StorageRef[];"), "{row}");
+        let insert = &out[out.find("Insert: {").unwrap()..out.find("Update: {").unwrap()];
+        assert!(insert.contains("avatar?: StorageRef | null;"), "{insert}");
+        assert!(insert.contains("banner: StorageRef;"), "{insert}");
+        assert!(
+            out.contains("profiles: {},"),
+            "not in the runtime map: {out}"
+        );
+        // A module without one doesn't import it.
+        let plain = tiny(
+            "v1",
+            "public",
+            &format!(r#"{{"t":{{"columns":{{"c":{}}}}}}}"#, col("text")),
+            "{}",
+        );
+        let plain = generate(&serde_json::from_str(&plain).unwrap()).unwrap();
+        assert!(!plain.contains("StorageRef"), "{plain}");
     }
 
     /// A schema name with a dot can't be addressed (names are "schema.name"): refused.
