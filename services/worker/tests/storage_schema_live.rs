@@ -3967,3 +3967,135 @@ async fn storage_console_owner_live() {
     }))
     .await;
 }
+
+// --- #102: storage_ref columns and the batched resolve ---------------------------------------
+
+/// `POST /storage/v1/object/resolve` with `refs` (and `expires_in` 60): `(status, body)`.
+async fn resolve_refs(key: &str, refs: Value) -> (u16, Value) {
+    storage("POST", "/storage/v1/object/resolve", key, Some(json!({ "refs": refs, "expires_in": 60 }))).await
+}
+
+/// A `storage.object_ref` column round-trips through the query API as `{bucket_id, name}`
+/// (AC 5) and generates as `StorageRef` (AC 1); one resolve answers every ref in order, a
+/// signed URL for what the caller can read, the public URL in a public bucket, and `null` for
+/// a missing object, an object or bucket row level security hides, or an invalid name, all
+/// alike (AC 2, AC 3); over 1000 refs is 400.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_refs_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_refs_live() {
+    with_fx(|fx| Box::pin(async move {
+        // The table first: the data API reads the schema on its first request here.
+        fx.owner(
+            "CREATE TABLE profiles (id int PRIMARY KEY, avatar storage.object_ref, banner storage.object_ref NOT NULL);
+             GRANT SELECT, INSERT ON profiles TO authenticated;",
+        )
+        .await
+        .expect("the profiles table");
+        let secret = fx.secret_key("st-refs", None).await;
+        let public = fx.public_key().await;
+        for b in ["files", "pub", "closed"] {
+            fx.bucket(b).await;
+        }
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; UPDATE storage.buckets SET public = true WHERE name = 'pub'; COMMIT;").await;
+        for (name, table, command, using, check) in [
+            ("b_select", "buckets", "SELECT", "'name <> ''closed'''", "NULL"),
+            ("o_select", "objects", "SELECT", "'name NOT LIKE ''hidden/%'''", "NULL"),
+            ("o_insert", "objects", "INSERT", "NULL", "'true'"),
+        ] {
+            fx.owner(&format!(
+                "SELECT storage.create_policy('{name}', '{table}', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for (path, body) in [("files/a.txt", "v1"), ("files/hidden/x.txt", "h"), ("pub/logo.png", "png")] {
+            let (status, _, b) = object("POST", &format!("/storage/v1/object/{path}"), &secret, Some(body.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
+            assert_eq!(status, 200, "{path}: {}", json_of(&b));
+        }
+        let id = "SELECT id FROM storage.buckets WHERE name =";
+        let files = fx.value(&format!("{id} 'files'")).await;
+        let pub_ = fx.value(&format!("{id} 'pub'")).await;
+        let closed = fx.value(&format!("{id} 'closed'")).await;
+        // An object in the bucket the caller can't see (storage's own write, with its ticket).
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage;
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role)
+  VALUES ('00000000-0000-0000-0000-0000000000f1', '{closed}', 'c.txt', 1, 'e', now() + interval '5 minutes', 'chelabase_storage');
+INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('{closed}', 'c.txt', 1, 'e', '00000000-0000-0000-0000-0000000000f1');
+COMMIT;"
+        ))
+        .await;
+
+        // AC 5: inserted as {bucket_id, name}, read back the same.
+        let a = json!({ "bucket_id": files, "name": "a.txt" });
+        let logo = json!({ "bucket_id": pub_, "name": "logo.png" });
+        let (status, body) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "insert", "into": "profiles",
+            "values": [{ "id": 1, "avatar": a, "banner": logo }, { "id": 2, "avatar": null, "banner": a }],
+        })))
+        .await;
+        assert!((200..300).contains(&status), "insert: {status} {body}");
+        let (status, rows) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "select", "from": "profiles", "select": ["id", "avatar", "banner"], "orderBy": [{ "col": "id" }],
+        })))
+        .await;
+        assert_eq!(status, 200, "{rows}");
+        assert_eq!(rows, json!([{ "id": 1, "avatar": a, "banner": logo }, { "id": 2, "avatar": null, "banner": a }]));
+
+        // AC 1: the key's generated types type the columns as StorageRef.
+        let (status, _, ts) = object("GET", "/data/v1/types", &secret, None, &[]).await;
+        let ts = String::from_utf8_lossy(&ts);
+        assert_eq!(status, 200, "{ts}");
+        assert!(ts.contains("import type { StorageRef, TypeMap } from \"@chelabase/client\";"), "{ts}");
+        assert!(ts.contains("avatar: StorageRef | null;") && ts.contains("banner: StorageRef;"), "{ts}");
+
+        // AC 2, AC 3: one request, input order; unreadable refs are null, whatever the reason.
+        let refs = json!([
+            a,
+            { "bucket_id": files, "name": "hidden/x.txt" },
+            logo,
+            { "bucket_id": closed, "name": "c.txt" },
+            { "bucket_id": files, "name": "ghost.txt" },
+            { "bucket_id": "00000000-0000-0000-0000-000000000000", "name": "a.txt" },
+            { "bucket_id": files, "name": "../a.txt" },
+            a,
+        ]);
+        let (status, body) = resolve_refs(&secret, refs.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        let urls = body["urls"].as_array().expect("urls").clone();
+        assert_eq!(urls.len(), 8, "{body}");
+        for i in [1, 3, 4, 5, 6] {
+            assert_eq!(urls[i], Value::Null, "slot {i}: {body}");
+        }
+        let signed = urls[0].as_str().expect("a signed URL");
+        assert!(signed.starts_with("/storage/v1/object/sign/files/a.txt?token="), "{signed}");
+        assert!(urls[7].as_str().unwrap().starts_with("/storage/v1/object/sign/files/a.txt?token="), "{body}");
+        let (status, _, got) = keyless("GET", signed, None).await;
+        assert_eq!((status, &got[..]), (200, &b"v1"[..]));
+        let public_url = urls[2].as_str().expect("a public URL");
+        assert_eq!(public_url, format!("/storage/v1/object/public/{}/pub/logo.png?database={}", fx.main, fx.database));
+        let (status, _, got) = keyless("GET", public_url, None).await;
+        assert_eq!((status, &got[..]), (200, &b"png"[..]));
+        // Its token is for that object only: another name with it is refused.
+        let token = signed.split_once("?token=").unwrap().1;
+        assert_eq!(keyless("GET", &format!("/storage/v1/object/sign/files/hidden/x.txt?token={token}"), None).await.0, 403);
+        assert!(body["expires_at"].as_u64().is_some(), "{body}");
+
+        // The public key's role (anon) has no policy: every slot is null, not an error.
+        let (status, body) = resolve_refs(&public, refs).await;
+        assert_eq!((status, body["urls"].as_array().map(Vec::len)), (200, Some(8)), "{body}");
+        assert!(body["urls"].as_array().unwrap().iter().all(Value::is_null), "{body}");
+
+        // An empty batch answers empty; over 1000 refs is 400; a malformed ref is 400.
+        assert_eq!(resolve_refs(&secret, json!([])).await.1["urls"], json!([]));
+        let many: Vec<Value> = (0..1001).map(|_| a.clone()).collect();
+        let (status, body) = resolve_refs(&secret, json!(many)).await;
+        assert_eq!((status, &body["error"]["code"]), (400, &json!("invalid_request")), "{body}");
+        assert_eq!(resolve_refs(&secret, json!([{ "bucket_id": "nope", "name": "a" }])).await.0, 400);
+    }))
+    .await;
+}
