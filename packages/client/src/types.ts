@@ -1,5 +1,6 @@
 // The type layer: the `Database` shape `chelabase gen types` emits, the runtime type map,
 // and the typed builder interfaces. No runtime code lives here.
+import type { StorageClient } from "./storage.ts";
 
 /** A JSON value (`json` and `jsonb` columns). */
 export type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
@@ -356,6 +357,12 @@ export interface Auth<DB extends DatabaseShape, S = Session> {
 export interface Client<DB extends DatabaseShape, B extends boolean, S = Session> extends Tx<DB, B> {
   /** App user sign-up, sign-in and session handling. Shared by `database()` siblings. */
   readonly auth: Auth<DB, S>;
+  /**
+   * Storage: buckets and their objects, as this client's key (and app user). Loaded on first
+   * use, so an app that never touches it never bundles it. A `database()` sibling's storage
+   * works on that database.
+   */
+  readonly storage: StorageClient;
   /**
    * Runs the operations in order in one transaction, all or nothing (at most 50), and
    * resolves to each one's result.
