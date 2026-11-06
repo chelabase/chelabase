@@ -517,7 +517,6 @@ mod tests {
     /// m6 re-audit S1: an upload refused for its `Content-Type` (400) is refused before the
     /// token is spent, so the URL still takes the corrected upload.
     #[tokio::test]
-    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
     async fn a_refused_upload_keeps_its_token() {
         let control = Arc::new(FakeControl::default());
         let (base, _, data) = serve_with(Unreachable, Unreachable, control.clone()).await;
@@ -540,7 +539,9 @@ mod tests {
         let put = |content_type: &'static str| {
             let url = url.clone();
             async move {
-                let res = reqwest::Client::new()
+                let res = chelabase_http::client_builder()
+                    .build()
+                    .unwrap()
                     .put(url)
                     .header("content-type", content_type)
                     .body(b"x".to_vec())
