@@ -384,20 +384,17 @@ services:
       - |
         set -e
         umask 077
-        nak="$$(cat /run/chelabase/secrets/s3/access-key)"
-        nsk="$$(cat /run/chelabase/secrets/s3/secret-key)"
-        sak="$$(cat /run/chelabase/secrets/storage-s3/access-key)"
-        ssk="$$(cat /run/chelabase/secrets/storage-s3/secret-key)"
-        cat > /tmp/s3.json <<EOT
-        {"identities": [
-          {"name": "neon",
-           "credentials": [{"accessKey": "$$nak", "secretKey": "$$nsk"}],
-           "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},
-          {"name": "storage",
-           "credentials": [{"accessKey": "$$sak", "secretKey": "$$ssk"}],
-           "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]}]}
-        EOT
-        unset nak nsk sak ssk
+        # The S3 identities' keys go from their files into s3.json through stdin and stdout only
+        # (tr drops the newline), so no key is ever a program argument or a shell variable.
+        key() { tr -d '\n' < "/run/chelabase/secrets/$$1"; }
+        {
+          printf '{"identities": [\n  {"name": "neon",\n   "credentials": [{"accessKey": "'
+          key s3/access-key; printf '", "secretKey": "'; key s3/secret-key
+          printf '"}],\n   "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},\n'
+          printf '  {"name": "storage",\n   "credentials": [{"accessKey": "'
+          key storage-s3/access-key; printf '", "secretKey": "'; key storage-s3/secret-key
+          printf '"}],\n   "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]}]}\n'
+        } > /tmp/s3.json
         D=/run/chelabase/secrets/grpc-tls
         mkdir -p /etc/seaweedfs
         {
