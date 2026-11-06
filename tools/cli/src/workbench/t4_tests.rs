@@ -100,6 +100,12 @@ fn may_publish(text: &str, user: &str, subject: &str) -> bool {
             .any(|p| matches(p, subject))
 }
 
+fn may_subscribe(text: &str, user: &str, subject: &str) -> bool {
+    list(text, user, "subscribe", "allow")
+        .iter()
+        .any(|p| matches(p, subject))
+}
+
 fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -397,7 +403,7 @@ fn up_restarts_valkey_only_for_a_changed_acl_on_a_running_stack() {
     assert!(!valkey_needs_restart(false, false));
 }
 
-// Object storage m9: storage's NATS user only listens, to exactly its cache events; it can
+// Object storage m9: storage's NATS user only listens, to exactly the subjects it handles; it can
 // publish nothing (no allow list, deny everything), so it can neither send jobs nor answer.
 #[test]
 fn storage_only_listens_to_its_cache_events() {
@@ -409,8 +415,12 @@ fn storage_only_listens_to_its_cache_events() {
     }
     assert_eq!(
         as_set(list(&text, "storage", "subscribe", "allow")),
-        set(&["chelabase.rt.project.>", "chelabase.rt.access.>", "chelabase.storage.>", "_INBOX_storage.>"])
+        set(&["chelabase.rt.project.*", "chelabase.rt.access.*", "chelabase.storage.events", "_INBOX_storage.>"])
     );
+    // Exactly the subjects it handles: one project or tenant token, nothing deeper.
+    for subject in ["chelabase.rt.project.p.x", "chelabase.rt.access.t.member", "chelabase.storage.other"] {
+        assert!(!may_subscribe(&text, "storage", subject), "{subject}");
+    }
     // Only the orchestrator (and the runner, as it) publishes the storage events.
     for user in ["worker", "realtime"] {
         assert!(!may_publish(&text, user, "chelabase.storage.events"), "{user}");

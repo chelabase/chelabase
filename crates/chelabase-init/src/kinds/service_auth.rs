@@ -154,15 +154,16 @@ fn realtime() -> NatsPermissions {
 /// Object storage (m9) only listens: what makes it drop a branch's cached connection info,
 /// pools and schema check (the orchestrator's project events and storage branch events), and
 /// what makes it drop a signed URL's cached key liveness (access events and storage key
-/// events). It publishes nothing and answers nobody.
+/// events). Exactly the subjects it handles: one project or tenant token (`chelabase.rt.*`'s
+/// layout), and the one storage events subject. It publishes nothing and answers nobody.
 fn storage() -> NatsPermissions {
     NatsPermissions {
         publish: vec![],
         publish_deny: vec![">"],
         subscribe: vec![
-            "chelabase.rt.project.>",
-            "chelabase.rt.access.>",
-            STORAGE_EVENTS,
+            "chelabase.rt.project.*",
+            "chelabase.rt.access.*",
+            "chelabase.storage.events",
             "_INBOX_storage.>",
         ],
     }
