@@ -862,7 +862,7 @@ async fn hardening(fx: &Fx) {
         "0"
     );
     assert_eq!(fx.value("SELECT has_table_privilege('audit_x', 'storage.objects', 'SELECT') OR has_table_privilege('anon', 'storage.upload_tickets', 'SELECT')").await, "f");
-    assert_eq!(fx.value("SELECT string_agg(tgname || '=' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid IN ('storage.objects'::regclass, 'storage.upload_tickets'::regclass) AND NOT tgisinternal").await, "guard_tickets=A,protect_objects=A,touch_objects=A");
+    assert_eq!(fx.value("SELECT string_agg(tgname || '=' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid IN ('storage.objects'::regclass, 'storage.upload_tickets'::regclass) AND NOT tgisinternal").await, "freeze_objects=A,guard_tickets=A,protect_objects=A,touch_objects=A");
     fx.admin("DROP ROLE audit_x").await;
 
     // S1: a session that reached chelabase_storage through another role is ended too.
