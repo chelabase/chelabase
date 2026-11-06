@@ -530,6 +530,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         version: Uuid::new_v4(),
         datoid: 0,
     };
+    names::check_content_type(&row.content_type)?;
     limits.check_declared(&row.content_type)?;
     let (expected, datoid) = state.precheck(&data, &at, &row, upsert, &rid).await?;
     row.datoid = datoid;
@@ -692,10 +693,12 @@ fn object_headers(found: &Found, name: &str, download: Option<&str>) -> HeaderMa
         }
     };
     set(&mut h, header::ETAG, names::quoted_etag(&found.etag));
-    set(&mut h, header::CONTENT_TYPE, found.content_type.clone());
+    // Only the parsed essence (a browser takes a list's last type), never the stored text.
+    let content_type = names::served_content_type(&found.content_type);
+    set(&mut h, header::CONTENT_TYPE, content_type.clone());
     // Inline only for a safe type without `?download`; anything else is an attachment.
     let disposition = match download {
-        None if names::inline_safe(&found.content_type) => None,
+        None if names::inline_safe(&content_type) => None,
         other => Some(other.unwrap_or("")),
     };
     set(
@@ -1387,6 +1390,39 @@ mod tests {
         assert_eq!(h[header::CONTENT_SECURITY_POLICY], "sandbox");
         let h = object_headers(&found, "a.png", Some(""));
         assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
+    }
+
+    /// m6 audit B3: a stored type a browser would read as HTML (a comma list) is served as
+    /// an octet-stream attachment; a safe type is served as its essence only.
+    #[test]
+    fn a_comma_content_type_is_never_inline() {
+        for stored in [
+            "text/plain;a=b,text/html",
+            "image/png;x=1, text/html",
+            "text/plain;charset=utf-8,application/xhtml+xml",
+        ] {
+            let found = Found {
+                datoid: 1,
+                version: Uuid::nil(),
+                size: 1,
+                etag: "e".into(),
+                content_type: stored.into(),
+                owner: None,
+            };
+            let h = object_headers(&found, "a.txt", None);
+            assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream", "{stored}");
+            assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"), "{stored}");
+        }
+        let found = Found {
+            datoid: 1,
+            version: Uuid::nil(),
+            size: 1,
+            etag: "e".into(),
+            content_type: "text/plain; charset=utf-8; x=<b>".into(),
+            owner: None,
+        };
+        let h = object_headers(&found, "a.txt", None);
+        assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
     }
 
     /// Every download and HEAD answer says `nosniff`.

@@ -2337,7 +2337,7 @@ async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
     assert_eq!(dead.await.0, 409);
     assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
     let made = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
-    assert_eq!(made.0, 204, "{}", made.1);
+    assert_eq!(made, (200, json!({ "expires_at": 1_893_456_000 })));
     let again = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
     assert_eq!(again.0, 409);
     let (code, body) = app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await;
@@ -2345,6 +2345,76 @@ async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
     assert_eq!(body["key"]["key_id"], json!(key_id));
     assert_eq!(body["claims"], json!({ "sub": "u1" }));
     assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+}
+
+/// Object storage m6 fix (B1, S3): an app user's upload token (its claims carry the session's
+/// `sid`) is recorded only while that session of the key's project is live, never past the
+/// session's expiry, and is spent only while the session is still live.
+#[tokio::test]
+async fn storage_upload_tokens_follow_the_app_session() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let project = ProjectId::new();
+    let key_id = uuid::Uuid::new_v4();
+    let lookup = DataKeyLookup {
+        key_id,
+        branch_id: BranchId::new(),
+        project_id: project,
+        kind: DataKeyKind::Public,
+        role: "anon".into(),
+        databases: None,
+        role_oid: None,
+    };
+    neon.data_keys.lock().unwrap().push(([9; 32], lookup));
+    let session = |project: ProjectId, life: chrono::Duration| {
+        let neon = neon.clone();
+        async move {
+            let id = uuid::Uuid::new_v4();
+            neon.insert_app_session(&NewAppSession {
+                id,
+                project_id: project,
+                user_id: uuid::Uuid::new_v4(),
+                zitadel_session_id: "z",
+                refresh_hash: [1; 32],
+                expires_at: chrono::Utc::now() + life,
+            })
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let record = |token: uuid::Uuid, sid: Value| {
+        let body = json!({ "token_id": token, "key_id": key_id, "claims": { "sub": "u1", "sid": sid },
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1) });
+        app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), body)
+    };
+    let app = &app;
+    let consume = |token: uuid::Uuid| async move {
+        app.post_json(&format!("/internal/storage/upload-tokens/{token}/consume"), Some(STORAGE_TOKEN), json!({})).await
+    };
+
+    // Clamped to the session's 10 minutes, and spent while it is live.
+    let live = session(project, chrono::Duration::minutes(10)).await;
+    let t1 = uuid::Uuid::new_v4();
+    let (code, body) = record(t1, json!(live)).await;
+    assert_eq!(code, 200, "{body}");
+    let exp = body["expires_at"].as_i64().unwrap();
+    let cap = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
+    assert!(exp <= cap && exp > cap - 30, "{body}");
+    assert_eq!(consume(t1).await.0, 200);
+
+    // Revoked after minting: the token isn't spent into an upload.
+    let t2 = uuid::Uuid::new_v4();
+    assert_eq!(record(t2, json!(live)).await.0, 200);
+    assert!(neon.revoke_app_session(live, project).await.unwrap().is_some());
+    assert_eq!(consume(t2).await.0, 404);
+
+    // A revoked, expired, unknown, another project's or unreadable session mints nothing.
+    let expired = session(project, chrono::Duration::seconds(-1)).await;
+    let foreign = session(ProjectId::new(), chrono::Duration::minutes(10)).await;
+    for sid in [json!(live), json!(expired), json!(uuid::Uuid::new_v4()), json!(foreign), json!("nope"), json!(7)] {
+        assert_eq!(record(uuid::Uuid::new_v4(), sid.clone()).await.0, 409, "{sid}");
+    }
 }
 
 /// The storage route answers as `chelabase_storage` with its own password (sealed for the

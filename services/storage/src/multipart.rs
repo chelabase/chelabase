@@ -449,6 +449,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
+    crate::names::check_content_type(&content_type)?;
     limits.check_declared(&content_type)?;
     let row = Row {
         bucket: limits.id,

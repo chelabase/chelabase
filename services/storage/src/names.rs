@@ -121,6 +121,62 @@ pub fn inline_safe(content_type: &str) -> bool {
     }
 }
 
+/// A stored or declared Content-Type under a strict grammar: `type/subtype` then any
+/// `; name=value` parameters, every part an RFC 9110 token (no quoted strings, no `,`, no
+/// whitespace inside a part). Its lower-case essence and its parameters (names lower case),
+/// or `None`. A browser reads a comma-separated list's last type, so a `,` is never valid.
+pub fn parse_content_type(content_type: &str) -> Option<(String, Vec<(String, String)>)> {
+    // RFC 9110's `tchar`: no separator (`,` `;` `"` `/` `=` space …), no control character.
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    // Optional whitespace around `;` only (space or tab).
+    fn ows(s: &str) -> &str {
+        s.trim_matches([' ', '\t'])
+    }
+    let mut parts = content_type.split(';');
+    let (kind, sub) = ows(parts.next()?).split_once('/')?;
+    if !token(kind) || !token(sub) {
+        return None;
+    }
+    let essence = format!("{kind}/{sub}").to_ascii_lowercase();
+    let params = parts
+        .map(|p| {
+            let (name, value) = ows(p).split_once('=')?;
+            (token(name) && token(value)).then(|| (name.to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((essence, params))
+}
+
+/// What a download says its Content-Type is: the essence [`inline_safe`] judged, plus a
+/// validated `charset` for `text/plain` only; never the stored text. Anything that doesn't
+/// parse is `application/octet-stream`.
+pub fn served_content_type(stored: &str) -> String {
+    let Some((essence, params)) = parse_content_type(stored) else {
+        return "application/octet-stream".into();
+    };
+    // The first `charset`, as a browser reads it.
+    match params.iter().find(|(name, _)| name == "charset") {
+        Some((_, charset)) if essence == "text/plain" => {
+            format!("text/plain; charset={}", charset.to_ascii_lowercase())
+        }
+        _ => essence,
+    }
+}
+
+/// 400 unless an upload's declared Content-Type parses ([`parse_content_type`]).
+pub fn check_content_type(content_type: &str) -> Result<(), Failure> {
+    match parse_content_type(content_type) {
+        Some(_) => Ok(()),
+        None => Err(Failure::invalid_request(
+            "Content-Type must be one type/subtype with unquoted name=value parameters",
+        )),
+    }
+}
+
 /// A name or bucket as URL path segments: each `/`-separated segment percent-encoded (all but
 /// unreserved characters), so the URL's path decodes back to exactly `name`.
 pub fn encode_path(name: &str) -> String {
@@ -264,6 +320,43 @@ mod tests {
 
     /// AC: `../x`, `/x`, 1025 bytes (and control characters, empty segments) are refused.
     /// m6: only the safe inline types are served inline; parameters and case don't matter.
+    /// m6 audit B3: a comma (a browser takes the list's last type) or anything outside the
+    /// strict grammar is refused at upload, and a download never serves the stored text.
+    #[test]
+    fn content_types_are_strict_and_served_as_their_essence() {
+        for bad in [
+            "text/plain;a=b,text/html",
+            "image/png;x=1, text/html",
+            "text/plain;charset=utf-8,application/xhtml+xml",
+            "text/html, image/png",
+            "text/plain; charset=\"utf-8\"",
+            "text/plain;charset",
+            "text/ plain",
+            "text/plain;;a=b",
+            "text/plain\u{0}",
+            "/plain",
+            "text/",
+            "",
+        ] {
+            assert!(parse_content_type(bad).is_none(), "{bad:?}");
+            assert_eq!(check_content_type(bad).unwrap_err().0.status.as_u16(), 400, "{bad:?}");
+            assert_eq!(served_content_type(bad), "application/octet-stream", "{bad:?}");
+            assert!(!inline_safe(&served_content_type(bad)), "{bad:?}");
+        }
+        for (good, served) in [
+            ("text/plain", "text/plain"),
+            ("Text/Plain; Charset=UTF-8", "text/plain; charset=utf-8"),
+            ("text/plain;format=flowed;charset=us-ascii", "text/plain; charset=us-ascii"),
+            ("image/png; x=1", "image/png"),
+            ("text/html; charset=utf-8", "text/html"),
+            ("application/vnd.api+json", "application/vnd.api+json"),
+        ] {
+            assert!(check_content_type(good).is_ok(), "{good}");
+            assert_eq!(served_content_type(good), served, "{good}");
+        }
+        assert!(parse_content_type("text/plain; charset=utf-8").is_some());
+    }
+
     #[test]
     fn only_safe_types_are_inline() {
         for t in [

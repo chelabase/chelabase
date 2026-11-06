@@ -7,13 +7,19 @@
 //! 2. the key that minted it is still live on the token's branch, and still reaches its
 //!    database (403; cached [`crate::control::LIVENESS_TTL`]);
 //! 3. the token's database is still served on that branch, the same Chelabase database and the
-//!    same Postgres database (its OID), and a row of that name still exists there, read as
-//!    storage itself (404). The version served is the token's: an overwrite doesn't change
-//!    what the URL serves, a delete ends it.
+//!    same Postgres database (its OID), and the version the token was signed for is still the
+//!    current version of that name there, read as storage itself (404). An overwrite or a
+//!    delete ends the URL, and re-creating the name (or resetting the branch past it) never
+//!    revives it: a new upload is a new version.
 //!
 //! An upload token is recorded in the control plane when minted and spent there by its one
-//! upload (on any replica, across restarts); the upload then runs as the minting key's current
-//! role with the minting request's claims, exactly as m5's upload (row level security decides).
+//! upload (on any replica, across restarts). The token carries the minting identity: the role
+//! it ran as (and the role's OID), the app session behind an app user's request, and whether
+//! the upload may replace an existing object (the minter's choice; the uploader's `x-upsert`
+//! is ignored). The upload runs as that role with the minting request's claims, exactly as
+//! m5's upload (row level security decides), only while a key's role is still that key's and
+//! an app user's session is still live (the control plane refuses to spend it otherwise, and
+//! an app user's URL never outlives the session).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,8 +37,12 @@ use serde_json::json;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use chelabase_auth::internal::DataIdentity;
+use serde_json::Value;
+
 use crate::app::{AppState, identity};
 use crate::buckets::body;
+use crate::control::LiveKey;
 use crate::engine::datoid_of;
 use crate::error::Failure;
 use crate::names::{self, check_object_name};
@@ -44,13 +54,28 @@ use crate::token::{self, Claims, Purpose, TokenError};
 pub const DEFAULT_TTL: i64 = 3600;
 pub const MAX_TTL: i64 = chelabase_storage::MAX_SIGNED_URL_TTL.as_secs() as i64;
 
-/// The database's OID and whether a row of the name still exists in the bucket (storage's own
+/// The database's OID and the current version of the name in the bucket, if any (storage's own
 /// read: the token's minter could read it, so no policy is asked again).
 const SIGNED_ROW: NamedStatement = named_statement!(
     "signed row",
-    "SELECT (SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()), EXISTS (SELECT 1 FROM storage.objects o JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) o.bucket_id WHERE b.name OPERATOR(pg_catalog.=) $1 AND o.name OPERATOR(pg_catalog.=) $2)",
+    "SELECT (SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()), (SELECT o.version_id FROM storage.objects o JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) o.bucket_id WHERE b.name OPERATOR(pg_catalog.=) $1 AND o.name OPERATOR(pg_catalog.=) $2)",
     &[Type::TEXT, Type::TEXT]
 );
+
+/// A download token still opens its object: the same Postgres database (`oid`) and its
+/// version still the name's current one (`current`); else 404.
+pub fn still_current(
+    claims: &Claims,
+    oid: Option<u32>,
+    current: Option<Uuid>,
+) -> Result<(), Failure> {
+    match (claims.datoid, claims.version_id) {
+        (Some(datoid), Some(version)) if oid == Some(datoid) && current == Some(version) => {
+            Ok(())
+        }
+        _ => Err(Failure::object_not_found()),
+    }
+}
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -93,7 +118,19 @@ pub struct SignBody {
     pub expires_in: Option<i64>,
 }
 
-/// `?token=` (and a download's `download=`, an upload's `upsert=`).
+/// An upload URL's lifetime, and whether its upload may replace an existing object.
+#[derive(Deserialize, ToSchema, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct SignUploadBody {
+    /// Seconds, 1 to 604800 (7 days); default 3600. An app user's URL never outlives the
+    /// user's session.
+    pub expires_in: Option<i64>,
+    /// The upload may replace an existing object (also `?upsert=true` or `x-upsert: true` on
+    /// this request). Fixed here: the uploader can't change it.
+    pub upsert: Option<bool>,
+}
+
+/// `?token=` (and a download's `download=`).
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SignedParams {
@@ -101,8 +138,39 @@ pub struct SignedParams {
     pub token: Option<String>,
     /// Download as an attachment; the value is the file name (empty: the object's own).
     pub download: Option<String>,
-    /// Replace an existing object (an upload URL).
-    pub upsert: Option<bool>,
+}
+
+/// The app session behind an app user's request (its claims' `sid`), if any.
+pub fn session_of(data: &DataIdentity) -> Result<Option<Uuid>, Failure> {
+    match data.claims.get("sid") {
+        None => Ok(None),
+        Some(sid) => sid
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .map(Some)
+            .ok_or_else(|| Failure::unauthorized("the user token's session isn't readable")),
+    }
+}
+
+/// Who a spent upload token's upload runs as: the role it was minted with (and its OID) and
+/// the minting claims, on the key as it is now. A key's own role must still be the key's role
+/// (and OID); an app user's token must name the session its minting claims carry (the control
+/// plane checked that session is still live). `None`: refused.
+pub fn upload_identity(key: LiveKey, minted: Value, claims: &Claims) -> Option<DataIdentity> {
+    let role = claims.role.clone()?;
+    match claims.session_id {
+        Some(sid) => {
+            if minted.get("sid").and_then(Value::as_str) != Some(sid.to_string().as_str()) {
+                return None;
+            }
+            let mut data = key.identity(minted);
+            data.role = role;
+            data.role_oid = claims.role_oid;
+            Some(data)
+        }
+        None => (key.role == role && key.role_oid == claims.role_oid)
+            .then(|| key.identity(minted)),
+    }
 }
 
 fn signed_url(route: &str, bucket: &str, name: &str, token: &str) -> String {
@@ -119,7 +187,7 @@ fn signed_url(route: &str, bucket: &str, name: &str, token: &str) -> String {
     operation_id = "signObject",
     tag = "storage",
     summary = "Create a signed download URL",
-    description = "The caller must be able to read the object (row level security). The URL serves the object's current version without a key until it expires, the object is deleted or the key is revoked.",
+    description = "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. Sign again to link to a new version.",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     request_body = SignBody,
     security(("bearer" = [])),
@@ -160,6 +228,10 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
         size: Some(found.size),
         etag: Some(found.etag),
         content_type: Some(found.content_type),
+        role: None,
+        role_oid: None,
+        session_id: None,
+        upsert: false,
         token_id: Uuid::new_v4(),
         exp,
     };
@@ -209,7 +281,7 @@ pub fn key_still_reaches(key: &crate::control::LiveKey, claims: &Claims) -> bool
         (status = 200, description = "The object", content_type = "application/octet-stream", body = Vec<u8>),
         (status = 401, description = "`invalid_token`, `token_expired`", body = StorageErrorEnvelope),
         (status = 403, description = "`token_not_valid`: another object's token, or its key was revoked", body = StorageErrorEnvelope),
-        (status = 404, description = "`object_not_found`: deleted since", body = StorageErrorEnvelope),
+        (status = 404, description = "`object_not_found`: overwritten or deleted since (the signed version is no longer current)", body = StorageErrorEnvelope),
     ),
 )]
 pub async fn signed_download<S: ConnSource, M: ConnSource>(
@@ -252,9 +324,7 @@ pub async fn signed_download<S: ConnSource, M: ConnSource>(
         )
         .await?;
     let row = rows.first().ok_or_else(Failure::storage_unavailable)?;
-    if datoid_of(row.get(0)) != Some(datoid) || !row.get::<_, bool>(1) {
-        return Err(Failure::object_not_found());
-    }
+    still_current(&claims, datoid_of(row.get(0)), row.get::<_, Option<Uuid>>(1))?;
     let found = Found {
         datoid,
         version,
@@ -290,9 +360,9 @@ pub async fn signed_download<S: ConnSource, M: ConnSource>(
     operation_id = "signUpload",
     tag = "storage",
     summary = "Create a one-time upload URL",
-    description = "The caller must be able to see the bucket. The URL takes one upload (`PUT`) without a key, as the caller: row level security decides then.",
+    description = "The caller must be able to see the bucket. The URL takes one upload (`PUT`) without a key, as the caller (its role and claims): row level security decides then. Whether it may replace an existing object is fixed here (`upsert`). An app user's URL never outlives the user's session and fails once the session ends.",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
-    request_body = SignBody,
+    request_body = SignUploadBody,
     security(("bearer" = [])),
     responses(
         (status = 200, description = "`signed_url` (a path on the API host) and `expires_at`", body = Value),
@@ -305,18 +375,30 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
     headers: HeaderMap,
     Path((bucket, name)): Path<(String, String)>,
     Query(q): Query<ObjectParams>,
-    json: Result<Json<SignBody>, JsonRejection>,
+    json: Result<Json<SignUploadBody>, JsonRejection>,
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     check_object_name(&name)?;
-    let ttl = ttl_of(body(json)?.expires_in)?;
+    let asked = body(json)?;
+    let ttl = ttl_of(asked.expires_in)?;
+    let upsert = asked.upsert.unwrap_or(false)
+        || q.upsert.unwrap_or(false)
+        || headers.get("x-upsert").and_then(|v| v.to_str().ok()) == Some("true");
+    let session_id = session_of(&data)?;
     let at = state
         .engine
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
     state.bucket(&data, &at, &bucket, &rid).await?;
     let key = state.urls.key(&rid).await?;
-    let exp = now() + ttl as u64;
+    let token_id = Uuid::new_v4();
+    let exp = state
+        .urls
+        .control()
+        .record_upload(token_id, data.key_id, &data.claims, now() + ttl as u64)
+        .await
+        .map_err(|e| crate::control::unreachable(e, &rid))?
+        .ok_or_else(|| Failure::unauthorized("the key or the user's session isn't live"))?;
     let claims = Claims {
         purpose: Purpose::Upload,
         database_id: at.database_id,
@@ -330,18 +412,13 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
         size: None,
         etag: None,
         content_type: None,
-        token_id: Uuid::new_v4(),
+        role: Some(data.role.clone()),
+        role_oid: data.role_oid,
+        session_id,
+        upsert,
+        token_id,
         exp,
     };
-    let recorded = state
-        .urls
-        .control()
-        .record_upload(claims.token_id, data.key_id, &data.claims, exp)
-        .await
-        .map_err(|e| crate::control::unreachable(e, &rid))?;
-    if !recorded {
-        return Err(Failure::unauthorized("the key isn't live"));
-    }
     let token = token::sign(key, &claims);
     let url = signed_url("upload/sign", &claims.bucket, &claims.name, &token);
     Ok(Json(json!({ "signed_url": url, "expires_at": exp })).into_response())
@@ -353,13 +430,14 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
     operation_id = "signedUpload",
     tag = "storage",
     summary = "Upload through a one-time URL",
-    description = "No key: the token is the credential, once. Streams the body as an upload by the URL's minter.",
+    description = "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters.",
     params(("bucket" = String, Path), ("name" = String, Path), SignedParams),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
+        (status = 400, description = "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters", body = StorageErrorEnvelope),
         (status = 401, description = "`invalid_token`, `token_expired`", body = StorageErrorEnvelope),
-        (status = 403, description = "`token_not_valid`: used already, another object's, or its key was revoked; `not_allowed`", body = StorageErrorEnvelope),
+        (status = 403, description = "`token_not_valid`: used already, another object's, its key was revoked or its role changed, or the app user's session ended; `not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`", body = StorageErrorEnvelope),
         (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
@@ -383,15 +461,18 @@ pub async fn signed_upload<S: ConnSource, M: ConnSource>(
         .consume_upload(claims.token_id)
         .await
         .map_err(|e| crate::control::unreachable(e, &rid))?;
-    let Some((key, minted)) = spent.filter(|(k, _)| key_still_reaches(k, &claims)) else {
-        return Err(Failure::token_refused());
-    };
-    let data = key.identity(minted);
+    let data = spent
+        .filter(|(k, _)| key_still_reaches(k, &claims))
+        .and_then(|(key, minted)| upload_identity(key, minted, &claims))
+        .ok_or_else(Failure::token_refused)?;
     let params = ObjectParams {
         database: Some(claims.database.clone()),
-        upsert: q.upsert,
+        upsert: Some(claims.upsert),
         download: None,
     };
+    // The URL's choice only: the uploader's `x-upsert` is dropped.
+    let mut headers = headers;
+    headers.remove("x-upsert");
     upload_as(
         &state,
         &data,
@@ -436,6 +517,10 @@ mod tests {
             size: Some(1),
             etag: None,
             content_type: None,
+            role: None,
+            role_oid: None,
+            session_id: None,
+            upsert: false,
             token_id: Uuid::new_v4(),
             exp: 10,
         };
@@ -466,5 +551,82 @@ mod tests {
         assert_eq!(token_failure(TokenError::Mismatch).0.status.as_u16(), 403);
         assert_eq!(token_failure(TokenError::Invalid).0.status.as_u16(), 401);
         assert_eq!(token_failure(TokenError::Expired).0.status.as_u16(), 401);
+    }
+
+    /// m6 audit B1, S3: a spent upload token's upload runs as the role it was minted with:
+    /// an app user's as `authenticated` with the user's claims (not the public key's `anon`),
+    /// only for the session its claims name; a key's only while the key still has that role.
+    #[test]
+    fn an_upload_runs_as_its_minting_identity() {
+        let key = crate::control::LiveKey {
+            key_id: Uuid::new_v4(),
+            branch_id: Uuid::new_v4(),
+            kind: chelabase_types::data_key::DataKeyKind::Public,
+            role: "anon".into(),
+            databases: None,
+            role_oid: None,
+        };
+        let sid = Uuid::new_v4();
+        let user = json!({ "sub": "u1", "sid": sid.to_string(), "role": "authenticated" });
+        let claims = Claims {
+            purpose: Purpose::Upload,
+            database_id: Uuid::new_v4(),
+            branch_id: key.branch_id,
+            database: "app".into(),
+            datoid: None,
+            key_id: key.key_id,
+            bucket: "b".into(),
+            name: "n".into(),
+            version_id: None,
+            size: None,
+            etag: None,
+            content_type: None,
+            role: Some("authenticated".into()),
+            role_oid: None,
+            session_id: Some(sid),
+            upsert: false,
+            token_id: Uuid::new_v4(),
+            exp: 10,
+        };
+        let data = upload_identity(key.clone(), user.clone(), &claims).expect("the user's upload");
+        assert_eq!((data.role.as_str(), data.role_oid, &data.claims), ("authenticated", None, &user));
+        // Another session's claims, or none, don't fit the token.
+        let other = json!({ "sub": "u1", "sid": Uuid::new_v4().to_string() });
+        assert!(upload_identity(key.clone(), other, &claims).is_none());
+        assert!(upload_identity(key.clone(), json!({}), &claims).is_none());
+        // A key's own token: its role (and OID) must still be the key's.
+        let own = Claims { role: Some("anon".into()), session_id: None, ..claims.clone() };
+        assert_eq!(upload_identity(key.clone(), json!({}), &own).unwrap().role, "anon");
+        let renamed = crate::control::LiveKey { role: "other".into(), ..key.clone() };
+        assert!(upload_identity(renamed, json!({}), &own).is_none());
+        let reoided = crate::control::LiveKey { role_oid: Some(5), ..key.clone() };
+        assert!(upload_identity(reoided, json!({}), &own).is_none());
+        // A key's token can't claim an app user's role, nor a token minted with no role.
+        let lifted = Claims { session_id: None, ..claims.clone() };
+        assert!(upload_identity(key.clone(), json!({}), &lifted).is_none());
+        assert!(upload_identity(key, json!({}), &Claims { role: None, ..own }).is_none());
+    }
+
+    /// An app user's request names its session (`sid`); a key's doesn't; an unreadable one
+    /// mints nothing.
+    #[test]
+    fn a_session_is_read_from_the_claims() {
+        let sid = Uuid::new_v4();
+        let mut data = DataIdentity {
+            branch_id: Uuid::new_v4(),
+            key_id: Uuid::new_v4(),
+            kind: chelabase_types::data_key::DataKeyKind::Public,
+            role: "authenticated".into(),
+            claims: json!({ "sid": sid.to_string() }),
+            databases: None,
+            project_id: None,
+            role_oid: None,
+            server_vouched: false,
+        };
+        assert_eq!(session_of(&data).unwrap(), Some(sid));
+        data.claims = json!({});
+        assert_eq!(session_of(&data).unwrap(), None);
+        data.claims = json!({ "sid": 7 });
+        assert_eq!(session_of(&data).unwrap_err().0.status.as_u16(), 401);
     }
 }
