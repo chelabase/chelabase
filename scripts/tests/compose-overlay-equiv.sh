@@ -9,7 +9,10 @@
 # removed the retired identity provider's services, files and settings on purpose, so REV is now
 # its last compose commit (1e8623ac). Its fix gave the workbench orchestrator the stack's setup
 # code, so REV is now that commit (402bb861). #128 merged, so REV is now its squash commit
-# (67156a23). At a REV with only docker-compose.yml, that file alone is the reference.
+# (67156a23). The object-storage epic (#93, #96, #99) changed the workbench stack on purpose
+# (SeaweedFS's file-held, scoped S3 identities, its storage bucket and gRPC mTLS, the storage
+# service, its internal token and the worker's blob sweeper), so REV is now its last compose
+# commit (a9e41cce). At a REV with only docker-compose.yml, that file alone is the reference.
 #
 #   scripts/tests/compose-overlay-equiv.sh [--env-file <stack.env>] [--rev <git rev>]
 #
@@ -29,8 +32,8 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
-# The last intended change of the workbench shape: auth-replacement (#128), squash-merged.
-rev=67156a23
+# The last intended change of the workbench shape: the object-storage epic's last compose commit.
+rev=a9e41cce
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;

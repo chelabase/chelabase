@@ -49,7 +49,7 @@ expect 'tools/bench-data-api/src/main.rs' $'rust=bench-data-api\nweb=none'
 expect 'services/gateway/src/lib.rs' $'rust=gateway\nweb=none'
 # A core crate selects most of the workspace; every leaf of the graph's roots selects it all.
 expect_has 'crates/chelabase-types/src/lib.rs' rust= chelabase-types orchestrator gateway chelabase
-expect $'crates/chelabase-types/src/lib.rs\ncrates/chelabase-http/src/lib.rs\ncrates/chelabase-secrets/src/lib.rs\ncrates/chelabase-typegen/src/lib.rs' $'rust=full\nweb=none'
+expect $'crates/chelabase-types/src/lib.rs\ncrates/chelabase-http/src/lib.rs\ncrates/chelabase-secrets/src/lib.rs\ncrates/chelabase-typegen/src/lib.rs\ncrates/chelabase-storage/src/lib.rs' $'rust=full\nweb=none'
 expect 'Cargo.lock' $'rust=full\nweb=none'
 expect 'pnpm-lock.yaml' $'rust=none\nweb=full'
 expect 'brand-new-dir/file.txt' $'rust=full\nweb=full'
