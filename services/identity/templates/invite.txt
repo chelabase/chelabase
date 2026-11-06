@@ -1,0 +1,10 @@
+Subject: You're invited to {{project}}
+
+You've been invited to {{project}}. Your invitation code is:
+
+    {{code}}
+
+Enter it to choose your password and finish joining. It expires in {{expires}} and works once.
+Enter it at: {{link}}
+
+If you weren't expecting this invitation, you can ignore this email.

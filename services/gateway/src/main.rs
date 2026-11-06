@@ -1,7 +1,6 @@
 //! Chelabase HTTP API gateway: the single front door on plain HTTP.
 
 use chelabase_auth::internal::InternalSigner;
-use chelabase_auth::JwtVerifier;
 use gateway::config::GatewayConfig;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
@@ -24,7 +23,6 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let config = GatewayConfig::from_env()?;
-    let verifier = JwtVerifier::from_env()?;
     let signer = InternalSigner::from_env()?;
     let registry = Arc::new(SharedRegistry::new(Registry::from_entry(&config.entry)));
     let keys = Arc::new(DataKeyResolver::new(&config.internal_url, &config.data_keys_token));
@@ -38,7 +36,14 @@ fn main() -> anyhow::Result<()> {
         &config.internal_url,
         &config.app_sessions_token,
     ));
-    let pipeline = Pipeline::new(registry, config.entry.studio_origin(), verifier, signer, keys, users);
+    // #119: member tokens signed by auth; unset, every member token is refused.
+    let members = chelabase_auth::member_token::MemberTokenVerifier::from_lookup(|name| std::env::var(name).ok())?;
+    match &members {
+        Some(m) => info!(kid = m.kid(), "member tokens are verified with CHELABASE_MEMBER_JWT_PUBLIC_KEY"),
+        None => tracing::warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: every bearer is refused"),
+    }
+    let pipeline = Pipeline::new(registry, config.entry.studio_origin(), signer, keys, users)
+        .with_member_tokens(members);
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under Compose (the workbench) or k8s a process manager restarts us,

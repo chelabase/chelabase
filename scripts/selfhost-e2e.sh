@@ -5,25 +5,29 @@
 # `just selfhost-e2e`.
 #
 #   1. render + up      a fresh `docker compose up --wait` from infra/compose
-#   2. healthy          every service is healthy or a one-shot that exited 0; with SMTP set (a
-#                      throwaway Mailpit, the password file at the documented owner and mode) the
-#                      bootstrap succeeded and Zitadel's SMTP configuration is active
+#   2. healthy          every service is healthy or a one-shot that exited 0 (SMTP set: a
+#                      throwaway Mailpit, the password file at the documented owner and mode)
 #   3. setup code       the code is in `logs init-secrets` and the documented command prints it
 #   4. code required    sign-up without the code, and with a wrong one, is 403 setup_code_invalid
-#   5. claim            sign-up with the code, sign-in, GET /v1/me: tenant admin and instance admin
+#   5. claim            the Acme example (docker-compose.example.yml's `example-seed`) claims the
+#                      instance with the code through sign-up, invites and admits every demo person
+#                      and seeds Acme; Ada signs in (the session cookie, then /auth/v1/token) and
+#                      GET /v1/me says tenant admin and instance admin; a second seed run skips
 #   6. claimed          the code no longer opens the instance, and sign-up is closed (403
 #                      sign_up_closed: open sign-up is off by default)
 #   7. data             create a project and a database through the API; the connection details
 #                      name the published proxy (<ep>.localtest.me, CHELABASE_PROXY_PORT); with the
 #                      CA fetched as the docs say, psql on the host (verify-full) creates and reads
 #                      a row, and SQL over HTTP on the host answers
-#   8. webhook          a signed Zitadel user.deactivated event is answered 200 (a bad signature 401)
+#   8. email            an invite by email reaches Mailpit through the identity service's SMTP
+#                      (the password file read at 10001:0600), with its code
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
 #  10. secret reads     every running service reads its mounted secrets as its own uid and groups
 #  11. rerun            a second `up --wait` changes no secret, container or log line of the code
 #  12. uninstall        the documented uninstall (computes still running) leaves no container,
 #                      volume or network
-#  13. failing install  in a second project, an SMTP host with no sender fails `up --wait` at init-bootstrap
+#  13. failing install  in a second project, an SMTP host with no sender fails `up --wait`: the
+#                      identity service refuses to start and names the missing setting
 #
 # Images: by default `-f docker-compose.build.yml` builds them from this checkout (the cache is
 # shared with `just images`). SELFHOST_E2E_IMAGES=local runs the base file on the images
@@ -48,6 +52,7 @@ PROJECT=""
 FAIL_PROJECT=""
 TORN_DOWN=1
 ADMIN_TOKEN=""
+ADMIN_JAR=""
 
 say() { echo "[$LOG_PREFIX] $*"; }
 pass() { echo "ok   $* ($((SECONDS - t0)) s)"; }
@@ -67,7 +72,7 @@ tail_logs() { # tail_logs <project>
   echo "---- docker compose ps -a ($p)" >&2
   compose "$p" ps -a >&2 2>&1 || true
   # Whatever is not healthy, plus the app tier, whose logs usually say why a step failed.
-  for svc in init-secrets init-bootstrap orchestrator auth gateway; do
+  for svc in init-secrets init-bootstrap identity orchestrator auth gateway example-seed; do
     echo "---- logs $svc (tail 12)" >&2
     { compose "$p" logs --no-color --tail 12 "$svc" 2>&1 | cut -c1-300 >&2; } || true
   done
@@ -184,7 +189,6 @@ write_env() {
     echo "CHELABASE_AUTH_HOST_NAME=auth.chelabase.localhost"
     echo "CHELABASE_PUBLIC_PORT=$port"
     echo "CHELABASE_PUBLIC_SECURE=false"
-    echo "CHELABASE_ZITADEL_TLS_MODE=disabled"
     echo "CHELABASE_CONTROL_SUBNET=10.$n.0.0/22"
     echo "CHELABASE_CONTROL_COMPUTE_RANGE=10.$n.2.0/23"
     echo "CHELABASE_ORCHESTRATOR_CONTROL_IP=10.$n.0.10"
@@ -218,7 +222,7 @@ EOF
       interval: 2s
       timeout: 5s
       retries: 30
-  init-bootstrap:
+  identity:
     depends_on:
       mailpit:
         condition: service_healthy
@@ -282,56 +286,48 @@ vol_cat() {
 
 # ---- the sign-in client (Studio's login API, no browser) -----------------------------------------
 
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-
-# authorize → an authRequest id from Zitadel's redirect to Studio's /login.
-authorize() {
-  local verifier challenge loc
-  verifier="$(openssl rand -hex 32)"
-  challenge="$(printf %s "$verifier" | openssl dgst -sha256 -binary | b64url)"
-  echo "$verifier" >"$tmp/verifier"
-  loc="$(curl -sS --max-time 30 -o /dev/null -w '%{redirect_url}' -G "$AUTH/oauth/v2/authorize" \
-    --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$STUDIO/callback" \
-    --data-urlencode "response_type=code" \
-    --data-urlencode "scope=openid profile email urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:${PROJECT_ID}:aud" \
-    --data-urlencode "code_challenge=$challenge" --data-urlencode "code_challenge_method=S256")" ||
-    die "authorize: no answer from $AUTH"
-  [[ "$loc" == "$STUDIO/login?authRequest="* ]] || die "authorize redirected to '$loc'"
-  echo "${loc#*authRequest=}"
-}
-
-# ui <path> <json>: Studio's login API through the gateway; body to stdout, status in $tmp/ui-status.
+# ui <path> <json> [jar]: Studio's login API through the gateway, as Studio sends it (Origin,
+# X-Chelabase-Studio); body to stdout, status in $tmp/ui-status. The jar keeps auth's cookies.
 ui() {
-  local out
-  out="$(curl -sS --max-time 30 -b "$tmp/jar" -c "$tmp/jar" -H "Origin: $STUDIO" -H 'Content-Type: application/json' \
-    -w '\n%{http_code}' -X POST "$API/auth/v1/$1" -d "$2")" || die "POST /auth/v1/$1: no answer"
+  local out jar="${3:-$tmp/jar}"
+  out="$(curl -sS --max-time 30 -b "$jar" -c "$jar" -H "Origin: $STUDIO" -H 'X-Chelabase-Studio: 1' \
+    -H 'Content-Type: application/json' -w '\n%{http_code}' -X POST "$API/auth/v1/$1" -d "$2")" || die "POST /auth/v1/$1: no answer"
   printf '%s' "${out##*$'\n'}" >"$tmp/ui-status"
   printf '%s' "${out%$'\n'*}"
 }
 
 sign_up() { # sign_up <email> [code]
   local body
-  body="$(jq -nc --arg ar "$(authorize)" --arg e "$1" --arg p "$PASSWORD" --arg c "${2:-}" \
-    '{authRequest: $ar, email: $e, givenName: "Self", familyName: "Host", password: $p} + (if $c == "" then {} else {setupCode: $c} end)')"
-  ui sign-up "$body"
+  body="$(jq -nc --arg e "$1" --arg p "$PASSWORD" --arg c "${2:-}" \
+    '{email: $e, givenName: "Self", familyName: "Host", password: $p} + (if $c == "" then {} else {setupCode: $c} end)')"
+  ui sign-up "$body" "$tmp/jar"
 }
 
-sign_in() { # sign_in <email> → an access token
-  local out code token
-  out="$(ui sign-in "$(jq -nc --arg ar "$(authorize)" --arg e "$1" --arg p "$PASSWORD" '{authRequest: $ar, email: $e, password: $p}')")"
-  [[ "$(jq -r '.next // empty' <<<"$out")" == done ]] || die "sign-in as $1: $(cat "$tmp/ui-status") $out"
-  code="$(jq -r .redirect <<<"$out" | sed -E 's/.*[?&]code=([^&]+).*/\1/')"
-  token="$(curl -sS --max-time 30 -X POST "$AUTH/oauth/v2/token" -d grant_type=authorization_code -d "code=$code" \
-    -d "redirect_uri=$STUDIO/callback" -d "client_id=$CLIENT" -d "code_verifier=$(cat "$tmp/verifier")" | jq -r .access_token)"
-  [[ -n "$token" && "$token" != null ]] || die "no access token for $1"
+# sign_in <email> <password> <jar>: a sign-in that must answer `studio`, its session in the jar.
+sign_in() {
+  local out
+  out="$(ui sign-in "$(jq -nc --arg e "$1" --arg p "$2" '{email: $e, password: $p}')" "$3")"
+  [[ "$(cat "$tmp/ui-status")" == 200 && "$(jq -r '.next // empty' <<<"$out")" == studio ]] ||
+    die "sign-in as $1: $(cat "$tmp/ui-status") $out"
+}
+
+# session_token <jar> → an access token minted from the jar's session (POST /auth/v1/token).
+session_token() {
+  local out token
+  out="$(curl -sS --max-time 30 -b "$1" -H "Origin: $STUDIO" -H 'X-Chelabase-Studio: 1' -X POST "$API/auth/v1/token")" ||
+    die "POST /auth/v1/token: no answer"
+  token="$(jq -r '.access_token // empty' <<<"$out" 2>/dev/null)"
+  [[ -n "$token" ]] || die "POST /auth/v1/token: $out"
   echo "$token"
 }
 
-# api <method> <path> [json]: the management API as the claimant; status to stdout, body in $tmp/body.
+# api <method> <path> [json]: the management API as the claimant (a fresh token from the claimant's
+# session each call: tokens are short-lived); status to stdout, body in $tmp/body.
 api() {
-  local args=(-sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X "$1" "$API$2" -H "Authorization: Bearer $ADMIN_TOKEN")
+  local args=(-sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X "$1" "$API$2")
   [[ -z "${3:-}" ]] || args+=(-H 'content-type: application/json' -d "$3")
-  curl "${args[@]}" || echo 000
+  ADMIN_TOKEN="$(session_token "$ADMIN_JAR")"
+  printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" | curl "${args[@]}" -H @- || echo 000
 }
 
 # ---- 1. render + up ------------------------------------------------------------------------------
@@ -346,7 +342,7 @@ docker run --rm --network none -v "$tmp:/w" --entrypoint sh "$FILE_HELPER" -c \
   'umask 077 && printf %s "$1" >/w/smtp.password && chown 10001:10001 /w/smtp.password && chmod 600 /w/smtp.password' sh "$SMTP_PASSWORD" ||
   die "writing the SMTP password file"
 [[ "$(stat -c %u:%a "$tmp/smtp.password")" == 10001:600 ]] || die "the SMTP password file is $(stat -c %u:%a "$tmp/smtp.password")"
-WITH_MAILPIT=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 \
+WITH_MAILPIT=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 CHELABASE_SMTP_TLS=none \
   CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password"
 PROXY_PORT="$(sed -n 's/^CHELABASE_PROXY_PORT=//p' "$tmp/$PROJECT.env")"
 PROXY_HTTP_PORT="$(sed -n 's/^CHELABASE_PROXY_HTTP_PORT=//p' "$tmp/$PROJECT.env")"
@@ -384,18 +380,6 @@ for one_shot in init-secrets init-bootstrap; do
 done
 pass "$n_services containers healthy or done; init-secrets and init-bootstrap exited 0"
 
-step "Zitadel's SMTP configuration is the install's and active"
-# Zitadel's admin API with the bootstrap's PAT, from inside the orchestrator (the PAT goes to
-# curl in its config on stdin, never its command line); Zitadel's instance is the auth host.
-compose "$PROJECT" exec -T orchestrator sh -c '
-  printf "header = \"Authorization: Bearer %s\"\n" "$(cat /run/chelabase/secrets/zitadel-pats/admin.pat)" |
-    curl -sS --max-time 30 -K - -X POST -H "Host: $1" -H "content-type: application/json" -d "{}" \
-      http://zitadel:8080/admin/v1/smtp/_search' sh "auth.chelabase.localhost:$PORT" >"$tmp/smtp.json" 2>&1 ||
-  die "listing Zitadel's SMTP configurations: $(cat "$tmp/smtp.json")"
-jq -e 'any(.result[]?; .host == "mailpit:1025" and .state == "SMTP_CONFIG_ACTIVE" and .senderAddress == "chelabase@example.com")' \
-  "$tmp/smtp.json" >/dev/null || die "no active SMTP configuration for mailpit:1025: $(jq -c '[.result[]? | {host, state}]' "$tmp/smtp.json" 2>&1 || cat "$tmp/smtp.json")"
-pass "SMTP mailpit:1025 is active (the password file was read at 10001:0600)"
-
 # ---- 3. setup code -------------------------------------------------------------------------------
 
 step "the setup code is in the init-secrets logs"
@@ -416,11 +400,6 @@ curl -fsS --max-time 30 "$API/auth/v1/instance" >"$tmp/instance.json" || die "GE
 [[ "$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$API/_gateway/ready")" == 200 ]] || die "/_gateway/ready is not 200"
 pass "setupRequired is true, Studio answers 200, the gateway is ready"
 
-PROJECT_ID="$(vol_cat bootstrap/ids/project-id | tr -d '\r\n')"
-CLIENT="$(vol_cat bootstrap/ids/studio-client-id | tr -d '\r\n')"
-ORG_ID="$(vol_cat bootstrap/ids/org-id | tr -d '\r\n')"
-[[ -n "$PROJECT_ID" && -n "$CLIENT" && -n "$ORG_ID" ]] || die "the bootstrap's ids are missing from the secrets volume"
-
 # ---- 4. the code is required ---------------------------------------------------------------------
 
 step "sign-up without the code, and with a wrong one, is refused"
@@ -439,18 +418,49 @@ for attempt in none wrong; do
 done
 pass "no code and a wrong code both 403 setup_code_invalid"
 
-# ---- 5. claim ------------------------------------------------------------------------------------
+# ---- 5. claim: the Acme example -----------------------------------------------------------------
 
-step "claim the instance with the code"
-out="$(sign_up "$EMAIL" "$CODE")"
-[[ "$(cat "$tmp/ui-status")" == 200 ]] || die "sign-up with the code: $(cat "$tmp/ui-status") $out"
-ADMIN_TOKEN="$(sign_in "$EMAIL")"
+step "the Acme example claims the instance with the code and seeds it"
+# The example overlay as the docs run it, on the image init-secrets runs (built from this
+# checkout, or the local release image): the seed is `chelabase-init example`.
+INIT_IMAGE="$(jq -r '.services["init-secrets"].image' "$tmp/config.json")"
+[[ -n "$INIT_IMAGE" && "$INIT_IMAGE" != null ]] || die "no init-secrets image in the rendered config"
+printf 'services:\n  example-seed:\n    image: %s\n    pull_policy: never\n' "$INIT_IMAGE" >"$tmp/example-image.yml"
+seed() { # seed <log file>: one run of the example seed
+  docker compose -p "$PROJECT" --project-directory "$dir" "${COMPOSE_FILES[@]}" -f "$tmp/$PROJECT.override.yml" \
+    -f "$dir/docker-compose.example.yml" -f "$tmp/example-image.yml" --env-file "$tmp/$PROJECT.env" \
+    run --rm --no-deps example-seed >"$1" 2>&1
+}
+seed "$tmp/seed.log" || { tail -n 30 "$tmp/seed.log" >&2; die "the example seed failed"; }
+grep -q 'example: acme: .* writes\. Acme/' "$tmp/seed.log" || { tail -n 30 "$tmp/seed.log" >&2; die "the seed didn't finish Acme"; }
+grep -qE 'code=|[?&]t=|Bearer|eyJ' "$tmp/seed.log" && die "the seed log carries a code, a token or an invite link"
+grep -qF "$CODE" "$tmp/seed.log" && die "the seed log prints the setup code"
+DEMO_PASSWORD="$(sed -nE 's/.*these accounts all sign in with the password (.+)$/\1/p' "$tmp/seed.log" | head -n1)"
+[[ -n "$DEMO_PASSWORD" ]] || die "the seed log names no demo password"
+EMAIL="ada@acme.example"
+ADMIN_JAR="$tmp/ada.jar"
+sign_in "$EMAIL" "$DEMO_PASSWORD" "$ADMIN_JAR"
 status="$(api GET /v1/me)"
 [[ "$status" == 200 ]] || die "GET /v1/me: $status $(cat "$tmp/body")"
 jq -e --arg e "$EMAIL" '.member.tenant_admin == true and .instance_admin == true and .tenant_id != null and .email == $e' "$tmp/body" >/dev/null ||
-  die "the claimant is not tenant admin of a bound tenant: $(jq -c '{email, member, instance_admin, tenant_id}' "$tmp/body")"
+  die "Ada is not tenant admin of a bound tenant: $(jq -c '{email, member, instance_admin, tenant_id}' "$tmp/body")"
 TENANT_ID="$(jq -r .tenant_id "$tmp/body")"
-pass "the claimant signed in and is tenant admin (tenant $TENANT_ID)"
+# Every demo person (crates/chelabase-init/src/example/people.rs) is an active member, and Acme exists.
+want_people="$(grep -cE '^\s+email: "[a-z]+@acme\.example",' "$root/crates/chelabase-init/src/example/people.rs")"
+status="$(api GET /v1/members)"
+[[ "$status" == 200 ]] || die "GET /v1/members: $status"
+active="$(jq '[.[] | select((.email // "") | endswith("@acme.example")) | select(.status == "active")] | length' "$tmp/body")"
+[[ "$active" == "$want_people" ]] || die "$active of $want_people demo people are active members"
+status="$(api GET /v1/projects)"
+[[ "$status" == 200 ]] && jq -e 'any((if type == "array" then . else .projects end)[]; .name == "Acme")' "$tmp/body" >/dev/null ||
+  die "no project Acme: $status $(head -c 300 "$tmp/body")"
+# Bea, a demo person the seed admitted through an invite, signs in with the demo password.
+sign_in "bea@acme.example" "$DEMO_PASSWORD" "$tmp/bea.jar"
+session_token "$tmp/bea.jar" >/dev/null
+seed "$tmp/seed2.log" || { tail -n 30 "$tmp/seed2.log" >&2; die "the second example seed failed"; }
+grep -q 'already complete on this instance: skipped, 0 writes' "$tmp/seed2.log" ||
+  { tail -n 20 "$tmp/seed2.log" >&2; die "the second seed run didn't skip"; }
+pass "the example claimed the instance as $EMAIL (tenant $TENANT_ID), admitted $active demo people and seeded Acme; a second run skipped with 0 writes"
 
 step "the claimed instance no longer takes the code, and sign-up is closed"
 [[ "$(curl -fsS --max-time 30 "$API/auth/v1/instance" | jq -r .setupRequired)" == false ]] || die "setupRequired is still true after the claim"
@@ -464,7 +474,7 @@ for code in "$CODE" ""; do
 done
 status="$(api GET /v1/members)"
 [[ "$status" == 200 ]] || die "GET /v1/members: $status"
-[[ "$(jq '[.[] | select(.tenant_admin == true)] | length' "$tmp/body")" == 1 ]] || die "expected exactly one tenant admin: $(cat "$tmp/body")"
+jq -e --arg e "$EMAIL" 'any(.[]; .email == $e and .tenant_admin == true)' "$tmp/body" >/dev/null || die "Ada isn't a tenant admin in the member list"
 pass "setupRequired is false; a second sign-up (with the used code or none) is 403 sign_up_closed"
 
 # ---- 7. a project and a database, through the proxy ----------------------------------------------
@@ -528,26 +538,31 @@ out="$(curl -sS --max-time 30 --resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1" --
   die "SQL over HTTP at $http_url: ${out##*$'\n'} $(head -c 300 <<<"${out%$'\n'*}")"
 pass "from the host: psql (verify-full, the CA from docker compose cp) created and read a row; SQL over HTTP read it"
 
-# ---- 8. the Zitadel webhook ----------------------------------------------------------------------
+# ---- 8. email through the identity service's SMTP ---------------------------------------------
 
-step "a signed Zitadel user.deactivated event is answered 200"
-signing_key="$(vol_cat bootstrap/actions-signing-key | tr -d '\r\n')"
-[[ -n "$signing_key" ]] || die "no Actions signing key in the bootstrap outputs"
-event_body="$(jq -nc --arg org "$ORG_ID" '{aggregateID: "999999999999", aggregateType: "user", resourceOwner: $org, instanceID: "i1",
-  event_type: "user.deactivated", created_at: (now | todate), userID: "999999999999"}')"
-post_event() { # post_event <signature header or ''>
-  local args=(-sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8083/internal/zitadel/events
-    -H 'content-type: application/json' -d "$event_body")
-  [[ -z "$1" ]] || args+=(-H "zitadel-signature: $1")
-  compose "$PROJECT" exec -T orchestrator curl "${args[@]}"
-}
-ts="$(date +%s)"
-sig="t=$ts,v1=$(printf '%s.%s' "$ts" "$event_body" | openssl dgst -sha256 -hmac "$signing_key" -hex | sed 's/^.* //')"
-status="$(post_event "$sig")" || die "could not post to the orchestrator"
-[[ "$status" == 200 ]] || die "a correctly signed user.deactivated event: $status (wanted 200)"
-status="$(post_event "t=$ts,v1=$(printf '0%.0s' $(seq 64))")" || die "could not post to the orchestrator"
-[[ "$status" == 401 ]] || die "a wrongly signed event: $status (wanted 401)"
-pass "the signed event is 200, a bad signature is 401"
+step "an invite by email reaches Mailpit with its code"
+status="$(api GET /v1/invites/delivery)"
+[[ "$status" == 200 && "$(jq -c . "$tmp/body")" == '{"email_available":true,"reason":null}' ]] ||
+  die "invites can't be emailed: $status $(cat "$tmp/body")"
+INVITEE="invitee-$(openssl rand -hex 3)@example.com"
+status="$(api POST /v1/invites "$(jq -nc --arg e "$INVITEE" '{email: $e, grants: [], delivery: "email"}')")"
+[[ "$status" == 201 ]] || die "POST /v1/invites (email): $status $(cat "$tmp/body")"
+# Mailpit isn't published: its API is read from inside the orchestrator's container.
+mail=""
+deadline=$((SECONDS + 30))
+while ((SECONDS < deadline)); do
+  mail="$(compose "$PROJECT" exec -T orchestrator curl -sS --max-time 10 -G --data-urlencode "query=to:$INVITEE" \
+    http://mailpit:8025/api/v1/search 2>/dev/null |
+    jq -r '.messages[0].ID // empty' 2>/dev/null || true)"
+  [[ -z "$mail" ]] || break
+  sleep 1
+done
+[[ -n "$mail" ]] || die "no invite mail to $INVITEE in Mailpit after 30 s"
+compose "$PROJECT" exec -T orchestrator curl -sS --max-time 10 "http://mailpit:8025/api/v1/message/$mail" | jq -r .Text | tr -d '\r' >"$tmp/invite.txt" ||
+  die "reading the invite mail"
+grep -qE '^[[:space:]]+[0-9]{6}[[:space:]]*$' "$tmp/invite.txt" || die "the invite mail carries no six-digit code"
+grep -qF "$STUDIO/accept-invite?user=" "$tmp/invite.txt" || die "the invite mail has no accept link to $STUDIO"
+pass "the invite mail reached Mailpit (SMTP with the password file at 10001:0600), with a code and the accept link"
 
 # ---- 9. no secret in docker inspect --------------------------------------------------------------
 
@@ -556,9 +571,9 @@ step "no secret value appears in any container's docker inspect"
 # non-empty line of 12+ characters that is not PEM framing, tagged with its file name.
 docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s:ro" --entrypoint sh "$HELPER" -c '
   cd /s
-  for f in $(find . -type f \( -name "*.password" -o -name "*.token" -o -name "*.jwt" -o -name masterkey \
-      -o -name access-key -o -name secret-key -o -name setup.code -o -name secrets.key -o -name actions-signing-key \
-      -o -name admin.pat -o -name ticket.key -o -name "*.pem" \) ! -name "*.pub.pem" ! -name "*.pub"); do
+  for f in $(find . -type f \( -name "*.password" -o -name "*.token" -o -name "*.jwt" -o -name "*.key" \
+      -o -name access-key -o -name secret-key -o -name setup.code -o -name secret -o -name "*.pem" \) \
+      ! -name "*.pub.pem" ! -name "*.pub" ! -name ca.crt); do
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in "" | -----*) continue ;; esac
       [ "${#line}" -ge 12 ] && printf "%s\t%s\n" "$f" "$line"
@@ -617,19 +632,11 @@ done
 ((checked >= 15)) || die "only $checked services with secrets were checked"
 pass "$checked running services read all their mounted secrets as their own uid and groups"
 
-step "Zitadel's PATs are 0600 and auth starts without a mode warning"
-# Zitadel creates a PAT 0644 unless the file exists; init-secrets makes them 0600 first.
-modes="$(docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s:ro" --entrypoint stat "$HELPER" \
-  -c '%a:%u %n' /s/zitadel-pats/admin.pat /s/zitadel-pats/login-client.pat)" || die "stat of the PATs failed"
-open_pats="$(grep -v '^600:10001 ' <<<"$modes" || true)"
-[[ -z "$open_pats" ]] || die "a Zitadel PAT is not 0600 and the app user's: $(tr '\n' ' ' <<<"$open_pats")"
-for f in admin.pat login-client.pat; do
-  [[ -n "$(vol_cat "zitadel-pats/$f" | tr -d '[:space:]')" ]] || die "zitadel-pats/$f is empty: Zitadel did not write it"
-done
+step "auth starts without a mode warning"
 if compose "$PROJECT" logs --no-color auth 2>&1 | grep -F 'readable by other users'; then
   die "auth warns that a secret it reads is readable by other users"
 fi
-pass "both PATs are 0600, owned by 10001 and written; auth logs no mode warning"
+pass "auth logs no mode warning"
 
 # ---- 11. a rerun changes nothing -----------------------------------------------------------------
 
@@ -672,16 +679,17 @@ fi
 
 # ---- 13. a failing install -----------------------------------------------------------------------
 
-step "an SMTP host with no sender fails up --wait at init-bootstrap"
+step "an SMTP host with no sender fails up --wait at the identity service"
 FAIL_PROJECT="chelabase-selfhost-e2e-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 write_env "$FAIL_PROJECT" "$(free_port)" "CHELABASE_SMTP_HOST=smtp.example.com"
 UP_ARGS=(up -d --wait --wait-timeout 300)
 [[ -n "${SELFHOST_E2E_IMAGES:-}" ]] && UP_ARGS+=(--pull never) || UP_ARGS+=(--build)
 if compose_up "$FAIL_PROJECT"; then die "up --wait succeeded with CHELABASE_SMTP_HOST set and no CHELABASE_SMTP_FROM"; fi
-grep -q 'init-bootstrap' "$tmp/$FAIL_PROJECT.up" || { tail -n 20 "$tmp/$FAIL_PROJECT.up" >&2; die "the failure does not name init-bootstrap"; }
-exit_code="$(compose "$FAIL_PROJECT" ps -a --format json | jq -rs '.[] | select(.Service == "init-bootstrap") | .ExitCode')"
-[[ "$exit_code" == 1 ]] || die "init-bootstrap exit code is '$exit_code' (wanted 1)"
-pass "up --wait failed naming init-bootstrap (exit 1): $(grep -m1 -E "init-bootstrap.*(exit|didn)" "$tmp/$FAIL_PROJECT.up" || echo "see log")"
+grep -q 'identity' "$tmp/$FAIL_PROJECT.up" || { tail -n 20 "$tmp/$FAIL_PROJECT.up" >&2; die "the failure does not name the identity service"; }
+compose "$FAIL_PROJECT" logs --no-color identity >"$tmp/fail-identity.log" 2>&1 || true
+grep -qF 'CHELABASE_SMTP_HOST is set without CHELABASE_SMTP_FROM' "$tmp/fail-identity.log" ||
+  { tail -n 20 "$tmp/fail-identity.log" >&2; die "the identity service doesn't name the missing CHELABASE_SMTP_FROM"; }
+pass "up --wait failed at the identity service, which names CHELABASE_SMTP_FROM"
 uninstall "$FAIL_PROJECT" >"$tmp/uninstall-fail.log" 2>&1 || { tail -n 20 "$tmp/uninstall-fail.log" >&2; die "the documented uninstall failed"; }
 nothing_left "$FAIL_PROJECT"
 pass "$FAIL_PROJECT: no containers, volumes or networks left"

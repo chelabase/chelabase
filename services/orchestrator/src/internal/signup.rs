@@ -2,15 +2,22 @@
 //! `CHELABASE_APP_AUTH_INTERNAL_TOKEN`, like `/internal/app/*`). Every body is JSON, so the
 //! setup code and the claim nonce never go in a URL.
 //!
-//! - `POST /internal/signup/check {org, setup_code?}`: may a visitor create an account in this
-//!   Zitadel org? A tenant with a member follows its open sign-up switch and ignores any code.
+//! - `POST /internal/signup/check {setup_code?}`: may a visitor create an account in the
+//!   instance's tenant ([`InternalState::tenant`], the seeded one)? A tenant with a member
+//!   follows its open sign-up switch and ignores any code.
 //!   A member-less tenant (a fresh install) takes a sign-up only with the setup code that
 //!   `chelabase-init secrets` printed (`CHELABASE_SETUP_CODE_FILE`); without a configured code
 //!   it takes none (fail closed). The right code also gets a one-time claim nonce.
-//! - `POST /internal/signup/claimed {org, user_id, nonce}`: after it created the Zitadel user,
-//!   `auth` binds the tenant's claim to it by spending the nonce ([`MetadataClient::claim_setup`]).
-//!   Only that user's first request then claims the tenant admin ([`MetadataClient::admit_member`]).
-//!   The bearer alone binds nothing: a claim needs a nonce, which only the code gets.
+//! - `POST /internal/signup/claimed {user_id, nonce}`: after it created the identity user,
+//!   `auth` binds the tenant's claim to it by spending the nonce ([`MetadataClient::claim_setup`]),
+//!   and that user becomes the tenant admin ([`MetadataClient::admit_member`]). A member token
+//!   never makes a row, so this is where it is made. The bearer alone binds nothing: a claim
+//!   needs a nonce, which only the code gets.
+//! - `POST /internal/signup/joined {user_id}`: the same for an open sign-up, whose row is
+//!   `pending` until an admin approves it. It asks the gate's question again, and writes no row
+//!   for a user whose email isn't verified.
+//! - `POST /internal/members/active {user_id}`: the tenants a person is an active or pending
+//!   member of. `auth` chooses a sign-in's tenant from it and re-reads it before minting.
 //!
 //! [`MetadataClient::claim_setup`]: chelabase_metadata::MetadataClient::claim_setup
 //! [`MetadataClient::admit_member`]: chelabase_metadata::MetadataClient::admit_member
@@ -22,7 +29,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use chelabase_metadata::members::SetupClaimOutcome;
+use chelabase_identity::{Identity, IdentityError, Missing, Pool, User};
+use chelabase_metadata::members::{Admission, MemberStatus, SetupClaimOutcome};
 use chelabase_neon::ComputeLocator;
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::mode_policy::SignUpRule;
@@ -108,8 +116,6 @@ pub fn load_setup_code(path: Option<&str>) -> Option<SetupCode> {
 #[derive(Deserialize)]
 pub(super) struct CheckBody {
     #[serde(default)]
-    org: String,
-    #[serde(default)]
     setup_code: Option<String>,
 }
 
@@ -120,8 +126,8 @@ fn answer(allowed: bool, reason: &str, setup_required: bool) -> Response {
 
 /// `{"allowed", "reason", "setup_required", "claim_nonce"?}`; `reason` is `open`,
 /// `first_member` (with `claim_nonce`), `closed`, `setup_code_invalid` or `platform`.
-/// `setup_required` is true while a member-less tenant waits for the code. A Zitadel org no
-/// tenant owns is `closed`.
+/// `setup_required` is true while a member-less tenant waits for the code. A missing tenant is
+/// `closed`.
 ///
 /// "Member-less" is the tenant having no invited, pending, active or suspended member (only
 /// `removed` ones, or none): once anyone is in, the code is dead. Two concurrent sign-ups with
@@ -138,7 +144,7 @@ where
     if state.policy.sign_up() == SignUpRule::Refused {
         return answer(false, "platform", false);
     }
-    let facts = match state.metadata.signup_facts(&b.org).await {
+    let facts = match state.metadata.signup_facts(state.tenant).await {
         Ok(Some(f)) => f,
         Ok(None) => return answer(false, "closed", false),
         Err(e) => {
@@ -156,7 +162,7 @@ where
     match b.setup_code.as_deref() {
         Some(presented) if code.matches(presented) => {}
         Some(_) => {
-            info!(org = %b.org, "sign-up gate: wrong setup code");
+            info!(tenant = %state.tenant, "sign-up gate: wrong setup code");
             return answer(false, "setup_code_invalid", true);
         }
         None => return answer(false, "setup_code_invalid", true),
@@ -167,7 +173,7 @@ where
         return ApiError::internal().into_response();
     }
     let hash: [u8; 32] = Sha256::digest(nonce).into();
-    match state.metadata.insert_setup_nonce(&b.org, hash, SETUP_NONCE_TTL).await {
+    match state.metadata.insert_setup_nonce(state.tenant, hash, SETUP_NONCE_TTL).await {
         Ok(true) => {}
         Ok(false) => return answer(false, "closed", false),
         Err(e) => {
@@ -175,7 +181,7 @@ where
             return ApiError::internal().into_response();
         }
     }
-    info!(org = %b.org, "sign-up gate: setup code accepted, claim nonce issued");
+    info!(tenant = %state.tenant, "sign-up gate: setup code accepted, claim nonce issued");
     Json(json!({
         "allowed": true,
         "reason": "first_member",
@@ -189,8 +195,6 @@ where
 /// refused like wrong ones.
 #[derive(Deserialize)]
 pub(super) struct ClaimedBody {
-    #[serde(default)]
-    org: String,
     #[serde(default)]
     user_id: String,
     #[serde(default)]
@@ -217,9 +221,25 @@ fn unavailable(what: &str) -> Response {
     .into_response()
 }
 
-/// A Zitadel user id: it goes into Zitadel URL paths, so only its exact shape is passed on.
+/// An identity user id: a UUID, as every id of the service's is.
 fn is_user_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
+    uuid::Uuid::parse_str(id).is_ok_and(|u| u.hyphenated().to_string() == id)
+}
+
+/// The identity user, or `None` for a definite not-found.
+async fn identity_user(identity: &Identity, id: &str) -> Result<Option<User>, IdentityError> {
+    match identity.get_user(&Pool::Members, id).await {
+        Ok(user) => Ok(Some(user)),
+        Err(IdentityError::NotFound(Missing::User)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The identity user an open sign-up may write a row for: `None` for a definite not-found and
+/// for an unverified email. A `pending` row shows in the admins' request list and takes its
+/// address from other rows (`release_email`), so it waits until the address is proven.
+async fn joinable_user(identity: &Identity, id: &str) -> Result<Option<User>, IdentityError> {
+    Ok(identity_user(identity, id).await?.filter(|user| user.email_verified))
 }
 
 /// The nonce's SHA-256, for a nonce of exactly the shape `check` hands out (64 hex digits).
@@ -228,15 +248,15 @@ fn nonce_hash(nonce: &str) -> Option<[u8; 32]> {
     Some(Sha256::digest(bytes).into())
 }
 
-/// Binds the tenant's claim to `user_id`: 200 `{"bound": true}`; 200 `{"bound": false}` when
-/// the tenant already has an admin or a live claim of another user (the account stays, and
-/// waits as a newcomer); 403 `setup_code_invalid` (nothing written) for a missing, malformed,
-/// expired, spent or other org's nonce, a user that isn't in the org, platform mode, or no
-/// configured setup code; 503 when Zitadel can't be asked. `auth` deletes the account it
-/// just made on anything but a 200.
+/// Binds the tenant's claim to `user_id` and writes their member row: 200 `{"bound": true}`,
+/// the tenant admin; 200 `{"bound": false}` when the tenant already has an admin or a live
+/// claim of another user (the account stays, as a `pending` member); 403 `setup_code_invalid`
+/// (nothing written) for a missing, malformed, expired, spent or other tenant's nonce, an unknown
+/// user, platform mode, or no configured setup code; 503 when identity can't be asked. `auth`
+/// deletes the account it just made on anything but a 200.
 ///
-/// The user must exist in Zitadel in `org`. A claim of another user is replaced only when that
-/// user has no member row and Zitadel no longer has it (a stale claim), or the install would
+/// The user must exist in the members pool. A claim of another user is replaced only when that
+/// user has no member row and identity no longer has it (a stale claim), or the install would
 /// be locked out for good.
 pub(super) async fn claimed<M, L>(
     State(state): State<Arc<InternalState<M, L>>>,
@@ -255,18 +275,18 @@ where
     let Some(hash) = nonce_hash(&b.nonce) else {
         return refused("no or a malformed nonce");
     };
-    if !is_user_id(&b.user_id) || b.org.is_empty() {
-        return refused("malformed user or org");
+    if !is_user_id(&b.user_id) {
+        return refused("malformed user");
     }
-    let Some(zitadel) = &state.zitadel else {
-        return unavailable("no Zitadel admin client to check the user");
+    let Some(identity) = &state.identity else {
+        return unavailable("no identity client to check the user");
     };
-    match zitadel.get_user(&b.user_id).await {
-        Ok(Some(u)) if u.org_id == b.org => {}
-        Ok(_) => return refused("the user is not in the org"),
-        Err(e) => return unavailable(&format!("Zitadel lookup failed: {e}")),
-    }
-    let current = match state.metadata.setup_claim(&b.org).await {
+    let user = match identity_user(identity, &b.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return refused("no such user"),
+        Err(e) => return unavailable(&format!("identity lookup failed: {e}")),
+    };
+    let current = match state.metadata.setup_claim(state.tenant).await {
         Ok(c) => c,
         Err(e) => {
             error!("setup claim: {e}");
@@ -274,40 +294,139 @@ where
         }
     };
     let replace = match current {
-        Some(c) if c.zitadel_user_id != b.user_id && !c.has_member_row => {
-            if !is_user_id(&c.zitadel_user_id) {
-                None
+        Some(c) if c.identity_user_id != b.user_id && !c.has_member_row => {
+            if !is_user_id(&c.identity_user_id) {
+                // A claim from before the identity service (not one of its ids): that user can
+                // never sign in again.
+                Some(c.identity_user_id)
             } else {
                 // Only a definite not-found is "gone"; an unreadable answer fails closed.
-                match zitadel.user_is_gone(&c.zitadel_user_id).await {
-                    Ok(true) => Some(c.zitadel_user_id),
-                    Ok(false) => None,
-                    Err(e) => return unavailable(&format!("Zitadel lookup failed: {e}")),
+                match identity_user(identity, &c.identity_user_id).await {
+                    Ok(None) => Some(c.identity_user_id),
+                    Ok(Some(_)) => None,
+                    Err(e) => return unavailable(&format!("identity lookup failed: {e}")),
                 }
             }
         }
         _ => None,
     };
-    match state
+    let outcome = state
         .metadata
-        .claim_setup(&b.org, hash, &b.user_id, replace.as_deref())
-        .await
-    {
+        .claim_setup(state.tenant, hash, &b.user_id, replace.as_deref())
+        .await;
+    let admission = match outcome {
         Ok(Some(SetupClaimOutcome::Bound)) => {
-            info!(org = %b.org, user = %b.user_id, replaced = replace.is_some(), "setup claim bound");
-            Json(json!({"bound": true})).into_response()
+            info!(tenant = %state.tenant, user = %b.user_id, replaced = replace.is_some(), "setup claim bound");
+            Admission::Closed
         }
         Ok(Some(SetupClaimOutcome::AlreadyClaimed)) => {
-            info!(org = %b.org, user = %b.user_id, "setup claim: already claimed, the account waits as a newcomer");
-            Json(json!({"bound": false})).into_response()
+            info!(tenant = %state.tenant, user = %b.user_id, "setup claim: already claimed, the account waits as a newcomer");
+            Admission::Pending
         }
-        Ok(Some(SetupClaimOutcome::Refused)) => refused("no live nonce of this org"),
-        Ok(None) => refused("no tenant owns the org"),
+        Ok(Some(SetupClaimOutcome::Refused)) => return refused("no live nonce of this tenant"),
+        Ok(None) => return refused("the tenant doesn't exist"),
         Err(e) => {
             error!("setup claim: {e}");
+            return ApiError::internal().into_response();
+        }
+    };
+    let admit = |admission| {
+        state.metadata.admit_sign_up(state.tenant, &b.user_id, &user.email, &user.name, admission)
+    };
+    let mut admitted = admit(admission).await;
+    // An admin appeared between the bind and the row: they wait like any other newcomer.
+    if matches!(admitted, Ok(None)) && admission == Admission::Closed {
+        admitted = admit(Admission::Pending).await;
+    }
+    match admitted {
+        Ok(status) => Json(json!({"bound": status == Some(MemberStatus::Active)})).into_response(),
+        Err(e) => {
+            error!("setup claim: writing the member row: {e}");
             ApiError::internal().into_response()
         }
     }
+}
+
+#[derive(Deserialize)]
+pub(super) struct JoinedBody {
+    #[serde(default)]
+    user_id: String,
+}
+
+/// Writes the `pending` row of a user who signed up while the tenant is open: 200
+/// `{"joined": true}`. 200 `{"joined": false}` (nothing written) in platform mode, for a tenant
+/// that isn't open now or has no member yet (the setup claim's business), for a missing tenant
+/// or user, and for a user whose email isn't verified. 503 when identity can't be asked.
+/// `auth` deletes the account unless `joined`. With verification on, `auth` asks only once the
+/// email is verified (m11's verify-email).
+pub(super) async fn joined<M, L>(
+    State(state): State<Arc<InternalState<M, L>>>,
+    Json(b): Json<JoinedBody>,
+) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let no = || Json(json!({"joined": false})).into_response();
+    if state.policy.sign_up() == SignUpRule::Refused || !is_user_id(&b.user_id) {
+        return no();
+    }
+    match state.metadata.signup_facts(state.tenant).await {
+        Ok(Some(f)) if f.open && f.has_members => {}
+        Ok(_) => return no(),
+        Err(e) => {
+            error!("sign-up join: {e}");
+            return ApiError::internal().into_response();
+        }
+    }
+    let Some(identity) = &state.identity else {
+        return unavailable("no identity client to check the user");
+    };
+    let user = match joinable_user(identity, &b.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return no(),
+        Err(e) => return unavailable(&format!("identity lookup failed: {e}")),
+    };
+    match state
+        .metadata
+        .admit_sign_up(state.tenant, &b.user_id, &user.email, &user.name, Admission::Pending)
+        .await
+    {
+        Ok(status) => Json(json!({"joined": status.is_some()})).into_response(),
+        Err(e) => {
+            error!("sign-up join: writing the member row: {e}");
+            ApiError::internal().into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ActiveBody {
+    #[serde(default)]
+    user_id: String,
+}
+
+/// `{"active": [tenant…], "pending": [tenant…]}`, each ordered by tenant id. Empty lists for a
+/// person with neither: a suspended, removed or invited member is in neither.
+pub(super) async fn active<M, L>(
+    State(state): State<Arc<InternalState<M, L>>>,
+    Json(b): Json<ActiveBody>,
+) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let rows = match state.metadata.member_tenants(&b.user_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("member tenants: {e}");
+            return ApiError::internal().into_response();
+        }
+    };
+    let of = |want: MemberStatus| {
+        rows.iter().filter(|(_, s)| *s == want).map(|(t, _)| t.as_uuid()).collect::<Vec<_>>()
+    };
+    Json(json!({"active": of(MemberStatus::Active), "pending": of(MemberStatus::Pending)})).into_response()
 }
 
 #[cfg(test)]
@@ -368,14 +487,32 @@ mod tests {
         assert!(load_setup_code(good.to_str()).unwrap().matches(CODE));
     }
 
+    // #121 audit S1: an address nobody proved gets no `pending` row, so it can't squat an
+    // email in the admin's request list.
+    #[tokio::test]
+    async fn only_a_verified_user_may_join() {
+        use chelabase_identity::mock::FakeIdentity;
+        let mock = FakeIdentity::start().await;
+        let verified = mock.with_user(&Pool::Members, "a@x.com", "password1");
+        let unverified = mock.with_unverified_user(&Pool::Members, "b@x.com", "password1");
+        let identity = mock.client();
+        let joinable = joinable_user(&identity, &verified).await.unwrap();
+        assert_eq!(joinable.map(|u| u.id), Some(verified));
+        assert!(joinable_user(&identity, &unverified).await.unwrap().is_none(), "unverified");
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert!(joinable_user(&identity, &unknown).await.unwrap().is_none(), "unknown");
+        mock.set_down(true);
+        assert!(joinable_user(&identity, &unknown).await.is_err(), "unreadable is not a no");
+    }
+
     #[test]
     fn nonces_and_user_ids_have_one_shape() {
         assert!(nonce_hash(&"ab".repeat(32)).is_some());
         for bad in ["", "ab", &"ab".repeat(33), &"zz".repeat(32)] {
             assert!(nonce_hash(bad).is_none(), "{bad:?}");
         }
-        assert!(is_user_id("312345678901234567"));
-        for bad in ["", "12a", "../1", &"1".repeat(33)] {
+        assert!(is_user_id("0195b3e6-7a10-7c3e-9d50-6f8a3b1c2d4e"));
+        for bad in ["", "12a", "../1", "312345678901234567", "0195B3E6-7A10-7C3E-9D50-6F8A3B1C2D4E"] {
             assert!(!is_user_id(bad), "{bad:?}");
         }
     }

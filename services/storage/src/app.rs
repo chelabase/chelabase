@@ -108,7 +108,6 @@ mod tests {
     fn identity_of(data: Option<DataIdentity>) -> Identity {
         Identity {
             sub: Uuid::new_v4().to_string(),
-            org_id: String::new(),
             auth: if data.is_some() {
                 AuthMethod::DataKey
             } else {

@@ -77,7 +77,6 @@ pub struct ProjectAuth {
     pub project_id: ProjectId,
     pub status: AppUsersStatus,
     pub error: Option<String>,
-    pub zitadel_org_id: Option<String>,
     pub database_id: DatabaseId,
     pub pg_database: String,
     pub schema_name: String,
@@ -104,7 +103,8 @@ pub struct NewProjectAuth<'a> {
 pub enum BeginEnable {
     /// A new `enabling` row.
     Started,
-    /// A `failed` row with the same location went back to `enabling`.
+    /// A `failed` row, or a `disabling` one on hold, with the same location went back to
+    /// `enabling`.
     Retry,
     /// A row exists (any other state, or another location): nothing written.
     Exists(ProjectAuth),
@@ -133,7 +133,7 @@ pub struct AppSession {
     pub id: Uuid,
     pub project_id: ProjectId,
     pub user_id: Uuid,
-    pub zitadel_session_id: String,
+    pub identity_session_id: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -145,7 +145,7 @@ pub struct NewAppSession<'a> {
     pub id: Uuid,
     pub project_id: ProjectId,
     pub user_id: Uuid,
-    pub zitadel_session_id: &'a str,
+    pub identity_session_id: &'a str,
     pub refresh_hash: [u8; 32],
     pub expires_at: DateTime<Utc>,
 }
@@ -156,7 +156,7 @@ impl std::fmt::Debug for NewAppSession<'_> {
             .field("id", &self.id)
             .field("project_id", &self.project_id)
             .field("user_id", &self.user_id)
-            .field("zitadel_session_id", &self.zitadel_session_id)
+            .field("identity_session_id", &self.identity_session_id)
             .field("refresh_hash", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .finish()
@@ -221,7 +221,6 @@ fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
         project_id: ProjectId(r.get("project_id")),
         status: AppUsersStatus::parse(r.get("status"))?,
         error: r.get("error"),
-        zitadel_org_id: r.get("zitadel_org_id"),
         database_id: DatabaseId(r.get("database_id")),
         pg_database: r.get("pg_database"),
         schema_name: r.get("schema_name"),
@@ -238,7 +237,7 @@ fn session_from_row(r: &PgRow) -> AppSession {
         id: r.get("id"),
         project_id: ProjectId(r.get("project_id")),
         user_id: r.get("user_id"),
-        zitadel_session_id: r.get("zitadel_session_id"),
+        identity_session_id: r.get("identity_session_id"),
         created_at: r.get("created_at"),
         last_used_at: r.get("last_used_at"),
         expires_at: r.get("expires_at"),
@@ -249,7 +248,7 @@ fn session_from_row(r: &PgRow) -> AppSession {
 impl MetadataClient {
     pub async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE project_id = $1",
         )
@@ -280,24 +279,10 @@ impl MetadataClient {
         .collect()
     }
 
-    pub async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
-        sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
-                    schema_name, table_name, email_verification, on_delete, created_at, updated_at
-             FROM project_auth WHERE zitadel_org_id = $1",
-        )
-        .bind(org_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .as_ref()
-        .map(auth_from_row)
-        .transpose()
-    }
-
     /// The `project_auth` row whose auth database is `db`, if any.
     pub async fn app_auth_for_database(&self, db: DatabaseId) -> Result<Option<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE database_id = $1",
         )
@@ -311,9 +296,10 @@ impl MetadataClient {
 
     /// Starts enabling app users. Locks the project row (`FOR UPDATE`) and refuses with
     /// [`MetadataError::ProjectDeleting`] unless the project is `active`. A missing row is
-    /// inserted as `enabling`; a `failed` row with the same database, schema and table goes
-    /// back to `enabling` with its error cleared and the two settings updated; any other row is
-    /// returned untouched.
+    /// inserted as `enabling`; a `failed` row, or a `disabling` one the worker put on hold (its
+    /// pool still had users: the row holds the error), with the same database, schema and table
+    /// goes back to `enabling` with its error cleared and the two settings updated; any other
+    /// row is returned untouched.
     pub async fn begin_enable_app_users(
         &self,
         new: &NewProjectAuth<'_>,
@@ -330,7 +316,7 @@ impl MetadataClient {
             Some(_) => return Err(MetadataError::ProjectDeleting(new.project_id)),
         }
         let existing = sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE project_id = $1 FOR UPDATE",
         )
@@ -361,7 +347,8 @@ impl MetadataClient {
                     && row.pg_database == new.pg_database
                     && row.schema_name == new.schema_name
                     && row.table_name == new.table_name;
-                if row.status == AppUsersStatus::Failed && same_place {
+                let on_hold = row.status == AppUsersStatus::Disabling && row.error.is_some();
+                if (row.status == AppUsersStatus::Failed || on_hold) && same_place {
                     sqlx::query(
                         "UPDATE project_auth
                          SET status = 'enabling', error = NULL, email_verification = $2,
@@ -395,7 +382,7 @@ impl MetadataClient {
              SET email_verification = COALESCE($2, email_verification),
                  on_delete = COALESCE($3, on_delete), updated_at = now()
              WHERE project_id = $1
-             RETURNING project_id, status, error, zitadel_org_id, database_id, pg_database,
+             RETURNING project_id, status, error, database_id, pg_database,
                        schema_name, table_name, email_verification, on_delete, created_at,
                        updated_at",
         )
@@ -407,23 +394,6 @@ impl MetadataClient {
         .as_ref()
         .map(auth_from_row)
         .transpose()
-    }
-
-    /// Records the project's Zitadel org (a second project claiming one org is a
-    /// [`MetadataError::Conflict`]).
-    pub async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
-        let result = sqlx::query(
-            "UPDATE project_auth SET zitadel_org_id = $2, updated_at = now() WHERE project_id = $1",
-        )
-        .bind(project.as_uuid())
-        .bind(org_id)
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => Err(MetadataError::Conflict),
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// Ends enabling: `enabled`, or `failed` with the error. True when the row was `enabling`.
@@ -462,6 +432,7 @@ impl MetadataClient {
         Ok(updated == 1)
     }
 
+    /// Deletes the row whatever its status: the project's delete, which then drops the pool.
     pub async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         sqlx::query("DELETE FROM project_auth WHERE project_id = $1")
             .bind(project.as_uuid())
@@ -470,9 +441,42 @@ impl MetadataClient {
         Ok(())
     }
 
+    /// The end of a disable: deletes the row only while it's `disabling`, so a duplicate job
+    /// can't take the row of an enable that started since. True when it did.
+    pub async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        let deleted = sqlx::query("DELETE FROM project_auth WHERE project_id = $1 AND status = 'disabling'")
+            .bind(project.as_uuid())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(deleted == 1)
+    }
+
+    /// Records (`Some`) or clears (`None`) the worker's last reconcile error on an `enabled`
+    /// row (a pool gone from the identity service, a branch it can't upgrade), or why a
+    /// `disabling` row's disable is on hold (its pool still has users). Not an `enabling` row
+    /// (an enable's own outcome ends it), nor a `failed` one (it keeps the enable's error). A
+    /// row already holding the value is left alone.
+    pub async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE project_auth SET error = $2, updated_at = now()
+             WHERE project_id = $1 AND status IN ('enabled', 'disabling')
+               AND error IS DISTINCT FROM $2",
+        )
+        .bind(project.as_uuid())
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE status = 'enabled' ORDER BY created_at, project_id",
         )
@@ -489,7 +493,7 @@ impl MetadataClient {
         older_than: Duration,
     ) -> Result<Vec<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth
              WHERE status IN ('enabling', 'disabling')
@@ -612,14 +616,14 @@ impl MetadataClient {
 
     pub async fn insert_app_session(&self, s: &NewAppSession<'_>) -> Result<(), MetadataError> {
         sqlx::query(
-            "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+            "INSERT INTO app_sessions (id, project_id, user_id, identity_session_id, refresh_hash,
                  expires_at)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(s.id)
         .bind(s.project_id.as_uuid())
         .bind(s.user_id)
-        .bind(s.zitadel_session_id)
+        .bind(s.identity_session_id)
         .bind(s.refresh_hash.as_slice())
         .bind(s.expires_at)
         .execute(&self.pool)
@@ -630,7 +634,7 @@ impl MetadataClient {
     /// The session, revoked or not.
     pub async fn app_session(&self, id: Uuid) -> Result<Option<AppSession>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+            "SELECT id, project_id, user_id, identity_session_id, created_at, last_used_at,
                     expires_at, revoked_at
              FROM app_sessions WHERE id = $1",
         )
@@ -657,7 +661,7 @@ impl MetadataClient {
     ) -> Result<RefreshOutcome, MetadataError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, refresh_hash, prev_refresh_hash,
+            "SELECT id, project_id, user_id, identity_session_id, refresh_hash, prev_refresh_hash,
                     grace_refresh_sealed, grace_until, created_at, last_used_at, expires_at,
                     revoked_at, now() AS now
              FROM app_sessions WHERE id = $1 FOR UPDATE",
@@ -695,7 +699,7 @@ impl MetadataClient {
                      expires_at = LEAST(now() + make_interval(secs => $5),
                                         created_at + make_interval(secs => $6))
                  WHERE id = $1
-                 RETURNING id, project_id, user_id, zitadel_session_id, created_at,
+                 RETURNING id, project_id, user_id, identity_session_id, created_at,
                            last_used_at, expires_at, revoked_at",
             )
             .bind(id)
@@ -715,7 +719,7 @@ impl MetadataClient {
                 _ => {
                     let revoked = sqlx::query(
                         "UPDATE app_sessions SET revoked_at = now() WHERE id = $1
-                         RETURNING id, project_id, user_id, zitadel_session_id, created_at,
+                         RETURNING id, project_id, user_id, identity_session_id, created_at,
                                    last_used_at, expires_at, revoked_at",
                     )
                     .bind(id)
@@ -744,7 +748,7 @@ impl MetadataClient {
         cap: Duration,
     ) -> Result<PeekOutcome, MetadataError> {
         let row = sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, refresh_hash, prev_refresh_hash,
+            "SELECT id, project_id, user_id, identity_session_id, refresh_hash, prev_refresh_hash,
                     grace_until, grace_refresh_sealed IS NOT NULL AS has_sealed, created_at,
                     last_used_at, expires_at, revoked_at, now() AS now
              FROM app_sessions WHERE id = $1",
@@ -793,7 +797,7 @@ impl MetadataClient {
         Ok(sqlx::query(
             "UPDATE app_sessions SET revoked_at = now()
              WHERE id = $1 AND project_id = $2 AND revoked_at IS NULL
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(id)
@@ -816,7 +820,7 @@ impl MetadataClient {
             "UPDATE app_sessions SET revoked_at = now()
              WHERE id = $1 AND project_id = $2 AND revoked_at IS NULL
                AND (refresh_hash = $3 OR prev_refresh_hash = $3)
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(id)
@@ -842,7 +846,7 @@ impl MetadataClient {
              WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL
                AND ($3::uuid IS NULL OR id <> $3)
                AND ($4::timestamptz IS NULL OR created_at < $4)
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(project.as_uuid())
@@ -861,7 +865,7 @@ impl MetadataClient {
         Ok(sqlx::query(
             "UPDATE app_sessions SET revoked_at = now()
              WHERE project_id = $1 AND revoked_at IS NULL
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(project.as_uuid())
@@ -879,7 +883,7 @@ impl MetadataClient {
         user: Uuid,
     ) -> Result<Vec<AppSession>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+            "SELECT id, project_id, user_id, identity_session_id, created_at, last_used_at,
                     expires_at, revoked_at
              FROM app_sessions
              WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()

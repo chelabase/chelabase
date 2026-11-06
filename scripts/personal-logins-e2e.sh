@@ -18,8 +18,8 @@
 #    next run works with the member role's new password (P16 b);
 # 8. an expired VALID UNTIL (set short in the metadata): refused once the proxy's cache entry
 #    expires; a reset renews it;
-# 9. dev's Zitadel user deactivated in Zitadel (its Actions webhook reaches the orchestrator):
-#    refused.
+# 9. offboarded (dev removed from the tenant, which bans their account and ends its sessions
+#    inline): the login is refused and listed as revoked, and dev can't sign in.
 # Everything it makes is removed on exit, also on failure. KEEP=1 leaves the project.
 set -euo pipefail
 
@@ -49,17 +49,8 @@ pass() {
 }
 
 [[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
-demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
-[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
-set -a
-# shellcheck disable=SC1090
-source "$demo_env"
-set +a
 ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
 [[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
-[[ -n "${CHELABASE_ZITADEL_ADMIN_PAT_FILE:-}" && -s "${CHELABASE_ZITADEL_ADMIN_PAT_FILE}" ]] ||
-  die "CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset or empty (run just workbench up: its bootstrap writes demo.env)"
-ZITADEL="${CHELABASE_ZITADEL_ISSUER:-$CHELABASE_ENTRY_AUTH_URL}"
 : "${CHELABASE_STACK:?run through just workbench run}"
 command -v docker >/dev/null || die "docker is missing (step 5 stops main's compute)"
 # shellcheck source=lib/member-sign-in.sh
@@ -92,15 +83,6 @@ uapi() {
   local args=(-sS --max-time 60 -D "$tmp/headers" -o "$tmp/body" -w '%{http_code}' -X "$2" "$GATEWAY$3")
   if [[ -n "${4:-}" ]]; then args+=(-H 'content-type: application/json' -d "$4"); fi
   printf 'Authorization: Bearer %s\n' "$1" | curl "${args[@]}" -H @- || true
-}
-
-# zitadel <method> <path> [body]: Zitadel's API with the admin PAT; the status (body in
-# $tmp/zbody). The PAT goes through a header file, never argv.
-zitadel() {
-  printf 'Authorization: Bearer %s\n' "$(tr -d '\n' <"$CHELABASE_ZITADEL_ADMIN_PAT_FILE")" >"$tmp/zauth"
-  local args=(-sS --max-time 30 -o "$tmp/zbody" -w '%{http_code}' -X "$1" "$ZITADEL$2" -H @"$tmp/zauth")
-  if [[ -n "${3:-}" ]]; then args+=(-H 'content-type: application/json' -d "$3"); fi
-  curl "${args[@]}" || true
 }
 
 # pg <user> <password> <host> <sql>: psql through the proxy (output on stdout, errors in
@@ -226,9 +208,9 @@ grant '["billing"]'
 DEV_TOKEN="$(member_token)"
 s="$(uapi "$DEV_TOKEN" GET /v1/me)"
 [[ "$s" == 200 ]] || die "dev's /v1/me: $s $(cat "$tmp/body")"
-ZUSER="$(jq -r '.sub' "$tmp/body")"
-[[ -n "$ZUSER" && "$ZUSER" != null ]] || die "dev's /v1/me has no sub"
-pass "project $name, database $db_id with billing and other_grp, member $MEMBER_ID (Zitadel user $ZUSER) a Developer with billing"
+IDENTITY_USER="$(jq -r '.sub' "$tmp/body")"
+[[ -n "$IDENTITY_USER" && "$IDENTITY_USER" != null ]] || die "dev's /v1/me has no sub"
+pass "project $name, database $db_id with billing and other_grp, member $MEMBER_ID (identity user $IDENTITY_USER) a Developer with billing"
 
 # --- 2. The login: shown once, connects, SET ROLE only into the safe set ------------------------
 
@@ -385,15 +367,16 @@ reset_login "$DEV_TOKEN" "$LOGIN"
 connects "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "the login renewed by a reset"
 pass "an expired login is refused; a reset renews it"
 
-# --- 9. Offboarded in Zitadel ------------------------------------------------------------------------
+# --- 9. Offboarded: removed from the tenant -------------------------------------------------------
 
-s="$(zitadel POST "/v2/users/$ZUSER/deactivate" '{}')"
-[[ "$s" == 200 ]] || die "Zitadel deactivate: $s $(cat "$tmp/zbody")"
-refused "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "the login of a user deactivated in Zitadel" 60
+ok DELETE "/v1/members/$MEMBER_ID" 204
+refused "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "the login of a removed member" 60
 s="$(api GET "/v1/members/$MEMBER_ID/personal-logins")"
 [[ "$s" == 200 ]] || die "dev's logins as the admin: $s $(cat "$tmp/body")"
-jq -e --arg n "$LOGIN" 'any(.logins[]; .role_name == $n and .status == "revoked" and .revoked_reason == "identity_offboarded")' "$tmp/body" >/dev/null ||
-  die "the login isn't revoked as identity_offboarded: $(cat "$tmp/body")"
-pass "deactivated in Zitadel: the webhook revoked the login (identity_offboarded)"
+jq -e --arg n "$LOGIN" 'any(.logins[]; .role_name == $n and .status == "revoked" and .revoked_reason == "member_removed")' \
+  "$tmp/body" >/dev/null || die "the login isn't revoked as member_removed: $(cat "$tmp/body")"
+next="$(jq -r '.next // empty' <<<"$(sign_in "$MEMBER_EMAIL" "$MEMBER_PASSWORD" "$(new_jar)")" 2>/dev/null || true)"
+[[ "$(status)" == 401 && -z "$next" ]] || die "a removed member's sign-in answered $(status) next=$next (wanted 401)"
+pass "removed from the tenant: the login is refused and revoked (member_removed), and dev's sign-in is refused"
 
 echo "all passed ($((SECONDS - t0)) s)"

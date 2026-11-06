@@ -1,4 +1,5 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useRef, type ReactNode } from "react";
+import { useScrollHint } from "./scroll-hint";
 import {
   Archive,
   ArrowUpRight,
@@ -8,9 +9,11 @@ import {
   DoorOpen,
   KeyRound,
   LayoutDashboard,
+  Maximize2,
   Radio,
   SquareTerminal,
   Waypoints,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
@@ -105,7 +108,7 @@ function Edge() {
   );
 }
 
-function Band({ id, labelledby, children }: { id?: string; labelledby: string; children: ReactNode }) {
+function Band({ id, labelledby, className = "", children }: { id?: string; labelledby: string; className?: string; children: ReactNode }) {
   const { tone } = useContext(BandTone);
   // --band is this band's ground; the edge above it is drawn in the same colour.
   const ground = tone === "raised" ? "[--band:var(--deep)]" : "[--band:var(--ink)]";
@@ -113,7 +116,7 @@ function Band({ id, labelledby, children }: { id?: string; labelledby: string; c
     <section
       id={id}
       aria-labelledby={labelledby}
-      className={`relative px-gutter py-section scroll-mt-16 bg-(--band) [--claw-gap:var(--band)] ${ground}`}
+      className={`relative px-gutter py-section scroll-mt-16 bg-(--band) [--claw-gap:var(--band)] ${ground} ${className}`}
     >
       <Edge />
       {children}
@@ -126,11 +129,12 @@ const SETTLE = "translate-y-0.5";
 /** Landing-only nudges of the wordmark's claw: it sits a little low and may overflow its box. */
 const CLAW = "-mb-[0.1em] overflow-visible";
 
-/** A claw-marked list of short notes, on ink or on seafoam. */
-function Notes({ notes, ground = "ink" }: { notes: Array<{ title: string; body: ReactNode }>; ground?: "ink" | "seafoam" }) {
-  const body = ground === "ink" ? `text-chalk-dim ${CODE_ON_INK}` : `text-chalk-dim ${CODE_ON_INK}`;
+/** A claw-marked list of short notes, in one column or, above a screenshot, two (one below 900px). */
+function Notes({ notes, columns = 1 }: { notes: Array<{ title: string; body: ReactNode }>; columns?: 1 | 2 }) {
+  const body = `text-chalk-dim ${CODE_ON_INK}`;
+  const grid = columns === 2 ? "mt-10 grid grid-cols-2 gap-x-14 gap-y-8 max-[900px]:grid-cols-1 max-[900px]:gap-y-6.5" : "mt-9 grid gap-6.5";
   return (
-    <ul className="mt-9 grid gap-6.5">
+    <ul className={grid}>
       {notes.map((n) => (
         <li key={n.title} className="grid grid-cols-[38px_minmax(0,1fr)] gap-x-3.5 gap-y-1">
           <ClawMark size={30} className="row-span-2 mt-0.5" />
@@ -157,11 +161,35 @@ function CodeInset({ label, note, children, className = "" }: { label: ReactNode
   );
 }
 
-/** A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport, and a link to the full-size file. */
-function StudioShot({ src, width, height, alt, caption }: { src: string; width: number; height: number; alt: string; caption: string }) {
+/**
+ * A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport. Clicking
+ * it opens it larger over the page; Esc, the close button or a click anywhere closes it again.
+ */
+function StudioShot({
+  src,
+  width,
+  height,
+  alt,
+  caption,
+  className = "",
+}: {
+  src: string;
+  width: number;
+  height: number;
+  alt: string;
+  caption: string;
+  className?: string;
+}) {
+  const zoom = useRef<HTMLDialogElement>(null);
+  const close = () => zoom.current?.close();
   return (
-    <figure className="m-0 min-w-0">
-      <a href={src} className={`block rounded-xl ${FOCUS}`}>
+    <figure className={`m-0 min-w-0 ${className}`}>
+      <button
+        type="button"
+        aria-label={`Enlarge: ${alt}`}
+        onClick={() => zoom.current?.showModal()}
+        className={`group relative block w-full p-0 border-0 rounded-xl bg-transparent cursor-zoom-in ${FOCUS}`}
+      >
         <img
           src={src}
           width={width}
@@ -169,10 +197,41 @@ function StudioShot({ src, width, height, alt, caption }: { src: string; width: 
           alt={alt}
           loading="lazy"
           decoding="async"
-          className="block w-full h-auto rounded-xl border border-line-strong bg-ink"
+          className="block w-full h-auto rounded-xl border border-line-strong bg-ink transition-[border-color] duration-200 ease-design group-hover:border-sand/45"
         />
-      </a>
+        <span
+          className="absolute top-3 right-3 grid place-items-center size-8 rounded-full bg-ink/85 text-chalk opacity-0 transition-opacity duration-200 ease-design group-hover:opacity-100 group-focus-visible:opacity-100"
+          aria-hidden="true"
+        >
+          <Maximize2 size={15} strokeWidth={1.8} />
+        </span>
+      </button>
       <figcaption className="mt-2.5 text-[0.9rem] leading-snug text-chalk-dim">{caption}</figcaption>
+      {/* Every click inside closes it: there is nothing to do in here but look. */}
+      <dialog
+        ref={zoom}
+        aria-label={alt}
+        onClick={close}
+        className="m-auto p-0 border-0 bg-transparent max-w-[calc(100vw-2*var(--spacing-gutter))] max-h-none overflow-visible cursor-zoom-out backdrop:bg-ink/88"
+      >
+        <img
+          src={src}
+          width={width}
+          height={height}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          className="block w-auto h-auto max-w-full max-h-[calc(100svh-7rem)] rounded-xl border border-line-strong bg-ink shadow-[0_30px_80px_-30px] shadow-black/80"
+        />
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={close}
+          className={`fixed top-4 right-4 grid place-items-center size-10 border-[1.5px] border-chalk rounded-full bg-ink text-chalk cursor-pointer hover:bg-ink-lit ${FOCUS}`}
+        >
+          <X size={18} strokeWidth={1.8} aria-hidden="true" />
+        </button>
+      </dialog>
     </figure>
   );
 }
@@ -211,11 +270,23 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
             Manage, collaborate, iterate. On Postgres.
           </p>
           <p className="mt-2.5 max-w-160 text-chalk-dim text-[1.125rem] text-pretty">
-            An open-source Postgres platform you run yourself. Branch, merge and restore databases, give your team access
-            Postgres itself enforces, and query from your app with a typed client. Chelabase's own services are written in
-            Rust.
+            An open-source Postgres platform you can run yourself. Branch, merge and restore databases, give your team access
+            Postgres itself enforces, and query from your app with a typed client. Its core services are written in Rust.
           </p>
           <Actions docsUrl={docsUrl} className="mt-6 short:mt-4.5" />
+          {/* the same notice the README, docs and Studio carry */}
+          <p className="mt-4 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.95rem] text-chalk-dim short:mt-3">
+            <span className="px-1.5 py-px border border-sand/60 rounded-sm text-sand text-xs font-semibold uppercase tracking-wide">
+              Alpha
+            </span>
+            <span>
+              Not ready for production data yet: expect breaking changes, and{" "}
+              <a href={`${GITHUB_URL}/issues`} className={`text-chalk underline underline-offset-3 decoration-sand/60 hover:decoration-sand ${FOCUS}`}>
+                report what breaks
+              </a>
+              .
+            </span>
+          </p>
         </div>
         <ShoreScene />
       </header>
@@ -231,9 +302,14 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
       <footer className={`${COLUMN} flex flex-wrap items-center justify-between gap-x-8 gap-y-4 pt-5.5 pb-7 text-chalk-dim text-[0.92rem]`}>
         <div className="flex items-center gap-2">
           <Wordmark className="text-[1.15rem]" visualClassName={SETTLE} clawClassName={`h-[1.32em] ${CLAW}`} />
-          <span>· self-hosted preview</span>
+          <span>· self-hosted alpha</span>
         </div>
-        <span>A hosted version is planned. Drawings on this page are illustrations.</span>
+        <span>
+          A hosted version is planned. Drawings on this page are illustrations.{" "}
+          <a href="mailto:hello@chelabase.com" className={`text-chalk underline underline-offset-3 decoration-sand/60 hover:decoration-sand ${FOCUS}`}>
+            hello@chelabase.com
+          </a>
+        </span>
       </footer>
     </div>
   );
@@ -282,7 +358,7 @@ const PIECES: Piece[] = [
     id: "realtime",
     icon: Radio,
     title: "Realtime",
-    body: "Pushes changed rows and presence over a WebSocket as keys only, so each row is read again as the viewer's role.",
+    body: "Pushes changed rows and presence to Studio over a WebSocket as keys only, so each row is read again as the viewer's role.",
     to: "architecture/realtime",
   },
   {
@@ -317,7 +393,7 @@ const PIECES: Piece[] = [
     id: "cli",
     icon: SquareTerminal,
     title: "CLI",
-    body: "A script you install for quick setup and management from the terminal: generate types, run migrations and more. Not available yet.",
+    body: "A command-line tool for setup and management from the terminal: generate types, run migrations and more. Not available yet.",
     soon: true,
   },
   {
@@ -351,8 +427,14 @@ function PieceBody({ piece: p }: { piece: Piece }) {
       <h3 className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5 mt-2 font-serif font-semibold leading-[1.3] text-[1.25rem] max-[560px]:mt-0 max-[560px]:text-[1.1rem]">
         {p.title}
         {p.soon && (
-          <span className="inline-block px-2.25 py-px border-[1.5px] border-dashed border-coral rounded-full font-sans text-[0.8rem] font-semibold text-coral whitespace-nowrap">
-            Coming soon
+          // On a phone tile the chip takes the corner a linked tile gives its arrow, so the name
+          // keeps its line and every tile stays the same height. Under 400px it says only "Soon"
+          // beside the icon; screen readers still hear "Coming soon".
+          <span className="inline-block px-2.25 py-px border-[1.5px] border-dashed border-coral rounded-full font-sans text-[0.8rem] font-semibold text-coral whitespace-nowrap max-[560px]:absolute max-[560px]:top-4 max-[560px]:right-4 max-[560px]:px-1.75 max-[560px]:border max-[560px]:text-[0.7rem] max-[560px]:leading-[1.5]">
+            <span className="max-[400px]:sr-only">Coming soon</span>
+            <span className="hidden max-[400px]:inline" aria-hidden="true">
+              Soon
+            </span>
           </span>
         )}
         {p.to && (
@@ -377,8 +459,8 @@ function Pieces({ docsUrl }: SectionProps) {
           Everything in one place.
         </h2>
         <p className={`${SECTION_LEDE} text-chalk-dim`}>
-          Every Chelabase backend service is built in Rust, and so is Neon's storage engine under Postgres: small
-          native services that run together on one machine.
+          Chelabase's core services are built in Rust, and so is Neon's storage engine under Postgres. Accounts live in a
+          small internal Identity service on Better Auth. It all runs together on one machine.
         </p>
         <ul className="mt-11 grid grid-cols-2 gap-4 max-[900px]:grid-cols-1 max-[560px]:grid-cols-2 max-[560px]:gap-3 max-[560px]:mt-8">
           {PIECES.map((p) => (
@@ -410,7 +492,7 @@ const MANAGE_NOTES = [
   },
   {
     title: "A SQL editor with a guard",
-    body: "It asks before risky statements, runs as the owner or as a role you pick, and keeps saved queries and history for the project.",
+    body: "It asks before risky statements, runs as the owner or as a role you pick, and keeps saved queries per database, shared with the project, with your run history in your browser.",
   },
   {
     title: "Credentials you can see again",
@@ -425,44 +507,23 @@ const MANAGE_NOTES = [
 function Manage() {
   return (
     <Band id="manage" labelledby="manage-title">
-      <div className={`${SECTION_INNER} ${SPLIT}`}>
-        <div>
-          <h2 id="manage-title" className={SECTION_TITLE}>
-            Manage it from one console.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Studio holds the whole database: tables, SQL, roles, keys and your app's users. A change shows as the SQL it
-            will run, before it runs.
-          </p>
-          <Notes notes={MANAGE_NOTES} />
-          <div className="mt-10 grid gap-6">
-            <StudioShot
-              src="/screens/manage-table-editor.webp"
-              width={1152}
-              height={800}
-              alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
-              caption="A staged change shows its SQL and a dry run before anything runs."
-            />
-            <StudioShot
-              src="/screens/manage-rls-warning.webp"
-              width={806}
-              height={126}
-              alt="Studio's RLS warning on the Data API panel: anyone with your public key can read the rows of public.employees, with the ALTER TABLE statement that enables row-level security."
-              caption="Studio flags public.employees, reachable by the data API without row-level security."
-            />
-          </div>
-        </div>
-        <CodeInset label="Table editor · review changes" note="illustration" className="sticky top-22 max-[900px]:static">
-          <C>-- 2 changes to sales.orders, applied in one transaction</C>
-          {"\n"}
-          <K>alter table</K> sales.orders{"\n"}
-          {"  "}
-          <K>add column</K> shipped_at <T>timestamptz</T>;{"\n"}
-          <K>create index</K> orders_customer_idx{"\n"}
-          {"  "}
-          <K>on</K> sales.orders (customer_id);{"\n\n"}
-          <C>-- dry run: ok</C>
-        </CodeInset>
+      <div className={SECTION_INNER}>
+        <h2 id="manage-title" className={SECTION_TITLE}>
+          Manage it from one console.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Studio holds the whole database: tables, SQL, roles, keys and your app's users. A change shows as the SQL it
+          will run, before it runs.
+        </p>
+        <Notes notes={MANAGE_NOTES} columns={2} />
+        <StudioShot
+          className="mt-12"
+          src="/screens/manage-table-editor.webp"
+          width={1152}
+          height={800}
+          alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
+          caption="A staged change shows its SQL and a dry run before anything runs."
+        />
       </div>
     </Band>
   );
@@ -492,39 +553,23 @@ const COLLABORATE_NOTES = [
 function Collaborate() {
   return (
     <Band id="collaborate" labelledby="collaborate-title">
-      <div className={`${SECTION_INNER} ${SPLIT} grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)]`}>
-        <div>
-          <h2 id="collaborate-title" className={SECTION_TITLE}>
-            Bring your team in.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Invite people, group them into teams, and grant each team the Postgres roles it may act as. Postgres' own
-            privileges decide the rest, so a schema can belong to one team.
-          </p>
-          <Notes notes={COLLABORATE_NOTES} />
-          <div className="mt-10 grid gap-6">
-            <StudioShot
-              src="/screens/collaborate-team-access.webp"
-              width={832}
-              height={542}
-              alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
-              caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
-            />
-          </div>
-        </div>
-        <CodeInset
-          label="SQL editor · Acme, a schema per team"
-          note="from the docs"
-          className="sticky top-22 order-first max-[900px]:static max-[900px]:order-none"
-        >
-          <K>create role</K> finance <K>nologin</K>;{"\n"}
-          <K>alter schema</K> finance <K>owner to</K> finance;{"\n\n"}
-          <C>-- Members › Teams › Finance:</C>
-          {"\n"}
-          <C>-- Developer on the project, acting as finance.</C>
-          {"\n"}
-          <C>-- Its members change finance.invoices; sales can't.</C>
-        </CodeInset>
+      <div className={SECTION_INNER}>
+        <h2 id="collaborate-title" className={SECTION_TITLE}>
+          Bring your team in.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Invite people, group them into teams, and grant each team the Postgres roles it may act as. Postgres' own
+          privileges decide the rest, so a schema can belong to one team.
+        </p>
+        <Notes notes={COLLABORATE_NOTES} columns={2} />
+        <StudioShot
+          className="mt-12"
+          src="/screens/collaborate-team-access.webp"
+          width={1152}
+          height={800}
+          alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
+          caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
+        />
       </div>
     </Band>
   );
@@ -532,60 +577,27 @@ function Collaborate() {
 
 /* ---------- Iterate ---------- */
 
-const TERM = "font-serif font-semibold text-[1.25rem]";
-const DEFINITION = "mt-1 max-w-[52ch] text-chalk-dim";
-
 function Iterate() {
   return (
     <Band id="iterate" labelledby="branch-title">
-      <div
-        className={`${SECTION_INNER} grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)] gap-16 items-start max-[900px]:grid-cols-1`}
-      >
-        <div>
-          <h2 id="branch-title" className={SECTION_TITLE}>
-            Branch it. Reset it. Restore it. Merge it.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Every database starts with one branch, main. Try a change on a copy of real data, then bring it home.
-          </p>
-          <dl className="mt-8 grid gap-5">
-            <div>
-              <dt className={TERM}>Branch</dt>
-              <dd className={DEFINITION}>
-                Copy any branch as it is now, or as it was at any point in its history window (seven days by default).
-                The copy is copy-on-write, so it's ready at once, with its own endpoint and password.
-              </dd>
-            </div>
-            <div>
-              <dt className={TERM}>Reset</dt>
-              <dd className={DEFINITION}>Bring a branch back in line with its parent's latest state, keeping its connection string.</dd>
-            </div>
-            <div>
-              <dt className={TERM}>Restore</dt>
-              <dd className={DEFINITION}>
-                Take a branch back to a point in time. The old timeline is kept as a backup branch, in case you want it
-                back.
-              </dd>
-            </div>
-            <div>
-              <dt className={TERM}>Merge</dt>
-              <dd className={DEFINITION}>
-                Move schema changes from a branch into its parent with a three-way merge. Resolve conflicts, rehearse
-                on a copy of the target, then apply. Rows never move.
-              </dd>
-            </div>
-          </dl>
-        </div>
-        <div className="grid gap-6 min-w-0">
+      <div className={SECTION_INNER}>
+        <h2 id="branch-title" className={SECTION_TITLE}>
+          Branch it. Reset it. Restore it. Merge it.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Every database starts with one branch, main. Try a change on a copy of real data, then bring it home.
+        </p>
+        <div className="mt-10">
           <TideGauge />
-          <StudioShot
-            src="/screens/iterate-branches.webp"
-            width={1152}
-            height={934}
-            alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
-            caption="Protected main, and feature-discounts branched from it, ready to merge."
-          />
         </div>
+        <StudioShot
+          className="mt-12"
+          src="/screens/iterate-branches.webp"
+          width={1152}
+          height={790}
+          alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
+          caption="Protected main, and feature-discounts branched from it, ready to merge."
+        />
       </div>
     </Band>
   );
@@ -621,8 +633,9 @@ function YourApp() {
             Build your app on a typed API.
           </h2>
           <p className={`${SECTION_LEDE} text-chalk-dim ${CODE_ON_INK}`}>
-            One endpoint, <code>POST /data/v1/query</code>, and a client with types fetched from your schema. Queries run
-            as <code>anon</code> or <code>authenticated</code>, so row-level security decides what each user sees.
+            One endpoint, <code>POST /data/v1/query</code>, and a client with types fetched from your schema. Public-key
+            queries run as <code>anon</code> or <code>authenticated</code>, so row-level security decides what each user sees.
+            The client isn't on npm yet: use it from the repository.
           </p>
           <Notes notes={APP_NOTES} />
         </div>
@@ -666,7 +679,7 @@ const INSTALL_STEPS: Array<{ title: string; body: ReactNode }> = [
     title: "Start it",
     body: (
       <>
-        <code>docker compose up -d --wait</code>. You need Docker Engine 26 and Compose 2.30 or newer, nothing else.
+        <code>docker compose up -d --wait</code>. You need Docker Engine 26 and Compose 2.30 or newer, and room for about 26 containers.
       </>
     ),
   },
@@ -679,14 +692,16 @@ const INSTALL_STEPS: Array<{ title: string; body: ReactNode }> = [
 
 function InstallTerminal({ className = "" }: { className?: string }) {
   return (
-    <CodeInset label="Your terminal" note="from the README" className={className}>
+    <CodeInset label="Your terminal" note="Install" className={className}>
       <F>git</F> clone https://github.com/chelabase/chelabase.git{"\n"}
       <F>cd</F> chelabase/infra/compose{"\n"}
       <F>cp</F> .env.example .env{"\n"}
       <F>docker</F> compose up -d --wait{"\n"}
       <F>docker</F> compose logs init-secrets <C># your setup code</C>
       {"\n\n"}
-      <C># want a populated demo? add -f docker-compose.example.yml</C>
+      <C># want a populated demo instead? on a fresh stack:</C>
+      {"\n"}
+      <C># docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait</C>
       {"\n"}
       <C># then open http://studio.chelabase.localhost:8000</C>
     </CodeInset>
@@ -725,50 +740,71 @@ function Install() {
 
 /* ---------- Compare ---------- */
 
-type Mark = "yes" | "partial" | "soon" | "no" | "other" | "unknown";
+type Mark = "yes" | "partial" | "soon" | "no";
+/** A cell: a mark, or a product that solves it another way, named in a short note. */
+type Cell = Mark | { other: string };
 
 const MARK_TEXT: Record<Mark, string> = {
   yes: "Yes",
   partial: "Partly",
   soon: "Coming soon",
   no: "No",
-  other: "Different model",
-  unknown: "To survey",
 };
 
-/** The mark's colour; its glyph (`.mark--*::before`) is drawn in landing.css. */
-const MARK_CLASS: Record<Mark, string> = {
+/** The mark's colour; its glyph (`.mark--*::before`) is drawn in landing.css. A note is chalk, not
+ *  chalk-dim, so another approach never reads as "No". */
+const MARK_CLASS: Record<Mark | "other", string> = {
   yes: "text-seafoam",
   partial: "text-sand",
   soon: "text-coral",
   no: "text-chalk-dim",
-  other: "text-chalk-dim",
-  unknown: "text-chalk-dim italic font-serif",
+  other: "text-chalk",
 };
 
 const CELL = "p-3.5 text-left";
-const HEAD = "pb-3 border-b-2 border-line-strong font-serif font-semibold text-[1.1rem]";
+/** The row names stay in view while a phone scrolls the products sideways: opaque, unlike the
+ *  products' cells, with an inset edge since a collapsed border doesn't stick with the cell. */
+const ROW_HEAD = "sticky left-0 z-1 min-w-36 min-[561px]:min-w-48 shadow-[inset_-1px_0_0_var(--line)] max-[560px]:pl-2.5";
+/** Zebra rows; the sticky row name takes its row's ground. */
+const STRIPE = ["bg-ink", "bg-channel"] as const;
+/** Rules between columns only: the stripes separate the rows. */
+const COLUMN_RULE = "border-l border-line";
+/** Chelabase's column: a sand band edged in sand, from the header down. */
+const BAND = "bg-sand/8 border-x border-sand/40";
+const HEAD = "pb-3 border-b-2 border-b-line-strong font-serif font-semibold text-[1.1rem]";
 
 const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"] as const;
 
-type Marks = [Mark, Mark, Mark, Mark, Mark, Mark];
+type Cells = [Cell, Cell, Cell, Cell, Cell, Cell];
 
-const ROWS: Array<{ label: string; marks: Marks }> = [
-  { label: "Postgres", marks: ["yes", "yes", "other", "yes", "yes", "other"] },
-  { label: "Copy-on-write branches", marks: ["yes", "other", "no", "yes", "no", "no"] },
-  { label: "Schema merge between branches", marks: ["yes", "partial", "no", "no", "no", "yes"] },
-  { label: "Point-in-time restore", marks: ["yes", "yes", "yes", "yes", "yes", "no"] },
-  { label: "Protected branches", marks: ["yes", "no", "no", "yes", "partial", "yes"] },
-  { label: "Self-hostable", marks: ["yes", "partial", "no", "no", "no", "no"] },
-  { label: "Typed query API", marks: ["yes", "yes", "other", "yes", "no", "no"] },
-  { label: "App-user auth, server rendering included", marks: ["yes", "yes", "yes", "yes", "no", "no"] },
-  { label: "Team access through Postgres roles", marks: ["yes", "other", "other", "other", "other", "other"] },
-  { label: "Table and SQL editors", marks: ["yes", "yes", "partial", "yes", "partial", "partial"] },
-  { label: "Live rows", marks: ["yes", "yes", "yes", "partial", "no", "no"] },
-  { label: "Object storage", marks: ["soon", "yes", "yes", "yes", "no", "no"] },
+const ROWS: Array<{ label: string; cells: Cells }> = [
+  { label: "Postgres", cells: ["yes", "yes", "yes", "yes", "yes", { other: "MySQL" }] },
+  { label: "Copy-on-write branches", cells: ["yes", { other: "Schema-only branches" }, "no", "yes", "no", "no"] },
+  { label: "Schema merge between branches", cells: ["yes", "partial", "no", "no", "no", "yes"] },
+  { label: "Protected branches", cells: ["yes", "no", "no", "yes", "partial", "yes"] },
+  { label: "Point-in-time restore", cells: ["yes", "yes", "yes", "yes", "yes", "no"] },
+  { label: "Self-hostable", cells: ["yes", "partial", "no", "partial", "no", "no"] },
+  {
+    label: "Team access enforced by Postgres",
+    cells: ["yes", { other: "Dashboard roles" }, { other: "Cloud IAM" }, { other: "Org roles" }, { other: "Org roles" }, { other: "Org roles" }],
+  },
+  { label: "Typed query API", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "App-user auth, with SSR", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "Table and SQL editors", cells: ["yes", "yes", "partial", "yes", "partial", "partial"] },
+  { label: "Live rows in the editor", cells: ["yes", "no", "yes", "no", "no", "no"] },
+  { label: "Realtime for your app", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
+  { label: "Object storage", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
 ];
 
+function CompareCell({ cell }: { cell: Cell }) {
+  const kind = typeof cell === "string" ? cell : "other";
+  const text = typeof cell === "string" ? MARK_TEXT[cell] : cell.other;
+  return <span className={`mark mark--${kind} flex items-center gap-2 whitespace-nowrap ${MARK_CLASS[kind]}`}>{text}</span>;
+}
+
 function Compare() {
+  const scroller = useRef<HTMLDivElement>(null);
+  const { scrollable, more } = useScrollHint(scroller);
   return (
     <Band labelledby="compare-title">
       <div className={SECTION_INNER}>
@@ -779,47 +815,63 @@ function Compare() {
           What each platform offers today, from its own docs. Benchmarks come later.
         </p>
         {/* a wireframe, not a result */}
-        <div className="mt-10 p-7 border-2 border-dashed border-line-strong rounded-2xl bg-ink">
+        <div className="mt-10 p-7 border-2 border-dashed border-line-strong rounded-2xl bg-ink max-[560px]:p-4">
           <p className="inline-block mb-5.5 px-3.5 py-1.5 border-2 border-coral rounded-md text-coral font-serif font-bold text-[0.95rem] -rotate-[1.5deg]">
             Comparison preview — benchmarks coming later
           </p>
-          {/* focusable so a keyboard can scroll the columns a phone cuts off */}
-          <div className={`overflow-x-auto ${FOCUS}`} tabIndex={0} role="region" aria-label="Comparison table">
-            <table className="w-full min-w-200 border-collapse text-[0.97rem]" aria-label="Comparison preview">
-              <thead>
-                <tr>
-                  <td className={`${CELL} align-middle`} />
-                  {COLUMNS.map((c) => (
-                    <th key={c} scope="col" className={`${CELL} ${HEAD} align-bottom`}>
-                      {/* Chelabase's own column is set in the wordmark, which is taller; the names align on the bottom. */}
-                      {c === "Chelabase" ? <Wordmark visualClassName="translate-y-[0.24em]" clawClassName={`h-[1.32em] ${CLAW}`} /> : c}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {ROWS.map((r, row) => {
-                  const rule = `align-middle ${row > 0 ? "border-t border-line" : ""}`;
-                  return (
-                    <tr key={r.label}>
-                      <th scope="row" className={`${CELL} ${rule} w-[20%] font-semibold text-chalk`}>
-                        {r.label}
+          <div className="relative">
+            {/* focusable while it scrolls, so a keyboard can reach the columns a phone cuts off */}
+            <div
+              ref={scroller}
+              className={`compare-scroll overflow-x-auto ${FOCUS}`}
+              tabIndex={scrollable ? 0 : undefined}
+              role="region"
+              aria-label="Comparison table"
+            >
+              <table className="w-full min-w-200 border-collapse text-[0.97rem]">
+                <caption className="sr-only">Comparison preview</caption>
+                <thead>
+                  <tr>
+                    <td className={`${CELL} ${ROW_HEAD} bg-ink align-middle`} />
+                    {COLUMNS.map((c, i) => (
+                      <th key={c} scope="col" className={`${CELL} ${HEAD} ${i === 0 ? `${BAND} border-t` : COLUMN_RULE} align-bottom`}>
+                        {/* Chelabase's own column is set in the wordmark, which is taller; the names align on the bottom. */}
+                        {c === "Chelabase" ? <Wordmark visualClassName="translate-y-[0.24em]" clawClassName={`h-[1.32em] ${CLAW}`} /> : c}
                       </th>
-                      {r.marks.map((m, i) => (
-                        <td key={COLUMNS[i]} className={`${CELL} ${rule} ${i === 0 ? "bg-sand/5" : ""}`}>
-                          <span className={`mark mark--${m} flex items-center gap-2 ${MARK_CLASS[m]}`}>{MARK_TEXT[m]}</span>
-                        </td>
-                      ))}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {ROWS.map((r, row) => {
+                    const stripe = STRIPE[row % 2];
+                    return (
+                      <tr key={r.label} className={stripe}>
+                        <th scope="row" className={`${CELL} ${ROW_HEAD} ${stripe} align-middle w-[20%] font-semibold text-chalk`}>
+                          {r.label}
+                        </th>
+                        {r.cells.map((cell, i) => (
+                          <td key={COLUMNS[i]} className={`${CELL} align-middle ${i === 0 ? BAND : COLUMN_RULE}`}>
+                            <CompareCell cell={cell} />
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {/* more columns to the right: a fade over the cut edge, gone once scrolled to the end */}
+            <div
+              aria-hidden="true"
+              className={`pointer-events-none absolute inset-y-0 right-0 w-14 bg-linear-to-l from-ink to-transparent transition-opacity duration-200 ${more ? "opacity-100" : "opacity-0"}`}
+            />
           </div>
           <p className="mt-4.5 max-w-[70ch] text-chalk-dim text-[0.95rem]">
-            From each product's docs, October 2026. Supabase's merge requests and Neon's realtime are in beta; Neon's
-            schema diff compares branches but doesn't merge them. PlanetScale merges schema through deploy requests on
-            MySQL (Vitess) only.
+            From each product's docs, November 2026. Neon's realtime and object storage are in beta; Neon's schema diff
+            compares branches but doesn't merge them. Supabase merges a branch into production through a schema diff,
+            and self-hosted Supabase runs one project without branching or point-in-time restore. PlanetScale merges
+            schema through deploy requests on MySQL (Vitess) only. Firebase's Postgres is SQL Connect (Cloud SQL for
+            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't.
           </p>
         </div>
       </div>
@@ -831,9 +883,12 @@ function Compare() {
 
 function Landfall({ docsUrl }: SectionProps) {
   return (
-    <Band labelledby="landfall-title">
-      <div className="max-w-250 mx-auto grid grid-cols-[minmax(160px,0.7fr)_minmax(0,1.3fr)] gap-14 items-center max-[900px]:grid-cols-1 max-[900px]:justify-items-start">
-        <svg className="w-full h-auto max-w-80 max-[900px]:max-w-50" viewBox="0 0 240 190" aria-hidden="true">
+    // Stacked on a phone, the crab, the call and the footer sit close: the last band needs less air
+    // than a section between sections.
+    <Band labelledby="landfall-title" className="max-[900px]:pt-10 max-[900px]:pb-10">
+      <div className="max-w-250 mx-auto grid grid-cols-[minmax(160px,0.7fr)_minmax(0,1.3fr)] gap-14 items-center max-[900px]:grid-cols-1 max-[900px]:justify-items-start max-[900px]:gap-5">
+        {/* cropped to the drawing (it fills x 23-223, y 29-172 of its 240 x 190 box), the box scaled to match */}
+        <svg className="w-full h-auto max-w-72 max-[900px]:max-w-44" viewBox="16 22 214 157" aria-hidden="true">
           <CrabFigure />
         </svg>
         <div className="min-w-0 w-full">

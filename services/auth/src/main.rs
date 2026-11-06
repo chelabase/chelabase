@@ -4,7 +4,6 @@ use auth::app::{AppState, router};
 use auth::app_users::AppUsers;
 use auth::config::{AppConfig, Config};
 use auth::guard::RateLimiter;
-use auth::zitadel::Zitadel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Some(c) => {
             AppConfig::check_internal_token(config.mode, dev, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
-            Some(AppUsers::from_config(&c, &config.zitadel)?)
+            Some(AppUsers::from_config(&c)?)
         }
         None => None,
     };
@@ -42,14 +41,24 @@ async fn main() -> anyhow::Result<()> {
         AppConfig::check_internal_token(config.mode, dev, &c.1)?;
         auth::app_users::InternalClient::new(&c.0, &c.1)
     };
+    // Member tokens for the auth host's issuer, and the identity service's client: members can't
+    // sign in without them, so neither is optional.
+    let member_tokens = auth::config::MemberTokenConfig::from_env()?
+        .map(|c| auth::member_token::MemberTokens::from_config(&c, &config.issuer))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("CHELABASE_MEMBER_JWT_PRIVATE_KEY/PUBLIC_KEY are not set"))?;
+    info!(kid = member_tokens.kid(), "member tokens are signed (they live {} s)", member_tokens.ttl().as_secs());
+    let identity = auth::config::identity_from_lookup(|name| std::env::var(name).ok())?
+        .ok_or_else(|| anyhow::anyhow!("CHELABASE_IDENTITY_URL/CHELABASE_IDENTITY_TOKEN_FILE are not set"))?;
     let state = Arc::new(AppState {
         app,
         signup_gate: Some(signup_gate),
         used_tickets: Default::default(),
-        admin: AppConfig::admin_from_env(&config.zitadel)?,
-        zitadel: Zitadel::new(&config.zitadel.base, &config.token).with_host(config.zitadel.host.as_deref()),
         config,
         limiter: RateLimiter::default(),
+        member_tokens,
+        identity,
+        clock: Default::default(),
     });
     // The TCP peer decides whose X-Forwarded-For counts (only the trusted proxy's).
     axum::serve(

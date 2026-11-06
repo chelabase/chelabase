@@ -22,7 +22,7 @@ describe("browser pass fixes (FD)", () => {
     const me = (platform_role: "viewer" | "developer" | "admin", roles: string[]) => ({
       sub: "u", email: "u@x", name: "U", tenant_id: "t1", member: { id: "m", status: "active", tenant_admin: false },
       instance_admin: false, tenant_admins: [], projects: [{ project_id: "p1", platform_role, roles, databases: [] }],
-      user: { sub: "u", org_id: "o" }, tenant: { id: "t1", slug: "s", display_name: null, projects: [] },
+      user: { sub: "u" }, tenant: { id: "t1", slug: "s", display_name: null, projects: [] },
     }) as unknown as Parameters<typeof projectCaps>[0];
     // R18: an Admin too only when the grant names them; every role ("all") doesn't.
     expect(dataApiActAs(projectCaps(me("admin", []), "p1"))).toEqual([]);

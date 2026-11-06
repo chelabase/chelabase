@@ -16,7 +16,7 @@ There are two directions:
 
 Both branches must be `ready` and normal (a restore backup can't be merged), and the branch needs a parent: main can't start a merge. A merge covers one Postgres database; by default the branch's main one.
 
-For how it works inside, see [The schema merge engine](/docs/architecture/schema-merge).
+For how it works inside, see [The schema merge engine](/architecture/schema-merge).
 
 ## What a merge moves
 
@@ -31,7 +31,7 @@ For how it works inside, see [The schema merge engine](/docs/architecture/schema
 | Sequences | standalone, owned by a column, and identity ones, with their parameters |
 | Policies | command, permissive or restrictive, roles, `USING`, `WITH CHECK`, comment |
 | Grants | on schemas, tables, columns and sequences, and default privileges |
-| Roles | created and renamed; the attributes and memberships Chelabase's [roles path](/docs/using/login-roles) can set. Never passwords. See [Roles](#roles) |
+| Roles | created and renamed; the attributes and memberships Chelabase's [roles path](/using/login-roles) can set. Never passwords. See [Roles](#roles) |
 
 **Reported, not merged.** The merge lists these as changed on the source, "apply by hand": views, materialized views, functions, procedures, triggers, domains, composite types, partitioned tables and partitions, tables that inherit from another (`INHERITS`), foreign tables, extensions, rules, casts, operators, publications and user event triggers. When something the merge does move depends on one of them (a column default or a policy that calls a function only the source has), the preview says so, and the rehearsal fails on that step with Postgres's error rather than applying half.
 
@@ -159,7 +159,7 @@ Roles are per branch, so a merge handles them through the same path as the roles
 
 - **Created roles.** A role the source added is created on the target. If it can log in it gets a new generated password, which you read from the branch's connection details (`result.created_roles` names them); a group gets none. Passwords are never copied.
 - **Updated roles.** The attributes and memberships the roles API can set (`LOGIN`, `INHERIT`, `CONNECTION LIMIT`, `VALID UNTIL`, `BYPASSRLS`, owner-level, `member_of`) are updated. A `member_of` list never revokes a membership in a `pg_*` role or one of Chelabase's own groups.
-- **Renamed roles.** A role the source renamed (the same role, matched by identity, under a new name) is renamed on the target through the control plane, first of all in phase 0. Its stored row, its login copy and its data API secret keys move with it, so the keys keep working. Grants, owners and policies that name it follow Postgres's own rename. Because anything that connects as the old name fails to authenticate once the rename lands, the step is flagged as breaking and needs an acknowledgement. Studio shows the secret keys that use the role, and the sessions connected to the target as it right now ([live sessions](/docs/using/login-roles#live-sessions)); a client that isn't connected at that moment isn't listed, so change every connection string that names the old name. A rename onto a name another target role keeps, or two roles that swap names, is refused as unplannable: rename them on the target first.
+- **Renamed roles.** A role the source renamed (the same role, matched by identity, under a new name) is renamed on the target through the control plane, first of all in phase 0. Its stored row, its login copy and its data API secret keys move with it, so the keys keep working. Grants, owners and policies that name it follow Postgres's own rename. Because anything that connects as the old name fails to authenticate once the rename lands, the step is flagged as breaking and needs an acknowledgement. Studio shows the secret keys that use the role, and the sessions connected to the target as it right now ([live sessions](/using/login-roles#live-sessions)); a client that isn't connected at that moment isn't listed, so change every connection string that names the old name. A rename onto a name another target role keeps, or two roles that swap names, is refused as unplannable: rename them on the target first.
 - **Never dropped.** A role the source dropped is reported, not dropped.
 - **Apply by hand.** Role changes the roles path can't make are listed under "Not merged" as "apply by hand", and the target keeps its own values, without counting as drift: `CREATEDB`, `CREATEROLE` and `REPLICATION` on their own, role comments, who granted a membership and with which options, memberships in `pg_*` or Chelabase's own roles, and anything about the branch's owner role `postgres` (its attributes and its memberships are never merged).
 
@@ -230,7 +230,7 @@ The body is optional. Send `version` (the one you last read) to apply what you s
 2. the `version` isn't the merge's: `merge_version_conflict`;
 3. a conflict has no resolution: `merge_conflicts_open`;
 4. a data-loss, security or breaking step has no acknowledgement: `merge_drops_unacknowledged`;
-5. the target is [protected](/docs/using/branches#protected-branches) and the body lacks `confirm: true`: `merge_confirm_required`;
+5. the target is [protected](/using/branches#protected-branches) and the body lacks `confirm: true`: `merge_confirm_required`;
 6. another merge is changing the target, or is failed half applied on it: `merge_busy`, with that merge's id in `error.merge_id`.
 
 A branch that isn't ready answers `branch_not_ready`. Apply answers `202` and the merge runs in phases:
@@ -356,12 +356,12 @@ The merge reads the target and compares it with the merged schema. A difference 
 | `after` | What happens to the source branch |
 |---|---|
 | `keep` (default) | Kept; the merge becomes its new base, if the source is still the schema that was merged. If the source changed since the merge was computed, the base isn't advanced (`result.after.base` is `not_advanced`), so its newer changes show up in the next merge. |
-| `reset` | Reset to its parent, like [reset to parent](/docs/using/branches#reset-to-parent). |
+| `reset` | Reset to its parent, like [reset to parent](/using/branches#reset-to-parent). |
 | `delete` | Deleted. The usual refusal (for example, the branch has child branches) is recorded as a sentence in `result.after.refused` and the merge is still `done`. |
 
 `result.after` records what happened: `base` (`recorded`, `not_advanced` or `not_recorded`) for a keep; `outcome` (`done`, or `started` for a reset whose branch is still switching) for a reset or delete; `refused` for a refusal; `started: true`, with `timeline`, while a reset or delete runs. A reset or delete records that it started before it acts, so a crash never runs it twice.
 
-`result` lists the roles the merge created, each with the branch it was created on. Read a role's password from that branch's connection details with `role`, as for any [login role](/docs/using/login-roles).
+`result` lists the roles the merge created, each with the branch it was created on. Read a role's password from that branch's connection details with `role`, as for any [login role](/using/login-roles).
 
 ### Finish a merge applied with drift
 
@@ -382,15 +382,15 @@ POST /v1/databases/{id}/merges/{merge_id}/finish
 
 Some objects are Chelabase's own, or are kept in line by it. A merge never moves them, even when you change them by hand, and never reports them as differences.
 
-- **Chelabase's schemas:** `chelabase` (the data API's) and `chelabase_merge` (the merge's own recovery marker), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
+- **Chelabase's schemas:** `chelabase` (the data API's), `chelabase_merge` (the merge's own recovery marker) and `chelabase_guard` (the protected-branch DDL guard), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
 - **The app users table's managed parts:**
-  - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`);
+  - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`);
   - the guard triggers and the two own-row policies (`chelabase_users_select_own`, `chelabase_users_update_own`);
   - the email index (`chelabase_users_email_key`);
   - the table's grants to `authenticated` and `chelabase_auth_sync`.
 
   Columns you add to the users table do merge.
-- **Chelabase's roles:** `authenticator`, `anon`, `authenticated`, every `chelabase_*` role, `cloud_admin`, `neon_superuser`, and every `pg_*` role. A role's membership in one of them (for example owner-level, which is membership of `neon_superuser`) stays on the member.
+- **Chelabase's roles:** `authenticator`, `anon`, `authenticated`, every `chelabase_*` role, `cloud_admin`, `neon_superuser`, the hidden member logins (`cb_m_*`), and every `pg_*` role. A role's membership in one of them (for example owner-level, which is membership of `neon_superuser`) stays on the member.
 - **Extension members.** The extension itself is reported; what it installs isn't.
 - **The data API's default privileges.** These are the per-schema defaults that grant new tables in a served schema to `anon` and `authenticated`, and one database-wide row: the owner's `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, which the data API writes. Each branch with the data API on already has them, so merging them would only show a difference between a branch that has the data API on and one that doesn't. The exclusion is exact: the database-wide function row of the owner whose privileges are the owner's own `EXECUTE`, and per-schema grants to `anon` and `authenticated` by the owner. A default privilege of yours for another role, or with another grant, merges as usual.
 - **Role changes the roles path can't make,** and the owner role's own attributes: reported as "apply by hand" (see [Roles](#roles)).
@@ -404,7 +404,7 @@ The base is stored when a branch is created, reset, or merged with `keep`. It is
 
 Bases are kept as a history, not one row, and each is tied to the branch's own position in time. Restoring a branch to before a merge therefore makes the next merge compare against the ancestor that was true then. A restore to a point before an earlier restore's point finds the right ancestor too, however many restores deep.
 
-When a branch has no stored base (the read at create failed, the stored one is from an older model version, or the branch predates merging), the merge reads one live from the recorded point in history. Within the branch's [history window](/docs/using/branches#limits-and-settings), 7 days by default, every point can be read. Outside it, a branch point (where the branch was created or last reset) can still be read, because the storage layer keeps it while the timeline it was recorded on exists. That is the branch's own timeline, or, after a restore, the old timeline its backup holds, so it lasts until the backup is deleted. Only when the point is gone (a base recorded by a merge with `keep` and now outside the window, or recorded on a timeline that no longer exists, such as a deleted backup's) does the merge stay a `draft` with no analysis and an `error` that starts with `merge_base_unavailable: `, followed by the reason (the stored base is from another model version, or the branch point is outside the window, for example). It then offers **re-baseline**:
+When a branch has no stored base (the read at create failed, the stored one is from an older model version, or the branch predates merging), the merge reads one live from the recorded point in history. Within the branch's [history window](/using/branches#limits-and-settings), 7 days by default, every point can be read. Outside it, a branch point (where the branch was created or last reset) can still be read, because the storage layer keeps it while the timeline it was recorded on exists. That is the branch's own timeline, or, after a restore, the old timeline its backup holds, so it lasts until the backup is deleted. Only when the point is gone (a base recorded by a merge with `keep` and now outside the window, or recorded on a timeline that no longer exists, such as a deleted backup's) does the merge stay a `draft` with no analysis and an `error` that starts with `merge_base_unavailable: `, followed by the reason (the stored base is from another model version, or the branch point is outside the window, for example). It then offers **re-baseline**:
 
 ```json
 POST /v1/databases/{id}/merges/{merge_id}/recompute
@@ -446,4 +446,4 @@ The page polls while a worker holds the merge, and while a requested after-merge
 
 ## Errors
 
-The merge codes are in the [error reference](/docs/reference/errors#schema-merges).
+The merge codes are in the [error reference](/reference/errors#schema-merges).

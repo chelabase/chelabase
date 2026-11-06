@@ -9,8 +9,8 @@ include!("common/fakes.rs");
 
 use chelabase_metadata::personal_logins::{LoginEndpoint, RevokeReason};
 use chelabase_types::access::RoleSet;
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
 
 async fn body_of(resp: reqwest::Response) -> Value {
     resp.json().await.unwrap()
@@ -26,24 +26,15 @@ fn code_of(body: &Value) -> &str {
 }
 
 /// org-1's tenant with project Billing (database web1, owner `postgres`, main and `dev`) and
-/// Zitadel's mock behind the orchestrator (the member routes need it).
-async fn zworld() -> (MemberWorld, MockZitadel) {
+/// the identity fake behind the orchestrator (the member routes need it).
+async fn zworld() -> (MemberWorld, FakeIdentity) {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let mock = MockZitadel::start().await;
-    mock.add_org("org-1");
-    let app = spawn_app_custom(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-    )
+    let mock = FakeIdentity::start().await;
+    mock.with_pool(&Pool::Members);
+    let app = spawn_app_identity(metadata.clone(), jobs.clone(), Some(mock.client()), Arc::new(chelabase_query::app_users::PgUsersDb::new()), None)
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
     let mut db = sample_database(tenant);
@@ -98,7 +89,7 @@ fn log_event(
 
 // ---- D7 ------------------------------------------------------------------------------------
 
-// D7: a member whose Zitadel user was offboarded (the mark) is refused every route but
+// D7: a member whose identity user was offboarded (the mark) is refused every route but
 // `GET /v1/me` with 403 `member_offboarded`, whatever its grants: tenant routes, project and
 // database routes, and a new personal login. `/me` answers, with no project to use.
 #[tokio::test]
@@ -252,7 +243,7 @@ async fn a_team_only_member_sees_its_projects() {
 #[tokio::test]
 async fn a_suspension_retry_still_tells_the_proxies_and_reconciles() {
     let (w, mock) = zworld().await;
-    let sub = mock.add_user_in("org-1", "bob@x.com", "Secret-pass1", true);
+    let sub = mock.with_user(&Pool::Members, "bob@x.com", "Secret-pass1");
     let bob = w
         .metadata
         .add_granted(w.tenant, &sub, w.project, PlatformRole::Developer, &["app"]);
@@ -334,7 +325,7 @@ async fn a_main_reconcile_that_isnt_done_is_enqueued() {
         Err(ResetError::Timeout),
     ] {
         let (w, mock) = zworld().await;
-        let sub = mock.add_user_in("org-1", "ann@x.com", "Secret-pass1", true);
+        let sub = mock.with_user(&Pool::Members, "ann@x.com", "Secret-pass1");
         w.metadata
             .add_granted(w.tenant, &sub, w.project, PlatformRole::Developer, &["app"]);
         *w.jobs.member_reconcile_reply.lock().unwrap() = Some(reply.clone());
@@ -363,7 +354,7 @@ async fn a_main_reconcile_that_isnt_done_is_enqueued() {
 #[tokio::test]
 async fn revoke_now_counts_what_its_write_revoked() {
     let (w, mock) = zworld().await;
-    let sub = mock.add_user_in("org-1", "cal@x.com", "Secret-pass1", true);
+    let sub = mock.with_user(&Pool::Members, "cal@x.com", "Secret-pass1");
     let cal = w
         .metadata
         .add_granted(w.tenant, &sub, w.project, PlatformRole::Developer, &["app"]);
@@ -434,7 +425,7 @@ async fn an_access_write_never_answers_500_after_its_commit() {
         "{body}"
     );
 
-    mock.add_user_in("org-1", "old@x.com", "Secret-pass1", true);
+    mock.with_user(&Pool::Members, "old@x.com", "Secret-pass1");
     let add = json!({ "email": "old@x.com", "grants": grants_body(&w) });
     let resp = w
         .app
@@ -443,9 +434,9 @@ async fn an_access_write_never_answers_500_after_its_commit() {
     assert_eq!(
         resp.status(),
         201,
-        "an addition answered 500 after its commit"
+        "an existing account's invite answered 500 after its commit"
     );
-    assert_eq!(body_of(resp).await["outcome"], "added");
+    assert_eq!(body_of(resp).await["outcome"], "invited");
 
     let pending = w
         .metadata

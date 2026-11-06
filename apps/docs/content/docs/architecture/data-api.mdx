@@ -3,7 +3,7 @@ title: "Data API"
 description: "How a data API request becomes SQL: the request flow, pooling, caches, the schema model and the benchmark."
 ---
 
-Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it on the branch's compute. For how to use it, see the [data API guide](/docs/using/data-api).
+Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it on the branch's compute. For how to use it, see the [data API guide](/using/data-api).
 
 ## Request flow
 
@@ -25,12 +25,12 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
   ↓ JSON response
 ```
 
-Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it. The gateway's caching and rate limit are described on the [Gateway](/docs/architecture/gateway) page.
+Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it. The gateway's caching and rate limit are described on the [Gateway](/architecture/gateway) page.
 
 `rest` has two listeners:
 
-- the public one on `127.0.0.1:8085`, for the gateway: `POST /data/v1/query` and `GET /data/v1/schema`, trusting only the gateway's identity token;
-- an internal one on `127.0.0.1:8086`, for the orchestrator, behind a static bearer: a schema read for Studio, `POST /internal/branches/{id}/invalidate` (the orchestrator calls it when a branch's served databases or default schema change) and Studio's console route.
+- the public one on `127.0.0.1:8085`, for the gateway: `POST /data/v1/query`, `GET /data/v1/schema` and `GET /data/v1/types`, trusting only the gateway's identity token;
+- an internal one on `127.0.0.1:8086`, for the orchestrator, behind a static bearer: a schema and a types read for Studio, `POST /internal/branches/{id}/invalidate` (the orchestrator calls it when a branch's served databases or default schema change), and Studio's console query and cell routes.
 
 ### Settings
 
@@ -39,7 +39,8 @@ Keys authenticate with the `Authorization: Bearer` header. The gateway resolves 
 | `CHELABASE_REST_ADDR` | `127.0.0.1:8085` | Public listener |
 | `CHELABASE_REST_INTERNAL_ADDR` | `127.0.0.1:8086` | Internal listener |
 | `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | The orchestrator's internal listener, for connection info |
-| `CHELABASE_REST_INTERNAL_TOKEN` | `chelabase-dev-rest-internal` | Bearer for the internal listener, both directions (dev default) |
+| `CHELABASE_REST_INTERNAL_TOKEN` | `chelabase-dev-rest-internal` | Bearer for the internal listener, both directions (also `…_FILE`); the dev value is accepted only with `CHELABASE_DEV_DEFAULTS=1` |
+| `CHELABASE_COMPUTE_CA_FILE` | required | The platform CA certificate every compute's TLS is verified against |
 | `CHELABASE_REST_MAX_CONNECTIONS` | `200` | Permits shared by every pool, on top of each branch's own `max_connections` setting (one budget for all of the branch's database pools) |
 | `CHELABASE_REST_MAX_RESPONSE_BYTES` | 16 MiB | The largest response; the first result past the cap rolls the request back and answers 413 `too_large` |
 
@@ -73,7 +74,7 @@ The pipelined design was chosen with a benchmark against the previous path (sqlx
 
 ## Schema model
 
-The `chelabase` schema holds machinery only, reserved and never exposed. The other reserved schemas are `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration` and temp schemas.
+The `chelabase` schema holds machinery only, reserved and never exposed. The other reserved schemas are `pg_catalog`, `information_schema`, `pg_toast`, `neon`, `neon_migration`, `chelabase_guard` (the protected-branch DDL guard) and temp schemas.
 
 An object is reachable when the key's role has `USAGE` on its schema and any privilege on the object: any column-level `SELECT`, `INSERT` or `UPDATE`, or table-level `DELETE`, for tables, views, materialized views and foreign tables, and `EXECUTE` for functions. Anything else answers like a name that doesn't exist (`unknown_table`, `unknown_column`, `unknown_function`).
 

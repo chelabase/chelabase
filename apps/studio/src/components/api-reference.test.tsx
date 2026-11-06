@@ -16,11 +16,8 @@ vi.mock("@scalar/api-reference-react", () => ({
 import ApiReference, { apiReferenceConfiguration } from "./api-reference";
 
 const env: StudioEnv = {
-  issuer: "http://issuer",
-  clientId: "c",
-  projectId: "p",
-  orgId: "o",
   apiUrl: "http://gw.test",
+  studioHost: "studio.test",
 };
 
 const wrap = (token: string | undefined, doc: ApiDocId = "management") => (

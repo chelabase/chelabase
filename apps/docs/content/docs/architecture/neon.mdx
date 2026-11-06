@@ -12,8 +12,8 @@ Docker Compose (`infra/compose/docker-compose.yml`) starts, besides the control 
 - **SeaweedFS**, an S3-compatible object store, with a `neon` bucket for the safekeeper's WAL backups;
 - the **storage broker**, three **safekeepers** (`safekeeper1` to `safekeeper3`, each with its WAL on its own volume), the **storage controller** (with its own Postgres) and the **pageserver**. The storage controller runs without `--dev`, which puts every timeline on three safekeepers;
 - **Neon's proxy**, which terminates TLS and speaks Postgres wire and SQL over HTTP;
-- **Valkey**, for the proxy's cache invalidation and query cancel, and for [realtime](/docs/architecture/realtime)'s tickets and counters;
-- **NATS**, for the control plane's jobs and events and for realtime. Both NATS and Valkey require credentials (see [Security](/docs/architecture/security#service-credentials)).
+- **Valkey**, for the proxy's cache invalidation and query cancel, and for [realtime](/architecture/realtime)'s tickets and counters;
+- **NATS**, for the control plane's jobs and events and for realtime. Both NATS and Valkey require credentials (see [Security](/architecture/security#service-credentials)).
 
 The worker starts one compute container per database (and per branch) through the Docker socket, from the compute image pinned in Compose. Each compute reaches its storage through the pageserver and safekeepers, and reports to the control plane. The Neon services run as the stack's own uid, whatever the host's.
 
@@ -25,13 +25,13 @@ The storage controller creates each safekeeper timeline and deletes it (local WA
 
 ## The internal listener
 
-The orchestrator's internal listener is on `127.0.0.1:8083` (`CHELABASE_INTERNAL_ADDR`). It serves the machines that call the control plane: Neon's proxy (to look up roles and endpoints), `compute_ctl` (for each compute's spec and hooks) and the storage controller, plus the gateway, `rest` and `auth` for their lookups. Each caller has its own bearer token and can open only its own routes, and nothing goes through the gateway.
+The orchestrator's internal listener is on `127.0.0.1:8083` (`CHELABASE_INTERNAL_ADDR`). It serves the machines that call the control plane: Neon's proxy (to look up roles and endpoints), `compute_ctl` (for each compute's spec and hooks) and the storage controller, plus the gateway, `rest`, `auth` and realtime for their lookups. Each caller has its own bearer token and can open only its own routes, and nothing goes through the gateway.
 
 ## Proxy and connections
 
 Neon's proxy listens on port 4432 (Postgres wire) and port 4444 (WebSocket and SQL over HTTP) inside the stack's network, for hostnames of the form `<endpoint>.localtest.me`. Only the Postgres port is published on the host, as the stack's proxy port (4432 on main; see the table below), and the connection strings the control plane hands out name that host port. The serverless port is in-network only: `/connection`'s `http_url` (`https://<endpoint>.localtest.me:4444/sql`) names a port the host doesn't publish: it works only from a container on the stack's network, dialling the `proxy` service's address (as the e2e scripts do with `curl --connect-to`). `localtest.me` resolves to loopback; `CHELABASE_PROXY_DOMAIN`, `CHELABASE_PROXY_PG_PORT` and `CHELABASE_PROXY_HTTP_PORT` change the domain and the ports the control plane reports.
 
-A self-hosted install publishes both ports (`CHELABASE_PROXY_ADDR`, default `127.0.0.1`, at `CHELABASE_PROXY_PORT`, default 5432, and `CHELABASE_PROXY_HTTP_PORT`, default 4444) and sets the control plane's domain and ports to match, so `http_url` works from the host too. The proxy takes its endpoint domain from its certificate's CN (`*.<domain>`, routing `<endpoint>.<domain>` by TLS server name); `proxy-tls` issues it for `CHELABASE_PROXY_DOMAIN` from the install's own CA. See [Install: connect to databases](/docs/self-hosting/install#connect-to-databases).
+A self-hosted install publishes both ports (`CHELABASE_PROXY_ADDR`, default `127.0.0.1`, at `CHELABASE_PROXY_PORT`, default 5432, and `CHELABASE_PROXY_HTTP_PORT`, default 4444) and sets the control plane's domain and ports to match, so `http_url` works from the host too. The proxy takes its endpoint domain from its certificate's CN (`*.<domain>`, routing `<endpoint>.<domain>` by TLS server name); `proxy-tls` issues it for `CHELABASE_PROXY_DOMAIN` from the install's own CA. See [Install: connect to databases](/self-hosting/install#connect-to-databases).
 
 The proxy asks the orchestrator for each role's SCRAM secret. It caches role secrets for at most a minute, so a password change must publish `/password_updated` after the compute is reconfigured; `chelabase neon password-updated` does that. It fails loudly when no proxy is subscribed, rather than reporting success.
 
@@ -43,7 +43,7 @@ Each checkout's workbench stack runs in its own Docker network, and only two por
 
 | Service | Host port (main) | Notes |
 | --- | --- | --- |
-| Gateway | 8000 | HTTP front door (Pingora); reaches Studio, the API, Zitadel and the rest by host name |
+| Gateway | 8000 | HTTP front door (Pingora); reaches Studio, the API and the rest by host name |
 | Neon proxy | 4432 | Postgres wire (`<endpoint>.localtest.me:4432`) |
 
 Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4599); `just workbench status` lists them. Everything else is internal to the stack's network and reached by service name:
@@ -52,7 +52,7 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | --- | --- | --- |
 | Studio | `studio:3000` | The web app (dev server) |
 | Orchestrator | `orchestrator:8081` | Management API; internal to the gateway |
-| Orchestrator internal listener | `orchestrator:8083` | For the proxy, `compute_ctl`, the storage controller, the gateway, `rest` and `auth` |
+| Orchestrator internal listener | `orchestrator:8083` | For the proxy, `compute_ctl`, the storage controller, the gateway, `rest`, `auth` and realtime |
 | Worker health | `worker:8082` | `/health` |
 | auth | `auth:8084` | Sign-in backend (via the gateway at `/auth/v1`) |
 | rest | `rest:8085` | Data API engine (via the gateway at `/data/v1`) |
@@ -60,8 +60,7 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | metadata Postgres | `metadata-db:5432` | Control-plane metadata |
 | NATS (with JetStream) | `nats:4222` (monitor 8222) | Provision queue, jobs and events; one credentialed user per service |
 | Realtime | `realtime:8087`, `realtime:8088` | Live rows and presence: the socket and tickets (via the gateway), and `/health` |
-| Zitadel | `zitadel:8080` | Console: `http://auth.chelabase.localhost:8000/ui/console` |
-| Zitadel Postgres | `zitadel-db:5432` | Zitadel's own database |
+| Identity | `identity:8080` | Accounts and sessions for members and app users; internal only, no host route ([Identity service](/architecture/identity)) |
 | Mailpit | `mailpit:8025` | Local email inbox (verification codes, resets) |
 | Neon storage controller | `storage-controller:1234` | Tenants and timelines |
 | Neon pageserver | `pageserver:9898` | Pageserver HTTP API |
@@ -75,7 +74,7 @@ Run `just workbench psql`, `just workbench exec <service> <cmd>` and `just workb
 
 ## The compute network
 
-Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's and test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, Zitadel, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
+Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's, realtime's and the test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, the identity service, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
 
 `compute_ctl`'s internal server on `compute:3081` listens on loopback only and needs a per-start secret, so other computes can't reach it. Tenant storage tokens for capable computes expire after 24 hours and the worker refreshes them hourly. The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
 

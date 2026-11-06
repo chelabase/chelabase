@@ -40,12 +40,12 @@ while IFS= read -r f; do
   grep -q 'CHELABASE_STACK_CHECKOUT' "$f" || fail "$f recreates apps without CHELABASE_STACK_CHECKOUT"
 done < <(git grep -l -e '--force-recreate' -- 'services/*/tests/*' 'crates/*/tests/*' 'crates/*/src/*' 'services/*/src/*')
 just --show wt-add | gq 'origin/main' || fail "wt-add treats origin/main as a step base"
-for r in create-db-demo zitadel-reset; do
+for r in create-db-demo auth-token; do
   just --show "$r" | gq 'workbench env' || fail "$r loads the stack's env"
 done
 for f in scripts/live.sh scripts/internal-addr.sh scripts/stack-reset-slots.sh \
   scripts/tests/live.sh scripts/tests/internal-addr.sh scripts/tests/stack-reset-slots.sh \
-  scripts/tests/dev-recipes.sh; do
+  scripts/tests/dev-recipes.sh "scripts/zit""adel-reset.sh"; do
   [[ ! -e "$f" ]] || fail "$f is retired"
 done
 [[ -x scripts/sweep-dbs.sh ]] || fail "scripts/sweep-dbs.sh exists"
@@ -59,7 +59,7 @@ hostaddr_loopback='hostaddr=127\.0\.0\.1'
 for pat in 'compose exec' 'cargo run' 'cargo test' \
   "$loopback" 'host\.docker\.internal' \
   'internal-addr\.sh' 'name=\^chelabase-compute-' '\.chelabase/neon/proxy-ca\.crt' \
-  '\.chelabase/zitadel' "$hostaddr_loopback" 'just live' 'just dev\b' 'just deps-up'; do
+  "$hostaddr_loopback" 'just live' 'just dev\b' 'just deps-up'; do
   targets=("${scripts[@]}")
   if [[ "$pat" == 'compose exec' || "$pat" == "$loopback" || "$pat" == "$hostaddr_loopback" ]]; then
     targets=()
@@ -71,17 +71,6 @@ for pat in 'compose exec' 'cargo run' 'cargo test' \
   [[ -z "$hits" ]] || fail "scripts still use $pat:
 $hits"
 done
-for f in scripts/zitadel-reset.sh; do
-  grep -q -- '-p "\$CHELABASE_COMPOSE_PROJECT"' "$f" || fail "$f acts on the stack's project"
-done
-# The apps mount both PATs as Compose secrets: the reset waits until Zitadel has rewritten both.
-grep -qF '[[ -s "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/login-client.pat" ]]' scripts/zitadel-reset.sh ||
-  fail "zitadel-reset waits for both PATs"
-# The PATs are secrets: the reset leaves them 0600 and the dir private (Zitadel runs as the host uid).
-grep -qE 'chmod 600 .*\$\{ZDIR\}/admin\.pat' scripts/zitadel-reset.sh &&
-  grep -qE 'chmod 600 .*\$\{ZDIR\}/login-client\.pat' scripts/zitadel-reset.sh ||
-  fail "zitadel-reset chmods both PATs 0600"
-! grep -q 'chmod 777' scripts/zitadel-reset.sh || fail "zitadel-reset must not make the Zitadel dir 0777"
 for f in scripts/neon-e2e.sh scripts/branch-e2e.sh; do
   grep -q 'chelabase.dev/stack' "$f" || fail "$f selects computes by the stack's label"
 done
@@ -89,7 +78,7 @@ grep -q 'CHELABASE_PROXY_HOSTADDR' scripts/neon-e2e.sh || fail "neon-e2e dials t
 for f in packages/neon-e2e/check.mjs packages/client/scripts/e2e.mjs; do
   grep -q 'CHELABASE_PROXY_HOSTADDR' "$f" || fail "$f dials the proxy's address"
 done
-just --show check | gq 'scripts/tests/workbench-recipes.sh' || fail "just check runs this file"
+just --show check-scripts | gq 'scripts/tests/workbench-recipes.sh' || fail "just check-scripts runs this file"
 
 # T6 review fix round.
 # C1: a curl to the proxy's serverless endpoint (<ep>.localtest.me:4444) must be routed to the
@@ -111,7 +100,7 @@ for f in $(grep -lE 'PROXY_HTTP_PORT|:4444' "${scripts[@]}" || true); do
 done
 # I2: recipe arguments are passed as arguments, never re-split by the shell.
 grep -q '^set positional-arguments' justfile || fail "the justfile sets positional-arguments"
-for r in workbench bench-data-api zitadel-bootstrap; do
+for r in workbench bench-data-api stack-bootstrap; do
   just --show "$r" | gq -E '"\$(@|1)"' || fail "$r passes its arguments quoted (\"\$@\" or \"\$1\")"
   ! just --show "$r" | gq -F '{{' || fail "$r interpolates its arguments into the shell line"
 done
@@ -132,12 +121,12 @@ grep -q 'CHELABASE_ENTRY_API_URL' packages/client/scripts/e2e.mjs || fail "clien
 grep -q 'CHELABASE_PROXY_PORT' scripts/neon-e2e.sh ||
   fail "neon-e2e checks handed-out URIs against the stack's host proxy port (CHELABASE_PROXY_PORT)"
 # m4 (#11): the bootstrap runs `chelabase-init bootstrap` in a container on the stack's compose
-# network (the CLI's `dev bootstrap`), so the host needs no route to Zitadel and the recipe only
-# builds the tool and calls the CLI; the CLI loads the stack env and writes the Zitadel files.
-just --show zitadel-bootstrap | gq 'cargo build -q -p init' || fail "zitadel-bootstrap builds chelabase-init first"
-just --show zitadel-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
-  fail "zitadel-bootstrap runs the CLI's dev bootstrap"
-just --show check | gq 'scripts/tests/retired-names.sh' || fail "just check runs retired-names.sh"
+# network (the CLI's `dev bootstrap`), so the host needs no route into the stack and the recipe
+# only builds the tool and calls the CLI; the CLI loads the stack env.
+just --show stack-bootstrap | gq 'cargo build -q -p init' || fail "stack-bootstrap builds chelabase-init first"
+just --show stack-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
+  fail "stack-bootstrap runs the CLI's dev bootstrap"
+just --show check-scripts | gq 'scripts/tests/retired-names.sh' || fail "just check-scripts runs retired-names.sh"
 # W2 live: the worker's live tests share the stack (branch_live restarts its pageserver, roles_live
 # recreates its orchestrator, caps count every database), so they run one at a time, as the
 # retired worker-live recipe's --test-threads=1 did; a nextest test group holds them to one.
@@ -158,5 +147,5 @@ grep -B3 -A3 'test-group = "stack-serial"' "$nextest" | gq -F 'package(chelabase
 dev_hits="$(grep -nE 'chelabase-dev-[a-z]' "${scripts[@]}" | grep -v '^scripts/compute-network-e2e\.sh:' || true)"
 [[ -z "$dev_hits" ]] || fail "scripts fall back to a public development bearer:
 $dev_hits"
-just --show check | gq 'scripts/tests/compose-secret-argv.sh' || fail "just check runs compose-secret-argv.sh"
+just --show check-scripts | gq 'scripts/tests/compose-secret-argv.sh' || fail "just check-scripts runs compose-secret-argv.sh"
 echo "workbench-recipes: ok"

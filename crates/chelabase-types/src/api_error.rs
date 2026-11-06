@@ -12,7 +12,8 @@ pub enum ErrorCode {
     Unauthorized,
     /// 403: the caller is known but lacks the access; may carry `extra.required` (the level needed).
     Forbidden,
-    TenantNotBound,
+    /// A person with several tenants signed in without choosing one (`?tenant=`).
+    TenantRequired,
     NotFound,
     MethodNotAllowed,
     InvalidRequest,
@@ -115,10 +116,6 @@ pub enum ErrorCode {
     /// An invite for someone whose own sign-up waits for approval: approve or decline it. The
     /// body carries `member_id`.
     SignupPending,
-    /// More than one user of the organisation has the email.
-    EmailAmbiguous,
-    /// A user outside the tenant's organisation already has the email.
-    EmailInUseElsewhere,
     /// The invite was revoked, accepted or replaced since.
     InviteClosed,
     /// Postgres refused the statement for the role you act as (SQLSTATE 42501).
@@ -148,7 +145,7 @@ pub enum ErrorCode {
     PersonalLoginExists,
     /// 403: the caller's membership is suspended.
     MemberSuspended,
-    /// 403: the caller's identity was deactivated, locked or removed in Zitadel (D7).
+    /// 403: the caller's account was offboarded (D7).
     MemberOffboarded,
     /// 422: a role delete's successor isn't one the owner can SET to, or is owner-level,
     /// reserved, a personal login or the role itself.
@@ -156,14 +153,16 @@ pub enum ErrorCode {
     /// 409: a role delete would expose objects (definer routines, non-invoker views granted to
     /// others) to its successor and wasn't confirmed with the preview's current token.
     ExposureUnconfirmed,
+    /// 503: the identity service (app users' pools) can't be reached or refused Chelabase's call.
+    IdentityUnavailable,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 106] = [
+    pub const ALL: [ErrorCode; 105] = [
         Self::Unauthorized,
         Self::Forbidden,
-        Self::TenantNotBound,
+        Self::TenantRequired,
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::InvalidRequest,
@@ -248,8 +247,6 @@ impl ErrorCode {
         Self::MemberRoleReconcileFailed,
         Self::LinkNotAllowed,
         Self::SignupPending,
-        Self::EmailAmbiguous,
-        Self::EmailInUseElsewhere,
         Self::InviteClosed,
         Self::PermissionDenied,
         Self::DependentsChanged,
@@ -267,13 +264,14 @@ impl ErrorCode {
         Self::MemberOffboarded,
         Self::InvalidSuccessor,
         Self::ExposureUnconfirmed,
+        Self::IdentityUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
-            Self::TenantNotBound => "tenant_not_bound",
+            Self::TenantRequired => "tenant_required",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::InvalidRequest => "invalid_request",
@@ -358,8 +356,6 @@ impl ErrorCode {
             Self::MemberRoleReconcileFailed => "member_role_reconcile_failed",
             Self::LinkNotAllowed => "link_not_allowed",
             Self::SignupPending => "signup_pending",
-            Self::EmailAmbiguous => "email_ambiguous",
-            Self::EmailInUseElsewhere => "email_in_use_elsewhere",
             Self::InviteClosed => "invite_closed",
             Self::PermissionDenied => "permission_denied",
             Self::DependentsChanged => "dependents_changed",
@@ -377,6 +373,7 @@ impl ErrorCode {
             Self::MemberOffboarded => "member_offboarded",
             Self::InvalidSuccessor => "invalid_successor",
             Self::ExposureUnconfirmed => "exposure_unconfirmed",
+            Self::IdentityUnavailable => "identity_unavailable",
         }
     }
 }
@@ -479,10 +476,10 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 106] = [
+    const ALL: [(ErrorCode, &str); 105] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
-        (ErrorCode::TenantNotBound, "tenant_not_bound"),
+        (ErrorCode::TenantRequired, "tenant_required"),
         (ErrorCode::NotFound, "not_found"),
         (ErrorCode::MethodNotAllowed, "method_not_allowed"),
         (ErrorCode::InvalidRequest, "invalid_request"),
@@ -567,8 +564,6 @@ mod tests {
         (ErrorCode::MemberRoleReconcileFailed, "member_role_reconcile_failed"),
         (ErrorCode::LinkNotAllowed, "link_not_allowed"),
         (ErrorCode::SignupPending, "signup_pending"),
-        (ErrorCode::EmailAmbiguous, "email_ambiguous"),
-        (ErrorCode::EmailInUseElsewhere, "email_in_use_elsewhere"),
         (ErrorCode::InviteClosed, "invite_closed"),
         (ErrorCode::PermissionDenied, "permission_denied"),
         (ErrorCode::DependentsChanged, "dependents_changed"),
@@ -584,13 +579,14 @@ mod tests {
         (ErrorCode::ExposesDataApi, "exposes_data_api"),
         (ErrorCode::PersonalLoginExists, "personal_login_exists"),
         (ErrorCode::MemberSuspended, "member_suspended"),
-        // Final round D7: 403, the caller's identity was offboarded in Zitadel.
+        // Final round D7: 403, the caller's account was offboarded.
         (ErrorCode::MemberOffboarded, "member_offboarded"),
         // T10: 422, a role delete's successor isn't one the owner can SET to, is owner-level,
         // reserved, a personal login or the role itself.
         (ErrorCode::InvalidSuccessor, "invalid_successor"),
         // T10 fix: 409, a role delete's exposures weren't confirmed with the preview's token.
         (ErrorCode::ExposureUnconfirmed, "exposure_unconfirmed"),
+        (ErrorCode::IdentityUnavailable, "identity_unavailable"),
     ];
 
     #[test]

@@ -152,13 +152,13 @@ impl Scratch {
             .unwrap()
     }
 
-    async fn zitadel_of(&self, member: Uuid) -> String {
+    async fn identity_user_of(&self, member: Uuid) -> String {
         self.client
             .member(member)
             .await
             .unwrap()
             .unwrap()
-            .zitadel_user_id
+            .identity_user_id
     }
 }
 
@@ -441,7 +441,7 @@ async fn team_bounds_and_unchanged_writes() {
 
 // I4, MH-5: the check's read is every affected member × affected project, by member then
 // project, each with the member's own grant and team grants; the committed write reports the
-// affected members with their Zitadel users and the projects to reconcile.
+// affected members with their identity users and the projects to reconcile.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn the_checks_read_and_the_writes_report() {
@@ -495,7 +495,7 @@ async fn the_checks_read_and_the_writes_report() {
     assert!(w.changed);
     assert_eq!(
         w.affected,
-        vec![(a, s.zitadel_of(a).await), (b, s.zitadel_of(b).await)]
+        vec![(a, s.identity_user_of(a).await), (b, s.identity_user_of(b).await)]
     );
     assert_eq!(w.projects, pq.to_vec());
     // A second delete finds no team.
@@ -532,7 +532,7 @@ async fn invite_teams_are_deduplicated_and_revoking_drops_them() {
     };
     let teams = [sx.clone(), sx.clone()];
     let invite = NewInvite {
-        zitadel_user_id: "zi",
+        identity_user_id: "zi",
         email: "i@x.com",
         expires_at: Utc::now() + Duration::days(7),
         token_hash: [7; 32],

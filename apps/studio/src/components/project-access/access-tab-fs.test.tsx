@@ -15,7 +15,7 @@ const adminMe = {
   sub: "ana", email: "ana@example.test", name: "ana", tenant_id: "t1", instance_admin: false, tenant_admins: [],
   member: { id: "ana", status: "active", tenant_admin: false },
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
-  user: { sub: "ana", org_id: "o" },
+  user: { sub: "ana" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [project] },
 } as unknown as Me;
 

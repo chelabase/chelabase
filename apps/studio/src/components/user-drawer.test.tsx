@@ -47,23 +47,6 @@ describe("UserDrawer", () => {
     expect(fetch.calls.some((c) => c.method === "PATCH")).toBe(false);
   });
 
-  it("drawer_set_password", async () => {
-    const { fetch } = setup({ "PATCH /v1/projects/p1/users/u1": () => jsonResponse(base) });
-    await userEvent.type(await screen.findByLabelText("New password"), "s3cret-pass-phrase");
-    await userEvent.click(screen.getByRole("button", { name: "Set password" }));
-    await waitFor(() => expect(fetch.calls.some((c) => c.method === "PATCH")).toBe(true));
-    expect(await patchBody(fetch)).toEqual({ password: "s3cret-pass-phrase" });
-    expect(await screen.findByText("Password changed; the user's sessions ended")).toBeInTheDocument();
-  });
-
-  it("drawer_set_password_weak", async () => {
-    setup({ "PATCH /v1/projects/p1/users/u1": () => jsonResponse({ error: { code: "weak_password", message: "raw" } }, 400) });
-    await userEvent.type(await screen.findByLabelText("New password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Set password" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("That password is too weak");
-    expect(screen.getByLabelText("New password")).toHaveValue("");
-  });
-
   it("drawer_deactivate_reactivate", async () => {
     let state: AppUser["state"] = "active";
     const { fetch } = setup({

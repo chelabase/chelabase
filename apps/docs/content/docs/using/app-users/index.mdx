@@ -5,19 +5,19 @@ description: Sign-up and sign-in for the users of your own app, and how to turn 
 
 Your app signs its own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims.
 
-- Zitadel holds the identities. Each project that enables app users gets its own Zitadel organization (its id is the project's id).
+- Chelabase's identity service holds the identities. Each project that enables app users gets its own pool of users (`app-<project id>`), apart from every other project's and from Studio's members.
 - Chelabase issues the tokens.
 - Each user also has a row in a users table that your app owns, so you can add columns, foreign keys and row-level security policies to it.
 
 Pages in this section:
 
-- [The users table](/docs/using/app-users/users-table): what Chelabase manages, what you own, and sign-up data.
-- [Claim helpers](/docs/using/app-users/claim-helpers): `chelabase.user_id()` and friends, for policies and defaults.
-- [Tokens, sessions and the SDK](/docs/using/app-users/sessions): the sign-in flows, token lifetimes and refresh.
-- [Managing users](/docs/using/app-users/managing-users): the platform admin API and Studio's Users tab.
-- [Settings](/docs/using/app-users/settings): environment variables.
+- [The users table](/using/app-users/users-table): what Chelabase manages, what you own, and sign-up data.
+- [Claim helpers](/using/app-users/claim-helpers): `chelabase.user_id()` and friends, for policies and defaults.
+- [Tokens, sessions and the SDK](/using/app-users/sessions): the sign-in flows, token lifetimes and refresh.
+- [Managing users](/using/app-users/managing-users): the platform admin API and Studio's Users tab.
+- [Settings](/using/app-users/settings): environment variables.
 
-How the sync between Zitadel and the users table works is described in [App users internals](/docs/architecture/app-users).
+How the sync between the identity service and the users table works is described in [App users internals](/architecture/app-users).
 
 ## Enabling
 
@@ -47,7 +47,7 @@ Only `database_id` is required.
 | `schema` | `public` | `^[a-z_][a-z0-9_]{0,62}$`. Reserved schemas (`chelabase`, `information_schema`, `pg_*`, Postgres's and Neon's own) are refused. |
 | `table` | `users` | `^[a-z_][a-z0-9_]{0,62}$`. |
 | `email_verification` | `false` | Whether new users must confirm their email with an emailed code. |
-| `on_delete` | `delete` | What deleting a user in Zitadel does to its row: `delete` or `mark`. See [The users table](/docs/using/app-users/users-table). |
+| `on_delete` | `delete` | What deleting a user does to its row: `delete` or `mark`. See [The users table](/using/app-users/users-table). |
 
 The first call enables app users and answers 202. The project's app-users status goes from `enabling` to `enabled`, or to `failed` with an `error`. Sending the same PUT again retries a failed or stuck enable. Once app users are enabled, a later PUT changes `email_verification` and `on_delete` only (200); any other change is 409 `app_users_location_fixed`.
 
@@ -58,14 +58,14 @@ Enabling needs:
 - no table at `schema.table` on any branch (409 `app_users_table_exists`).
 
 <Callout type="info">
-Without `CHELABASE_ZITADEL_ADMIN_PAT_FILE` (and `CHELABASE_AUTH_HOST`, which gives the issuer) set on the orchestrator, the app-user admin routes answer 503 and enabling can't start. `just workbench up` sets this up. See [Settings](/docs/using/app-users/settings).
+When the identity service can't be reached, the app-user admin routes answer 503 `identity_unavailable` and enabling waits. A Compose install and `just workbench up` wire it up. See [Settings](/using/app-users/settings).
 </Callout>
 
 What enabling does:
 
-- creates the project's Zitadel organization;
+- creates the project's pool in the identity service;
 - creates the users table (RLS on, two own-row policies) and its guard on every branch of the database, plus the sync login `chelabase_auth_sync`;
-- installs the [claim helpers](/docs/using/app-users/claim-helpers) in every other database the data API serves in the project.
+- installs the [claim helpers](/using/app-users/claim-helpers) in every other database the data API serves in the project.
 
 New branches of the database get the same setup (with their own `chelabase_auth_sync` password) and the users' rows. While app users are on, the data API of the Postgres database that holds the users table can't be switched off or removed (409).
 
@@ -75,7 +75,7 @@ New branches of the database get the same setup (with their own `chelabase_auth_
 DELETE /v1/projects/{id}/app-users
 ```
 
-Refused with 409 `app_users_has_users` while the organization has any user: delete them first (Studio's Users tab, or the [admin API](/docs/using/app-users/managing-users)). Otherwise the answer is 202 and the worker removes the guard machinery and the sync login from every branch, revokes the sessions and deletes the organization. Sending the request again while the project is `disabling` retries.
+Refused with 409 `app_users_has_users` while the pool has any user: delete them first (Studio's Users tab, or the [admin API](/using/app-users/managing-users)). Otherwise the answer is 202 and the worker removes the guard machinery and the sync login from every branch, revokes the sessions and drops the pool. Sending the request again while the project is `disabling` retries.
 
 The table stays as an ordinary table, **with row-level security still on and no policies**: the two built-in policies are removed, because they call the claim helpers. Add your own policies, or switch RLS off.
 

@@ -79,7 +79,7 @@ describe("BP-1: what each address's answer means", () => {
   });
 
   it("with_links_the_resent_link_is_listed_once_with_a_copy_button", async () => {
-    setup({ "pend@x.test": pendingAnswer("pend@x.test") }, resend("inv-pend", "https://studio.test/invite#again-secret"), { email_available: false, reason: "no_email_provider" });
+    setup({ "pend@x.test": pendingAnswer("pend@x.test") }, resend("inv-pend", "https://studio.test/invite#again-secret"), { email_available: false, reason: "email_not_configured" });
     const dialog = await compose("pend@x.test, new@x.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Send 2 invites" }));
     const results = await screen.findByRole("dialog", { name: /^Invites sent/ });
@@ -88,7 +88,7 @@ describe("BP-1: what each address's answer means", () => {
   });
 
   it("a_single_pending_invitee_is_resent_and_the_link_is_handed_over", async () => {
-    const { onLink, f } = setup({ "pend@x.test": pendingAnswer("pend@x.test") }, resend("inv-pend", "https://studio.test/invite#again-secret"), { email_available: false, reason: "no_email_provider" });
+    const { onLink, f } = setup({ "pend@x.test": pendingAnswer("pend@x.test") }, resend("inv-pend", "https://studio.test/invite#again-secret"), { email_available: false, reason: "email_not_configured" });
     const dialog = await compose("pend@x.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
     await waitFor(() => expect(onLink).toHaveBeenCalledWith({ email: "pend@x.test", url: "https://studio.test/invite#again-secret" }));
@@ -136,7 +136,7 @@ describe("BP-1: what each address's answer means", () => {
   });
 
   it("edit_and_retry_reopens_with_exactly_the_failed_addresses", async () => {
-    const fail = () => jsonResponse({ error: { code: "email_in_use_elsewhere", message: "x" } }, 409);
+    const fail = () => jsonResponse({ error: { code: "signup_pending", message: "x" } }, 409);
     setup({ "a@x.test": fail, "b@x.test": fail, "ines@x.test": activeAnswer("ines@x.test") });
     const dialog = await compose("a@x.test, ines@x.test, b@x.test, c@x.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Send 4 invites" }));

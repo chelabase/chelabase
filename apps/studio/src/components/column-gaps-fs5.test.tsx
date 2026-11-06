@@ -86,7 +86,7 @@ describe("project databases table gaps (fix S5)", () => {
   const me = {
     sub: "u1", email: "u1@example.test", name: "U1", tenant_id: "t1", member: { id: "m-self", status: "active", tenant_admin: true },
     instance_admin: true, tenant_admins: [], projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
-    user: { sub: "u1", org_id: "org-1" },
+    user: { sub: "u1" },
     tenant: { id: "t1", slug: "demo", display_name: null, projects: [{ id: "p1", slug: "default", name: "Default", status: "active", databases: [database] }] },
   } as unknown as Me;
   const info: ProjectInfo = { id: "p1", slug: "default", name: "Default", status: "active", error: null, app_users: null, created_at: "2026-10-03T10:00:00Z", updated_at: "2026-10-03T10:00:00Z" };

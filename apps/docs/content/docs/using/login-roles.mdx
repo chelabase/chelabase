@@ -39,7 +39,7 @@ A membership is refused with `role_membership_not_allowed` when its target is:
 - the role itself, a role that doesn't exist, or one the owner can't administer;
 - a group that is itself a member of one of those, at any depth, since joining it would reach them indirectly.
 
-A connection limit under `-1` is refused with `role_attribute_not_allowed`. Both codes are in the [error reference](/docs/reference/errors#login-roles-and-data-api-keys). A [schema merge](/docs/using/merging-schema) creates and updates roles through this same path, so the same rules apply to it.
+A connection limit under `-1` is refused with `role_attribute_not_allowed`. Both codes are in the [error reference](/reference/errors#login-roles-and-data-api-keys). A [schema merge](/using/merging-schema) creates and updates roles through this same path, so the same rules apply to it.
 
 ## What works in SQL
 
@@ -87,7 +87,7 @@ A change made through Studio or the API that the compute didn't confirm (the com
 
 ## Live sessions
 
-`GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions` lists the sessions open as a role on the branch's compute right now: `count`, and for each session its `client_addr` (`null` for a connection from inside the compute), `application_name` and `backend_start`, oldest first. It only reads: when the compute isn't running, the answer is `compute_running: false` with no sessions, and the compute isn't started. A client that isn't connected at that moment isn't listed. A name with no role has no sessions. Studio shows it on a [schema merge](/docs/using/merging-schema#roles) that renames a role.
+`GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions` lists the sessions open as a role on the branch's compute right now: `count`, and for each session its `client_addr` (`null` for a connection from inside the compute), `application_name` and `backend_start`, oldest first. It only reads: when the compute isn't running, the answer is `compute_running: false` with no sessions, and the compute isn't started. A client that isn't connected at that moment isn't listed. A name with no role has no sessions. Studio shows it on a [schema merge](/using/merging-schema#roles) that renames a role.
 
 ## Resync
 
@@ -100,8 +100,8 @@ When Chelabase can't reach the control plane, role and database DDL fails after 
 
 ## On a protected branch
 
-On a protected branch with the "guard login roles" switch on, a login role other than the owner can't change the schema unless it is exempted on that branch by name. The member logins of non-Admins are refused either way. See [Protected branches](/docs/using/branches#protected-branches).
+On a protected branch with the "guard login roles" switch on, a login role other than the owner can't change the schema unless it is exempted on that branch by name. The member logins of non-Admins are refused either way. See [Protected branches](/using/branches#protected-branches).
 
 ## Passwords across branches
 
-A new branch keeps its parent's role passwords unless the parent is protected. See [Branches](/docs/using/branches).
+A new branch keeps its parent's role passwords unless the parent is protected. See [Branches](/using/branches).

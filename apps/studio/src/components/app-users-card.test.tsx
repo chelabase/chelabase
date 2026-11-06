@@ -16,7 +16,7 @@ const dbs: DatabaseSummary[] = [
 ];
 const settings = (over: Partial<AppUsersSettings> = {}): AppUsersSettings => ({
   database_id: "d1", pg_database: "postgres", schema: "public", table: "users", email_verification: false,
-  on_delete: "delete", status: "enabled", error: null, zitadel_org_id: "org1", ...over,
+  on_delete: "delete", status: "enabled", error: null, ...over,
 });
 const mainBranch = {
   id: "b-main", name: "main", parent_branch_id: null, kind: "normal", status: "ready", host: "h", port: 1,
@@ -50,7 +50,7 @@ describe("AppUsersCard", () => {
     expect(screen.getByLabelText("Schema")).toHaveValue("public");
     expect(screen.getByLabelText("Table")).toHaveValue("users");
     expect(screen.getByLabelText("Require email verification")).not.toBeChecked();
-    expect(screen.getByLabelText("When a user is deleted in Zitadel")).toHaveValue("delete");
+    expect(screen.getByLabelText("When a user is deleted in the identity service")).toHaveValue("delete");
     expect(screen.getByText(/GRANT INSERT \(col\) ON <table> TO authenticated/)).toBeInTheDocument();
     expect(screen.getByText(/RLS is on/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Enable app users" }));
@@ -79,14 +79,33 @@ describe("AppUsersCard", () => {
   it("failed_shows_error_and_retry", async () => {
     const { fetch } = setup(
       {
-        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "failed", error: "zitadel org: boom" })),
+        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "failed", error: "identity pool: boom" })),
         "PUT /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "enabling" }), 202),
       },
       { ...project, app_users: "failed" },
     );
-    expect(await screen.findByText("zitadel org: boom")).toBeInTheDocument();
+    expect(await screen.findByText("identity pool: boom")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Disable" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(fetch.calls.some((c) => c.method === "PUT")).toBe(true));
+    expect(await fetch.calls.find((c) => c.method === "PUT")!.json()).toMatchObject({
+      database_id: "d1", pg_database: "postgres", schema: "public", table: "users", on_delete: "delete",
+    });
+  });
+
+  // A disable the worker put on hold (its pool still has users): the reason, and enabling again.
+  it("disable_on_hold_shows_error_and_enable_again", async () => {
+    const held = "the app-user pool app-p1 still holds 1 user(s); the pool is kept";
+    const { fetch } = setup(
+      {
+        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "disabling", error: held })),
+        "PUT /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "enabling" }), 202),
+      },
+      { ...project, app_users: "disabling" },
+    );
+    expect(await screen.findByText(held)).toBeInTheDocument();
+    expect(screen.getByText("Disabling app users is on hold")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Enable again" }));
     await waitFor(() => expect(fetch.calls.some((c) => c.method === "PUT")).toBe(true));
     expect(await fetch.calls.find((c) => c.method === "PUT")!.json()).toMatchObject({
       database_id: "d1", pg_database: "postgres", schema: "public", table: "users", on_delete: "delete",

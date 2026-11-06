@@ -3,7 +3,7 @@ title: App users in the client
 description: Sign your app's users up and in with db.auth, and how the session reaches the data API.
 ---
 
-With [app users](/docs/using/app-users) enabled on the project, `db.auth` signs your users up and in. Once signed in, every request the client sends carries the user's access token (the `chelabase-user` header), so the data API runs as that user.
+With [app users](/using/app-users) enabled on the project, `db.auth` signs your users up and in. Once signed in, every request the client sends carries the user's access token (the `chelabase-user` header), so the data API runs as that user.
 
 ```ts twoslash
 import { createClient } from "@chelabase/client";
@@ -40,20 +40,20 @@ if (user) console.log(user.email);
 
 ## Sign-up data
 
-`signUp`'s `data` fills the app's own columns of the users table. With a generated `Database` it is typed from that table's insertable columns, without the managed ones (`id`, `email`, `email_verified`, `created_at`, `deleted_at`). `session` is `null` while email verification is pending (`verificationRequired`).
+`signUp`'s `data` fills the app's own columns of the users table. With a generated `Database` it is typed from that table's insertable columns, without the managed ones (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`). `session` is `null` while email verification is pending (`verificationRequired`).
 
 ## Where the session is kept
 
 - Only the refresh token is stored, under the key `chelabase.<first 12 characters of the key>.refresh`: in `localStorage` when present, otherwise in memory. Pass `auth.storage` (`{ get, set, remove }`, sync or async) for anything else, such as React Native. The access token stays in memory.
 - `database()` siblings share the same session.
-- In a server-rendered app the session lives in cookies instead: see [Server rendering](/docs/using/client/ssr).
+- In a server-rendered app the session lives in cookies instead: see [Server rendering](/using/client/ssr).
 
 ## Refresh and sign-out
 
 - The access token is refreshed 60 seconds before it expires (halfway through its life when it lives under two minutes), by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
 - A data request answered `401 user_token_expired` refreshes once and retries once. A returning visitor's first request refreshes lazily first.
 - When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`, or any request carrying the access token (data or `db.auth`) is answered `401 user_session_revoked`, the client signs out locally: it drops the stored refresh token, emits `signed_out` and throws the `DataApiError`.
-- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request and keep the cookies until the access token is a few minutes past its expiry, since a stale request must not wipe a newer session; older (or missing) ones are cleared. See [Server rendering](/docs/using/client/ssr).
+- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request and keep the cookies until the access token is a few minutes past its expiry, since a stale request must not wipe a newer session; older (or missing) ones are cleared. See [Server rendering](/using/client/ssr).
 
 ## A token from elsewhere
 

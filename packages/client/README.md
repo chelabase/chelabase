@@ -79,12 +79,12 @@ export const POST = createAuthHandler({ url, key: PUBLIC_KEY, serverKey: SECRET_
 
 When another system owns the session, `createClient({ url, key, accessToken: () => token })`
 sends that token and never refreshes it. The full Next.js walkthrough is the guide's Server
-rendering page, `/docs/using/client/ssr` on the docs site
-(http://docs.chelabase.localhost:8000/docs/using/client/ssr in the workbench).
+rendering page, `/using/client/ssr` on the docs site
+(http://docs.chelabase.localhost:8000/using/client/ssr in the workbench).
 
 ## Documentation
 
 The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types (and
 `fetchTypes`),
 other databases and app users (`db.auth`). Read it in `apps/docs/content/docs/using/client/`, or run the docs site in the workbench
-(`just workbench up --with docs`, then http://docs.chelabase.localhost:8000/docs/using/client).
+(`just workbench up --with docs`, then http://docs.chelabase.localhost:8000/using/client).

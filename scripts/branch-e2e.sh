@@ -36,12 +36,6 @@ cleanup() {
 }
 
 [[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
-demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
-[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
-set -a
-# shellcheck disable=SC1091
-source "$demo_env"
-set +a
 ca="${CHELABASE_PROXY_CA_FILE:?run through just workbench run}"
 [[ -s "$ca" ]] || die "$ca is missing (run just workbench up)"
 trap cleanup EXIT

@@ -1,6 +1,6 @@
 ---
 title: Hosts
-description: The three host names Chelabase serves (Studio, the API and sign-in), the DNS and TLS they need, and the rules the gateway checks at startup.
+description: The three host names Chelabase uses (Studio, the API and the token issuer), the DNS and TLS they need, and the rules the gateway checks at startup.
 ---
 
 Everything a browser or client reaches goes through the gateway, and the gateway tells the services apart by the `Host` header. You give Chelabase three host names. There is no path prefix to configure.
@@ -9,7 +9,7 @@ Everything a browser or client reaches goes through the gateway, and the gateway
 |---|---|---|
 | Studio | `CHELABASE_STUDIO_HOST` | The Studio web app |
 | API | `CHELABASE_API_HOST` | The management API, the data API and the app-user sign-in routes |
-| Auth | `CHELABASE_AUTH_HOST` | Zitadel: sign-in pages, its console, discovery and token endpoints |
+| Auth | `CHELABASE_AUTH_HOST` | Nothing (every path is 404): it names the issuer of member access tokens |
 
 Three more hosts are optional and serve only when set: `CHELABASE_DOCS_HOST` (the docs site), `CHELABASE_LANDING_HOST` (the landing page) and `CHELABASE_MAIL_HOST` (Mailpit, for local email). A blank value means unset.
 
@@ -22,13 +22,13 @@ CHELABASE_API_HOST=api.acme.com
 CHELABASE_AUTH_HOST=auth.acme.com
 ```
 
-## Why Zitadel has its own host
+## Why there is an auth host
 
-Zitadel's issuer, its discovery document, its redirects and the links in its emails are root paths, and they are signed into tokens. It can't live under a path such as `/auth` on another host, so it gets a host of its own. Chelabase derives the issuer from the auth host and the scheme (`https://auth.acme.com`), and the gateway, the orchestrator and Zitadel all use that one value. You never set the issuer yourself.
+Member access tokens name their issuer, and Chelabase derives it from the auth host and the scheme (`https://auth.acme.com`). `auth` signs with that issuer, and the gateway, the orchestrator and realtime accept only it, so a token minted for one install never passes at another. The sign-in pages themselves are Studio's, and the login API is on the API host. You never set the issuer yourself.
 
 ## DNS
 
-Point the hosts at the machine that runs the gateway. Either one wildcard record (`*.acme.com`) or one record per host (`studio`, `api` and `auth`, plus any optional ones) works. Nothing else needs a record: the gateway is the only public entry.
+Point the hosts at the machine that runs the gateway. Either one wildcard record (`*.acme.com`) or one record per host (`studio` and `api`, plus any optional ones) works. The auth host needs no record: nothing is fetched from it. Nothing else needs a record: the gateway is the only public entry.
 
 ## TLS
 
@@ -40,13 +40,9 @@ CHELABASE_PUBLIC_SCHEME=https
 
 `CHELABASE_PUBLIC_SCHEME` is `http` or `https` (case does not matter) and defaults to `https`; a blank value is `https` too. It decides the scheme of every URL Chelabase builds (Studio's origin, the API base, the issuer) and the `X-Forwarded-Proto` the gateway sends to the services. Session cookies are marked Secure exactly when it is `https`, in every mode; `CHELABASE_AUTH_SECURE_COOKIES` overrides that, and auth logs a warning at startup when it turns Secure off under `https`. Use `http` only for local work: platform mode refuses to start with it.
 
-### Calls to Zitadel inside the network
+### Calls inside the network
 
-With TLS in front, the public auth URL (`https://auth.acme.com`) only works from outside: inside the network nothing speaks TLS. So the services never call it. The gateway, realtime and the orchestrator fetch Zitadel's signing keys, and auth, the orchestrator and the worker call its API, at `CHELABASE_ZITADEL_INTERNAL_URL` (the Compose install sets `http://zitadel:8080`), in plain HTTP with the auth host as the `Host` header, which is how Zitadel picks its instance.
-
-Where the keys come from doesn't change which tokens pass: a token's `iss` must still be the public issuer exactly (`https://auth.acme.com`), and a token without one is refused. If the keys can't be fetched, every token is refused until they can.
-
-`CHELABASE_ZITADEL_INTERNAL_URL` is an origin only, `http(s)://host[:port]`: a path, query, fragment or credentials make the service refuse to start. Unset, the services call the issuer itself, which is right when the services reach the public URL directly (local work over plain HTTP).
+With TLS in front, the public URLs only work from outside: inside the network nothing speaks TLS. The services never call them. Member tokens are verified locally with the member public key, so no service fetches keys, and the services reach each other at their internal addresses (the identity service at `http://identity:8080`).
 
 ### Behind a reverse proxy
 
@@ -81,12 +77,11 @@ An invalid entry stops the gateway at startup with a message naming `CHELABASE_G
 | `CHELABASE_GATEWAY_LISTEN` | `127.0.0.1:8000` | Where the gateway listens: a comma-separated list of `ip:port` addresses, IPv6 in brackets (`127.0.0.1:8000,[::1]:8000`) |
 | `CHELABASE_GATEWAY_TRUSTED_PROXIES` | none | Reverse proxies whose forwarded client address the gateway believes: CIDRs or addresses, comma-separated (see [Behind a reverse proxy](#behind-a-reverse-proxy)) |
 | `CHELABASE_STUDIO_UPSTREAM` | `http://127.0.0.1:3000` | Where the gateway reaches Studio |
-| `CHELABASE_ZITADEL_UPSTREAM` | `http://127.0.0.1:8080` | Where it reaches Zitadel |
-| `CHELABASE_ZITADEL_INTERNAL_URL` | unset (Compose: `http://zitadel:8080`) | Where the other services reach Zitadel, with the auth host as `Host` ([above](#calls-to-zitadel-inside-the-network)); unset, at the issuer |
-| `CHELABASE_ZITADEL_JWKS_URL` | unset | Fetch the signing keys from exactly this URL instead (wins over `CHELABASE_ZITADEL_INTERNAL_URL` for the keys; no `Host` is added) |
 | `CHELABASE_DOCS_UPSTREAM` | `http://127.0.0.1:3001` | The docs site (used only with a docs host) |
 | `CHELABASE_LANDING_UPSTREAM` | `http://127.0.0.1:3002` | The landing page (used only with a landing host) |
 | `CHELABASE_MAIL_UPSTREAM` | `http://127.0.0.1:8025` | Mailpit (used only with a mail host) |
+
+These are the services' own defaults. The Compose install differs: it defaults the scheme to `http`, sets the gateway's listen address and the Studio upstream itself, and doesn't pass the optional docs, landing and mail hosts, so setting those in `.env` has no effect there.
 
 The gateway also reaches the orchestrator, auth, the data API engine and realtime through `CHELABASE_ORCHESTRATOR_URL`, `CHELABASE_AUTH_URL`, `CHELABASE_REST_URL` and `CHELABASE_REALTIME_URL`.
 
@@ -96,9 +91,9 @@ The gateway and every service that reads the hosts refuse to start, with a messa
 
 - **Studio and the API are one site:** they share a parent domain of at least two labels. `studio.acme.com` and `api.acme.com` pass, and so do `studio.acme.pages.dev` and `api.acme.pages.dev` (one site under `acme.pages.dev`); two hosts on different domains don't. The sign-in cookies are `SameSite=Strict`, so the browser sends them from Studio to the API only when both are the same site. The check has no public-suffix list, so it can't catch two hosts directly under a public suffix: `a.pages.dev` and `b.pages.dev` pass it, yet they are two sites and sign-in fails. Pick a domain you own. If both hosts are IP addresses, they must be the same address.
 - **No host carries its scheme's default port.** Write `studio.acme.com`, not `studio.acme.com:443`: browsers drop the default port from `Host` and `Origin`, so the setting could never match.
-- **A port in a setting matches only that port.** `auth.chelabase.localhost:8000` serves requests whose `Host` is exactly that. A host without a port matches any port. When both match, the one with the port wins.
+- **A port in a setting matches only that port.** `studio.chelabase.localhost:8000` serves requests whose `Host` is exactly that. A host without a port matches any port. When both match, the one with the port wins.
 - **No two hosts are identical** (after lowercasing and dropping a trailing dot).
-- **The issuer is derived** from the auth host and the scheme. Setting `CHELABASE_ZITADEL_ISSUER` to a different value is refused, and setting it without `CHELABASE_AUTH_HOST` is refused.
+- **The issuer is derived** from the auth host and the scheme.
 - **Platform mode requires `https`.** With `CHELABASE_MODE=platform`, the gateway, auth and the orchestrator refuse `CHELABASE_PUBLIC_SCHEME=http`.
 
 ## Settings that were removed
@@ -109,6 +104,5 @@ The gateway and every service that reads the hosts refuse to start, with a messa
 | `CHELABASE_STUDIO_ORIGINS` | `CHELABASE_STUDIO_HOST`; the allowed CORS origin is derived from it |
 | `CHELABASE_STUDIO_URL` | `CHELABASE_STUDIO_HOST` |
 | `CHELABASE_GATEWAY_ADDR` | `CHELABASE_GATEWAY_LISTEN` |
-| `CHELABASE_ZITADEL_ISSUER` on its own | `CHELABASE_AUTH_HOST` (and the scheme); the issuer follows |
 
 A service that finds one of the removed settings set refuses to start and names its replacement.

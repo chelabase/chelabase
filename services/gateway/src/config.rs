@@ -5,7 +5,6 @@ use crate::registry::Site;
 use crate::upstreams::Upstreams;
 use chelabase_types::entry::{
     Entry, DEFAULT_DOCS_UPSTREAM, DEFAULT_LANDING_UPSTREAM, DEFAULT_MAIL_UPSTREAM, DEFAULT_STUDIO_UPSTREAM,
-    DEFAULT_ZITADEL_UPSTREAM,
 };
 use chelabase_types::mode::Mode;
 use std::net::SocketAddr;
@@ -78,7 +77,6 @@ impl GatewayConfig {
         // Docs, landing and Mailpit have an upstream only when their host is set.
         let sites = [
             (Site::Studio, "CHELABASE_STUDIO_UPSTREAM", DEFAULT_STUDIO_UPSTREAM, true),
-            (Site::Auth, "CHELABASE_ZITADEL_UPSTREAM", DEFAULT_ZITADEL_UPSTREAM, true),
             (Site::Docs, "CHELABASE_DOCS_UPSTREAM", DEFAULT_DOCS_UPSTREAM, entry.docs_host().is_some()),
             (
                 Site::Landing,
@@ -308,7 +306,6 @@ mod tests {
     fn site_upstreams_default_to_loopback_and_exist_only_with_their_host() {
         let c = GatewayConfig::from_lookup(with(&[])).unwrap();
         assert_eq!(c.upstreams.site_addr(Site::Studio), DEFAULT_STUDIO_UPSTREAM.strip_prefix("http://"));
-        assert_eq!(c.upstreams.site_addr(Site::Auth), DEFAULT_ZITADEL_UPSTREAM.strip_prefix("http://"));
         assert_eq!(c.upstreams.site_addr(Site::Docs), None);
         assert_eq!(c.upstreams.site_addr(Site::Mail), None);
         let c = GatewayConfig::from_lookup(with(&[

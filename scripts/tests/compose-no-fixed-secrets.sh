@@ -28,7 +28,6 @@ patterns=(
   'AWS_ACCESS_KEY_ID: *chelabase'
   'AWS_SECRET_ACCESS_KEY: *[^$ ]'
   'POSTGRES_PASSWORD: '
-  'ZITADEL_DATABASE_POSTGRES_(USER|ADMIN)_PASSWORD'
   '--masterkey[ =]'
   '://[A-Za-z0-9_.-]+:[^@/ ]+@'
   'chelabase-dev-[a-z-]+'

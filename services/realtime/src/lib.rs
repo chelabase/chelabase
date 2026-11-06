@@ -11,7 +11,7 @@
 //! - [`channel`]: join targets, canonical channel ids and R4's channel hash.
 //! - [`socket`]: the upgrade and one socket's session; [`outq`]: its outbound queue, bounded
 //!   by frames and bytes.
-//! - [`auth`]: OIDC verification of `auth` frames (R9, S14).
+//! - [`auth`]: member-token verification of `auth` frames (R9, S14).
 //! - [`orchestrator`]: `/internal/realtime/*` (P13, S13, S14, S15).
 //! - [`reauth`]: re-authorization outcomes, coalescing and the per-cycle cache (W19, W28, R15).
 //! - [`presence`]: members across instances (§5.1, §5.2, R4, R15, R20).

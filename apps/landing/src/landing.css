@@ -5,6 +5,11 @@
   color-scheme: dark;
 }
 
+/* A zoomed screenshot holds the page still behind it. */
+:root:has(.landing dialog[open]) {
+  overflow: hidden;
+}
+
 /* ---------- Motion pieces used by the gauge ---------- */
 
 .survey {
@@ -82,6 +87,22 @@
   border-radius: 4px;
 }
 
+/* ---------- Comparison table: a visible, palette-coloured scrollbar where it scrolls ---------- */
+
+.landing .compare-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.landing .compare-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.landing .compare-scroll::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 4px;
+}
+
 /* ---------- Comparison marks: a glyph per answer, drawn in the mark's colour ---------- */
 
 .mark::before {
@@ -116,10 +137,6 @@
 .mark--other::before {
   border-radius: 1px;
   transform: rotate(45deg) scale(0.8);
-}
-
-.mark--unknown::before {
-  border-style: dotted;
 }
 
 @media (prefers-reduced-motion: reduce) {

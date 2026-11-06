@@ -22,7 +22,7 @@ export interface MeResponse {
   email: string | null;
   /**
      * Whether the caller may use instance routes (self-hosted: an active tenant admin;
-     * platform: a member of the operator organisation).
+     * platform: a member of the operator tenant).
      */
   instance_admin: boolean;
   member: MeMember | null;

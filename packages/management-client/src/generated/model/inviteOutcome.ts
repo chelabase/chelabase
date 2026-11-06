@@ -13,6 +13,5 @@ export type InviteOutcome = typeof InviteOutcome[keyof typeof InviteOutcome];
 
 export const InviteOutcome = {
   invited: 'invited',
-  added: 'added',
   existing_member: 'existing_member',
 } as const;

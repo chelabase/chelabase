@@ -9,7 +9,7 @@ import type { MemberAccess } from './memberAccess.ts';
 import type { MemberStatusView } from './memberStatusView.ts';
 
 /**
- * A member of the tenant: a person in its Zitadel organisation.
+ * A member of the tenant: a person of the members pool.
  */
 export interface Member {
   /**

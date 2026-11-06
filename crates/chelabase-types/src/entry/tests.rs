@@ -102,14 +102,6 @@ fn removed_variables_are_refused_with_their_replacement() {
 }
 
 #[test]
-fn an_explicit_issuer_must_equal_the_derived_one() {
-    assert!(Entry::from_lookup(env(&[("CHELABASE_ZITADEL_ISSUER", "http://auth.chelabase.localhost:8000")])).is_ok());
-    assert!(Entry::from_lookup(env(&[("CHELABASE_ZITADEL_ISSUER", "http://auth.chelabase.localhost:8000/")])).is_ok());
-    let msg = err(&[("CHELABASE_ZITADEL_ISSUER", "http://old-issuer.example")]);
-    assert!(msg.contains("CHELABASE_ZITADEL_ISSUER") && msg.contains("CHELABASE_AUTH_HOST"), "{msg}");
-}
-
-#[test]
 fn identical_hosts_are_refused() {
     let msg = err(&[("CHELABASE_AUTH_HOST", "API.chelabase.localhost:8000")]);
     assert!(msg.contains("CHELABASE_AUTH_HOST") && msg.contains("CHELABASE_API_HOST"), "{msg}");
@@ -141,15 +133,6 @@ fn issuer_from_lookup_follows_p3() {
         issuer_from_lookup(get(&[("CHELABASE_PUBLIC_SCHEME", "http"), ("CHELABASE_AUTH_HOST", "auth.chelabase.localhost:8000")])).unwrap(),
         Some("http://auth.chelabase.localhost:8000".to_string())
     );
-    let msg = issuer_from_lookup(get(&[("CHELABASE_ZITADEL_ISSUER", "http://old-issuer.example")])).unwrap_err().to_string();
-    assert!(msg.contains("CHELABASE_AUTH_HOST"), "{msg}");
-    let msg = issuer_from_lookup(get(&[
-        ("CHELABASE_AUTH_HOST", "auth.acme.com"),
-        ("CHELABASE_ZITADEL_ISSUER", "http://old-issuer.example"),
-    ]))
-    .unwrap_err()
-    .to_string();
-    assert!(msg.contains("CHELABASE_ZITADEL_ISSUER"), "{msg}");
 }
 
 #[test]
@@ -253,11 +236,9 @@ fn the_same_site_parent_needs_two_non_empty_labels() {
 }
 
 #[test]
-fn the_scheme_and_an_explicit_issuer_ignore_case_and_one_trailing_slash() {
+fn the_scheme_ignores_case() {
     let e = Entry::from_lookup(env(&[("CHELABASE_PUBLIC_SCHEME", "HTTP")])).unwrap();
     assert_eq!(e.scheme(), Scheme::Http);
-    assert!(Entry::from_lookup(env(&[("CHELABASE_ZITADEL_ISSUER", "HTTP://Auth.Chelabase.Localhost:8000")])).is_ok());
-    assert!(Entry::from_lookup(env(&[("CHELABASE_ZITADEL_ISSUER", "http://auth.chelabase.localhost:8000//")])).is_err());
 }
 
 // T2 review: browsers drop a scheme's default port from Origin and Host, so a host setting
@@ -272,16 +253,10 @@ fn a_host_with_its_schemes_default_port_is_refused() {
 }
 
 // End-of-step review: the loopback upstream defaults live in one place, here, for the gateway
-// and the CLI bootstrap (which reaches Zitadel without the gateway).
+// (loopback addresses).
 #[test]
-fn upstream_defaults_live_here_and_env_wins() {
-    assert_eq!(zitadel_upstream(|_| None), DEFAULT_ZITADEL_UPSTREAM);
-    assert_eq!(
-        zitadel_upstream(|k| (k == "CHELABASE_ZITADEL_UPSTREAM").then(|| "http://zitadel:8080".to_string())),
-        "http://zitadel:8080"
-    );
-    assert_eq!(zitadel_upstream(|k| (k == "CHELABASE_ZITADEL_UPSTREAM").then(|| " ".to_string())), DEFAULT_ZITADEL_UPSTREAM);
-    for default in [DEFAULT_STUDIO_UPSTREAM, DEFAULT_ZITADEL_UPSTREAM, DEFAULT_DOCS_UPSTREAM, DEFAULT_LANDING_UPSTREAM, DEFAULT_MAIL_UPSTREAM] {
+fn upstream_defaults_live_here() {
+    for default in [DEFAULT_STUDIO_UPSTREAM, DEFAULT_DOCS_UPSTREAM, DEFAULT_LANDING_UPSTREAM, DEFAULT_MAIL_UPSTREAM] {
         assert!(default.starts_with("http://127.0.0.1:"), "{default}");
     }
 }
@@ -298,52 +273,3 @@ fn platform_mode_refuses_an_http_entry() {
     assert!(https.check_mode(Mode::Platform).is_ok());
 }
 
-// #24: the apps reach Zitadel at CHELABASE_ZITADEL_INTERNAL_URL with the auth host as Host,
-// else at the issuer; the issuer is never taken from it.
-#[test]
-fn zitadel_is_reached_in_network_with_the_auth_host_or_at_the_issuer() {
-    let at = |v: Option<&str>, issuer: &str| {
-        let v = v.map(str::to_string);
-        zitadel_at(move |k| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.clone()).flatten(), issuer)
-    };
-    assert_eq!(
-        at(None, "https://auth.example.com").unwrap(),
-        ZitadelAt { base: "https://auth.example.com".into(), host: None }
-    );
-    assert_eq!(at(Some("  "), "http://auth.chelabase.localhost:8000").unwrap().host, None);
-    for (raw, base) in [
-        ("http://zitadel:8080", "http://zitadel:8080"),
-        ("http://zitadel:8080/", "http://zitadel:8080"),
-        ("https://10.0.0.5", "https://10.0.0.5"),
-        ("http://[fd00::5]:8080", "http://[fd00::5]:8080"),
-    ] {
-        assert_eq!(
-            at(Some(raw), "https://auth.example.com").unwrap(),
-            ZitadelAt { base: base.into(), host: Some("auth.example.com".into()) },
-            "{raw}"
-        );
-    }
-    assert_eq!(
-        at(Some("http://zitadel:8080"), "http://auth.chelabase.localhost:8000").unwrap().host.as_deref(),
-        Some("auth.chelabase.localhost:8000")
-    );
-    for bad in [
-        "zitadel:8080",
-        "HTTP://zitadel:8080",
-        "ftp://zitadel",
-        "http://",
-        "http:///",
-        "http://zitadel:8080/oauth/v2/keys",
-        "http://zitadel/evil",
-        "http://zitadel:8080?x",
-        "http://zitadel:8080#x",
-        "http://u:p@zitadel:8080",
-        "http://u@zitadel",
-        "http://zitadel:0",
-        "http://zitadel:65536",
-        "http://zit_adel",
-    ] {
-        let e = at(Some(bad), "https://auth.example.com").unwrap_err().to_string();
-        assert!(e.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {e}");
-    }
-}

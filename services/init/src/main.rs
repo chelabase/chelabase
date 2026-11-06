@@ -7,9 +7,10 @@
 //!   `CHELABASE_SEED_*` line is written as its file, instead of a generated value, on the run
 //!   that creates that file (see `chelabase_init::seed`).
 //! - `chelabase-init setup-code --dir <dir>` prints the stored setup code again.
-//! - `chelabase-init bootstrap --out <dir> [--demo]` makes the product's Zitadel objects and
-//!   binds the seeded tenant, waiting for Zitadel, the metadata migrations and the orchestrator
-//!   (see `chelabase_init::bootstrap`). It writes only into `--out` and creates no key.
+//! - `chelabase-init bootstrap --out <dir> [--demo]` sets up the identity service and, with
+//!   `--demo`, signs up the workbench's dev member, waiting for the metadata migrations and the
+//!   orchestrator (see `chelabase_init::bootstrap`). It writes only into `--out` and creates no
+//!   key.
 //! - `chelabase-init example` claims a fresh local instance as the demo tenant admin and adds
 //!   the demo people, through the public endpoints only (see `chelabase_init::example`). It
 //!   refuses any stack that isn't local, and prints no code, token or setup code.
@@ -48,19 +49,19 @@ enum Command {
         #[arg(long)]
         seeds: Option<PathBuf>,
     },
-    /// Make the product's Zitadel objects and bind the seeded tenant (idempotent).
+    /// Set up the identity service, and with --demo the dev member (idempotent).
     Bootstrap {
-        /// The output dir: the only place it writes (org and client ids, the Actions key).
+        /// The output dir: the only place it writes (its lock, and dev-member.json).
         #[arg(long)]
         out: PathBuf,
-        /// Also make the workbench's dev objects: the demo machine user and its key, Mailpit
-        /// as SMTP, the tenant admins. Keeps Zitadel's first human user active.
+        /// Also sign up the workbench's dev member with the setup code: the seeded tenant's
+        /// admin, its random password kept in the output dir (0600).
         #[arg(long)]
         demo: bool,
-        /// With --demo: the tenant admin's email (a Zitadel user that must exist).
+        /// With --demo: the dev member's email (default dev@chelabase.localhost).
         #[arg(long, requires = "demo")]
         admin_email: Option<String>,
-        /// How long to wait for Zitadel, the metadata migrations and the orchestrator
+        /// How long to wait for the metadata migrations, the orchestrator and auth
         /// (seconds, or 30s, 10m, 1h).
         #[arg(long, default_value = "10m", value_parser = parse_timeout)]
         timeout: std::time::Duration,

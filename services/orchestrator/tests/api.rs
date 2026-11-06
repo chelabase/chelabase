@@ -48,7 +48,7 @@ async fn bearer_token_without_identity_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/databases", app.base))
-        .bearer_auth("some-zitadel-jwt")
+        .bearer_auth("some-unsigned-jwt")
         .json(&create_body(TenantId::new()))
         .send()
         .await
@@ -69,7 +69,7 @@ async fn expired_identity_is_401() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let token = app
         .signer
-        .sign_at(Service::Orchestrator.name(), &identity("org-1"), now - 3600)
+        .sign_at(Service::Orchestrator.name(), &identity_of(DEFAULT_SUB), now - 3600)
         .unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
@@ -78,7 +78,7 @@ async fn expired_identity_is_401() {
 #[tokio::test]
 async fn identity_minted_for_another_service_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let token = app.signer.sign("some-other-service", &identity("org-1")).unwrap();
+    let token = app.signer.sign("some-other-service", &identity_of(DEFAULT_SUB)).unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
@@ -89,23 +89,22 @@ async fn identity_from_untrusted_key_is_401() {
     let (other_private, _) = generate_keypair_pem();
     let forger = InternalSigner::from_pem(other_private.as_bytes()).unwrap();
     let token = forger
-        .sign(Service::Orchestrator.name(), &identity("org-1"))
+        .sign(Service::Orchestrator.name(), &identity_of(DEFAULT_SUB))
         .unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
 
+// #126: an identity that names no tenant (no member token) is 401: nothing finds a tenant
+// any other way.
 #[tokio::test]
-async fn unbound_org_is_tenant_not_bound() {
+async fn an_identity_without_a_tenant_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let token = app.token_for_org("org-not-bound");
+    let token = app.token_for_org("no-such-tenant");
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(code_of(&body), "tenant_not_bound");
-    let message = message_of(&body);
-    assert!(message.contains("init-bootstrap"), "{message}");
-    assert!(message.contains("just zitadel-bootstrap"), "{message}");
+    assert_eq!(code_of(&body), "unauthorized");
 }
 
 #[tokio::test]
@@ -322,7 +321,7 @@ async fn get_me(app: &TestApp, identity_header: Option<&str>) -> reqwest::Respon
 }
 
 #[tokio::test]
-async fn me_for_bound_org_returns_tenant_projects_and_databases() {
+async fn me_returns_tenant_projects_and_databases() {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
@@ -333,7 +332,6 @@ async fn me_for_bound_org_returns_tenant_projects_and_databases() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["user"]["sub"], "user-1");
-    assert_eq!(body["user"]["org_id"], "org-1");
     assert_eq!(body["tenant"]["id"], serde_json::json!(tenant));
     assert_eq!(body["tenant"]["slug"], "demo");
     let project = &body["tenant"]["projects"][0];
@@ -347,18 +345,18 @@ async fn me_for_bound_org_returns_tenant_projects_and_databases() {
 }
 
 #[tokio::test]
-async fn me_for_unbound_org_returns_null_tenant() {
+async fn me_without_a_tenant_returns_null_tenant() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = get_me(&app, Some(&app.token_for_org("org-unbound"))).await;
+    let resp = get_me(&app, Some(&app.token_for_org("no-tenant"))).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["user"]["org_id"], "org-unbound");
+    assert_eq!(body["user"], json!({ "sub": DEFAULT_SUB }));
     assert!(body["tenant"].is_null());
 }
 
 // Review Focus 2.
 #[tokio::test]
-async fn me_for_bound_org_with_missing_tenant_row_returns_null_tenant() {
+async fn me_with_a_missing_tenant_row_returns_null_tenant() {
     let metadata = FakeMetadata::default();
     metadata.bind_org("org-1", TenantId::new());
     let app = spawn_app(metadata, FakeJobs::default()).await;
@@ -5371,980 +5369,9 @@ async fn me_lists_project_name_and_status() {
     assert_eq!((projects[1]["name"].as_str(), projects[1]["status"].as_str()), (Some("Going"), Some("deleting")));
 }
 
-// ---- App users: settings and user admin ---------------------------------------------
-
-use chelabase_query::app_users::{NewUserRow, PendingInsert, SyncTarget, UserRowError, UsersDb};
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel, User as MockUser};
-
-/// What `FakeUsersDb` does when asked to insert or to commit.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum UdbFault {
-    Constraint,
-    EmailTaken,
-    CommitFails,
-}
-
-/// A users-table writer that journals what it was asked, and (with a probe) how many users
-/// Zitadel had at each step.
-#[derive(Clone, Default)]
-struct FakeUsersDb {
-    journal: Arc<Mutex<Vec<String>>>,
-    targets: Arc<Mutex<Vec<SyncTarget>>>,
-    rows: Arc<Mutex<Vec<NewUserRow>>>,
-    fault: Arc<Mutex<Option<UdbFault>>>,
-    probe: Arc<Mutex<Option<Arc<Mutex<chelabase_zitadel::mock::Inner>>>>>,
-}
-
-impl FakeUsersDb {
-    fn zitadel_users(&self) -> usize {
-        self.probe.lock().unwrap().as_ref().map_or(0, |i| i.lock().unwrap().users.len())
-    }
-    fn journal(&self) -> Vec<String> {
-        self.journal.lock().unwrap().clone()
-    }
-}
-
-struct FakePending {
-    db: FakeUsersDb,
-}
-
-#[async_trait::async_trait]
-impl PendingInsert for FakePending {
-    async fn commit(self: Box<Self>) -> Result<(), UserRowError> {
-        let users = self.db.zitadel_users();
-        self.db.journal.lock().unwrap().push(format!("commit:users={users}"));
-        if *self.db.fault.lock().unwrap() == Some(UdbFault::CommitFails) {
-            return Err(UserRowError::Unavailable("commit failed".into()));
-        }
-        Ok(())
-    }
-    async fn rollback(self: Box<Self>) {
-        self.db.journal.lock().unwrap().push("rollback".into());
-    }
-}
-
-#[async_trait::async_trait]
-impl UsersDb for FakeUsersDb {
-    async fn begin_insert(&self, target: &SyncTarget, row: &NewUserRow) -> Result<Box<dyn PendingInsert>, UserRowError> {
-        let users = self.zitadel_users();
-        self.journal.lock().unwrap().push(format!("begin:{}:users={users}", row.email));
-        self.targets.lock().unwrap().push(target.clone());
-        self.rows.lock().unwrap().push(row.clone());
-        match *self.fault.lock().unwrap() {
-            Some(UdbFault::Constraint) => Err(UserRowError::Constraint {
-                message: "null value in column \"nick\"".into(),
-                constraint: Some("users_nick_check".into()),
-            }),
-            Some(UdbFault::EmailTaken) => Err(UserRowError::EmailTaken),
-            _ => Ok(Box::new(FakePending { db: self.clone() })),
-        }
-    }
-}
-
-const AU_ORG: &str = "o1";
-const AU_PASSWORD: &str = "correct-horse-9";
-
-/// A project with a ready database (main branch, Postgres database `web1` served by the data
-/// API), org-1's tenant, and optionally Zitadel's mock behind the orchestrator.
-struct Au {
-    app: TestApp,
-    metadata: FakeMetadata,
-    jobs: FakeJobs,
-    tenant: TenantId,
-    project: ProjectRecord,
-    db: DatabaseId,
-    main: BranchId,
-    mock: Option<MockZitadel>,
-    udb: FakeUsersDb,
-}
-
-async fn au_env(with_zitadel: bool) -> Au {
-    let (mock, zitadel) = if with_zitadel {
-        let mock = MockZitadel::start().await;
-        let z = Zitadel::new(&mock.base, ADMIN_TOKEN);
-        (Some(mock), Some(z))
-    } else {
-        (None, None)
-    };
-    au_env_on(mock, zitadel).await
-}
-
-/// [`au_env`] with this Zitadel client (the mock's, or a real one with no mock).
-async fn au_env_on(mock: Option<MockZitadel>, zitadel: Option<Zitadel>) -> Au {
-    let metadata = FakeMetadata::default();
-    let jobs = FakeJobs::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    let project = metadata.create_project(tenant, "Web").await.unwrap();
-    let db = project_database(tenant, project.id, DatabaseStatus::Ready);
-    let (db_id, main) = (db.database_id, db.main.id);
-    metadata.insert_database(db);
-    metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
-    metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
-    let udb = FakeUsersDb::default();
-    if let Some(mock) = &mock {
-        *udb.probe.lock().unwrap() = Some(mock.inner.clone());
-    }
-    let app = spawn_app_parts(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        zitadel,
-        Arc::new(udb.clone()),
-    )
-    .await;
-    Au { app, metadata, jobs, tenant, project, db: db_id, main, mock, udb }
-}
-
-impl Au {
-    fn path(&self, rest: &str) -> String {
-        format!("/v1/projects/{}{rest}", self.project.id)
-    }
-
-    async fn call(&self, method: Method, rest: &str, body: Option<Value>) -> (u16, Value) {
-        let resp = send(&self.app, method, &self.path(rest), "org-1", body).await;
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap();
-        (status, if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap() })
-    }
-
-    fn set_auth(&self, status: AppUsersStatus) {
-        self.set_auth_in(status, AU_ORG);
-    }
-
-    /// [`Au::set_auth`] with the project's users in Zitadel org `org`.
-    fn set_auth_in(&self, status: AppUsersStatus, org: &str) {
-        let now = chrono::Utc::now();
-        self.metadata.project_auths.lock().unwrap().insert(
-            self.project.id,
-            ProjectAuth {
-                project_id: self.project.id,
-                status,
-                error: None,
-                zitadel_org_id: Some(org.into()),
-                database_id: self.db,
-                pg_database: "web1".into(),
-                schema_name: "public".into(),
-                table_name: "users".into(),
-                email_verification: false,
-                on_delete: OnDelete::Delete,
-                created_at: now,
-                updated_at: now,
-            },
-        );
-    }
-
-    fn auth(&self) -> ProjectAuth {
-        self.metadata.project_auths.lock().unwrap().get(&self.project.id).cloned().expect("project_auth row")
-    }
-
-    /// The sync role's sealed password on the auth database's main branch.
-    fn seal_sync_role(&self) {
-        let sealed = chelabase_secrets::seal_role_password(&self.app.key, &self.main.to_string(), "chelabase_auth_sync", "sync-pw");
-        self.metadata.branch_syncs.lock().unwrap().insert(
-            self.main,
-            BranchAuthSync { branch_id: self.main, pg_database: "web1".into(), password_sealed: sealed },
-        );
-        *self.app.locator.addr.lock().unwrap() = Some("127.0.0.1:55432".parse().unwrap());
-    }
-
-    fn mock(&self) -> &MockZitadel {
-        self.mock.as_ref().expect("zitadel mock")
-    }
-
-    /// A Zitadel user with a UUID id, in org `org`.
-    fn add_user(&self, org: &str, email: &str) -> uuid::Uuid {
-        let id = uuid::Uuid::new_v4();
-        self.mock().inner.lock().unwrap().users.push(MockUser {
-            id: id.to_string(),
-            email: email.into(),
-            password: AU_PASSWORD.into(),
-            verified: true,
-            locked: false,
-            org_id: org.into(),
-            username: email.into(),
-            display_name: String::new(),
-            inactive: false,
-            created_at: "2026-10-03T10:00:00Z".into(),
-        });
-        id
-    }
-
-    fn add_session(&self, user: uuid::Uuid, zitadel_session: &str) {
-        let now = chrono::Utc::now();
-        self.metadata.app_sessions.lock().unwrap().push(AppSession {
-            id: uuid::Uuid::new_v4(),
-            project_id: self.project.id,
-            user_id: user,
-            zitadel_session_id: zitadel_session.into(),
-            created_at: now,
-            last_used_at: now,
-            expires_at: now + chrono::Duration::days(30),
-            revoked_at: None,
-        });
-    }
-
-    fn live_sessions(&self, user: uuid::Uuid) -> usize {
-        self.metadata
-            .app_sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| s.user_id == user && s.revoked_at.is_none())
-            .count()
-    }
-
-    fn syncs(&self) -> Vec<AppUsersSyncJob> {
-        self.jobs.app_users_sync_jobs.lock().unwrap().clone()
-    }
-
-    fn jobs_published(&self) -> Vec<AppUsersJob> {
-        self.jobs.app_users_jobs.lock().unwrap().clone()
-    }
-}
-
-fn put_body(au: &Au) -> Value {
-    json!({ "database_id": au.db })
-}
-
-#[tokio::test]
-async fn get_app_users_404_until_enabled_then_the_settings() {
-    let au = au_env(false).await;
-    let (status, body) = au.call(Method::GET, "/app-users", None).await;
-    assert_eq!((status, code_of(&body)), (404, "app_users_disabled"), "{body}");
-    au.set_auth(AppUsersStatus::Enabled);
-    let (status, body) = au.call(Method::GET, "/app-users", None).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["status"], "enabled");
-    assert_eq!(body["database_id"], au.db.to_string());
-    assert_eq!((body["pg_database"].as_str(), body["schema"].as_str(), body["table"].as_str()), (Some("web1"), Some("public"), Some("users")));
-    assert_eq!((body["email_verification"].as_bool(), body["on_delete"].as_str()), (Some(false), Some("delete")));
-    assert_eq!(body["zitadel_org_id"], AU_ORG);
-    assert!(body["error"].is_null());
-}
-
-#[tokio::test]
-async fn app_users_routes_refuse_a_deleting_project_and_another_tenants() {
-    let au = au_env(false).await;
-    let theirs = au.metadata.create_project(TenantId::new(), "Theirs").await.unwrap();
-    let resp = send(&au.app, Method::GET, &format!("/v1/projects/{}/app-users", theirs.id), "org-1", None).await;
-    assert_eq!(resp.status(), 404);
-    au.metadata.begin_project_delete(au.tenant, au.project.id).await.unwrap();
-    for (method, rest) in [(Method::GET, "/app-users"), (Method::DELETE, "/app-users"), (Method::GET, "/users")] {
-        let (status, body) = au.call(method, rest, None).await;
-        assert_eq!((status, code_of(&body)), (409, "project_deleting"), "{rest}: {body}");
-    }
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!((status, code_of(&body)), (409, "project_deleting"), "{body}");
-}
-
-#[tokio::test]
-async fn enable_app_users_202_publishes() {
-    let au = au_env(true).await;
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(body["status"], "enabling");
-    assert_eq!((body["pg_database"].as_str(), body["schema"].as_str(), body["table"].as_str()), (Some("web1"), Some("public"), Some("users")));
-    assert_eq!((body["email_verification"].as_bool(), body["on_delete"].as_str()), (Some(false), Some("delete")));
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
-    assert_eq!(*au.jobs.app_users_checks.lock().unwrap(), vec!["web1.public.users".to_string()]);
-    assert_eq!(au.auth().status, AppUsersStatus::Enabling);
-}
-
-#[tokio::test]
-async fn put_while_enabling_republishes() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabling);
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
-    assert!(au.jobs.app_users_checks.lock().unwrap().is_empty(), "an existing location isn't checked again");
-}
-
-#[tokio::test]
-async fn delete_while_disabling_republishes() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Disabling);
-    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
-}
-
-#[tokio::test]
-async fn reserved_schema_is_422() {
-    let au = au_env(true).await;
-    for schema in ["chelabase", "information_schema", "pg_x", "pg_catalog"] {
-        let mut body = put_body(&au);
-        body["schema"] = json!(schema);
-        let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
-        assert_eq!(status, 422, "{schema}: {answer}");
-    }
-    assert!(au.jobs_published().is_empty());
-    assert!(au.metadata.project_auths.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn app_users_enable_refusals() {
-    let au = au_env(true).await;
-    let put = |extra: Value| {
-        let mut body = put_body(&au);
-        for (k, v) in extra.as_object().unwrap() {
-            body[k] = v.clone();
-        }
-        body
-    };
-    // Identifiers and on_delete.
-    for bad in [json!({"schema": "Bad-Name"}), json!({"table": "1x"}), json!({"table": ""}), json!({"on_delete": "keep"}), json!({"pg_database": ""})] {
-        let (status, body) = au.call(Method::PUT, "/app-users", Some(put(bad.clone()))).await;
-        assert_eq!(status, 422, "{bad}: {body}");
-    }
-    // Another project's database (same tenant) is unknown to this one.
-    let other = au.metadata.create_project(au.tenant, "Other").await.unwrap();
-    let foreign = project_database(au.tenant, other.id, DatabaseStatus::Ready);
-    let foreign_id = foreign.database_id;
-    au.metadata.insert_database(foreign);
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": foreign_id}))).await;
-    assert_eq!((status, code_of(&body)), (404, "not_found"), "{body}");
-    // Another tenant's.
-    let theirs = project_database(TenantId::new(), ProjectId::new(), DatabaseStatus::Ready);
-    let theirs_id = theirs.database_id;
-    au.metadata.insert_database(theirs);
-    let (status, _) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": theirs_id}))).await;
-    assert_eq!(status, 404);
-    // Not ready.
-    let pending = project_database(au.tenant, au.project.id, DatabaseStatus::Provisioning);
-    let pending_id = pending.database_id;
-    au.metadata.insert_database(pending);
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": pending_id}))).await;
-    assert_eq!((status, code_of(&body)), (409, "database_not_ready"), "{body}");
-    // The data API is off on a child branch.
-    let child = au.metadata.add_branch(au.db, "dev", au.main, BranchKind::Normal, BranchStatus::Ready);
-    au.metadata.add_branch_db(child, "web1", "owner", DatabaseOrigin::Main);
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!((status, code_of(&body)), (409, "data_api_not_enabled"), "{body}");
-    au.metadata.set_data_api(child, "web1", chelabase_metadata::DataApiState::On);
-    // The table exists.
-    *au.jobs.app_users_check_reply.lock().unwrap() =
-        Some(AppUsersCheckReply { ok: false, code: Some("app_users_table_exists".into()), error: Some("exists".into()) });
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!((status, code_of(&body)), (409, "app_users_table_exists"), "{body}");
-    // Any other worker failure is a 503.
-    *au.jobs.app_users_check_reply.lock().unwrap() =
-        Some(AppUsersCheckReply { ok: false, code: Some("boom".into()), error: Some("no".into()) });
-    let (status, _) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!(status, 503);
-    assert!(au.jobs_published().is_empty());
-    assert!(au.metadata.project_auths.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn put_again_updates_settings_200() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let mut body = put_body(&au);
-    body["email_verification"] = json!(true);
-    body["on_delete"] = json!("mark");
-    let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
-    assert_eq!(status, 200, "{answer}");
-    assert_eq!((answer["email_verification"].as_bool(), answer["on_delete"].as_str()), (Some(true), Some("mark")));
-    assert_eq!(answer["status"], "enabled");
-    assert_eq!(au.auth().on_delete, OnDelete::Mark);
-    assert!(au.jobs_published().is_empty());
-}
-
-#[tokio::test]
-async fn put_with_other_location_409_location_fixed() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    for extra in [json!({"schema": "app"}), json!({"table": "people"}), json!({"pg_database": "web2"})] {
-        let mut body = put_body(&au);
-        body[extra.as_object().unwrap().keys().next().unwrap()] = extra.as_object().unwrap().values().next().unwrap().clone();
-        let (status, answer) = au.call(Method::PUT, "/app-users", Some(body)).await;
-        assert_eq!((status, code_of(&answer)), (409, "app_users_location_fixed"), "{extra}: {answer}");
-    }
-    let other = project_database(au.tenant, au.project.id, DatabaseStatus::Ready);
-    let other_id = other.database_id;
-    au.metadata.insert_database(other);
-    let (status, answer) = au.call(Method::PUT, "/app-users", Some(json!({"database_id": other_id}))).await;
-    assert_eq!((status, code_of(&answer)), (409, "app_users_location_fixed"), "{answer}");
-    assert_eq!(au.auth().database_id, au.db);
-}
-
-#[tokio::test]
-async fn retry_after_failed_202() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Failed);
-    au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().error = Some("boom".into());
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(body["status"], "enabling");
-    assert!(body["error"].is_null());
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
-}
-
-#[tokio::test]
-async fn disable_refused_while_users_exist() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.add_user(AU_ORG, "a@x.test");
-    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
-    assert_eq!((status, code_of(&body)), (409, "app_users_has_users"), "{body}");
-    assert!(au.jobs_published().is_empty());
-    assert_eq!(au.auth().status, AppUsersStatus::Enabled);
-}
-
-#[tokio::test]
-async fn disable_202_publishes() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.add_user("o2", "elsewhere@x.test");
-    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(body["status"], "disabling");
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
-    assert_eq!(au.auth().status, AppUsersStatus::Disabling);
-}
-
-#[tokio::test]
-async fn create_user_inserts_then_creates_then_commits() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!(status, 201, "{body}");
-    assert_eq!((body["email"].as_str(), body["email_verified"].as_bool(), body["state"].as_str()), (Some("new@x.test"), Some(true), Some("active")));
-    let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
-    // The row went in first (no Zitadel user yet) and committed after Zitadel had the user.
-    assert_eq!(au.udb.journal(), vec!["begin:new@x.test:users=0".to_string(), "commit:users=1".to_string()]);
-    let user = au.mock().user_by_id(&id.to_string()).expect("zitadel user");
-    assert_eq!((user.email.as_str(), user.org_id.as_str(), user.verified), ("new@x.test", AU_ORG, true));
-    let target = au.udb.targets.lock().unwrap()[0].clone();
-    let loopback = std::net::Ipv4Addr::LOCALHOST.to_string();
-    assert_eq!(
-        (target.branch_id, target.host.as_str(), target.port, target.database.as_str(), target.user.as_str(), target.password.as_str()),
-        (au.main.as_uuid(), loopback.as_str(), 55432, "web1", "chelabase_auth_sync", "sync-pw")
-    );
-    assert_eq!((target.schema.as_str(), target.table.as_str()), ("public", "users"));
-    let row = au.udb.rows.lock().unwrap()[0].clone();
-    assert_eq!((row.id, row.email_verified), (id, true));
-    assert!(row.data.is_empty());
-    let syncs = au.syncs();
-    assert_eq!(syncs.len(), 1);
-    assert_eq!((syncs[0].user_id, syncs[0].origin_branch_id, syncs[0].data.is_none()), (id, Some(au.main), true));
-    assert_eq!(syncs[0].project_id, au.project.id);
-}
-
-// ---- T10 I3: the app-users sync reaches the compute's control address over TLS ----
-
-/// [`au_env`] (with Zitadel) whose orchestrator has `compute_tls`; also the main branch's
-/// endpoint id.
-async fn au_env_tls(compute_tls: Arc<orchestrator::compute_tls::ComputeTls>) -> (Au, String) {
-    let metadata = FakeMetadata::default();
-    let jobs = FakeJobs::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    let project = metadata.create_project(tenant, "Web").await.unwrap();
-    let db = project_database(tenant, project.id, DatabaseStatus::Ready);
-    let endpoint = db.main.endpoint_id.clone().expect("the main branch has an endpoint");
-    let (db_id, main) = (db.database_id, db.main.id);
-    metadata.insert_database(db);
-    metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
-    metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
-    let udb = FakeUsersDb::default();
-    let mock = MockZitadel::start().await;
-    *udb.probe.lock().unwrap() = Some(mock.inner.clone());
-    let zitadel = Zitadel::new(&mock.base, ADMIN_TOKEN);
-    let app = spawn_app_with_compute_tls(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(zitadel),
-        Arc::new(udb.clone()),
-        None,
-        Some(compute_tls),
-    )
-    .await;
-    let au = Au { app, metadata, jobs, tenant, project, db: db_id, main, mock: Some(mock), udb };
-    (au, endpoint)
-}
-
-/// A compute client pair written into a fresh directory (kept alive with the guard).
-fn written_client_pair() -> (tempfile::TempDir, Arc<orchestrator::compute_tls::ComputeTls>) {
-    use chelabase_neon::compute_tls::{ComputeCa, ORCHESTRATOR_CN, write_client_pair};
-    let dir = tempfile::tempdir().unwrap();
-    let now = SystemTime::now();
-    let ca = ComputeCa::generate(now).unwrap();
-    let pair = ca.issue_client(ORCHESTRATOR_CN, now).unwrap();
-    write_client_pair(dir.path(), &pair, ca.cert_pem(), now).unwrap();
-    let tls = Arc::new(orchestrator::compute_tls::ComputeTls::new(dir.path().to_path_buf()));
-    (dir, tls)
-}
-
-// The sync's target carries the same compute TLS as every other compute connection: the
-// compute's certificate name and the loaded client pair (taken from one snapshot).
-#[tokio::test]
-async fn app_user_sync_reaches_the_compute_over_tls() {
-    let (_dir, compute_tls) = written_client_pair();
-    let fingerprint = compute_tls.get().expect("the pair is loaded").fingerprint();
-    let (au, endpoint) = au_env_tls(compute_tls).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!(status, 201, "{body}");
-    let target = au.udb.targets.lock().unwrap()[0].clone();
-    let tls = target.tls.as_ref().expect("the sync uses TLS to the compute");
-    assert_eq!(tls.server_name, chelabase_neon::compute_tls::server_name(&endpoint));
-    assert_eq!(tls.fingerprint, fingerprint);
-    // The address stays the compute's (control) address.
-    assert_eq!((target.host.as_str(), target.port), (std::net::Ipv4Addr::LOCALHOST.to_string().as_str(), 55432));
-}
-
-// R-T10a: no client pair loaded yet is 503 `compute_tls_failed`, never a plaintext
-// connection; the log names the branch and the endpoint (RT3-7, T10 m2).
-#[tokio::test]
-async fn app_user_sync_without_a_client_pair_is_compute_tls_failed() {
-    let logs = Logs::default();
-    let _guard = logs.capture();
-    let empty = tempfile::tempdir().unwrap();
-    let compute_tls = Arc::new(orchestrator::compute_tls::ComputeTls::new(empty.path().to_path_buf()));
-    let (au, endpoint) = au_env_tls(compute_tls).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "new@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (503, "compute_tls_failed"), "{body}");
-    assert!(au.udb.journal().is_empty(), "no connection was tried: {:?}", au.udb.journal());
-    assert!(au.mock().user("new@x.test").is_none());
-    let text = logs.text();
-    let line = text
-        .lines()
-        .find(|l| l.contains("no compute client certificate loaded"))
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!(line.contains(&format!("branch_id={}", au.main)), "{line}");
-    assert!(line.contains(&format!("endpoint_id={endpoint}")), "{line}");
-}
-
-#[tokio::test]
-async fn create_user_email_verified_false_is_passed_on() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let (status, body) =
-        au.call(Method::POST, "/users", Some(json!({"email": "u@x.test", "password": AU_PASSWORD, "email_verified": false}))).await;
-    assert_eq!(status, 201, "{body}");
-    assert_eq!(body["email_verified"], false);
-    assert!(!au.udb.rows.lock().unwrap()[0].email_verified);
-    assert!(!au.mock().user("u@x.test").unwrap().verified);
-}
-
-#[tokio::test]
-async fn create_user_commit_failure_deletes_zitadel_user() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    *au.udb.fault.lock().unwrap() = Some(UdbFault::CommitFails);
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (503, "unavailable"), "{body}");
-    assert!(au.mock().user("n@x.test").is_none());
-    assert!(au.mock().calls().iter().any(|c| c.starts_with("DELETE /v2/users/")), "{:?}", au.mock().calls());
-    assert!(au.syncs().is_empty());
-}
-
-#[tokio::test]
-async fn create_user_constraint_422_never_calls_zitadel() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    *au.udb.fault.lock().unwrap() = Some(UdbFault::Constraint);
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (422, "constraint_violation"), "{body}");
-    assert_eq!(body["error"]["constraint"], "users_nick_check");
-    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
-    assert!(au.syncs().is_empty());
-}
-
-#[tokio::test]
-async fn create_user_email_taken_and_weak_password() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    *au.udb.fault.lock().unwrap() = Some(UdbFault::EmailTaken);
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
-    *au.udb.fault.lock().unwrap() = None;
-    // The user exists in the org but the table doesn't know it (N2): the org is asked before
-    // Zitadel could make a duplicate, and the row is rolled back.
-    au.add_user(AU_ORG, "dup@x.test");
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "DUP@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
-    assert_eq!(au.udb.journal().last().map(String::as_str), Some("rollback"));
-    assert!(!au.mock().calls().contains(&"POST /v2/users/new".to_string()));
-    // Zitadel's password policy.
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "w@x.test", "password": "short"}))).await;
-    assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
-    assert_eq!(au.udb.journal().last().map(String::as_str), Some("rollback"));
-    assert!(au.syncs().is_empty());
-}
-
-#[tokio::test]
-async fn list_users_pages_and_searches() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    for i in 0..55 {
-        au.add_user(AU_ORG, &format!("user{i:02}@x.test"));
-    }
-    au.add_user("o2", "stranger@x.test");
-    let (status, page) = au.call(Method::GET, "/users", None).await;
-    assert_eq!(status, 200, "{page}");
-    assert_eq!(page["users"].as_array().unwrap().len(), 50);
-    let token = page["next_page_token"].as_str().expect("next token").to_string();
-    assert_eq!(page["users"][0]["state"], "active");
-    let (status, page2) = au.call(Method::GET, &format!("/users?page_token={token}"), None).await;
-    assert_eq!(status, 200, "{page2}");
-    assert_eq!(page2["users"].as_array().unwrap().len(), 5);
-    assert!(page2["next_page_token"].is_null());
-    let (_, found) = au.call(Method::GET, "/users?search=USER07", None).await;
-    assert_eq!(found["users"].as_array().unwrap().len(), 1);
-    assert_eq!(found["users"][0]["email"], "user07@x.test");
-    let (status, bad) = au.call(Method::GET, "/users?page_token=not-a-token", None).await;
-    assert_eq!(status, 422, "{bad}");
-}
-
-#[tokio::test]
-async fn get_user_and_sessions() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.add_session(id, "s1");
-    let (status, body) = au.call(Method::GET, &format!("/users/{id}"), None).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!((body["id"].as_str(), body["email"].as_str()), (Some(id.to_string().as_str()), Some("a@x.test")));
-    let (status, sessions) = au.call(Method::GET, &format!("/users/{id}/sessions"), None).await;
-    assert_eq!(status, 200, "{sessions}");
-    assert_eq!(sessions.as_array().unwrap().len(), 1);
-    for key in ["id", "created_at", "last_used_at", "expires_at"] {
-        assert!(sessions[0][key].is_string(), "{key}");
-    }
-    assert!(sessions[0].get("zitadel_session_id").is_none());
-    let (status, _) = au.call(Method::GET, &format!("/users/{}", uuid::Uuid::new_v4()), None).await;
-    assert_eq!(status, 404);
-}
-
-#[tokio::test]
-async fn update_password_revokes_sessions() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.add_session(id, "s1");
-    au.add_session(id, "s2");
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": "brand-new-pw-1"}))).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(au.mock().user_by_id(&id.to_string()).unwrap().password, "brand-new-pw-1");
-    assert_eq!(au.live_sessions(id), 0);
-    let calls = au.mock().calls();
-    assert!(calls.contains(&"DELETE /v2/sessions/s1".to_string()) && calls.contains(&"DELETE /v2/sessions/s2".to_string()), "{calls:?}");
-    assert_eq!(au.syncs().len(), 1);
-    assert_eq!(au.syncs()[0].user_id, id);
-}
-
-#[tokio::test]
-async fn update_email_and_flag() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "b@x.test"}))).await;
-    assert_eq!(status, 200, "{body}");
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert_eq!((user.email.as_str(), user.verified), ("b@x.test", true));
-    // A new address can be set unverified (a code is sent).
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "c@x.test", "email_verified": false}))).await;
-    assert_eq!(status, 200, "{body}");
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert_eq!((user.email.as_str(), user.verified), ("c@x.test", false));
-    assert_eq!(body["email_verified"], false);
-    assert_eq!(au.syncs().len(), 2);
-}
-
-/// The Studio drawer's "Email verified" toggle (browser pass: 503). Zitadel v4.19.1 refuses
-/// `POST /v2/users/{id}/email` with the unchanged address (`Errors.User.Email.NotChanged`), so
-/// the flag alone goes through `PATCH /v2/users/{id}`.
-#[tokio::test]
-async fn update_email_verified_alone_marks_the_current_address() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.mock().inner.lock().unwrap().users.iter_mut().for_each(|u| u.verified = false);
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email_verified": true}))).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!((body["email"].as_str(), body["email_verified"].as_bool()), (Some("a@x.test"), Some(true)));
-    assert!(au.mock().user_by_id(&id.to_string()).unwrap().verified);
-    let calls = au.mock().calls();
-    assert!(calls.contains(&format!("PATCH /v2/users/{id}")), "{calls:?}");
-    assert!(!calls.contains(&format!("POST /v2/users/{id}/email")), "{calls:?}");
-    assert_eq!(au.syncs().len(), 1);
-    // Again, and with the same address spelled out: nothing to change, still 200.
-    for patch in [json!({"email_verified": true}), json!({"email": "a@x.test", "email_verified": true})] {
-        let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(patch.clone())).await;
-        assert_eq!(status, 200, "{patch}: {body}");
-        assert_eq!(body["email_verified"], true);
-    }
-    // Zitadel can't take the verification back without a new address: 422, nothing changes.
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email_verified": false}))).await;
-    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
-    assert!(au.mock().user_by_id(&id.to_string()).unwrap().verified);
-    // An unverified user asked to stay unverified: nothing to do, 200.
-    let other = au.add_user(AU_ORG, "b@x.test");
-    au.mock().inner.lock().unwrap().users.iter_mut().filter(|u| u.id == other.to_string()).for_each(|u| u.verified = false);
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{other}"), Some(json!({"email_verified": false}))).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["email_verified"], false);
-}
-
-/// N2: an address two users of the org already share (made outside Chelabase's checks) is taken.
-#[tokio::test]
-async fn update_to_an_ambiguous_email_is_taken() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let a = au.add_user(AU_ORG, "a@x.test");
-    au.add_user(AU_ORG, "c@x.test");
-    au.add_user(AU_ORG, "C@x.test");
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "c@x.test"}))).await;
-    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "c@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
-}
-
-/// Zitadel's precondition refusals (already in that state) are 409s, never 503.
-#[tokio::test]
-async fn state_changes_already_done_are_409() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
-    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
-    assert_eq!(status, 200, "{body}");
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
-    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
-}
-
-#[tokio::test]
-async fn update_email_taken_409() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let a = au.add_user(AU_ORG, "a@x.test");
-    au.add_user(AU_ORG, "b@x.test");
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "B@x.test"}))).await;
-    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
-    assert_eq!(au.mock().user_by_id(&a.to_string()).unwrap().email, "a@x.test");
-    assert!(au.syncs().is_empty());
-    // The user's own address isn't "taken".
-    let (status, _) = au.call(Method::PATCH, &format!("/users/{a}"), Some(json!({"email": "a@x.test"}))).await;
-    assert_eq!(status, 200);
-}
-
-#[tokio::test]
-async fn deactivate_revokes_and_syncs() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.add_session(id, "s1");
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/deactivate"), None).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["state"], "inactive");
-    assert!(au.mock().user_by_id(&id.to_string()).unwrap().inactive);
-    assert_eq!(au.live_sessions(id), 0);
-    assert!(au.mock().calls().contains(&"DELETE /v2/sessions/s1".to_string()));
-    assert_eq!(au.syncs().len(), 1);
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["state"], "active");
-    assert!(!au.mock().user_by_id(&id.to_string()).unwrap().inactive);
-    assert_eq!(au.syncs().len(), 2);
-}
-
-#[tokio::test]
-async fn revoke_sessions_is_204() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.add_session(id, "s1");
-    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}/sessions"), None).await;
-    assert_eq!(status, 204);
-    assert_eq!(au.live_sessions(id), 0);
-    assert!(au.mock().calls().contains(&"DELETE /v2/sessions/s1".to_string()));
-}
-
-#[tokio::test]
-async fn delete_user_syncs() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    au.add_session(id, "s1");
-    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
-    assert_eq!(status, 204);
-    assert!(au.mock().user_by_id(&id.to_string()).is_none());
-    assert_eq!(au.live_sessions(id), 0);
-    assert_eq!(au.syncs().len(), 1);
-    assert_eq!((au.syncs()[0].user_id, au.syncs()[0].data.is_none()), (id, true));
-}
-
-#[tokio::test]
-async fn other_org_user_404() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user("o2", "stranger@x.test");
-    for (method, rest, body) in [
-        (Method::GET, format!("/users/{id}"), None),
-        (Method::PATCH, format!("/users/{id}"), Some(json!({"password": "brand-new-pw-1"}))),
-        (Method::POST, format!("/users/{id}/deactivate"), None),
-        (Method::POST, format!("/users/{id}/reactivate"), None),
-        (Method::GET, format!("/users/{id}/sessions"), None),
-        (Method::DELETE, format!("/users/{id}/sessions"), None),
-        (Method::DELETE, format!("/users/{id}"), None),
-    ] {
-        let (status, answer) = au.call(method.clone(), &rest, body).await;
-        assert_eq!(status, 404, "{method} {rest}: {answer}");
-    }
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert_eq!((user.password.as_str(), user.inactive), (AU_PASSWORD, false));
-    assert!(au.syncs().is_empty());
-}
-
-#[tokio::test]
-async fn user_routes_need_enabled_app_users() {
-    let au = au_env(true).await;
-    let (status, body) = au.call(Method::GET, "/users", None).await;
-    assert_eq!((status, code_of(&body)), (409, "app_users_disabled"), "{body}");
-    au.set_auth(AppUsersStatus::Enabling);
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "a@x.test", "password": AU_PASSWORD}))).await;
-    assert_eq!((status, code_of(&body)), (409, "app_users_disabled"), "{body}");
-}
-
-#[tokio::test]
-async fn routes_503_without_zitadel() {
-    let au = au_env(false).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = uuid::Uuid::new_v4();
-    for (method, rest, body) in [
-        (Method::GET, "/users".to_string(), None),
-        (Method::POST, "/users".to_string(), Some(json!({"email": "a@x.test", "password": AU_PASSWORD}))),
-        (Method::GET, format!("/users/{id}"), None),
-        (Method::PATCH, format!("/users/{id}"), Some(json!({"email_verified": true}))),
-        (Method::DELETE, format!("/users/{id}"), None),
-        (Method::DELETE, "/app-users".to_string(), None),
-    ] {
-        let (status, answer) = au.call(method.clone(), &rest, body).await;
-        assert_eq!((status, code_of(&answer)), (503, "unavailable"), "{method} {rest}: {answer}");
-    }
-    // Reading the settings needs no Zitadel.
-    let (status, _) = au.call(Method::GET, "/app-users", None).await;
-    assert_eq!(status, 200);
-}
-
-#[tokio::test]
-async fn data_api_disable_refused_on_auth_database() {
-    let au = au_env(false).await;
-    au.metadata.add_branch_db(au.main, "web2", "owner", DatabaseOrigin::Sql);
-    au.metadata.set_data_api(au.main, "web2", chelabase_metadata::DataApiState::On);
-    au.set_auth(AppUsersStatus::Enabled);
-    au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().pg_database = "web2".into();
-    let base = format!("/v1/databases/{}/branches/{}/pg-databases/web2/data-api", au.db, au.main);
-    for query in ["", "?remove=true"] {
-        let resp = send(&au.app, Method::DELETE, &format!("{base}{query}"), "org-1", None).await;
-        let body = error_of(resp, 409).await;
-        assert_eq!(code_of(&body), "conflict", "{body}");
-        assert_eq!(message_of(&body), "app users use this database: disable app users first");
-    }
-    assert!(au.jobs.data_api_calls.lock().unwrap().is_empty());
-    // Another Postgres database of the same Chelabase database is free to go.
-    au.metadata.add_branch_db(au.main, "web3", "owner", DatabaseOrigin::Sql);
-    let resp = send(&au.app, Method::DELETE, &format!("/v1/databases/{}/branches/{}/pg-databases/web3/data-api", au.db, au.main), "org-1", None).await;
-    assert_eq!(resp.status(), 204);
-}
-
-#[tokio::test]
-async fn list_projects_batches_the_auth_read() {
-    let (app, metadata, tenant) = projects_app(FakeJobs::default()).await;
-    let mut ids = vec![];
-    for name in ["A", "B", "C"] {
-        ids.push(metadata.create_project(tenant, name).await.unwrap().id);
-    }
-    metadata.project_auths.lock().unwrap().insert(
-        ids[1],
-        ProjectAuth {
-            project_id: ids[1],
-            status: AppUsersStatus::Enabled,
-            error: None,
-            zitadel_org_id: None,
-            database_id: DatabaseId::new(),
-            pg_database: "web1".into(),
-            schema_name: "public".into(),
-            table_name: "users".into(),
-            email_verification: false,
-            on_delete: OnDelete::Delete,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        },
-    );
-    let body: Value = send(&app, Method::GET, "/v1/projects", "org-1", None).await.json().await.unwrap();
-    let states: Vec<_> = body.as_array().unwrap().iter().map(|p| p["app_users"].as_str()).collect();
-    assert_eq!(states, vec![None, Some("enabled"), None]);
-    assert_eq!(metadata.project_auth_reads.load(Ordering::SeqCst), 0);
-    assert_eq!(metadata.project_auth_batch_reads.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn disable_retry_while_disabling_skips_the_users_check() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Disabling);
-    // The org still lists a user (or is gone): the retry must not look.
-    au.add_user(AU_ORG, "a@x.test");
-    let (status, body) = au.call(Method::DELETE, "/app-users", None).await;
-    assert_eq!(status, 202, "{body}");
-    assert_eq!(au.jobs_published(), vec![AppUsersJob::Disable { project_id: au.project.id }]);
-    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
-}
-
-#[tokio::test]
-async fn put_while_disabling_409() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Disabling);
-    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
-    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
-    assert!(au.jobs_published().is_empty());
-    assert_eq!(au.auth().status, AppUsersStatus::Disabling);
-}
-
-#[tokio::test]
-async fn delete_user_succeeds_and_syncs_when_the_revoke_fails() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    *au.metadata.fail_revoke.lock().unwrap() = true;
-    let (status, _) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
-    assert_eq!(status, 204);
-    assert!(au.mock().user_by_id(&id.to_string()).is_none());
-    assert_eq!(au.syncs().len(), 1);
-}
-
-#[tokio::test]
-async fn update_with_a_weak_password_changes_nothing() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    let (status, body) =
-        au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test", "password": "short"}))).await;
-    assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert_eq!((user.email.as_str(), user.password.as_str()), ("a@x.test", AU_PASSWORD));
-    assert!(au.syncs().is_empty());
-}
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
+use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
 
 // ---- saved queries
 
@@ -6360,9 +5387,7 @@ impl Branching {
         if self.metadata.member(tenant, sub).is_none() {
             self.metadata.add_member(tenant, sub, MemberStatus::Active, true);
         }
-        let mut id = identity("org-1");
-        id.sub = sub.into();
-        let token = self.app.signer.sign(Service::Orchestrator.name(), &id).unwrap();
+        let token = self.app.sign(&identity_of(sub), Some(tenant));
         let mut req = reqwest::Client::new()
             .request(method, format!("{}{path}", self.app.base))
             .header(IDENTITY_HEADER, token);
@@ -6805,7 +5830,7 @@ impl Branching {
 
     /// The member row of `sub` (made by its first request).
     fn member_of_sub(&self, sub: &str) -> uuid::Uuid {
-        self.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == sub).expect("a member row").id
+        self.metadata.members.lock().unwrap().iter().find(|m| m.identity_user_id == sub).expect("a member row").id
     }
 
     async fn run_as(&self, sub: &str, branch: BranchId, role: Option<&str>) -> reqwest::Response {
@@ -9299,7 +8324,7 @@ async fn removed_member_is_refused_with_a_valid_token() {
     assert_eq!(code_of(&err), "not_found");
     // The request neither revives the member nor makes a new one.
     assert_eq!(w.metadata.member(w.tenant, "bob").unwrap().status, MemberStatus::Removed);
-    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "bob").count(), 1);
+    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.identity_user_id == "bob").count(), 1);
 
     // A removed tenant admin is refused too, on every project.
     w.metadata.set_member(w.tenant, DEFAULT_SUB, |m| m.status = MemberStatus::Removed);
@@ -9307,20 +8332,6 @@ async fn removed_member_is_refused_with_a_valid_token() {
     assert_eq!(code_of(&err), "not_found");
     let err = error_of(w.app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/projects", Some(json!({"name": "x"}))).await, 404).await;
     assert_eq!(code_of(&err), "not_found");
-}
-
-#[tokio::test]
-async fn invited_member_activates_on_first_request() {
-    let w = member_world(Mode::SelfHosted).await;
-    let id = w.metadata.add_member(w.tenant, "carol", MemberStatus::Invited, false);
-    w.metadata.add_open_invite(id);
-    w.metadata.grant(id, w.project, PlatformRole::Viewer, &[]);
-    let path = format!("/v1/databases/{}", w.db);
-    assert_eq!(w.app.send_as("carol", "org-1", Method::GET, &path, None).await.status(), 200);
-    let m = w.metadata.member(w.tenant, "carol").unwrap();
-    assert_eq!(m.status, MemberStatus::Active);
-    assert!(m.accepted_at.is_some());
-    assert_eq!(m.email.as_deref(), Some("carol@example.test"), "the token's claims are stored");
 }
 
 // I1: an invited member whose invite expired (or never existed) stays invited and gets
@@ -9391,8 +8402,8 @@ async fn me_lists_narrowed_databases() {
     assert!(me["projects"].as_array().unwrap().iter().all(|p| p["databases"] == json!([]) && p["roles"] == "all"), "{me}");
 }
 
-// R39: sign-up is off unless the tenant switched it on: a person in the org with no invite and
-// no row is refused (the "ask your admin for an invite" answer) and nothing is written.
+// R39: a person with no row is refused (the "ask your admin for an invite" answer) and nothing
+// is written: rows are made only by sign-up and accept-invite (#126).
 #[tokio::test]
 async fn closed_signup_creates_no_member() {
     let w = member_world(Mode::SelfHosted).await;
@@ -9404,94 +8415,9 @@ async fn closed_signup_creates_no_member() {
     assert_eq!(code_of(&err), "no_access_yet");
     assert!(w.metadata.member(w.tenant, "hal").is_none(), "no member row");
     assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
-    // /v1/me still answers, with no membership.
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(me["projects"], json!([]));
-}
-
-// M7 (R41): on a fresh install two people may sign up before either has a member row (the gate
-// counts members). The one whose first request comes second is not stranded: while the tenant's
-// admin claim is recent they are a pending request (shown in Requests). Anyone later is refused.
-#[tokio::test]
-async fn first_member_race_loser_is_a_pending_request() {
-    let w = member_world(Mode::SelfHosted).await;
-    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
-    let me: Value = w.app.send_as("late", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    let late = w.metadata.member(w.tenant, "late").expect("a member row");
-    assert_eq!((late.status, late.tenant_admin), (MemberStatus::Pending, false));
-    assert_eq!(me["member"]["status"], "pending", "{me}");
-    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
-    assert_eq!(events, vec!["member_joined".to_string()]);
-    // The admin sees the request.
-    let list: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/members", None).await.json().await.unwrap();
-    assert!(list.as_array().unwrap().iter().any(|m| m["status"] == "pending"), "{list}");
-
-    // Once the claim is old, a person with no row is refused again, and nothing is written.
-    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::hours(3)));
-    let before = w.metadata.members.lock().unwrap().len();
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
-    // And a tenant whose admin was not claimed through sign-up never admits one.
-    w.metadata.set_admin_claim(w.tenant, None);
-    let me: Value = w.app.send_as("ivy", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-}
-
-// AC 6 through `admit` (reworded after the m3 re-audit, B3): two code-gated sign-ups, the claim
-// bound to A. A becomes the admin whichever first request comes first. B is refused
-// (`no_access_yet`, nothing written) until A's first request, and a pending request after it.
-#[tokio::test]
-async fn setup_race_loser_is_refused_until_the_winner_signs_in() {
-    for loser_first in [true, false] {
-        let w = member_world(Mode::SelfHosted).await;
-        w.metadata.members.lock().unwrap().retain(|m| m.tenant_id != w.tenant);
-        w.metadata.set_admin_claim(w.tenant, None);
-        w.metadata.set_setup_claim(w.tenant, "user-a");
-        let me = |sub: &'static str| {
-            let w = &w;
-            async move { w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json::<Value>().await.unwrap() }
-        };
-        if loser_first {
-            let b = me("user-b").await;
-            assert!(b["member"].is_null(), "B before A: refused, {b}");
-            assert!(w.metadata.member(w.tenant, "user-b").is_none(), "nothing written");
-            let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
-            assert_eq!(code_of(&err), "no_access_yet");
-            assert!(w.metadata.member(w.tenant, "user-b").is_none());
-        }
-        assert!(!me("user-a").await["member"].is_null());
-        let a = w.metadata.member(w.tenant, "user-a").unwrap();
-        assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true), "loser_first={loser_first}");
-        assert!(!me("user-b").await["member"].is_null());
-        let b = w.metadata.member(w.tenant, "user-b").unwrap();
-        assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false), "loser_first={loser_first}");
-        let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
-        assert_eq!(code_of(&err), "pending_approval");
-    }
-}
-
-// R39: with open sign-up on, the same person becomes a pending member (one `member_joined`
-// event) who can do nothing yet.
-#[tokio::test]
-async fn open_signup_creates_pending_member() {
-    let w = member_world(Mode::SelfHosted).await;
-    w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    let hal = w.metadata.member(w.tenant, "hal").unwrap().id;
-    assert_eq!(me["member"], json!({ "id": hal, "status": "pending", "tenant_admin": false }));
-    assert_eq!(me["projects"], json!([]));
-    let m = w.metadata.member(w.tenant, "hal").expect("a member row");
-    assert_eq!((m.status, m.tenant_admin), (MemberStatus::Pending, false), "the tenant has an admin already");
-    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
-    assert_eq!(events, vec!["member_joined"]);
-    // Asking again changes nothing, and a pending member stays out.
-    let path = format!("/v1/databases/{}", w.db);
-    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, &path, None).await, 403).await;
-    assert_eq!(code_of(&err), "pending_approval");
-    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "hal").count(), 1);
-    assert_eq!(w.metadata.events.lock().unwrap().len(), 1, "no second event");
+    // #119: `/v1/me` tells a member token with no row nothing of the tenant.
+    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet");
 }
 
 // R40: a pending member is 403 `pending_approval` on every route except /v1/me.
@@ -9698,22 +8624,23 @@ async fn approve_checks_grants() {
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(grant("viewer", &[]))).await.status(), 200);
 }
 
-// R40: declining removes the pending member and deactivates its Zitadel user, as removal does.
+// R40: declining removes the pending member and bans its account, as removal does.
 #[tokio::test]
-async fn decline_removes_and_deactivates() {
+async fn decline_removes_and_bans() {
     let t = mw(Mode::SelfHosted).await;
-    let zid = t.mock.add_user_in("org-1", "pat@example.test", "", false);
+    let zid = t.identity.with_invited_user(&Pool::Members, "pat@example.test");
     let pat = t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Pending, false);
+    t.identity.with_session(&Pool::Members, &zid);
     let path = format!("/v1/members/{pat}/decline");
     t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
     let err = error_of(t.send("padmin", Method::POST, &path, None).await, 403).await;
     assert_eq!(err["error"]["required"], "tenant admin");
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
     assert_eq!(t.w.metadata.member(t.w.tenant, &zid).unwrap().status, MemberStatus::Removed);
-    assert!(t.mock.user_by_id(&zid).unwrap().inactive, "the Zitadel user is deactivated");
-    assert!(t.mock.calls().contains(&"POST /v2/sessions/search".to_string()), "its sessions are ended");
+    assert!(t.identity.user(&Pool::Members, &zid).unwrap().banned, "the account is banned");
+    assert_eq!(t.identity.session_count(&Pool::Members), 0, "its sessions are ended");
     assert_eq!(t.actions(), vec!["member_declined"]);
-    // A repeat retries the Zitadel steps and writes nothing more.
+    // A repeat retries the identity steps and writes nothing more.
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
     assert_eq!(t.actions(), vec!["member_declined"]);
     // An active member isn't declined; a stranger's id is 404.
@@ -9724,30 +8651,6 @@ async fn decline_removes_and_deactivates() {
     assert_eq!(code_of(&err), "not_found");
 }
 
-// R39, R40: a pending member never becomes the first admin; whoever finds the tenant without
-// one claims it.
-#[tokio::test]
-async fn pending_never_becomes_first_admin() {
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.members.lock().unwrap().retain(|m| m.zitadel_user_id != DEFAULT_SUB); // no admin yet
-    metadata.open_signups.lock().unwrap().insert(tenant, true);
-    let pat = metadata.add_member(tenant, "pat", MemberStatus::Pending, false);
-    let app = spawn_app_full(metadata.clone(), FakeJobs::default(), "http://127.0.0.1:9", Mode::SelfHosted, 10).await;
-    let me: Value = app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!(me["member"], json!({ "id": pat, "status": "pending", "tenant_admin": false }));
-    let m = metadata.member(tenant, "pat").unwrap();
-    assert_eq!((m.id, m.status, m.tenant_admin), (pat, MemberStatus::Pending, false));
-    let me: Value = app.send_as("first", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!((&me["member"]["status"], &me["member"]["tenant_admin"]), (&json!("active"), &json!(true)));
-    assert!(me["member"]["id"].as_str().is_some_and(|id| id.len() == 36), "{me}");
-    assert_eq!(metadata.member(tenant, "pat").unwrap().status, MemberStatus::Pending);
-    // Even with the claim made by someone else, pat stays pending on every later request.
-    app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await;
-    assert!(!metadata.member(tenant, "pat").unwrap().tenant_admin);
-}
-
 #[tokio::test]
 async fn platform_mode_creates_no_members() {
     let w = member_world(Mode::Platform).await;
@@ -9755,14 +8658,13 @@ async fn platform_mode_creates_no_members() {
     let path = format!("/v1/databases/{}", w.db);
     let err = error_of(w.app.send_as("dave", "org-1", Method::GET, &path, None).await, 403).await;
     assert_eq!(code_of(&err), "not_available_in_platform_mode");
-    let me: Value = w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(me["projects"], json!([]));
+    let err = error_of(w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
     assert_eq!(w.metadata.members.lock().unwrap().len(), before);
     assert!(w.metadata.member(w.tenant, "dave").is_none());
 
     // An existing member is served; a tenant admin isn't an instance admin without the
-    // operator org.
+    // operator tenant.
     assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
     let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
     assert_eq!(me["instance_admin"], json!(false));
@@ -9959,42 +8861,6 @@ async fn put_app_users_reads_the_database_override() {
     assert_eq!(err["error"]["required"], "admin");
 }
 
-// I2 (R18): a token without email or name claims gets them from Zitadel, once.
-#[tokio::test]
-async fn missing_claims_are_read_from_zitadel() {
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.open_signups.lock().unwrap().insert(tenant, true);
-    let mock = MockZitadel::start().await;
-    let zed = mock.add_user("Zed@Example.Test", "correct-horse-9", true);
-    mock.set_display_name(&zed, "Zed Zulu");
-    let app = spawn_app_parts(
-        metadata.clone(),
-        FakeJobs::default(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-    )
-    .await;
-    let bare = |sub: &str| Identity { email: None, name: None, ..identity_of(sub, "org-1") };
-    let me = body_of(app.send_identity(&bare(&zed), Method::GET, "/v1/me").await).await;
-    assert_eq!(me["email"], "zed@example.test", "{me}");
-    assert_eq!(me["name"], "Zed Zulu");
-    let m = metadata.member(tenant, &zed).unwrap();
-    assert_eq!((m.email.as_deref(), m.display_name.as_str()), (Some("zed@example.test"), "Zed Zulu"));
-    // Known now: the next request doesn't ask Zitadel again.
-    app.send_identity(&bare(&zed), Method::GET, "/v1/me").await;
-    let lookups = mock.inner.lock().unwrap().calls.iter().filter(|c| c.contains(&format!("/v2/users/{zed}"))).count();
-    assert_eq!(lookups, 1);
-    // A Zitadel failure isn't fatal: the member is made without them (pending, as zed is).
-    let me = body_of(app.send_identity(&bare("ghost"), Method::GET, "/v1/me").await).await;
-    assert!(me["email"].is_null() && me["name"].is_null(), "{me}");
-    assert_eq!(me["member"]["status"], "pending");
-}
-
 // I3: `create_merge` goes by the branch merged into.
 #[tokio::test]
 async fn create_merge_into_protected_parent_needs_admin() {
@@ -10066,13 +8932,13 @@ async fn the_member_row_is_read_once_per_request() {
     for mode in [Mode::SelfHosted, Mode::Platform] {
         let w = member_world(mode).await;
         let path = format!("/v1/databases/{}", w.db);
-        let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
-        let full = identity_of(DEFAULT_SUB, "org-1");
+        let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB) };
+        let full = identity_of(DEFAULT_SUB);
         for (label, identity) in [("claims", &full), ("no claims", &bare)] {
             // The first request may refresh the claims; count the steady state.
-            w.app.send_identity(identity, Method::GET, &path).await;
+            w.app.send_identity(identity, "org-1", Method::GET, &path).await;
             let before = w.metadata.member_reads.load(Ordering::SeqCst);
-            assert_eq!(w.app.send_identity(identity, Method::GET, &path).await.status(), 200);
+            assert_eq!(w.app.send_identity(identity, "org-1", Method::GET, &path).await.status(), 200);
             assert_eq!(w.metadata.member_reads.load(Ordering::SeqCst) - before, 1, "{mode:?} {label}");
         }
     }
@@ -10086,53 +8952,10 @@ async fn me_name_is_null_when_unknown() {
         m.display_name = String::new();
         m.email = None;
     });
-    let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
-    let me = body_of(w.app.send_identity(&bare, Method::GET, "/v1/me").await).await;
+    let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB) };
+    let me = body_of(w.app.send_identity(&bare, "org-1", Method::GET, "/v1/me").await).await;
     assert!(me["name"].is_null(), "{me}");
     assert!(me["email"].is_null(), "{me}");
-}
-
-// M7 (R19): `Instance` routes are checked before the tenant binding, so a platform operator
-// whose org is no tenant reaches them; every other route still answers `tenant_not_bound`.
-#[tokio::test]
-async fn instance_routes_skip_tenant_binding_for_operators() {
-    let spawn = |mode: Mode, metadata: FakeMetadata| async move {
-        spawn_app_custom(
-            metadata,
-            FakeJobs::default(),
-            "http://127.0.0.1:9",
-            mode,
-            10,
-            None,
-            Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-            Some("ops"),
-        )
-        .await
-    };
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.add_member(tenant, "plain", MemberStatus::Active, false);
-    let app = spawn(Mode::Platform, metadata.clone()).await;
-    // The operator org isn't a tenant: the probe passes, any tenant route doesn't.
-    let resp = app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "op");
-    let err = error_of(app.send_as("op", "ops", Method::GET, "/v1/projects", None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
-    // In platform mode a tenant admin isn't an instance admin, and another org is unbound.
-    let err = error_of(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("instance admin")));
-    let err = error_of(app.send_as("x", "elsewhere", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
-
-    // Self-hosted: the tenant admin passes, another member doesn't, the operator org is nothing.
-    let app = spawn(Mode::SelfHosted, metadata).await;
-    assert_eq!(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await.status(), 200);
-    let err = error_of(app.send_as("plain", "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(err["error"]["required"], "instance admin");
-    let err = error_of(app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
 }
 
 // --- Route-specific refinements (members and roles, T6) --------------------------------------
@@ -10440,7 +9263,6 @@ async fn app_user_routes_apply_the_auth_database_override() {
         project_id: w.project,
         status: AppUsersStatus::Enabled,
         error: None,
-        zitadel_org_id: Some("zorg".into()),
         database_id,
         pg_database: "web1".into(),
         schema_name: "public".into(),
@@ -10456,7 +9278,7 @@ async fn app_user_routes_apply_the_auth_database_override() {
     let base = format!("/v1/projects/{}", w.project);
     let create = json!({ "email": "a@example.test", "password": "correct-horse-9" });
 
-    // Without an override: not refused (the Zitadel client is missing, which is another answer).
+    // Without an override: not refused (the identity client is missing, which is another answer).
     let ok = body_of(w.app.send_as("pat", "org-1", Method::DELETE, &format!("{base}/app-users"), None).await).await;
     assert!(!access_refusal(&ok), "{ok}");
     w.metadata.narrow(pat, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
@@ -10567,7 +9389,7 @@ async fn act_as_chain_reachable_role_allowed() {
     let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query.clone())).await).await;
     assert!(!access_refusal(&ok), "{ok}");
     // The sql editor takes the same chain, through dan's member role (granted `billing_admin`).
-    let dan = w.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == "dan").unwrap().id;
+    let dan = w.metadata.members.lock().unwrap().iter().find(|m| m.identity_user_id == "dan").unwrap().id;
     let role_name = chelabase_types::role_name::member_role_name(dan);
     let password_enc =
         chelabase_secrets::seal_member_role_password(&w.app.key, w.dev.as_uuid(), &role_name, "pw").unwrap();
@@ -10729,8 +9551,7 @@ async fn delete_database_refuses_the_app_auth_database() {
             project_id: w.project,
             status: AppUsersStatus::Enabled,
             error: None,
-            zitadel_org_id: Some("zorg".into()),
-            database_id: w.db,
+                database_id: w.db,
             pg_database: "web1".into(),
             schema_name: "public".into(),
             table_name: "users".into(),
@@ -10766,29 +9587,44 @@ async fn create_database_takes_the_tenant_from_the_caller() {
 // ---- T7: the member management API --------------------------------------------------------
 
 /// The member world (org-1's tenant; project Billing with database web1, owner `postgres`,
-/// main plus `dev`), with Zitadel's mock behind the orchestrator (admin PAT; org-1 exists in
-/// it) and, in platform mode, `ops` as the operator org.
+/// main plus `dev`), with the identity fake behind the orchestrator (its members pool exists)
+/// and `ops` as the operator tenant, whose active member `operator` is.
 struct Mw {
     w: MemberWorld,
-    mock: MockZitadel,
+    identity: FakeIdentity,
 }
 
 async fn mw(mode: Mode) -> Mw {
+    mw_with(mode, true).await
+}
+
+/// `mw` whose orchestrator has no identity client.
+async fn mw_without_identity() -> Mw {
+    mw_with(Mode::SelfHosted, false).await
+}
+
+async fn mw_with(mode: Mode, with_identity: bool) -> Mw {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
+    let ops = TenantId::new();
+    metadata.bind_org("ops", ops);
+    metadata.add_member(ops, "operator", MemberStatus::Active, false);
     let jobs = FakeJobs::default();
-    let mock = MockZitadel::start().await;
-    mock.add_org("org-1");
-    let app = spawn_app_custom(
+    let identity = FakeIdentity::start().await;
+    identity.with_pool(&Pool::Members);
+    let app = spawn_app_core_with(
         metadata.clone(),
         jobs.clone(),
         "http://127.0.0.1:9",
         mode,
         10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        Some("ops"),
+        None,
+        Some(ops),
+        None,
+        with_identity.then(|| identity.client()),
+        None,
     )
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
@@ -10801,7 +9637,7 @@ async fn mw(mode: Mode) -> Mw {
     metadata.insert_database(db);
     let dev = metadata.add_branch(db_id, "dev", main, BranchKind::Normal, BranchStatus::Ready);
     let w = MemberWorld { app, metadata, tenant, project, db: db_id, dev, merge: uuid::Uuid::nil(), jobs };
-    Mw { w, mock }
+    Mw { w, identity }
 }
 
 impl Mw {
@@ -10839,7 +9675,7 @@ fn invite_body(w: &MemberWorld, email: &str, role: &str, roles: &[&str]) -> Valu
 }
 
 #[tokio::test]
-async fn invite_creates_zitadel_user_and_invited_member() {
+async fn invite_creates_identity_user_and_invited_member() {
     let t = mw(Mode::SelfHosted).await;
     let resp = t
         .send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "  New@Example.COM ", "developer", &["app"])))
@@ -10855,21 +9691,20 @@ async fn invite_creates_zitadel_user_and_invited_member() {
     let hours = (expires - chrono::Utc::now()).num_minutes();
     assert!((71 * 60..=72 * 60).contains(&hours), "the invite lives 72 h: {hours} min");
 
-    // Zitadel: a passwordless user in the tenant's org, and only the invite mail.
-    let user = t.mock.user("new@example.com").expect("a Zitadel user");
-    assert_eq!((user.org_id.as_str(), user.password.as_str()), ("org-1", ""));
-    assert_eq!(t.mock.emails(), vec![(user.id.clone(), "invite".to_string())]);
-    assert!(
-        t.mock
-            .invite_template(&user.id)
-            .is_some_and(|u| u.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t=")),
-        "{:?}",
-        t.mock.invite_template(&user.id)
-    );
+    // The identity service: a passwordless user in the members pool, and only the invite code,
+    // mailed with a link to the accept page (the code itself isn't in it).
+    let sub = sub_of(&t, "new@example.com");
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().has_password);
+    let sent = t.identity.codes_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].user_id.as_str(), sent[0].kind), (sub.as_str(), chelabase_identity::CodeKind::Invite));
+    let link = sent[0].link.clone().unwrap();
+    assert!(link.starts_with(&format!("http://studio.test/accept-invite?user={sub}&t=")), "{link}");
+    assert!(!link.contains(&sent[0].code), "{link}");
     // Metadata: an invited member with its (inert) grant, an invite, one event.
     let id: uuid::Uuid = member["id"].as_str().unwrap().parse().unwrap();
     let stored = t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == id).cloned().unwrap();
-    assert_eq!((stored.zitadel_user_id.as_str(), stored.status), (user.id.as_str(), MemberStatus::Invited));
+    assert_eq!((stored.identity_user_id.as_str(), stored.status), (sub.as_str(), MemberStatus::Invited));
     assert_eq!(t.grant_of(id), Some(GrantRow { platform_role: PlatformRole::Developer, pg_roles: vec!["app".into()] }));
     assert_eq!(t.actions(), vec!["invite_created"]);
     // Everyone in the tenant sees the invited member and its open invite.
@@ -10879,8 +9714,8 @@ async fn invite_creates_zitadel_user_and_invited_member() {
     assert_eq!(listed["invite"]["id"], invite_id.as_str());
 }
 
-// Review focus 3, R8 and R18: a member is matched by Zitadel user id first, then by a non-NULL
-// email (trimmed, any case); no second Zitadel user is made.
+// Review focus 3, R8 and R18: a member is matched by identity user id first, then by a non-NULL
+// email (trimmed, any case); no second identity user is made.
 #[tokio::test]
 async fn invite_matches_existing_member_case_insensitively() {
     let t = mw(Mode::SelfHosted).await;
@@ -10893,13 +9728,13 @@ async fn invite_matches_existing_member_case_insensitively() {
     let body = body_of(resp).await;
     assert_eq!(body["outcome"], "existing_member");
     assert_eq!(body["member"]["id"], bob.to_string());
-    assert!(!t.mock.calls().iter().any(|c| c == "POST /v2/users/new"), "{:?}", t.mock.calls());
+    assert!(!t.identity.calls().iter().any(|c| c == "POST /internal/v1/pools/members/users"), "{:?}", t.identity.calls());
     assert_eq!(t.grant_of(bob).map(|g| g.platform_role), Some(PlatformRole::Viewer));
     assert_eq!(t.enqueued(), t.branches());
 
-    // Id first: Zitadel says carol@x.com is user Z; the member with Z has no stored email (it
-    // went stale) while another member still holds it.
-    let z = t.mock.add_user_in("org-1", "carol@x.com", "Secret-pass1", true);
+    // Id first: the identity service says carol@x.com is user Z; the member with Z has no stored
+    // email (it went stale) while another member still holds it.
+    let z = t.identity.with_user(&Pool::Members, "carol@x.com", "Secret-pass1");
     let carol = t.w.metadata.add_member(t.w.tenant, &z, MemberStatus::Active, false);
     t.w.metadata.set_member(t.w.tenant, &z, |m| m.email = None);
     let stale = t.w.metadata.add_member(t.w.tenant, "stale", MemberStatus::Active, false);
@@ -10912,37 +9747,6 @@ async fn invite_matches_existing_member_case_insensitively() {
     assert_eq!(body["outcome"], "existing_member");
     assert_eq!(body["member"]["id"], carol.to_string());
     assert_eq!(t.grant_of(stale), None);
-}
-
-#[tokio::test]
-async fn invite_existing_org_user_gets_member_row() {
-    let t = mw(Mode::SelfHosted).await;
-    let z = t.mock.add_user_in("org-1", "dana@x.com", "Secret-pass1", true);
-    t.mock.set_display_name(&z, "Dana D");
-    let resp = t
-        .send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "dana@x.com", "developer", &["app"])))
-        .await;
-    assert_eq!(resp.status(), 201);
-    let body = body_of(resp).await;
-    assert_eq!(body["outcome"], "added");
-    let m = &body["member"];
-    assert_eq!((m["status"].as_str(), m["display_name"].as_str()), (Some("active"), Some("Dana D")));
-    assert!(m["invite"].is_null());
-    let stored = t.w.metadata.member(t.w.tenant, &z).expect("a member row for the Zitadel user");
-    assert_eq!(stored.status, MemberStatus::Active);
-    assert_eq!(t.grant_of(stored.id).map(|g| g.pg_roles), Some(vec!["app".to_string()]));
-    // No new Zitadel user and no mail.
-    assert!(t.mock.emails().is_empty());
-    assert_eq!(t.mock.users_with_email("dana@x.com"), 1);
-    assert_eq!(t.actions(), vec!["member_added"]);
-    assert_eq!(t.enqueued(), t.branches());
-    // Inviting them again finds the member.
-    let again = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "dana@x.com", "viewer", &[])))
-            .await,
-    )
-    .await;
-    assert_eq!(again["outcome"], "existing_member");
 }
 
 #[tokio::test]
@@ -11076,27 +9880,26 @@ async fn grant_change_enqueues_reconcile_for_every_branch() {
 }
 
 #[tokio::test]
-async fn remove_member_deactivates_and_enqueues() {
+async fn remove_member_bans_and_enqueues() {
     let t = mw(Mode::SelfHosted).await;
-    let z = t.mock.add_user_in("org-1", "gil@x.com", "Secret-pass1", true);
+    let z = t.identity.with_user(&Pool::Members, "gil@x.com", "Secret-pass1");
     let gil = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
-    let z_client = Zitadel::new(&t.mock.base, ADMIN_TOKEN);
-    z_client.create_session(&z, "Secret-pass1").await.unwrap();
-    let other = t.mock.add_user_in("org-1", "hal@x.com", "Secret-pass1", true);
-    z_client.create_session(&other, "Secret-pass1").await.unwrap();
+    t.identity.with_session(&Pool::Members, &z);
+    let other = t.identity.with_user(&Pool::Members, "hal@x.com", "Secret-pass1");
+    t.identity.with_session(&Pool::Members, &other);
     assert_eq!(t.send(&z, Method::GET, "/v1/projects", None).await.status(), 200);
 
     let path = format!("/v1/members/{gil}");
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&z).unwrap().inactive);
-    assert_eq!(t.mock.session_count(), 1, "only gil's session ended");
+    assert!(t.identity.user(&Pool::Members, &z).unwrap().banned);
+    assert_eq!(t.identity.session_count(&Pool::Members), 1, "only gil's session ended");
     assert_eq!(t.enqueued(), t.branches());
     assert_eq!(t.w.metadata.member(t.w.tenant, &z).unwrap().status, MemberStatus::Removed);
     assert_eq!(t.grant_of(gil), None);
     // Their still-valid token is refused at once.
     let err = error_of(t.send(&z, Method::GET, &format!("/v1/projects/{}", t.w.project), None).await, 404).await;
     assert_eq!(code_of(&err), "not_found");
-    // Removing again is a retry: Zitadel says already inactive, which is fine.
+    // Removing again is a retry: already banned, which is fine.
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
     // Another tenant's member, or none, is 404.
     let foreign = TenantId::new();
@@ -11165,28 +9968,6 @@ async fn open_signup_platform_refused() {
     t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
     let err = error_of(t.send("padmin", Method::GET, "/v1/instance/settings", None).await, 403).await;
     assert_eq!(err["error"]["required"], "instance admin");
-}
-
-#[tokio::test]
-async fn revoke_invite_deletes_zitadel_user() {
-    let t = mw(Mode::SelfHosted).await;
-    let body = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ivy@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let member: uuid::Uuid = body["member"]["id"].as_str().unwrap().parse().unwrap();
-    let user = t.mock.user("ivy@x.com").unwrap();
-    let path = format!("/v1/invites/{invite}");
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&user.id).is_none(), "the never-activated user is deleted");
-    assert!(t.mock.calls().contains(&format!("DELETE /v2/users/{}", user.id)));
-    assert_eq!(t.w.metadata.member(t.w.tenant, &user.id).unwrap().status, MemberStatus::Removed);
-    assert_eq!(t.grant_of(member), None);
-    // I4: revoking again (the member is removed) retries the Zitadel delete; it is gone: fine.
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{}", uuid::Uuid::new_v4()), None).await, 404).await;
-    assert_eq!(message_of(&err), "invite not found");
 }
 
 // ---- T7 review fixes --------------------------------------------------------------------------
@@ -11451,16 +10232,16 @@ async fn grant_put_rechecks_existing_overrides() {
     assert_eq!(err["error"]["role"], "login");
 }
 
-// I2 (R29): a removed member comes back only as `invited`, with a fresh code (a password-reset
-// one: they have a password); the Zitadel user stays deactivated, and the event names the inviter.
+// I2 (R29): a removed member comes back only as `invited`, with a notice (they have an
+// account); the ban stays until they accept, and the event names the inviter.
 #[tokio::test]
-async fn removed_member_is_reinvited_with_a_code() {
+async fn removed_member_is_reinvited_with_a_notice() {
     let t = mw(Mode::SelfHosted).await;
-    let z = t.mock.add_user_in("org-1", "rae@x.com", "Secret-pass1", true);
+    let z = t.identity.with_user(&Pool::Members, "rae@x.com", "Secret-pass1");
     let rae = t.w.metadata.add_member(t.w.tenant, &z, MemberStatus::Active, false);
     t.w.metadata.set_member(t.w.tenant, &z, |m| m.email = Some("rae@x.com".into()));
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{rae}"), None).await.status(), 204);
-    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+    assert!(t.identity.user(&Pool::Members, &z).unwrap().banned);
     t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
     let padmin = t.w.metadata.member(t.w.tenant, "padmin").unwrap().id;
     let body = json!({ "email": "rae@x.com", "platform_role": "viewer", "pg_roles": [] });
@@ -11469,35 +10250,29 @@ async fn removed_member_is_reinvited_with_a_code() {
     let body = body_of(resp).await;
     assert_eq!((body["outcome"].as_str(), body["member"]["status"].as_str()), (Some("invited"), Some("invited")));
     assert_eq!(body["member"]["id"], rae.to_string(), "the same member row");
-    // I1: the invite never reactivates the user; accept-invite does, once the code is verified.
-    assert!(t.mock.user_by_id(&z).unwrap().inactive, "still deactivated until the code is accepted");
-    assert!(!t.mock.calls().iter().any(|c| c.contains("reactivate")), "{:?}", t.mock.calls());
-    // Zitadel makes no invite code for a user who has a password ("already initialized"): the
-    // code is a password-reset one, mailed with the accept-invite link marked `reset=1`.
-    assert!(t.mock.invite_code(&z).is_none());
-    assert!(t.mock.emails().contains(&(z.clone(), "reset".to_string())));
-    let template = t.mock.reset_template(&z).expect("a reset mail with a link");
-    assert!(
-        template.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t=")
-            && template.ends_with("&reset=1"),
-        "{template}"
-    );
+    // I1: the invite never lifts the ban; accept-invite does (m11).
+    assert!(t.identity.user(&Pool::Members, &z).unwrap().banned, "still banned until they accept");
+    // They have an account: a notice to sign in and accept, never a code.
+    assert!(t.identity.codes_sent().is_empty());
+    let notices = t.identity.notices_sent();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].link.starts_with("http://studio.test/accept-invite?t="), "{}", notices[0].link);
     let event = t.w.metadata.events.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
         (event.action.as_str(), event.actor_member_id, event.project_id),
         ("invite_created", Some(padmin), Some(t.w.project.as_uuid()))
     );
-    // Revoking it never deletes a user who once had a password: it is deactivated again.
+    // Revoking it never deletes an account with a password.
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
-    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+    assert!(t.identity.user(&Pool::Members, &z).unwrap().banned);
 }
 
 // M4: when the code can't be sent the invite is revoked at once, and the log says why.
 #[tokio::test]
 async fn failed_invite_delivery_is_revoked_with_its_reason() {
     let t = mw(Mode::SelfHosted).await;
-    t.mock.fail("/invite_code", 503, "Errors.Internal", 1);
+    t.identity.fail(CODES_ROUTE, 503, "internal", 1);
     let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "fail@x.com", "viewer", &[]))).await;
     assert_eq!(resp.status(), 503);
     let events = t.w.metadata.events.lock().unwrap().clone();
@@ -11505,25 +10280,23 @@ async fn failed_invite_delivery_is_revoked_with_its_reason() {
     assert_eq!(revoked.after.as_ref().unwrap()["reason"], "delivery_failed");
 }
 
-// I2 (R29): a user of the org who never set a password, or isn't Active, is invited by mail: an
-// invite code for one with no way to sign in, a password-reset code for one with a password
-// (Zitadel makes no invite code for them, Initial state included).
+// I2 (R29): an account nobody established (no password, or an unverified email) is invited by
+// mail with an invite code, which only its mailbox can read.
 #[tokio::test]
-async fn org_user_without_password_gets_an_invite_code() {
+async fn unestablished_account_gets_an_invite_code() {
     let t = mw(Mode::SelfHosted).await;
-    let nopw = t.mock.add_user_in("org-1", "nopw@x.com", "", false);
-    let initial = t.mock.add_user_in("org-1", "init@x.com", "Secret-pass1", true);
-    t.mock.set_initial(&initial);
-    for (email, z, reset) in [("nopw@x.com", &nopw, false), ("init@x.com", &initial, true)] {
+    let nopw = t.identity.with_invited_user(&Pool::Members, "nopw@x.com");
+    let pre = t.identity.with_unverified_user(&Pool::Members, "pre@x.com", "Secret-pass1");
+    for (email, z) in [("nopw@x.com", &nopw), ("pre@x.com", &pre)] {
         let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, email, "viewer", &[]))).await;
         assert_eq!(resp.status(), 201, "{email}");
         let body = body_of(resp).await;
         assert_eq!(body["outcome"], "invited", "{email}");
         assert_eq!(t.w.metadata.member(t.w.tenant, z).unwrap().status, MemberStatus::Invited);
-        assert_eq!(t.mock.invite_code(z).is_some(), !reset, "{email}");
-        assert_eq!(t.mock.reset_template(z).is_some(), reset, "{email}");
+        assert!(t.identity.codes_sent().iter().any(|c| &c.user_id == z), "{email}: an invite code is mailed");
     }
-    assert_eq!(t.mock.users_with_email("nopw@x.com"), 1, "no second user");
+    assert!(t.identity.notices_sent().is_empty());
+    assert!(!t.identity.calls().iter().any(|c| c == "POST /internal/v1/pools/members/users"), "no second user");
 }
 
 // I3: an existing member's invite writes all its grants or none.
@@ -11556,43 +10329,6 @@ async fn existing_member_invite_is_all_or_nothing() {
     assert!(t.w.metadata.grants.lock().unwrap().get(&(m, other.as_uuid())).is_some());
     assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["group2".to_string(), "plain".to_string()]);
     assert_eq!(t.actions().iter().filter(|a| *a == "grant_put").count(), 2);
-}
-
-// I4: the metadata revoke comes first; a Zitadel failure is retried by revoking again.
-#[tokio::test]
-async fn revoke_retries_the_zitadel_delete() {
-    let t = mw(Mode::SelfHosted).await;
-    let body = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "zed@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("zed@x.com").unwrap();
-    let path = format!("/v1/invites/{invite}");
-    t.mock.fail("DELETE /v2/users/", 503, "Errors.Internal", 1);
-    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
-    assert_eq!(code_of(&err), "unavailable");
-    assert_eq!(t.w.metadata.member(t.w.tenant, &user.id).unwrap().status, MemberStatus::Removed, "revoked first");
-    assert!(t.mock.user_by_id(&user.id).is_some());
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&user.id).is_none());
-    // An old invite of a member invited again (same row, a newer open invite) is closed: 409.
-    // Yan is invited, then removed as a member (the invite is revoked, the user deactivated but
-    // kept), then invited again: R29 brings the same row back with a new code.
-    let body = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "yan@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    let old = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let yan = body["member"]["id"].as_str().unwrap().to_string();
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{yan}"), None).await.status(), 204);
-    let again = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "yan@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    assert_eq!((again["outcome"].as_str(), again["member"]["id"].as_str()), (Some("invited"), Some(yan.as_str())));
-    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{old}"), None).await, 409).await;
-    assert_eq!(code_of(&err), "invite_closed");
 }
 
 // M6: a write that changes nothing enqueues no reconcile.
@@ -11793,14 +10529,14 @@ async fn resend_invite_sends_a_new_code() {
     )
     .await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("jay@x.com").unwrap();
-    let first = t.mock.invite_code(&user.id).unwrap();
+    let first = t.identity.codes_sent()[0].code.clone();
     let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await;
     assert_eq!(resp.status(), 200);
     let resent = body_of(resp).await;
     assert_eq!(resent["id"], invite.as_str());
-    assert_ne!(t.mock.invite_code(&user.id).unwrap(), first);
-    assert_eq!(t.mock.emails().len(), 2);
+    let sent = t.identity.codes_sent();
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[1].code, first);
     assert_eq!(t.actions(), vec!["invite_created", "invite_resent"]);
     // A revoked invite can't be resent.
     t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await;
@@ -11843,7 +10579,7 @@ async fn grant_with_reserved_role_name_is_refused() {
         .await;
         assert_eq!(code_of(&err), "invalid_request", "override {name:?}");
     }
-    assert!(t.mock.user("kai@x.com").is_none(), "a refused invite makes no Zitadel user");
+    assert!(t.identity.user_by_email(&Pool::Members, "kai@x.com").is_none(), "a refused invite makes no identity user");
     assert_eq!(t.grant_of(m).unwrap().pg_roles, vec!["app".to_string()]);
     // The data API's own roles stay grantable (R10).
     for name in ["anon", "authenticated"] {
@@ -11949,7 +10685,7 @@ async fn access_events_page_newest_first() {
 
 // ---- T12x: API additions for the Members UI ------------------------------------------------
 
-/// The invite link's `t` parameter: the token of the template Zitadel was given.
+/// The invite link's `t` parameter: the token of the template identity was given.
 fn token_of(template: &str) -> String {
     template.split("&t=").nth(1).expect("the template carries t=").to_string()
 }
@@ -12060,28 +10796,25 @@ async fn access_events_name_removed_members_and_projects() {
     assert_eq!(put["target_email"], "m@example.test");
 }
 
-// R32: the invite link carries a Chelabase token besides Zitadel's code; the Zitadel mail gets
-// it in the URL template and only its SHA-256 is stored.
+// R32: the invite mail's link carries a Chelabase token (and never the code); only the token's
+// SHA-256 is stored.
 #[tokio::test]
-async fn invite_url_template_carries_the_token() {
+async fn invite_mail_link_carries_the_token() {
     let t = mw(Mode::SelfHosted).await;
     let body = body_of(
         t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "tok@x.com", "viewer", &[]))).await,
     )
     .await;
-    let user = t.mock.user("tok@x.com").unwrap();
-    let template = t.mock.invite_template(&user.id).unwrap();
-    assert!(
-        template.starts_with("http://studio.test/accept-invite?user={{.UserID}}&code={{.Code}}&t="),
-        "{template}"
-    );
-    let token = token_of(&template);
+    let sub = sub_of(&t, "tok@x.com");
+    let link = t.identity.codes_sent()[0].link.clone().unwrap();
+    assert!(link.starts_with(&format!("http://studio.test/accept-invite?user={sub}&t=")), "{link}");
+    let token = token_of(&link);
     assert_eq!(token.len(), 43, "32 bytes, base64url without padding: {token}");
     assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "{token}");
     assert_eq!(stored_hash(&t, body["member"]["invite"]["id"].as_str().unwrap()), hash_of(&token));
-    // The Zitadel user's own tokens are never reused: another invite, another token.
+    // Another invite, another token.
     t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "tok2@x.com", "viewer", &[]))).await;
-    let other = token_of(&t.mock.invite_template(&t.mock.user("tok2@x.com").unwrap().id).unwrap());
+    let other = token_of(t.identity.codes_sent()[1].link.as_deref().unwrap());
     assert_ne!(other, token);
 }
 
@@ -12093,10 +10826,9 @@ async fn resend_rotates_the_token() {
     )
     .await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("rot@x.com").unwrap();
-    let first = token_of(&t.mock.invite_template(&user.id).unwrap());
+    let first = token_of(t.identity.codes_sent()[0].link.as_deref().unwrap());
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await.status(), 200);
-    let second = token_of(&t.mock.invite_template(&user.id).unwrap());
+    let second = token_of(t.identity.codes_sent()[1].link.as_deref().unwrap());
     assert_ne!(first, second);
     // Only the new link's token is stored.
     let stored = stored_hash(&t, &invite);
@@ -12113,8 +10845,8 @@ fn link_invite_body(w: &MemberWorld, email: &str) -> Value {
     body
 }
 
-// With `link`, Zitadel hands back the code instead of mailing it; the response carries the
-// whole `/accept-invite` link once, and nothing keeps it.
+// With `link`, the identity service hands back the code instead of mailing it; the response
+// carries the whole `/accept-invite` link once, and nothing keeps it.
 #[tokio::test]
 async fn link_invite_returns_the_url_once_and_sends_no_mail() {
     let t = mw(Mode::SelfHosted).await;
@@ -12123,17 +10855,16 @@ async fn link_invite_returns_the_url_once_and_sends_no_mail() {
     assert_eq!(resp.headers()["cache-control"], "no-store");
     let body = body_of(resp).await;
     assert_eq!(body["outcome"], "invited");
-    let user = t.mock.user("link@x.com").expect("a Zitadel user");
-    let code = t.mock.invite_code(&user.id).unwrap();
+    let sub = sub_of(&t, "link@x.com");
     let url = body["invite_url"].as_str().unwrap().to_string();
-    let prefix = format!("http://studio.test/accept-invite?user={}&code={code}&t=", user.id);
+    let prefix = format!("http://studio.test/accept-invite?user={sub}&code=");
     assert!(url.starts_with(&prefix), "{url}");
-    let token = url[prefix.len()..].to_string();
+    let code = url[prefix.len()..prefix.len() + 6].to_string();
+    let token = token_of(&url);
     assert_eq!(token.len(), 43, "{token}");
-    // No mail and no template: Zitadel sent nothing.
-    assert!(t.mock.emails().is_empty());
-    assert_eq!(t.mock.invite_template(&user.id), None);
-    // Only the token's hash is stored, and the Zitadel code is the one in the link.
+    // Nothing was mailed.
+    assert!(t.identity.codes_sent().is_empty() && t.identity.notices_sent().is_empty());
+    // Only the token's hash is stored.
     let invite = body["member"]["invite"]["id"].as_str().unwrap();
     assert_eq!(stored_hash(&t, invite), hash_of(&token));
     assert_eq!(t.actions(), vec!["invite_created"]);
@@ -12146,7 +10877,7 @@ async fn link_invite_returns_the_url_once_and_sends_no_mail() {
     )
     .await;
     assert!(by_mail.get("invite_url").is_none(), "{by_mail}");
-    assert_eq!(t.mock.emails().len(), 1);
+    assert_eq!(t.identity.codes_sent().len(), 1);
     // A person who needs no code (already a member) gets no link.
     let again = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "link@x.com"))).await;
     assert_eq!(again.status(), 200);
@@ -12165,7 +10896,7 @@ async fn link_invite_returns_the_url_once_and_sends_no_mail() {
     bad["delivery"] = json!("pigeon");
     let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(bad)).await, 422).await;
     assert_eq!(code_of(&err), "invalid_request");
-    assert!(t.mock.user("bad@x.com").is_none());
+    assert!(t.identity.user_by_email(&Pool::Members, "bad@x.com").is_none());
 }
 
 #[tokio::test]
@@ -12176,73 +10907,61 @@ async fn link_resend_rotates_code_and_token() {
     )
     .await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("relink@x.com").unwrap();
-    let (first_url, first_code) = (body["invite_url"].as_str().unwrap().to_string(), t.mock.invite_code(&user.id).unwrap());
+    let sub = sub_of(&t, "relink@x.com");
+    let first_url = body["invite_url"].as_str().unwrap().to_string();
     let path = format!("/v1/invites/{invite}/resend");
     let resp = t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["cache-control"], "no-store");
     let resent = body_of(resp).await;
-    let second_code = t.mock.invite_code(&user.id).unwrap();
     let second_url = resent["invite_url"].as_str().unwrap().to_string();
-    assert_ne!(first_code, second_code);
     assert_ne!(first_url, second_url);
-    let prefix = format!("http://studio.test/accept-invite?user={}&code={second_code}&t=", user.id);
+    let prefix = format!("http://studio.test/accept-invite?user={sub}&code=");
     assert!(second_url.starts_with(&prefix), "{second_url}");
+    assert_ne!(first_url[prefix.len()..prefix.len() + 6], second_url[prefix.len()..prefix.len() + 6], "a new code");
     // Only the new link's token is stored; no mail went out.
-    assert_eq!(stored_hash(&t, &invite), hash_of(&second_url[prefix.len()..]));
-    assert!(t.mock.emails().is_empty());
+    assert_eq!(stored_hash(&t, &invite), hash_of(&token_of(&second_url)));
+    assert!(t.identity.codes_sent().is_empty());
     assert_eq!(resent["id"], invite.as_str());
     assert_eq!(t.actions(), vec!["invite_created", "invite_resent"]);
     // Without a body the resend is by email, as before: a mail and no link.
     let resp = t.send(DEFAULT_SUB, Method::POST, &path, None).await;
     assert_eq!(resp.status(), 200);
     assert!(body_of(resp).await.get("invite_url").is_none());
-    assert_eq!(t.mock.emails().len(), 1);
+    assert_eq!(t.identity.codes_sent().len(), 1);
     // An unknown delivery is refused.
     let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "pigeon" }))).await, 422).await;
     assert_eq!(code_of(&err), "invalid_request");
     // M3: a `null` body is the default too: by email.
-    let mails = t.mock.emails().len();
     let resp = t.send(DEFAULT_SUB, Method::POST, &path, Some(Value::Null)).await;
     assert_eq!(resp.status(), 200);
     assert!(body_of(resp).await.get("invite_url").is_none());
-    assert_eq!(t.mock.emails().len(), mails + 1);
+    assert_eq!(t.identity.codes_sent().len(), 2);
 }
 
-// I1: a link carries only a code, so it is for a Zitadel user the invite makes or one that has
-// never had a password; anyone else is 409 "send by email", before anything changes.
+// I1: a link carries a code that sets the password, so it is for a user the invite makes or one
+// with no password and an unverified email; anyone else is 409 "send by email", before anything
+// changes (`invite_return_refused_for_existing_account` has each kind of account).
 #[tokio::test]
 async fn link_invite_is_for_users_without_a_password() {
     let t = mw(Mode::SelfHosted).await;
-    // A removed member whose Zitadel user has a password: a link is refused, email works.
-    let zid = t.mock.add_user_in("org-1", "back@x.com", "Correct-horse-9", true);
+    t.identity.set_email_configured(false);
+    // A removed member with a password: a link is refused, before anything changes.
+    let zid = t.identity.with_user(&Pool::Members, "back@x.com", "Correct-horse-9");
     t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Removed, false);
-    t.mock.set_inactive(&zid, true);
     let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "back@x.com"))).await, 409).await;
     assert_eq!(code_of(&err), "link_not_allowed");
-    // Whether email delivery works now, so Studio can offer it (no provider in this mock).
+    // Whether email delivery works now, so Studio can offer it.
     assert_eq!(err["error"]["email_available"], json!(false), "{err}");
-    let writes = |t: &Mw| {
-        t.mock.calls().iter().filter(|c| c.contains("invite_code") || c.contains("reactivate") || c.contains("users/new")).count()
-    };
-    assert_eq!(writes(&t), 0, "nothing was changed in Zitadel");
+    assert!(!t.identity.calls().iter().any(|c| c.contains("/codes") || c == "POST /internal/v1/pools/members/users"));
     assert_eq!(t.w.metadata.member(t.w.tenant, &zid).unwrap().status, MemberStatus::Removed);
     assert!(t.actions().is_empty());
+    t.identity.set_email_configured(true);
     let by_mail = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "viewer", &[]))).await;
     assert_eq!(by_mail.status(), 201);
     assert!(body_of(by_mail).await.get("invite_url").is_none());
-    // Any other way to sign in counts as much as a password: a passkey, an OTP, an IdP link.
-    for (i, method) in ["PASSKEY", "TOTP", "U2F", "OTP_EMAIL", "IDP"].into_iter().enumerate() {
-        let email = format!("factor{i}@x.com");
-        let zid = t.mock.add_user_in("org-1", &email, "", false);
-        t.mock.add_auth_method(&zid, &format!("AUTHENTICATION_METHOD_TYPE_{method}"));
-        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, &email))).await, 409).await;
-        assert_eq!(code_of(&err), "link_not_allowed", "{method}");
-        assert!(t.w.metadata.member(t.w.tenant, &zid).is_none(), "{method}: nothing was made");
-    }
-    // An org user who never set a password: a link is fine.
-    let fresh = t.mock.add_user_in("org-1", "fresh@x.com", "", false);
+    // An account that never set a password: a link is fine.
+    let fresh = t.identity.with_invited_user(&Pool::Members, "fresh@x.com");
     let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "fresh@x.com"))).await;
     assert_eq!(resp.status(), 201);
     assert!(body_of(resp).await["invite_url"].as_str().unwrap().contains(&format!("user={fresh}&code=")));
@@ -12252,33 +10971,27 @@ async fn link_invite_is_for_users_without_a_password() {
 #[tokio::test]
 async fn link_resend_refused_after_the_invitee_has_a_password() {
     let t = mw(Mode::SelfHosted).await;
+    t.identity.set_email_configured(false);
     let body = body_of(
         t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(link_invite_body(&t.w, "late@x.com"))).await,
     )
     .await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("late@x.com").unwrap();
+    let sub = sub_of(&t, "late@x.com");
     let path = format!("/v1/invites/{invite}/resend");
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await.status(), 200);
-    let code = t.mock.invite_code(&user.id);
-    // A password, or any other factor, since the invite was made.
-    for after in ["password", "AUTHENTICATION_METHOD_TYPE_TOTP", "AUTHENTICATION_METHOD_TYPE_PASSKEY"] {
-        if after == "password" {
-            t.mock.set_password(&user.id, "Correct-horse-9");
-        } else {
-            t.mock.set_password(&user.id, "");
-            t.mock.add_auth_method(&user.id, after);
-        }
-        let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
-        assert_eq!(code_of(&err), "link_not_allowed", "{after}");
-        assert_eq!(err["error"]["email_available"], json!(false), "{after}");
-        assert_eq!(t.mock.invite_code(&user.id), code, "{after}: no new code was made");
-    }
+    // A password since the invite was made.
+    t.identity.client().set_password(&Pool::Members, &sub, "Correct-horse-9").await.unwrap();
+    let codes = t.identity.calls().iter().filter(|c| c.contains("/codes")).count();
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert_eq!(err["error"]["email_available"], json!(false));
+    assert_eq!(t.identity.calls().iter().filter(|c| c.contains("/codes")).count(), codes, "no new code was made");
+    // By email: an invite code still, as the email isn't verified (pre-registered).
+    t.identity.set_email_configured(true);
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
-    // By email: a password-reset code (Zitadel makes no invite code for them now).
-    assert!(t.mock.reset_template(&user.id).is_some_and(|t| t.ends_with("&reset=1")));
-    // With an active email provider, the refusal says so.
-    t.mock.set_email_providers(&[("p1", true)]);
+    assert_eq!(t.identity.codes_sent().len(), 1);
+    // With email configured, the refusal says so.
     let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
     assert_eq!((code_of(&err), &err["error"]["email_available"]), ("link_not_allowed", &json!(true)), "{err}");
 }
@@ -12287,19 +11000,12 @@ async fn link_resend_refused_after_the_invitee_has_a_password() {
 #[tokio::test]
 async fn invite_conflicts_have_their_own_codes() {
     let t = mw(Mode::SelfHosted).await;
-    // Two users of the organisation share the email.
-    t.mock.allow_duplicate_emails();
-    t.mock.add_user_in("org-1", "twin@x.com", "", false);
-    t.mock.add_user_in("org-1", "twin@x.com", "", false);
-    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "twin@x.com", "viewer", &[]))).await, 409).await;
-    assert_eq!(code_of(&err), "email_ambiguous", "{err}");
-    // A user of another organisation already has it: Zitadel refuses to make a second one.
-    let t = mw(Mode::SelfHosted).await;
-    t.mock.add_org("org-2");
-    t.mock.add_user_in("org-2", "elsewhere@x.com", "Correct-horse-9", true);
-    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "elsewhere@x.com", "viewer", &[]))).await, 409).await;
-    assert_eq!(code_of(&err), "email_in_use_elsewhere", "{err}");
-    // A revoked invite can't be resent (revoking a replaced one: `revoke_retries_the_zitadel_delete`).
+    // A sign-up waiting for approval.
+    let pending = t.identity.with_unverified_user(&Pool::Members, "wait@x.com", "Secret-pass1");
+    t.w.metadata.add_member(t.w.tenant, &pending, MemberStatus::Pending, false);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "wait@x.com", "viewer", &[]))).await, 409).await;
+    assert_eq!(code_of(&err), "signup_pending", "{err}");
+    // A revoked invite can't be resent.
     let body = body_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "gone@x.com", "viewer", &[]))).await).await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
@@ -12314,30 +11020,19 @@ async fn delivery_reports_smtp_state() {
         let t = &t;
         async move { body_of(t.send(sub, Method::GET, "/v1/invites/delivery", None).await).await }
     };
-    // No provider at all, then only an inactive one.
-    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "no_email_provider" }));
-    t.mock.set_email_providers(&[("p1", false)]);
-    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "no_email_provider" }));
-    // An active one; any active member may ask (the answer decides the invite dialog).
-    t.mock.set_email_providers(&[("p1", false), ("p2", true)]);
+    // Any active member may ask (the answer decides the invite dialog).
     t.w.metadata.add_granted(t.w.tenant, "viewer", t.w.project, PlatformRole::Viewer, &[]);
     assert_eq!(ask("viewer").await, json!({ "email_available": true, "reason": null }));
-    // A Zitadel failure is a plain "no", with the reason.
-    t.mock.set_down(true);
-    assert_eq!(ask(DEFAULT_SUB).await, json!({ "email_available": false, "reason": "zitadel_unavailable" }));
-    t.mock.set_down(false);
-    // The server asked Zitadel's admin API, once per question.
-    assert!(t.mock.calls().contains(&"POST /admin/v1/email/_search".to_string()));
+    assert!(t.identity.calls().contains(&"GET /internal/v1/email/status".to_string()));
     // Platform mode makes no members: a stranger is refused like on any tenant route.
     let platform = mw(Mode::Platform).await;
     let err = error_of(platform.send("stranger", Method::GET, "/v1/invites/delivery", None).await, 403).await;
     assert_eq!(code_of(&err), "not_available_in_platform_mode");
-    // Without a Zitadel client the answer is "no", not an error.
-    let w = member_world(Mode::SelfHosted).await;
-    let resp = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/invites/delivery", None).await;
+    // Without an identity client the answer is "no", not an error.
+    let none = mw_without_identity().await;
     assert_eq!(
-        body_of(resp).await,
-        json!({ "email_available": false, "reason": "zitadel_not_configured" })
+        body_of(none.send(DEFAULT_SUB, Method::GET, "/v1/invites/delivery", None).await).await,
+        json!({ "email_available": false, "reason": "identity_unavailable" })
     );
 }
 
@@ -14840,13 +13535,13 @@ async fn role_create_update_delete_write_events_with_the_branch() {
 //
 // Through the fakes: the routes' powers row by row (Part 7), the password shown once, names
 // (D3), every revocation path clearing the proxy cache (P4) and reconciling (P16 b),
-// suspension with Zitadel's lock (D5, S7), and what personal logins are hidden from (MH-11,
+// suspension with identity's ban (D5, S7), and what personal logins are hidden from (MH-11,
 // MH-12, MH-21). The fake's personal-login records (`FakeLogin`) stand for T3's metadata.
 
 use chelabase_metadata::personal_logins::{LoginEndpoint, LoginStatus, RevokeReason};
 
 /// The T8 world: `mw`'s (project Billing, database web1 with main `ep-0123456789ab` and `dev`),
-/// each member behind a Zitadel mock user (their sub) so suspension can lock them: `alice` and
+/// each member behind a fake identity user (their sub) so suspension can lock them: `alice` and
 /// `bob` Developers with `app`, `vera` a Viewer, `pam` an Admin of Billing, and `oscar` an
 /// Admin of project Elsewhere only. Each is (member id, sub).
 struct Pl {
@@ -14863,7 +13558,7 @@ async fn pl_world() -> Pl {
     let t = mw(Mode::SelfHosted).await;
     let elsewhere = t.w.metadata.create_project(t.w.tenant, "Elsewhere").await.unwrap().id;
     let person = |name: &str, project: ProjectId, role: PlatformRole| {
-        let sub = t.mock.add_user_in("org-1", &format!("{name}@x.com"), "Secret-pass1", true);
+        let sub = t.identity.with_user(&Pool::Members, &format!("{name}@x.com"), "Secret-pass1");
         (t.w.metadata.add_granted(t.w.tenant, &sub, project, role, &["app"]), sub)
     };
     let alice = person("alice", t.w.project, PlatformRole::Developer);
@@ -14923,9 +13618,9 @@ impl Pl {
     fn status_of(&self, member: uuid::Uuid) -> MemberStatus {
         self.t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == member).unwrap().status
     }
-    /// One more member of the tenant behind a Zitadel mock user, granted `role` on `project`.
+    /// One more member of the tenant behind a fake identity user, granted `role` on `project`.
     fn add_person(&self, name: &str, project: ProjectId, role: PlatformRole) -> (uuid::Uuid, String) {
-        let sub = self.t.mock.add_user_in("org-1", &format!("{name}@x.com"), "Secret-pass1", true);
+        let sub = self.t.identity.with_user(&Pool::Members, &format!("{name}@x.com"), "Secret-pass1");
         (self.t.w.metadata.add_granted(self.t.w.tenant, &sub, project, role, &["app"]), sub)
     }
     /// A live login of `who` on web1 named `name`, with its rows on main and `dev`.
@@ -14956,11 +13651,6 @@ impl Pl {
     /// `POST /v1/members/{member}/{action}`: `suspend`, `reinstate` or `revoke-postgres-access`.
     async fn member_action(&self, sub: &str, member: uuid::Uuid, action: &str) -> reqwest::Response {
         self.send(sub, Method::POST, &format!("/v1/members/{member}/{action}"), None).await
-    }
-    /// How many times Zitadel was asked `POST /v2/users/{user}/{verb}`.
-    fn zitadel_calls(&self, user: &str, verb: &str) -> usize {
-        let want = format!("POST /v2/users/{user}/{verb}");
-        self.t.mock.calls().iter().filter(|c| **c == want).count()
     }
 }
 
@@ -15430,7 +14120,7 @@ async fn every_access_write_clears_the_proxy_cache_for_the_members_logins() {
     assert!(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status().is_success());
     told("m_odel".into(), "override delete").await;
 
-    let sub = p.t.mock.add_user_in("org-1", "m_admin@x.com", "Secret-pass1", true);
+    let sub = p.t.identity.with_user(&Pool::Members, "m_admin@x.com", "Secret-pass1");
     let m = (p.t.w.metadata.add_member(p.t.w.tenant, &sub, MemberStatus::Active, true), sub);
     p.seed(&m, "m_admin");
     let resp = p.send(DEFAULT_SUB, Method::PATCH, &format!("/v1/members/{}", m.0), Some(json!({ "tenant_admin": false }))).await;
@@ -15490,69 +14180,6 @@ async fn suspending_yourself_or_the_last_tenant_admin_is_refused() {
             assert_eq!(code_of(&err), "not_found", "{action}");
         }
     }
-}
-
-// D5, P14, S7: suspend ends the member's Zitadel sessions and locks the user; the suspended
-// member is refused everywhere but `/v1/me` (which says so); suspending again redoes the lock.
-// Reinstate unlocks; reinstating an active member redoes only the unlock.
-#[tokio::test]
-async fn suspend_locks_the_zitadel_user_and_reinstate_unlocks_it() {
-    let p = pl_world().await;
-    let z = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    z.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
-    z.create_session(&p.alice.1, "Secret-pass1").await.unwrap();
-    assert_eq!(p.t.mock.session_count(), 2);
-
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(body_of(resp).await["status"], "suspended");
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the Zitadel user is locked");
-    assert_eq!(p.t.mock.session_count(), 1, "only bob's sessions ended");
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
-
-    let project = format!("/v1/projects/{}", p.t.w.project);
-    let logins = p.member_logins_path(p.bob.0);
-    for path in ["/v1/projects", project.as_str(), "/v1/members", logins.as_str()] {
-        let err = error_of(p.send(&p.bob.1, Method::GET, path, None).await, 403).await;
-        assert_eq!(code_of(&err), "member_suspended", "{path}");
-    }
-    let err = error_of(p.put_login(&p.bob.1, "bob_login").await, 403).await;
-    assert_eq!(code_of(&err), "member_suspended");
-    let me = body_of(p.send(&p.bob.1, Method::GET, "/v1/me", None).await).await;
-    assert_eq!(me["member"]["status"], "suspended", "{me}");
-
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200, "S7: a retry");
-    assert_eq!(p.zitadel_calls(&p.bob.1, "lock"), 2, "the retry locks again");
-
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(body_of(resp).await["status"], "active");
-    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the Zitadel user is unlocked");
-    assert_eq!(p.send(&p.bob.1, Method::GET, "/v1/projects", None).await.status(), 200);
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await.status(), 200, "S7: a retry");
-    assert_eq!(p.zitadel_calls(&p.bob.1, "unlock"), 2, "the retry unlocks again");
-}
-
-// S7: a lock Zitadel refuses is 503 with the Chelabase side done; the retry completes it. The
-// same for reinstate's unlock.
-#[tokio::test]
-async fn a_failed_lock_is_completed_by_the_retry() {
-    let p = pl_world().await;
-    p.t.mock.fail("/lock", 500, "Errors.Internal", 1);
-    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await, 503).await;
-    assert_eq!(code_of(&err), "unavailable");
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended, "the Chelabase side is done");
-    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200);
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the retry locked the user");
-
-    p.t.mock.fail("/unlock", 500, "Errors.Internal", 1);
-    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await, 503).await;
-    assert_eq!(code_of(&err), "unavailable");
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Active, "the Chelabase side is done");
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await.status(), 200);
-    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the retry unlocked the user");
 }
 
 // MH-11: every generic role route treats a personal login as absent: not listed; reset,
@@ -16314,7 +14941,7 @@ mod t23_teams {
             assert_eq!(code_of(&err), "invalid_request", "{teams}: {err}");
             assert_eq!(message_of(&err), "teams can be attached only by a tenant admin's invite", "{teams}: {err}");
         }
-        assert!(t.mock.user("eve@x.com").is_none(), "no Zitadel user was made");
+        assert!(t.identity.user_by_email(&Pool::Members, "eve@x.com").is_none(), "no identity user was made");
         assert!(t.actions().is_empty(), "nothing written: {:?}", t.actions());
         assert!(members_of(&t, team).is_empty());
         let body = json!({ "email": "eve@x.com", "platform_role": "viewer", "pg_roles": [] });
@@ -16329,10 +14956,10 @@ mod t23_teams {
         let t = mw(Mode::SelfHosted).await;
         let team = t.w.metadata.seed_team(t.w.tenant, "Billing team");
         t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Developer, &[]);
-        let z = t.mock.add_user_in("org-1", "dana@x.com", "Secret-pass1", true);
+        let z = t.identity.with_user(&Pool::Members, "dana@x.com", "Secret-pass1");
         let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Active, false);
         t.w.metadata.set_member(t.w.tenant, "bob", |m| m.email = Some("bob@x.com".into()));
-        for (email, outcome, status) in [("new@x.com", "invited", 201), ("dana@x.com", "added", 201), ("bob@x.com", "existing_member", 200)] {
+        for (email, outcome, status) in [("new@x.com", "invited", 201), ("dana@x.com", "invited", 201), ("bob@x.com", "existing_member", 200)] {
             t.clear_enqueued();
             let added = count(&t, "team_member_added");
             let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams(email, json!([team])))).await;
@@ -16499,7 +15126,7 @@ mod t23_teams {
             assert_eq!(code_of(&err), "invalid_request", "{path}: {err}");
         }
         assert!(t.actions().is_empty(), "{:?}", t.actions());
-        assert!(t.mock.user("new@x.com").is_none(), "refused before Zitadel");
+        assert!(t.identity.user_by_email(&Pool::Members, "new@x.com").is_none(), "refused before the identity service");
         // 50 is the limit after deduplication: one id 51 times is one team.
         let same: Vec<uuid::Uuid> = vec![team; 51];
         let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams("new@x.com", json!(same)))).await;
@@ -16674,7 +15301,7 @@ mod t23_teams {
     #[tokio::test]
     async fn remove_member_reconciles_team_projects() {
         let t = mw(Mode::SelfHosted).await;
-        let zid = t.mock.add_user_in("org-1", "r@x.com", "Secret-pass1", true);
+        let zid = t.identity.with_user(&Pool::Members, "r@x.com", "Secret-pass1");
         let r = t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Active, false);
         let team = api_team(&t.w.app, "Team", t.w.project, "developer", &[], &[r]).await;
         t.clear_enqueued();
@@ -16860,476 +15487,14 @@ mod t23_teams {
     }
 }
 
-// --- Zitadel refusals are read by their captured id, never by status or text (#76) -------------
+// --- Epic review (#77) -------------------------------------------------------------------------
 
-/// A removal, a decline and an invite revoke whose deactivate gets a 404 or 400 that isn't the
-/// endpoint's captured answer (an id nobody captured) are 503 with the Zitadel user still active; the retry
-/// completes them.
-#[tokio::test]
-async fn a_deactivate_that_isnt_zitadels_answer_is_503_and_retriable() {
-    let t = mw(Mode::SelfHosted).await;
-    // Removal.
-    let z = t.mock.add_user_in("org-1", "ivy@x.com", "Secret-pass1", true);
-    let ivy = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
-    let path = format!("/v1/members/{ivy}");
-    for status in [404, 400] {
-        t.mock.fail("/deactivate", status, "Errors.Odd", 1);
-        let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
-        assert_eq!(code_of(&err), "unavailable", "remove {status}");
-        assert!(!t.mock.user_by_id(&z).unwrap().inactive, "remove {status}: still active");
-    }
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&z).unwrap().inactive);
-    // Decline.
-    let zp = t.mock.add_user_in("org-1", "pat2@x.com", "", false);
-    let pat = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
-    let path = format!("/v1/members/{pat}/decline");
-    t.mock.fail("/deactivate", 404, "Errors.Odd", 1);
-    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
-    assert_eq!(code_of(&err), "unavailable", "decline");
-    assert!(!t.mock.user_by_id(&zp).unwrap().inactive, "decline: still active");
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&zp).unwrap().inactive);
-    // Revoking the open invite of a user who once had a password.
-    let zr = t.mock.add_user_in("org-1", "rob@x.com", "Secret-pass1", true);
-    let rob = t.w.metadata.add_member(t.w.tenant, &zr, MemberStatus::Active, false);
-    t.w.metadata.set_member(t.w.tenant, &zr, |m| m.email = Some("rob@x.com".into()));
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{rob}"), None).await.status(), 204);
-    let body = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "rob@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    t.mock.set_inactive(&zr, false);
-    t.mock.fail("/deactivate", 404, "Errors.Odd", 1);
-    let revoke = format!("/v1/invites/{invite}");
-    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &revoke, None).await, 503).await;
-    assert_eq!(code_of(&err), "unavailable", "revoke");
-    assert!(!t.mock.user_by_id(&zr).unwrap().inactive, "revoke: still active");
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &revoke, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&zr).unwrap().inactive);
-}
-
-/// Suspending a member whose Zitadel user is inactive reactivates it, locks it, then ends its
-/// sessions: the user ends active and locked (an inactive user could be reactivated by a reset
-/// code's accept-invite, a locked one can't), and reinstating gives back a working sign-in.
-#[tokio::test]
-async fn suspending_a_member_whose_zitadel_user_is_inactive_locks_it() {
-    let p = pl_world().await;
-    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
-    p.t.mock.set_inactive(&p.bob.1, true);
-    assert_eq!(p.t.mock.session_count(), 1);
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
-    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
-    assert_eq!(p.t.mock.session_count(), 0, "its sessions ended");
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(user.locked && !user.inactive, "active and locked: {user:?}");
-    assert!(client.create_session(&p.bob.1, "Secret-pass1").await.is_err(), "no sign-in");
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200, "a retry");
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
-    // Reinstating unlocks it: a working sign-in.
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
-    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(!user.locked && !user.inactive, "active and unlocked: {user:?}");
-    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
-    // A refusal that isn't Zitadel's still fails the suspend.
-    let carl = p.add_person("carl", p.t.w.project, PlatformRole::Viewer);
-    p.t.mock.fail("/lock", 400, "Errors.Odd", 1);
-    assert_eq!(p.member_action(DEFAULT_SUB, carl.0, "suspend").await.status(), 503);
-    assert!(!p.t.mock.user_by_id(&carl.1).unwrap().locked);
-}
-
-/// A lock that fails after the reactivate answers 503, still ends the sessions, and leaves a
-/// state the retry completes from (the same steps again).
-#[tokio::test]
-async fn a_lock_failing_after_the_reactivate_is_503_and_the_retry_locks() {
-    let p = pl_world().await;
-    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
-    p.t.mock.set_inactive(&p.bob.1, true);
-    // The first lock gets Zitadel's own answer for an inactive user; the one after the
-    // reactivate fails.
-    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
-    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
-    let err = error_of(resp, 503).await;
-    assert_eq!(code_of(&err), "unavailable", "{err}");
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
-    assert_eq!(p.t.mock.session_count(), 0, "the sessions end even when the lock fails");
-    assert_eq!(p.zitadel_calls(&p.bob.1, "reactivate"), 1);
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(user.locked || user.inactive, "the failed suspend left the user open: {user:?}");
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
-    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(user.locked && !user.inactive, "active and locked: {user:?}");
-}
-
-/// Re-audit S1: a lock that fails after the reactivate must not leave the suspended member with a
-/// working sign-in, with or without the deactivate that restores the old state succeeding.
-#[tokio::test]
-async fn audit_failed_lock_after_reactivate_leaves_a_working_sign_in() {
-    let p = pl_world().await;
-    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    p.t.mock.set_inactive(&p.bob.1, true);
-    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
-    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
-    assert_eq!(resp.status(), 503);
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    let after = client.create_session(&p.bob.1, "Secret-pass1").await;
-    assert!(
-        user.inactive || user.locked,
-        "the failed suspend left the user more open than before: {user:?}, session {:?}",
-        after.is_ok()
-    );
-    // When the deactivate fails too, the answer is the lock's 503 all the same.
-    let carl = p.add_person("carl", p.t.w.project, PlatformRole::Viewer);
-    p.t.mock.set_inactive(&carl.1, true);
-    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
-    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
-    p.t.mock.fail("/deactivate", 503, "Errors.Internal", 1);
-    let err = error_of(p.member_action(DEFAULT_SUB, carl.0, "suspend").await, 503).await;
-    assert_eq!(code_of(&err), "unavailable", "{err}");
-    assert_eq!(p.member_action(DEFAULT_SUB, carl.0, "suspend").await.status(), 200, "a retry");
-    assert!(p.t.mock.user_by_id(&carl.1).unwrap().locked);
-}
-
-/// A member whose Zitadel user is in the Initial state (it can't be deactivated, only deleted)
-/// is removed or declined all the same: the user is locked, so it can't finish sign-up, and the
-/// removal is done (204), not a 409 on every retry.
-#[tokio::test]
-async fn removing_or_declining_a_member_whose_zitadel_user_is_initial_locks_it() {
-    let t = mw(Mode::SelfHosted).await;
-    let z = t.mock.add_user_in("org-1", "ini@x.com", "", false);
-    t.mock.set_initial(&z);
-    let ini = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
-    let path = format!("/v1/members/{ini}");
-    let resp = t.send(DEFAULT_SUB, Method::DELETE, &path, None).await;
-    assert_eq!(resp.status(), 204, "{}", body_of(resp).await);
-    assert!(t.mock.user_by_id(&z).unwrap().locked, "remove: locked");
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204, "a retry");
-    // Decline.
-    let zp = t.mock.add_user_in("org-1", "inip@x.com", "", false);
-    t.mock.set_initial(&zp);
-    let pat = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
-    let path = format!("/v1/members/{pat}/decline");
-    let resp = t.send(DEFAULT_SUB, Method::POST, &path, None).await;
-    assert_eq!(resp.status(), 204, "{}", body_of(resp).await);
-    assert!(t.mock.user_by_id(&zp).unwrap().locked, "decline: locked");
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204, "a retry");
-}
-
-const PROXY_404: &str = "<html><head><title>404 Not Found</title></head><body>nginx</body></html>";
-const PROXY_400: &str = "<html><head><title>400 Bad Request</title></head><body>nginx</body></html>";
-
-/// A proxy's HTML 404 or 400 on the Zitadel step of a removal or a suspension is 503, with the
-/// Zitadel user untouched; the retry completes it.
-#[tokio::test]
-async fn a_proxys_html_answer_on_remove_or_suspend_is_503() {
-    let p = pl_world().await;
-    let path = format!("/v1/members/{}", p.vera.0);
-    for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
-        p.t.mock.answer_raw("/deactivate", status, body, 1);
-        let err = error_of(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
-        assert_eq!(code_of(&err), "unavailable", "remove {status}");
-        assert!(!p.t.mock.user_by_id(&p.vera.1).unwrap().inactive, "remove {status}: still active");
-    }
-    assert_eq!(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(p.t.mock.user_by_id(&p.vera.1).unwrap().inactive);
-    for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
-        p.t.mock.answer_raw("/lock", status, body, 1);
-        let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await, 503).await;
-        assert_eq!(code_of(&err), "unavailable", "suspend {status}");
-        assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "suspend {status}: not locked");
-    }
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200);
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
-}
-
-/// The same for the app-user delete and deactivate routes.
-#[tokio::test]
-async fn a_proxys_html_answer_on_app_user_delete_or_deactivate_is_503() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    for (what, method, path, verb) in [
-        ("deactivate", Method::POST, format!("/users/{id}/deactivate"), "/deactivate"),
-        ("delete", Method::DELETE, format!("/users/{id}"), "DELETE /v2/users/"),
-    ] {
-        for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
-            au.mock().answer_raw(verb, status, body, 1);
-            let (got, answer) = au.call(method.clone(), &path, None).await;
-            assert_eq!((got, code_of(&answer)), (503, "unavailable"), "{what} {status}: {answer}");
-        }
-    }
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert!(!user.inactive, "the user is untouched");
-}
-
-/// An invite code asked for a user Zitadel doesn't have is a 400 (`COMMAND-Wgvn4`); the resend
-/// answers 404, and a 404 with another id on the auth-methods read answers 503.
-#[tokio::test]
-async fn invite_callers_read_the_captured_missing_user_and_auth_methods_answers() {
-    let t = mw(Mode::SelfHosted).await;
-    let body = body_of(
-        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "gone@x.com", "viewer", &[]))).await,
-    )
-    .await;
-    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
-    let user = t.mock.user("gone@x.com").unwrap();
-    let resend = format!("/v1/invites/{invite}/resend");
-    t.mock.fail("authentication_methods", 404, "Errors.Odd", 1);
-    let err = error_of(
-        t.send(DEFAULT_SUB, Method::POST, &resend, Some(json!({ "delivery": "link" }))).await,
-        503,
-    )
-    .await;
-    assert_eq!(code_of(&err), "unavailable");
-    t.mock.remove_user(&user.id);
-    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &resend, None).await, 404).await;
-    assert_eq!(code_of(&err), "not_found");
-}
-
-/// Zitadel's bcrypt limit is 72 bytes: a longer app-user password is 422 before Zitadel is asked.
-#[tokio::test]
-async fn app_user_passwords_over_72_bytes_are_422_before_zitadel() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    let long = "Aa1!".repeat(19);
-    assert_eq!(long.len(), 76);
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": long}))).await;
-    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
-    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
-    let id = au.add_user(AU_ORG, "a@x.test");
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": long}))).await;
-    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
-    assert!(!au.mock().calls().iter().any(|c| c.ends_with("/password")), "{:?}", au.mock().calls());
-    let exact = "Aa1!".repeat(18);
-    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": exact}))).await;
-    assert_eq!(status, 200, "{body}");
-}
-
-/// Zitadel's create-path password-policy refusals (one `COMMA-` id per check, as
-/// `tests/zitadel_live.rs` captured them) are 422 `weak_password`, not 503.
-#[tokio::test]
-async fn app_user_create_maps_every_password_policy_refusal_to_weak_password() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    au.seal_sync_role();
-    for id in ["COMMA-HuJf6", "COMMA-VoaRj", "COMMA-co3Xw", "COMMA-ZBv4H", "COMMA-ZDLwA"] {
-        let body = json!({
-            "code": 3,
-            "message": format!("Errors.User.PasswordComplexityPolicy ({id})"),
-            "details": [{"@type": "type.googleapis.com/zitadel.v1.ErrorDetail", "id": id, "message": "policy"}],
-        });
-        au.mock().answer_raw("POST /v2/users/new", 400, &body.to_string(), 1);
-        let (status, answer) = au.call(Method::POST, "/users", Some(json!({"email": "w@x.test", "password": AU_PASSWORD}))).await;
-        assert_eq!((status, code_of(&answer)), (422, "weak_password"), "{id}: {answer}");
-    }
-}
-
-/// Reactivating an app user in the Initial state (it never finished sign-up, so it was never
-/// deactivated) is a 409, not a 200 that shows it `inactive`.
-#[tokio::test]
-async fn reactivating_an_initial_app_user_is_409() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "i@x.test");
-    au.mock().set_initial(&id.to_string());
-    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
-    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
-}
-
-/// The app-user routes' answers for the refusals the real Zitadel gives, through the routes
-/// (create, update, state changes, delete). Runs in the workbench runner, which has `demo.env`:
-///
-/// ```text
-/// just workbench test -p orchestrator --test api -- --run-ignored only live_app_user_routes
-/// ```
-#[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
-#[allow(clippy::disallowed_methods)]
-async fn live_app_user_routes_answer_zitadels_refusals() {
-    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset (source demo.env)"));
-    let issuer = var("CHELABASE_ZITADEL_ISSUER");
-    let host = issuer.split_once("://").map(|(_, h)| h.trim_end_matches('/').to_string()).unwrap();
-    let base = std::env::var("CHELABASE_ZITADEL_INTERNAL_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "http://zitadel:8080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let pat_file = std::path::PathBuf::from(var("CHELABASE_ZITADEL_ADMIN_PAT_FILE"));
-    let pat_file = if pat_file.is_relative() { std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(pat_file) } else { pat_file };
-    let pat = std::fs::read_to_string(pat_file).unwrap().trim().to_string();
-    let z = Zitadel::new(&base, &pat).with_host(Some(&host));
-    let tag = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let org = format!("live-routes-{tag}");
-    z.ensure_org(&org, &org).await.unwrap();
-    let au = au_env_on(None, Some(Zitadel::new(&base, &pat).with_host(Some(&host)))).await;
-    au.set_auth_in(AppUsersStatus::Enabled, &org);
-    au.seal_sync_role();
-    let strong = "Str0ng!pass-live";
-    let email = format!("a-{tag}@example.com");
-    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": email, "password": strong}))).await;
-    assert_eq!(status, 201, "create: {body}");
-    let id = body["id"].as_str().unwrap().to_string();
-    let user = format!("/users/{id}");
-    let expect = |what: &str, got: (u16, Value), status: u16, code: &str| {
-        assert_eq!((got.0, code_of(&got.1)), (status, code), "{what}: {}", got.1);
-    };
-    // Every password-policy check, on create and on a password change.
-    for weak in ["Sh0rt!", "abcdefgh1!", "ABCDEFGH1!", "Abcdefgh!!", "Abcdefgh12"] {
-        let new = json!({"email": format!("w-{tag}-{}@example.com", weak.len()), "password": weak});
-        expect(&format!("create, {weak}"), au.call(Method::POST, "/users", Some(new)).await, 422, "weak_password");
-        expect(&format!("update, {weak}"), au.call(Method::PATCH, &user, Some(json!({"password": weak}))).await, 422, "weak_password");
-    }
-    expect("create, email taken", au.call(Method::POST, "/users", Some(json!({"email": email, "password": strong}))).await, 409, "email_taken");
-    // State changes.
-    let (status, body) = au.call(Method::POST, &format!("{user}/deactivate"), None).await;
-    assert_eq!((status, body["state"].as_str()), (200, Some("inactive")), "deactivate: {body}");
-    expect("deactivate again", au.call(Method::POST, &format!("{user}/deactivate"), None).await, 409, "conflict");
-    let (status, body) = au.call(Method::POST, &format!("{user}/reactivate"), None).await;
-    assert_eq!((status, body["state"].as_str()), (200, Some("active")), "reactivate: {body}");
-    expect("reactivate again", au.call(Method::POST, &format!("{user}/reactivate"), None).await, 409, "conflict");
-    // A user Zitadel doesn't have.
-    let unknown = format!("/users/{}", uuid::Uuid::new_v4());
-    expect("update, not found", au.call(Method::PATCH, &unknown, Some(json!({"password": strong}))).await, 404, "not_found");
-    expect("deactivate, not found", au.call(Method::POST, &format!("{unknown}/deactivate"), None).await, 404, "not_found");
-    expect("delete, not found", au.call(Method::DELETE, &unknown, None).await, 404, "not_found");
-    // A token Zitadel refuses is 503.
-    let bogus = au_env_on(None, Some(Zitadel::new(&base, "not-a-token").with_host(Some(&host)))).await;
-    bogus.set_auth_in(AppUsersStatus::Enabled, &org);
-    expect("a token Zitadel refuses", bogus.call(Method::POST, &format!("{user}/deactivate"), None).await, 503, "unavailable");
-    // Delete, then again.
-    let (status, body) = au.call(Method::DELETE, &user, None).await;
-    assert_eq!(status, 204, "delete: {body}");
-    expect("delete again", au.call(Method::DELETE, &user, None).await, 404, "not_found");
-    z.delete_org(&org).await.unwrap();
-}
-
-/// The app-user routes answer 503 for a refusal that isn't Zitadel's own, never 404 or 409.
-#[tokio::test]
-async fn app_user_state_and_delete_routes_answer_503_for_a_foreign_refusal() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let id = au.add_user(AU_ORG, "a@x.test");
-    for (what, method, path) in [
-        ("deactivate", Method::POST, format!("/users/{id}/deactivate")),
-        ("delete", Method::DELETE, format!("/users/{id}")),
-    ] {
-        for status in [404, 400] {
-            let verb = if what == "delete" { "DELETE /v2/users/" } else { "/deactivate" };
-            au.mock().fail(verb, status, "Errors.Odd", 1);
-            let (got, answer) = au.call(method.clone(), &path, None).await;
-            assert_eq!(got, 503, "{what} {status}: {answer}");
-            assert_eq!(code_of(&answer), "unavailable", "{what} {status}: {answer}");
-        }
-    }
-    let user = au.mock().user_by_id(&id.to_string()).unwrap();
-    assert!(!user.inactive, "the user is untouched");
-    // Zitadel's own not-found on delete (the user vanished after the org check) is done.
-    au.mock().fail("DELETE /v2/users/", 404, "Errors.User.NotFound", 1);
-    let (status, body) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
-    assert_eq!(status, 204, "{body}");
-}
-
-/// A member's Zitadel user lives in the tenant's org, not a project's app-user org, so the
-/// app-user routes can't reactivate it (a suspended member never gets a working sign-in).
-#[tokio::test]
-async fn app_user_reactivate_cannot_reach_a_members_zitadel_user() {
-    let au = au_env(true).await;
-    au.set_auth(AppUsersStatus::Enabled);
-    let member = au.add_user("org-members", "m@x.test");
-    au.mock().lock(&member.to_string());
-    let (status, body) = au.call(Method::POST, &format!("/users/{member}/reactivate"), None).await;
-    assert_eq!((status, code_of(&body)), (404, "not_found"), "{body}");
-    assert!(!au.mock().calls().iter().any(|c| c.contains("reactivate")), "{:?}", au.mock().calls());
-    assert!(au.mock().user_by_id(&member.to_string()).unwrap().locked);
-}
-
-// --- Epic review (#77): reinstate after a failed suspend; deactivate only the last membership ---
-
-/// A suspend whose lock fails after the reactivate deactivates the user again and answers 503.
-/// Reinstating instead of retrying the suspend must give back a working sign-in: the user is
-/// reactivated, not left inactive behind a 200.
-#[tokio::test]
-async fn reinstating_after_a_failed_suspend_reactivates_the_user() {
-    let p = pl_world().await;
-    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    p.t.mock.set_inactive(&p.bob.1, true);
-    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
-    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
-    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 503);
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive, "the failed suspend deactivated it again");
-    // A reactivate that fails is 503 and the reinstate stays retryable.
-    p.t.mock.fail("/reactivate", 503, "Errors.Internal", 1);
-    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await, 503).await;
-    assert_eq!(code_of(&err), "unavailable", "{err}");
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive);
-    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
-    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
-    assert_eq!(p.status_of(p.bob.0), MemberStatus::Active);
-    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(!user.locked && !user.inactive, "active and unlocked: {user:?}");
-    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
-}
-
-/// One Zitadel user can be a member of several tenants. Removing (or declining) one membership
-/// while another isn't removed only ends the user's sessions; the last one deactivates it.
-#[tokio::test]
-async fn removing_or_declining_deactivates_only_the_last_membership() {
-    let t = mw(Mode::SelfHosted).await;
-    let other_tenant = TenantId::new();
-    let z_client = Zitadel::new(&t.mock.base, ADMIN_TOKEN);
-    // Removal.
-    let z = t.mock.add_user_in("org-1", "kim@x.com", "Secret-pass1", true);
-    let kim = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
-    let elsewhere = t.w.metadata.add_member(other_tenant, &z, MemberStatus::Active, false);
-    z_client.create_session(&z, "Secret-pass1").await.unwrap();
-    let path = format!("/v1/members/{kim}");
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert_eq!(t.w.metadata.member(t.w.tenant, &z).unwrap().status, MemberStatus::Removed);
-    let user = t.mock.user_by_id(&z).unwrap();
-    assert!(!user.inactive && !user.locked, "still a member elsewhere: {user:?}");
-    assert_eq!(t.mock.session_count(), 0, "its sessions ended");
-    // Once the other membership is removed too, the retry deactivates.
-    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == elsewhere).unwrap().status = MemberStatus::Removed;
-    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&z).unwrap().inactive, "the last membership deactivates");
-    // Decline.
-    let zp = t.mock.add_user_in("org-1", "pia@x.com", "Secret-pass1", true);
-    let pia = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
-    let elsewhere = t.w.metadata.add_member(other_tenant, &zp, MemberStatus::Suspended, false);
-    let path = format!("/v1/members/{pia}/decline");
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
-    assert_eq!(t.w.metadata.member(t.w.tenant, &zp).unwrap().status, MemberStatus::Removed);
-    assert!(!t.mock.user_by_id(&zp).unwrap().inactive, "decline: still a member elsewhere");
-    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == elsewhere).unwrap().status = MemberStatus::Removed;
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
-    assert!(t.mock.user_by_id(&zp).unwrap().inactive, "decline: the last membership deactivates");
-    // An Initial user with another membership isn't locked either.
-    let zi = t.mock.add_user_in("org-1", "ian@x.com", "", false);
-    t.mock.set_initial(&zi);
-    let ian = t.w.metadata.add_member(t.w.tenant, &zi, MemberStatus::Pending, false);
-    t.w.metadata.add_member(other_tenant, &zi, MemberStatus::Invited, false);
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{ian}/decline"), None).await.status(), 204);
-    assert!(!t.mock.user_by_id(&zi).unwrap().locked, "initial: still invited elsewhere");
-}
-
-/// Revoking an invite of a user who is a member of another tenant leaves the Zitadel user alone
-/// (neither deactivated nor deleted).
+/// Revoking an invite of a user who is a member of another tenant leaves the account alone.
 #[tokio::test]
 async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
     let t = mw(Mode::SelfHosted).await;
     let other_tenant = TenantId::new();
-    // Once had a password (deactivated otherwise).
-    let zr = t.mock.add_user_in("org-1", "ray@x.com", "Secret-pass1", true);
+    let zr = t.identity.with_user(&Pool::Members, "ray@x.com", "Secret-pass1");
     let ray = t.w.metadata.add_member(t.w.tenant, &zr, MemberStatus::Active, false);
     t.w.metadata.set_member(t.w.tenant, &zr, |m| m.email = Some("ray@x.com".into()));
     t.w.metadata.add_member(other_tenant, &zr, MemberStatus::Active, false);
@@ -17340,5 +15505,1023 @@ async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
     .await;
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
-    assert!(!t.mock.user_by_id(&zr).unwrap().inactive, "revoke: still a member elsewhere");
+    let user = t.identity.user(&Pool::Members, &zr).expect("revoke: still a member elsewhere");
+    assert!(!user.banned, "{user:?}");
+}
+
+// --- #119: member tokens (the gateway's identity names a tenant, `tid`) ------------------------
+
+/// The gateway's identity for a member token of person `sub` naming `tenant`.
+fn member_identity_token(app: &TestApp, sub: &str, tenant: uuid::Uuid) -> String {
+    app.signer
+        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub), tenant, DEFAULT_SID)
+        .unwrap()
+}
+
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
+async fn send_member(app: &TestApp, sub: &str, tenant: uuid::Uuid, method: Method, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", app.base))
+        .header(IDENTITY_HEADER, member_identity_token(app, sub, tenant))
+        .send()
+        .await
+        .unwrap()
+}
+
+fn set_status(metadata: &FakeMetadata, tenant: TenantId, sub: &str, status: MemberStatus) {
+    let mut members = metadata.members.lock().unwrap();
+    let m = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == sub).unwrap();
+    m.status = status;
+}
+
+// AC 1 and AC 4: an active member reaches the route as that member of `tid`; once suspended in
+// metadata, the same (still valid) token is refused with 403, and once removed with today's
+// refusal for a removed member.
+#[tokio::test]
+async fn member_token_removed_member_403() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "rita", w.project, PlatformRole::Viewer, &[]);
+    let path = format!("/v1/databases/{}", w.db);
+    let tid = w.tenant.as_uuid();
+    assert_eq!(send_member(&w.app, "rita", tid, Method::GET, &path).await.status(), 200);
+    let me: Value = send_member(&w.app, "rita", tid, Method::GET, "/v1/me")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["member"]["status"], "active", "{me}");
+    assert_eq!(me["tenant_id"], json!(tid), "{me}");
+
+    set_status(&w.metadata, w.tenant, "rita", MemberStatus::Suspended);
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, &path).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+
+    // A removed member is refused as today (`access::decide`: a removed member is told
+    // nothing exists, 404 on every tenant route).
+    set_status(&w.metadata, w.tenant, "rita", MemberStatus::Removed);
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, &path).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, "/v1/members").await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(w.metadata.member(w.tenant, "rita").unwrap().status, MemberStatus::Removed, "never reactivated");
+}
+
+// AC 5: `tid` names a tenant the subject isn't a member of: 403 and no member row, even with
+// open sign-up on and a recent admin claim (neither makes a member row from a token).
+#[tokio::test]
+async fn member_token_wrong_tenant_403_no_jit() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
+    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
+    // A member of another tenant names this one.
+    let other = TenantId::new();
+    w.metadata.bind_org("org-2", other);
+    w.metadata.add_member(other, "mallory", MemberStatus::Active, true);
+    w.metadata.set_overview(TenantOverview {
+        id: w.tenant,
+        slug: "victim-corp".into(),
+        display_name: Some("Victim Corp".into()),
+        projects: vec![],
+    });
+    let before = (w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len());
+    let path = format!("/v1/databases/{}", w.db);
+    for sub in ["mallory", "newcomer"] {
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, &path).await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/members").await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        // `/v1/me` too: `tid` alone never reveals the tenant.
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/me").await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        assert!(!err.to_string().contains("victim-corp"), "{sub}: {err}");
+        assert!(w.metadata.member(w.tenant, sub).is_none(), "{sub}: no member row");
+    }
+    assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
+    // mallory's own tenant still works for her.
+    let me: Value = send_member(&w.app, "mallory", other.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+    assert_eq!(me["member"]["status"], "active", "{me}");
+}
+
+// A tenant that no longer exists: 401, and nothing is written.
+#[tokio::test]
+async fn member_token_unknown_tenant_401() {
+    let w = member_world(Mode::SelfHosted).await;
+    let before = w.metadata.members.lock().unwrap().len();
+    let gone = uuid::Uuid::new_v4();
+    for path in ["/v1/me".to_string(), format!("/v1/databases/{}", w.db), "/v1/members".into()] {
+        let err = error_of(send_member(&w.app, DEFAULT_SUB, gone, Method::GET, &path).await, 401).await;
+        assert_eq!(code_of(&err), "unauthorized", "{path}");
+    }
+    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
+}
+
+// `CHELABASE_OPERATOR_TENANT_ID`: in platform mode a member token naming the operator tenant
+// passes the instance check; another tenant doesn't.
+#[tokio::test]
+async fn operator_tenant_is_instance_admin_for_member_tokens() {
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let resp = send_member(&app, "op", ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
+    assert_eq!(resp.status(), 200);
+    let err = error_of(send_member(&app, DEFAULT_SUB, tenant.as_uuid(), Method::GET, INSTANCE_PROBE).await, 403).await;
+    assert_eq!(err["error"]["required"], "instance admin");
+}
+
+// #119 on the realtime routes: a member token is verified here with the member key; the member
+// is read (never made) in the tenant `tid` names; `/internal/realtime/member` takes the
+// gateway identity's `tenant_id`.
+#[tokio::test]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
+async fn realtime_routes_take_member_tokens() {
+    use chelabase_auth::member_token::{MemberClaims, MemberTokenSigner, MemberTokenVerifier, MEMBER_AUDIENCE};
+    const ISSUER: &str = "http://auth.test";
+    let (private, public) = chelabase_auth::internal::generate_keypair_pem();
+    let signer = MemberTokenSigner::from_pem(private.as_bytes(), public.as_bytes(), ISSUER).unwrap();
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
+    metadata.add_granted(tenant, "rita", project, PlatformRole::Viewer, &[]);
+    metadata.add_granted(tenant, "sus", project, PlatformRole::Viewer, &[]);
+    metadata.set_member(tenant, "sus", |m| m.status = MemberStatus::Suspended);
+    let other = TenantId::new();
+    metadata.bind_org("org-2", other);
+    let app = spawn_app_member_tokens(
+        metadata.clone(),
+        Mode::SelfHosted,
+        MemberTokenVerifier::from_pem(public.as_bytes(), ISSUER).unwrap(),
+    )
+    .await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let token = |sub: &str, tid: uuid::Uuid| {
+        signer
+            .sign(&MemberClaims {
+                iss: ISSUER.into(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: sub.into(),
+                tid,
+                sid: "s".into(),
+                email: format!("{sub}@example.test"),
+                name: sub.into(),
+                iat: now,
+                exp: now + 300,
+            })
+            .unwrap()
+    };
+    let post = |path: &'static str, body: Value| {
+        let base = app.base.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}{path}"))
+                .bearer_auth(REALTIME_TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    const PROJECTS: &str = "/internal/realtime/projects";
+    const MEMBER: &str = "/internal/realtime/member";
+
+    let (status, body) = post(PROJECTS, json!({ "token": token("rita", tenant.as_uuid()) })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], json!(tenant.as_uuid()), "{body}");
+    // Another tenant (rita isn't a member there), an unknown tenant, a suspended member, and a
+    // token from another key are refused; nothing is created.
+    let members_before = metadata.members.lock().unwrap().len();
+    let (o_private, o_public) = chelabase_auth::internal::generate_keypair_pem();
+    let foreign = MemberTokenSigner::from_pem(o_private.as_bytes(), o_public.as_bytes(), ISSUER).unwrap();
+    let forged = foreign
+        .sign(&MemberClaims {
+            iss: ISSUER.into(),
+            aud: MEMBER_AUDIENCE.into(),
+            sub: "rita".into(),
+            tid: tenant.as_uuid(),
+            sid: "s".into(),
+            email: "r@x".into(),
+            name: "r".into(),
+            iat: now,
+            exp: now + 300,
+        })
+        .unwrap();
+    for (what, t) in [
+        ("other tenant", token("rita", other.as_uuid())),
+        ("unknown tenant", token("rita", uuid::Uuid::new_v4())),
+        ("suspended", token("sus", tenant.as_uuid())),
+        ("foreign key", forged),
+    ] {
+        let (status, body) = post(PROJECTS, json!({ "token": t })).await;
+        assert_ne!(status, 200, "{what}: {body}");
+    }
+    assert_eq!(metadata.members.lock().unwrap().len(), members_before);
+
+    let ask = |body: Value| post(MEMBER, body);
+    let (status, body) = ask(json!({ "sub": "rita", "tenant_id": tenant.as_uuid() })).await;
+    assert_eq!((status, body["allowed"].clone()), (200, json!(true)), "{body}");
+    for (what, b) in [
+        ("suspended", json!({ "sub": "sus", "tenant_id": tenant.as_uuid() })),
+        ("other tenant", json!({ "sub": "rita", "tenant_id": other.as_uuid() })),
+        ("unknown tenant", json!({ "sub": "rita", "tenant_id": uuid::Uuid::new_v4() })),
+        ("nil tenant", json!({ "sub": "rita", "tenant_id": uuid::Uuid::nil() })),
+    ] {
+        let (status, body) = ask(b).await;
+        assert_eq!((status, body["allowed"].clone()), (200, json!(false)), "{what}: {body}");
+    }
+    // #126: the tenant is required, and nothing else is taken (an org is an unknown field).
+    for b in [json!({ "sub": "rita" }), json!({ "sub": "rita", "tenant_id": tenant.as_uuid(), "org_id": "org-1" })] {
+        assert_eq!(ask(b).await.0, 400);
+    }
+}
+
+// `tid` is never trusted alone: naming the operator tenant makes no one an operator without an
+// active membership there, on the instance check and on `/v1/me` alike.
+#[tokio::test]
+async fn operator_tenant_needs_an_active_membership() {
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    metadata.add_member(ops, "sus", MemberStatus::Suspended, false);
+    metadata.add_member(ops, "off", MemberStatus::Active, false);
+    metadata.set_member(ops, "off", |m| m.offboarded = true);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let before = metadata.members.lock().unwrap().len();
+    assert_eq!(send_member(&app, "op", ops.as_uuid(), Method::GET, INSTANCE_PROBE).await.status(), 200);
+    for sub in ["stranger", "sus", "off"] {
+        let resp = send_member(&app, sub, ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
+        assert_eq!(resp.status(), 403, "{sub}");
+    }
+    // A member not in good standing is still told where they stand; a stranger is told nothing.
+    for sub in ["sus", "off"] {
+        let me: Value = send_member(&app, sub, ops.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+        assert_eq!(me["instance_admin"], json!(false), "{sub}: {me}");
+    }
+    let err = error_of(send_member(&app, "stranger", ops.as_uuid(), Method::GET, "/v1/me").await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
+    assert_eq!(metadata.members.lock().unwrap().len(), before, "nothing is admitted");
+}
+
+// The realtime routes read the same rule: their principal for a member token naming the operator
+// tenant is an operator only with an active membership there, and is never made one by `tid`.
+#[tokio::test]
+async fn realtime_principal_operator_needs_an_active_membership() {
+    use chelabase_auth::member_token::{MemberClaims, MEMBER_AUDIENCE};
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    metadata.add_member(ops, "sus", MemberStatus::Suspended, false);
+    metadata.add_member(ops, "off", MemberStatus::Active, false);
+    metadata.set_member(ops, "off", |m| m.offboarded = true);
+    let other = TenantId::new();
+    metadata.bind_org("org-1", other);
+    metadata.add_member(other, "op", MemberStatus::Active, false);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let before = metadata.members.lock().unwrap().len();
+    let principal = |sub: &'static str, tenant: TenantId| {
+        let app = &app;
+        async move {
+            let claims = MemberClaims {
+                iss: "http://auth.test".into(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: sub.into(),
+                tid: tenant.as_uuid(),
+                sid: "s".into(),
+                email: String::new(),
+                name: String::new(),
+                iat: 0,
+                exp: 0,
+            };
+            orchestrator::read_only_member_principal(&app.state, &claims).await.unwrap().unwrap()
+        }
+    };
+    assert!(principal("op", ops).await.in_operator_org, "an active member of the operator tenant");
+    assert!(!principal("op", other).await.in_operator_org, "the same person in another tenant");
+    for sub in ["stranger", "sus", "off"] {
+        assert!(!principal(sub, ops).await.in_operator_org, "{sub}");
+    }
+    assert!(principal("stranger", ops).await.member.is_none(), "read, never made");
+    assert_eq!(metadata.members.lock().unwrap().len(), before);
+}
+
+// --- Members through the identity service (#122) -------------------------------------------------
+
+const CODES_ROUTE: &str = "POST /internal/v1/pools/members/codes";
+
+/// The members-pool user with this email.
+fn sub_of(t: &Mw, email: &str) -> String {
+    t.identity.user_by_email(&Pool::Members, email).expect("an identity user")
+}
+
+/// The body of a 201.
+async fn created(resp: reqwest::Response) -> Value {
+    let status = resp.status();
+    let body = body_of(resp).await;
+    assert_eq!(status, 201, "{body}");
+    body
+}
+
+/// A second tenant holding the same person, for the cases about one global account.
+fn second_tenant(t: &Mw, sub: &str, status: MemberStatus) -> (TenantId, uuid::Uuid) {
+    let other = TenantId::new();
+    let member = t.w.metadata.add_member(other, sub, status, false);
+    (other, member)
+}
+
+/// An active Developer of Billing behind a verified identity user with a password.
+fn identity_member(t: &Mw, email: &str) -> (uuid::Uuid, String) {
+    let sub = t.identity.with_user(&Pool::Members, email, "Secret-pass1");
+    let member = t.w.metadata.add_granted(t.w.tenant, &sub, t.w.project, PlatformRole::Developer, &["app"]);
+    (member, sub)
+}
+
+fn invite_link_body(t: &Mw, email: &str) -> Value {
+    let mut body = invite_body(&t.w, email, "developer", &["app"]);
+    body["delivery"] = json!("link");
+    body
+}
+
+#[tokio::test]
+async fn invite_return_delivery_creates_passwordless_user() {
+    let t = mw(Mode::SelfHosted).await;
+    let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "new@x.com"))).await;
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    let body = created(resp).await;
+    assert_eq!(body["outcome"], "invited");
+    let sub = t.identity.user_by_email(&Pool::Members, "new@x.com").expect("an identity user");
+    let user = t.identity.user(&Pool::Members, &sub).unwrap();
+    assert!(!user.has_password && !user.verified, "{user:?}");
+    let url = body["invite_url"].as_str().unwrap();
+    assert!(url.starts_with(&format!("http://studio.test/accept-invite?user={sub}&code=")), "{url}");
+    assert!(url.contains("&t="), "{url}");
+    assert!(t.identity.codes_sent().is_empty() && t.identity.notices_sent().is_empty(), "nothing is mailed");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Invited);
+}
+
+#[tokio::test]
+async fn invite_undo_keeps_preexisting_user() {
+    let t = mw(Mode::SelfHosted).await;
+    // An account that exists already, and a code that can't be made.
+    let sub = t.identity.with_invited_user(&Pool::Members, "old@x.com");
+    t.identity.fail(CODES_ROUTE, 503, "internal", 1);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "old@x.com"))).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert!(t.identity.user(&Pool::Members, &sub).is_some(), "not this call's user: it stays");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Removed, "the undelivered invite is undone");
+    // The same failure on a user this call made takes that user away again.
+    t.identity.fail(CODES_ROUTE, 503, "internal", 1);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "fresh@x.com"))).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "fresh@x.com"), None);
+}
+
+// A user this call made that another tenant's invite reached before the undo isn't deleted.
+#[tokio::test]
+async fn invite_undo_keeps_a_user_shared_since() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "both@x.com");
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    t.identity.fail(CODES_ROUTE, 503, "internal", 1);
+    // By email: a link for someone another tenant holds is refused before anything is sent.
+    let body = invite_body(&t.w, "both@x.com", "developer", &["app"]);
+    error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 503).await;
+    assert!(t.identity.user(&Pool::Members, &sub).is_some());
+}
+
+#[tokio::test]
+async fn suspend_revokes_inline() {
+    let p = pl_world().await;
+    let sub = p.t.identity.with_user(&Pool::Members, "sue@x.com", "Secret-pass1");
+    let member = (p.t.w.metadata.add_granted(p.t.w.tenant, &sub, p.t.w.project, PlatformRole::Developer, &["app"]), sub.clone());
+    let login = p.seed(&member, "sue");
+    p.t.identity.with_session(&Pool::Members, &sub);
+    let resp = p.member_action(DEFAULT_SUB, member.0, "suspend").await;
+    assert_eq!(resp.status(), 200);
+    // The personal login, in the same request.
+    let stored = p.t.w.metadata.personal_logins.lock().unwrap().iter().find(|l| l.login.role_name == login.login.role_name).cloned().unwrap();
+    assert!(stored.verifier.is_none(), "the login's verifier is gone");
+    // The realtime event names them.
+    let events = p.t.w.app.rt_events.access();
+    assert!(events.iter().any(|e| e.tenant_id == p.t.w.tenant.as_uuid() && e.member_sub.as_deref() == Some(sub.as_str())), "{events:?}");
+    // Their identity sessions, and every route but /v1/me.
+    assert_eq!(p.t.identity.session_count(&Pool::Members), 0);
+    let err = error_of(p.send(&sub, Method::GET, "/v1/members", None).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+}
+
+#[tokio::test]
+async fn suspend_keeps_sessions_while_another_membership_lives() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "two@x.com");
+    second_tenant(&t, &sub, MemberStatus::Active);
+    t.identity.with_session(&Pool::Members, &sub);
+    let path = format!("/v1/members/{member}/suspend");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    assert_eq!(t.identity.session_count(&Pool::Members), 1, "the other tenant's session stays; /token refuses this tenant");
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
+}
+
+#[tokio::test]
+async fn remove_one_of_two_tenants_keeps_account() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "two@x.com");
+    second_tenant(&t, &sub, MemberStatus::Active);
+    t.identity.with_session(&Pool::Members, &sub);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    let user = t.identity.user(&Pool::Members, &sub).unwrap();
+    assert!(!user.banned, "{user:?}");
+    assert_eq!(t.identity.session_count(&Pool::Members), 1, "they can still mint tokens for the other tenant");
+    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+    assert_eq!(stored.status, MemberStatus::Removed);
+    assert!(stored.offboarded, "the offboarded mark is written");
+}
+
+#[tokio::test]
+async fn remove_last_tenant_bans() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "two@x.com");
+    let (_, other) = second_tenant(&t, &sub, MemberStatus::Active);
+    t.identity.with_session(&Pool::Members, &sub);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == other).unwrap().status = MemberStatus::Removed;
+    // The retry of the first removal sees the last membership gone.
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    let user = t.identity.user(&Pool::Members, &sub).unwrap();
+    assert!(user.banned, "{user:?}");
+    assert_eq!(user.ban_reason.as_deref(), Some(MEMBER_REMOVED_BAN_REASON));
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+}
+
+// A ban somebody else placed keeps its reason, so nothing of ours lifts it later.
+#[tokio::test]
+async fn remove_keeps_a_foreign_ban_reason() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "abuse@x.com");
+    t.identity.client().ban(&Pool::Members, &sub, Some("abuse")).await.unwrap();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    assert_eq!(t.identity.user(&Pool::Members, &sub).unwrap().ban_reason.as_deref(), Some("abuse"));
+}
+
+// Each identity step of a removal failing: 503, the member is out, every other step ran, and
+// the retry finishes.
+#[tokio::test]
+async fn remove_partial_failure_is_finished_by_a_retry() {
+    for step in ["/sessions", "/ban", "GET /internal/v1/pools/members/users/"] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "gone@x.com");
+        t.identity.with_session(&Pool::Members, &sub);
+        t.identity.fail(step, 503, "internal", 1);
+        let path = format!("/v1/members/{member}");
+        let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+        assert_eq!(code_of(&err), "identity_unavailable", "{step}");
+        let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+        assert_eq!(stored.status, MemberStatus::Removed, "{step}");
+        assert!(t.w.app.rt_events.access().iter().any(|e| e.member_sub.as_deref() == Some(sub.as_str())), "{step}");
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204, "{step}");
+        assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned, "{step}");
+        assert_eq!(t.identity.session_count(&Pool::Members), 0, "{step}");
+    }
+}
+
+// A failed login write is a retryable 503 with the member already out, and the retry does what
+// it skipped.
+#[tokio::test]
+async fn remove_login_step_failure_is_finished_by_a_retry() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "gone@x.com");
+    t.identity.with_session(&Pool::Members, &sub);
+    *t.w.metadata.fail_offboard.lock().unwrap() = true;
+    let path = format!("/v1/members/{member}");
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Removed);
+    *t.w.metadata.fail_offboard.lock().unwrap() = false;
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+}
+
+// Decline ends the same way as a removal, and a retry finishes it.
+#[tokio::test]
+async fn decline_bans_the_last_membership_and_retries() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_unverified_user(&Pool::Members, "pia@x.com", "Secret-pass1");
+    let pia = t.w.metadata.add_member(t.w.tenant, &sub, MemberStatus::Pending, false);
+    t.identity.with_session(&Pool::Members, &sub);
+    t.identity.fail("/ban", 503, "internal", 1);
+    let path = format!("/v1/members/{pia}/decline");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    assert!(t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+    let subs = t.w.app.rt_events.access().into_iter().filter(|e| e.member_sub.as_deref() == Some(sub.as_str())).count();
+    assert_eq!(subs, 2, "each call emits, so a lost first event is repaired by the retry");
+}
+
+#[tokio::test]
+async fn suspend_identity_down_503_member_refused() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "sue@x.com");
+    t.identity.with_session(&Pool::Members, &sub);
+    t.identity.set_down(true);
+    let path = format!("/v1/members/{member}/suspend");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    // Already locked out by the orchestrator.
+    let err = error_of(t.send(&sub, Method::GET, "/v1/members", None).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+    t.identity.set_down(false);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    assert_eq!(t.identity.session_count(&Pool::Members), 0, "the retry finished it");
+}
+
+// No identity client at all (a token file not readable at start-up): the Chelabase side is
+// still done before the 503.
+#[tokio::test]
+async fn no_identity_client_answers_503_after_the_metadata_and_login_steps() {
+    let t = mw_without_identity().await;
+    let bob = t.w.metadata.add_granted(t.w.tenant, "bob", t.w.project, PlatformRole::Developer, &["app"]);
+    let ann = t.w.metadata.add_granted(t.w.tenant, "ann", t.w.project, PlatformRole::Developer, &["app"]);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{bob}/suspend"), None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert_eq!(t.w.metadata.member(t.w.tenant, "bob").unwrap().status, MemberStatus::Suspended);
+    assert!(t.w.app.rt_events.access().iter().any(|e| e.member_sub.as_deref() == Some("bob")));
+
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{ann}"), None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    let stored = t.w.metadata.member(t.w.tenant, "ann").unwrap();
+    assert_eq!(stored.status, MemberStatus::Removed);
+    assert!(stored.offboarded, "the login step ran");
+}
+
+#[tokio::test]
+async fn reinstate_restores() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "sue@x.com");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    // The mark, and a ban that is ours.
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == member).unwrap().offboarded = true;
+    t.identity.client().ban(&Pool::Members, &sub, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    let before = t.w.app.rt_events.access().len();
+    let path = format!("/v1/members/{member}/reinstate");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+    assert_eq!(stored.status, MemberStatus::Active);
+    assert!(!stored.offboarded, "the mark is cleared");
+    assert_eq!(t.send(&sub, Method::GET, "/v1/members", None).await.status(), 200);
+    // Realtime re-checks once the member is really clear: the last event comes after the clear.
+    let events = t.w.app.rt_events.access();
+    assert_eq!(events.len(), before + 2, "{events:?}");
+}
+
+#[tokio::test]
+async fn reinstate_partial_failure_is_finished_by_a_retry() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "sue@x.com");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == member).unwrap().offboarded = true;
+    t.identity.client().ban(&Pool::Members, &sub, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    t.identity.fail("/unban", 503, "internal", 1);
+    let path = format!("/v1/members/{member}/reinstate");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    assert!(!t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+}
+
+#[tokio::test]
+async fn delivery_reports_email_not_configured() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.set_email_configured(false);
+    let body = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/invites/delivery", None).await).await;
+    assert_eq!(body, json!({ "email_available": false, "reason": "email_not_configured" }));
+    t.identity.set_email_configured(true);
+    let body = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/invites/delivery", None).await).await;
+    assert_eq!(body, json!({ "email_available": true, "reason": null }));
+    t.identity.set_down(true);
+    let body = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/invites/delivery", None).await).await;
+    assert_eq!(body, json!({ "email_available": false, "reason": "identity_unavailable" }));
+}
+
+// The password and the verified flag each make an account "existing": a code handed to an admin
+// would let them take it over.
+#[tokio::test]
+async fn invite_return_refused_for_existing_account() {
+    let t = mw(Mode::SelfHosted).await;
+    let verified = t.identity.with_user(&Pool::Members, "victim@x.io", "Secret-pass1");
+    let unverified = t.identity.with_unverified_user(&Pool::Members, "pre@x.io", "Secret-pass1");
+    let confirmed = t.identity.with_invited_user(&Pool::Members, "conf@x.io");
+    t.identity.client().mark_email_verified(&Pool::Members, &confirmed).await.unwrap();
+    for (email, sub) in [("victim@x.io", &verified), ("pre@x.io", &unverified), ("conf@x.io", &confirmed)] {
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, email))).await, 409).await;
+        assert_eq!(code_of(&err), "link_not_allowed", "{email}");
+        assert_eq!(err["error"]["email_available"], true, "{email}");
+        assert!(t.w.metadata.member(t.w.tenant, sub).is_none(), "{email}: no member row");
+    }
+    assert!(!t.identity.calls().iter().any(|c| c.contains(CODES_ROUTE)), "no code is created");
+}
+
+// By email an established account gets the notice: no code, and a link with only the ticket.
+#[tokio::test]
+async fn invite_email_to_an_established_account_sends_a_notice() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_user(&Pool::Members, "ann@x.io", "Secret-pass1");
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ann@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(body["outcome"], "invited");
+    assert_eq!(body["member"]["status"], "invited", "nobody joins without accepting");
+    let notices = t.identity.notices_sent();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].user_id, sub);
+    assert!(notices[0].link.starts_with("http://studio.test/accept-invite?t="), "{}", notices[0].link);
+    assert!(!notices[0].link.contains("code="), "{}", notices[0].link);
+    assert!(t.identity.codes_sent().is_empty(), "never a password-setting code");
+}
+
+// A person with no proven mailbox or no password gets the code by email, which only the mailbox
+// can read (m11's pre-registered case).
+#[tokio::test]
+async fn invite_email_to_a_preregistered_account_mails_a_code() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.with_unverified_user(&Pool::Members, "pre@x.io", "Secret-pass1");
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "pre@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(t.identity.codes_sent().len(), 1);
+    assert!(t.identity.notices_sent().is_empty());
+}
+
+// A password set between the read and the code: the service refuses, and the person gets the
+// notice instead of a failed invite.
+#[tokio::test]
+async fn invite_refused_at_the_service_falls_back_to_the_notice() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.with_invited_user(&Pool::Members, "race@x.io");
+    t.identity.fail(CODES_ROUTE, 409, "invite_refused", 1);
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "race@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(t.identity.notices_sent().len(), 1);
+    // With a link it is the same refusal as the read's, and the invite is undone.
+    t.identity.with_invited_user(&Pool::Members, "race2@x.io");
+    t.identity.fail(CODES_ROUTE, 409, "invite_refused", 1);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "race2@x.io"))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+}
+
+#[tokio::test]
+async fn resend_never_gives_an_existing_account_a_code() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_user(&Pool::Members, "ann@x.io", "Secret-pass1");
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ann@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}/resend");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200);
+    assert_eq!(t.identity.notices_sent().iter().filter(|n| n.user_id == sub).count(), 2);
+    assert!(t.identity.codes_sent().is_empty());
+}
+
+// Resend's own limit: five sends an hour per person, the first invite included. The 429 mails
+// nothing and moves nothing.
+#[tokio::test]
+async fn invite_code_issuance_is_limited_per_user() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "many@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}/resend");
+    for n in 2..=5 {
+        assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200, "send {n}");
+    }
+    let sent = t.identity.codes_sent().len();
+    assert_eq!(sent, 5);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 429).await;
+    assert_eq!(code_of(&err), "rate_limited");
+    assert_eq!(t.identity.codes_sent().len(), sent);
+    // Link delivery counts the same, and so does another person's budget not.
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 429).await;
+    assert_eq!(code_of(&err), "rate_limited");
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "other@x.io", "developer", &["app"]))).await).await;
+}
+
+// A second tenant's invites spend the same budget: the code guesses are per user.
+#[tokio::test]
+async fn invite_limit_counts_a_first_invite_to_an_existing_user() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "cap@x.io");
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "cap@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    for _ in 2..=5 {
+        assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/invites/{invite}/resend"), None).await.status(), 200);
+    }
+    // Held by another tenant, so the revoke keeps the user; invited again it is the sixth send.
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "cap@x.io", "developer", &["app"]))).await, 429).await;
+    assert_eq!(code_of(&err), "rate_limited");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Removed, "nothing was written");
+}
+
+// The search is a substring match: the right person is found past a page of near misses, and a
+// near miss alone is no match.
+#[tokio::test]
+async fn invite_matches_the_exact_email_over_pages() {
+    let t = mw(Mode::SelfHosted).await;
+    for n in 0..205 {
+        t.identity.with_invited_user(&Pool::Members, &format!("x{n}ann@x.io"));
+    }
+    let sub = t.identity.with_invited_user(&Pool::Members, "ann@x.io");
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ann@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Invited, "the existing user");
+    let before = t.identity.calls().iter().filter(|c| c.starts_with("POST /internal/v1/pools/members/users")).count();
+    assert_eq!(before, 0, "no second user");
+    // A substring of a stored address is a new person.
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "n@x.io", "developer", &["app"]))).await).await;
+    assert!(t.identity.user_by_email(&Pool::Members, "n@x.io").is_some());
+}
+
+// Two invites of one new email at once: the loser of the create reads the user again.
+#[tokio::test]
+async fn invite_create_conflict_is_retryable() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.fail("POST /internal/v1/pools/members/users", 409, "conflict", 1);
+    let err = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "race@x.io", "developer", &["app"]))).await;
+    // The user was not really made by the forced fault, so the re-read finds nobody: a retryable 503.
+    let err = error_of(err, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+}
+
+// #122 N4: the create lost to a concurrent invite that made the same user: the search runs once
+// more and this invite goes to that user.
+#[tokio::test]
+async fn invite_create_lost_to_a_concurrent_invite_uses_that_user() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.fail_after("POST /internal/v1/pools/members/users", 409, "conflict", 1);
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "race@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(body["outcome"], "invited");
+    let sub = sub_of(&t, "race@x.io");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Invited);
+    assert!(t.identity.user(&Pool::Members, &sub).is_some(), "not this call's user: never deleted");
+}
+
+// #122 B1: a failed offboard write doesn't skip the identity half of a removal: the sessions end
+// and the account is banned in the same request, the answer is a retryable 503, and a retry
+// finishes the write.
+#[tokio::test]
+async fn adv_remove_offboard_failure_still_ends_identity_access() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "adv5@x.com");
+    t.identity.with_session(&Pool::Members, &sub);
+    *t.w.metadata.fail_offboard.lock().unwrap() = true;
+    let _ = t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await;
+    assert_eq!(t.identity.session_count(&Pool::Members), 0, "sessions left alive after the 500");
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned, "not banned after the 500");
+}
+
+// #122 B1, decline: the same.
+#[tokio::test]
+async fn decline_offboard_failure_still_ends_identity_access() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_unverified_user(&Pool::Members, "pia@x.com", "Secret-pass1");
+    let pia = t.w.metadata.add_member(t.w.tenant, &sub, MemberStatus::Pending, false);
+    t.identity.with_session(&Pool::Members, &sub);
+    *t.w.metadata.fail_offboard.lock().unwrap() = true;
+    let path = format!("/v1/members/{pia}/decline");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    *t.w.metadata.fail_offboard.lock().unwrap() = false;
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert!(t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+}
+
+// #122 S1 (decided): removal from the last *active* tenant always ends the sessions; the account
+// is banned only when no other non-removed row exists, so an open invite, a pending sign-up or a
+// suspension elsewhere keeps it usable for that acceptance, approval or reinstatement.
+#[tokio::test]
+async fn adv_remove_ends_sessions_while_only_an_inactive_row_remains() {
+    for other in [MemberStatus::Invited, MemberStatus::Pending, MemberStatus::Suspended] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "adv1@x.com");
+        second_tenant(&t, &sub, other);
+        t.identity.with_session(&Pool::Members, &sub);
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204, "{other:?}");
+        assert_eq!(t.identity.session_count(&Pool::Members), 0, "{other:?}: no other active tenant");
+        let user = t.identity.user(&Pool::Members, &sub).unwrap();
+        assert!(!user.banned, "{other:?}: another row lives: {user:?}");
+    }
+}
+
+// #122 S1, suspend: the sessions end when no other tenant holds them as an active member.
+#[tokio::test]
+async fn suspend_ends_sessions_when_the_only_other_row_is_an_open_invite() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "two@x.com");
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    t.identity.with_session(&Pool::Members, &sub);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
+}
+
+// #122 re-audit B1: an account banned for a reason that isn't ours can't be reinstated. The
+// answer is 409 and nothing is written: the member stays suspended and refused, and the ban stays.
+#[tokio::test]
+async fn reinstate_under_a_foreign_ban_is_refused() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "sue2@x.com");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    assert!(!t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded, "suspend sets no mark");
+    t.identity.client().ban(&Pool::Members, &sub, Some("abuse")).await.unwrap();
+    let before = t.w.app.rt_events.access().len();
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/reinstate"), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Suspended);
+    assert_eq!(t.w.app.rt_events.access().len(), before, "nothing changed");
+    let err = error_of(t.send(&sub, Method::GET, "/v1/members", None).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+    let user = t.identity.user(&Pool::Members, &sub).unwrap();
+    assert!(user.banned, "{user:?}");
+    assert_eq!(user.ban_reason.as_deref(), Some("abuse"));
+}
+
+// #122 re-audit S1: a link hands the admin a password-setting code, so it is refused for a person
+// another tenant still holds (an open invite there included). By email the code reaches only
+// the mailbox owner, so that stays allowed; a resend by link is refused the same way.
+#[tokio::test]
+async fn link_invite_refused_for_another_tenants_invitee() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "theirs@x.com");
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "theirs@x.com"))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert!(t.w.metadata.member(t.w.tenant, &sub).is_none(), "no member row");
+    assert!(!t.identity.calls().iter().any(|c| c.contains(CODES_ROUTE)), "no code is created");
+
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "theirs@x.com", "developer", &["app"]))).await).await;
+    assert_eq!(t.identity.codes_sent().len(), 1, "email delivery stays allowed");
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}/resend");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200, "by email it is resent");
+}
+
+// A link for someone whose only other row is removed is still a new person's link.
+#[tokio::test]
+async fn link_invite_allowed_when_the_other_tenant_removed_them() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "gone@x.com");
+    second_tenant(&t, &sub, MemberStatus::Removed);
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "gone@x.com"))).await).await;
+    assert!(body["invite_url"].is_string(), "{body}");
+}
+
+// The m10 follow-up: finding the invitee is one exact identity lookup, never a substring search
+// paged to the end. 650 users contain `a@x.com`; none is it.
+#[tokio::test]
+async fn invite_lookup_is_one_identity_call() {
+    let t = mw(Mode::SelfHosted).await;
+    for i in 0..650 {
+        t.identity.with_invited_user(&Pool::Members, &format!("u{i}a@x.com"));
+    }
+    let list = "GET /internal/v1/pools/members/users";
+    let before = t.identity.calls().len();
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "a@x.com", "developer", &["app"]))).await).await;
+    let lists = t.identity.calls()[before..].iter().filter(|c| c.as_str() == list).count();
+    assert_eq!(lists, 1, "user-list reads for one invite");
+}
+
+// #122 re-audit N1: other memberships unreadable after the revoke is the retryable 503, and the
+// same revoke again finishes it.
+#[tokio::test]
+async fn revoke_invite_other_memberships_failure_is_retryable() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "new@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}");
+    *t.w.metadata.fail_other_memberships.lock().unwrap() = true;
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    *t.w.metadata.fail_other_memberships.lock().unwrap() = false;
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.io"), None);
+}
+
+// #122 re-audit N2: with no identity client, ending access for someone active in another tenant
+// has nothing to do there, so it is no 503.
+#[tokio::test]
+async fn no_identity_client_is_no_503_while_active_elsewhere() {
+    let t = mw_without_identity().await;
+    let bob = t.w.metadata.add_granted(t.w.tenant, "bob", t.w.project, PlatformRole::Developer, &["app"]);
+    let ann = t.w.metadata.add_granted(t.w.tenant, "ann", t.w.project, PlatformRole::Developer, &["app"]);
+    second_tenant(&t, "bob", MemberStatus::Active);
+    second_tenant(&t, "ann", MemberStatus::Active);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{bob}/suspend"), None).await.status(), 200);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{ann}"), None).await.status(), 204);
+}
+
+// #122 S3: an invite that fails before its member row is written deletes the user it made only
+// when no other tenant's row references it by then.
+#[tokio::test]
+async fn invite_failing_before_its_row_keeps_a_user_another_tenant_reached() {
+    for shared in [true, false] {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Racy");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Viewer, &[]);
+        let project = t.w.project;
+        // The team changes before each write, so the store gives up after its retries.
+        t.w.metadata.race_teams_once(move |md| md.seed_team_grant(team, project, PlatformRole::Developer, &[]));
+        let identity = t.identity.clone();
+        t.w.metadata.race_teams_once(move |md| {
+            md.seed_team_grant(team, project, PlatformRole::Viewer, &[]);
+            if shared {
+                // Another tenant's invite reaches the new user meanwhile.
+                let sub = identity.user_by_email(&Pool::Members, "new@x.com").expect("made by this call");
+                md.add_member(TenantId::new(), &sub, MemberStatus::Invited, false);
+            }
+        });
+        let body = json!({ "email": "new@x.com", "grants": [], "team_ids": [team] });
+        error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 409).await;
+        let left = t.identity.user_by_email(&Pool::Members, "new@x.com");
+        assert_eq!(left.is_some(), shared, "shared: {shared}");
+    }
+}
+
+// A removed member keeps the mark in metadata; a new invite clears it, or they could never use
+// the tenant after accepting.
+#[tokio::test]
+async fn reinvite_clears_the_offboarded_mark() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "back@x.com");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+    assert!(t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "developer", &["app"]))).await).await;
+    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+    assert_eq!(stored.status, MemberStatus::Invited);
+    assert!(!stored.offboarded);
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned, "the ban stays until they accept (m11)");
+}
+
+// #119 B3: a tenant admin on a member token has no org, and the members pool doesn't need one.
+#[tokio::test]
+async fn invite_works_on_a_member_token() {
+    let t = mw(Mode::SelfHosted).await;
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/invites", t.w.app.base))
+        .header(IDENTITY_HEADER, member_identity_token(&t.w.app, DEFAULT_SUB, t.w.tenant.as_uuid()))
+        .json(&invite_body(&t.w, "new@x.com", "developer", &["app"]))
+        .send()
+        .await
+        .unwrap();
+    created(resp).await;
+    assert!(t.identity.user_by_email(&Pool::Members, "new@x.com").is_some());
+}
+
+// A revoked invite: a never-activated user goes; one with a password stays as it is, and one
+// shared with another tenant too.
+#[tokio::test]
+async fn revoke_invite_deletes_only_a_passwordless_unshared_user() {
+    let t = mw(Mode::SelfHosted).await;
+    let revoke = async |email: &str| {
+        let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, email, "developer", &["app"]))).await).await;
+        let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+        t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await
+    };
+    assert_eq!(revoke("new@x.io").await.status(), 204);
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.io"), None);
+
+    let sub = t.identity.with_user(&Pool::Members, "ann@x.io", "Secret-pass1");
+    assert_eq!(revoke("ann@x.io").await.status(), 204);
+    let user = t.identity.user(&Pool::Members, &sub).expect("an established account stays");
+    assert!(!user.banned, "{user:?}");
+
+    let shared = t.identity.with_invited_user(&Pool::Members, "both@x.io");
+    second_tenant(&t, &shared, MemberStatus::Invited);
+    assert_eq!(revoke("both@x.io").await.status(), 204);
+    assert!(t.identity.user(&Pool::Members, &shared).is_some());
+}
+
+// The identity step of a revoke fails: 503, retried by revoking again, and the row stays revoked.
+#[tokio::test]
+async fn revoke_invite_retries_the_identity_step() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "new@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    t.identity.fail("DELETE /internal/v1/pools/members/users/", 503, "internal", 1);
+    let path = format!("/v1/invites/{invite}");
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "identity_unavailable");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.io"), None);
 }

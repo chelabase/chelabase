@@ -2114,7 +2114,7 @@ impl Fx {
                 id: sid,
                 project_id: self.project,
                 user_id: user,
-                zitadel_session_id: "storage-live",
+                identity_session_id: "storage-live",
                 refresh_hash: hash,
                 expires_at: now + chrono::Duration::hours(1),
             })
@@ -2455,7 +2455,6 @@ async fn in_process_storage_with(store: Arc<FailingStore>, branch: BranchId, inf
     tokio::spawn(async move { axum::serve(listener, storage::app::router(state)).await });
     let identity = Identity {
         sub: Uuid::new_v4().to_string(),
-        org_id: String::new(),
         auth: AuthMethod::DataKey,
         request_id: "in-process".into(),
         data: Some(DataIdentity {

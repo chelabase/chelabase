@@ -1,6 +1,6 @@
 /**
  * Search params stay plain strings. TanStack Router's default JSON-parses each value, which
- * turns all-digit Zitadel ids and codes into (imprecise) numbers.
+ * turns all-digit ids and codes into (imprecise) numbers.
  */
 export function parseSearch(search: string): Record<string, string> {
   return Object.fromEntries(new URLSearchParams(search));

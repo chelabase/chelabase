@@ -3,7 +3,7 @@ title: "Table API"
 description: "How the table API works: one renderer shared with schema merges, scoped catalog reads, the session, the order of a change, the cascade check and the DDL guard."
 ---
 
-The table API reads a branch's schema and changes it with structured operations. It backs Studio's table editor. For how to call it, see the [Table API guide](/docs/using/table-api).
+The table API reads a branch's schema and changes it with structured operations. It backs Studio's table editor. For how to call it, see the [Table API guide](/using/table-api).
 
 The routes are in `services/orchestrator/src/table_api/` (`read.rs`, `changes.rs`, `rows.rs`); the renderer is `chelabase_schema::ddl`; the request and response types are `chelabase_types::table_api`; the guard is `services/worker/src/schema_guard.rs`.
 
@@ -11,7 +11,7 @@ The routes are in `services/orchestrator/src/table_api/` (`read.rs`, `changes.rs
 
 An operation (`create_table`, `alter_column`, `grant`, …) is a typed value, not SQL text. `chelabase_schema::ddl::render` turns a list of them into statements, each with the operation it came from, the lock it takes, whether it may rewrite its table and whether it is `CONCURRENTLY`. It is pure: what it needs to know about existing tables comes in through a `RenderContext` (the tables' models and sizes, and whether the request cascades).
 
-The renderer shares code with the [schema merge](/docs/architecture/schema-merge): column definitions, policies, grants and comments go through the merge planner's own renderers, so a merge and the table editor produce the same SQL for the same object. Grants render one statement per privilege and per column, as the merge does.
+The renderer shares code with the [schema merge](/architecture/schema-merge): column definitions, policies, grants and comments go through the merge planner's own renderers, so a merge and the table editor produce the same SQL for the same object. Grants render one statement per privilege and per column, as the merge does.
 
 - Names (tables, columns, constraints, roles, types, collations) are quoted by `sql::ident`. Data types are structured (`schema`, `name`, `modifiers`, `array`) and rendered fully qualified.
 - Expressions (defaults, checks, `USING`, predicates, policy clauses) are the caller's SQL, used as given, and run as the acting role. Each must be exactly one expression (`InvalidExpression` otherwise): it scans with no comment, no `;`, no top-level comma and brackets that never close one opened outside it, and `SELECT (<expr>)` parses as one plain `SELECT` with one target, so it can't add clauses to the statement around it. The statements go through the extended protocol, one statement per call, so a value that holds a `;` can't add a second one.

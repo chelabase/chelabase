@@ -30,8 +30,8 @@ fn render(slug: &str) -> HashMap<String, String> {
         .collect()
 }
 
-// C1: the gateway starts before the first bootstrap (bootstrap reaches Zitadel through it), so
-// every machine-level key path an app needs at startup is in stack.env, not only in demo.env.
+// C1: every machine-level key path an app needs at startup is in stack.env: no app waits on the
+// bootstrap.
 #[test]
 fn the_machine_keys_are_in_the_stack_env_before_any_bootstrap() {
     let env = render("feat-x");
@@ -42,10 +42,8 @@ fn the_machine_keys_are_in_the_stack_env_before_any_bootstrap() {
         ("CHELABASE_AUTH_COOKIE_KEY", "/m/.chelabase/auth/cookie.key"),
         ("CHELABASE_APP_JWT_PRIVATE_KEY", "/m/.chelabase/auth/app-jwt.key"),
         ("CHELABASE_APP_JWT_PUBLIC_KEY", "/m/.chelabase/auth/app-jwt.pub"),
-        (
-            "CHELABASE_ZITADEL_JWKS_URL",
-            "http://auth.feat-x.chelabase.localhost:8137/oauth/v2/keys",
-        ),
+        ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", "/m/.chelabase/auth/member-jwt.key"),
+        ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", "/m/.chelabase/auth/member-jwt.pub"),
     ] {
         assert_eq!(env.get(k).map(String::as_str), Some(v), "{k}");
     }

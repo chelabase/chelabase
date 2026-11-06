@@ -12,7 +12,6 @@ export type DeliveryReason = typeof DeliveryReason[keyof typeof DeliveryReason];
 
 
 export const DeliveryReason = {
-  no_email_provider: 'no_email_provider',
-  zitadel_unavailable: 'zitadel_unavailable',
-  zitadel_not_configured: 'zitadel_not_configured',
+  email_not_configured: 'email_not_configured',
+  identity_unavailable: 'identity_unavailable',
 } as const;

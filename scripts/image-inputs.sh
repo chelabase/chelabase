@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the eight release images
+#   scripts/image-inputs.sh images                  the nine release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD
@@ -23,11 +23,13 @@
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
 #                 the build reads outside the graph: studio.Caddyfile, openapi/,
 #                 infra/compose/.env.example (its pin block left out: pinning rewrites it)
+#   identity      services/identity and its workspace: dependencies, package.json, pnpm-lock.yaml,
+#                 pnpm-workspace.yaml, identity.Dockerfile
 # A pin commit missing from history counts as changed, with a warning.
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime init studio)
+images=(gateway orchestrator worker rest auth realtime init studio identity)
 rust=(gateway orchestrator worker rest auth realtime init)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
@@ -75,6 +77,9 @@ inputs() { # inputs <image>
       pnpm_dirs apps/studio
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/studio.Dockerfile \
         infra/images/studio.Caddyfile openapi "$envex" ;;
+    identity)
+      pnpm_dirs services/identity
+      printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/identity.Dockerfile ;;
     *)
       rust_dirs "$1"
       rust_dirs "${rust[@]}" | sed 's#$#/Cargo.toml#'
@@ -153,6 +158,7 @@ case "$cmd" in
       rc=0
       copies "$root/infra/images/server.Dockerfile" "${rust[@]}" || rc=1
       copies "$root/infra/images/studio.Dockerfile" studio || rc=1
+      copies "$root/infra/images/identity.Dockerfile" identity || rc=1
       [[ $rc -eq 0 ]] && echo "image-inputs: every Dockerfile COPY is within its images' inputs"
       exit $rc
     fi ;;

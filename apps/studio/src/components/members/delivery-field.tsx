@@ -2,11 +2,9 @@ import type { Delivery, InviteDelivery } from "@chelabase/management-client";
 import { RadioGroup } from "@/components/ui/radio-group";
 
 const NO_EMAIL: Record<string, string> = {
-  no_email_provider:
-    "Email isn't set up on this instance, so invites go out as a link you send yourself. To send them by email, add an SMTP provider in Zitadel.",
-  zitadel_unavailable: "Couldn't check whether email is set up, so invites go out as a link for now.",
-  zitadel_not_configured:
-    "This instance has no identity-provider admin access configured, so invites go out as a link.",
+  email_not_configured:
+    "Email isn't set up on this instance, so invites go out as a link you send yourself. To send them by email, configure SMTP for the identity service.",
+  identity_unavailable: "Couldn't check whether email is set up, so invites go out as a link for now.",
 };
 
 export interface DeliveryFieldProps {
@@ -19,7 +17,7 @@ export interface DeliveryFieldProps {
   disabled?: boolean;
 }
 
-/** How the invitee gets the invite: email (when Zitadel can send it) or a one-time link. */
+/** How the invitee gets the invite: email (when the instance can send it) or a one-time link. */
 export function DeliveryField({ info, value, onChange, error, disabled }: DeliveryFieldProps) {
   if (info === undefined) return <p className="text-sm text-chalk-dim">Checking email…</p>;
   const options = [
@@ -30,7 +28,7 @@ export function DeliveryField({ info, value, onChange, error, disabled }: Delive
     <div className="space-y-1.5">
       <RadioGroup inline label="How they get the invite" options={options} value={value} onValueChange={onChange} disabled={disabled} />
       {!info.email_available && (
-        <p className="max-w-[65ch] text-xs text-chalk-dim">{NO_EMAIL[info.reason ?? "no_email_provider"] ?? NO_EMAIL.no_email_provider}</p>
+        <p className="max-w-[65ch] text-xs text-chalk-dim">{NO_EMAIL[info.reason ?? "email_not_configured"] ?? NO_EMAIL.email_not_configured}</p>
       )}
       {error && (
         <p role="alert" className="text-sm text-coral">

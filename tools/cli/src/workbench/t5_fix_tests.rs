@@ -87,7 +87,7 @@ fn a_missing_nextest_still_lets_the_runner_start() {
 // M3: a half-up stack is brought up, not taken as running.
 #[test]
 fn missing_services_are_found() {
-    let running = vec!["gateway".to_string(), "zitadel".to_string(), "worker".to_string()];
+    let running = vec!["gateway".to_string(), "mailpit".to_string(), "worker".to_string()];
     assert_eq!(
         missing_services(&["orchestrator", "worker", "gateway", "studio"], &running),
         ["orchestrator", "studio"]

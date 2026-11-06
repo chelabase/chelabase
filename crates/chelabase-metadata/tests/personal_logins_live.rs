@@ -345,12 +345,12 @@ async fn a_retried_offboarding_still_lists_the_rows() {
         .await
         .unwrap();
     let first = c
-        .revoke_logins_for_zitadel_user(h.t, "alice")
+        .revoke_logins_for_identity_user(h.t, "alice")
         .await
         .unwrap();
     let events = s.events_of(h.t, "personal_logins_revoked").await.len();
     let again = c
-        .revoke_logins_for_zitadel_user(h.t, "alice")
+        .revoke_logins_for_identity_user(h.t, "alice")
         .await
         .unwrap();
     assert_eq!(first.len(), 1);

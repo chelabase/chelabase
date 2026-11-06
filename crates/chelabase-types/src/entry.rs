@@ -6,60 +6,9 @@ use std::net::IpAddr;
 /// The loopback upstreams the gateway reaches by default (`CHELABASE_*_UPSTREAM` override them).
 /// This is the one place they live.
 pub const DEFAULT_STUDIO_UPSTREAM: &str = "http://127.0.0.1:3000";
-pub const DEFAULT_ZITADEL_UPSTREAM: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_DOCS_UPSTREAM: &str = "http://127.0.0.1:3001";
 pub const DEFAULT_LANDING_UPSTREAM: &str = "http://127.0.0.1:3002";
 pub const DEFAULT_MAIL_UPSTREAM: &str = "http://127.0.0.1:8025";
-
-/// Zitadel's upstream: `CHELABASE_ZITADEL_UPSTREAM` (blank = unset), else
-/// [`DEFAULT_ZITADEL_UPSTREAM`]. Reached directly (with the auth host as `Host`) by anything that
-/// runs before the gateway, such as the CLI bootstrap.
-pub fn zitadel_upstream(get: impl Fn(&str) -> Option<String>) -> String {
-    value(&get, "CHELABASE_ZITADEL_UPSTREAM").unwrap_or_else(|| DEFAULT_ZITADEL_UPSTREAM.to_string())
-}
-
-/// Where an app sends its calls to Zitadel (keys and API) (#24).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZitadelAt {
-    /// The URL calls go to, no trailing slash: `CHELABASE_ZITADEL_INTERNAL_URL`, else the issuer.
-    pub base: String,
-    /// The `Host` they carry when `base` is the in-network URL: the public auth host (Zitadel
-    /// picks its instance by Host). `None` when `base` is the issuer itself.
-    pub host: Option<String>,
-}
-
-/// `CHELABASE_ZITADEL_INTERNAL_URL` (blank = unset): Zitadel's address inside the network, an
-/// `http(s)://host[:port]` origin and nothing else (no path, query, fragment or credentials).
-/// The self-hosted install sets it, because behind a TLS proxy with no port in the hosts the
-/// public `https://auth…` URL doesn't reach Zitadel from inside the network. Calls to it carry
-/// the auth host (the issuer's authority) as `Host`. Unset: calls go to the issuer, as before.
-/// The issuer itself (what a token's `iss` must be) never comes from it.
-pub fn zitadel_at(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt, EntryError> {
-    const NAME: &str = "CHELABASE_ZITADEL_INTERNAL_URL";
-    let Some(raw) = value(&get, NAME) else {
-        return Ok(ZitadelAt { base: issuer.trim_end_matches('/').to_string(), host: None });
-    };
-    let bad = |why: &str| EntryError(format!("{NAME} {raw:?} {why}"));
-    let authority = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .ok_or_else(|| bad("must start with http:// or https://"))?;
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    if authority.is_empty() {
-        return Err(bad("has no host"));
-    }
-    validate_host(authority)
-        .map_err(|e| bad(&format!("must be an origin, scheme://host[:port], with no path, query or credentials ({e})")))?;
-    let host = issuer
-        .split_once("://")
-        .map(|(_, rest)| rest.trim_end_matches('/'))
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| EntryError(format!("the issuer {issuer:?} has no host")))?;
-    Ok(ZitadelAt {
-        base: raw.strip_suffix('/').unwrap_or(&raw).to_string(),
-        host: Some(host.to_string()),
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -183,38 +132,6 @@ fn issuer_of(scheme: Scheme, auth_host: &str) -> String {
     format!("{}://{auth_host}", scheme.as_str())
 }
 
-/// P3 for a lookup: the explicit issuer, when set, must equal the derived one.
-fn check_issuer(
-    get: &impl Fn(&str) -> Option<String>,
-    scheme: Scheme,
-    auth_host: Option<&str>,
-) -> Result<(), EntryError> {
-    let explicit = value(get, "CHELABASE_ZITADEL_ISSUER");
-    match (auth_host, explicit) {
-        (Some(host), Some(explicit)) => {
-            let derived = issuer_of(scheme, host);
-            if explicit
-                .strip_suffix('/')
-                .unwrap_or(&explicit)
-                .eq_ignore_ascii_case(&derived)
-            {
-                Ok(())
-            } else {
-                fail(format!(
-                    "CHELABASE_ZITADEL_ISSUER {explicit:?} differs from the issuer {derived:?} \
-                     derived from CHELABASE_AUTH_HOST and CHELABASE_PUBLIC_SCHEME; \
-                     remove CHELABASE_ZITADEL_ISSUER"
-                ))
-            }
-        }
-        (None, Some(_)) => fail(
-            "CHELABASE_ZITADEL_ISSUER is derived from CHELABASE_AUTH_HOST; \
-             set CHELABASE_AUTH_HOST (and remove CHELABASE_ZITADEL_ISSUER)",
-        ),
-        _ => Ok(()),
-    }
-}
-
 fn ip_of(host: &str) -> Option<IpAddr> {
     let name = normalize_host(host);
     let name = name
@@ -255,8 +172,7 @@ impl Entry {
     /// CHELABASE_{DOCS,LANDING,MAIL}_HOST (optional; blank = unset). Refuses: a missing or invalid
     /// host, a host carrying the scheme's default port, a bad scheme, two identical hosts (P1), Studio/API not one site (P2), the removed
     /// CHELABASE_API_HOSTS / CHELABASE_STUDIO_ORIGINS / CHELABASE_STUDIO_URL when non-blank (the
-    /// message names the replacement), and CHELABASE_ZITADEL_ISSUER that differs from the derived
-    /// issuer (P3). Messages name the variable.
+    /// message names the replacement). Messages name the variable.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, EntryError> {
         for (old, new) in REMOVED {
             if value(&get, old).is_some() {
@@ -293,7 +209,6 @@ impl Entry {
         }
 
         check_same_site(&studio, &api)?;
-        check_issuer(&get, scheme, Some(&auth))?;
         Ok(Self {
             scheme,
             studio,
@@ -364,15 +279,13 @@ impl Entry {
     }
 }
 
-/// P3 for services that need only the issuer: None when neither CHELABASE_AUTH_HOST nor
-/// CHELABASE_ZITADEL_ISSUER is set; the derived issuer when the auth host is set (a different
-/// explicit issuer refused); an error naming CHELABASE_AUTH_HOST when only the issuer is set.
+/// P3 for services that need only the issuer: the one derived from `CHELABASE_AUTH_HOST` (and
+/// the public scheme), or `None` when the auth host isn't set.
 pub fn issuer_from_lookup(
     get: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, EntryError> {
     let scheme = scheme_from(&get)?;
     let auth = optional_host(&get, scheme, "CHELABASE_AUTH_HOST")?;
-    check_issuer(&get, scheme, auth.as_deref())?;
     Ok(auth.map(|host| issuer_of(scheme, &host)))
 }
 

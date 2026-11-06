@@ -33,6 +33,17 @@ async fn main() -> anyhow::Result<()> {
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
     let internal_config = InternalConfig::from_env()?;
+    // #119: member tokens signed by auth, and the platform operator's tenant for them.
+    let member_tokens = orchestrator::internal::config::member_tokens(|name| std::env::var(name).ok())?;
+    if member_tokens.is_none() {
+        warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: realtime refuses every member token");
+    }
+    let operator_tenant = orchestrator::internal::config::operator_tenant(|name| std::env::var(name).ok())?;
+    // Review fix 1: how long a member token's session answer is reused.
+    let member_session_window = orchestrator::member_sessions::window(
+        std::env::var("CHELABASE_MEMBER_SESSION_CHECK_SECS").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     // Unset is a startup error (P13); empty means no address rule.
     let member_logins = internal_config.member_logins()?;
     let realtime_logins = internal_config.realtime_logins()?;
@@ -42,17 +53,6 @@ async fn main() -> anyhow::Result<()> {
     internal_config.check_mode(&ModePolicy::new(mode))?;
     if internal_config.dev_defaults.is_on() {
         tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (explicit opt-in)");
-    }
-    // Readiness doesn't wait for the Actions key: the bootstrap needs the orchestrator up to
-    // make the Actions target, and writes the key after. The webhook answers 503 until then.
-    match &internal_config.actions_signing_key {
-        None => tracing::warn!(
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY(_FILE) is not set: the Zitadel Actions webhook answers 503"
-        ),
-        Some(key) => match key.get() {
-            Ok(_) => tracing::info!("the Actions signing key is loaded from {}", key.var()),
-            Err(e) => tracing::info!("{e}; the Actions webhook answers 503 until it is"),
-        },
     }
     let roles = RoleSettings::from_lookup(
         mode,
@@ -125,8 +125,9 @@ async fn main() -> anyhow::Result<()> {
         app_auth_token: internal_config.app_auth_token.clone(),
         app_sessions_token: internal_config.app_sessions_token.clone(),
         app_refresh_ttl: internal_config.app_refresh_ttl,
-        actions_signing_key: internal_config.actions_signing_key.clone(),
-        zitadel: internal_config.load_zitadel(),
+        // Self-hosted runs one tenant, the seeded one: sign-up and the setup claim are its.
+        tenant: chelabase_types::TenantId(chelabase_metadata::DEMO_TENANT_ID),
+        identity: identity_service(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
         setup_code: orchestrator::internal::load_setup_code(
@@ -150,8 +151,7 @@ async fn main() -> anyhow::Result<()> {
         metadata,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: internal_config.realtime_token.clone(),
-            // The gateway's settings (issuer, JWKS URL), the same env names.
-            verifier: chelabase_auth::JwtVerifier::from_env()?,
+            member: member_tokens.clone(),
         },
         rt_events,
         proxy_cache,
@@ -161,10 +161,7 @@ async fn main() -> anyhow::Result<()> {
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest,
         policy: ModePolicy::new(mode),
-        operator_org: std::env::var("CHELABASE_OPERATOR_ORG_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty()),
+        operator_tenant,
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(
@@ -172,10 +169,11 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.stack,
         )?),
         console: Console::default(),
-        zitadel: zitadel_admin(
-            &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
-                .map_err(anyhow::Error::new)?,
-        ),
+        identity_service: identity_service(),
+        member_sessions: Arc::new(orchestrator::member_sessions::MemberSessions::new(
+            identity_service(),
+            member_session_window,
+        )),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
@@ -222,31 +220,13 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
     }
 }
 
-/// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from
-/// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None` (warned) when that is unset or the file can't be
+/// The identity service's client from `CHELABASE_IDENTITY_URL` and
+/// `CHELABASE_IDENTITY_TOKEN_FILE`; `None` (warned) when either is unset or the token can't be
 /// read.
-fn zitadel_admin(at: &chelabase_types::entry::ZitadelAt) -> Option<chelabase_zitadel::client::Zitadel> {
-    let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+fn identity_service() -> Option<chelabase_identity::Identity> {
+    chelabase_identity::Identity::from_env()
+        .inspect_err(|err| warn!("{err}; app users can't be managed"))
         .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    else {
-        warn!("CHELABASE_ZITADEL_ADMIN_PAT_FILE is not set; app users can't be enabled");
-        return None;
-    };
-    match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => {
-            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
-        }
-        Ok(_) => {
-            warn!("{file} is empty; app users can't be enabled");
-            None
-        }
-        Err(err) => {
-            warn!("can't read {file}: {err}; app users can't be enabled");
-            None
-        }
-    }
 }
 
 /// The variable, or `default` when unset or blank.

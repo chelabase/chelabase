@@ -1,13 +1,16 @@
-# The offline checks: `just check` (nextest included) and the doctests `just test` adds, the same
-# commands a contributor runs.
-# Until the repo is public this runs by hand only (Actions minutes are billed on a private repo).
+# The offline checks: `just check-scripts`, `just check-rust` and `just check-web`, the recipes a
+# contributor's `just check` runs. A pull request or a push to main runs the Rust and web checks
+# only for the packages its changes affect (scripts/ci-affected.sh); the nightly run and a manual
+# one run everything. The `ci` job is the required check.
 name: ci
 
 on:
   workflow_dispatch:
-  # enable at launch: uncomment these two lines (the whole change for this workflow)
-  # pull_request:
-  # push: { branches: [main] }
+  pull_request:
+  push: { branches: [main] }
+  # Before live.yml's 03:17.
+  schedule:
+    - cron: "47 2 * * *"
 
 permissions:
   contents: read
@@ -16,26 +19,121 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  check:
-    name: just check, doctests
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      web: ${{ steps.detect.outputs.web }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The detector reads `cargo metadata --no-deps` (no build, no dependencies fetched).
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          cargo -V
+
+      # A pull request against its base; a push to main against the commit main was at before it
+      # (everything when that's unknown or not an ancestor, e.g. the branch's first push);
+      # the nightly and manual runs check everything.
+      - name: Detect
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=""
+          case "$EVENT" in
+            pull_request) base="origin/$BASE_REF" ;;
+            push)
+              if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git merge-base --is-ancestor "$BEFORE" HEAD; then
+                base="$BEFORE"
+              fi
+              ;;
+          esac
+          if [[ -n "$base" ]]; then
+            echo "changes since $base:"
+            git diff --name-only --no-renames "$base...HEAD"
+            scripts/ci-affected.sh "$base" | tee -a "$GITHUB_OUTPUT"
+          else
+            printf 'rust=full\nweb=full\n' | tee -a "$GITHUB_OUTPUT"
+          fi
+
+  scripts:
+    name: check-scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # compose-overlay-equiv.sh compares against an older commit.
+          fetch-depth: 0
+
+      # proto reads .prototools: Rust, moon, node, pnpm, just (and sccache, unused here).
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+
+      - name: Compose version (the compose scripts need 2.30 or newer)
+        run: docker compose version
+
+      # proto's Rust install leaves the toolchain without rustc on the hosted runner, so let
+      # rustup install rust-toolchain.toml's channel and components itself. The scripts run
+      # `cargo metadata` and `cargo generate-lockfile` (no build).
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain uninstall "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" || true
+          rustup toolchain install
+          rustc -vV
+
+      # no-copyleft.sh lists the installed packages' licenses.
+      - name: pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: just check-scripts
+
+  rust:
+    name: check-rust
+    needs: changes
+    if: needs.changes.outputs.rust != 'none'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: System packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang cmake protobuf-compiler postgresql-client jq
 
-      # proto reads .prototools: Rust, moon, node, pnpm, just (and sccache, unused here).
       - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
         with:
           auto-install: true
@@ -45,10 +143,46 @@ jobs:
         with:
           tool: nextest,cargo-deny@0.20.2
 
-      - name: Compose version (just check's compose scripts need 2.30 or newer)
-        run: docker compose version
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain uninstall "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" || true
+          rustup toolchain install
+          rustc -vV
 
+      # One key for every event (shared-key replaces the job-based key), so pull requests
+      # restore main's cache; only main saves, to stay under the repository's cache limit.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: check-rust
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: just check-rust
+        env:
+          RUST: ${{ needs.changes.outputs.rust }}
+        run: |
+          if [[ "$RUST" == full ]]; then
+            just check-rust
+          else
+            # shellcheck disable=SC2086 # one argument per package
+            just check-rust $RUST
+          fi
+
+  web:
+    name: check-web
+    needs: changes
+    if: needs.changes.outputs.web != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
 
       - name: pnpm store path
         id: pnpm-store
@@ -62,8 +196,34 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: just check
+      - name: just check-web
+        env:
+          WEB: ${{ needs.changes.outputs.web }}
+        run: |
+          if [[ "$WEB" == full ]]; then
+            just check-web
+          else
+            # shellcheck disable=SC2086 # one argument per package
+            just check-web $WEB
+          fi
 
-      # `just test` is `cargo nextest run --workspace` (already run by `just check`) plus the
-      # doctests, which nextest doesn't run: only the doctests are left.
-      - run: cargo test --workspace --doc
+  # The required check: fails unless the detector ran and every check it chose passed.
+  ci:
+    name: ci
+    needs: [changes, scripts, rust, web]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SCRIPTS: ${{ needs.scripts.result }}
+          RUST: ${{ needs.rust.result }}
+          WEB: ${{ needs.web.result }}
+        run: |
+          echo "changes=$CHANGES check-scripts=$SCRIPTS check-rust=$RUST check-web=$WEB"
+          [[ "$CHANGES" == success ]] || exit 1
+          for r in "$SCRIPTS" "$RUST" "$WEB"; do
+            [[ "$r" == success || "$r" == skipped ]] || exit 1
+          done

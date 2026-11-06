@@ -1,6 +1,6 @@
 // Usage: node scripts/studio-create-db-check.mjs <studio base url> <email> <password> [persistent]
 //   e.g. node scripts/studio-create-db-check.mjs http://studio.<slug>.chelabase.localhost:8100 \
-//          zitadel-admin@zitadel.auth.<slug>.chelabase.localhost 'Password1!'
+//          dev@chelabase.localhost "$(jq -r .password <stack dir>/bootstrap/dev-member.json)"
 //
 // Studio "Create database" input check, through the real sign-in form, in headless Chromium.
 // Exit 0 (prints OK): typing enables the button and the click sends the create request.

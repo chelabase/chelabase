@@ -2,21 +2,21 @@
 //! login delete, overrides in the member list's filter (MH-22), reset converging like create,
 //! a main without an endpoint refused before anything is written, a custom owner's name,
 //! the role drop asked for on delete, reinstate's side effects, a suspension retry that redoes
-//! only Zitadel (S7), revoke-now's counts, and another tenant's member.
+//! only the identity step (S7), revoke-now's counts, and another tenant's member.
 #![allow(dead_code, unused_imports)]
 
 include!("common/fakes.rs");
 
 use chelabase_metadata::personal_logins::{LoginEndpoint, RevokeReason};
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
 
 /// org-1's tenant with project Billing (database web1, owner `postgres`, main and `dev`) and
-/// Zitadel's mock behind the orchestrator; `alice` and `bob` Developers, `pam` the Admin of
+/// the identity fake behind the orchestrator; `alice` and `bob` Developers, `pam` the Admin of
 /// Billing, each `(member id, sub)`.
 struct E {
     w: MemberWorld,
-    mock: MockZitadel,
+    mock: FakeIdentity,
     alice: (uuid::Uuid, String),
     bob: (uuid::Uuid, String),
     pam: (uuid::Uuid, String),
@@ -27,18 +27,9 @@ async fn world() -> E {
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let mock = MockZitadel::start().await;
-    mock.add_org("org-1");
-    let app = spawn_app_custom(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-    )
+    let mock = FakeIdentity::start().await;
+    mock.with_pool(&Pool::Members);
+    let app = spawn_app_identity(metadata.clone(), jobs.clone(), Some(mock.client()), Arc::new(chelabase_query::app_users::PgUsersDb::new()), None)
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
     let mut db = sample_database(tenant);
@@ -60,7 +51,7 @@ async fn world() -> E {
         jobs,
     };
     let person = |name: &str, role: PlatformRole| {
-        let sub = mock.add_user_in("org-1", &format!("{name}@x.com"), "Secret-pass1", true);
+        let sub = mock.with_user(&Pool::Members, &format!("{name}@x.com"), "Secret-pass1");
         (
             w.metadata
                 .add_granted(w.tenant, &sub, w.project, role, &["app"]),
@@ -385,10 +376,11 @@ async fn reinstate_reconciles_the_members_projects() {
     );
 }
 
-// S7: suspending a suspended member again redoes Zitadel's lock and writes no second event.
+// S7: suspending a suspended member again redoes the identity step (ending the sessions) and
+// writes no second event.
 // (Final round A, T8-3: the side effects, idempotent, run again too; see `final_a.rs`.)
 #[tokio::test]
-async fn a_suspension_retry_redoes_only_the_zitadel_step() {
+async fn a_suspension_retry_redoes_only_the_identity_step() {
     let e = world().await;
     let path = format!("/v1/members/{}/suspend", e.bob.0);
     assert_eq!(
@@ -409,13 +401,13 @@ async fn a_suspension_retry_redoes_only_the_zitadel_step() {
         events,
         "no second event"
     );
-    let locks = e
+    let ends = e
         .mock
         .calls()
         .iter()
-        .filter(|c| **c == format!("POST /v2/users/{}/lock", e.bob.1))
+        .filter(|c| **c == format!("DELETE /internal/v1/pools/members/users/{}/sessions", e.bob.1))
         .count();
-    assert_eq!(locks, 2);
+    assert_eq!(ends, 2);
 }
 
 // P16 (b): `revoked` counts the logins that were live (not one revoked earlier), and

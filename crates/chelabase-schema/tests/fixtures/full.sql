@@ -106,6 +106,7 @@ CREATE TABLE public.users (
   email_verified boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz,
+  banned_at timestamptz,
   nickname text
 );
 CREATE TABLE chelabase.app_users_table (one boolean PRIMARY KEY DEFAULT true CHECK (one),

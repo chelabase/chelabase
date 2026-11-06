@@ -1,0 +1,73 @@
+---
+title: "Identity service"
+description: "Where accounts live: pools, the service boundary, member tokens and how access is revoked."
+---
+
+The identity service (`services/identity`) holds every account Chelabase knows: Studio's members and each project's app users. It is a small Node service built on [Better Auth](https://www.better-auth.com) (MIT), behind a narrow internal JSON API. Nothing outside the stack talks to it: people sign in through `auth`'s login API, and `auth`, the orchestrator and the worker call the identity service on their behalf.
+
+## Pools
+
+Accounts live in **pools**, one Postgres schema each, in the metadata server's database:
+
+| Pool | Schema | Holds | Made by |
+| --- | --- | --- | --- |
+| `members` | `identity_members` | Studio's members, in every tenant | `init-bootstrap`, on install |
+| `app-<project id>` | `identity_app_<hex>` | One project's app users | The worker, when app users are enabled; dropped when app users are disabled or the project is deleted |
+
+A pool has Better Auth's own tables (users, accounts, sessions) plus a table of emailed codes. A user, a session or a code is never valid in another pool: every query is schema-qualified, the connections run with `search_path = pg_catalog` so an unqualified name fails instead of reaching another pool, and a code is bound to its pool's schema.
+
+Members and app users never share a pool, a signing key or a token audience.
+
+## The boundary
+
+- **Not on the gateway.** The service listens on `http://identity:8080` inside the stack's network only. No public host and no gateway route reach it, and computes can't reach it either.
+- **One bearer per caller.** `auth`, the orchestrator, the worker and the bootstrap each present their own token (`tokens/<caller>-identity.token` in the secrets volume), and every route lists the callers it accepts. The orchestrator, for example, may create only invite codes, and only the worker may create or drop an app-user pool.
+- **Its own database role.** The service connects as `chelabase_identity`, which has no `CREATE` on the database and no grant on Chelabase's own schemas. It owns only its pool schemas, which it makes and drops through `SECURITY DEFINER` functions in the `identity_admin` schema that accept nothing but a pool schema name.
+- **Secrets.** `identity/secret` keys the code hashes; `identity/db.password` is the role's password. Both are made once by `init-secrets` and never overwritten.
+
+## Codes and email
+
+Email verification, password reset and invites use six-digit codes:
+
+- one live code per user and kind (`verify`, `reset`, `invite`); a new one replaces the old;
+- verification and reset codes last 15 minutes, invite codes 7 days, though the invite itself expires after 72 hours, which is the limit an invitee meets; each takes at most 5 wrong guesses;
+- a code is stored only as an HMAC-SHA256 under `identity/secret`, bound to the pool, the user, the kind and the user's current email, so changing the email kills every outstanding code;
+- `auth` issues at most 5 verification or reset codes an hour per person and kind. Invite codes come from the orchestrator and are limited there instead, to 5 invite sends (first invites and resends together) an hour per person.
+
+These limits, like `auth`'s other sign-in limits, are kept in each process's memory: they apply per replica, not across replicas, and start again when the service restarts.
+
+With SMTP configured (`CHELABASE_SMTP_*`, see [Install](/self-hosting/install#email)), the identity service mails the code. Without it, nothing is mailed: an admin invites by link instead, and the link carries the code.
+
+## Member sign-in and tokens
+
+1. Studio posts the email and password to `POST /auth/v1/sign-in`. `auth` checks them against the `members` pool and, for an active member, sets the `chelabase_session` cookie: encrypted with `auth/cookie.key`, `HttpOnly`, `SameSite=Strict`, scoped to `/auth/v1`, and `Secure` under https. The cookie seals the identity session and the tenant the person signed in to.
+2. Studio calls `POST /auth/v1/token` with the cookie, its `Origin` and `X-Chelabase-Studio: 1`. `auth` checks that the identity session is live and younger than 30 days and that the membership is active, then signs a **member access token**.
+3. Every Management API call carries that token. Studio keeps it in memory only and asks for a new one before it expires.
+
+A member token is an EdDSA JWT signed with `auth/member-jwt.key`. Its audience is `chelabase-member`, its issuer the auth host (`CHELABASE_AUTH_HOST` with the public scheme), its subject the identity user id, and `tid` the tenant. It lives `CHELABASE_MEMBER_ACCESS_TTL_SECS` (300 seconds by default, 60 to 900). The gateway, the orchestrator and realtime verify it locally with `auth/member-jwt.pub`; there is no key fetch that could fail open. Any other algorithm, key, issuer, audience or claim is refused.
+
+## Revocation
+
+The membership is checked on every request, so removing or suspending someone takes effect on their next request, with no token to wait out. The sign-in session behind a member token is checked too: the orchestrator asks the identity service whether the session is still live and reuses the answer for `CHELABASE_MEMBER_SESSION_CHECK_SECS` (15 seconds by default, 0 to 30; 0 asks on every request). So logout and a password reset cut off a token minted before them within that many seconds on the management API; an open realtime socket loses its channels at their next check (on a token renewal, or every minute) after that. If the identity service can't answer, the request is refused with 503 `identity_unavailable` rather than let through:
+
+- **Removing or declining a member** revokes their personal Postgres logins and ends any open SQL-editor session or realtime socket. A token they already hold gets 404 `not_found` (`GET /v1/me` says `removed`). Their identity sessions end at once unless they are still active in another tenant: then the sessions are kept, which is safe because the session cookie is sealed to the tenant it signed in to. The account is banned only when the person has no other membership that isn't removed (invited, pending, active or suspended).
+- **Suspending** a member refuses every request with 403 `member_suspended` and revokes their logins, and ends their identity sessions unless they are active in another tenant; reinstating lets them back in. A suspended member who tries to sign in gets the generic sign-in failure (401 `invalid_credentials`, the same answer as a wrong password), not a message saying they are suspended. That is deliberate: sign-in never reveals whether an account exists or what state it is in. A password reset doesn't change this.
+- **A password reset** ends every session of the account; member tokens minted from those sessions stop working within seconds.
+- **Logout** revokes the session and clears the cookie; member tokens minted from it stop working within seconds.
+- **An invite accepted again** by a removed member lifts the ban only then, with their own password.
+
+`/auth/v1/token` refuses a session that has ended or a membership that is no longer active, so Studio signs the person out at its next refresh.
+
+## App users
+
+A project's app users sign in through `/auth/v1/app/*` with the project's public key. `auth` runs the same pool operations against `app-<project id>` and signs app tokens with `auth/app-jwt.key` (a different key and audience from member tokens). The worker keeps each branch's `users` table in step with the pool. See [App users](/architecture/app-users).
+
+## Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHELABASE_IDENTITY_URL` | none; Compose sets `http://identity:8080` | Where `auth`, the orchestrator, the worker and the bootstrap reach it |
+| `CHELABASE_IDENTITY_TOKEN_FILE` | per caller | The caller's bearer (`tokens/<caller>-identity.token`) |
+| `CHELABASE_IDENTITY_POOL_CACHE_SIZE` | `256` | Pools kept open in memory |
+| `CHELABASE_SMTP_HOST`, `_PORT`, `_TLS`, `_FROM`, `_USER`, `CHELABASE_SMTP_PASSWORD_PATH` | unset | Outgoing mail; see [Install](/self-hosting/install#email) |
+| `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | Member token lifetime (`auth`), 60 to 900 |

@@ -7331,7 +7331,7 @@ export const getCreateInviteUrl = () => {
 }
 
 /**
- * Matches the email to a person: an existing member just gets the grants, all or none (200); an active user of the organisation who has a password and was never a member becomes an active member (201, `added`, no mail); anyone else, a removed member or a deactivated or passwordless user of the organisation included, gets a Zitadel invite mail with a link to Studio's `/accept-invite` and is `invited` until they accept (201); one who already has a way to sign in (a removed member invited again) gets Zitadel's password-reset mail with the same link marked `reset=1`, since Zitadel makes no invite code for them. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: "link"` (only when the invite makes the Zitadel user, or the user has never had a way to sign in (password, passkey, OTP, U2F, IdP link); else 409 `link_not_allowed`, send by email) nothing is mailed (no email provider needed): the response carries the link as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.
+ * Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: "link"` (only for a new person, or an account with no password and an unverified email that no other tenant holds by an invite or a membership; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.
  * @summary Invite a person
  */
 export const createInvite = async (createInviteRequest: CreateInviteRequest, options?: Parameters<typeof customFetch>[1]): Promise<InviteResult> => {
@@ -7420,7 +7420,7 @@ export const getGetInviteDeliveryUrl = () => {
 }
 
 /**
- * Asks Zitadel whether an email provider is active. Without one, invite by link (`delivery: "link"`). A Zitadel that can't be asked is not an error: the answer is `email_available: false` with the reason.
+ * Asks the identity service whether SMTP is configured. Without it, invite by link (`delivery: "link"`). An identity service that can't be asked is not an error: the answer is `email_available: false` with the reason.
  * @summary Can invites be emailed?
  */
 export const getInviteDelivery = async ( options?: Parameters<typeof customFetch>[1]): Promise<InviteDelivery> => {
@@ -7522,7 +7522,7 @@ export const getRevokeInviteUrl = (inviteId: string,) => {
 }
 
 /**
- * The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.
+ * The member becomes `removed` and its grants go; then the invitee's account is deleted when it never set a password; an account with a password, or one that is still a member of another tenant, is left as it is. Revoking an invite whose member is still removed retries that step.
  * @summary Revoke an invite
  */
 export const revokeInvite = async (inviteId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -7597,7 +7597,7 @@ export const getResendInviteUrl = (inviteId: string,) => {
 }
 
 /**
- * Zitadel mails a new code (the old one stops working), or with `delivery: "link"` (only for an invitee with no way to sign in yet; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. The body may be left out (then `email`).
+ * A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: "link"` (only for an invitee with no password and an unverified email whom no other tenant holds; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).
  * @summary Send an invite again
  */
 export const resendInvite = async (inviteId: string,
@@ -7890,7 +7890,7 @@ export const getRemoveMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.
+ * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end, and when no other tenant holds them at all (an open invite, a pending sign-up or a suspension counts) the account is banned too. While they are an active member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Every step runs even when one fails; removing a removed member again redoes every step after the removal.
  * @summary Remove a member
  */
 export const removeMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8145,7 +8145,7 @@ export const getDeclineMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.
+ * The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked, their account's sessions end when they are an active member of no other tenant, and the account is banned when no other tenant holds them at all. A still-valid token is refused at once. Every step runs even when one fails; declining a removed member again redoes those steps.
  * @summary Decline a sign-up
  */
 export const declineMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8322,7 +8322,7 @@ export const getReinstateMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.
+ * The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. An account banned for any other reason is 409 `conflict` and nothing changes: the member stays suspended until that ban is lifted. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.
  * @summary Reinstate a suspended member
  */
 export const reinstateMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
@@ -8472,7 +8472,7 @@ export const getSuspendMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.
+ * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.
  * @summary Suspend a member
  */
 export const suspendMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
@@ -9338,7 +9338,7 @@ export const getPutAppUsersUrl = (id: string,) => {
 }
 
 /**
- * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's Zitadel org, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
+ * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202), and so does pressing it on a disable on hold (`disabling` with an `error`: its pool still has users), which keeps the pool and its users. Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
  * @summary Enable app users, or change their settings
  */
 export const putAppUsers = async (id: string,
@@ -9428,7 +9428,7 @@ export const getDisableAppUsersUrl = (id: string,) => {
 }
 
 /**
- * Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.
+ * Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.
  * @summary Disable app users
  */
 export const disableAppUsers = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<AppUsersSettings> => {
@@ -10260,7 +10260,7 @@ export const getCreateAppUserUrl = (id: string,) => {
 }
 
 /**
- * Writes the user's row to the users table first (the table's own constraints can refuse it), then creates the Zitadel user, then commits. Columns of your own get their defaults.
+ * Creates the identity user, then writes the user's row to the users table and commits. When the table refuses the row (its own constraints) the identity user is deleted again. Columns of your own get their defaults.
  * @summary Create a user
  */
 export const createAppUser = async (id: string,
@@ -10460,7 +10460,7 @@ export const getDeleteAppUserUrl = (id: string,
 }
 
 /**
- * Deletes the Zitadel user and ends their sessions; the users table's row follows the project's `on_delete` setting.
+ * Ends the user's sessions and deletes the identity user; the users table's row follows the project's `on_delete` setting. The sessions are revoked first, so a `503` still ended them.
  * @summary Delete a user
  */
 export const deleteAppUser = async (id: string,
@@ -10537,8 +10537,8 @@ export const getUpdateAppUserUrl = (id: string,
 }
 
 /**
- * A new password ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. The users table follows through the sync job.
- * @summary Change a user's email or password
+ * Sending `email` ends the user's sessions, also when it's the address they already have, so a retry finishes a change whose answer was an error. A `5xx` for a new address may mean the address changed: send the same request again. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.
+ * @summary Change a user's email
  */
 export const updateAppUser = async (id: string,
     userId: string,
@@ -10606,7 +10606,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type UpdateAppUserMutationVariables = {id: string;userId: string;data: UpdateAppUserRequest}
 
     /**
- * @summary Change a user's email or password
+ * @summary Change a user's email
  */
 export const useUpdateAppUser = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateAppUser>>, TError,UpdateAppUserMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -10629,7 +10629,7 @@ export const getDeactivateAppUserUrl = (id: string,
 }
 
 /**
- * The user can't sign in, and their sessions end.
+ * Bans the user: they can't sign in, and their sessions end. The sessions are revoked first, so a `503` still ended them.
  * @summary Deactivate a user
  */
 export const deactivateAppUser = async (id: string,

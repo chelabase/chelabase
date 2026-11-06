@@ -8,9 +8,8 @@
 //!   HTTP/1 only, and the upgrade check says so in a comment naming it, so enabling h2 refuses
 //!   it there too.
 
-use chelabase_auth::JwtVerifier;
 use chelabase_auth::internal::{InternalSigner, generate_keypair_pem};
-use chelabase_auth::test_support::MockJwks;
+use chelabase_auth::test_support::MemberKeys;
 use chelabase_types::entry::Scheme;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
@@ -28,17 +27,17 @@ use tokio::net::{TcpListener, TcpStream};
 const API: &str = "api.test";
 const STUDIO: &str = "http://studio.test";
 
-async fn gateway() -> (Gateway, MockJwks) {
-    let jwks = MockJwks::start().await;
+async fn gateway() -> (Gateway, MemberKeys) {
+    let jwks = MemberKeys::new();
     let (private_pem, _public) = generate_keypair_pem();
     let pipeline = Pipeline::new(
         Arc::new(SharedRegistry::new(Registry::new([API]))),
         STUDIO.to_string(),
-        JwtVerifier::new(jwks.config(vec![])),
         InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
         Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
         Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
-    );
+    )
+    .with_member_tokens(Some(jwks.verifier()));
     let upstreams = Upstreams::new("http://127.0.0.1:1", "http://127.0.0.1:1").unwrap();
     (
         Gateway::new(pipeline, upstreams, Duration::from_secs(7), Scheme::Http),
@@ -149,7 +148,7 @@ async fn an_http10_request_without_upgrade_is_still_proxied() {
 #[tokio::test]
 async fn the_refused_upgrade_answer_carries_the_routes_cors_headers() {
     let (gw, jwks) = gateway().await;
-    let token = jwks.token_for_org("user-1", "org-1", 300);
+    let token = jwks.token("user-1", uuid::Uuid::from_u128(1), 300);
     let raw = format!(
         "POST /v1/databases HTTP/1.1\r\nHost: {API}\r\nContent-Length: 0\r\nAuthorization: Bearer {token}\r\nOrigin: {STUDIO}\r\n\
          Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
@@ -170,7 +169,7 @@ async fn the_refused_upgrade_answer_carries_the_routes_cors_headers() {
 #[tokio::test]
 async fn the_refused_upgrade_answer_gives_another_origin_no_cors_grant() {
     let (gw, jwks) = gateway().await;
-    let token = jwks.token_for_org("user-1", "org-1", 300);
+    let token = jwks.token("user-1", uuid::Uuid::from_u128(1), 300);
     let raw = format!(
         "POST /v1/databases HTTP/1.1\r\nHost: {API}\r\nContent-Length: 0\r\nAuthorization: Bearer {token}\r\nOrigin: http://evil.example\r\n\
          Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"

@@ -1,7 +1,7 @@
 //! The service: its dependencies, its two listeners and its handle.
 //!
 //! - [`build`]: production dependencies from the [`Config`] (the gateway's verify key file,
-//!   OIDC, NATS, Valkey; T8's change source), then [`build_with`].
+//!   auth's member-token key, NATS, Valkey; T8's change source), then [`build_with`].
 //! - [`Deps::connect`]: the same dependencies with a given identity verifier (the live tests
 //!   sign their own identities: the runner has no gateway key).
 //! - [`build_with`]: binds `config.addr` and `config.internal_addr` (port 0 for an ephemeral
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
-use crate::auth::{OidcVerifier, TokenVerifier};
+use crate::auth::{MemberVerifier, TokenVerifier};
 use crate::bus::{Bus, BusStream, NatsBus};
 use crate::channel::Scope;
 use crate::config::Config;
@@ -61,13 +61,25 @@ pub struct Deps {
 }
 
 impl Deps {
-    /// NATS (`config.nats`), Valkey (`config.valkey`), the OIDC verifier (`config.oidc`) and the
+    /// NATS (`config.nats`), Valkey (`config.valkey`), the member-token verifier and the
     /// change source, with `identity` as the identity verifier.
     pub async fn connect(config: &Config, identity: Arc<InternalVerifier>) -> anyhow::Result<Self> {
-        let oidc = config
-            .oidc
+        let issuer = config
+            .issuer
             .clone()
-            .context("the gateway's OIDC settings (CHELABASE_AUTH_HOST) are required")?;
+            .context("the member tokens' issuer (CHELABASE_AUTH_HOST) is required")?;
+        // #119: auth's member tokens, with the auth host's issuer.
+        let members = config
+            .member_jwt_public_key
+            .as_deref()
+            .map(|path| {
+                chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(path, &issuer)
+                    .map_err(|e| anyhow::anyhow!("CHELABASE_MEMBER_JWT_PUBLIC_KEY: {e}"))
+            })
+            .transpose()?;
+        if members.is_none() {
+            tracing::warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: every member token is refused");
+        }
         let nats = chelabase_nats::connect(&config.nats)
             .await
             .with_context(|| format!("NATS at {}", config.nats.url))?;
@@ -113,7 +125,7 @@ impl Deps {
         .await?;
         Ok(Self {
             identity,
-            verifier: Arc::new(OidcVerifier::new(oidc)),
+            verifier: Arc::new(MemberVerifier::new(members)),
             tickets: valkey.clone(),
             counters: valkey,
             bus,
@@ -183,7 +195,13 @@ impl Shared {
     /// cycle's cached one, so the member's other sockets don't act on a stale answer this
     /// cycle. Only answers about the member's access are kept (not an expired token's, not a
     /// transient `unavailable`).
-    pub fn fresh_answer(&self, sub: &str, target: &AuthTarget, outcome: &AuthorizeOutcome) {
+    pub fn fresh_answer(
+        &self,
+        sub: &str,
+        sid: &str,
+        target: &AuthTarget,
+        outcome: &AuthorizeOutcome,
+    ) {
         if matches!(
             outcome,
             AuthorizeOutcome::Allowed { .. }
@@ -194,7 +212,7 @@ impl Shared {
             self.cycle_cache
                 .lock()
                 .unwrap()
-                .put(sub, target, cycle, outcome.clone());
+                .put(sub, sid, target, cycle, outcome.clone());
         }
     }
 

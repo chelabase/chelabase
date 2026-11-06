@@ -22,9 +22,12 @@ const branchName = (i: number, n: number) => (i === n - 1 ? "staging" : BRANCH_N
 /** The scene's crabs, branches, sun and palms live in the page's centred column; sand and water run full width. */
 const SCENE_MAX = 1240;
 
-/** How many branches fit the column: two on phones, three on desktops (the column caps the width). */
+/**
+ * How many branches fit the column: one on phones, three on desktops (the column caps the width). A phone's one
+ * branch is staging, so it both resets and merges.
+ */
 export function forkCount(contentWidth: number): number {
-  return contentWidth < 700 ? 2 : 3;
+  return contentWidth < 700 ? 1 : 3;
 }
 
 function measure(pts: Pt[]) {
@@ -59,12 +62,31 @@ const toD = (pts: Pt[]) => pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)}
 
 /** The next section's wave edge reaches this far up into the bottom of the scene; nothing is drawn there. */
 const TIDE_PX = 44;
+/** On a phone the Replay row sits on the sand, not beside the trails: nothing is drawn this far up from the bottom. */
+export const CAPTION_PX = 80;
 
-function buildScene(W: number, H: number) {
+/** A name drawn on the sand, placed so its estimated extent stays on screen. */
+export interface Label {
+  text: string;
+  x: number;
+  y: number;
+  anchor: "start" | "middle" | "end";
+  /** Estimated rendered width (Spectral italic), for keeping it on screen. */
+  width: number;
+}
+
+/** Text widths without a layout: Spectral italic runs about half an em per character, a little more in semibold. */
+const textWidth = (text: string, px: number, bold = false) => text.length * px * (bold ? 0.52 : 0.48);
+
+export function buildScene(W: number, H: number) {
   const horizon = H * 0.3;
   const beachTop = H * 0.47;
-  // the part of the beach crabs and names may use: above the incoming tide
-  const floor = H - TIDE_PX;
+  // the centred column everything that moves is laid out in; a phone's column draws everything smaller
+  const L = Math.max(24, (W - SCENE_MAX) / 2);
+  const CW = W - 2 * L;
+  const compact = CW < 700;
+  // the part of the beach crabs and names may use: above the incoming tide (and, on a phone, the Replay row)
+  const floor = H - (compact ? CAPTION_PX : TIDE_PX);
   const mainY = beachTop + (floor - beachTop) * 0.46;
   const yAt = (x: number) => mainY + 5 * Math.sin(x / 150);
 
@@ -72,20 +94,19 @@ function buildScene(W: number, H: number) {
   for (let x = -40; x <= W + 40; x += 16) mainPts.push([x, yAt(x)]);
   const main = measure(mainPts);
 
-  // the centred column everything that moves is laid out in
-  const L = Math.max(24, (W - SCENE_MAX) / 2);
-  const CW = W - 2 * L;
   const n = forkCount(CW);
-  const headX = L + CW * 0.94;
+  // where main's crab stops; a phone keeps the whole crab on screen
+  const headX = L + CW * (compact ? 0.86 : 0.94);
   const trails: Trail[] = [];
   for (let i = 0; i < n; i++) {
-    const fx = L + CW * (0.12 + (i * 0.56) / Math.max(1, n - 1));
+    // a lone branch forks a third of the way along, so its reset and its merge both have room
+    const fx = n === 1 ? L + CW * 0.3 : L + CW * (0.12 + (i * 0.56) / Math.max(1, n - 1));
     const up = i % 2 === 0;
     const by = up ? beachTop + (floor - beachTop) * 0.16 : beachTop + (floor - beachTop) * 0.86;
-    const run = Math.max(90, CW * 0.09);
+    const run = compact ? 56 : Math.max(90, CW * 0.09);
     const bx = fx + run;
     // branches end well short of where main's crab stops, so the two never crowd
-    const ex = Math.min(L + CW * 0.86, bx + Math.max(80, CW * (n > 2 ? 0.1 : 0.16)));
+    const ex = Math.min(L + CW * (compact ? 0.74 : 0.86), bx + (compact ? CW * 0.14 : Math.max(80, CW * (n > 2 ? 0.1 : 0.16))));
     const a: Pt = [fx, yAt(fx)];
     const pts = [...cubic(a, [fx + run * 0.5, a[1]], [bx - run * 0.5, by], [bx, by], 28), [ex, by] as Pt];
     const m = measure(pts);
@@ -102,7 +123,7 @@ function buildScene(W: number, H: number) {
   };
   const headAt = atX(headX);
   // after staging is merged, main's crab walks on a little further
-  const head2At = atX(L + CW * 0.985);
+  const head2At = atX(L + CW * (compact ? 0.93 : 0.985));
   // merge: staging's crab hops from the end of its branch down onto main, just behind main's crab
   const staging = trails[n - 1];
   const e = staging.pts[staging.pts.length - 1];
@@ -113,8 +134,39 @@ function buildScene(W: number, H: number) {
   // main's crab enters just left of the column; the trail before that is main's past, already there
   const startAt = atX(L - 110);
 
-  const sunR = Math.min(190, Math.max(70, H * 0.28));
+  // names: just past each branch's bend, under the trail unless that's below the floor; pulled in from the edge
+  const namePx = compact ? 14 : 17;
+  const keepOnScreen = (l: Omit<Label, "width">, bold = false): Label => {
+    const width = textWidth(l.text, namePx, bold);
+    const right = l.anchor === "end" ? l.x : l.anchor === "middle" ? l.x + width / 2 : l.x + width;
+    return right > W - 6 ? { ...l, x: W - 6, anchor: "end", width } : { ...l, width };
+  };
+  const below = compact ? 24 : 31;
+  const above = compact ? 10 : 14;
+  const branchLabels = trails.map((t) => {
+    const at = t.pts[28];
+    return keepOnScreen({ text: t.name, x: at[0] + 10, y: at[1] + below > floor ? at[1] - above : at[1] + below, anchor: "start" });
+  });
+  const firstFork = trails[0].pts[0];
+  const hopEnd = hopPts[hopPts.length - 1];
+  const labels = {
+    main: keepOnScreen({ text: "main", x: L + 4, y: mainPts[0][1] - 18, anchor: "start" }),
+    branches: branchLabels,
+    reset: keepOnScreen({ text: "reset", x: firstFork[0], y: firstFork[1] + (compact ? 26 : 34), anchor: "middle" }, true),
+    // the full note doesn't fit a phone's column; there the one branch runs above main, so the note sits under the
+    // burrow, on sand nothing else uses
+    merged: keepOnScreen(
+      compact
+        ? { text: "merged into main", x: hopEnd[0], y: hopEnd[1] + 26, anchor: "middle" }
+        : { text: "staging's schema merged into main", x: hopEnd[0], y: hopEnd[1] + 34, anchor: "middle" },
+      true,
+    ),
+  };
+
+  const sunR = compact ? Math.min(64, H * 0.16) : Math.min(190, Math.max(70, H * 0.28));
   return {
+    compact,
+    labels,
     W,
     H,
     floor,
@@ -129,11 +181,12 @@ function buildScene(W: number, H: number) {
     hop,
     trails,
     sun: { cx: L + CW - Math.max(130, CW * 0.15), cy: horizon + sunR * 0.18, r: sunR },
-    crabScale: Math.min(0.5, Math.max(0.3, H / 900)),
+    crabScale: compact ? 0.27 : Math.min(0.5, Math.max(0.3, H / 900)),
   };
 }
 
-const NAME = "font-serif italic text-[17px] transition-opacity ease-design";
+/** The size comes from the scene (smaller on a phone), which places the names by it. */
+const NAME = "font-serif italic transition-opacity ease-design";
 /** A branch's name, in ink on the sand. */
 const BRANCH_NAME = `${NAME} fill-ink duration-400`;
 /** What just happened to a branch (reset, merged), in the claw's dark shell. */
@@ -149,6 +202,9 @@ export function ShoreScene() {
   const id = useId().replace(/:/g, "");
   const box = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1440, h: 460 });
+  // The server can't know the viewport, so its drawing is laid out for a guess; it stays hidden until the box is
+  // measured, or a wide screen paints it shrunk to the middle before it jumps to full width.
+  const [measured, setMeasured] = useState(false);
   const [run, setRun] = useState(0);
 
   useLayoutEffect(() => {
@@ -160,6 +216,7 @@ export function ShoreScene() {
       setSize((s) => (s.w === w && s.h === h ? s : { w, h }));
     };
     read();
+    setMeasured(true);
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(read);
     ro.observe(el);
@@ -296,26 +353,34 @@ export function ShoreScene() {
     return () => cancelAnimationFrame(frame);
   }, [scene, run]);
 
-  const { W, H, L, CW, floor, horizon, beachTop, main, trails, sun, hop } = scene;
+  const { W, H, L, CW, horizon, beachTop, main, trails, sun, hop, compact, labels } = scene;
   const lagoonTop = wave(horizon, W, 4, 90);
   const beachEdge = wave(beachTop, W, 7, 120);
   const fill = (pts: Pt[]) => `${toD(pts)} L ${W + 20} ${H + 20} L -20 ${H + 20} Z`;
-  const palmScale = Math.min(1.35, Math.max(0.55, H / 520));
-  const first = trails[0];
-  const firstFork = first.pts[0];
+  const palmScale = compact ? 0.42 : Math.min(1.35, Math.max(0.55, H / 520));
+  // a phone's palms stand at the top of the sand, clear of main's crab
+  const palmY = compact ? 4 : 26;
+  // a phone's trails are narrower, with finer footprints
+  const trail = compact ? { main: 13, branch: 9, step: 3.5, dot: 2.4, gap: "0.1 7" } : { main: 22, branch: 15, step: 5, dot: 3.5, gap: "0.1 10" };
+  const nameSize = compact ? 14 : 17;
+  const text = (l: Label) => ({ x: l.x, y: l.y, textAnchor: l.anchor, fontSize: nameSize });
 
   return (
     <div
-      className="relative flex-auto min-h-80 -mt-14 [--claw-gap:var(--sand)] max-[560px]:flex-none max-[560px]:h-90 max-[560px]:mt-3"
+      className="relative flex-auto min-h-80 -mt-14 [--claw-gap:var(--sand)] max-[560px]:flex-none max-[560px]:h-100 max-[560px]:mt-3"
       ref={box}
     >
       <svg
-        className="absolute inset-0 block size-full"
+        className={measured ? "absolute inset-0 block size-full" : "absolute inset-0 block size-full invisible"}
         width={W}
         height={H}
         viewBox={`0 0 ${W} ${H}`}
         role="img"
-        aria-label={`Illustration: a crab walks main along the beach while smaller crabs fork off down ${trails.length} branches; one branch then resets, and staging's schema is merged into main, its crab burrowing into the sand.`}
+        aria-label={
+          trails.length === 1
+            ? "Illustration: a crab walks main along the beach while a smaller crab forks off down one branch, staging; staging resets, then its schema is merged into main, its crab burrowing into the sand."
+            : `Illustration: a crab walks main along the beach while smaller crabs fork off down ${trails.length} branches; one branch then resets, and staging's schema is merged into main, its crab burrowing into the sand.`
+        }
       >
         <defs>
           {[main, ...trails, ...(hop ? [hop] : [])].map((t, i) => (
@@ -352,10 +417,10 @@ export function ShoreScene() {
 
         {/* palms */}
         <g color="var(--palm)">
-          <g transform={`translate(${L + CW - 40} ${beachTop + 26}) scale(${palmScale})`}>
+          <g transform={`translate(${L + CW - 40} ${beachTop + palmY}) scale(${palmScale})`}>
             <PalmTree lean={-1} />
           </g>
-          <g transform={`translate(${L + CW - 140} ${beachTop + 18}) scale(${palmScale * 0.78})`}>
+          <g transform={`translate(${L + CW - (compact ? 90 : 140)} ${beachTop + palmY - 8}) scale(${palmScale * 0.78})`}>
             <PalmTree lean={1} />
           </g>
         </g>
@@ -363,49 +428,39 @@ export function ShoreScene() {
         {/* trails: wet sand, then footprints */}
         {[main, ...trails, ...(hop ? [hop] : [])].map((t, i) => (
           <g key={i} mask={`url(#${id}-m${i})`}>
-            <path d={toD(t.pts)} fill="none" stroke="var(--wet-sand)" strokeWidth={i === 0 ? 22 : 15} strokeLinecap="round" strokeLinejoin="round" />
-            <path d={toD(t.pts)} fill="none" stroke="var(--ink)" strokeOpacity={0.55} strokeWidth={3.5} strokeLinecap="round" strokeDasharray="0.1 10" transform="translate(0 -3.5)" />
-            <path d={toD(t.pts)} fill="none" stroke="var(--ink)" strokeOpacity={0.55} strokeWidth={3.5} strokeLinecap="round" strokeDasharray="0.1 10" strokeDashoffset={5} transform="translate(0 3.5)" />
+            <path d={toD(t.pts)} fill="none" stroke="var(--wet-sand)" strokeWidth={i === 0 ? trail.main : trail.branch} strokeLinecap="round" strokeLinejoin="round" />
+            <path d={toD(t.pts)} fill="none" stroke="var(--ink)" strokeOpacity={0.55} strokeWidth={trail.dot} strokeLinecap="round" strokeDasharray={trail.gap} transform={`translate(0 ${-trail.dot})`} />
+            <path d={toD(t.pts)} fill="none" stroke="var(--ink)" strokeOpacity={0.55} strokeWidth={trail.dot} strokeLinecap="round" strokeDasharray={trail.gap} strokeDashoffset={trail.step} transform={`translate(0 ${trail.dot})`} />
           </g>
         ))}
 
         {/* names */}
-        <text x={L + 4} y={main.pts[0][1] - 18} className={BRANCH_NAME}>
-          main
+        <text {...text(labels.main)} className={BRANCH_NAME}>
+          {labels.main.text}
         </text>
-        {trails.map((t, i) => {
-          // name the branch just past its bend, under the trail, clear of where its crab stops
-          const at = t.pts[28];
-          return (
-            <text
-              key={t.name}
-              ref={(el) => {
-                nameRefs.current[i] = el;
-              }}
-              x={at[0] + 10}
-              y={at[1] + 31 > floor ? at[1] - 14 : at[1] + 31}
-              className={BRANCH_NAME}
-            >
-              {t.name}
-            </text>
-          );
-        })}
-        <text ref={resetLabel} x={firstFork[0]} y={firstFork[1] + 34} textAnchor="middle" className={EVENT_NAME} opacity={0}>
-          reset
+        {labels.branches.map((l, i) => (
+          <text
+            key={l.text}
+            ref={(el) => {
+              nameRefs.current[i] = el;
+            }}
+            {...text(l)}
+            className={BRANCH_NAME}
+            // hidden until its crab sets off, so the first frame never flashes every name
+            opacity={0}
+          >
+            {l.text}
+          </text>
+        ))}
+        <text ref={resetLabel} {...text(labels.reset)} className={EVENT_NAME} opacity={0}>
+          {labels.reset.text}
         </text>
 
         {hop && (
           <>
             <ellipse ref={burrow} cx={hop.pts[hop.pts.length - 1][0]} cy={hop.pts[hop.pts.length - 1][1] + 4} rx={14} ry={5} fill="var(--shell-dark)" opacity={0} />
-            <text
-              ref={mergeLabel}
-              x={hop.pts[hop.pts.length - 1][0]}
-              y={hop.pts[hop.pts.length - 1][1] + 34}
-              textAnchor="middle"
-              className={EVENT_NAME}
-              opacity={0}
-            >
-              staging's schema merged into main
+            <text ref={mergeLabel} {...text(labels.merged)} className={EVENT_NAME} opacity={0}>
+              {labels.merged.text}
             </text>
           </>
         )}

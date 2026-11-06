@@ -3,15 +3,14 @@
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
 use chelabase_types::dev_defaults::DevDefaults;
-use chelabase_types::entry::{Scheme, ZitadelAt};
-use chelabase_types::file_value::{FileValue, Sensitivity};
+use chelabase_types::entry::Scheme;
 pub use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Sign-in and sign-up answers take at least this long. It must exceed Zitadel's slowest real
-/// path (password hashing on sign-up, then verifying it for the session; ~0.8 s locally),
+/// Sign-in and sign-up answers take at least this long. It must exceed the identity service's
+/// slowest real path (password hashing on sign-up, then verifying it for the session),
 /// or timing tells existing accounts from unknown ones. `just auth-e2e` checks it live.
 pub const DEFAULT_MIN_RESPONSE_MS: u64 = 1500;
 
@@ -20,15 +19,7 @@ pub struct Config {
     pub listen: String,
     /// The public issuer (what Studio is told; a token's `iss`).
     pub issuer: String,
-    /// Where auth's calls to Zitadel go: `CHELABASE_ZITADEL_INTERNAL_URL` with the auth host as
-    /// `Host`, else the issuer (#24).
-    pub zitadel: ZitadelAt,
-    pub token: String,
     pub cookie_key: SecretKey,
-    /// `CHELABASE_ZITADEL_ORG_ID`, or the file `CHELABASE_ZITADEL_ORG_ID_FILE` names (the
-    /// bootstrap's `org-id`), read on first use: until it is there, every route that needs the
-    /// org answers 503 and `/health` reports not-ready.
-    pub org_id: FileValue,
     /// The first Studio origin; email links point at its pages.
     pub studio_url: String,
     /// What `GET /auth/v1/studio-config` serves.
@@ -41,52 +32,19 @@ pub struct Config {
     pub trusted_proxies: crate::guard::TrustedProxies,
 }
 
-/// Studio's runtime config (`GET /auth/v1/studio-config`): its Zitadel ids, each the variable or
-/// the file `<NAME>_FILE` names (the bootstrap's `studio-client-id` and `project-id`), and the
-/// public URLs. Without both ids (the workbench, whose Studio has its build values) the route
-/// answers 404.
+/// Studio's runtime config (`GET /auth/v1/studio-config`): the public URLs.
 #[derive(Clone, Debug, Default)]
 pub struct StudioSettings {
-    /// `CHELABASE_ZITADEL_STUDIO_CLIENT_ID[_FILE]`: Studio's OIDC client id.
-    pub client_id: Option<FileValue>,
-    /// `CHELABASE_ZITADEL_PROJECT_ID[_FILE]`: the `chelabase` project (the token audience).
-    pub project_id: Option<FileValue>,
     /// The public API base (`<scheme>://<api host>`).
     pub api_url: String,
     /// Studio's public host.
     pub studio_host: String,
 }
 
-/// The bootstrap's ids auth reads: the org (required, now or later) and Studio's two.
-pub struct ZitadelIds {
-    pub org_id: FileValue,
-    pub studio_client_id: Option<FileValue>,
-    pub project_id: Option<FileValue>,
-}
-
-impl ZitadelIds {
-    /// Each id is `NAME` or `NAME_FILE`, never both; the org id is required.
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let id = |name: &str| {
-            FileValue::from_lookup(&get, name, Sensitivity::Public).map_err(anyhow::Error::msg)
-        };
-        let org_id = id("CHELABASE_ZITADEL_ORG_ID")?.with_context(|| {
-            "neither CHELABASE_ZITADEL_ORG_ID nor CHELABASE_ZITADEL_ORG_ID_FILE is set; a self-hosted \
-             stack points CHELABASE_ZITADEL_ORG_ID_FILE at the bootstrap's org-id (it may appear \
-             after auth starts), the workbench sets CHELABASE_ZITADEL_ORG_ID in the stack's zitadel/demo.env"
-        })?;
-        Ok(Self {
-            org_id,
-            studio_client_id: id("CHELABASE_ZITADEL_STUDIO_CLIENT_ID")?,
-            project_id: id("CHELABASE_ZITADEL_PROJECT_ID")?,
-        })
-    }
-}
-
 fn var(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| {
         format!(
-            "{name} is not set; a workbench stack sets it in its stack.env or, after `just zitadel-bootstrap`, in the stack's zitadel/demo.env (`just workbench env` prints the stack.env path)"
+            "{name} is not set; a workbench stack sets it in its stack.env (`just workbench env` prints the path)"
         )
     })
 }
@@ -155,19 +113,9 @@ fn warn_if_open(path: &str) {
     let _ = path;
 }
 
-/// Where auth's Zitadel calls go ([`Config::zitadel`]): `CHELABASE_ZITADEL_INTERNAL_URL` with
-/// the auth host as `Host`, else the issuer; a malformed internal URL stops auth (#24).
-pub fn zitadel_from_lookup(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt> {
-    chelabase_types::entry::zitadel_at(get, issuer).map_err(anyhow::Error::new)
-}
-
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
-        let token_file = var("CHELABASE_AUTH_TOKEN_FILE")?;
-        warn_if_open(&token_file);
-        let token =
-            std::fs::read_to_string(&token_file).with_context(|| format!("read {token_file}"))?;
         let cookie_key_file = var("CHELABASE_AUTH_COOKIE_KEY")?;
         warn_if_open(&cookie_key_file);
         let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
@@ -197,19 +145,12 @@ impl Config {
         )
         .map_err(anyhow::Error::msg)?;
         check_listen(&listen, !trusted_proxies.is_empty())?;
-        let ids = ZitadelIds::from_lookup(|name| std::env::var(name).ok())?;
-        let zitadel = zitadel_from_lookup(|name| std::env::var(name).ok(), &entry.issuer())?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
-            zitadel,
-            token: token.trim().to_string(),
             cookie_key,
-            org_id: ids.org_id,
             studio_url: entry.studio_origin(),
             studio: StudioSettings {
-                client_id: ids.studio_client_id,
-                project_id: ids.project_id,
                 api_url: entry.api_base(),
                 studio_host: entry.studio_host().to_string(),
             },
@@ -228,8 +169,7 @@ impl Config {
 }
 
 /// Settings for app users' flows (`/auth/v1/app/*`). Without the app key pair, the identity
-/// verify key or the admin token file, those routes answer 503 and the platform flows run as
-/// before.
+/// verify key or the compute CA, those routes answer 503 and the platform flows run as before.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppConfig {
     pub private_key: PathBuf,
@@ -239,9 +179,6 @@ pub struct AppConfig {
     pub internal_token: String,
     /// The gateway's identity verify key (tokens with `aud = "auth"`).
     pub verify_key: PathBuf,
-    /// Zitadel's admin token: the login client can't delete users (P32), and a sign-up whose
-    /// commit fails deletes the user it made.
-    pub admin_pat_file: PathBuf,
     /// The platform CA's certificate (`CHELABASE_COMPUTE_CA_FILE`): the app-users sync verifies
     /// every compute's TLS against it (U15).
     pub compute_ca: PathBuf,
@@ -291,23 +228,6 @@ impl AppConfig {
         .map_err(anyhow::Error::msg)
     }
 
-    /// The admin Zitadel client from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`, independent of the app
-    /// keys; `None` (with a warning) when the variable is unset. Accept-invite needs it.
-    pub fn admin_from_env(at: &ZitadelAt) -> Result<Option<crate::zitadel::Zitadel>> {
-        let Some(path) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        else {
-            tracing::warn!(
-                "CHELABASE_ZITADEL_ADMIN_PAT_FILE is not set: accepting invites answers 503"
-            );
-            return Ok(None);
-        };
-        let pat = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        Ok(Some(crate::zitadel::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref())))
-    }
-
     pub fn from_env() -> Result<Option<Self>> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
@@ -329,16 +249,11 @@ impl AppConfig {
         if verify_key.is_none() {
             missing.push("CHELABASE_INTERNAL_VERIFY_KEY");
         }
-        let admin_pat_file = get("CHELABASE_ZITADEL_ADMIN_PAT_FILE");
-        if admin_pat_file.is_none() {
-            missing.push("CHELABASE_ZITADEL_ADMIN_PAT_FILE");
-        }
         let compute_ca = get("CHELABASE_COMPUTE_CA_FILE");
         if compute_ca.is_none() {
             missing.push("CHELABASE_COMPUTE_CA_FILE");
         }
-        let (Some(verify_key), Some(admin_pat_file), Some(compute_ca)) =
-            (verify_key, admin_pat_file, compute_ca)
+        let (Some(verify_key), Some(compute_ca)) = (verify_key, compute_ca)
         else {
             tracing::warn!("app users are off: {} not set", missing.join(" and "));
             return Ok(None);
@@ -361,9 +276,68 @@ impl AppConfig {
             internal_token: internal_token
                 .unwrap_or_else(|| DEFAULT_APP_AUTH_INTERNAL_TOKEN.into()),
             verify_key: verify_key.into(),
-            admin_pat_file: admin_pat_file.into(),
             compute_ca: compute_ca.into(),
         }))
+    }
+}
+
+/// #119: auth's member-token keys (`auth/member-jwt.{key,pub}`) and lifetime.
+#[derive(Debug, Clone)]
+pub struct MemberTokenConfig {
+    /// `CHELABASE_MEMBER_JWT_PRIVATE_KEY`: the PKCS#8 signing key (auth only).
+    pub private_key: PathBuf,
+    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY`: its public half (gives the tokens' `kid`).
+    pub public_key: PathBuf,
+    /// `CHELABASE_MEMBER_ACCESS_TTL_SECS`: 300 unless set, from 60 to 900.
+    pub ttl: Duration,
+}
+
+pub const DEFAULT_MEMBER_ACCESS_TTL_SECS: u64 = chelabase_auth::member_token::MEMBER_DEFAULT_TTL_SECS;
+
+impl MemberTokenConfig {
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Both keys or neither (`None`: auth signs no member tokens); one alone refuses to start.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        const PRIVATE: &str = "CHELABASE_MEMBER_JWT_PRIVATE_KEY";
+        const PUBLIC: &str = "CHELABASE_MEMBER_JWT_PUBLIC_KEY";
+        const TTL: &str = "CHELABASE_MEMBER_ACCESS_TTL_SECS";
+        let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (private_key, public_key) = match (get(PRIVATE), get(PUBLIC)) {
+            (None, None) => return Ok(None),
+            (Some(k), Some(p)) => (PathBuf::from(k), PathBuf::from(p)),
+            (Some(_), None) => anyhow::bail!("{PRIVATE} is set without {PUBLIC}"),
+            (None, Some(_)) => anyhow::bail!("{PUBLIC} is set without {PRIVATE}"),
+        };
+        let max = chelabase_auth::member_token::MEMBER_MAX_TTL_SECS;
+        let ttl = match get(TTL) {
+            None => DEFAULT_MEMBER_ACCESS_TTL_SECS,
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (60..=max).contains(n))
+                .with_context(|| format!("{TTL}={v}: expected seconds from 60 to {max}"))?,
+        };
+        Ok(Some(Self { private_key, public_key, ttl: Duration::from_secs(ttl) }))
+    }
+}
+
+/// #119: auth's identity-service client, from `CHELABASE_IDENTITY_URL` and
+/// `CHELABASE_IDENTITY_TOKEN_FILE` (`tokens/auth-identity.token`): both or neither (`None`);
+/// one alone, or an unreadable or empty token file, refuses to start.
+pub fn identity_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<chelabase_identity::Identity>> {
+    const URL: &str = "CHELABASE_IDENTITY_URL";
+    const TOKEN: &str = "CHELABASE_IDENTITY_TOKEN_FILE";
+    let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match (get(URL), get(TOKEN)) {
+        (None, None) => Ok(None),
+        (Some(url), Some(file)) => chelabase_identity::Identity::from_token_file(&url, std::path::Path::new(&file))
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{TOKEN}: {e}")),
+        (Some(_), None) => anyhow::bail!("{URL} is set without {TOKEN}"),
+        (None, Some(_)) => anyhow::bail!("{TOKEN} is set without {URL}"),
     }
 }
 
@@ -371,23 +345,54 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    // m13 audit N2: how auth builds `Config.zitadel` (sign-in, invites, app users' admin calls).
+    fn member_vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+
+    // #119: the member-token pair is both or neither; the TTL is 300 s unless set, 60..=900.
     #[test]
-    fn zitadel_is_reached_at_the_internal_url_else_the_issuer() {
-        let lookup = |v: Option<&'static str>| {
-            move |k: &str| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.map(str::to_string)).flatten()
-        };
-        let set = zitadel_from_lookup(lookup(Some("http://zitadel:8080")), "https://auth.example.com").unwrap();
-        assert_eq!(set.base, "http://zitadel:8080");
-        assert_eq!(set.host.as_deref(), Some("auth.example.com"));
-        for unset in [None, Some(""), Some("  ")] {
-            let at = zitadel_from_lookup(lookup(unset), "http://auth.chelabase.localhost:8000").unwrap();
-            assert_eq!((at.base.as_str(), at.host), ("http://auth.chelabase.localhost:8000", None), "{unset:?}");
+    fn member_token_config_is_both_keys_and_a_bounded_ttl() {
+        assert!(MemberTokenConfig::from_lookup(member_vars(&[])).unwrap().is_none());
+        let keys = [
+            ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", "/s/auth/member-jwt.key"),
+            ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", "/s/auth/member-jwt.pub"),
+        ];
+        let c = MemberTokenConfig::from_lookup(member_vars(&keys)).unwrap().unwrap();
+        assert_eq!(c.private_key, PathBuf::from("/s/auth/member-jwt.key"));
+        assert_eq!(c.public_key, PathBuf::from("/s/auth/member-jwt.pub"));
+        assert_eq!(c.ttl, Duration::from_secs(300));
+        for (one, missing) in [(keys[0], keys[1].0), (keys[1], keys[0].0)] {
+            let err = MemberTokenConfig::from_lookup(member_vars(&[one])).unwrap_err().to_string();
+            assert!(err.contains(missing), "{err}");
         }
-        for bad in ["zitadel:8080", "http://zitadel:8080/x", "http://u@zitadel"] {
-            let err = zitadel_from_lookup(lookup(Some(bad)), "https://auth.example.com").unwrap_err().to_string();
-            assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {err}");
+        for (ttl, ok) in [("60", true), ("900", true), ("901", false), ("59", false), ("soon", false)] {
+            let mut v = keys.to_vec();
+            v.push(("CHELABASE_MEMBER_ACCESS_TTL_SECS", ttl));
+            let got = MemberTokenConfig::from_lookup(member_vars(&v));
+            assert_eq!(got.is_ok(), ok, "{ttl}");
+            if ok {
+                assert_eq!(got.unwrap().unwrap().ttl.as_secs(), ttl.parse::<u64>().unwrap());
+            }
         }
+    }
+
+    // #119: auth's identity client is the URL and its token file, both or neither.
+    #[test]
+    fn the_identity_client_needs_its_url_and_token_file() {
+        assert!(identity_from_lookup(member_vars(&[])).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth-identity.token");
+        std::fs::write(&file, "tok\n").unwrap();
+        let path: &'static str = Box::leak(file.to_str().unwrap().to_string().into_boxed_str());
+        let both = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", path)];
+        assert!(identity_from_lookup(member_vars(&both)).unwrap().is_some());
+        for (one, missing) in [(both[0], both[1].0), (both[1], both[0].0)] {
+            let err = identity_from_lookup(member_vars(&[one])).unwrap_err().to_string();
+            assert!(err.contains(missing), "{err}");
+        }
+        let gone = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", "/nonexistent/t")];
+        assert!(identity_from_lookup(vars(&gone)).is_err());
     }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -398,11 +403,10 @@ mod tests {
         move |name| map.get(name).cloned()
     }
 
-    const FULL: [(&str, &str); 5] = [
+    const FULL: [(&str, &str); 4] = [
         ("CHELABASE_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
         ("CHELABASE_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
         ("CHELABASE_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
-        ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
         ("CHELABASE_COMPUTE_CA_FILE", "/k/compute-ca/ca.crt"),
     ];
 
@@ -436,39 +440,12 @@ mod tests {
         assert!(AppConfig::check_internal_token(Mode::SelfHosted, DevDefaults::OFF, "a-long-random-secret").is_ok());
     }
 
-    // m5 (AC 3): each id is the variable or the file it names, not both (the error names the
-    // variable); the org id is required in one form.
-    #[test]
-    fn config_refuses_env_and_file_both() {
-        for name in [
-            "CHELABASE_ZITADEL_ORG_ID",
-            "CHELABASE_ZITADEL_STUDIO_CLIENT_ID",
-            "CHELABASE_ZITADEL_PROJECT_ID",
-        ] {
-            let file = format!("{name}_FILE");
-            let mut pairs = vec![("CHELABASE_ZITADEL_ORG_ID", "o1")];
-            pairs.push((name, "the-id"));
-            pairs.push((file.as_str(), "/out/x"));
-            let err = ZitadelIds::from_lookup(vars(&pairs)).err().expect(name).to_string();
-            assert!(err.contains(&format!("{name} ")) && err.contains("not both"), "{name}: {err}");
-        }
-        let err = ZitadelIds::from_lookup(vars(&[])).err().unwrap().to_string();
-        assert!(err.contains("CHELABASE_ZITADEL_ORG_ID_FILE"), "{err}");
-        let ids = ZitadelIds::from_lookup(vars(&[("CHELABASE_ZITADEL_ORG_ID_FILE", "/out/org-id")])).unwrap();
-        assert_eq!(ids.org_id.var(), "CHELABASE_ZITADEL_ORG_ID_FILE");
-        assert!(ids.org_id.get().is_err(), "not written yet: not ready, not an error at startup");
-        assert!(ids.studio_client_id.is_none() && ids.project_id.is_none());
-        let ids = ZitadelIds::from_lookup(vars(&[("CHELABASE_ZITADEL_ORG_ID", "o1")])).unwrap();
-        assert_eq!(ids.org_id.get(), Ok("o1"));
-    }
-
     #[test]
     fn app_config_defaults() {
         let c = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
         assert_eq!(c.access_ttl, Duration::from_secs(900));
         assert_eq!(c.internal_url, "http://127.0.0.1:8083");
         assert_eq!(c.internal_token, "chelabase-dev-app-auth");
-        assert_eq!(c.admin_pat_file, PathBuf::from("/k/admin.pat"));
         let mut more = FULL.to_vec();
         more.push(("CHELABASE_APP_ACCESS_TTL_SECS", "300"));
         more.push(("CHELABASE_INTERNAL_URL", "http://10.0.0.1:9000"));
@@ -478,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_is_off_without_keys_verify_key_or_admin_token() {
+    fn app_config_is_off_without_keys_verify_key_or_compute_ca() {
         assert_eq!(AppConfig::from_vars(vars(&[])).unwrap(), None);
         for (name, _) in FULL {
             let some: Vec<_> = FULL.iter().filter(|(n, _)| *n != name).copied().collect();

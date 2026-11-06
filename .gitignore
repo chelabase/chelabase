@@ -39,6 +39,10 @@ apps/studio/.tanstack/
 # Neon source checkout for `just neon-build`
 infra/neon/.cache/
 
+# Wrangler local state and dev secrets
+.wrangler/
+.dev.vars*
+
 # Playwright MCP snapshots and logs
 .playwright-mcp/
 

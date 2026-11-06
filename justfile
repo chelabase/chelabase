@@ -22,33 +22,21 @@ workbench *args:
     cargo run -q -p chelabase -- workbench "$@"
 
 # Rerun this stack's bootstrap as `workbench up` does: `chelabase-init bootstrap --demo` inside the
-# stack (Zitadel objects, the tenant bind, the demo tenant admin), then the apps' env files
-zitadel-bootstrap admin_email="":
+# stack (the identity service's setup, the dev member on a fresh stack)
+stack-bootstrap admin_email="":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build -q -p init
-    # No address: the stack's own `zitadel-admin@zitadel.<auth host>` (or the pre-W1 name) is used.
+    # No address: dev@chelabase.localhost.
     cargo run -q -p chelabase -- dev bootstrap ${1:+--admin-email "$1"}
 
-# Wipe this stack's Zitadel volume only so FirstInstance rewrites admin.pat
-zitadel-reset:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    set -a
-    # shellcheck disable=SC1090
-    . "$(cargo run -q -p chelabase -- workbench env)"
-    set +a
-    ./scripts/zitadel-reset.sh
-
-# Mint a short-lived demo access token (stdout)
+# A short-lived member access token of this stack's dev member (stdout)
 auth-token:
     #!/usr/bin/env bash
     set -euo pipefail
     set -a
     # shellcheck disable=SC1090
     . "$(cargo run -q -p chelabase -- workbench env)"
-    # shellcheck disable=SC1091
-    [[ ! -f "$CHELABASE_ZITADEL_DIR/demo.env" ]] || . "$CHELABASE_ZITADEL_DIR/demo.env"
     set +a
     cargo run -q -p chelabase -- dev token
 
@@ -56,17 +44,20 @@ auth-token:
 landing-visual *args:
     pnpm --filter @chelabase/landing build && pnpm --filter @chelabase/landing visual "$@"
 
+# Build and deploy the landing page or the docs to Cloudflare from a clean main; `--dry-run` checks
+# the build and upload on any branch without deploying
+site-deploy app *args:
+    scripts/deploy-site.sh {{app}} {{args}}
+
 # --- Demo helpers ---
 
-# POST a demo database using seeded tenant/project IDs + minted JWT access token
+# POST a demo database using seeded tenant/project IDs and the dev member's access token
 create-db-demo name="demo1":
     #!/usr/bin/env bash
     set -euo pipefail
     set -a
     # shellcheck disable=SC1090
     . "$(cargo run -q -p chelabase -- workbench env)"
-    # shellcheck disable=SC1091
-    [[ ! -f "$CHELABASE_ZITADEL_DIR/demo.env" ]] || . "$CHELABASE_ZITADEL_DIR/demo.env"
     set +a
     TOKEN="$(cargo run -q -p chelabase -- dev token)"
     curl -sS -X POST "$CHELABASE_ENTRY_API_URL/v1/databases" \
@@ -102,7 +93,12 @@ deny-install:
 deny:
     cargo deny check advisories
 
-check:
+# Everything CI checks offline: the shell script tests, the Rust checks and the web checks.
+# CI runs the same recipes, each limited to what a pull request affects (scripts/ci-affected.sh).
+check: check-scripts check-rust check-web
+
+# The shell script tests (offline; they need docker compose, cargo and an installed pnpm workspace)
+check-scripts:
     scripts/tests/entry-urls.sh
     scripts/tests/entry-sh.sh
     scripts/tests/stack-urls.sh
@@ -115,34 +111,81 @@ check:
     scripts/tests/compose-secret-boundary.sh
     scripts/tests/compose-no-fixed-secrets.sh
     scripts/tests/compose-env-tunables.sh
-    scripts/tests/compose-zitadel-internal.sh
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
+    scripts/tests/no-copyleft.sh
     scripts/tests/compose-image-pins.sh
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
+    scripts/tests/ci-affected.sh
+
+# cargo-deny, check, clippy, nextest and doctests: the whole workspace, or only the given packages
+# (`just check-rust gateway chelabase-routes`)
+check-rust *packages:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ $# -eq 0 ]]; then
+      sel=(--workspace) doc=(--workspace) no_tests=()
+    else
+      sel=() doc=() no_tests=(--no-tests=warn)
+      libs=" $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(any(.targets[].kind[]; . == "lib" or . == "proc-macro")) | .name' | tr '\n' ' ') "
+      for p in "$@"; do
+        sel+=(-p "$p")
+        # `cargo test --doc -p` fails on a package without a library (init, the CLI).
+        if [[ "$libs" == *" $p "* ]]; then doc+=(-p "$p"); fi
+      done
+    fi
+    set -x
     just deny
-    cargo check --workspace
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo nextest run --workspace
-    pnpm --filter @chelabase/management-client generate
-    pnpm --filter @chelabase/studio generate:login
-    test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
-    pnpm --filter @chelabase/management-client typecheck
-    pnpm --filter @chelabase/management-client test
-    pnpm --filter @chelabase/studio typecheck
-    pnpm --filter @chelabase/studio test
-    pnpm --filter @chelabase/client typecheck
-    pnpm --filter @chelabase/client test
-    pnpm --filter @chelabase/design typecheck
-    pnpm --filter @chelabase/design test
-    pnpm --filter @chelabase/docs typecheck
-    pnpm --filter @chelabase/docs build
-    pnpm --filter @chelabase/docs test
-    pnpm --filter @chelabase/landing typecheck
-    pnpm --filter @chelabase/landing build
-    pnpm --filter @chelabase/landing test
+    cargo check "${sel[@]}"
+    cargo clippy "${sel[@]}" --all-targets -- -D warnings
+    cargo nextest run "${sel[@]}" "${no_tests[@]}"
+    if [[ ${#doc[@]} -gt 0 ]]; then cargo test "${doc[@]}" --doc; fi
+
+# The generated-code check and each web package's typecheck, tests and build: all of them, or only
+# the given pnpm packages (`just check-web @chelabase/design`), always in this order
+check-web *packages:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    all=(@chelabase/management-client @chelabase/studio @chelabase/client @chelabase/design @chelabase/docs @chelabase/landing)
+    want=" ${*:-${all[*]}} "
+    for p in $want; do
+      [[ " ${all[*]} " == *" $p "* ]] || { echo "check-web: $p is not one of: ${all[*]}" >&2; exit 1; }
+    done
+    on() { [[ "$want" == *" $1 "* ]]; }
+    set -x
+    if on @chelabase/management-client || on @chelabase/studio; then
+      pnpm --filter @chelabase/management-client generate
+      pnpm --filter @chelabase/studio generate:login
+      test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
+    fi
+    if on @chelabase/management-client; then
+      pnpm --filter @chelabase/management-client typecheck
+      pnpm --filter @chelabase/management-client test
+    fi
+    if on @chelabase/studio; then
+      pnpm --filter @chelabase/studio typecheck
+      pnpm --filter @chelabase/studio test
+    fi
+    if on @chelabase/client; then
+      pnpm --filter @chelabase/client typecheck
+      pnpm --filter @chelabase/client test
+    fi
+    if on @chelabase/design; then
+      pnpm --filter @chelabase/design typecheck
+      pnpm --filter @chelabase/design test
+    fi
+    if on @chelabase/docs; then
+      pnpm --filter @chelabase/docs typecheck
+      pnpm --filter @chelabase/docs build
+      pnpm --filter @chelabase/docs test
+    fi
+    if on @chelabase/landing; then
+      pnpm --filter @chelabase/landing typecheck
+      pnpm --filter @chelabase/landing build
+      pnpm --filter @chelabase/landing test
+    fi
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests run on the stack with `just workbench test`.
@@ -258,8 +301,8 @@ storage-leak-e2e:
     cargo run -q -p chelabase -- workbench run scripts/storage-leak-e2e.sh
 
 # Live projects and app users story: a project and its database, enable app users, SDK sign-up
-# with data, own-row RLS, a branch gets the rows, a Zitadel email change through the webhook,
-# refresh rotation and reuse, a user deleted, the project deleted with its org
+# with data, own-row RLS, a branch gets the rows, refresh rotation and reuse, a user deleted, the
+# project deleted
 app-users-e2e:
     cargo run -q -p chelabase -- workbench run scripts/app-users-e2e.sh
 
@@ -310,12 +353,12 @@ role-e2e:
 
 # Live members story: an email invite (link from Mailpit) and a link invite, a grant, the SQL editor
 # acting as a group role, revoke, open sign-up and approval (with
-# Mailpit as Zitadel's SMTP provider)
+# Mailpit as the identity service's SMTP server)
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
 
 # Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
-# revocation on grant loss (compute suspended), suspend, revoke-now, Zitadel offboarding, expiry
+# revocation on grant loss (compute suspended), suspend, revoke-now, offboarding, expiry
 personal-logins-e2e:
     cargo run -q -p chelabase -- workbench run scripts/personal-logins-e2e.sh
 

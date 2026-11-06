@@ -345,17 +345,24 @@ pub async fn claim<'a, H: Http>(
         .get("setupRequired")
         .and_then(Value::as_bool)
         .ok_or_else(|| anyhow!("GET /auth/v1/instance: no setupRequired"))?;
+    let not_admin = || {
+        anyhow!(
+            "{} is not this instance's tenant admin: someone else claimed it first ({RESET})",
+            ADA.email
+        )
+    };
     let ada = if setup_required {
-        // `setupRequired` stays true until Ada's first bearer request makes her member row, so
-        // a run that stopped after her sign-up finds her account already there: sign her in
-        // (no write) and sign up only when that is refused. Her `/v1/me` below then claims the
-        // tenant admin through the bound claim, or the check there fails a lost race.
+        // A fresh install. Should Ada's account exist anyway (an older install's account,
+        // or an earlier run whose sign-up wrote nothing else), sign her in (no write) and sign up
+        // only when that is refused. The sign-up binds the claim and makes her the tenant admin
+        // in one step, or leaves her `pending` when someone else holds the claim.
         match s.sign_in(ADA.email, DEMO_PASSWORD).await? {
             SignIn::Token(token) => token,
+            SignIn::Pending => return Err(not_admin()),
             SignIn::Refused => {
                 let code = read_setup_code(cfg)?;
                 writes += 1;
-                let token = s
+                let signed = s
                     .sign_up(
                         ADA.email,
                         DEMO_PASSWORD,
@@ -363,6 +370,9 @@ pub async fn claim<'a, H: Http>(
                         Some(&code),
                     )
                     .await?;
+                let SignIn::Token(token) = signed else {
+                    return Err(not_admin());
+                };
                 writeln!(
                     out,
                     "example: signed up {} with the setup code (the claim is checked next)",
@@ -375,6 +385,7 @@ pub async fn claim<'a, H: Http>(
         // Never a sign-up here: on a claimed instance it could only make a newcomer.
         match s.sign_in(ADA.email, DEMO_PASSWORD).await? {
             SignIn::Token(token) => token,
+            SignIn::Pending => return Err(not_admin()),
             SignIn::Refused => bail!("instance already claimed ({RESET})"),
         }
     };
@@ -382,10 +393,7 @@ pub async fn claim<'a, H: Http>(
         .api(Method::GET, "/v1/me", &ada, None, "GET /v1/me")
         .await?;
     if !active(&me) || me.pointer("/member/tenant_admin") != Some(&json!(true)) {
-        bail!(
-            "{} is not this instance's tenant admin: someone else claimed it first ({RESET})",
-            ADA.email
-        );
+        return Err(not_admin());
     }
     Ok((s, ada, writes))
 }
@@ -436,7 +444,7 @@ pub async fn admit<H: Http>(
             }
             Some(other) => bail!("{} is {other} ({RESET})", p.email),
         };
-        // Their first request makes the invited member active.
+        // The accept made the invited member active.
         let me = s
             .api(Method::GET, "/v1/me", &token, None, "GET /v1/me")
             .await?;
@@ -501,7 +509,7 @@ async fn admit_invited<H: Http>(
         Err(e) if call_error(&e).is_some_and(|c| c.code.as_deref() == Some("link_not_allowed")) => {
             match s.sign_in(p.email, DEMO_PASSWORD).await? {
                 SignIn::Token(token) => Ok(token),
-                SignIn::Refused => bail!(
+                SignIn::Pending | SignIn::Refused => bail!(
                     "{} can sign in, but not with the demo password ({RESET})",
                     p.email
                 ),
@@ -610,18 +618,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crash_after_an_accept_is_finished_by_signing_in() {
+    async fn a_crash_after_an_accept_leaves_the_member_active() {
         let f = Fake::new();
         f.crash_after("POST /auth/v1/accept-invite", 1);
         run(&f).await.unwrap_err();
-        assert_eq!(f.status(PEOPLE[0].email), Some("invited"));
+        assert_eq!(f.status(PEOPLE[0].email), Some("active"));
         run(&f).await.unwrap();
         all_active(&f);
+        assert_eq!(f.count("POST /auth/v1/accept-invite"), PEOPLE.len());
     }
 
-    /// The run dies after `key`'s first call is applied; the claim is bound but Ada has no
-    /// member row yet, so the instance still answers `setupRequired: true`. The rerun signs her
-    /// in (her account exists) instead of signing up again into `409 email_taken`.
+    /// The run dies after `key`'s first call is applied; the sign-up already made Ada the
+    /// tenant admin, so the instance answers `setupRequired: false`. The rerun signs her in
+    /// instead of signing up again into `409 email_taken`.
     async fn a_crash_before_adas_first_request_recovers(key: &str) {
         let f = Fake::new();
         f.crash_after(key, 1);
@@ -629,7 +638,8 @@ mod tests {
         {
             let s = f.0.lock().unwrap();
             assert_eq!(s.claimed_by.as_deref(), Some(ADA.email));
-            assert!(s.members.is_empty(), "{:?}", s.members);
+            assert_eq!(s.members.len(), 1, "{:?}", s.members);
+            assert!(s.members[ADA.email].admin);
         }
         let rerun = run(&f).await;
         assert!(rerun.is_ok(), "{:#}", rerun.unwrap_err());
@@ -641,13 +651,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crash_after_adas_sign_up_before_her_first_request_recovers() {
+    async fn a_crash_after_adas_sign_up_recovers() {
         a_crash_before_adas_first_request_recovers("POST /auth/v1/sign-up").await;
     }
 
     #[tokio::test]
     async fn a_crash_during_adas_token_exchange_recovers() {
-        a_crash_before_adas_first_request_recovers("POST /oauth/v2/token").await;
+        a_crash_before_adas_first_request_recovers("POST /auth/v1/token").await;
     }
 
     #[tokio::test]
@@ -684,7 +694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claim_bound_to_a_human_before_their_first_request_fails() {
+    async fn a_claim_bound_to_a_human_without_a_member_row_fails() {
         let f = Fake::new();
         {
             let mut s = f.0.lock().unwrap();

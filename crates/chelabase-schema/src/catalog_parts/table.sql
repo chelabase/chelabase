@@ -69,7 +69,7 @@
       JOIN pg_type ty ON ty.oid = a.atttypid
       LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
       WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped
-        AND NOT (t.is_users AND a.attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at'))),
+        AND NOT (t.is_users AND a.attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at'))),
     'constraints', (SELECT coalesce(jsonb_agg(jsonb_build_object(
         'oid', k.oid::int8,
         'name', k.conname,
@@ -92,7 +92,7 @@
         AND NOT (t.is_users AND k.conkey IS NOT NULL AND k.conkey <@ ARRAY(
               SELECT ma.attnum FROM pg_attribute ma
               WHERE ma.attrelid = t.oid
-                AND ma.attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at')))),
+                AND ma.attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at')))),
     'indexes', (SELECT coalesce(jsonb_agg(jsonb_build_object(
         'oid', i.indexrelid::int8,
         'name', ic.relname,

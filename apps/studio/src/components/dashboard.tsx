@@ -84,11 +84,10 @@ function Workspace({ me }: { me: Me }) {
   if (tenant === null) {
     return (
       <section className="space-y-2">
-        <h1 className="text-2xl font-semibold">Your organization isn't set up yet</h1>
+        <h1 className="text-2xl font-semibold">Your workspace isn't set up yet</h1>
         <p className="text-muted-foreground">
-          You're signed in (org <code>{me.user.org_id}</code>), but no Chelabase tenant is bound to that
-          organization. Self-hosted: check <code>docker compose logs init-bootstrap</code> and run{" "}
-          <code>docker compose up -d</code> to run it again. Workbench: run <code>just zitadel-bootstrap</code>.
+          You're signed in, but no Chelabase tenant exists for this account yet. Self-hosted: check{" "}
+          <code>docker compose logs init-bootstrap</code> and run <code>docker compose up -d</code> to run it again.
         </p>
       </section>
     );

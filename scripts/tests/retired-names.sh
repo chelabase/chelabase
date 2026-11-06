@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # W2 end-of-step review: nothing outside history, the migration and the guards still names the
-# retired one-stack machinery (the host app tier, the live queue, the shared Zitadel dir, Studio's
+# retired one-stack machinery (the host app tier, the live queue, Studio's
 # symlinked env file) or a port the workbench no longer publishes.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -11,7 +11,7 @@ mapfile -t files < <(git ls-files ':!docs/superpowers/**' ':!docs/roadmap/**' \
   ':!pnpm-lock.yaml')
 bad=0
 for pat in 'just (dev|live|deps-up|deps-down|deps-ps|dev-down|stop|worker|orchestrator)\b' \
-  '\.chelabase/zitadel' '\.chelabase/dev' '\.chelabase/live' 'apps/studio/\.env\.local' \
+  '\.chelabase/dev' '\.chelabase/live' 'apps/studio/\.env\.local' \
   '127\.0\.0\.1:4444' 'live\.sh' 'internal-addr\.sh'; do
   if hits="$(grep -nIE "$pat" "${files[@]}")"; then
     echo "retired-names: $pat" >&2

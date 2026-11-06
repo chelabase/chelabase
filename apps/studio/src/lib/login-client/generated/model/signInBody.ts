@@ -6,7 +6,6 @@
  */
 
 export interface SignInBody {
-  authRequest: string;
   email: string;
   password: string;
 }

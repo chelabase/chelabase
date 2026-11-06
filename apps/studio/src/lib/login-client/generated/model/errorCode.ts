@@ -14,7 +14,7 @@ export type ErrorCode = typeof ErrorCode[keyof typeof ErrorCode];
 export const ErrorCode = {
   unauthorized: 'unauthorized',
   forbidden: 'forbidden',
-  tenant_not_bound: 'tenant_not_bound',
+  tenant_required: 'tenant_required',
   not_found: 'not_found',
   method_not_allowed: 'method_not_allowed',
   invalid_request: 'invalid_request',
@@ -99,8 +99,6 @@ export const ErrorCode = {
   member_role_reconcile_failed: 'member_role_reconcile_failed',
   link_not_allowed: 'link_not_allowed',
   signup_pending: 'signup_pending',
-  email_ambiguous: 'email_ambiguous',
-  email_in_use_elsewhere: 'email_in_use_elsewhere',
   invite_closed: 'invite_closed',
   permission_denied: 'permission_denied',
   dependents_changed: 'dependents_changed',
@@ -118,4 +116,5 @@ export const ErrorCode = {
   member_offboarded: 'member_offboarded',
   invalid_successor: 'invalid_successor',
   exposure_unconfirmed: 'exposure_unconfirmed',
+  identity_unavailable: 'identity_unavailable',
 } as const;

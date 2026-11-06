@@ -1,5 +1,5 @@
 //! The socket tests' harness: realtime in-process (`app::build_with`) on ephemeral loopback
-//! ports with the in-memory store and bus, the fake change source, the fake OIDC verifier, a
+//! ports with the in-memory store and bus, the fake change source, the fake member-token verifier, a
 //! gateway identity signer of the test's own and a fake orchestrator serving T6's
 //! `/internal/realtime/{authorize,projects}` answers. Several instances share the store, the bus
 //! and the orchestrator, as instances share Valkey, NATS and the orchestrator.
@@ -44,7 +44,6 @@ pub const TENANT: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00
 pub const PROJECT: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0002);
 pub const DB: Uuid = Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111);
 pub const BR: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
-pub const ORG: &str = "org-1";
 pub const BEARER: &str = "rt-internal-test-token";
 
 pub fn loopback() -> SocketAddr {
@@ -58,19 +57,30 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-/// A member token for `sub` in [`ORG`], expiring in `exp_in` seconds.
+/// A member token for `sub` in [`TENANT`], expiring in `exp_in` seconds.
 pub fn token(sub: &str, exp_in: i64) -> String {
-    token_in(sub, ORG, exp_in)
+    token_in(sub, TENANT, exp_in)
 }
 
-pub fn token_in(sub: &str, org: &str, exp_in: i64) -> String {
+pub fn token_in(sub: &str, tenant: Uuid, exp_in: i64) -> String {
+    token_session(sub, tenant, &format!("sid-{sub}"), exp_in)
+}
+
+/// A member token for `sub` in `tenant` from identity session `sid`.
+pub fn token_session(sub: &str, tenant: Uuid, sid: &str, exp_in: i64) -> String {
     FakeVerifier::token(&MemberToken {
         sub: sub.into(),
-        org_id: org.into(),
+        tenant_id: Some(tenant),
+        sid: sid.into(),
         exp: (now() as i64 + exp_in) as u64,
         name: Some(format!("Name {sub}")),
         email: Some(format!("{sub}@example.com")),
     })
+}
+
+/// The session a fake token names.
+pub fn sid_of(token: &str) -> Option<String> {
+    FakeVerifier::decode(token).map(|t| t.sid)
 }
 
 /// The sub a fake token names.
@@ -234,6 +244,8 @@ pub struct Harness {
     signer: InternalSigner,
     verify_pem: String,
     rt: Option<Realtime>,
+    /// #119: the instances' token verifier instead of [`Self::verifier`] (the real one).
+    token_verifier: Option<Arc<dyn realtime::auth::TokenVerifier>>,
 }
 
 impl Harness {
@@ -243,6 +255,18 @@ impl Harness {
 
     /// One instance; `tune` adjusts its config (timings, limits) before it starts.
     pub async fn start_with(tune: impl FnOnce(&mut Config)) -> Self {
+        Self::start_full(tune, None).await
+    }
+
+    /// #119: one instance whose `auth` frames are checked by `verifier` (the production one).
+    pub async fn start_verifying(verifier: Arc<dyn realtime::auth::TokenVerifier>) -> Self {
+        Self::start_full(|_| {}, Some(verifier)).await
+    }
+
+    async fn start_full(
+        tune: impl FnOnce(&mut Config),
+        token_verifier: Option<Arc<dyn realtime::auth::TokenVerifier>>,
+    ) -> Self {
         let (signing_pem, verify_pem) = generate_keypair_pem();
         let key = TicketKey::generate();
         let orch = FakeOrchestrator::start().await;
@@ -263,6 +287,7 @@ impl Harness {
             signer: InternalSigner::from_pem(signing_pem.as_bytes()).unwrap(),
             verify_pem,
             rt: None,
+            token_verifier,
         };
         let rt = h.instance(|_| {}).await;
         h.rt = Some(rt);
@@ -277,7 +302,10 @@ impl Harness {
         tune(&mut config);
         let deps = Deps {
             identity: Arc::new(InternalVerifier::from_pem(self.verify_pem.as_bytes()).unwrap()),
-            verifier: self.verifier.clone(),
+            verifier: match &self.token_verifier {
+                Some(v) => v.clone(),
+                None => self.verifier.clone(),
+            },
             tickets: self.store.clone(),
             counters: self.store.clone(),
             bus: self.bus.clone(),
@@ -294,18 +322,20 @@ impl Harness {
         self.rt.take().unwrap()
     }
 
-    /// A gateway identity for `sub` in `org`, minted for realtime.
-    pub fn identity(&self, sub: &str, org: &str) -> String {
+    /// #119: the gateway identity for a member token of `sub` naming `tenant`, minted for
+    /// realtime.
+    pub fn identity(&self, sub: &str, tenant: Uuid) -> String {
         let identity = Identity {
             sub: sub.into(),
-            org_id: org.into(),
             auth: AuthMethod::ManagementJwt,
             request_id: format!("rid-{}", Uuid::new_v4()),
             data: None,
             email: Some(format!("{sub}@example.com")),
             name: Some(format!("Name {sub}")),
         };
-        self.signer.sign("realtime", &identity).unwrap()
+        self.signer
+            .sign_for_tenant("realtime", &identity, tenant, &format!("sid-{sub}"))
+            .unwrap()
     }
 
     /// `POST /v1/realtime/tickets` on `rt` with these headers: (status, headers, body).
@@ -326,13 +356,15 @@ impl Harness {
         (status, headers, body)
     }
 
-    /// A Studio ticket for `sub` in [`ORG`] from the first instance.
+    /// A Studio ticket for `sub` in [`TENANT`] from the first instance.
     pub async fn ticket(&self, sub: &str) -> String {
-        self.ticket_on(self.rt(), sub, ORG).await
+        self.ticket_on(self.rt(), sub, TENANT).await
     }
 
-    pub async fn ticket_on(&self, rt: &Realtime, sub: &str, org: &str) -> String {
-        let (status, _, body) = self.post_ticket(rt, Some(&self.identity(sub, org))).await;
+    pub async fn ticket_on(&self, rt: &Realtime, sub: &str, tenant: Uuid) -> String {
+        let (status, _, body) = self
+            .post_ticket(rt, Some(&self.identity(sub, tenant)))
+            .await;
         assert_eq!(status, 201, "ticket for {sub}: {body}");
         body["ticket"].as_str().expect("a ticket").to_string()
     }
@@ -341,7 +373,7 @@ impl Harness {
     pub async fn app_ticket(&self, key_id: Uuid) -> String {
         let identity = TicketIdentity {
             sub: key_id.to_string(),
-            org_id: String::new(),
+            tenant_id: None,
             auth: AuthMethod::DataKey,
             email: None,
             name: None,
@@ -404,7 +436,7 @@ impl Harness {
     }
 
     pub async fn authed_on(&self, rt: &Realtime, sub: &str) -> Ws {
-        let ticket = self.ticket_on(rt, sub, ORG).await;
+        let ticket = self.ticket_on(rt, sub, TENANT).await;
         let mut ws = Self::open(rt, &ticket).await;
         ws.send(json!({"type": "auth", "token": token(sub, 3600)}))
             .await;
