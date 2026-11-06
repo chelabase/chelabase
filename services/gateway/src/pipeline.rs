@@ -302,11 +302,17 @@ impl Pipeline {
             return None;
         };
         if endpoint.policy.cors == Cors::Any {
+            // An upload URL is PUT from the app's own origin, its token the credential.
+            let methods = if endpoint.name == chelabase_routes::storage::SIGNED_UPLOAD.name {
+                "PUT"
+            } else {
+                "GET, POST"
+            };
             return Some(GatewayResponse {
                 status: 204,
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
-                    ("access-control-allow-methods", "GET, POST".to_string()),
+                    ("access-control-allow-methods", methods.to_string()),
                     ("access-control-allow-headers", "authorization, content-type, chelabase-user".to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
@@ -1512,6 +1518,35 @@ mod tests {
         }
         assert!(statuses.contains(&(429, Some("rate_limited".to_string()))));
         assert!(h.mock.lookups() <= 25, "{}", h.mock.lookups());
+    }
+
+    /// m6 follow-up: a browser on any origin may PUT through an upload URL (the token is the
+    /// credential); every other any-origin route still answers `GET, POST`.
+    #[tokio::test]
+    async fn cors_any_preflight_allows_put_through_an_upload_url() {
+        let h = data_harness().await;
+        for (path, method, allowed) in [
+            ("/storage/v1/object/upload/sign/files/a%20b.png", "PUT", "PUT"),
+            ("/storage/v1/object/upload/sign/files/a.png", "POST", "GET, POST"),
+            ("/storage/v1/upload/session/s1/1", "PUT", "GET, POST"),
+        ] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[("origin", "https://app.example"), ("access-control-request-method", method)],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(resp.status, 204, "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"), "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some(allowed), "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
+        }
+        assert_eq!(h.mock.lookups(), 0, "preflight does no auth");
     }
 
     #[tokio::test]
