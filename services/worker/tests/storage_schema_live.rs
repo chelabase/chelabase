@@ -2989,9 +2989,11 @@ async fn storage_multipart_destination_limits_live() {
     .await;
 }
 
-/// AC 6: the storage service in this process with a 150 MiB cap on upload memory: a part
-/// with no declared length holds up to 100 MiB while it streams, so a second one is 503
-/// `busy` at once; once the first is done, the next is taken.
+/// AC 6: the storage service in this process with a 6 MiB cap on upload memory. A part
+/// holds only the bytes it has sent (m7 re-audit S2): while a slow 5 MiB part streams, a small
+/// part is still taken (nothing is held up front, so a trickling client can't pin a part's
+/// worth), but a 5 MiB part that doesn't fit beside it is 503 `busy`; once the first is
+/// done, it is taken.
 #[tokio::test]
 #[ignore = "needs the workbench stack"]
 async fn storage_multipart_memory_cap_live() {
@@ -2999,7 +3001,7 @@ async fn storage_multipart_memory_cap_live() {
         let fx = &*fx;
         objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
         let store = Arc::new(FailingStore::default());
-        let (base, token) = in_process_storage_with(store, fx.main, storage::limits::InFlight::new(150 * MIB)).await;
+        let (base, token) = in_process_storage_with(store, fx.main, storage::limits::InFlight::new(6 * MIB)).await;
         let call = |method: &'static str, path: String, body: reqwest::Body| {
             let (base, token) = (base.clone(), token.clone());
             async move {
@@ -3019,18 +3021,27 @@ async fn storage_multipart_memory_cap_live() {
         let id = b["id"].as_str().unwrap().to_string();
         let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let past = Arc::new(tokio::sync::Notify::new());
-        // 5 MiB at about 3 MiB/s, chunked: the server holds its 100 MiB while it reads.
+        // 5 MiB at about 3 MiB/s, chunked: the server holds what it has read so far.
         let slow = counted_body(5 * MIB, Duration::from_millis(20), sent, 2 * MIB, past.clone());
-        let (first, second) = tokio::join!(
-            call("PUT", format!("/storage/v1/upload/session/{id}/1"), slow),
-            async {
-                past.notified().await;
-                call("PUT", format!("/storage/v1/upload/session/{id}/2"), reqwest::Body::wrap_stream(futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; 1024]))]))).await
-            },
-        );
+        let chunked = |n: usize| reqwest::Body::wrap_stream(futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; n]))]));
+        // Bounded: if the first part were refused at once, its mark would never come.
+        let (first, (small, big)) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                call("PUT", format!("/storage/v1/upload/session/{id}/1"), slow),
+                async {
+                    past.notified().await;
+                    let small = call("PUT", format!("/storage/v1/upload/session/{id}/2"), chunked(1024)).await;
+                    let big = call("PUT", format!("/storage/v1/upload/session/{id}/3"), chunked(5 * MIB)).await;
+                    (small, big)
+                },
+            )
+        })
+        .await
+        .expect("the first part never reached 2 MiB: it was refused or stalled");
         assert_eq!(first.0, 200, "{}", first.1);
-        assert_eq!((second.0, second.1["error"]["code"].clone()), (503, json!("busy")), "{}", second.1);
-        let (status, b) = call("PUT", format!("/storage/v1/upload/session/{id}/2"), reqwest::Body::from(vec![1u8; 1024])).await;
+        assert_eq!(small.0, 200, "{}", small.1);
+        assert_eq!((big.0, big.1["error"]["code"].clone()), (503, json!("busy")), "{}", big.1);
+        let (status, b) = call("PUT", format!("/storage/v1/upload/session/{id}/3"), chunked(5 * MIB)).await;
         assert_eq!(status, 200, "{b}");
         assert_eq!(call("DELETE", format!("/storage/v1/upload/session/{id}"), reqwest::Body::from(Vec::new())).await.0, 204);
     }))
@@ -3276,7 +3287,7 @@ async fn streamed(base: &str, token: &str, method: &str, path: &str, body: reqwe
     }
 }
 
-/// B1 (in-process: the stack's service predates the fix): HTML after 600 spaces, or after a
+/// B1 (in-process, with a 1 s idle period): HTML after 600 spaces, or after a
 /// UTF-8 BOM and whitespace, declared as `image/png` into an `image/*` bucket is 415 as a
 /// single upload and as part 1 alike; nothing is stored.
 #[tokio::test]

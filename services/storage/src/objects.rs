@@ -533,13 +533,11 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     limits.check_declared(&row.content_type)?;
     let (expected, datoid) = state.precheck(&data, &at, &row, upsert, &rid).await?;
     row.datoid = datoid;
-    // The body's buffer (at most one stream part) comes out of the process's cap: 503 `busy`.
+    // The body's buffer (at most one stream part) comes out of the process's cap as its bytes
+    // arrive: 503 `busy` past it. A body that stalls fails the request (408), which frees it.
     let stream_part = chelabase_storage::STREAM_PART_SIZE as u64;
-    let _buffer = state
-        .inflight
-        .reserve(declared.map_or(stream_part, |d| (d.max(0) as u64).min(stream_part)))?;
-    // A body that stalls fails the request (408), which frees the reservation.
-    let (mut body, stalled) = until_idle(request.into_data_stream(), state.inflight.body_idle());
+    let (body, stalled) = until_idle(request.into_data_stream(), state.inflight.body_idle());
+    let (mut body, held) = state.inflight.metered(body, stream_part);
     if limits.sniffs() {
         let (head, again) = peek(body).await.map_err(|e| e.failure())?;
         limits.check_sniffed(&head)?;
@@ -561,6 +559,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         Staged::Store(_) if stalled.load(Ordering::SeqCst) => {
             Failure::body_stalled(state.inflight.body_idle())
         }
+        Staged::Store(_) if held.refused() => Failure::busy(),
         Staged::Store(e) => Failure::from_store(&e, &rid),
     })?;
     row.size = Some(meta.size as i64);

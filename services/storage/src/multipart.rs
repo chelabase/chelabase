@@ -548,13 +548,11 @@ pub async fn upload_part<S: ConnSource, M: ConnSource>(
     if declared.is_some_and(|d| d > budget) {
         return Err(over(budget, limit));
     }
-    // The whole part is held: its bytes come out of the process's cap first (503 `busy`).
-    let _buffer = state
-        .inflight
-        .reserve(declared.unwrap_or(budget).min(budget))?;
     let mut buf = BytesMut::new();
-    // A body that stalls fails the part (408), which frees the reservation.
-    let (mut body, _) = until_idle(request.into_data_stream(), state.inflight.body_idle());
+    // The whole part is held: its bytes come out of the process's cap as they arrive (503
+    // `busy` past it). A body that stalls fails the part (408), which frees its share.
+    let (body, _) = until_idle(request.into_data_stream(), state.inflight.body_idle());
+    let (mut body, _held) = state.inflight.metered(body, budget);
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| e.failure())?;
         if (buf.len() + chunk.len()) as u64 > budget {

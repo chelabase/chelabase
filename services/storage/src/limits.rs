@@ -160,11 +160,13 @@ pub async fn peek<E: Send + 'static>(
 /// (`CHELABASE_STORAGE_BODY_IDLE_SECS`).
 pub const DEFAULT_BODY_IDLE: Duration = Duration::from_secs(60);
 
-/// A request body's failure: the client's own, or no bytes for the idle period.
+/// A request body's failure: the client's own, no bytes for the idle period, or no room in
+/// the in-flight cap for the bytes it sent ([`InFlight::metered`]).
 #[derive(Debug)]
 pub enum BodyError {
     Stalled(Duration),
     Client(String),
+    Busy,
 }
 
 impl std::fmt::Display for BodyError {
@@ -172,15 +174,18 @@ impl std::fmt::Display for BodyError {
         match self {
             BodyError::Stalled(idle) => write!(f, "no bytes for {} s", idle.as_secs_f64()),
             BodyError::Client(e) => f.write_str(e),
+            BodyError::Busy => f.write_str("too many uploads in flight"),
         }
     }
 }
 
 impl BodyError {
-    /// 408 `request_timeout` for a stalled body, else 400 `invalid_request`.
+    /// 408 `request_timeout` for a stalled body, 503 `busy` past the cap, else 400
+    /// `invalid_request`.
     pub fn failure(&self) -> Failure {
         match self {
             BodyError::Stalled(idle) => Failure::body_stalled(*idle),
+            BodyError::Busy => Failure::busy(),
             BodyError::Client(e) => Failure::invalid_request(format!("the request body: {e}")),
         }
     }
@@ -219,14 +224,30 @@ pub fn until_idle<E: std::fmt::Display + Send + 'static>(
 
 /// The per-process cap on upload buffers (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`): a part is
 /// held whole in memory while it goes to the store, and a single upload holds up to one
-/// stream part. Past the cap a request is 503 `busy` at once, before its body is read. A
-/// reservation lasts as long as its request, and a request whose body delivers nothing for
-/// [`InFlight::body_idle`] fails ([`until_idle`]): an idle client can't hold the cap.
+/// stream part. A body takes its share as its bytes arrive ([`InFlight::metered`]), so a
+/// client holds only what it has sent: a slow or trickling client can't pin a whole part's
+/// worth. A body that needs more than is free fails 503 `busy`. A share lasts as long as its
+/// request, and a body that delivers nothing for [`InFlight::body_idle`] fails
+/// ([`until_idle`]).
 #[derive(Clone)]
 pub struct InFlight {
     permits: Arc<Semaphore>,
     capacity: usize,
     body_idle: Duration,
+}
+
+/// A request's share of the in-flight cap ([`InFlight::metered`]), freed on drop.
+#[derive(Clone)]
+pub struct Held {
+    permit: Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>,
+    refused: Arc<AtomicBool>,
+}
+
+impl Held {
+    /// Whether the body failed for want of room in the cap.
+    pub fn refused(&self) -> bool {
+        self.refused.load(Ordering::SeqCst)
+    }
 }
 
 impl InFlight {
@@ -260,6 +281,52 @@ impl InFlight {
             .clone()
             .try_acquire_many_owned(n)
             .map_err(|_| Failure::busy())
+    }
+
+    /// `body`, taking each chunk's bytes from the cap as it arrives, up to `hold` in all (what
+    /// the request can have in memory at once). A chunk that doesn't fit fails the body with
+    /// [`BodyError::Busy`] and ends it. The share is held while the returned [`Held`] lives.
+    pub fn metered(
+        &self,
+        body: BoxStream<'static, Result<Bytes, BodyError>>,
+        hold: u64,
+    ) -> (BoxStream<'static, Result<Bytes, BodyError>>, Held) {
+        let held = Held {
+            permit: Arc::new(std::sync::Mutex::new(None)),
+            refused: Arc::new(AtomicBool::new(false)),
+        };
+        let share = held.clone();
+        let permits = self.permits.clone();
+        let stream = futures_util::stream::unfold(Some((body, 0u64)), move |state| {
+            let (share, permits) = (share.clone(), permits.clone());
+            async move {
+                let (mut body, taken) = state?;
+                match body.next().await? {
+                    Ok(chunk) => {
+                        let want = (taken + chunk.len() as u64).min(hold) - taken;
+                        if want > 0 {
+                            let got = u32::try_from(want)
+                                .ok()
+                                .and_then(|n| permits.try_acquire_many_owned(n).ok());
+                            let Some(got) = got else {
+                                share.refused.store(true, Ordering::SeqCst);
+                                return Some((Err(BodyError::Busy), None));
+                            };
+                            let mut slot = share.permit.lock().unwrap_or_else(|e| e.into_inner());
+                            match slot.as_mut() {
+                                Some(p) => p.merge(got),
+                                None => *slot = Some(got),
+                            }
+                        }
+                        Some((Ok(chunk), Some((body, taken + want))))
+                    }
+                    Err(e) => Some((Err(e), None)),
+                }
+            }
+        })
+        .fuse()
+        .boxed();
+        (stream, held)
     }
 
     /// Bytes free now (tests).
@@ -515,6 +582,46 @@ mod tests {
         assert!(failed.next().await.unwrap().is_err());
         assert!(failed.next().await.is_none());
         assert!(failed.next().await.is_none());
+    }
+
+    /// m7 re-audit S2: a body holds only the bytes it has sent (up to `hold`), so a client
+    /// that trickles bytes holds what it sent, not a whole part. A body that needs more than
+    /// is free fails 503 `busy`, and the share returns when the handle drops.
+    #[tokio::test]
+    async fn the_cap_grows_with_the_bytes_received() {
+        let cap = InFlight::new(100);
+        let idle = Duration::from_secs(5);
+        let chunk = |n: usize| Ok::<_, &str>(Bytes::from(vec![b'x'; n]));
+        let (body, _) = until_idle(futures_util::stream::once(async move { chunk(10) }).chain(futures_util::stream::pending()), idle);
+        let (mut trickle, held) = cap.metered(body, 100);
+        trickle.next().await.unwrap().unwrap();
+        assert_eq!(cap.available(), 90);
+        // Past `hold` nothing more is taken: the bytes beyond it went out already.
+        let (body, _) = until_idle(futures_util::stream::iter([chunk(30), chunk(30), chunk(30)]), idle);
+        let (mut big, big_held) = cap.metered(body, 40);
+        while let Some(c) = big.next().await {
+            c.unwrap();
+        }
+        assert_eq!(cap.available(), 50);
+        assert!(!big_held.refused());
+        drop(big);
+        drop(big_held);
+        assert_eq!(cap.available(), 90);
+        // More than is free: 503 `busy`, and the stream ends.
+        let _most = cap.reserve(85).unwrap();
+        let (body, _) = until_idle(futures_util::stream::iter([chunk(3), chunk(3)]), idle);
+        let (mut late, late_held) = cap.metered(body, 100);
+        late.next().await.unwrap().unwrap();
+        let f = late.next().await.unwrap().unwrap_err().failure();
+        assert_eq!((f.0.status.as_u16(), f.0.code), (503, "busy"));
+        assert!(late.next().await.is_none());
+        assert!(late_held.refused());
+        drop(late);
+        drop(late_held);
+        drop(trickle);
+        drop(held);
+        drop(_most);
+        assert_eq!(cap.available(), 100);
     }
 
     /// AC 6: the cap holds concurrent buffers to its bytes; past it is 503 `busy` at once,
