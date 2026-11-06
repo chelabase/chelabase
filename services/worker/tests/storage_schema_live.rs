@@ -3287,7 +3287,7 @@ async fn streamed(base: &str, token: &str, method: &str, path: &str, body: reqwe
     }
 }
 
-/// B1 (in-process, with a 1 s idle period): HTML after 600 spaces, or after a
+/// B1 (in-process): HTML after 600 spaces, or after a
 /// UTF-8 BOM and whitespace, declared as `image/png` into an `image/*` bucket is 415 as a
 /// single upload and as part 1 alike; nothing is stored.
 #[tokio::test]
