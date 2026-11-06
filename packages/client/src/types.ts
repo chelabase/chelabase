@@ -11,6 +11,12 @@ export type Json = string | number | boolean | null | Json[] | { [k: string]: Js
  */
 export type Int8 = { readonly __chelabase: "int8" };
 
+/**
+ * A `storage.object_ref` column's value: an object by its bucket's id and its name. Insert it
+ * as `{ bucket_id, name }`; `client.storage.resolve` turns refs into URLs.
+ */
+export type StorageRef = { bucket_id: string; name: string };
+
 /** The Postgres types whose JSON numbers the client reads from their exact source text. */
 export type PgExact = "int8" | "numeric";
 

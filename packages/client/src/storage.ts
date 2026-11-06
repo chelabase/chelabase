@@ -4,6 +4,7 @@ import { SESSION_GONE, USER_HEADER } from "./auth.ts";
 import { NO_REDIRECTS } from "./error.ts";
 import { StorageError, toStorageError } from "./storage-errors.ts";
 import { downloadParam, encodeName, queryOf, type StorageContext } from "./storage-lazy.ts";
+import type { StorageRef } from "./types.ts";
 
 // --- public types ----------------------------------------------------------------------
 
@@ -134,6 +135,13 @@ export interface SignedUrlOptions {
   download?: string | boolean;
 }
 
+export interface ResolveOptions {
+  /** A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600. */
+  expiresIn?: number;
+  /** Serve as an attachment: `true` under the object's own name, a string under that name. */
+  download?: string | boolean;
+}
+
 export interface SignedUrl {
   path: string;
   /** Absolute, on the gateway; needs no key. */
@@ -254,6 +262,14 @@ export interface StorageClient {
   updateBucket(name: string, changes: UpdateBucket): Promise<void>;
   /** See `createBucket`. Only an empty bucket (409 `conflict` otherwise). */
   deleteBucket(name: string): Promise<void>;
+  /**
+   * URLs for `storage.object_ref` values, in one request: a signed URL (as `createSignedUrl`)
+   * for each object the caller can read, a public bucket's public URL, and `null` for a ref
+   * the caller can't read (missing, or hidden by row level security) or a `null` ref. An
+   * array resolves in input order (at most 1000 refs); an empty one sends no request.
+   */
+  resolve(ref: StorageRef | null | undefined, opts?: ResolveOptions): Promise<string | null>;
+  resolve(refs: readonly (StorageRef | null | undefined)[], opts?: ResolveOptions): Promise<(string | null)[]>;
 }
 
 // --- transport -------------------------------------------------------------------------
@@ -280,7 +296,7 @@ interface Req {
   accept?: number[];
 }
 
-async function call(ctx: StorageContext, r: Req): Promise<Response> {
+export async function call(ctx: StorageContext, r: Req): Promise<Response> {
   r.signal?.throwIfAborted();
   const url = `${ctx.base}${r.path}${queryOf({ database: ctx.database, ...r.query })}`;
   const headers: Record<string, string> = { authorization: `Bearer ${ctx.key}`, ...r.headers };
@@ -314,7 +330,7 @@ async function call(ctx: StorageContext, r: Req): Promise<Response> {
   throw err;
 }
 
-async function readJson<T>(res: Response): Promise<T> {
+export async function readJson<T>(res: Response): Promise<T> {
   const text = await res.text();
   try {
     return JSON.parse(text) as T;
@@ -530,11 +546,14 @@ function unquote(etag: string | null): string | null {
   return etag === null ? null : etag.replace(/^W\//, "").replace(/^"(.*)"$/, "$1");
 }
 
+/** A URL path the server gave, on the gateway, with `download` added when asked. */
+export function absoluteUrl(ctx: StorageContext, path: string, download?: string | boolean): string {
+  const d = downloadParam(download);
+  return `${ctx.base}${path}${d === undefined ? "" : `${path.includes("?") ? "&" : "?"}download=${encodeURIComponent(d)}`}`;
+}
+
 export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBucket, "getPublicUrl"> {
-  const absolute = (signed: string, download?: string | boolean) => {
-    const d = downloadParam(download);
-    return `${ctx.base}${signed}${d === undefined ? "" : `${signed.includes("?") ? "&" : "?"}download=${encodeURIComponent(d)}`}`;
-  };
+  const absolute = (signed: string, download?: string | boolean) => absoluteUrl(ctx, signed, download);
   const sign = async (path: string, opts: SignedUrlOptions = {}): Promise<SignedUrl> => {
     const res = await call(ctx, {
       method: "POST",
@@ -614,7 +633,7 @@ export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBuck
   };
 }
 
-export function adminApi(ctx: StorageContext): Omit<StorageClient, "from"> {
+export function adminApi(ctx: StorageContext): Omit<StorageClient, "from" | "resolve"> {
   const at = (name: string) => `/storage/v1/bucket/${encodeURIComponent(name)}`;
   return {
     listBuckets: async () => readJson(await call(ctx, { method: "GET", path: "/storage/v1/bucket" })),
