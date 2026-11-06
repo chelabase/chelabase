@@ -1356,6 +1356,39 @@ mod tests {
         assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
     }
 
+    /// m6 audit B3: a stored type a browser would read as HTML (a comma list) is served as
+    /// an octet-stream attachment; a safe type is served as its essence only.
+    #[test]
+    fn a_comma_content_type_is_never_inline() {
+        for stored in [
+            "text/plain;a=b,text/html",
+            "image/png;x=1, text/html",
+            "text/plain;charset=utf-8,application/xhtml+xml",
+        ] {
+            let found = Found {
+                datoid: 1,
+                version: Uuid::nil(),
+                size: 1,
+                etag: "e".into(),
+                content_type: stored.into(),
+                owner: None,
+            };
+            let h = object_headers(&found, "a.txt", None);
+            assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream", "{stored}");
+            assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"), "{stored}");
+        }
+        let found = Found {
+            datoid: 1,
+            version: Uuid::nil(),
+            size: 1,
+            etag: "e".into(),
+            content_type: "text/plain; charset=utf-8; x=<b>".into(),
+            owner: None,
+        };
+        let h = object_headers(&found, "a.txt", None);
+        assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
+    }
+
     /// Every download and HEAD answer says `nosniff`.
     #[test]
     fn downloads_are_never_sniffed() {
