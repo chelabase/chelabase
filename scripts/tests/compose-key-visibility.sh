@@ -33,6 +33,7 @@ universe='[
   "K/orchestrator-tls/current/client.crt", "K/orchestrator-tls/current/client.key", "K/orchestrator-tls/current/ca.crt",
   "K/realtime-tls/current/client.crt", "K/realtime-tls/current/client.key", "K/realtime-tls/current/ca.crt",
   "K/nats/orchestrator.password", "K/nats/worker.password", "K/nats/realtime.password", "K/nats/runner.password",
+  "K/nats/storage.password",
   "K/valkey/proxy.password", "K/valkey/control.password", "K/valkey/realtime.password", "K/valkey/runner.password",
   "K/valkey/health.password",
   "K/neon/compute-jwt.pub.pem", "K/neon/storage-tokens/pageserver-api.jwt", "K/neon/storage-tokens/safekeeper-data.jwt",
@@ -117,7 +118,8 @@ expected='{
     "C/scripts/tests/workbench-compose.sh": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
-    "K/tokens/storage-internal.token": "ro"
+    "K/tokens/storage-internal.token": "ro",
+    "K/nats/storage.password": "ro"
   },
   "realtime": {
     "C/scripts/tests/workbench-compose.sh": "ro",

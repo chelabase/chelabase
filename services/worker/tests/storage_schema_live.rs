@@ -3813,3 +3813,31 @@ async fn storage_console_live() {
     }))
     .await;
 }
+
+/// NATS revocation (m6's AC, moved to m9): a revoked key's signed URL fails within a second,
+/// though its liveness was cached a moment before (the cache lifetime is 5 s): the
+/// orchestrator's event reaches storage.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_revocation_nats_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let (status, body) = api("POST", &fx.keys_path(), Some(json!({ "name": "st-revoke", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let (key, id) = (body["key"].as_str().unwrap().to_string(), body["id"].as_str().unwrap().to_string());
+        let (status, _, b) = object("POST", "/storage/v1/object/files/r.txt", &key, Some(b"r".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, _, b) = object("POST", "/storage/v1/object/sign/files/r.txt", &key, Some(json!({ "expires_in": 600 }).to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let url = format!("{}{}", gateway(), json_of(&b)["signed_url"].as_str().unwrap());
+        let get = || async { reqwest::Client::new().get(&url).send().await.unwrap().status().as_u16() };
+        assert_eq!(get().await, 200, "the URL serves (its key's liveness is now cached)");
+        let (status, body) = api("DELETE", &format!("{}/{id}", fx.keys_path()), None).await;
+        assert_eq!(status, 204, "{body}");
+        let revoked = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(get().await, 403, "still served {:?} after the revoke", revoked.elapsed());
+    }))
+    .await;
+}

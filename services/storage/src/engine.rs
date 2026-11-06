@@ -122,7 +122,19 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             schema_ok: moka::future::Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(SCHEMA_CHECK_TTL)
+                .support_invalidation_closures()
                 .build(),
+        }
+    }
+
+    /// Forgets what's held for `branch` at once (m9: a NATS event said its settings, status or
+    /// databases changed): its connection info and pools, both the callers' and storage's own,
+    /// and its databases' schema checks. Without the event they expire on their own.
+    pub async fn invalidate(&self, branch: Uuid) {
+        self.pools.invalidate(branch).await;
+        self.managed.invalidate(branch).await;
+        if let Err(e) = self.schema_ok.invalidate_entries_if(move |k, _| k.0 == branch) {
+            tracing::warn!(branch_id = %branch, "dropping the schema checks: {e}");
         }
     }
 
@@ -384,6 +396,23 @@ mod tests {
                 out.0.message
             );
         }
+    }
+
+    /// NATS (m9): a branch event drops the branch's schema check at once (the next request asks
+    /// again: storage's login is refused here, so 503); another branch's stays.
+    #[tokio::test]
+    async fn invalidating_a_branch_drops_its_schema_check() {
+        use chelabase_pgsession::test_support::RefusedSource;
+        let engine = Engine::new(Pools::new(RefusedSource, 1), RefusedSource);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        for branch in [a, b] {
+            engine.schema_ok.insert((branch, "app".into()), true).await;
+        }
+        engine.check_schema(a, "app", "r").await.unwrap();
+        engine.invalidate(a).await;
+        let err = engine.check_schema(a, "app", "r").await.unwrap_err();
+        assert_eq!(err.0.code, "storage_unavailable");
+        engine.check_schema(b, "app", "r").await.unwrap();
     }
 
     /// A database OID as the caller transaction reads it (int8).

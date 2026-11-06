@@ -1403,6 +1403,7 @@ dependencies = [
  "bytes",
  "chelabase-auth",
  "chelabase-http",
+ "chelabase-nats",
  "chelabase-pgsession",
  "chelabase-query",
  "chelabase-routes",

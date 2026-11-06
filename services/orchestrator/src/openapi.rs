@@ -698,6 +698,12 @@ impl JobPort for Doc {
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         match *self {}
     }
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), BoxError> {
+        match *self {}
+    }
     async fn check_data_role(
         &self,
         branch_id: BranchId,

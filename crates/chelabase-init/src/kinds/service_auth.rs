@@ -57,6 +57,9 @@ const CONTROL_CONSUMER_API: [&str; 6] = [
     "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_CONTROL.>",
     "$JS.ACK.CHELABASE_CONTROL.>",
 ];
+/// Object storage's cache events (m9: `chelabase-nats`'s `storage` subjects): the orchestrator
+/// publishes them, storage listens.
+const STORAGE_EVENTS: &str = "chelabase.storage.>";
 /// The tenant-attached events (carried gaps T4, P9): the subjects the orchestrator publishes.
 const NEON_EVENTS: &str = "chelabase.neon.attached.*";
 /// Creating or fixing the events stream (`ensure_neon_events_stream`): the orchestrator only
@@ -105,7 +108,7 @@ const REALTIME_PUBLISH: [&str; 22] = [
 fn orchestrator() -> NatsPermissions {
     let mut publish = vec![CONTROL_JOBS, "chelabase.rpc.>"];
     publish.extend(CORE_EVENTS);
-    publish.extend(["chelabase.rt.project.>", "chelabase.rt.access.>"]);
+    publish.extend(["chelabase.rt.project.>", "chelabase.rt.access.>", STORAGE_EVENTS]);
     publish.extend(CONTROL_STREAM_API);
     publish.push(NEON_EVENTS);
     publish.extend(NEON_EVENTS_STREAM_API);
@@ -145,6 +148,23 @@ fn realtime() -> NatsPermissions {
         publish,
         publish_deny: vec![],
         subscribe: vec!["chelabase.rt.>", "_INBOX_realtime.>"],
+    }
+}
+
+/// Object storage (m9) only listens: what makes it drop a branch's cached connection info,
+/// pools and schema check (the orchestrator's project events and storage branch events), and
+/// what makes it drop a signed URL's cached key liveness (access events and storage key
+/// events). It publishes nothing and answers nobody.
+fn storage() -> NatsPermissions {
+    NatsPermissions {
+        publish: vec![],
+        publish_deny: vec![">"],
+        subscribe: vec![
+            "chelabase.rt.project.>",
+            "chelabase.rt.access.>",
+            STORAGE_EVENTS,
+            "_INBOX_storage.>",
+        ],
     }
 }
 
@@ -207,6 +227,7 @@ fn permissions(user: &str) -> NatsPermissions {
         "worker" => worker(),
         "realtime" => realtime(),
         "runner" => runner(),
+        "storage" => storage(),
         other => unreachable!("no NATS user {other}"),
     }
 }
@@ -258,14 +279,16 @@ pub fn render_nats_auth_reusing(
             "    {{\n      user: \"{name}\"\n      password: \"{hash}\"\n"
         ));
         out.push_str("      permissions: {\n");
-        out.push_str(&format!(
-            "        publish: {{ allow: [{}]",
-            quoted_list(&p.publish)
-        ));
-        if !p.publish_deny.is_empty() {
-            out.push_str(&format!(", deny: [{}]", quoted_list(&p.publish_deny)));
+        // A user that publishes nothing (storage) gets a deny-all list only: an empty allow
+        // list would be no restriction.
+        let mut publish = Vec::new();
+        if !p.publish.is_empty() {
+            publish.push(format!("allow: [{}]", quoted_list(&p.publish)));
         }
-        out.push_str(" }\n");
+        if !p.publish_deny.is_empty() {
+            publish.push(format!("deny: [{}]", quoted_list(&p.publish_deny)));
+        }
+        out.push_str(&format!("        publish: {{ {} }}\n", publish.join(", ")));
         out.push_str(&format!(
             "        subscribe: {{ allow: [{}] }}\n",
             quoted_list(&p.subscribe)

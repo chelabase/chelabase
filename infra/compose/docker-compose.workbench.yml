@@ -648,6 +648,10 @@ services:
       - *stack-env
     environment:
       - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
+      # m9: its own NATS user (subscribe-only: cache invalidation events).
+      - CHELABASE_NATS_USER=storage
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/storage.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_storage
       - CHELABASE_STORAGE_BACKEND=seaweedfs
       - CHELABASE_STORAGE_S3_ENDPOINT=http://seaweedfs:8333
       - CHELABASE_STORAGE_S3_BUCKET=chelabase-storage
@@ -664,6 +668,7 @@ services:
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
       - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
       - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
+      - {source: nats-storage, target: "${CHELABASE_KEYS_DIR}/nats/storage.password"}
       - {source: s3-storage-access-key, target: /run/chelabase/secrets/storage-s3/access-key}
       - {source: s3-storage-secret-key, target: /run/chelabase/secrets/storage-s3/secret-key}
     healthcheck:
@@ -914,6 +919,7 @@ secrets:
   nats-worker: {file: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
   nats-realtime: {file: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
   nats-runner: {file: "${CHELABASE_KEYS_DIR}/nats/runner.password"}
+  nats-storage: {file: "${CHELABASE_KEYS_DIR}/nats/storage.password"}
   valkey-proxy: {file: "${CHELABASE_KEYS_DIR}/valkey/proxy.password"}
   valkey-control: {file: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
   valkey-realtime: {file: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}

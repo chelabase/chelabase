@@ -2095,6 +2095,8 @@ enum FakeReset {
 
 #[derive(Clone, Default)]
 struct FakeJobs {
+    /// Object storage m9: the storage cache events published.
+    storage_events: Arc<Mutex<Vec<chelabase_nats::StorageEvent>>>,
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
     deleted: Arc<Mutex<Vec<DatabaseId>>>,
     resets: Arc<Mutex<Vec<(DatabaseId, BranchId)>>>,
@@ -2223,6 +2225,14 @@ impl JobPort for FakeJobs {
             return Err("nats is down".into());
         }
         self.merge_jobs.lock().unwrap().push(job.payload.clone());
+        Ok(())
+    }
+
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.storage_events.lock().unwrap().push(event.clone());
         Ok(())
     }
 

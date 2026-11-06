@@ -93,6 +93,11 @@ pub const SEED_KEYS: &[SeedKey] = &[
         Rule::Secret,
     ),
     s(
+        "CHELABASE_SEED_NATS_STORAGE_PASSWORD",
+        "nats/storage.password",
+        Rule::Secret,
+    ),
+    s(
         "CHELABASE_SEED_VALKEY_PROXY_PASSWORD",
         "valkey/proxy.password",
         Rule::Secret,

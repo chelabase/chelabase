@@ -1349,6 +1349,13 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         job: &JobEnvelope<MergeJob>,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
+    /// Object storage m9: tells every storage replica to drop what it cached
+    /// (`chelabase_nats::SUBJECT_STORAGE_EVENTS`, core NATS, best effort).
+    fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
     /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
     /// `authenticator`).
     fn check_data_role(
@@ -1588,6 +1595,17 @@ impl JobPort for NatsPorts {
 
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         chelabase_nats::publish_merge(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), BoxError> {
+        let payload = serde_json::to_vec(event)?;
+        self.client
+            .publish(chelabase_nats::SUBJECT_STORAGE_EVENTS, payload.into())
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }

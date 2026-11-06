@@ -99,6 +99,7 @@ impl Urls {
             live: moka::future::Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(LIVENESS_TTL)
+                .support_invalidation_closures()
                 .build(),
         }
     }
@@ -112,6 +113,20 @@ impl Urls {
             .get_or_try_init(|| self.control.url_key())
             .await
             .map_err(|e| unreachable(e, rid))
+    }
+
+    /// Forgets `key_id`'s cached liveness on every branch (m9: it was revoked, rotated or its
+    /// databases changed): its URLs are checked again on their next use.
+    pub fn forget_key(&self, key_id: Uuid) {
+        if let Err(e) = self.live.invalidate_entries_if(move |k, _| k.0 == key_id) {
+            tracing::warn!(%key_id, "dropping a key's liveness: {e}");
+            self.live.invalidate_all();
+        }
+    }
+
+    /// Forgets every key's cached liveness (m9: a member's access changed).
+    pub fn forget_all(&self) {
+        self.live.invalidate_all();
     }
 
     /// The key while it is live for a URL signed on `branch` (cached, a miss asks the control
@@ -279,5 +294,64 @@ impl Control for Orchestrator {
                 (code, _) => Err(status(&path, code)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the liveness lookups; every key is live on its branch.
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl Control for Counting {
+        fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>> {
+            Box::pin(async { Err(Unreachable("unused".into())) })
+        }
+        fn live_key(&self, key_id: Uuid, branch: Uuid) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Some(LiveKey {
+                    key_id,
+                    branch_id: branch,
+                    kind: DataKeyKind::Secret,
+                    role: "authenticated".into(),
+                    databases: None,
+                    role_oid: None,
+                }))
+            })
+        }
+        fn record_upload<'a>(&'a self, _: Uuid, _: Uuid, _: &'a Value, _: u64) -> BoxFuture<'a, Result<Option<u64>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn consume_upload(&self, _: Uuid) -> BoxFuture<'_, Result<Option<(LiveKey, Value)>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// NATS (m9): a key event drops that key's cached liveness on every branch (the next URL
+    /// asks again), an access event drops every key's; others stay cached.
+    #[tokio::test]
+    async fn events_drop_cached_liveness() {
+        let control = Arc::new(Counting::default());
+        let urls = Urls::new(control.clone());
+        let (k1, k2, b1, b2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let lookups = || control.0.load(Ordering::SeqCst);
+        for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
+            urls.live_key(k, b, "r").await.unwrap();
+        }
+        assert_eq!(lookups(), 3);
+        urls.live_key(k1, b1, "r").await.unwrap();
+        assert_eq!(lookups(), 3, "cached");
+        urls.forget_key(k1);
+        for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
+            urls.live_key(k, b, "r").await.unwrap();
+        }
+        assert_eq!(lookups(), 5, "k1 asked again on both branches, k2 still cached");
+        urls.forget_all();
+        urls.live_key(k2, b1, "r").await.unwrap();
+        assert_eq!(lookups(), 6);
     }
 }

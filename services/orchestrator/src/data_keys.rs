@@ -29,6 +29,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
+use crate::storage_console::tell_storage;
+use chelabase_nats::StorageEvent;
 use crate::data_api_databases::validate_key_databases;
 use crate::privileges::check_all_rows;
 use crate::access::{authorize, authorize_database, authorize_key_role, refuse_personal_login_key, Target};
@@ -472,6 +474,8 @@ where
     match rotated {
         Ok(true) => {
             info!(request_id = %principal.request_id, branch_id = %branch.id, old_key_id = %old.id, key_id = %key.id, "key rotated");
+            // Object storage m9: the old key's signed URLs stop at once.
+            tell_storage(&state, StorageEvent::Key { key_id: old.id }).await;
             created(&key, plaintext)
         }
         Ok(false) => ApiError::not_found("key not found").into_response(),
@@ -652,6 +656,8 @@ where
     // Tokens already minted carry the old list; rest drops what it holds for the branch.
     if old.databases != databases {
         state.rest.invalidate(branch.id).await;
+        // Object storage m9: its signed URLs are checked against the new list at once.
+        tell_storage(&state, StorageEvent::Key { key_id: old.id }).await;
     }
     let blocked = old.kind == DataKeyKind::Secret
         && owner_level_roles(&state, &branch).await.contains(&old.role);
@@ -714,6 +720,8 @@ where
     match state.metadata.revoke_data_key(branch.id, key.id).await {
         Ok(true) => {
             info!(request_id = %principal.request_id, branch_id = %branch.id, key_id = %key.id, "key revoked");
+            // Object storage m9: its signed URLs stop at once.
+            tell_storage(&state, StorageEvent::Key { key_id: key.id }).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => ApiError::not_found("key not found").into_response(),

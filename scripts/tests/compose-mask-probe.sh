@@ -32,7 +32,7 @@ mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrat
 for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verify.pem auth/cookie.key \
   auth/app-jwt.key auth/app-jwt.pub neon/compute-jwt.pem neon/compute-jwt.pub compute-ca/ca.crt \
   compute-ca/ca.key orchestrator-tls/v1/client.crt orchestrator-tls/v1/client.key orchestrator-tls/v1/ca.crt \
-  nats/orchestrator.password nats/worker.password nats/realtime.password nats/runner.password \
+  nats/orchestrator.password nats/worker.password nats/realtime.password nats/runner.password nats/storage.password \
   valkey/proxy.password valkey/control.password valkey/realtime.password valkey/runner.password valkey/health.password \
   realtime/pg.password realtime/ticket.key realtime/internal.token \
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token \

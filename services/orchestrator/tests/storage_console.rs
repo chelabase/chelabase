@@ -459,3 +459,55 @@ async fn storage_refusing_our_bearer_is_502() {
     *storage.status.lock().unwrap() = Some(403);
     assert_eq!(call(&w, "dee", "GET", &path).await.status(), 403);
 }
+
+/// NATS revocation (moved from m6): revoking, rotating or narrowing a secret key tells storage
+/// to drop that key's cached liveness; changing a database's connection settings tells it to
+/// drop each branch's connection info and pools. Nothing is published for a no-op.
+#[tokio::test]
+async fn key_and_settings_changes_tell_storage() {
+    use chelabase_nats::StorageEvent;
+    let (w, _storage) = world().await;
+    w.metadata.add_member(w.tenant, "boss", MemberStatus::Active, true);
+    let keys = format!("/v1/databases/{}/branches/{}/keys", w.db, w.dev.as_uuid());
+    let made: Value = w
+        .app
+        .send_as("boss", "org-1", Method::POST, &keys, Some(json!({ "name": "k1", "role": "writer" })))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id: uuid::Uuid = made["id"].as_str().expect("a key id").parse().unwrap();
+    let events = || w.jobs.storage_events.lock().unwrap().clone();
+    assert!(events().is_empty());
+    let key = format!("{keys}/{id}");
+    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &key, Some(json!({ "databases": ["web1"] }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(events(), vec![StorageEvent::Key { key_id: id }]);
+    let resp = w.app.send_as("boss", "org-1", Method::POST, &format!("{key}/rotate"), None).await;
+    assert_eq!(resp.status(), 201);
+    let new_id: uuid::Uuid = resp.json::<Value>().await.unwrap()["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(events().last(), Some(&StorageEvent::Key { key_id: id }));
+    let before = events().len();
+    let resp = w.app.send_as("boss", "org-1", Method::DELETE, &format!("{keys}/{new_id}"), None).await;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(events()[before..], [StorageEvent::Key { key_id: new_id }]);
+
+    // Settings: storage's budget (or the data API's) changed: one event per branch.
+    let before = events().len();
+    let db = format!("/v1/databases/{}", w.db);
+    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &db, Some(json!({ "storage_max_connections": 7 }))).await;
+    assert_eq!(resp.status(), 200);
+    let mut branches: Vec<_> = events()[before..].to_vec();
+    branches.sort_by_key(|e| format!("{e:?}"));
+    let mut want = vec![
+        StorageEvent::Branch { branch_id: w.dev.as_uuid() },
+        StorageEvent::Branch { branch_id: w.db.as_uuid() },
+    ];
+    want.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(branches, want);
+    // The same value again, or another setting: nothing.
+    let before = events().len();
+    let resp = w.app.send_as("boss", "org-1", Method::PATCH, &db, Some(json!({ "storage_max_connections": 7, "max_rows": 500 }))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(events().len(), before);
+}

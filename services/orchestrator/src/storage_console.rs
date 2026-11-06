@@ -283,6 +283,19 @@ where
     response
 }
 
+/// Tells every storage replica to drop what it cached (m9's NATS revocation). Best effort: a
+/// lost event is covered by storage's own cache lifetimes (5 s for a key's liveness, 60 s for a
+/// branch's connection info), so a failure is only logged.
+pub(crate) async fn tell_storage<M, J>(state: &AppState<M, J>, event: chelabase_nats::StorageEvent)
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if let Err(err) = state.js.publish_storage_event(&event).await {
+        warn!(?event, "publish the storage event (storage's cache lifetimes cover it): {err}");
+    }
+}
+
 /// Who a request runs as on storage.
 struct Forward<'a> {
     branch: BranchId,

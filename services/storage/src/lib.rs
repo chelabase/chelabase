@@ -10,6 +10,7 @@ pub mod config;
 pub mod control;
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod internal;
 pub mod limits;
 pub mod multipart;
