@@ -4,7 +4,9 @@
 # other than 1000 here (4321:4322, chowned by a root helper container); each service's user,
 # entrypoint and secret mounts come from the real compose file rendered for that uid, with a
 # probe in place of its command: it must read every mount, run as the stack's uid, and (with a
-# data volume the image created as 1000:1000) write to /data. No stack is started.
+# data volume the image created as 1000:1000) write to /data. A service that drops to the stack's
+# uid from root must also give that uid a passwd and group entry (the image has only 1000's): the
+# pageserver runs initdb, which refuses an effective uid it can't look up. No stack is started.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 fixture="$root/scripts/tests/fixtures/workbench-stack.env"
@@ -55,11 +57,21 @@ docker image inspect "$image" >/dev/null 2>&1 || {
   exit 0
 }
 
-# Reads every file given, then writes /data when asked; prints the uid it ran as.
+# Reads every file given, then writes /data when asked; prints the uid it ran as. With
+# PROBE_NSS=yes the uid and gid must resolve to names, and with PROBE_INITDB=yes initdb must run
+# (both only for the wrapped services, whose root prelude can add the entries).
 probe='set -e
 want_data="$1"; shift
 for f in "$@"; do cat "$f" >/dev/null 2>&1 || { echo "UNREADABLE $f"; exit 3; }; done
 if [ "$want_data" = yes ]; then touch /data/.probe 2>/dev/null || { echo "UNWRITABLE /data"; exit 4; }; fi
+if [ "${PROBE_NSS:-}" = yes ]; then
+  getent passwd "$(id -u)" >/dev/null || { echo "NO PASSWD ENTRY for uid $(id -u)"; exit 5; }
+  getent group "$(id -g)" >/dev/null || { echo "NO GROUP ENTRY for gid $(id -g)"; exit 5; }
+fi
+if [ "${PROBE_INITDB:-}" = yes ]; then
+  LD_LIBRARY_PATH=/usr/local/v17/lib /usr/local/v17/bin/initdb -D /tmp/probe-pg -U cloud_admin \
+    >/tmp/initdb.log 2>&1 || { echo "INITDB FAILED"; tail -3 /tmp/initdb.log; exit 6; }
+fi
 id -u'
 
 for s in storage-controller pageserver safekeeper1 safekeeper2 safekeeper3 register-safekeepers proxy; do
@@ -84,8 +96,10 @@ for s in storage-controller pageserver safekeeper1 safekeeper2 safekeeper3 regis
   # and is replaced by the probe.
   entry="$(q ".services[\"$s\"].entrypoint // [] | if length == 4 and .[0] == \"/bin/sh\" and (.[2] | test(\"exec setpriv\")) then .[2] else empty end" | sed 's/\$\$/$/g')"
   if [[ -n "$entry" ]]; then
+    args+=(-e PROBE_NSS=yes)
+    [[ "$s" == pageserver ]] && args+=(-e PROBE_INITDB=yes)
     out="$(docker run "${args[@]}" --entrypoint /bin/sh "$image" -c "$entry" neon /bin/sh -c "$probe" sh "$want_data" "${files[@]}" 2>&1)" ||
-      fail "$s can't read its secrets or write its data as the stack's uid:
+      fail "$s can't run, read its secrets or write its data as the stack's uid:
 $out"
   else
     out="$(docker run "${args[@]}" --entrypoint /bin/sh "$image" -c "$probe" sh "$want_data" "${files[@]}" 2>&1)" ||
