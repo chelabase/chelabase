@@ -513,6 +513,53 @@ mod tests {
         }
     }
 
+    /// m6 re-audit S1: an upload refused for its `Content-Type` (400) is refused before the
+    /// token is spent, so the URL still takes the corrected upload.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    async fn a_refused_upload_keeps_its_token() {
+        let control = Arc::new(FakeControl::default());
+        let (base, _, data) = serve_with(Unreachable, Unreachable, control.clone()).await;
+        control.live.lock().unwrap().push(live_of(&data));
+        let token_id = Uuid::new_v4();
+        control.uploads.lock().unwrap().insert(token_id, (data.key_id, serde_json::json!({}), false));
+        let claims = crate::token::Claims {
+            purpose: crate::token::Purpose::Upload,
+            datoid: None,
+            version_id: None,
+            size: None,
+            etag: None,
+            content_type: None,
+            role: Some(data.role.clone()),
+            token_id,
+            ..download_claims(&data, crate::signed::now() + 60)
+        };
+        let token = crate::token::sign(&URL_KEY, &claims);
+        let url = format!("{base}/storage/v1/object/upload/sign/b/a.txt?token={token}");
+        let put = |content_type: &'static str| {
+            let url = url.clone();
+            async move {
+                let res = reqwest::Client::new()
+                    .put(url)
+                    .header("content-type", content_type)
+                    .body(b"x".to_vec())
+                    .send()
+                    .await
+                    .unwrap();
+                let status = res.status().as_u16();
+                let json: serde_json::Value = res.json().await.unwrap_or_default();
+                (status, json["error"]["code"].as_str().unwrap_or_default().to_owned())
+            }
+        };
+        for bad in ["text/plain; charset=\"utf-8\"", "text/plain,text/html"] {
+            assert_eq!(put(bad).await, (400, "invalid_request".to_owned()), "{bad}");
+            assert!(!control.uploads.lock().unwrap()[&token_id].2, "{bad} spent the token");
+        }
+        // The corrected retry spends it and goes on to upload (the branch is unreachable here).
+        assert_eq!(put("text/plain; charset=utf-8").await.0, 503);
+        assert!(control.uploads.lock().unwrap()[&token_id].2);
+    }
+
     /// AC 1, 4, 6 over `MemoryStore` (m6 audit B2, B5): a download token serves its version
     /// while it is the name's current one; overwritten, deleted, re-created under the same
     /// name, deleted on its branch while another branch still holds the blob, or its database

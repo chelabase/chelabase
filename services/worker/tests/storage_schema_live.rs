@@ -2923,6 +2923,55 @@ async fn storage_urls_upsert_live() {
     .await;
 }
 
+/// Re-audit B1 (decided 2026-11-06: accepted): a reset puts the branch back where the URL was
+/// signed, so a URL a delete ended serves its version again until it expires. This pins the
+/// behaviour.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_reset_revives_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/r.txt", &secret, Some(b"reset-original".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (child, _) = fx.child("urls-reset").await;
+        let (status, body) = api("POST", &format!("/v1/databases/{}/branches/{child}/keys", fx.id), Some(json!({ "name": "urls-reset", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let ck = body["key"].as_str().unwrap().to_string();
+        let (status, url) = mint("sign", "files/r.txt", &ck, 3600).await;
+        assert_eq!(status, 200, "{url}");
+        assert_eq!(&keyless("GET", &url, None).await.2[..], b"reset-original");
+        assert_eq!(object("DELETE", "/storage/v1/object/files/r.txt", &ck, None, &[]).await.0, 204);
+        assert_eq!(keyless("GET", &url, None).await.0, 404);
+        assert!(fx.metadata.set_branch_status(child, &[BranchStatus::Ready], BranchStatus::Resetting).await.unwrap());
+        fx.worker.handle_branch_job(BranchJob::ResetToParent { branch_id: child }).await.expect("reset job");
+        let record = fx.metadata.get_branch(child).await.unwrap().unwrap();
+        assert_eq!(record.status, BranchStatus::Ready, "{:?}", record.error);
+        let (status, _, got) = keyless("GET", &url, None).await;
+        assert_eq!((status, &got[..]), (200, &b"reset-original"[..]), "the reset revives the URL");
+    }))
+    .await;
+}
+
+/// Re-audit S1: an upload URL refused for its `Content-Type` (400) is not spent, and the
+/// corrected retry uploads.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_refused_upload_keeps_token_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let (status, up) = mint("upload/sign", "files/t.txt", &secret, 60).await;
+        assert_eq!(status, 200, "{up}");
+        let (status, b) = keyless_with("PUT", &up, b"retried".to_vec(), &[("content-type", "text/plain; charset=\"utf-8\"")]).await;
+        assert_eq!((status, b["error"]["code"].clone()), (400, json!("invalid_request")), "{b}");
+        let (status, b) = keyless_with("PUT", &up, b"retried".to_vec(), &[("content-type", "text/plain; charset=utf-8")]).await;
+        assert_eq!(status, 200, "the corrected retry: {b}");
+        assert_eq!(&object("GET", "/storage/v1/object/files/t.txt", &secret, None, &[]).await.2[..], b"retried");
+    }))
+    .await;
+}
+
 // --- m7: resumable uploads and bucket limits ------------------------------------------------
 
 const MIB: usize = 1 << 20;
