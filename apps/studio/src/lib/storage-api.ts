@@ -37,9 +37,9 @@ export interface BucketStats {
 /** Objects read per bucket for its count and size (storage's largest page). */
 export const STATS_PAGE = 1000;
 
-/** The console's role parameter: none is owner mode. */
-export function storageParams(role: string | null): StorageListBucketsParams {
-  return role === null ? {} : { role };
+/** The console's role parameter (none is owner mode), and the Postgres database when it isn't the branch's main one. */
+export function storageParams(role: string | null, database: string | null = null): StorageListBucketsParams {
+  return { ...(role === null ? {} : { role }), ...(database === null ? {} : { database }) };
 }
 
 /** Every storage query of a branch starts with this. */
@@ -119,8 +119,8 @@ export function isBucketNotEmpty(err: unknown): boolean {
 }
 
 /** The buckets the role sees on a branch (the main Postgres database's). */
-export function useBuckets(databaseId: string, branchId: string, role: string | null, enabled: boolean) {
-  return useStorageListBuckets(databaseId, branchId, storageParams(role), {
+export function useBuckets(databaseId: string, branchId: string, role: string | null, enabled: boolean, database: string | null = null) {
+  return useStorageListBuckets(databaseId, branchId, storageParams(role, database), {
     query: { enabled, select: parseBuckets, retry: false },
   });
 }
@@ -187,8 +187,8 @@ export interface ObjectListQuery {
 }
 
 /** A folder's listing: per branch, role, bucket, folder, sort and search, under the branch's prefix. */
-export function objectsKey(databaseId: string, branchId: string, role: string | null, bucket: string, q: ObjectListQuery): readonly unknown[] {
-  return [...branchPrefix(databaseId, branchId), "objects", bucket, q, storageParams(role)];
+export function objectsKey(databaseId: string, branchId: string, role: string | null, bucket: string, q: ObjectListQuery, database: string | null = null): readonly unknown[] {
+  return [...branchPrefix(databaseId, branchId), "objects", bucket, q, storageParams(role, database)];
 }
 
 /**

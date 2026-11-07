@@ -60,6 +60,7 @@ import { SortPopover } from "./sort-popover";
 import type { TableTarget } from "./target";
 import { useTableStructure } from "./use-structure";
 import { useColumnHeaders, type ColumnChips } from "./column-headers";
+import { useStorageRefCells } from "./cells/use-storage-ref-cells";
 
 export { COUNT_QUERY, ROWS_QUERY, rowWriteKeys };
 /** The row panel's single-row reads sit under `ROWS_QUERY` with this marker, so every refresh covers them. */
@@ -677,6 +678,25 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
     }
   }
 
+  const cellEditable = (col: string, key?: string) =>
+    writable &&
+    !rowsQuery.isPlaceholderData &&
+    !pk.includes(col) &&
+    !unread?.has(col) &&
+    !columns.find((c) => c.name === col)?.readOnly &&
+    (key === undefined || !rereading.includes(key));
+
+  // Object references (#106): files in their cells, resolved once per visible page.
+  const storageRefs = useStorageRefCells({
+    target,
+    columns,
+    rows,
+    keys,
+    canEdit: (col, key) => cellEditable(col, key),
+    canSign: access.write,
+    save: (key, column, value) => saveCell(key, column, value, true),
+  });
+
   async function overwrite() {
     if (!conflict) return;
     const { key, set } = conflict;
@@ -1038,14 +1058,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
               setOffset(0);
               setSort(dir ? { col, dir } : null);
             }}
-            canEdit={(col, key) =>
-              writable &&
-              !rowsQuery.isPlaceholderData &&
-              !pk.includes(col) &&
-              !unread?.has(col) &&
-              !columns.find((c) => c.name === col)?.readOnly &&
-              (key === undefined || !rereading.includes(key))
-            }
+            canEdit={cellEditable}
             onSave={saveCell}
             onCopy={(active) => {
               const list = chosenRows();
@@ -1064,7 +1077,9 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
                   load={() => loader.load(cellKey(pk, row), c.name)}
                   errorText={loader.errorText}
                 />
-              ) : undefined
+              ) : (
+                storageRefs.render(row, c, i)
+              )
             }
             widths={widths}
             pending={pendingColumns}
@@ -1098,6 +1113,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
             }
           />
       )}
+      {storageRefs.dialog}
       {conflict && (
         <ConflictDialog
           open

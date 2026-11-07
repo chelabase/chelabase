@@ -65,8 +65,9 @@ export function parseParts(body: unknown): Map<number, number> {
   return out;
 }
 
-export function consoleUploadApi(databaseId: string, branchId: string, role: string | null): UploadApi {
-  const params = storageParams(role);
+/** `database`: the Postgres database when it isn't the branch's main one (the table editor's). */
+export function consoleUploadApi(databaseId: string, branchId: string, role: string | null, database: string | null = null): UploadApi {
+  const params = storageParams(role, database);
   const withUpsert = (upsert: boolean) => (upsert ? { ...params, upsert: true } : params);
   return {
     put: (bucket, name, body, o) =>

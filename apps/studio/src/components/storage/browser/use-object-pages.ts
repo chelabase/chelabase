@@ -19,9 +19,9 @@ export interface ObjectQuery extends ObjectListQuery {
  * search, so changing any of them starts again from page one. Items repeated across pages
  * (storage's cursor shouldn't, but a write between pages may) are shown once.
  */
-export function useObjectPages(databaseId: string, branchId: string, role: string | null, bucket: string, q: ObjectQuery, enabled: boolean) {
+export function useObjectPages(databaseId: string, branchId: string, role: string | null, bucket: string, q: ObjectQuery, enabled: boolean, database: string | null = null) {
   const query = useInfiniteQuery({
-    queryKey: objectsKey(databaseId, branchId, role, bucket, q),
+    queryKey: objectsKey(databaseId, branchId, role, bucket, q, database),
     queryFn: async ({ pageParam, signal }) =>
       parseObjectPage(
         await storageListObjects(
@@ -29,7 +29,7 @@ export function useObjectPages(databaseId: string, branchId: string, role: strin
           branchId,
           bucket,
           { prefix: q.prefix, delimiter: "/", limit: OBJECT_PAGE, cursor: pageParam, sort_by: q.sort, order: q.order, search: q.search === "" ? null : q.search },
-          storageParams(role),
+          storageParams(role, database),
           { signal },
         ),
       ),

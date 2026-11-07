@@ -101,6 +101,16 @@ export function parseValue(col: ColumnDesc, text: string): Parsed {
       return { ok: true, value };
     }
     default:
+      // A `storage.object_ref` cell's raw text: JSON (as the grid shows it) becomes the composite's fields.
+      if (col.storage_ref?.kind === "ref" && t.startsWith("{")) {
+        try {
+          const value: unknown = JSON.parse(t);
+          if (typeof value === "object" && value !== null && !Array.isArray(value)) return { ok: true, value };
+        } catch {
+          // falls through to the error
+        }
+        return { ok: false, error: 'enter JSON like {"bucket_id": …, "name": …} or a record (bucket_id,name)' };
+      }
       return { ok: true, value: text };
   }
 }
