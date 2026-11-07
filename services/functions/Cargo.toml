@@ -1,0 +1,51 @@
+[package]
+name = "chelabase-functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase edge functions: invokes a branch's functions in the runtime and serves their bundles"
+
+[lib]
+name = "functions"
+path = "src/lib.rs"
+
+[[bin]]
+name = "functions"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
+chelabase-metadata = { workspace = true }
+chelabase-nats = { workspace = true }
+chelabase-secrets = { workspace = true }
+# The bundle store (bucket chelabase-functions, the `functions` S3 identity).
+chelabase-storage = { workspace = true }
+chelabase-types = { workspace = true }
+dotenvy = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+moka = { workspace = true }
+# The runtime proxy streams both bodies.
+reqwest = { workspace = true, features = ["stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# `last_error` (a statement the metadata crate doesn't have).
+sqlx = { workspace = true }
+# The internal listener's bearers, compared in constant time.
+subtle = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+# Decrypted secrets and the env header are wiped when a cached resolution drops.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+chelabase-auth = { workspace = true, features = ["keygen"] }
