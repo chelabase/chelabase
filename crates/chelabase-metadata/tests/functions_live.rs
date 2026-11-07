@@ -12,9 +12,10 @@ mod functions {
     use std::borrow::Cow;
 
     use chelabase_metadata::{
-        CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
+        BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
-        KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerSource, TriggerState,
+        KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerInstall, TriggerSource,
+        TriggerState,
     };
     use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_secrets::SecretKey;
@@ -1671,6 +1672,7 @@ mod functions {
                 .await
                 .unwrap();
             c.set_service_health(deployment, true).await.unwrap();
+            c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
             Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key, schedule }
         }
     }
@@ -1712,6 +1714,15 @@ mod functions {
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
             ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
             ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
+            ("settle_trigger_installs", |c, x| Box::pin(async move {
+                let installs: Vec<TriggerInstall> = c
+                    .list_triggers(x.main)
+                    .await?
+                    .into_iter()
+                    .map(|t| TriggerInstall { id: t.id, enabled_since: t.enabled_since, error: None })
+                    .collect();
+                c.settle_trigger_installs(x.main, &installs).await.map(drop)
+            })),
         ]
     }
 
@@ -1739,7 +1750,28 @@ mod functions {
                 c.rotate_secret_key(x.main, x.other_key, &secret_key(Uuid::new_v4(), x.main, "other", 77)).await.map(drop)
             })),
             ("mark_branch_deleted", |c, x| Box::pin(async move { c.mark_branch_deleted(x.main).await })),
+            // m8: the switches pend the branch's table triggers. The branch is made resetting
+            // with a pending timeline first, each a single statement on its row.
+            ("switch_to_pending_timeline", |c, x| Box::pin(async move {
+                if resetting(&c, x.main).await? {
+                    c.switch_to_pending_timeline(x.main, "tl-pending", None, "0/1").await?;
+                }
+                Ok(())
+            })),
+            ("switch_to_restored_timeline", |c, x| Box::pin(async move {
+                if resetting(&c, x.main).await? {
+                    c.switch_to_restored_timeline(x.main, "tl-pending", BranchId::new(), "main-before", "0/1").await?;
+                }
+                Ok(())
+            })),
         ]
+    }
+
+    /// Makes `branch` resetting with the pending timeline `tl-pending`; false when it no
+    /// longer can be (deleted meanwhile).
+    async fn resetting(c: &MetadataClient, branch: BranchId) -> Result<bool, MetadataError> {
+        Ok(c.set_branch_status(branch, &[BranchStatus::Ready], BranchStatus::Resetting).await?
+            && c.set_pending_timeline(branch, Some("tl-pending")).await?)
     }
 
     /// Refusals a write may answer when the other one changed its rows first.
@@ -1827,13 +1859,14 @@ mod functions {
     async fn function_writes_keep_the_lock_order() {
         let s = Scratch::new().await;
         // The rows a write can be stalled on, as SQL taking them FOR UPDATE.
-        let stalls: [(&str, &str); 8] = [
+        let stalls: [(&str, &str); 9] = [
             ("database", "SELECT 1 FROM databases WHERE id = $1 FOR UPDATE"),
             ("branch", "SELECT 1 FROM branches WHERE id = $2 FOR UPDATE"),
             ("endpoint", "SELECT 1 FROM neon_endpoints WHERE id = $3 FOR UPDATE"),
             ("function", "SELECT 1 FROM functions WHERE id = $4 FOR UPDATE"),
             ("branch state", "SELECT 1 FROM branch_functions WHERE function_id = $4 FOR UPDATE"),
             ("schedule", "SELECT 1 FROM function_schedules WHERE function_id = $4 FOR UPDATE"),
+            ("trigger", "SELECT 1 FROM function_triggers WHERE function_id = $4 FOR UPDATE"),
             ("managed key", "SELECT 1 FROM data_api_keys WHERE id = $5 FOR UPDATE"),
             ("service health", "SELECT 1 FROM service_health h JOIN function_deployments d ON d.id = h.deployment_id WHERE d.function_id = $4 FOR UPDATE OF h"),
         ];
@@ -1937,6 +1970,102 @@ mod functions {
         assert!(s.client.list_deployments(Uuid::new_v4()).await.unwrap().is_empty());
         s.finish().await;
     }
+    /// m8: the worker settles only the generation of a row it read (`enabled_since`): a row
+    /// pended again meanwhile (a reset or restore) stays pending; an install becomes
+    /// `installed` (error cleared), a failure `failed` with its error; a settled row is never
+    /// settled again, and other branches' rows are untouched.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_installs_settle_only_the_read_generation() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let a = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        let b = c.add_trigger(&table_trigger(main, f, &["delete"])).await.unwrap();
+        let read = c.list_triggers(main).await.unwrap();
+        let since = |id: Uuid| read.iter().find(|t| t.id == id).unwrap().enabled_since;
+        assert_eq!(c.pending_trigger_branches(10).await.unwrap(), vec![main]);
+        let stale = since(a) - chrono::Duration::seconds(1);
+        let settled = c
+            .settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: stale, error: None }])
+            .await
+            .unwrap();
+        assert_eq!(settled, 0, "another generation");
+        let settled = c
+            .settle_trigger_installs(
+                main,
+                &[
+                    TriggerInstall { id: a, enabled_since: since(a), error: None },
+                    TriggerInstall { id: b, enabled_since: since(b), error: Some("table_missing".into()) },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled, 2);
+        let after = c.list_triggers(main).await.unwrap();
+        let row = |id: Uuid| after.iter().find(|t| t.id == id).unwrap().clone();
+        assert_eq!((row(a).state, row(a).last_error), (TriggerState::Installed, None));
+        assert_eq!((row(b).state, row(b).last_error.as_deref()), (TriggerState::Failed, Some("table_missing")));
+        assert!(c.pending_trigger_branches(10).await.unwrap().is_empty());
+        let again = c
+            .settle_trigger_installs(main, &[TriggerInstall { id: b, enabled_since: since(b), error: None }])
+            .await
+            .unwrap();
+        assert_eq!(again, 0, "only pending rows settle");
+        let (_, other) = s.database().await;
+        assert_eq!(
+            c.settle_trigger_installs(other, &[TriggerInstall { id: a, enabled_since: since(a), error: None }])
+                .await
+                .unwrap(),
+            0,
+            "another branch's row"
+        );
+        s.finish().await;
+    }
+
+    /// m8: a reset's and a restore's switch pend every table trigger of the branch (installed
+    /// or failed) in the switch's transaction, with a new `enabled_since` and no error, so the
+    /// worker reinstalls them on the new timeline; storage triggers are left alone.
+    #[tokio::test]
+    #[ignore]
+    async fn switch_pends_table_triggers() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        s.full_function(db, main, "hello").await;
+        let c = &s.client;
+        for restore in [false, true] {
+            let before = c.list_triggers(main).await.unwrap();
+            assert!(before.iter().all(|t| t.state == TriggerState::Installed), "{before:?}");
+            assert!(c.set_branch_status(main, &[BranchStatus::Ready], BranchStatus::Resetting).await.unwrap());
+            let pending = format!("tl-{restore}");
+            assert!(c.set_pending_timeline(main, Some(&pending)).await.unwrap());
+            let switched = if restore {
+                c.switch_to_restored_timeline(main, &pending, BranchId::new(), "main-before", "0/1").await
+            } else {
+                c.switch_to_pending_timeline(main, &pending, None, "0/1").await
+            };
+            assert!(switched.unwrap());
+            let after = c.list_triggers(main).await.unwrap();
+            for t in &after {
+                let old = before.iter().find(|o| o.id == t.id).unwrap();
+                match t.source {
+                    TriggerSource::Table => {
+                        assert_eq!((t.state, t.last_error.as_deref()), (TriggerState::PendingInstall, None));
+                        assert!(t.enabled_since > old.enabled_since, "a new generation");
+                    }
+                    TriggerSource::Storage => assert_eq!(t, old),
+                }
+            }
+            sqlx::query("UPDATE function_triggers SET state = 'installed' WHERE branch_id = $1")
+                .bind(main.as_uuid())
+                .execute(s.pool())
+                .await
+                .unwrap();
+            s.ready(main).await;
+        }
+        s.finish().await;
+    }
 
     /// m9: a service's signing secret is sealed for its function (another function's id
     /// doesn't open it); the health checks poll each enabled external deployment on a live
@@ -2008,4 +2137,5 @@ mod functions {
         assert!(c.list_service_targets().await.unwrap().iter().all(|t| t.deployment_id != deployment));
         s.finish().await;
     }
+
 }

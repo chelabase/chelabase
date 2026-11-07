@@ -18,7 +18,8 @@
 //! - rules (not a view's `_RETURN`) on a relation owned by a non-Admin role.
 //!
 //! Skipped: extension members and objects in `pg_catalog`, `information_schema`, `pg_toast`,
-//! `pg_temp_*`, `pg_toast_temp_*` and `chelabase_guard`.
+//! `pg_temp_*`, `pg_toast_temp_*`, `chelabase_guard` and `chelabase_functions`, and the
+//! function triggers (`chelabase_fn_*` running a function in `chelabase_functions`).
 //!
 //! Every name part of a key, a `via` and a hash line is quoted as an identifier, so no name
 //! can make two items share a key or forge a hash line. Each item carries the md5 hex of its
@@ -56,6 +57,7 @@ skipped AS (
      OR n.nspname OPERATOR(pg_catalog.=) 'information_schema'
      OR n.nspname OPERATOR(pg_catalog.=) 'pg_toast'
      OR n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
+     OR n.nspname OPERATOR(pg_catalog.=) 'chelabase_functions'
      OR pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_temp_')
      OR pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_toast_temp_')
 ),
@@ -193,6 +195,7 @@ items(doc) AS (
   JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner
   CROSS JOIN LATERAL (SELECT EXISTS (SELECT FROM admin a WHERE a.oid OPERATOR(pg_catalog.=) p.proowner) AS admin) fa
   WHERE NOT tg.tgisinternal AND tg.tgparentid OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+    AND NOT (pg_catalog.starts_with(tg.tgname::pg_catalog.text, 'chelabase_fn_') AND pn.nspname OPERATOR(pg_catalog.=) 'chelabase_functions')
     AND (NOT fa.admin OR NOT EXISTS (SELECT FROM admin a WHERE a.oid OPERATOR(pg_catalog.=) c.relowner))
     AND NOT EXISTS (SELECT FROM skipped s WHERE s.oid OPERATOR(pg_catalog.=) c.relnamespace)
     AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend e

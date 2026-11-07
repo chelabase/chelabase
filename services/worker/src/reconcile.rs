@@ -603,6 +603,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
         }
+        // Edge functions m8: branches with a table trigger still to install.
+        self.sync_pending_fn_triggers().await;
         Ok(())
     }
 
