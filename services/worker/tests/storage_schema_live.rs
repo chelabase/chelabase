@@ -3917,7 +3917,22 @@ async fn storage_console_resolve_live() {
         let url = body["urls"][0].as_str().unwrap_or_else(|| panic!("a signed URL: {body}")).to_string();
         let (status, _, got) = keyless("GET", &url, None).await;
         assert_eq!((status, &got[..]), (200, &b"mine.txt"[..]));
+        // A plain Viewer resolves (existence and visibility), but its URL needs Developer.
+        let viewer = Member::granted(fx, json!({ "platform_role": "viewer", "pg_roles": ["authenticated"] })).await;
+        let (status, _, b) = object("POST", &resolve, &viewer.token, Some(json!({ "refs": refs, "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        let viewer_body = json_of(&b);
+        viewer.remove().await;
+        assert_eq!(status, 200, "viewer resolve: {viewer_body}");
+        assert_eq!(viewer_body["urls"][1], Value::Null, "another user's object: {viewer_body}");
+        let viewer_url = viewer_body["urls"][0].as_str().unwrap_or_else(|| panic!("a signed URL: {viewer_body}"));
+        let (status, _, got) = keyless("GET", viewer_url, None).await;
+        assert_eq!((status, json_of(&got)["error"]["code"].clone()), (403, json!("token_not_valid")), "a Viewer's resolved URL opened");
+        // Removing the member ends their URL within the NATS window.
         member.remove().await;
+        let removed = Instant::now();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let (status, _, got) = keyless("GET", &url, None).await;
+        assert_eq!((status, json_of(&got)["error"]["code"].clone()), (403, json!("token_not_valid")), "still served {:?} after the member was removed", removed.elapsed());
         // Owner mode (an Admin, no role): past every policy, by name and by id.
         let owner_refs = json!([{ "bucket": "files", "name": "mine.txt" }, { "id": theirs_id }]);
         let (status, _, b) = object("POST", &fx.owner_console("/object/resolve"), &dev_token().await, Some(json!({ "refs": owner_refs, "expires_in": 60 }).to_string().into()), &[JSON]).await;
@@ -3965,6 +3980,67 @@ impl Fx {
     fn owner_console(&self, tail: &str) -> String {
         format!("/v1/databases/{}/branches/{}/storage{tail}", self.id, self.main)
     }
+}
+
+/// #100 (the resolve route's audit, B1): a console URL lives on the level of the role it was
+/// minted as, not the member's best level. A Developer signs as `authenticated` and the URL
+/// opens. Then `authenticated` drops to Viewer (the own grant names only `anon`, a team grant
+/// names `authenticated` at Viewer) while the member stays a Developer: console `sign` as it is
+/// 403, and both the URL signed before and one resolved now are refused when opened.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_console_role_level_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL")]).await;
+        let (status, _, b) = object("POST", &fx.owner_console("/object/files/a.txt"), &dev_token().await, Some(b"hello".to_vec().into()), &[("content-type", "text/plain")]).await;
+        assert_eq!(status, 200, "owner upload: {}", json_of(&b));
+        let u = Uuid::new_v4();
+        let refs = json!({ "refs": [{ "bucket": "files", "name": "a.txt" }], "expires_in": 60 });
+        let sign = json!({ "expires_in": 60 }).to_string();
+        let mix = Member::granted(fx, json!({ "platform_role": "developer", "pg_roles": ["authenticated"] })).await;
+        let (status, _, b) = object("POST", &fx.console("/object/sign/files/a.txt", u), &mix.token, Some(sign.clone().into()), &[JSON]).await;
+        let body = json_of(&b);
+        assert_eq!(status, 200, "sign at Developer: {body}");
+        let signed = body["signed_url"].as_str().unwrap_or_else(|| panic!("a signed URL: {body}")).to_string();
+        assert_eq!(keyless("GET", &signed, None).await.0, 200, "the URL signed at Developer opens");
+        // `authenticated` lowered to Viewer; the member stays a Developer (on `anon`).
+        let (status, b2) = api("PUT", &format!("/v1/projects/{}/grants/{}", fx.project, mix.id), Some(json!({ "platform_role": "developer", "pg_roles": ["anon"] }))).await;
+        assert!(status < 300, "own grant: {status} {b2}");
+        let (status, team) = api("POST", "/v1/teams", Some(json!({ "name": format!("st-level-{}", Uuid::new_v4().simple()) }))).await;
+        assert!(status < 300, "team: {status} {team}");
+        let team_id = team["id"].as_str().or(team["team"]["id"].as_str()).expect("the team id").to_string();
+        let (status, b2) = api("PUT", &format!("/v1/teams/{team_id}/grants/{}", fx.project), Some(json!({ "platform_role": "viewer", "pg_roles": ["authenticated"] }))).await;
+        assert!(status < 300, "team grant: {status} {b2}");
+        let (status, b2) = api("PUT", &format!("/v1/teams/{team_id}/members/{}", mix.id), None).await;
+        assert!(status < 300, "team member: {status} {b2}");
+        let (sign_status, _, sb) = object("POST", &fx.console("/object/sign/files/a.txt", u), &mix.token, Some(sign.into()), &[JSON]).await;
+        let (resolve_status, _, rb) = object("POST", &fx.console("/object/resolve", u), &mix.token, Some(refs.to_string().into()), &[JSON]).await;
+        let resolved = json_of(&rb);
+        // Within the liveness cache's lifetime (5 s) even if no event drops it.
+        let lowered = Instant::now();
+        let open = |url: Option<String>| async move {
+            match url {
+                Some(url) => { let (status, _, got) = keyless("GET", &url, None).await; (status, json_of(&got)["error"]["code"].clone()) }
+                None => (0, Value::Null),
+            }
+        };
+        let resolved_url = resolved["urls"][0].as_str().map(str::to_owned);
+        let (mut before, mut now) = (open(Some(signed.clone())).await, open(resolved_url.clone()).await);
+        while (before.0 == 200 || now.0 == 200) && lowered.elapsed() < Duration::from_secs(6) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            (before, now) = (open(Some(signed.clone())).await, open(resolved_url.clone()).await);
+        }
+        let _ = api("DELETE", &format!("/v1/teams/{team_id}"), None).await;
+        mix.remove().await;
+        assert_eq!(sign_status, 403, "console sign as a Viewer-level role: {}", json_of(&sb));
+        assert_eq!(resolve_status, 200, "resolve at Viewer: {resolved}");
+        assert!(resolved_url.is_some(), "resolve names the object: {resolved}");
+        let refused = (403, json!("token_not_valid"));
+        assert_eq!(now, refused, "a URL resolved as a role held at Viewer opened ({:?} after the change): {resolved}", lowered.elapsed());
+        assert_eq!(before, refused, "a URL signed before its role dropped to Viewer still opens ({:?} after the change)", lowered.elapsed());
+    }))
+    .await;
 }
 
 /// Owner mode (m9, the human's option 3): with no role, an Admin's console runs as storage's
