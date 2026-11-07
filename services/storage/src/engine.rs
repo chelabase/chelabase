@@ -246,9 +246,24 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         request_id: &str,
         f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
     ) -> Result<(T, String), Failure> {
+        let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+        self.as_caller_mapped(data, requested, request_id, on_commit, f).await
+    }
+
+    /// [`Self::as_caller`], with a failed `COMMIT` (what deferred work raised once `f` had
+    /// succeeded) mapped by `on_commit` instead of the data API's mapping
+    /// ([`chelabase_query::with_transaction_mapped`]), in owner mode too.
+    pub async fn as_caller_mapped<T>(
+        &self,
+        data: &DataIdentity,
+        requested: Option<&str>,
+        request_id: &str,
+        on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+        f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+    ) -> Result<(T, String), Failure> {
         // The one place owner mode is chosen (m9): only a console owner-mode request has it.
         if let Some(owner) = crate::internal::owner_mode() {
-            return self.as_owner(owner, data, requested, request_id, f).await;
+            return self.as_owner(owner, data, requested, request_id, on_commit, f).await;
         }
         let served = self.served_database(data, requested).await?;
         let branch = data.branch_id;
@@ -275,7 +290,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                 })?;
                 let settings = session.settings(&served);
                 session
-                    .transaction(&served.name, &settings, request_id, f)
+                    .transaction_mapped(&served.name, &settings, request_id, on_commit, f)
                     .await
                     .map_err(Failure)
             })
@@ -294,6 +309,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         data: &DataIdentity,
         requested: Option<&str>,
         request_id: &str,
+        on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
         f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
     ) -> Result<(T, String), Failure> {
         let served = self.served_database(data, requested).await?;
@@ -312,6 +328,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                 &served.name,
                 info.settings.statement_timeout_ms,
                 request_id,
+                on_commit,
                 async |c| f(c, &database).await,
             )
             .await

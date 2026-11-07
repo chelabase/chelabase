@@ -4576,3 +4576,94 @@ async fn storage_webhooks(fx: &Fx, host: &str) {
     assert_eq!((attempts[0].outcome.as_str(), attempts[0].status), ("delivered", Some(200)));
     assert!(fx.metadata.delete_storage_webhook(fx.id.as_uuid(), webhook_id).await.unwrap());
 }
+
+/// #102 (m11 re-audit B1′): a deferred trigger can always defer the keys again, so a delete's
+/// work can still fail at COMMIT, after every statement passed. That failure gets the same
+/// fixed answer as one at the statement (`objects::deleted_failure`, nested): a late insert
+/// that breaks a deferred foreign key is 409 `referenced`, a deferred constraint trigger that
+/// raises is 409 `delete_refused`, never the owner's table, constraint, key or message. Single
+/// and batch delete alike; nothing is deleted.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_commit_time_refusal_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_commit_time_refusal_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        const TEXT: (&str, &str) = ("content-type", "text/plain");
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        // Each cascade's BEFORE trigger defers the keys; its deferred constraint trigger, fired
+        // by the delete's second SET CONSTRAINTS ALL IMMEDIATE, defers them again and queues
+        // work that only COMMIT runs.
+        fx.owner(
+            "CREATE TABLE secret_late (id int PRIMARY KEY, photo uuid
+                 CONSTRAINT secret_late_photo_fkey REFERENCES storage.objects(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TABLE secret_hook (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE CASCADE);
+             CREATE FUNCTION secret_defer() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN SET CONSTRAINTS ALL DEFERRED; RETURN OLD; END $$;
+             CREATE TRIGGER secret_defer BEFORE DELETE ON secret_hook FOR EACH ROW EXECUTE FUNCTION secret_defer();
+             CREATE FUNCTION secret_late_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN SET CONSTRAINTS ALL DEFERRED; INSERT INTO secret_late VALUES (OLD.id, gen_random_uuid()); RETURN NULL; END $$;
+             CREATE CONSTRAINT TRIGGER secret_late_insert AFTER DELETE ON secret_hook
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION secret_late_insert();
+             CREATE TABLE secret_hook2 (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE CASCADE);
+             CREATE TRIGGER secret_defer2 BEFORE DELETE ON secret_hook2 FOR EACH ROW EXECUTE FUNCTION secret_defer();
+             CREATE FUNCTION secret_late_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN SET CONSTRAINTS ALL DEFERRED; INSERT INTO secret_hook2 VALUES (100 + OLD.id, NULL); RETURN NULL; END $$;
+             CREATE FUNCTION secret_boom() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'secret_boom row %', NEW.id USING DETAIL = 'secret detail', HINT = 'secret hint'; END $$;
+             CREATE CONSTRAINT TRIGGER secret_boom AFTER INSERT ON secret_hook2
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.id > 100) EXECUTE FUNCTION secret_boom();
+             CREATE CONSTRAINT TRIGGER secret_late_raise AFTER DELETE ON secret_hook2
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION secret_late_raise();",
+        )
+        .await
+        .expect("the owner's tables");
+
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        let call = async |method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]| {
+            let (status, b) = raw(&base, &token, method, path, body, headers).await;
+            (status, json_of(&b))
+        };
+        let up = |name: &str| format!("/storage/v1/object/files/{name}");
+        for name in ["late.txt", "raise.txt", "free.txt"] {
+            let (status, b) = call("POST", &up(name), b"x".to_vec(), &[TEXT]).await;
+            assert_eq!(status, 200, "{name}: {b}");
+        }
+        let late = fx.value("SELECT id FROM storage.objects WHERE name = 'late.txt'").await;
+        let raise = fx.value("SELECT id FROM storage.objects WHERE name = 'raise.txt'").await;
+        fx.owner(&format!("INSERT INTO secret_hook VALUES (1, '{late}'); INSERT INTO secret_hook2 VALUES (1, '{raise}');"))
+            .await
+            .unwrap();
+
+        // Every case runs, and the failures are reported together.
+        let mut failures = Vec::new();
+        let mut check = |case: String, code: &str, status: u16, got: &Value| {
+            let text = got.to_string();
+            let leaked = ["secret", "photo", "constraint \"", "relation \"", "table \""].into_iter().find(|s| text.contains(s));
+            let extra = got["error"].get("detail").is_some() || got["error"].get("hint").is_some();
+            if leaked.is_some() || extra || (status, &got["error"]["code"]) != (409, &json!(code)) {
+                failures.push(format!("{case}: want 409 {code} with no owner text, got {status} {got}"));
+            }
+        };
+        for (name, code) in [("late.txt", "referenced"), ("raise.txt", "delete_refused")] {
+            let (status, got) = call("DELETE", &up(name), vec![], &[]).await;
+            check(name.to_owned(), code, status, &got);
+            let batch = json!({ "names": ["free.txt", name] }).to_string().into_bytes();
+            let (status, got) = call("DELETE", "/storage/v1/object/files", batch, &[JSON]).await;
+            check(format!("batch {name}"), code, status, &got);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(
+            fx.value("SELECT string_agg(name, ',' ORDER BY name) FROM storage.objects").await,
+            "free.txt,late.txt,raise.txt",
+            "nothing deleted"
+        );
+        assert_eq!(fx.owner("SELECT count(*) FROM secret_late").await.unwrap().trim(), "0");
+        assert_eq!(call("DELETE", &up("free.txt"), vec![], &[]).await.0, 204, "an unreferenced object still goes");
+    }))
+    .await;
+}
