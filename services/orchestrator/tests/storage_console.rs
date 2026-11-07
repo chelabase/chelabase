@@ -616,3 +616,109 @@ async fn owner_mode_needs_admin_and_names_no_role() {
     let path = format!("{}/bucket?claims=%7B%22sub%22%3A%22u%22%7D", base(&w));
     assert_eq!(call(&w, "boss", "GET", &path).await.status(), 422);
 }
+
+/// Sends `method path` as written (no client normalises it) and returns the status.
+async fn raw(w: &MemberWorld, sub: &str, method: &str, path: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = w.app.base.trim_start_matches("http://").to_string();
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: x\r\n{IDENTITY_HEADER}: {}\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}",
+        w.app.token_for(sub, "org-1")
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    let head = String::from_utf8_lossy(&out);
+    head.split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// B1 (the m9 audit): a `.` or `..` segment, raw or percent-encoded, must not turn the route
+/// the orchestrator authorized into another one at storage.
+#[tokio::test]
+async fn adv_dot_segments_never_change_the_route() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (w, storage) = world().await;
+    let addr = w.app.base.trim_start_matches("http://").to_string();
+    let session = "6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10";
+    let mut leaks = Vec::new();
+    for (method, tail) in [
+        ("GET", format!("/object/b/../../upload/session/{session}")),
+        (
+            "GET",
+            format!("/object/b/%2e%2e/%2e%2e/upload/session/{session}"),
+        ),
+        (
+            "GET",
+            format!("/object/b/.%2E/.%2e/upload/session/{session}"),
+        ),
+        ("POST", "/object/list/..".to_string()),
+    ] {
+        let path = format!("{}{tail}?role=reader", base(&w));
+        let before = storage.calls();
+        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nhost: x\r\n{IDENTITY_HEADER}: {}\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}",
+            w.app.token_for("vic", "org-1")
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        if storage.calls() > before {
+            let seen = storage.last();
+            if !seen.path_and_query.starts_with("/storage/v1/object/")
+                || seen.path_and_query.contains("upload/session")
+            {
+                leaks.push(format!(
+                    "{method} {tail} -> storage {} {}",
+                    seen.method, seen.path_and_query
+                ));
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "a Viewer route reached another storage route: {leaks:#?}"
+    );
+}
+
+/// The invariant behind B1, exhaustively over a small alphabet: for every console path made of
+/// route words, `.`, `..` and their percent-encodings (any case), either the orchestrator
+/// refuses it without calling storage, or storage receives exactly the route the orchestrator
+/// matched and authorized (`/storage/v1` + the tail as sent).
+#[tokio::test]
+async fn dot_segments_are_refused_or_reach_storage_unchanged() {
+    const WORDS: &[&str] = &[
+        "object", "b", "upload", "bucket", ".", "..", "%2e", "%2E%2e", ".%2E", "%2e.",
+    ];
+    let (w, storage) = world().await;
+    let mut tails = vec![String::new()];
+    let mut all = Vec::new();
+    for _ in 0..3 {
+        tails = tails
+            .iter()
+            .flat_map(|t| WORDS.iter().map(move |word| format!("{t}/{word}")))
+            .collect();
+        all.extend(tails.iter().cloned());
+    }
+    let mut wrong = Vec::new();
+    for tail in &all {
+        for method in ["GET", "POST"] {
+            let path = format!("{}{tail}?role=writer", base(&w));
+            let before = storage.calls();
+            let status = raw(&w, "dee", method, &path).await;
+            if storage.calls() == before {
+                continue;
+            }
+            let seen = storage.last();
+            let got = seen.path_and_query.split('?').next().unwrap();
+            if got != format!("/storage/v1{tail}") {
+                wrong.push(format!("{method} {tail} ({status}) -> {got}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "storage got another route: {wrong:#?}");
+}

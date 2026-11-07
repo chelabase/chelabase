@@ -3,13 +3,13 @@
 //! with NATS down storage keeps serving on them).
 //!
 //! It listens as its own NATS user (`storage`, subscribe-only) to:
-//! - `chelabase.rt.project.>`: a branch's status changed (a reset or restore ends with one), it
+//! - `chelabase.rt.project.*`: a branch's status changed (a reset or restore ends with one), it
 //!   was deleted, or one of its Postgres databases was created or dropped: the branch's
 //!   connection info, pools and schema checks go;
 //! - `chelabase.storage.events` ([`chelabase_nats::StorageEvent`]): a data key revoked, rotated
 //!   or its database list changed (its signed URLs' liveness goes), or a branch's connection
 //!   budget changed (as a branch event above);
-//! - `chelabase.rt.access.>`: a member's access changed (removed, suspended, a grant): every
+//! - `chelabase.rt.access.*`: a member's access changed (removed, suspended, a grant): every
 //!   cached key liveness goes, since a console URL lives on its member's access.
 
 use std::sync::Arc;
@@ -94,8 +94,8 @@ async fn listen<S: ConnSource, M: ConnSource>(
 ) -> anyhow::Result<()> {
     let client = chelabase_nats::connect(config).await?;
     let subjects = [
-        format!("{PROJECT}.>"),
-        format!("{ACCESS}.>"),
+        format!("{PROJECT}.*"),
+        format!("{ACCESS}.*"),
         SUBJECT_STORAGE_EVENTS.to_string(),
     ];
     let mut subscriptions = Vec::new();

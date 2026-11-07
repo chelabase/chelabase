@@ -28,6 +28,7 @@ use chelabase_query::QueryFailure;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+use crate::cache::Fenced;
 use crate::error::Failure;
 
 /// The oldest `storage` schema this service works with (`chelabase storage schema <n>`): the
@@ -106,7 +107,7 @@ pub struct Engine<S, M> {
     managed: ServicePool<M>,
     owner_level: OwnerLevelCache,
     /// `(branch, database)` → whether its schema may be served.
-    schema_ok: moka::future::Cache<(Uuid, String), bool>,
+    schema_ok: Fenced<(Uuid, String), bool>,
 }
 
 impl<S: ConnSource, M: ConnSource> Engine<S, M> {
@@ -119,11 +120,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             pools,
             managed,
             owner_level: owner_level::owner_level_cache(),
-            schema_ok: moka::future::Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(SCHEMA_CHECK_TTL)
-                .support_invalidation_closures()
-                .build(),
+            schema_ok: Fenced::new(10_000, SCHEMA_CHECK_TTL),
         }
     }
 
@@ -133,9 +130,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
     pub async fn invalidate(&self, branch: Uuid) {
         self.pools.invalidate(branch).await;
         self.managed.invalidate(branch).await;
-        if let Err(e) = self.schema_ok.invalidate_entries_if(move |k, _| k.0 == branch) {
-            tracing::warn!(branch_id = %branch, "dropping the schema checks: {e}");
-        }
+        self.schema_ok.forget_if(move |k, _| k.0 == branch);
     }
 
     /// The served database `data` asks for ([`pick_database`]), looking again at most every
@@ -222,19 +217,18 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         request_id: &str,
     ) -> Result<(), Failure> {
         let key = (branch, database.to_owned());
-        let ok = match self.schema_ok.get(&key).await {
-            Some(ok) => ok,
-            None => {
+        let ok = self
+            .schema_ok
+            .get_or_lookup(key, async {
                 let rows = self
                     .managed(branch, database, &STORAGE_SCHEMA, &[], request_id)
                     .await?;
-                let ok = rows
-                    .first()
-                    .is_some_and(|row| schema_acceptable(row.get(0), row.get(1)));
-                self.schema_ok.insert(key, ok).await;
-                ok
-            }
-        };
+                Ok::<_, Failure>(
+                    rows.first()
+                        .is_some_and(|row| schema_acceptable(row.get(0), row.get(1))),
+                )
+            })
+            .await?;
         if ok {
             Ok(())
         } else {

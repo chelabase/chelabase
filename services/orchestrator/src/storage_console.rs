@@ -162,6 +162,37 @@ pub fn storage_path(path: &str) -> Option<String> {
     Some(format!("/storage/v1/{tail}"))
 }
 
+/// Whether a path has a segment a URL parser removes or rewrites: `.` or `..`, raw or
+/// percent-encoded in any case (`%2e`, `.%2E`, …), or a `\` (a separator to WHATWG URL
+/// parsers). Such a path names one route here and another once parsed, so it's refused before
+/// the access check (B1, m9's audit).
+///
+/// The invariant (tested exhaustively in `tests/storage_console.rs` and below): a console path
+/// is either refused before storage is called, or storage receives exactly the route the
+/// orchestrator matched and authorized, `/storage/v1` + the tail as sent.
+pub fn has_dot_segment(path: &str) -> bool {
+    path.contains('\\')
+        || path.split('/').any(|segment| {
+            let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+            decoded == "." || decoded == ".."
+        })
+}
+
+/// 400, as storage answers a name with a dot segment.
+fn dot_segment() -> ApiError {
+    ApiError::invalid_request(
+        400,
+        "a storage path has no `.` or `..` segment (raw or percent-encoded) and no `\\`",
+    )
+}
+
+/// The URL storage is called at, or `None` when parsing it would change the path (defence in
+/// depth behind [`has_dot_segment`]: storage must get the route that was authorized).
+pub fn storage_url(base: &str, path: &str, query: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(&format!("{base}{path}?{query}")).ok()?;
+    (url.path() == path).then_some(url)
+}
+
 /// The value, or the error to answer with instead.
 macro_rules! or_answer {
     ($result:expr) => {
@@ -194,6 +225,18 @@ where
     };
     if query.role.as_deref() == Some("") {
         return unprocessable("role must not be empty").into_response();
+    }
+    // The route as sent, checked before anything else: a dot segment would make storage run
+    // another route than the one authorized below.
+    let Some(path) = storage_path(uri.path()) else {
+        error!(
+            path = uri.path(),
+            "storage console: a route outside …/storage"
+        );
+        return ApiError::internal().into_response();
+    };
+    if has_dot_segment(&path) {
+        return dot_segment().into_response();
     }
     let claims = or_answer!(parse_claims(query.claims.as_deref()));
     // No role (or `owner`, or the owner's name) is owner mode: acting as the owner needs Admin
@@ -249,13 +292,6 @@ where
         or_answer!(check_role(state, branch.id, role).await);
     }
 
-    let Some(path) = storage_path(uri.path()) else {
-        error!(
-            path = uri.path(),
-            "storage console: a route outside …/storage"
-        );
-        return ApiError::internal().into_response();
-    };
     let response = forward(
         &state.storage,
         &Forward {
@@ -355,9 +391,13 @@ async fn forward(
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
         return ApiError::internal().into_response();
     };
+    let Some(url) = storage_url(&storage.url, path, &query) else {
+        warn!(path, "storage console: the parsed URL changes the route");
+        return dot_segment().into_response();
+    };
     let mut request = storage
         .http
-        .request(method.clone(), format!("{}{path}?{query}", storage.url))
+        .request(method.clone(), url)
         .bearer_auth(&storage.token)
         .header(CONSOLE_HEADER, caller);
     let with_body = method != reqwest::Method::GET && method != reqwest::Method::HEAD;
@@ -751,6 +791,69 @@ mod tests {
             "/other",
         ] {
             assert_eq!(storage_path(bad), None, "{bad}");
+        }
+    }
+
+    /// The B1 invariant, exhaustively: every path of up to four segments over route words,
+    /// dots and their encodings (each case mix) is either refused by [`has_dot_segment`], or
+    /// parsing it as storage's URL leaves the path exactly as authorized; and
+    /// [`storage_url`] never hands on a URL whose path differs.
+    #[test]
+    fn a_path_is_refused_or_reaches_storage_unchanged() {
+        const SEGMENTS: &[&str] = &[
+            "b",
+            "a.txt",
+            "...",
+            "a..",
+            ".a",
+            "",
+            ".",
+            "..",
+            "%2e",
+            "%2E",
+            ".%2e",
+            "%2E.",
+            "%2e%2E",
+            "%2E%2E",
+            "%2e%2e%2e",
+            "a\\..",
+            "%5c",
+            "%2F..",
+        ];
+        let base = "http://storage:5001";
+        let mut paths = vec![String::from("/storage/v1")];
+        let mut checked = 0;
+        for _ in 0..4 {
+            paths = paths
+                .iter()
+                .flat_map(|p| SEGMENTS.iter().map(move |s| format!("{p}/{s}")))
+                .collect();
+            for path in &paths {
+                checked += 1;
+                let url = storage_url(base, path, "database=web1");
+                if let Some(url) = &url {
+                    assert_eq!(url.path(), path, "storage_url changed {path}");
+                }
+                if !has_dot_segment(path) {
+                    assert!(url.is_some(), "accepted {path}, but parsing changes it");
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
+        for dotted in [
+            "/storage/v1/object/b/..",
+            "/storage/v1/%2E%2e/x",
+            "/storage/v1/.%2E",
+            "/storage/v1/a\\b",
+        ] {
+            assert!(has_dot_segment(dotted), "{dotted}");
+        }
+        for fine in [
+            "/storage/v1/object/b/...",
+            "/storage/v1/object/b/a..b",
+            "/storage/v1/%2e%2e%2e",
+        ] {
+            assert!(!has_dot_segment(fine), "{fine}");
         }
     }
 
