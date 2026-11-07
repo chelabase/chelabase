@@ -2812,6 +2812,8 @@ struct FakeBundles {
     puts: Arc<Mutex<Vec<(DatabaseId, String, Vec<u8>)>>>,
     /// Answer every upload with this status (2xx when unset).
     status: Arc<Mutex<Option<u16>>>,
+    /// While set, an upload signals the first and waits for the second before it answers.
+    gate: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
 }
 
 impl orchestrator::functions::BundleSink for FakeBundles {
@@ -2823,7 +2825,12 @@ impl orchestrator::functions::BundleSink for FakeBundles {
     ) -> orchestrator::functions::SinkFuture<'a> {
         self.puts.lock().unwrap().push((database, sha256.to_string(), manifest.to_vec()));
         let status = *self.status.lock().unwrap();
+        let gate = self.gate.lock().unwrap().clone();
         Box::pin(async move {
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
             match status {
                 Some(code) if !(200..300).contains(&code) => {
                     Err(orchestrator::functions::SinkError::Status(code))

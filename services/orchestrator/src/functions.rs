@@ -924,6 +924,9 @@ where
         let function = find(&state, &record, &name).await?;
         // The run-as role's checks and the worker's answer, before any write.
         let run_as = match &request.run_as_role {
+            Some(Some(role)) if role.trim().is_empty() => {
+                return Err(unprocessable("run_as_role must not be empty (null clears it)"));
+            }
             Some(Some(role)) => {
                 let (oid, timeline, bypass) =
                     checked_key_identity(&state, &authorized, &record, &branch, role, &format!("function {name:?}'s run-as role {role:?}")).await?;
@@ -1073,6 +1076,26 @@ where
     .await)
 }
 
+/// The request body, at most `cap` bytes: over it is 413, a body that breaks off is 400.
+async fn read_capped(body: Body, cap: usize) -> Result<bytes::Bytes, ApiError> {
+    use futures_util::StreamExt;
+    let mut stream = body.into_data_stream();
+    let mut out = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|_| ApiError::invalid_request(400, "the request body couldn't be read"))?;
+        if out.len() + chunk.len() > cap {
+            return Err(ApiError::new(
+                413,
+                ErrorCode::TooLarge,
+                format!("the body is over the {cap}-byte limit"),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.freeze())
+}
+
 /// A sink refusal as the API answers it.
 fn sink_error(err: SinkError) -> ApiError {
     match err {
@@ -1148,11 +1171,14 @@ where
     respond(async {
         let (_, record, branch) = begin(&state, &principal, ep::CREATE_FUNCTION_DEPLOYMENT.policy.access, id, branch_id).await?;
         // The cap applies before anything is parsed.
-        let body = axum::body::to_bytes(body, MAX_DEPLOY_BODY).await.map_err(|_| {
-            ApiError::new(413, ErrorCode::TooLarge, format!("the body is over the {MAX_DEPLOY_BODY}-byte limit"))
-        })?;
+        let body = read_capped(body, MAX_DEPLOY_BODY).await?;
         let request: CreateDeploymentRequest = parse_body(&body)?;
         let manifest = request.manifest.get().as_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(manifest)
+            .map_err(|_| unprocessable("the manifest isn't valid JSON"))?;
+        if !parsed.is_object() {
+            return Err(unprocessable("the manifest is a JSON object"));
+        }
         if manifest.len() as i64 > MAX_BUNDLE_SIZE {
             return Err(ApiError::new(413, ErrorCode::TooLarge, format!("a bundle is at most {MAX_BUNDLE_SIZE} bytes")));
         }
@@ -1164,9 +1190,9 @@ where
         }
         let compatibility_date = match request.compatibility_date {
             Some(date) => date,
-            None => serde_json::from_str::<serde_json::Value>(request.manifest.get())
-                .ok()
-                .and_then(|m| m.get("compatibilityDate")?.as_str()?.parse::<NaiveDate>().ok())
+            None => parsed
+                .get("compatibilityDate")
+                .and_then(|d| d.as_str()?.parse::<NaiveDate>().ok())
                 .ok_or_else(|| unprocessable("no compatibility_date, and the manifest has no compatibilityDate"))?,
         };
         let function = find(&state, &record, &name).await?;
@@ -1178,6 +1204,9 @@ where
             .put(record.database_id, &request.sha256, bytes::Bytes::copy_from_slice(manifest))
             .await
             .map_err(sink_error)?;
+        // The upload may take a while: the branch's protection is checked again before anything
+        // is recorded (an Admin may have protected it meanwhile).
+        begin(&state, &principal, ep::CREATE_FUNCTION_DEPLOYMENT.policy.access, id, branch_id).await?;
         let deployment = state
             .metadata
             .create_deployment(&NewDeployment {
@@ -1198,8 +1227,9 @@ where
                 .set_active_deployment(branch.id, function.id, deployment.id)
                 .await
                 .map_err(|e| metadata_error("activate deployment", e))?;
-            changed(&state, branch.id, &name).await;
         }
+        // A new deployment, active or not: listings change.
+        changed(&state, branch.id, &name).await;
         info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, deployment_id = %deployment.id, "function deployed");
         Ok((StatusCode::CREATED, Json(Deployment::from(deployment))).into_response())
     }
