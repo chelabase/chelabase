@@ -119,6 +119,7 @@ check-scripts:
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
     scripts/tests/ci-affected.sh
+    scripts/tests/storage-docs-vars.sh
 
 # cargo-deny, check, clippy, nextest and doctests: the whole workspace, or only the given packages
 # (`just check-rust gateway chelabase-routes`)

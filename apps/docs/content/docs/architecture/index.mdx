@@ -12,7 +12,7 @@ This section describes how the parts fit together. For how to use them, start wi
 ```
 apps/studio          the web app (the only user-facing app)
 apps/docs            this documentation site
-services/            gateway, orchestrator, worker, rest, auth, realtime, identity, init
+services/            gateway, orchestrator, worker, rest, auth, realtime, storage, identity, init
 tools/cli            the `chelabase` binary (dev bootstrap, token minting, type generation)
 tools/bench-data-api the data API benchmark harness
 crates/              shared Rust libraries
@@ -37,6 +37,7 @@ The Rust workspace holds the control plane; a pnpm workspace holds Studio, this 
 | Auth | Sign-in backend for Studio and for app users; signs member and app-user tokens | [Studio](/architecture/studio), [App users](/architecture/app-users) |
 | Identity | Holds every account (Studio members and each project's app users), internal only | [Identity service](/architecture/identity) |
 | Realtime | Live rows and presence over a WebSocket | [Realtime](/architecture/realtime) |
+| Storage | Object storage at `/storage/v1`: buckets and files under row-level security, in an S3-compatible store | [Storage](/architecture/storage) |
 | Studio | The web app | [Studio](/architecture/studio) |
 
 NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and realtime's tickets, and Mailpit catches local email.
@@ -46,7 +47,7 @@ NATS JetStream carries the jobs, a metadata Postgres holds the control plane's o
 All API traffic enters through the gateway. It checks the credential (a member access token for the Management API, a data API key for the data API), then calls the owning service with a short-lived internal identity token. Services never see the client's own credential, and they trust only the gateway's token. Postgres connections do not go through the gateway: they reach each database through Neon's proxy.
 
 ```
-client ──HTTP──▶ gateway ──identity token──▶ orchestrator | auth | rest | realtime
+client ──HTTP──▶ gateway ──identity token──▶ orchestrator | auth | rest | realtime | storage
 client ──Postgres wire / SQL over HTTP──▶ Neon proxy ──▶ compute ◀── pageserver, safekeepers
 ```
 
@@ -65,6 +66,7 @@ This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, pre
   <Card title="App users" href="/architecture/app-users">Identity, tokens and how users are synced.</Card>
   <Card title="SQL editor" href="/architecture/sql-editor">Execution, the guard, limits and audit.</Card>
   <Card title="Realtime" href="/architecture/realtime">Live rows, presence, ports, settings and secrets.</Card>
+  <Card title="Storage" href="/architecture/storage">Object storage: the request flow, blob keys, the sweep and the credential barrier.</Card>
   <Card title="Neon" href="/architecture/neon">The storage stack, the proxy and local ports.</Card>
   <Card title="API generation" href="/architecture/api-generation">OpenAPI documents, generated clients and the reference UI.</Card>
   <Card title="Security" href="/architecture/security">Trust boundaries and security notes.</Card>
