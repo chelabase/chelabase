@@ -428,8 +428,28 @@ for render in base wb; do
   [[ "$render" == wb ]] && { f="$tmp/wb.json"; runner="runner "; }
   got="$(jq -r '.services["functions-runtime"].networks // {} | keys | join(" ")' "$f")"
   [[ "$got" == "functions functions-egress" ]] || err "$render: functions-runtime is on [$got], expected [functions functions-egress]"
+  # #183: the gateway joins the runtime's network as `gateway-functions` (the runtime's
+  # `env.CHELABASE` binding), and nothing else does.
   got="$(members functions "$f")"
-  [[ "$got" == "functions functions-runtime " ]] || err "$render: the functions network holds [$got]"
+  [[ "$got" == "functions functions-runtime gateway " ]] || err "$render: the functions network holds [$got]"
+  got="$(jq -c '.services.gateway.networks.functions.aliases // []' "$f")"
+  [[ "$got" == '["gateway-functions"]' ]] || err "$render: the gateway's alias on the functions network: got $got"
+  for svc in orchestrator worker metadata-db nats seaweedfs storage rest auth realtime identity; do
+    ! jq -e --arg s "$svc" '.services[$s].networks // {} | has("functions")' "$f" >/dev/null ||
+      err "$render: $svc must not be on the runtime's network"
+  done
+  # The binding's address is the gateway's alias and port, and its host the gateway's API host.
+  rt_cmd="$(jq -r '.services["functions-runtime"].command // [] | join(" ")' "$f")"
+  gw_port="$(jq -r '.services.gateway.environment.CHELABASE_GATEWAY_LISTEN // ""' "$f" | sed 's/.*://')"
+  [[ -z "$gw_port" ]] && gw_port="$(sed -n 's/^CHELABASE_GATEWAY_LISTEN=.*://p' "$root/scripts/tests/fixtures/workbench-stack.env")"
+  [[ "$rt_cmd" == "/usr/local/bin/workerd serve --experimental --external-addr chelabase-api=gateway-functions:$gw_port /etc/functions-runtime/config.capnp" ]] ||
+    err "$render: the runtime's binding must reach gateway-functions:$gw_port; command: $rt_cmd"
+  rt_host="$(jq -r '.services["functions-runtime"].environment.CHELABASE_API_HOST // ""' "$f")"
+  api_host="$(jq -r '.services.gateway.environment.CHELABASE_API_HOST // ""' "$f")"
+  [[ -z "$api_host" ]] && api_host="$(sed -n 's/^CHELABASE_API_HOST=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
+  [[ -n "$rt_host" && "$rt_host" == "$api_host" ]] || err "$render: the runtime's CHELABASE_API_HOST ($rt_host) must be the gateway's API host ($api_host)"
+  got="$(jq -r '.services["functions-runtime"].environment // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "CHELABASE_API_HOST" ]] || err "$render: the runtime gets CHELABASE_API_HOST and no other setting; got [$got]"
   got="$(members functions-control "$f")"
   [[ "$got" == "functions orchestrator ${runner}worker " ]] || err "$render: the functions-control network holds [$got]"
   got="$(members functions-egress "$f")"

@@ -558,8 +558,18 @@
       "cap_drop": [
         "ALL"
       ],
-      "command": null,
+      "command": [
+        "/usr/local/bin/workerd",
+        "serve",
+        "--experimental",
+        "--external-addr",
+        "chelabase-api=gateway-functions:8137",
+        "/etc/functions-runtime/config.capnp"
+      ],
       "entrypoint": null,
+      "environment": {
+        "CHELABASE_API_HOST": "api.feat-x.chelabase.localhost:8137"
+      },
       "healthcheck": {
         "interval": "5s",
         "retries": 3,
@@ -635,6 +645,11 @@
             "mail.feat-x.chelabase.localhost",
             "docs.feat-x.chelabase.localhost",
             "landing.feat-x.chelabase.localhost"
+          ]
+        },
+        "functions": {
+          "aliases": [
+            "gateway-functions"
           ]
         }
       },

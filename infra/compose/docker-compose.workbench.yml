@@ -597,6 +597,9 @@ services:
           - ${CHELABASE_MAIL_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_DOCS_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_LANDING_HOST_NAME:?set by chelabase workbench (stack.env)}
+      # #183: the functions' `env.CHELABASE` binding, as in the base file.
+      functions:
+        aliases: [gateway-functions]
     volumes: !override
       - *checkout-ro
       - *keys-mask
