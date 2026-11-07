@@ -22,7 +22,7 @@ use chelabase_routes::orchestrator as ep;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiJson, ApiPath};
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, info};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -135,7 +135,11 @@ async fn valid_url<M, J>(state: &AppState<M, J>, url: &str) -> Result<String, Ap
         .check_resolved(url)
         .await
         .map(|u| u.to_string())
-        .map_err(|refused| unprocessable(&format!("`url` is refused: {refused}")))
+        .map_err(|refused| {
+            // The address at fault goes to the log only: the answer names the host alone.
+            info!("storage webhook url refused: {}", refused.log_detail());
+            unprocessable(&format!("`url` is refused: {refused}"))
+        })
 }
 
 fn valid_events(events: &[String]) -> Result<Vec<String>, ApiError> {

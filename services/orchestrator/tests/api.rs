@@ -5428,7 +5428,8 @@ async fn a_webhook_secret_is_shown_once() {
 
 /// AC 3 at registration: private, loopback, link-local, metadata and IPv6 loopback literals in
 /// any spelling, a name resolving privately, an unresolvable one, http, and credentials are
-/// refused (nothing stored); an allowlisted internal host passes.
+/// refused (nothing stored), never naming a resolved address; a URL too long once normalized is
+/// refused too; an allowlisted internal host passes.
 #[tokio::test]
 async fn webhook_urls_must_reach_only_public_addresses() {
     let t = branching().await;
@@ -5455,7 +5456,19 @@ async fn webhook_urls_must_reach_only_public_addresses() {
         .await;
         assert_eq!(code_of(&body), "invalid_request", "{url}");
         assert!(message_of(&body).contains("url"), "{url}: {body}");
+        // The answer names the host, never the address it resolved to (internal DNS).
+        assert!(!body.to_string().contains("10.0.0.7"), "{url}: {body}");
     }
+    // Within the cap as sent, over it once normalized (each é is percent-encoded to 6 bytes):
+    // refused as too long, not stored past the column's limit.
+    let long = format!("https://hooks.example.test/{}", "\u{e9}".repeat(1000));
+    assert!(long.len() <= chelabase_http::outbound::MAX_URL_LEN);
+    let body = error_of(
+        t.send(Method::POST, &t.webhooks(), Some(json!({ "url": long, "events": ["object.created"] }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&body), "invalid_request");
     assert!(t.metadata.storage_webhooks.lock().unwrap().is_empty());
     t.create_webhook(json!({ "url": "https://inside.example.test/hook", "events": ["object.deleted"] })).await;
     // A change of URL is checked the same way.

@@ -149,6 +149,12 @@ async fn main() -> anyhow::Result<()> {
     compute_tls.spawn_reload();
 
     let rt_events: Arc<dyn orchestrator::internal::realtime::RtEvents> = Arc::new(nats.clone());
+    // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+        .map_err(anyhow::Error::msg)?;
+    for entry in webhooks.allow_hosts_with_port() {
+        warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
+    }
     let state = AppState {
         metadata,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
@@ -186,8 +192,7 @@ async fn main() -> anyhow::Result<()> {
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
-        webhooks: chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
-            .map_err(anyhow::Error::msg)?,
+        webhooks,
         compute_tls: Some(compute_tls),
     };
 
