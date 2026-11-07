@@ -6,6 +6,7 @@
  */
 import type { FunctionAuth } from './functionAuth.ts';
 import type { FunctionKind } from './functionKind.ts';
+import type { ServiceHealth } from './serviceHealth.ts';
 
 /**
  * A function of the database, with its state on this branch (null fields when it has no
@@ -20,6 +21,7 @@ export interface Function {
      */
   deployment_id: string | null;
   enabled: boolean;
+  health: ServiceHealth | null;
   id: string;
   kind: FunctionKind;
   /**
@@ -36,6 +38,11 @@ export interface Function {
      * @nullable
      */
   run_as_role: string | null;
+  /**
+     * A service's signing secret: only in the answer that made the service or rotated it.
+     * @nullable
+     */
+  signing_secret?: string | null;
   /** @nullable */
   updated_at: string | null;
 }

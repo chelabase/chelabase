@@ -13,6 +13,13 @@
 //! functions service's internal listener through a [`BundleSink`], byte for byte as uploaded
 //! (the runtime hashes exactly those bytes), and the deployment row is written only after it
 //! answered 2xx.
+//!
+//! m9: a `service` deploys a spec instead, `{backend: "external", url, health_path}`, and has a
+//! signing secret (`whsec_…`, shown once when the service is made and when it is rotated) the
+//! functions service signs each proxied request with. Making a service, deploying a URL and
+//! rotating the secret need a **tenant admin**: a URL opens a network path from the platform.
+//! The URL is checked against the services' outbound policy when it is saved (the functions
+//! service checks it again at every connection).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,6 +34,12 @@ use uuid::Uuid;
 
 /// The metadata the functions routes read and write (`chelabase_metadata`'s functions API).
 pub trait FunctionsPort: Send + Sync {
+    fn set_service_signing_secret(
+        &self,
+        database: DatabaseId,
+        function: Uuid,
+        secret: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn create_function(
         &self,
         database: DatabaseId,
@@ -105,6 +118,14 @@ pub trait FunctionsPort: Send + Sync {
 }
 
 impl FunctionsPort for MetadataClient {
+    async fn set_service_signing_secret(
+        &self,
+        database: DatabaseId,
+        function: Uuid,
+        secret: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::set_service_signing_secret(self, database, function, secret).await
+    }
     async fn create_function(
         &self,
         database: DatabaseId,
@@ -392,6 +413,15 @@ impl From<Auth> for FunctionAuth {
     }
 }
 
+/// What a service's last health check saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ServiceHealth)]
+enum Health {
+    Healthy,
+    Unhealthy,
+}
+
 /// A function of the database, with its state on this branch (null fields when it has no
 /// deployment active here).
 #[derive(Debug, Serialize, ToSchema)]
@@ -417,6 +447,13 @@ struct Function {
     last_error: Option<String>,
     #[schema(required = true)]
     updated_at: Option<DateTime<Utc>>,
+    /// A service's health on the branch (checked every 15 s); null before the first check, and
+    /// for a function.
+    #[schema(required = true)]
+    health: Option<Health>,
+    /// A service's signing secret: only in the answer that made the service or rotated it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signing_secret: Option<String>,
 }
 
 /// An immutable deployment of a function.
@@ -435,10 +472,14 @@ struct Deployment {
     created_at: DateTime<Utc>,
     #[schema(required = true)]
     note: Option<String>,
+    /// A service's spec (`{backend: "external", url, health_path}`); null for a function.
+    #[schema(required = true, value_type = Option<Object>)]
+    spec: Option<serde_json::Value>,
 }
 
 impl From<DeploymentRecord> for Deployment {
     fn from(d: DeploymentRecord) -> Self {
+        let spec = d.bundle_sha256.is_none().then(|| d.spec.clone());
         Deployment {
             id: d.id,
             bundle_sha256: d.bundle_sha256,
@@ -447,6 +488,7 @@ impl From<DeploymentRecord> for Deployment {
             created_by: d.created_by,
             created_at: d.created_at,
             note: d.note,
+            spec,
         }
     }
 }
@@ -476,24 +518,92 @@ struct PatchFunctionRequest {
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<String>)]
     run_as_role: Option<Option<String>>,
+    /// A service only: `true` makes a new signing secret (in this answer only; the old one
+    /// stops working). Needs a tenant admin.
+    rotate_signing_secret: Option<bool>,
 }
 
-/// A deployment: the bundle manifest (the runtime's format) and its hash.
+/// A deployment: a function's bundle manifest (the runtime's format) and its hash, or a
+/// service's `spec`.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 #[schema(as = CreateFunctionDeploymentRequest)]
 struct CreateDeploymentRequest {
-    /// The bundle manifest, as the runtime loads it. Stored byte for byte as sent.
-    #[schema(value_type = Object)]
-    manifest: Box<serde_json::value::RawValue>,
+    /// A function's bundle manifest, as the runtime loads it. Stored byte for byte as sent.
+    #[schema(value_type = Option<Object>)]
+    manifest: Option<Box<serde_json::value::RawValue>>,
     /// SHA-256 of the manifest's bytes as sent, lowercase hex.
-    sha256: String,
+    sha256: Option<String>,
+    /// A service's target (needs a tenant admin).
+    spec: Option<ServiceSpec>,
     /// Defaults to the manifest's `compatibilityDate`.
     compatibility_date: Option<NaiveDate>,
     note: Option<String>,
     /// Make it the active deployment on the branch (default true). The function stays enabled
     /// or disabled as it was; a new one starts disabled.
     activate: Option<bool>,
+}
+
+/// An external service: requests to `/services/v1/{name}/{rest}` go to `url` with the rest
+/// under its path; `health_path` (under it too) is polled every 15 s.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ServiceSpec {
+    /// `external`.
+    backend: String,
+    /// `https` (or `http` where the operator allows it), no credentials, query or fragment; a
+    /// public address, or an allowlisted host outside the platform.
+    url: String,
+    /// Starts with `/`, at most 256 printable ASCII characters, no `#`.
+    health_path: String,
+}
+
+/// The spec as stored, or why it's refused (422).
+async fn checked_spec<M, J>(state: &AppState<M, J>, spec: &ServiceSpec) -> Result<serde_json::Value, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if spec.backend != "external" {
+        return Err(unprocessable("backend must be `external`"));
+    }
+    let url = state
+        .services
+        .check_resolved(&spec.url)
+        .await
+        .map_err(|refused| unprocessable(&format!("url: {refused}")))?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(unprocessable("url: no query or fragment"));
+    }
+    let path = &spec.health_path;
+    if !path.starts_with('/') || path.len() > 256 || path.contains('#') || !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(unprocessable("health_path starts with / and is at most 256 printable ASCII characters, no #"));
+    }
+    Ok(serde_json::json!({"backend": "external", "url": url.as_str(), "health_path": path}))
+}
+
+fn is_tenant_admin(principal: &AuthPrincipal) -> bool {
+    principal.member.as_ref().is_some_and(|m| m.tenant_admin)
+}
+
+fn tenant_admin_needed() -> ApiError {
+    crate::access::deny_to_api(chelabase_types::access::Deny::Forbidden {
+        required: "tenant_admin".to_string(),
+    })
+}
+
+/// A new signing secret for the service, stored sealed; the secret.
+async fn rotate_secret<M, J>(state: &AppState<M, J>, database: DatabaseId, function: Uuid) -> Result<String, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let secret = crate::storage_webhooks::new_secret();
+    match state.metadata.set_service_signing_secret(database, function, &secret).await {
+        Ok(true) => Ok(secret),
+        Ok(false) => Err(not_found()),
+        Err(e) => Err(metadata_error("set service signing secret", e)),
+    }
 }
 
 /// A secret's value; it never comes back.
@@ -697,6 +807,12 @@ where
                 run_as_active: key.is_some(),
                 last_error: st.and_then(|s| s.last_error.clone()),
                 updated_at: st.map(|s| s.updated_at),
+                health: st.and_then(|s| match s.health.as_deref() {
+                    Some("healthy") => Some(Health::Healthy),
+                    Some("unhealthy") => Some(Health::Unhealthy),
+                    _ => None,
+                }),
+                signing_secret: None,
             }
         })
         .collect())
@@ -827,6 +943,11 @@ where
         if request.auth.is_some() && !deployed_here {
             return Err(refused("not_deployed", "deploy the function on this branch before setting its auth"));
         }
+        // m9: a service (made, or a function turned into one) needs a tenant admin.
+        let becomes_service = request.kind == Some(Kind::Service) && existing.as_ref().is_none_or(|f| f.kind != FunctionKind::Service);
+        if becomes_service && !is_tenant_admin(&principal) {
+            return Err(tenant_admin_needed());
+        }
         let (function, created) = match existing {
             None => {
                 let kind = request.kind.unwrap_or(Kind::Function).into();
@@ -864,7 +985,11 @@ where
             info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, created, "function written");
         }
         let status = if created { StatusCode::CREATED } else { StatusCode::OK };
-        Ok((status, Json(view(&state, &record, branch.id, function.id).await?)).into_response())
+        let mut answer = view(&state, &record, branch.id, function.id).await?;
+        if becomes_service {
+            answer.signing_secret = Some(rotate_secret(&state, record.database_id, function.id).await?);
+        }
+        Ok((status, Json(answer)).into_response())
     }
     .await)
 }
@@ -922,6 +1047,13 @@ where
         let (authorized, record, branch) = begin(&state, &principal, ep::UPDATE_FUNCTION.policy.access, id, branch_id).await?;
         let request: PatchFunctionRequest = parse_body(&body)?;
         let function = find(&state, &record, &name).await?;
+        let rotate = request.rotate_signing_secret == Some(true);
+        if rotate && !is_tenant_admin(&principal) {
+            return Err(tenant_admin_needed());
+        }
+        if rotate && function.kind != FunctionKind::Service {
+            return Err(unprocessable("only a service has a signing secret"));
+        }
         // The run-as role's checks and the worker's answer, before any write.
         let run_as = match &request.run_as_role {
             Some(Some(role)) if role.trim().is_empty() => {
@@ -959,7 +1091,17 @@ where
             info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, "function updated");
         }
         result?;
-        Ok(Json(view(&state, &record, branch.id, function.id).await?).into_response())
+        let mut answer = view(&state, &record, branch.id, function.id).await?;
+        if rotate {
+            answer.signing_secret = Some(rotate_secret(&state, record.database_id, function.id).await?);
+            // The secret is the database's: every branch's cached resolution drops it.
+            let branches = state.metadata.list_branches(record.database_id).await.map_err(|e| metadata_error("list branches", e))?;
+            for b in branches {
+                changed(&state, b.id, &name).await;
+            }
+            info!(request_id = %principal.request_id, function = %name, "service signing secret rotated");
+        }
+        Ok(Json(answer).into_response())
     }
     .await)
 }
@@ -1133,13 +1275,66 @@ fn sink_error(err: SinkError) -> ApiError {
     }
 }
 
+/// A function's bundle checked and stored with the functions service: `(sha256, size)` and
+/// its compatibility date. The branch's access is checked again after the upload.
+#[allow(clippy::too_many_arguments)]
+async fn stored_bundle<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    record: &DatabaseRecord,
+    function: &FunctionRecord,
+    manifest: &[u8],
+    sha256: &str,
+    compatibility_date: Option<NaiveDate>,
+    id: Uuid,
+    branch_id: Uuid,
+) -> Result<((String, i64), NaiveDate), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let parsed: serde_json::Value = serde_json::from_slice(manifest)
+        .map_err(|_| unprocessable("the manifest isn't valid JSON"))?;
+    if !parsed.is_object() {
+        return Err(unprocessable("the manifest is a JSON object"));
+    }
+    if manifest.len() as i64 > MAX_BUNDLE_SIZE {
+        return Err(ApiError::new(413, ErrorCode::TooLarge, format!("a bundle is at most {MAX_BUNDLE_SIZE} bytes")));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(unprocessable("sha256 is 64 lowercase hex characters"));
+    }
+    if hex::encode(Sha256::digest(manifest)) != sha256 {
+        return Err(unprocessable("the manifest doesn't hash to sha256"));
+    }
+    let compatibility_date = match compatibility_date {
+        Some(date) => date,
+        None => parsed
+            .get("compatibilityDate")
+            .and_then(|d| d.as_str()?.parse::<NaiveDate>().ok())
+            .ok_or_else(|| unprocessable("no compatibility_date, and the manifest has no compatibilityDate"))?,
+    };
+    if function.kind != FunctionKind::Function {
+        return Err(unprocessable("a service has no bundle"));
+    }
+    state
+        .bundles
+        .put(record.database_id, sha256, bytes::Bytes::copy_from_slice(manifest))
+        .await
+        .map_err(sink_error)?;
+    // The upload may take a while: the branch's protection is checked again before anything
+    // is recorded (an Admin may have protected it meanwhile).
+    begin(state, principal, ep::CREATE_FUNCTION_DEPLOYMENT.policy.access, id, branch_id).await?;
+    Ok(((sha256.to_owned(), manifest.len() as i64), compatibility_date))
+}
+
 #[utoipa::path(
     post,
     path = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments",
     operation_id = "createFunctionDeployment",
     tag = "functions",
-    summary = "Deploy a bundle",
-    description = "Stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service, then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.",
+    summary = "Deploy a bundle, or a service's spec",
+    description = "A function: stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service. A service: checks the `spec`'s URL (a tenant admin only). Then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -1152,7 +1347,8 @@ fn sink_error(err: SinkError) -> ApiError {
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over 12 MiB or the manifest over 10 MiB", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, or the function is a service", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: a service's spec needs a tenant admin", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, a bundle for a service or a spec for a function, or a refused URL or health path", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 502, description = "`unavailable`: the functions service refused the bundle", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the functions service is unavailable; nothing was recorded", body = ErrorEnvelope),
@@ -1173,48 +1369,31 @@ where
         // The cap applies before anything is parsed.
         let body = read_capped(body, MAX_DEPLOY_BODY).await?;
         let request: CreateDeploymentRequest = parse_body(&body)?;
-        let manifest = request.manifest.get().as_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(manifest)
-            .map_err(|_| unprocessable("the manifest isn't valid JSON"))?;
-        if !parsed.is_object() {
-            return Err(unprocessable("the manifest is a JSON object"));
-        }
-        if manifest.len() as i64 > MAX_BUNDLE_SIZE {
-            return Err(ApiError::new(413, ErrorCode::TooLarge, format!("a bundle is at most {MAX_BUNDLE_SIZE} bytes")));
-        }
-        if request.sha256.len() != 64 || !request.sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(unprocessable("sha256 is 64 lowercase hex characters"));
-        }
-        if hex::encode(Sha256::digest(manifest)) != request.sha256 {
-            return Err(unprocessable("the manifest doesn't hash to sha256"));
-        }
-        let compatibility_date = match request.compatibility_date {
-            Some(date) => date,
-            None => parsed
-                .get("compatibilityDate")
-                .and_then(|d| d.as_str()?.parse::<NaiveDate>().ok())
-                .ok_or_else(|| unprocessable("no compatibility_date, and the manifest has no compatibilityDate"))?,
-        };
         let function = find(&state, &record, &name).await?;
-        if function.kind != FunctionKind::Function {
-            return Err(unprocessable("a service has no bundle"));
-        }
-        state
-            .bundles
-            .put(record.database_id, &request.sha256, bytes::Bytes::copy_from_slice(manifest))
-            .await
-            .map_err(sink_error)?;
-        // The upload may take a while: the branch's protection is checked again before anything
-        // is recorded (an Admin may have protected it meanwhile).
-        begin(&state, &principal, ep::CREATE_FUNCTION_DEPLOYMENT.policy.access, id, branch_id).await?;
+        let (bundle, spec, compatibility_date) = match (&request.spec, &request.manifest, &request.sha256) {
+            (Some(spec), None, None) => {
+                if function.kind != FunctionKind::Service {
+                    return Err(unprocessable("a function deploys a bundle manifest"));
+                }
+                if !is_tenant_admin(&principal) {
+                    return Err(tenant_admin_needed());
+                }
+                (None, checked_spec(&state, spec).await?, Utc::now().date_naive())
+            }
+            (None, Some(manifest), Some(sha256)) => {
+                let (bundle, date) = stored_bundle(&state, &principal, &record, &function, manifest.get().as_bytes(), sha256, request.compatibility_date, id, branch_id).await?;
+                (Some(bundle), serde_json::json!({}), date)
+            }
+            _ => return Err(unprocessable("a deployment has a manifest and its sha256, or a service's spec")),
+        };
         let deployment = state
             .metadata
             .create_deployment(&NewDeployment {
                 id: Uuid::new_v4(),
                 function_id: function.id,
-                bundle_sha256: Some(&request.sha256),
-                bundle_size: Some(manifest.len() as i64),
-                spec: &serde_json::json!({}),
+                bundle_sha256: bundle.as_ref().map(|(sha, _)| sha.as_str()),
+                bundle_size: bundle.as_ref().map(|(_, size)| *size),
+                spec: &spec,
                 compatibility_date,
                 created_by: &principal.sub,
                 note: request.note.as_deref(),

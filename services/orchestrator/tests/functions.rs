@@ -721,9 +721,15 @@ mod functions {
             )
             .await;
         assert_eq!(status, 403, "{text}");
+        // m9: a project Admin isn't enough to make a service; a tenant admin is.
+        let (status, _) = w
+            .json("ada", "PUT", &w.path(w.w.dev, "/svc"), Some(json!({"kind": "service"})))
+            .await;
+        assert_eq!(status, 403);
+        w.w.metadata.add_member(w.w.tenant, "tom", MemberStatus::Active, true);
         let (status, body) = w
             .json(
-                "ada",
+                "tom",
                 "PUT",
                 &w.path(w.w.dev, "/svc"),
                 Some(json!({"kind": "service"})),
@@ -737,7 +743,7 @@ mod functions {
         // A service has no bundle.
         let (status, text) = w
             .call(
-                "ada",
+                "tom",
                 "POST",
                 &w.path(w.w.dev, "/svc/deployments"),
                 Some(deploy_body("djE=")),
@@ -1011,5 +1017,143 @@ mod functions {
         let mut answer = String::new();
         let _ = stream.read_to_string(&mut answer).await;
         assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    }
+
+    // --- m9: external services --------------------------------------------------------------
+
+    /// `tom` is a tenant admin.
+    async fn service_world() -> World {
+        let w = world().await;
+        w.w.metadata.add_member(w.w.tenant, "tom", MemberStatus::Active, true);
+        w
+    }
+
+    fn external(url: &str) -> Value {
+        json!({"spec": {"backend": "external", "url": url, "health_path": "/healthz"}})
+    }
+
+    /// AC: a tenant admin creates a service (its signing secret shown once), deploys an
+    /// external URL (stored normalized, active on the branch, `fn.changed` published) and
+    /// rotates the secret (shown once again).
+    #[tokio::test]
+    async fn functions_service_registered_by_a_tenant_admin() {
+        let w = service_world().await;
+        let (status, created) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"})))
+            .await;
+        assert_eq!(status, 201, "{created}");
+        assert_eq!(created["kind"], "service");
+        let first = created["signing_secret"].as_str().unwrap().to_owned();
+        assert!(first.starts_with("whsec_") && first.len() == 6 + 64, "{first}");
+        let (status, deployment) = w
+            .json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://HOOKS.example.test/api")))
+            .await;
+        assert_eq!(status, 201, "{deployment}");
+        assert_eq!(
+            deployment["spec"],
+            json!({"backend": "external", "url": "https://hooks.example.test/api", "health_path": "/healthz"})
+        );
+        assert!(deployment["bundle_sha256"].is_null());
+        assert!(w.w.app.bundles.puts.lock().unwrap().is_empty(), "no bundle");
+        assert!(w.published().iter().any(|(b, n)| *b == w.w.dev && n == "stub"));
+        let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, ""), None).await;
+        let stub = list.as_array().unwrap().iter().find(|f| f["name"] == "stub").unwrap().clone();
+        assert_eq!(stub["deployment_id"], deployment["id"]);
+        assert!(stub["health"].is_null(), "not checked yet");
+        assert!(stub.get("signing_secret").is_none(), "shown only once");
+        let (status, rotated) = w
+            .json("tom", "PATCH", &w.path(w.w.dev, "/stub"), Some(json!({"rotate_signing_secret": true})))
+            .await;
+        assert_eq!(status, 200, "{rotated}");
+        let second = rotated["signing_secret"].as_str().unwrap();
+        assert!(second.starts_with("whsec_") && second != first);
+        let stored = w.w.metadata.signing_secrets.lock().unwrap().clone();
+        assert_eq!(stored.values().cloned().collect::<Vec<_>>(), vec![second.to_owned()]);
+    }
+
+    /// AC: a Developer (or a project Admin) who isn't a tenant admin can't create a service,
+    /// set or change its URL, or rotate its secret: 403, nothing written.
+    #[tokio::test]
+    async fn functions_service_urls_need_a_tenant_admin() {
+        let w = service_world().await;
+        for sub in ["dee", "ada"] {
+            let (status, body) = w
+                .json(sub, "PUT", &w.path(w.w.dev, &format!("/svc-{sub}")), Some(json!({"kind": "service"})))
+                .await;
+            assert_eq!(status, 403, "{sub}: {body}");
+        }
+        w.json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"}))).await;
+        w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://hooks.example.test/a")))
+            .await;
+        let before = w.w.metadata.signing_secrets.lock().unwrap().clone();
+        for sub in ["dee", "ada"] {
+            let (status, body) = w
+                .json(sub, "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://hooks.example.test/b")))
+                .await;
+            assert_eq!(status, 403, "{sub}: {body}");
+            let (status, body) = w
+                .json(sub, "PATCH", &w.path(w.w.dev, "/stub"), Some(json!({"rotate_signing_secret": true})))
+                .await;
+            assert_eq!(status, 403, "{sub}: {body}");
+            // A function made by a Developer can't become a service either.
+            w.json("dee", "PUT", &w.path(w.w.dev, "/plain"), Some(json!({}))).await;
+            let (status, _) = w
+                .json(sub, "PUT", &w.path(w.w.dev, "/plain"), Some(json!({"kind": "service"})))
+                .await;
+            assert_eq!(status, 403, "{sub}");
+        }
+        let (_, deployments) = w.json("tom", "GET", &w.path(w.w.dev, "/stub/deployments"), None).await;
+        assert_eq!(deployments.as_array().unwrap().len(), 1);
+        assert_eq!(*w.w.metadata.signing_secrets.lock().unwrap(), before);
+        // Another project's member still hears 404, as for a missing database.
+        let (status, _) = w
+            .json("out", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://hooks.example.test/b")))
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    /// AC: unsafe URLs and malformed specs are refused at save time (422).
+    #[tokio::test]
+    async fn functions_service_unsafe_urls_refused() {
+        let w = service_world().await;
+        w.json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"}))).await;
+        for url in [
+            "http://127.0.0.1",
+            "http://[::1]",
+            "http://169.254.169.254",
+            "http://metadata-db:5432",
+            "http://nats:4222",
+            "file:///etc/passwd",
+            "http://METADATA-DB./",
+            "http://chelabase-metadata-db-1/",
+            "https://private.example.test/",
+            "https://nowhere.example.test/",
+            "https://hooks.example.test/?q=1",
+            "https://hooks.example.test/#f",
+        ] {
+            let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external(url))).await;
+            assert_eq!(status, 422, "{url}: {body}");
+        }
+        for spec in [
+            json!({"backend": "image", "url": "https://hooks.example.test/", "health_path": "/h"}),
+            json!({"backend": "external", "url": "https://hooks.example.test/", "health_path": "h"}),
+            json!({"backend": "external", "url": "https://hooks.example.test/", "health_path": "/h#x"}),
+            json!({"backend": "external", "url": "https://hooks.example.test/", "health_path": "/a b"}),
+        ] {
+            let (status, body) = w
+                .json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(json!({"spec": spec})))
+                .await;
+            assert_eq!(status, 422, "{spec}: {body}");
+        }
+        // A service takes no bundle, and a function no spec.
+        let (status, _) = w.call("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(deploy_body("djE="))).await;
+        assert_eq!(status, 422);
+        w.json("tom", "PUT", &w.path(w.w.dev, "/plain"), Some(json!({}))).await;
+        let (status, _) = w
+            .json("tom", "POST", &w.path(w.w.dev, "/plain/deployments"), Some(external("https://hooks.example.test/")))
+            .await;
+        assert_eq!(status, 422);
+        let (_, deployments) = w.json("tom", "GET", &w.path(w.w.dev, "/stub/deployments"), None).await;
+        assert!(deployments.as_array().unwrap().is_empty());
     }
 }

@@ -6,6 +6,7 @@
  */
 
 /**
- * The bundle manifest, as the runtime loads it. Stored byte for byte as sent.
+ * A function's bundle manifest, as the runtime loads it. Stored byte for byte as sent.
+ * @nullable
  */
-export type CreateFunctionDeploymentRequestManifest = { [key: string]: unknown };
+export type CreateFunctionDeploymentRequestManifest = { [key: string]: unknown } | null;

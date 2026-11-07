@@ -2226,8 +2226,8 @@ export const getCreateFunctionDeploymentUrl = (id: string,
 }
 
 /**
- * Stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service, then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.
- * @summary Deploy a bundle
+ * A function: stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service. A service: checks the `spec`'s URL (a tenant admin only). Then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.
+ * @summary Deploy a bundle, or a service's spec
  */
 export const createFunctionDeployment = async (id: string,
     branchId: string,
@@ -2296,7 +2296,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type CreateFunctionDeploymentMutationVariables = {id: string;branchId: string;name: string;data: CreateFunctionDeploymentRequest}
 
     /**
- * @summary Deploy a bundle
+ * @summary Deploy a bundle, or a service's spec
  */
 export const useCreateFunctionDeployment = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionDeployment>>, TError,CreateFunctionDeploymentMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}

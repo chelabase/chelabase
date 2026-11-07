@@ -96,6 +96,8 @@ struct FakeMetadata {
     saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
     /// m18: storage webhooks with their sealed secrets, and attempts by webhook.
     storage_webhooks: Arc<Mutex<Vec<(StorageWebhook, String)>>>,
+    /// Edge functions m9: services' signing secrets by function.
+    signing_secrets: Arc<Mutex<HashMap<uuid::Uuid, String>>>,
     storage_webhook_attempts: Arc<Mutex<Vec<(uuid::Uuid, StorageWebhookAttempt)>>>,
     /// Merge rows and their events.
     merges: Arc<Mutex<Vec<MergeRecord>>>,
@@ -3168,6 +3170,8 @@ async fn spawn_app_core_with(
         rt_events: Arc::new(rt_events.clone()),
         proxy_cache: Arc::new(cache.clone()),
         webhooks: webhook_outbound(),
+        // m9: the same resolver, http allowed so the hard deny is what refuses a stack host.
+        services: webhook_outbound().allow_http(true).deny_stack([]),
         bundles: Arc::new(bundles.clone()),
     });
     let probe: Router = Router::new()
@@ -5264,6 +5268,19 @@ impl FakeMetadata {
 }
 
 impl orchestrator::functions::FunctionsPort for FakeMetadata {
+    async fn set_service_signing_secret(
+        &self,
+        database: DatabaseId,
+        function: uuid::Uuid,
+        secret: &str,
+    ) -> Result<bool, MetadataError> {
+        let found = self.functions.lock().unwrap().functions.iter().any(|f| f.id == function && f.database_id == database);
+        if found {
+            self.signing_secrets.lock().unwrap().insert(function, secret.to_owned());
+        }
+        Ok(found)
+    }
+
     async fn create_function(
         &self,
         database: DatabaseId,
@@ -5413,6 +5430,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
                     run_as_key_id: None,
                     last_error: None,
                     updated_at: chrono::Utc::now(),
+                    health: None,
                 },
             )),
         }
