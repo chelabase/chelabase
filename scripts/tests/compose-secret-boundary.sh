@@ -465,9 +465,16 @@ for render in base wb; do
   [[ "$got" == '{"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
-fenv="$(jq -c '.services.functions.environment | {CHELABASE_FUNCTIONS_ADDR, CHELABASE_FUNCTIONS_INTERNAL_ADDR}' "$tmp/base.json")"
-[[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080,functions-control:8080"}' ]] ||
-  err "functions binds its aliases only: got $fenv"
+# #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
+# invocations only; each binds its own network's alias.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  fenv="$(jq -c '.services.functions.environment | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
+    | {CHELABASE_FUNCTIONS_ADDR, CHELABASE_FUNCTIONS_INTERNAL_ADDR, CHELABASE_FUNCTIONS_CONTROL_ADDR}' "$f")"
+  [[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080","CHELABASE_FUNCTIONS_CONTROL_ADDR":"functions-control:8080"}' ]] ||
+    err "$render: functions binds its aliases only, one side per network: got $fenv"
+done
 grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
   err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
 [[ "$(jq -r '.services["functions-runtime"].profiles // [] | length' "$tmp/base.json")" == 0 ]] ||

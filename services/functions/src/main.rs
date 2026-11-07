@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_secrets::SecretKey;
-use functions::app::{AppState, internal_router, public_router};
+use functions::app::{AppState, control_router, public_router, runtime_router};
 use functions::bundles::Bundles;
 use functions::config::Config;
 use functions::directory::Metadata;
@@ -61,10 +61,15 @@ async fn main() -> anyhow::Result<()> {
         config.worker_token.clone(),
     ));
     let public_addrs = resolve_all("CHELABASE_FUNCTIONS_ADDR", &config.addr).await?;
-    // The internal listener's: compose names the service's aliases on the internal networks
-    // only (the runtime's, and the orchestrator's and the worker's), so it listens there and
-    // nowhere else.
+    // The internal listener's two sides: compose names the service's alias on the runtime's
+    // network (bundle GETs) and on the orchestrator's and the worker's (uploads, invocations),
+    // so each side listens there and nowhere else.
     let internal_addrs = resolve_all("CHELABASE_FUNCTIONS_INTERNAL_ADDR", &config.internal_addr).await?;
+    let control_addrs = resolve_all("CHELABASE_FUNCTIONS_CONTROL_ADDR", &config.control_addr).await?;
+    anyhow::ensure!(
+        internal_addrs.iter().all(|a| !control_addrs.contains(a)),
+        "CHELABASE_FUNCTIONS_INTERNAL_ADDR and CHELABASE_FUNCTIONS_CONTROL_ADDR must name different addresses"
+    );
     let mut public = Vec::new();
     for addr in &public_addrs {
         public.push(tokio::net::TcpListener::bind(addr).await?);
@@ -73,8 +78,12 @@ async fn main() -> anyhow::Result<()> {
     for addr in &internal_addrs {
         internal.push(tokio::net::TcpListener::bind(addr).await?);
     }
+    let mut control = Vec::new();
+    for addr in &control_addrs {
+        control.push(tokio::net::TcpListener::bind(addr).await?);
+    }
     info!(
-        "functions listening on {public_addrs:?} and {internal_addrs:?} (internal), runtime {}, bucket {}",
+        "functions listening on {public_addrs:?}, {internal_addrs:?} (bundles) and {control_addrs:?} (uploads, invocations), runtime {}, bucket {}",
         config.runtime_url, config.store.bucket
     );
     let mut servers = tokio::task::JoinSet::new();
@@ -83,7 +92,11 @@ async fn main() -> anyhow::Result<()> {
         servers.spawn(async move { axum::serve(listener, app).await });
     }
     for listener in internal {
-        let app = internal_router(state.clone());
+        let app = runtime_router(state.clone());
+        servers.spawn(async move { axum::serve(listener, app).await });
+    }
+    for listener in control {
+        let app = control_router(state.clone());
         servers.spawn(async move { axum::serve(listener, app).await });
     }
     // The first listener to end ends the service.

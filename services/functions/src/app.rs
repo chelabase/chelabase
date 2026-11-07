@@ -5,8 +5,9 @@
 //! /functions/v1/public/{branch_id}/{name}[/{*rest}]` with none, and `GET /health`. Nothing
 //! else, `/internal/*` included.
 //!
-//! Internal (the `functions` network only): `GET /internal/bundles/{database_id}/{sha256}` (no
-//! bearer: the runtime has none), `PUT` the same (the orchestrator's bearer), and `POST
+//! Internal, in two sides on two networks (#181, audit S1): the runtime's side serves only
+//! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
+//! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
 //! /internal/invoke/{branch_id}/{name}` (the worker's bearer).
 
 use std::sync::Arc;
@@ -99,16 +100,23 @@ pub fn public_router(state: Shared) -> Router {
         .with_state(state)
 }
 
-pub fn internal_router(state: Shared) -> Router {
+/// The internal listener's runtime side (the runtime's `functions` network): bundle GETs only.
+/// Any other method or path is 404, never 405, so it says nothing of the control side.
+pub fn runtime_router(state: Shared) -> Router {
     Router::new()
-        .route(
-            "/internal/bundles/{database_id}/{sha256}",
-            get(get_bundle).put(put_bundle),
-        )
-        .route(
-            "/internal/invoke/{branch_id}/{name}",
-            axum::routing::post(invoke_internal),
-        )
+        .route("/internal/bundles/{database_id}/{sha256}", get(get_bundle))
+        .method_not_allowed_fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
+        .with_state(state)
+}
+
+/// Its control side (the orchestrator's and the worker's `functions-control` network): bundle
+/// PUTs (the orchestrator's bearer) and invocations (the worker's), nothing else.
+pub fn control_router(state: Shared) -> Router {
+    Router::new()
+        .route("/internal/bundles/{database_id}/{sha256}", axum::routing::put(put_bundle))
+        .route("/internal/invoke/{branch_id}/{name}", axum::routing::post(invoke_internal))
+        .method_not_allowed_fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
         .with_state(state)
 }

@@ -461,7 +461,8 @@
       ],
       "environment": {
         "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,127.0.0.1:8091",
-        "CHELABASE_FUNCTIONS_INTERNAL_ADDR": "functions-internal:8080,functions-control:8080",
+        "CHELABASE_FUNCTIONS_CONTROL_ADDR": "functions-control:8080",
+        "CHELABASE_FUNCTIONS_INTERNAL_ADDR": "functions-internal:8080",
         "CHELABASE_FUNCTIONS_RUNTIME_URL": "http://functions-runtime:8080",
         "CHELABASE_FUNCTIONS_TIMEOUT_MS": "",
         "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_functions",
