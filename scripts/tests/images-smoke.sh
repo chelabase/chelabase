@@ -6,7 +6,7 @@ set -euo pipefail
 
 TAG="${TAG:-latest}"
 REPO="${REPO:-chelabase}"
-apps=(gateway orchestrator worker rest auth realtime init)
+apps=(gateway orchestrator worker rest auth realtime storage init)
 bin_of() { [[ "$1" == init ]] && echo chelabase-init || echo "$1"; }
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }
@@ -29,11 +29,19 @@ for app in "${apps[@]}"; do
   [[ "${got}" == "${bin} " ]] && ok "${img}: binaries '${got}'" || bad "${img}: /usr/local/bin holds '${got}', want '${bin}'"
 done
 
+# Object storage (#152 AC 5): Compose runs it with `read_only: true` as the image's user, 10001.
+img="${REPO}/storage:${TAG}"
+if docker image inspect "${img}" >/dev/null 2>&1; then
+  user="$(docker image inspect -f '{{.Config.User}}' "${img}")"
+  [[ "${user}" == 10001 || "${user}" == 10001:* ]] && ok "${img}: user ${user}" || bad "${img}: user '${user}', want 10001"
+  if docker run --rm --read-only "${img}" storage --help >/dev/null 2>&1; then ok "${img}: storage --help on a read-only root"; else bad "${img}: storage --help fails on a read-only root"; fi
+fi
+
 all="${REPO}/server:${TAG}"
 if docker image inspect "${all}" >/dev/null 2>&1; then
-  want="auth chelabase-init gateway orchestrator realtime rest worker "
+  want="auth chelabase-init gateway orchestrator realtime rest storage worker "
   got="$(run "${all}" sh -c 'ls /usr/local/bin' | sort | tr '\n' ' ')"
-  [[ "${got}" == "${want}" ]] && ok "${all}: all seven binaries" || bad "${all}: /usr/local/bin holds '${got}', want '${want}'"
+  [[ "${got}" == "${want}" ]] && ok "${all}: all eight binaries" || bad "${all}: /usr/local/bin holds '${got}', want '${want}'"
   for app in "${apps[@]}"; do
     bin="$(bin_of "${app}")"
     docker run --rm "${all}" "${bin}" --help >/dev/null 2>&1 || bad "${all}: ${bin} --help exits non-zero"
