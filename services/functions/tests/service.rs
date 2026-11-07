@@ -353,6 +353,41 @@ async fn a_public_key_call_runs_the_function_with_its_env_and_caller() {
     assert_eq!(seen.header("chelabase-forwarded-key"), None);
 }
 
+/// The function sees its sub-path exactly as the client sent it: never percent-decoded, so an
+/// encoded `?`, `/` or `%` stays one path segment and dot segments don't collapse.
+#[tokio::test]
+async fn the_sub_path_is_forwarded_raw() {
+    let h = harness().await;
+    for (path, want) in [
+        ("/functions/v1/hello/a%3Fb%3D1", "/hello/a%3Fb%3D1"),
+        (
+            "/functions/v1/hello/a%3Fb%3D1?x=%3F",
+            "/hello/a%3Fb%3D1?x=%3F",
+        ),
+        ("/functions/v1/hello/x%2F..%2Fy", "/hello/x%2F..%2Fy"),
+        ("/functions/v1/hello/100%25/done", "/hello/100%25/done"),
+        ("/functions/v1/hello/a%2Fb/", "/hello/a%2Fb/"),
+    ] {
+        let resp = h
+            .call(reqwest::Method::GET, path, Cred::Public)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        assert_eq!(h.last().uri, want, "{path}");
+    }
+    for (rest, want) in [
+        ("a%3Fb%3D1", "/open/a%3Fb%3D1"),
+        ("x%2F..%2Fy", "/open/x%2F..%2Fy"),
+        ("100%25", "/open/100%25"),
+    ] {
+        let url = format!("{}/functions/v1/public/{}/open/{rest}", h.public, h.branch);
+        let resp = h.http.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{rest}");
+        assert_eq!(h.last().uri, want, "{rest}");
+    }
+}
+
 #[tokio::test]
 async fn an_app_user_call_carries_the_users_token_and_claims() {
     let h = harness().await;
