@@ -69,6 +69,20 @@ pub struct StorageInternal {
 impl StorageInternal {
     /// A client that never follows a redirect (#26) and has no total timeout (bodies stream).
     pub fn new(url: &str, token: &str) -> Result<Self, String> {
+        // `http://host:port` and nothing more: a path, query or fragment would change every
+        // console route after it was authorized ([`storage_url`] refuses those calls).
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| format!("CHELABASE_STORAGE_INTERNAL_URL {url:?}: {e}"))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none_or(str::is_empty)
+            || !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(format!(
+                "CHELABASE_STORAGE_INTERNAL_URL {url:?}: must be http(s)://host[:port], with no path, query or fragment"
+            ));
+        }
         let http = chelabase_http::client_builder()
             .connect_timeout(Duration::from_secs(5))
             .read_timeout(READ_TIMEOUT)
@@ -392,8 +406,9 @@ async fn forward(
         return ApiError::internal().into_response();
     };
     let Some(url) = storage_url(&storage.url, path, &query) else {
-        warn!(path, "storage console: the parsed URL changes the route");
-        return dot_segment().into_response();
+        // Unreachable once `has_dot_segment` passed and the base URL was checked at startup.
+        error!(path, "storage console: the parsed URL changes the route");
+        return ApiError::internal().into_response();
     };
     let mut request = storage
         .http
@@ -798,6 +813,30 @@ mod tests {
     /// dots and their encodings (each case mix) is either refused by [`has_dot_segment`], or
     /// parsing it as storage's URL leaves the path exactly as authorized; and
     /// [`storage_url`] never hands on a URL whose path differs.
+    /// Re-audit N5: storage's base URL is `scheme://host[:port]` with no path, query or
+    /// fragment, checked at startup; a path there would make every console call fail later
+    /// with an answer blaming the caller's path.
+    #[test]
+    fn the_storage_url_has_no_path() {
+        for good in [
+            "http://storage:8090",
+            "http://storage:8090/",
+            "https://10.0.0.5",
+        ] {
+            assert!(StorageInternal::new(good, "t").is_ok(), "{good}");
+        }
+        for bad in [
+            "http://storage:8090/base",
+            "http://storage:8090/?x=1",
+            "http://storage:8090#f",
+            "storage:8090",
+            "ftp://storage",
+            "http://",
+        ] {
+            assert!(StorageInternal::new(bad, "t").is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn a_path_is_refused_or_reaches_storage_unchanged() {
         const SEGMENTS: &[&str] = &[
