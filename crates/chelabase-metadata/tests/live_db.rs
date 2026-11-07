@@ -610,6 +610,20 @@ impl SealedFixture {
                 // Within its grace window: it can still be opened.
                 fixture.session = Some(insert_grace_session(client, 3600.0).await);
             }
+            ("branch_function_secrets", "ciphertext") => {
+                sqlx::query(
+                    "WITH f AS (INSERT INTO functions (id, database_id, name, kind)
+                                VALUES (gen_random_uuid(), $1, 'key-check', 'function')
+                                RETURNING id)
+                     INSERT INTO branch_function_secrets (branch_id, function_id, name, ciphertext)
+                     SELECT $2, id, 'KEY_CHECK', 'v1:x' FROM f",
+                )
+                .bind(database.as_uuid())
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             other => panic!("no fixture for sealed column {other:?}: add one here"),
         }
         fixture

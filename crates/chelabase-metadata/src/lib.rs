@@ -12,6 +12,7 @@ mod app_users;
 mod branches;
 mod data_api;
 mod ddl;
+mod functions;
 pub mod members;
 mod merges;
 mod neon;
@@ -43,6 +44,11 @@ pub use storage_webhooks::{
     StorageWebhookPatch,
 };
 pub use ddl::DdlTx;
+pub use functions::{
+    BranchFunction, DeploymentRecord, FunctionAuth, FunctionKind, FunctionRecord, MAX_BUNDLE_SIZE,
+    MAX_SECRET_BYTES, NewDeployment, NewSchedule, NewTrigger, ResolvedFunction, ScheduleRecord,
+    TriggerRecord, TriggerSource, TriggerState, valid_function_name, valid_secret_name,
+};
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
     MergeEvent, MergeRecord, MergeState, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
@@ -209,6 +215,17 @@ pub enum MetadataError {
     /// key can't be rotated onto the new role.
     #[error("the role {0} was dropped and created again")]
     RoleRecreated(String),
+    /// A function write the caller can fix: a bad name, size or hash, a deployment of another
+    /// function, trigger columns that don't fit the source. Nothing was written.
+    #[error("invalid function write: {0}")]
+    InvalidFunction(String),
+    /// The function, or the branch or database a function write names, is missing,
+    /// tombstoned, being deleted or another database's. Nothing was written.
+    #[error("function, branch or database not found")]
+    FunctionNotFound,
+    /// A sealed value didn't open (wrong key, or a value made for another row).
+    #[error("secret error: {0}")]
+    Secret(String),
 }
 
 impl MetadataError {
@@ -280,7 +297,9 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// (worker member roles, `seal_member_role_password`); `branch_auth_sync.password_sealed`
 /// (worker app users, `seal_role_password`); `app_sessions.grace_refresh_sealed` (orchestrator
 /// app refresh, `seal`; opened only while `grace_until > now()`, see
-/// [`MetadataClient::refresh_app_session`], and nothing clears it once the window is over).
+/// [`MetadataClient::refresh_app_session`], and nothing clears it once the window is over);
+/// `branch_function_secrets.ciphertext` (orchestrator function secrets and branch create,
+/// `seal` with AAD `fn-secret:{branch}:{function}:{name}`).
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
@@ -290,6 +309,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("member_branch_roles", "password_enc", None),
     ("branch_auth_sync", "password_sealed", None),
     ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
+    ("branch_function_secrets", "ciphertext", None),
 ];
 
 /// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
@@ -395,6 +415,9 @@ pub struct MetadataClient {
     /// Only for [`MetadataClient::lock_endpoint`]: each held lock keeps a connection, and
     /// holders need `pool` for their own queries, so locks can never starve it.
     locks: PgPool,
+    /// The control-plane secrets key, for function secrets (sealed and opened here, and sealed
+    /// again for a child branch inside `create_branch`). `None` refuses those.
+    secrets_key: Option<std::sync::Arc<chelabase_secrets::SecretKey>>,
 }
 
 /// Connections for endpoint locks, held and waited for: a waiter keeps one while Postgres
@@ -410,6 +433,7 @@ impl MetadataClient {
         Ok(Self {
             pool,
             locks: Self::lock_pool(config)?,
+            secrets_key: None,
         })
     }
 
@@ -420,6 +444,7 @@ impl MetadataClient {
         Ok(Self {
             pool,
             locks: Self::lock_pool(config)?,
+            secrets_key: None,
         })
     }
 
@@ -442,7 +467,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261107000001).
+        // this file when adding one (last: 20261107000002).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
@@ -450,6 +475,13 @@ impl MetadataClient {
             "metadata migrations applied"
         );
         Ok(())
+    }
+
+    /// This client with the secrets key, which function secrets (and copying them to a new
+    /// branch) need.
+    pub fn with_secrets_key(mut self, key: chelabase_secrets::SecretKey) -> Self {
+        self.secrets_key = Some(std::sync::Arc::new(key));
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -618,8 +650,8 @@ impl MetadataClient {
     }
 
     /// Turn the database row into a tombstone, revoking any personal login still live on it
-    /// (MH-9). Its branches are marked deleted one by one
-    /// ([`MetadataClient::mark_branch_deleted`]), each once its resources are gone.
+    /// (MH-9) and purging every branch's function state. Its branches are marked deleted one
+    /// by one ([`MetadataClient::mark_branch_deleted`]), each once its resources are gone.
     pub async fn mark_deleted(&self, database_id: DatabaseId) -> Result<(), MetadataError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -633,6 +665,13 @@ impl MetadataClient {
         .execute(&mut *tx)
         .await?;
         personal_logins::revoke_database_logins(&mut tx, &[database_id.as_uuid()]).await?;
+        // Every branch's function state goes with the database (its branch rows stay).
+        let branches: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM branches WHERE database_id = $1")
+                .bind(database_id.as_uuid())
+                .fetch_all(&mut *tx)
+                .await?;
+        functions::purge_branch_functions(&mut tx, &branches).await?;
         tx.commit().await?;
         Ok(())
     }

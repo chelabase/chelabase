@@ -458,7 +458,8 @@ impl MetadataClient {
     }
 
     /// Revokes a live secret key of the branch. False for an unknown or already revoked key,
-    /// and for a public key (rotate it instead: a branch always has one).
+    /// for a public key (rotate it instead: a branch always has one), and for a key a function
+    /// manages (deleting the function revokes it).
     pub async fn revoke_data_key(
         &self,
         branch: BranchId,
@@ -466,7 +467,8 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE data_api_keys SET revoked_at = now()
-             WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL",
+             WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL",
         )
         .bind(key_id)
         .bind(branch.as_uuid())
@@ -533,6 +535,7 @@ impl MetadataClient {
         let revoked: Option<Revoked> = sqlx::query_as(
             "UPDATE data_api_keys SET revoked_at = now()
              WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL
                AND kind = CASE WHEN $3 THEN 'secret' ELSE 'public' END
              RETURNING databases, role, role_oid, role_timeline",
         )
