@@ -316,6 +316,13 @@ compute-network-e2e:
 storage-iam-e2e:
     cargo run -q -p chelabase -- workbench run scripts/storage-iam-e2e.sh
 
+# Live object storage story through the gateway (#107): bucket, policies, upload, resumable upload,
+# download, signed and public URLs, a branch, delete, and the sweep's purge. `--backend s3` runs it
+# with storage and the worker switched to backend s3 on a second, throwaway S3 endpoint (it
+# recreates the stack's storage and worker, then restores them); `--restore` only restores
+storage-e2e *args:
+    cargo run -q -p chelabase -- workbench run scripts/storage-e2e.sh "$@"
+
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:
     cargo run -q -p chelabase -- workbench run scripts/data-e2e.sh
