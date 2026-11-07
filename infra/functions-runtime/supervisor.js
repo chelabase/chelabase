@@ -22,10 +22,18 @@
 // (public addresses only), and the request
 // without any x-chelabase-* header; their response loses any x-chelabase-* header too, so
 // `x-chelabase-error` only ever comes from the supervisor.
+//
+// Scheduled runs (m7): the functions service sets `x-chelabase-event: scheduled` on the worker's
+// invocations only (it strips every x-chelabase-* header a caller sends), with the JSON body
+// {"type": "scheduled", "cron": "<5 fields>", "scheduledTime": <epoch ms>}. The supervisor then
+// runs the bundle's `scheduled(controller, env, ctx)` handler instead of `fetch`, and answers 200
+// {"outcome": "ok"}, or 500 `scheduled handler: <outcome>` when it is missing or throws.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
 const ERROR_HEADER = "x-chelabase-error";
+const EVENT_HEADER = "x-chelabase-event";
+const MAX_EVENT_BYTES = 64 << 10;
 const START_FAILED = "bundle failed to start";
 const BUNDLE_RE = /^([A-Za-z0-9_-]{1,64})\/([0-9a-f]{64})$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -154,6 +162,36 @@ function withoutPrivateHeaders(res) {
   return out;
 }
 
+// The scheduled event's body: its cron and scheduledTime.
+async function scheduledEvent(request) {
+  const bad = new Refused(400, "scheduled event: the body must be {type, cron, scheduledTime}");
+  const text = await request.text();
+  if (text.length > MAX_EVENT_BYTES) throw bad;
+  let event;
+  try {
+    event = JSON.parse(text);
+  } catch {
+    throw bad;
+  }
+  const { type, cron, scheduledTime } = event ?? {};
+  if (type !== "scheduled" || typeof cron !== "string" || !Number.isFinite(scheduledTime)) throw bad;
+  return { cron, scheduledTime: new Date(scheduledTime) };
+}
+
+// Runs the loaded worker's `scheduled` handler (workerd's Fetcher.scheduled, which needs the
+// `service_binding_extra_handlers` flag on the supervisor).
+async function runScheduled(worker, event) {
+  let result;
+  try {
+    result = await worker.getEntrypoint().scheduled(event);
+  } catch (e) {
+    if (e?.remote) throw new Refused(500, "scheduled handler: exception");
+    throw new Refused(502, START_FAILED);
+  }
+  if (result?.outcome !== "ok") throw new Refused(500, `scheduled handler: ${result?.outcome ?? "no outcome"}`);
+  return Response.json({ outcome: "ok" });
+}
+
 const PROBE_CODE = {
   compatibilityDate: "2026-10-01",
   mainModule: "probe.js",
@@ -178,6 +216,10 @@ export default {
         const code = await loadCode(bindings, db, sha, env, gateway(ctx));
         worker = bindings.LOADER.get(id, async () => code);
         remember(id);
+      }
+      if (request.headers.get(EVENT_HEADER) === "scheduled") {
+        const event = await scheduledEvent(request);
+        return await runScheduled(worker, event);
       }
       const headers = new Headers();
       for (const [k, v] of request.headers) {
