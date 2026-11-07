@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import { ApiError } from "@chelabase/management-client";
-import { bucketStatsKey, bucketsKey, invalidateStorage, objectCountText, parseBuckets, storageParams, storageProblem, summarizeObjects } from "./storage-api";
+import { apiHref, bucketStatsKey, bucketsKey, invalidateStorage, objectActionError, objectsKey, objectCountText, parseBuckets, parseObjectPage, parseSigned, publicObjectUrl, storageParams, storageProblem, summarizeObjects } from "./storage-api";
 
 describe("storage query keys", () => {
   // #103 AC5: a key per branch and Act as role, so switching either reads the list again.
@@ -77,5 +77,61 @@ describe("storageProblem", () => {
     expect(storageProblem(new ApiError(503, "storage_unavailable" as never, "no"))).toBe("unavailable");
     expect(storageProblem(new ApiError(403, "forbidden" as never, "no"))).toBeNull();
     expect(storageProblem(null)).toBeNull();
+  });
+});
+
+describe("parseObjectPage", () => {
+  it("reads_items_and_the_cursor_dropping_malformed_ones", () => {
+    const page = parseObjectPage({
+      items: [
+        { name: "photos/", folder: true, size: null, etag: null, content_type: null, updated_at: null },
+        { name: "photos/a.png", folder: false, size: 10, etag: "e1", content_type: "image/png", updated_at: 1762000000 },
+        { name: 4 },
+      ],
+      next_cursor: "c",
+    });
+    expect(page.items).toEqual([
+      { name: "photos/", folder: true, size: null, etag: null, contentType: null, updatedAt: null },
+      { name: "photos/a.png", folder: false, size: 10, etag: "e1", contentType: "image/png", updatedAt: 1762000000 },
+    ]);
+    expect(page.nextCursor).toBe("c");
+    expect(parseObjectPage({ items: [], next_cursor: null }).nextCursor).toBeNull();
+    expect(parseObjectPage("nope")).toEqual({ items: [], nextCursor: null });
+  });
+});
+
+describe("objectsKey", () => {
+  it("is_under_the_branch_and_differs_by_role_folder_and_query", () => {
+    const q = { prefix: "", sort: "name", order: "asc", search: "" };
+    const keys = [
+      objectsKey("d1", "b1", null, "avatars", q),
+      objectsKey("d1", "b1", "anon", "avatars", q),
+      objectsKey("d1", "b1", null, "avatars", { ...q, prefix: "x/" }),
+      objectsKey("d1", "b1", null, "avatars", { ...q, search: "a" }),
+    ].map((k) => JSON.stringify(k));
+    expect(new Set(keys).size).toBe(4);
+    expect(objectsKey("d1", "b1", null, "avatars", q)[0]).toEqual(bucketsKey("d1", "b1", null)[0]);
+  });
+});
+
+describe("objectActionError", () => {
+  it("explains_write_once_and_references_and_keeps_the_servers_conflict_message", () => {
+    expect(objectActionError(new ApiError(409, "write_once" as never, "write-once"))).toMatch(/write-once/);
+    expect(objectActionError(new ApiError(409, "referenced" as never, "x"))).toMatch(/references/);
+    expect(objectActionError(new ApiError(409, "conflict" as never, "the object `a.png` already exists"))).toBe("the object `a.png` already exists");
+    expect(objectActionError(new ApiError(400, "invalid_request" as never, "bad content type"))).toBe("bad content type");
+  });
+});
+
+describe("URLs on the API host", () => {
+  it("a_signed_path_joins_the_api_url", () => {
+    expect(apiHref("https://api.test/", "/storage/v1/object/sign/a/b.png?token=t")).toBe("https://api.test/storage/v1/object/sign/a/b.png?token=t");
+    expect(parseSigned({ signed_url: "/storage/v1/x?token=t", expires_at: 5 })).toEqual({ path: "/storage/v1/x?token=t", expiresAt: 5 });
+    expect(parseSigned({})).toBeNull();
+  });
+  it("a_public_url_names_the_branch_bucket_object_and_database", () => {
+    expect(publicObjectUrl("https://api.test", "b1", "app db", "avatars", "my photos/a b.png")).toBe(
+      "https://api.test/storage/v1/object/public/b1/avatars/my%20photos/a%20b.png?database=app%20db",
+    );
   });
 });

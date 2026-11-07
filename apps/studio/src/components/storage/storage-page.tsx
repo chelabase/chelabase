@@ -12,6 +12,8 @@ import { useFillViewport } from "@/lib/use-fill-viewport";
 import { BucketDetails } from "./buckets/bucket-details";
 import { BucketDialog } from "./buckets/bucket-dialog";
 import { BucketList } from "./buckets/bucket-list";
+import { ObjectBrowser } from "./browser/object-browser";
+import { folderHref } from "./browser/paths";
 
 /** The Storage tab's place: down to the branch (storage runs in its main Postgres database), then a bucket and an object path. */
 export interface StorageParams {
@@ -31,6 +33,8 @@ export interface StoragePageProps {
   navigate: (p: StorageParams, opts?: { replace?: boolean }) => void;
   /** The Data API page at a place (where the data API is enabled); a plain link without it. */
   openDataApi?: (p: EditorParams) => void;
+  /** The API's base URL: signed and public object URLs are on it. */
+  apiUrl?: string;
 }
 
 const PLACE_LEVELS = LEVELS.slice(0, 3);
@@ -83,7 +87,7 @@ function Notice({ children, alert = false }: { children: ReactNode; alert?: bool
   );
 }
 
-function Page({ params, navigate, openDataApi }: StoragePageProps) {
+function Page({ params, navigate, openDataApi, apiUrl = "" }: StoragePageProps) {
   const fill = useFillViewport();
   const [last] = useState(() => readLast(browserStorage("local"), STORAGE_LAST_KEY));
   const place = usePlace({ projectId: params.projectId, databaseId: params.databaseId, branchId: params.branchId });
@@ -208,21 +212,38 @@ function Page({ params, navigate, openDataApi }: StoragePageProps) {
             />
           </div>
         </aside>
-        <div className="min-w-0 flex-1 overflow-y-auto">
+        <div className="flex min-w-0 flex-1 flex-col">
           {selected ? (
-            <BucketDetails
-              key={selected.name}
-              databaseId={databaseId}
-              branchId={branchId}
-              role={actAs}
-              bucket={selected}
-              canWrite={canWrite}
-              onDeleted={() => navigate(placeOf(current))}
-            />
+            <>
+              <div className="max-h-[40%] shrink-0 overflow-y-auto">
+                <BucketDetails
+                  key={selected.name}
+                  databaseId={databaseId}
+                  branchId={branchId}
+                  role={actAs}
+                  bucket={selected}
+                  canWrite={canWrite}
+                  onDeleted={() => navigate(placeOf(current))}
+                />
+              </div>
+              <ObjectBrowser
+                key={selected.name}
+                databaseId={databaseId}
+                branchId={branchId}
+                role={actAs}
+                bucket={selected}
+                pgDatabase={main.name}
+                path={current.path}
+                canWrite={canWrite}
+                apiUrl={apiUrl}
+                hrefFor={(path) => folderHref(storagePath({ ...placeOf(current), bucket: selected.name }), path)}
+                onNavigate={(path) => navigate({ ...placeOf(current), bucket: selected.name, ...(path ? { path } : {}) })}
+              />
+            </>
           ) : current.bucket ? (
             <Notice>Bucket not found</Notice>
           ) : (
-            <Notice>Pick a bucket to see its settings.</Notice>
+            <Notice>Pick a bucket to browse its files and settings.</Notice>
           )}
         </div>
       </div>

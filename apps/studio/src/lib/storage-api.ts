@@ -3,9 +3,11 @@ import {
   ApiError,
   getStorageListBucketsQueryKey,
   storageListObjects,
+  storageSignObject,
   useStorageListBuckets,
   type StorageListBucketsParams,
 } from "@chelabase/management-client";
+import { errorText } from "./errors";
 
 /**
  * Studio's side of the storage console routes (`/v1/databases/{id}/branches/{branch}/storage/…`):
@@ -132,4 +134,108 @@ export function useBucketStats(databaseId: string, branchId: string, role: strin
     enabled,
     retry: false,
   });
+}
+
+/** One entry of a delimiter listing: a file, or a folder (`name` ends with `/`, no size). Names are full keys. */
+export interface StorageItem {
+  name: string;
+  folder: boolean;
+  size: number | null;
+  etag: string | null;
+  contentType: string | null;
+  /** Seconds since the epoch. */
+  updatedAt: number | null;
+}
+
+/** A listing page as the browser reads it. */
+export interface ObjectPage {
+  items: StorageItem[];
+  nextCursor: string | null;
+}
+
+const strOrNull = (v: unknown): string | null => (typeof v === "string" ? v : null);
+const numOrNull = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+
+/** A listing answer's well-formed items and its cursor. */
+export function parseObjectPage(body: unknown): ObjectPage {
+  if (!isObject(body) || !Array.isArray(body.items)) return { items: [], nextCursor: null };
+  const items: StorageItem[] = [];
+  for (const item of body.items) {
+    if (!isObject(item) || typeof item.name !== "string" || item.name === "") continue;
+    items.push({
+      name: item.name,
+      folder: item.folder === true,
+      size: numOrNull(item.size),
+      etag: strOrNull(item.etag),
+      contentType: strOrNull(item.content_type),
+      updatedAt: numOrNull(item.updated_at),
+    });
+  }
+  const next = typeof body.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null;
+  return { items, nextCursor: next };
+}
+
+/** What a browser listing asks for besides the place. */
+export interface ObjectListQuery {
+  prefix: string;
+  sort: string;
+  order: string;
+  search: string;
+}
+
+/** A folder's listing: per branch, role, bucket, folder, sort and search, under the branch's prefix. */
+export function objectsKey(databaseId: string, branchId: string, role: string | null, bucket: string, q: ObjectListQuery): readonly unknown[] {
+  return [...branchPrefix(databaseId, branchId), "objects", bucket, q, storageParams(role)];
+}
+
+/**
+ * Why an object action failed, for a person: write-once buckets and rows that reference the
+ * object get their own explanation; anything else (a taken name, a bad type) is storage's message.
+ */
+export function objectActionError(err: unknown): string {
+  if (err instanceof ApiError) {
+    const code = err.code as string;
+    if (code === "write_once") return "The bucket is write-once: its files can't be overwritten, moved or deleted.";
+    if (code === "referenced") return `A table row still references this file; clear the reference first. ${err.message}`.trim();
+  }
+  return errorText(err);
+}
+
+/** A path on the API host (a signed URL's `signed_url`) as a full URL. */
+export function apiHref(apiUrl: string, path: string): string {
+  return `${apiUrl.replace(/\/+$/, "")}${path}`;
+}
+
+/** A sign answer: the path on the API host and when it stops working. */
+export function parseSigned(body: unknown): { path: string; expiresAt: number | null } | null {
+  if (!isObject(body) || typeof body.signed_url !== "string" || !body.signed_url.startsWith("/")) return null;
+  return { path: body.signed_url, expiresAt: numOrNull(body.expires_at) };
+}
+
+/** Each `/`-separated segment percent-encoded, as storage builds its own URLs. */
+export function encodeKey(name: string): string {
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
+/** A public bucket's object URL: no key needed. */
+export function publicObjectUrl(apiUrl: string, branchId: string, pgDatabase: string, bucket: string, name: string): string {
+  return apiHref(apiUrl, `/storage/v1/object/public/${encodeURIComponent(branchId)}/${encodeURIComponent(bucket)}/${encodeKey(name)}?database=${encodeURIComponent(pgDatabase)}`);
+}
+
+/** Console signed URLs live at most an hour. */
+export const MAX_SIGNED_TTL = 3600;
+
+/** Mints a signed download URL as the role (Developer), as a full URL on the API host. */
+export async function signObjectUrl(
+  apiUrl: string,
+  databaseId: string,
+  branchId: string,
+  role: string | null,
+  bucket: string,
+  name: string,
+  expiresIn: number,
+): Promise<{ url: string; expiresAt: number | null }> {
+  const signed = parseSigned(await storageSignObject(databaseId, branchId, bucket, name, { expires_in: Math.min(expiresIn, MAX_SIGNED_TTL) }, storageParams(role)));
+  if (!signed) throw new Error("Storage answered without a signed URL");
+  return { url: apiHref(apiUrl, signed.path), expiresAt: signed.expiresAt };
 }
