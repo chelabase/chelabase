@@ -6,8 +6,8 @@
 /// Schemas never read: Postgres's own, and Chelabase's (`chelabase`: the data API bootstrap;
 /// `chelabase_merge`: the merge's recovery marker, P1; `chelabase_guard`: the protected-branch
 /// DDL guard, TE-A P5; `storage`: object metadata, `services/worker/src/storage_schema.rs`,
-/// whose rows and policies stay per branch).
-pub const EXCLUDED_SCHEMAS: [&str; 7] = [
+/// whose rows and policies stay per branch; [`FUNCTIONS_SCHEMA`]: the function triggers' outbox).
+pub const EXCLUDED_SCHEMAS: [&str; 8] = [
     "pg_catalog",
     "information_schema",
     "pg_toast",
@@ -15,7 +15,18 @@ pub const EXCLUDED_SCHEMAS: [&str; 7] = [
     "chelabase_merge",
     "chelabase_guard",
     "storage",
+    FUNCTIONS_SCHEMA,
 ];
+
+/// Edge functions m8: the schema holding the database-event outbox and its trigger function
+/// (`services/worker/src/fn_triggers.rs`), owned by the NOLOGIN `chelabase_functions_owner`.
+pub const FUNCTIONS_SCHEMA: &str = "chelabase_functions";
+
+/// Edge functions m8: the triggers the worker installs on user tables,
+/// `chelabase_fn_<trigger id as 32 hex>`, each running `chelabase_functions.enqueue()`. The
+/// catalog and the protection review leave out a trigger with this prefix only when it runs a
+/// function in [`FUNCTIONS_SCHEMA`].
+pub const FUNCTION_TRIGGER_PREFIX: &str = "chelabase_fn_";
 
 /// Schema name prefixes never read: TOAST schemas (`pg_toast`, `pg_toast_temp_<n>`) and
 /// temporary schemas (`pg_temp_<n>`).
@@ -118,5 +129,41 @@ mod tests {
         assert!(EXCLUDED_SCHEMAS.contains(&"storage"));
         assert!(crate::ddl::hidden_schema("storage"));
         assert!(!crate::ddl::hidden_schema("storage2") && !crate::ddl::hidden_schema("public"));
+    }
+
+    /// Edge functions m8: the `chelabase_functions` schema (outbox, trigger function) is read
+    /// by no catalog path, and the `chelabase_fn_*` triggers it installs on user tables are
+    /// left out of the merge's catalog and the protection review, so two branches differing
+    /// only in function triggers plan no change and digest alike.
+    #[test]
+    fn exclusions_cover_the_functions_schema() {
+        assert_eq!(FUNCTIONS_SCHEMA, "chelabase_functions");
+        assert_eq!(FUNCTION_TRIGGER_PREFIX, "chelabase_fn_");
+        assert!(EXCLUDED_SCHEMAS.contains(&FUNCTIONS_SCHEMA));
+        assert!(crate::ddl::hidden_schema(FUNCTIONS_SCHEMA));
+        let quoted = format!("'{FUNCTIONS_SCHEMA}'");
+        for (what, sql) in [
+            ("catalog", crate::catalog::CATALOG_SQL),
+            ("digest", crate::plan::TARGET_DIGEST_SQL),
+            ("privileges", crate::privileges::privileges_sql()),
+        ] {
+            assert!(sql.contains(&quoted), "{what} SQL lacks {quoted}");
+        }
+        // The triggers: by name and by the function they run (a user's own trigger named
+        // `chelabase_fn_…` on another function stays visible).
+        let like = format!("'{}%'", FUNCTION_TRIGGER_PREFIX.replace('_', "\\_"));
+        let catalog = crate::catalog::CATALOG_SQL;
+        let triggers = &catalog[catalog.find("-- Triggers").unwrap()..];
+        let triggers = &triggers[..triggers.find("UNION ALL").unwrap()];
+        assert!(triggers.contains(&format!("tg.tgname LIKE {like}")), "{triggers}");
+        assert!(triggers.contains(&quoted), "{triggers}");
+        let review = crate::review::review_sql("postgres");
+        assert!(
+            review.contains(&format!(
+                "pg_catalog.starts_with(tg.tgname::pg_catalog.text, '{FUNCTION_TRIGGER_PREFIX}')"
+            )),
+            "{review}"
+        );
+        assert!(review.contains(&format!("n.nspname OPERATOR(pg_catalog.=) {quoted}")), "{review}");
     }
 }
