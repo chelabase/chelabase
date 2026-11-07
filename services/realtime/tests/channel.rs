@@ -31,6 +31,7 @@ fn a_table_join_is_its_structured_params() {
             pg_database: "app".into(),
             schema: "public".into(),
             table: "items".into(),
+            bucket: None,
         }
     );
     assert_eq!(role, None, "role null is the owner");

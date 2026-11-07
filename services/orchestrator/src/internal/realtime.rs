@@ -22,7 +22,10 @@
 //!   (`{keys}`, in order; no probe, `xid` ignored, rows needn't exist). With `convert_keys`
 //!   beside a check (RT1 final fix round), the same owner session and transaction also prints
 //!   those keys (`converted`, in order), so the check's rows and the converted keys can't
-//!   disagree. The body may hold [`checks::MAX_KEYS`] long keys in each list
+//!   disagree. With `bucket` beside a check (object storage m17, a storage channel's), the keys
+//!   are object ids and only the objects of that bucket the owner session sees are returned
+//!   (`chelabase_query::realtime::check_in_bucket`); `bucket` on another relation than
+//!   `storage.objects`, or with the convert mode, is the caller's bug (400). The body may hold [`checks::MAX_KEYS`] long keys in each list
 //!   ([`VISIBLE_BODY_LIMIT`]).
 
 use std::sync::Arc;
@@ -510,6 +513,10 @@ struct VisibleBody {
     /// check's fields; nothing for them when the probe or the check failed.
     #[serde(default)]
     convert_keys: Option<Vec<Vec<String>>>,
+    /// Object storage m17: a storage channel's bucket. The check returns only the objects of
+    /// that bucket (by id) the owner session sees.
+    #[serde(default)]
+    bucket: Option<Uuid>,
 }
 
 /// A decimal xid8: digits only, at most `u64::MAX`.
@@ -566,6 +573,9 @@ where
     if request.convert && request.convert_keys.is_some() {
         return bad("convert_keys goes with a check, not the convert mode");
     }
+    if request.convert && request.bucket.is_some() {
+        return bad("bucket goes with a check, not the convert mode");
+    }
     for keys in [&request.keys, &request.convert_keys].into_iter().flatten() {
         if keys.len() > checks::MAX_KEYS {
             return bad("at most 1000 keys");
@@ -614,6 +624,7 @@ where
     let convert_keys = request.convert_keys;
     let rel_oid = request.rel_oid;
     let convert = request.convert;
+    let bucket = request.bucket;
     let pg_database = gated.row.name.clone();
     // Realtime's share of the owner pool: the console always keeps a connection of its own.
     let slot = state.console.realtime_slot(gated.branch.id, &gated.row.name);
@@ -632,7 +643,7 @@ where
             async |client, _version| {
                 Ok(match (convert, keys.as_deref()) {
                     (true, Some(keys)) => owner_convert(client, rel_oid, keys).await,
-                    _ => owner_checks(client, rel_oid, xid, keys.as_deref(), convert_keys.as_deref()).await,
+                    _ => owner_checks(client, rel_oid, xid, keys.as_deref(), convert_keys.as_deref(), bucket).await,
                 })
             },
         )
@@ -738,6 +749,7 @@ async fn owner_checks(
     xid: Option<u64>,
     keys: Option<&[Vec<String>]>,
     convert_keys: Option<&[Vec<String>]>,
+    bucket: Option<Uuid>,
 ) -> Outcome {
     let rel = match checks::load_relation(client, rel_oid).await {
         Ok(Some(rel)) => rel,
@@ -757,10 +769,18 @@ async fn owner_checks(
             return Outcome::BadKeys(refused);
         }
     }
-    let checked = match keys {
-        None => None,
-        Some(keys) => match checks::check(client, &rel, xid, keys).await {
+    if bucket.is_some() && !checks::is_storage_objects(&rel) {
+        return Outcome::BadKeys("a bucket scopes a check of storage.objects only");
+    }
+    let checked = match (keys, bucket) {
+        (None, _) => None,
+        (Some(keys), None) => match checks::check(client, &rel, xid, keys).await {
             Ok(c) => Some(c),
+            Err(_) => return Outcome::Failed,
+        },
+        (Some(keys), Some(bucket)) => match checks::check_in_bucket(client, &rel, xid, keys, bucket).await {
+            Ok(Some(c)) => Some(c),
+            Ok(None) => return Outcome::BadKeys("a bucket scopes a check of storage.objects only"),
             Err(_) => return Outcome::Failed,
         },
     };

@@ -51,6 +51,7 @@ fn channel(t: &str) -> TableChannel {
         pg_database: "app".into(),
         schema: "public".into(),
         table: t.into(),
+        bucket: None,
     }
 }
 

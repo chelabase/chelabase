@@ -420,9 +420,109 @@ pub async fn check(
     Ok(Checked { visible, keys: out })
 }
 
+/// Object storage m17: whether `rel` is `storage.objects` with its one `uuid` key `id` (the
+/// only relation [`check_in_bucket`] reads).
+pub fn is_storage_objects(rel: &Relation) -> bool {
+    rel.schema == "storage"
+        && rel.name == "objects"
+        && matches!(rel.key.as_slice(), [c] if c.name == "id"
+            && c.type_schema == "pg_catalog" && c.type_name == "uuid")
+}
+
+/// Object storage m17: a storage channel's check, [`check_sql`]'s shape scoped to one bucket.
+/// The ids bound as `$1` (`text[]`) of the objects the session sees in bucket `$2` (a `uuid`
+/// as text), only while the session also sees the bucket itself (storage's listing refuses a
+/// bucket the caller can't see); with `with_xid`, `$3` is the transaction id, as in
+/// [`check_sql`]. One statement, so the row level security that decides the object and the
+/// bucket it is in are read from the same snapshot.
+pub fn bucket_check_sql(with_xid: bool) -> String {
+    let rows = "SELECT o.id::pg_catalog.text AS id FROM storage.objects AS o \
+         WHERE o.id OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[]::pg_catalog.uuid[]) \
+           AND o.bucket_id OPERATOR(pg_catalog.=) $2::pg_catalog.text::pg_catalog.uuid \
+           AND EXISTS (SELECT 1 FROM storage.buckets AS b \
+             WHERE b.id OPERATOR(pg_catalog.=) $2::pg_catalog.text::pg_catalog.uuid)";
+    if !with_xid {
+        return format!("SELECT true AS visible, r.id FROM ({rows}) AS r");
+    }
+    format!(
+        "SELECT v.visible, r.id \
+         FROM (SELECT pg_catalog.pg_visible_in_snapshot($3::pg_catalog.text::pg_catalog.xid8, \
+                      pg_catalog.pg_current_snapshot()) AS visible) AS v \
+         LEFT JOIN LATERAL ({rows}) AS r ON v.visible"
+    )
+}
+
+/// [`check`] for a storage channel: the keys (one id text each) of the objects in `bucket` the
+/// session sees. `None` when `rel` isn't `storage.objects` (the caller fails the check) or a
+/// key row isn't one text.
+pub async fn check_in_bucket(
+    client: &Client,
+    rel: &Relation,
+    xid: Option<u64>,
+    keys: &[Vec<String>],
+    bucket: uuid::Uuid,
+) -> Result<Option<Checked>, tokio_postgres::Error> {
+    if !is_storage_objects(rel) || keys.iter().any(|k| k.len() != 1) {
+        return Ok(None);
+    }
+    let ids: Vec<&str> = keys.iter().map(|k| k[0].as_str()).collect();
+    let bucket = bucket.hyphenated().to_string();
+    let xid_text = xid.map(|x| x.to_string());
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&ids, &bucket];
+    if let Some(x) = &xid_text {
+        params.push(x);
+    }
+    let rows = client.query(&bucket_check_sql(xid.is_some()), &params).await?;
+    let mut visible = true;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        visible = row.get(0);
+        if !visible {
+            break;
+        }
+        // The single `NULL` row of a visible check that matched nothing.
+        if let Some(id) = row.get::<_, Option<String>>(1) {
+            out.push(key_string(&[id]));
+        }
+    }
+    if !visible {
+        out.clear();
+    }
+    Ok(Some(Checked { visible, keys: out }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Object storage m17: only `storage.objects` with its `uuid` key `id` takes a bucket check,
+    /// and the check reads the object's bucket and the bucket's visibility in one statement,
+    /// every operator and cast `pg_catalog`-qualified.
+    #[test]
+    fn storage_bucket_check_reads_only_storage_objects_in_one_statement() {
+        let uuid = |name: &str| KeyColumn {
+            name: name.into(),
+            type_schema: "pg_catalog".into(),
+            type_name: "uuid".into(),
+            base_schema: "pg_catalog".into(),
+            base_name: "uuid".into(),
+            base_typtype: 'b',
+        };
+        let rel = |schema: &str, name: &str, key: Vec<KeyColumn>| Relation { oid: 1, schema: schema.into(), name: name.into(), key };
+        assert!(is_storage_objects(&rel("storage", "objects", vec![uuid("id")])));
+        assert!(!is_storage_objects(&rel("storage", "buckets", vec![uuid("id")])));
+        assert!(!is_storage_objects(&rel("public", "objects", vec![uuid("id")])));
+        assert!(!is_storage_objects(&rel("storage", "objects", vec![uuid("name")])));
+        assert!(!is_storage_objects(&rel("storage", "objects", vec![uuid("id"), uuid("v")])));
+        for with_xid in [false, true] {
+            let sql = bucket_check_sql(with_xid);
+            assert_eq!(sql.matches("SELECT").count(), if with_xid { 4 } else { 3 }, "{sql}");
+            assert!(sql.contains("o.bucket_id OPERATOR(pg_catalog.=) $2::pg_catalog.text::pg_catalog.uuid"), "{sql}");
+            assert!(sql.contains("EXISTS (SELECT 1 FROM storage.buckets AS b"), "{sql}");
+            assert!(!sql.contains(" = "), "no unqualified operator: {sql}");
+            assert_eq!(sql.contains("$3"), with_xid, "{sql}");
+        }
+    }
 
     fn float(ty: &str) -> KeyColumn {
         KeyColumn {

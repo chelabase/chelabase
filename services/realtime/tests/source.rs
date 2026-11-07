@@ -36,6 +36,7 @@ fn table_in(db: &str, t: &str) -> TableChannel {
         pg_database: db.into(),
         schema: "public".into(),
         table: t.into(),
+        bucket: None,
     }
 }
 
@@ -1040,4 +1041,50 @@ async fn dropping_the_handle_unwatches() {
         "no rows after unwatching"
     );
     let _ = w.slots.get("x").await;
+}
+
+/// Object storage m17: two storage channels of one database (two buckets of
+/// `storage.objects`) each have their own filter: every window reaches both, each releases only
+/// its own bucket's objects, and one bucket's last watcher leaving keeps the other streaming.
+#[tokio::test(start_paused = true)]
+async fn storage_channels_of_two_buckets_on_one_relation_get_their_own_keys() {
+    const A: uuid::Uuid = uuid::Uuid::from_u128(0xa);
+    const B: uuid::Uuid = uuid::Uuid::from_u128(0xb);
+    const O1: &str = "00000000-0000-4000-8000-000000000001";
+    const O2: &str = "00000000-0000-4000-8000-000000000002";
+    let w = World::new();
+    let objects = chelabase_query::realtime::Relation {
+        oid: REL,
+        schema: "storage".into(),
+        name: "objects".into(),
+        key: vec![col("id", "uuid")],
+    };
+    w.checker.set_resolve("storage", "objects", Ok(Some(resolved(objects))));
+    w.checker.insert_rows(REL, &[O1, O2]);
+    w.checker.place(&[O1], A);
+    w.checker.place(&[O2], B);
+    let bucket = |b| TableChannel {
+        schema: "storage".into(),
+        table: "objects".into(),
+        bucket: Some(b),
+        ..table("objects")
+    };
+    let a = w.instance("a").await;
+    let mut ja = watch(&a, &bucket(A), owner("member-a")).await.unwrap();
+    let mut jb = watch(&a, &bucket(B), owner("member-b")).await.unwrap();
+    for j in [&mut ja, &mut jb] {
+        let seen = until(&mut j.rx, Duration::from_secs(2), |e| *e == live()).await;
+        assert!(seen.is_ok(), "the slot streams: {seen:?}");
+    }
+    let session = a.repl.session().unwrap();
+    session.data(0x100, &insert(0x100, 7, REL, &[O1, O2]));
+    let rows = |e: &ChannelEvent| matches!(e, ChannelEvent::Rows(_));
+    let got_a = until(&mut ja.rx, Duration::from_secs(1), rows).await;
+    let got_b = until(&mut jb.rx, Duration::from_secs(1), rows).await;
+    assert_eq!(got_a.map(|s| s.last().cloned()), Ok(Some(keyed(ChangeOp::Insert, &[O1]))));
+    assert_eq!(got_b.map(|s| s.last().cloned()), Ok(Some(keyed(ChangeOp::Insert, &[O2]))));
+    drop(ja);
+    session.data(0x200, &insert(0x200, 8, REL, &[O2]));
+    let got_b = until(&mut jb.rx, Duration::from_secs(1), rows).await;
+    assert_eq!(got_b.map(|s| s.last().cloned()), Ok(Some(keyed(ChangeOp::Insert, &[O2]))));
 }
