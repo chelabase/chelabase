@@ -759,6 +759,7 @@ where
         .merge(signup)
         .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(crate::request_span))
         .with_state(state)
 }
 

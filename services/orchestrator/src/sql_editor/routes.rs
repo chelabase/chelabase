@@ -959,7 +959,10 @@ where
     let by = match (principal.member.as_ref(), authorized.grant.as_ref()) {
         (_, Some(grant)) if grant.platform_role == PlatformRole::Admin => Canceller::Admin,
         (Some(member), _) => Canceller::Member(member.id),
-        (None, _) => return ApiError::internal().into_response(),
+        (None, _) => {
+            error!(request_id = %principal.request_id, "cancel run: the caller is neither an admin nor a member");
+            return ApiError::internal().into_response();
+        }
     };
     match state.sql_editor.runs.cancel(run_id, BranchId(branch_id), by) {
         Cancelled::Done => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),

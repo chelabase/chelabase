@@ -226,4 +226,46 @@ mod tests {
         assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!mapped.message.contains("secret"), "{}", mapped.message);
     }
+
+    /// A writer that keeps what the subscriber prints.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// Under the default log filter, an engine `internal` failure (a `chelabase_query` event)
+    /// leaves an ERROR line with its request id and Postgres's detail; the client's body has
+    /// neither the detail nor a way to tell it apart from any other 500.
+    #[tokio::test]
+    async fn an_internal_failure_is_logged_with_its_request_id_under_the_default_filter() {
+        use crate::conn::test_support::{Answer, connect_error};
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(crate::DEFAULT_LOG_FILTER))
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let e = PoolError::Backend(connect_error(Answer::Error("XX000", "pg-detail-7")).await);
+        let mapped = ApiError::from_pool(&e, "rid-logged-1");
+        assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!mapped.message.contains("pg-detail-7"), "{}", mapped.message);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let line = log.lines().find(|l| l.contains("rid-logged-1")).unwrap_or_else(|| panic!("no log line for the request id in {log:?}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("pg-detail-7"), "{line}");
+    }
 }

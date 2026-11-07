@@ -68,7 +68,7 @@ pub use openapi::openapi;
 use access::{authorize, authorize_database, Target};
 
 /// The orchestrator's log filter when `RUST_LOG` is unset.
-pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,chelabase_auth=info";
+pub const DEFAULT_LOG_FILTER: &str = "orchestrator=info,tower_http=info,chelabase_auth=info,chelabase_metadata=info,chelabase_neon=info,chelabase_nats=info,chelabase_query=info";
 
 /// Port the Neon proxy serves the Postgres protocol on (default of `CHELABASE_PROXY_PG_PORT`).
 pub const PROXY_PG_PORT: u16 = 4432;
@@ -2655,7 +2655,36 @@ where
         .merge(internal::realtime::routes(&state))
         .merge(openapi::router())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(request_span))
         .with_state(state)
+}
+
+/// Runs the request inside a span carrying the gateway's `x-request-id`, so every line a
+/// handler logs (a 500's cause included) names the request, and says so when a 500 goes out.
+/// The id is cut and stripped to the characters the gateway allows: a direct caller can't
+/// forge log lines with it.
+pub(crate) async fn request_span(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use tracing::Instrument;
+    let request_id: String = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(128)
+        .collect();
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    async move {
+        let response = next.run(req).await;
+        if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(%method, %path, "answered 500; the cause is logged above under this request id");
+        }
+        response
+    }
+    .instrument(tracing::info_span!("request", %request_id))
+    .await
 }
 
 async fn health() -> impl IntoResponse {
@@ -3571,5 +3600,27 @@ mod proxy_address_tests {
         }
         let blank = ProxyAddress::from_lookup(lookup(&[("CHELABASE_PROXY_HTTP_PORT", " ")]));
         assert_eq!(blank.unwrap().http_port, 4444);
+    }
+}
+
+#[cfg(test)]
+mod default_log_filter_tests {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// `tracing::enabled!` needs a literal target, so the table is a macro list.
+    macro_rules! assert_info_on {
+        ($($target:literal),+) => { $(
+            assert!(tracing::enabled!(target: $target, tracing::Level::INFO), "{} is off at info", $target);
+        )+ };
+    }
+
+    #[test]
+    fn default_log_filter_enables_info_for_its_own_and_shared_crates() {
+        let filter = tracing_subscriber::EnvFilter::try_new(super::DEFAULT_LOG_FILTER).expect("the default filter parses");
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            assert_info_on!("orchestrator", "tower_http", "chelabase_auth", "chelabase_metadata", "chelabase_neon", "chelabase_nats", "chelabase_query");
+            assert!(!tracing::enabled!(target: "hyper", tracing::Level::INFO), "dependency crates stay out");
+        });
     }
 }

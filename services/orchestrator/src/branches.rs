@@ -550,7 +550,10 @@ where
             Json(branch_view(&state, branch).await),
         )
             .into_response(),
-        Ok(None) => ApiError::internal().into_response(),
+        Ok(None) => {
+            error!(%branch_id, "the branch is gone right after its create was accepted");
+            ApiError::internal().into_response()
+        }
         Err(err) => {
             error!("load created branch: {err}");
             ApiError::internal().into_response()
