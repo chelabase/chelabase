@@ -7978,6 +7978,226 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/storage/object/resolve": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Resolve object refs to URLs as a role",
+        "description": "Storage's `POST /storage/v1/object/resolve` as the role: `{\"refs\": [...], \"expires_in\"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you keep Developer access to the database (Admin for one resolved in owner mode). Needs the role held at Viewer.",
+        "operationId": "storageResolveObjects",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "The role to act as: row level security on `storage.buckets` and `storage.objects`\ndecides what it sees and may do. Absent, `owner` or the owner's name: owner mode, for an\nAdmin of the database only, which sees and writes past every policy (write-once buckets\nstill hold) and writes objects with no owner (`owner` null).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "claims",
+            "in": "query",
+            "description": "The JWT claims to run with: a JSON object (at most 4 KiB), `{}` when absent. Acting as\n`authenticated` with `{\"sub\": \"<user id>\"}` shows what that app user sees.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database; the branch's main database when absent. It must be served by the\ndata API.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Upload: replace an existing object.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`urls`: one per ref, in order, each a path on the API host or `null`; `expires_at` (seconds since the epoch)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID; storage's `invalid_request`, `invalid_value` or `reserved_bucket_name`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's, or one you have no access to), the branch or the Postgres database doesn't exist; storage's `bucket_not_found`, `object_not_found` or `upload_not_found`; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`data_api_disabled`: the Postgres database isn't served by the data API; `backup_branch`; `branch_not_ready`; storage's `conflict` or `write_once`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "storage's `too_large`: over the bucket's file size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "storage's `mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: `role` is empty, `claims` is given in owner mode, `claims` isn't a JSON object of at most 4096 bytes, or the query string is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`unavailable`: storage refused the orchestrator's credential (a server misconfiguration)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: object storage can't be reached right now (`Retry-After`); `worker_unavailable`; storage's `storage_unavailable` or `busy`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{name}": {
       "post": {
         "tags": [

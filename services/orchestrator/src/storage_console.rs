@@ -9,7 +9,7 @@
 //!    its own login (`BYPASSRLS`: past every policy, still held to the write-once and ticket
 //!    triggers); objects written so have no owner (`owner` NULL);
 //! 2. the member's access ([`authorize`] with the route's own `ActAs` level from
-//!    `chelabase_routes`): reads and listing need the role held at Viewer, every write, a signed
+//!    `chelabase_routes`): reads, listing and resolve need the role held at Viewer, every write, a signed
 //!    URL and a resumable upload's steps at Developer; an owner-level, LOGIN or reserved role
 //!    is Admin-only, a personal login nobody's (the SQL console's rules);
 //! 3. the branch is the database's, not a backup, ready; the Postgres database (`?database=`,
@@ -483,6 +483,7 @@ where
         .routes(routes!(copy_object))
         .routes(routes!(move_object))
         .routes(routes!(sign_object))
+        .routes(routes!(resolve_objects))
         .routes(routes!(create_upload))
         .routes(routes!(upload_part))
         .routes(routes!(list_parts, abort_upload))
@@ -715,6 +716,21 @@ storage_route!(
     ok = (
         200,
         "`signed_url` (a path on the API host) and `expires_at` (seconds since the epoch)"
+    )
+);
+storage_route!(
+    resolve_objects,
+    post,
+    "/v1/databases/{id}/branches/{branch_id}/storage/object/resolve",
+    "storageResolveObjects",
+    ep::STORAGE_RESOLVE_OBJECTS,
+    summary = "Resolve object refs to URLs as a role",
+    description = "Storage's `POST /storage/v1/object/resolve` as the role: `{\"refs\": [...], \"expires_in\"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you keep Developer access to the database (Admin for one resolved in owner mode). Needs the role held at Viewer.",
+    params(),
+    body(content = Value, content_type = "application/json"),
+    ok = (
+        200,
+        "`urls`: one per ref, in order, each a path on the API host or `null`; `expires_at` (seconds since the epoch)"
     )
 );
 storage_route!(

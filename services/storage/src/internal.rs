@@ -232,6 +232,7 @@ pub fn internal_router<S: ConnSource, M: ConnSource>(
             ep::SIGN_OBJECT.path,
             post(signed::sign::<S, M>).get(not_served),
         )
+        .route(ep::RESOLVE_OBJECTS.path, post(signed::resolve::<S, M>))
         .route(ep::CREATE_UPLOAD.path, post(multipart::create::<S, M>))
         .route(ep::UPLOAD_PART.path, put(multipart::upload_part::<S, M>))
         .route(
@@ -339,6 +340,7 @@ mod tests {
             ("GET", "/storage/v1/object/b/a.txt"),
             ("DELETE", "/storage/v1/object/b/a.txt"),
             ("POST", "/storage/v1/object/sign/b/a.txt"),
+            ("POST", "/storage/v1/object/resolve"),
             ("PUT", "/storage/v1/upload/session/x/1"),
         ];
         for (method, path) in routes {
@@ -486,6 +488,52 @@ mod tests {
         )
         .await;
         assert_eq!(status, 503);
+    }
+
+    /// The console resolves refs as its caller (#100 follow-up): a role caller and an owner-mode
+    /// caller both get past every check to the branch (unreachable here: 503), so row level
+    /// security as that caller decides what resolves; a resolve's URLs live at most an hour
+    /// (longer is 400 before anything is read), and a malformed ref is 400.
+    #[tokio::test]
+    async fn the_console_resolves_as_its_caller() {
+        let (internal, _) = serve().await;
+        let url = format!("{internal}/storage/v1/object/resolve");
+        let refs = json!([{ "bucket": "b", "name": "a.txt" }, { "id": Uuid::new_v4() }]);
+        let owner = json!({ "branch_id": Uuid::new_v4(), "database": "app", "owner": true, "member_id": Uuid::new_v4(), "request_id": "r" });
+        for who in [caller(), owner.to_string()] {
+            let headers = [
+                ("authorization", format!("Bearer {TOKEN}")),
+                (CONSOLE_HEADER, who.clone()),
+            ];
+            let (status, json) = call(
+                url.clone(),
+                "POST",
+                &headers,
+                json!({ "refs": refs, "expires_in": MAX_CONSOLE_TTL }),
+            )
+            .await;
+            assert_eq!(status, 503, "{who}: {json}");
+            let (status, json) = call(
+                url.clone(),
+                "POST",
+                &headers,
+                json!({ "refs": refs, "expires_in": MAX_CONSOLE_TTL + 1 }),
+            )
+            .await;
+            assert_eq!(
+                (status, json["error"]["code"].as_str()),
+                (400, Some("invalid_request")),
+                "{who}: {json}"
+            );
+            let (status, _) = call(
+                url.clone(),
+                "POST",
+                &headers,
+                json!({ "refs": [{ "bucket_id": "nope", "name": "a" }] }),
+            )
+            .await;
+            assert_eq!(status, 400, "{who}");
+        }
     }
 
     /// Owner mode (m9, the human's option 3): `"owner": true` and no role names storage's own

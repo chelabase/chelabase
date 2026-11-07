@@ -3884,6 +3884,54 @@ async fn storage_console_live() {
     .await;
 }
 
+/// The console's resolve (#100 follow-up, for #106): acting as `authenticated` with a user's
+/// claims, a ref that user's policies show resolves to a signed URL that serves, and another
+/// user's is null; the console caps the URLs at an hour. Owner mode resolves both (by name and
+/// by id), and its URLs serve.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_console_resolve_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_console_resolve_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
+        let member = Member::granted(fx, json!({ "platform_role": "developer", "pg_roles": ["authenticated"] })).await;
+        let token = member.token.clone();
+        let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
+        for (user, name) in [(u1, "mine.txt"), (u2, "theirs.txt")] {
+            let (status, _, b) = object("POST", &fx.console(&format!("/object/files/{name}"), user), &token, Some(name.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
+            assert_eq!(status, 200, "upload {name}: {}", json_of(&b));
+        }
+        let theirs_id = fx.value("SELECT id FROM storage.objects WHERE name = 'theirs.txt'").await;
+        let refs = json!([{ "bucket": "files", "name": "mine.txt" }, { "bucket": "files", "name": "theirs.txt" }]);
+        let resolve = fx.console("/object/resolve", u1);
+        let (status, _, b) = object("POST", &resolve, &token, Some(json!({ "refs": refs, "expires_in": 3601 }).to_string().into()), &[JSON]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (400, json!("invalid_request")), "{}", json_of(&b));
+        let (status, _, b) = object("POST", &resolve, &token, Some(json!({ "refs": refs, "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        let body = json_of(&b);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["urls"][1], Value::Null, "another user's object: {body}");
+        let url = body["urls"][0].as_str().unwrap_or_else(|| panic!("a signed URL: {body}")).to_string();
+        let (status, _, got) = keyless("GET", &url, None).await;
+        assert_eq!((status, &got[..]), (200, &b"mine.txt"[..]));
+        member.remove().await;
+        // Owner mode (an Admin, no role): past every policy, by name and by id.
+        let owner_refs = json!([{ "bucket": "files", "name": "mine.txt" }, { "id": theirs_id }]);
+        let (status, _, b) = object("POST", &fx.owner_console("/object/resolve"), &dev_token().await, Some(json!({ "refs": owner_refs, "expires_in": 60 }).to_string().into()), &[JSON]).await;
+        let body = json_of(&b);
+        assert_eq!(status, 200, "{body}");
+        for (i, want) in [(0, &b"mine.txt"[..]), (1, &b"theirs.txt"[..])] {
+            let url = body["urls"][i].as_str().unwrap_or_else(|| panic!("slot {i}: {body}"));
+            let (status, _, got) = keyless("GET", url, None).await;
+            assert_eq!((status, &got[..]), (200, want), "slot {i}");
+        }
+    }))
+    .await;
+}
+
 /// NATS revocation (m6's AC, moved to m9): a revoked key's signed URL fails within a second,
 /// though its liveness was cached a moment before (the cache lifetime is 5 s): the
 /// orchestrator's event reaches storage.

@@ -137,6 +137,7 @@ import type {
   StorageListPartsParams,
   StorageMoveObjectParams,
   StoragePutObjectParams,
+  StorageResolveObjectsParams,
   StorageSignObjectParams,
   StorageUpdateBucketParams,
   StorageUploadObjectParams,
@@ -5400,6 +5401,107 @@ export const useStorageMoveObject = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getStorageMoveObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageResolveObjectsUrl = (id: string,
+    branchId: string,
+    params?: StorageResolveObjectsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/resolve?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/resolve`
+}
+
+/**
+ * Storage's `POST /storage/v1/object/resolve` as the role: `{"refs": [...], "expires_in"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you keep Developer access to the database (Admin for one resolved in owner mode). Needs the role held at Viewer.
+ * @summary Resolve object refs to URLs as a role
+ */
+export const storageResolveObjects = async (id: string,
+    branchId: string,
+    storageResolveObjectsBody: unknown,
+    params?: StorageResolveObjectsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageResolveObjectsUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageResolveObjectsBody)
+  }
+);}
+
+
+
+
+
+export const getStorageResolveObjectsMutationKey = () => ['storageResolveObjects'] as const;
+
+export const getStorageResolveObjectsMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext> => {
+
+const mutationKey = getStorageResolveObjectsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageResolveObjects>>, StorageResolveObjectsMutationVariables> = (props) => {
+          const {id,branchId,data,params} = props ?? {};
+
+          return  storageResolveObjects(id,branchId,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageResolveObjectsMutationResult = NonNullable<Awaited<ReturnType<typeof storageResolveObjects>>>
+    export type StorageResolveObjectsMutationBody = unknown
+    export type StorageResolveObjectsMutationError = ErrorType<ErrorEnvelope>
+    export type StorageResolveObjectsMutationVariables = {id: string;branchId: string;data: unknown;params?: StorageResolveObjectsParams}
+
+    /**
+ * @summary Resolve object refs to URLs as a role
+ */
+export const useStorageResolveObjects = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageResolveObjects>>,
+        TError,
+        StorageResolveObjectsMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageResolveObjectsMutationOptions(options), queryClient);
     }
 
 export const getStorageSignObjectUrl = (id: string,
