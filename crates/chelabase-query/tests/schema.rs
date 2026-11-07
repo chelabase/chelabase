@@ -852,7 +852,9 @@ fn storage_ref_columns_are_described() {
 
 /// #102: the introspection reads each column's comment and whether a single-column foreign
 /// key points it at `storage.objects(id)` (found by name, so a database without storage
-/// still introspects).
+/// still introspects). It runs as the request's role, so the table is found through the
+/// catalog alone: a qualified name (`to_regclass('storage.objects')`, a `::regclass` cast)
+/// checks USAGE on `storage` and fails for a role without it (every custom role: a 500).
 #[test]
 fn introspection_reads_storage_ref_hints() {
     assert!(
@@ -860,9 +862,12 @@ fn introspection_reads_storage_ref_hints() {
         "{INTROSPECT_SQL}"
     );
     assert!(
-        INTROSPECT_SQL.contains("pg_catalog.to_regclass('storage.objects')"),
+        INTROSPECT_SQL.contains("s.nspname = 'storage' AND o.relname = 'objects'"),
         "{INTROSPECT_SQL}"
     );
+    for qualified in ["to_regclass", "to_regtype", "'storage."] {
+        assert!(!INTROSPECT_SQL.contains(qualified), "{qualified}: {INTROSPECT_SQL}");
+    }
     assert!(
         INTROSPECT_SQL.contains("f.contype = 'f'"),
         "{INTROSPECT_SQL}"

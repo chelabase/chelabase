@@ -81,7 +81,8 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
           a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a',
           pg_catalog.col_description(c.oid, a.attnum),
           EXISTS (SELECT FROM pg_catalog.pg_constraint f WHERE f.conrelid = c.oid AND f.contype = 'f'
-            AND f.conkey = ARRAY[a.attnum] AND f.confrelid = pg_catalog.to_regclass('storage.objects')
+            AND f.conkey = ARRAY[a.attnum] AND f.confrelid = (SELECT o.oid FROM pg_catalog.pg_class o JOIN pg_catalog.pg_namespace s ON s.oid = o.relnamespace
+              WHERE s.nspname = 'storage' AND o.relname = 'objects')
             AND f.confkey = ARRAY[(SELECT x.attnum FROM pg_catalog.pg_attribute x
               WHERE x.attrelid = f.confrelid AND x.attname = 'id')])) ORDER BY a.attnum), '[]')
         FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped),
