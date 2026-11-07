@@ -1135,7 +1135,7 @@ pub mod orchestrator {
         "/v1/databases/{id}/branches/{branch_id}/storage/object/move",
         Access::ActAs(Developer),
     );
-    /// A download URL that lives at most an hour, while the member keeps Developer access.
+    /// A download URL that lives at most an hour, while the member holds the role at Developer.
     pub const STORAGE_SIGN_OBJECT: Endpoint = key_endpoint(
         "orchestrator.storage_sign_object",
         Method::Post,
@@ -1143,7 +1143,7 @@ pub mod orchestrator {
         Access::ActAs(Developer),
     );
     /// Object refs to URLs, as the role (row level security decides; `null` for what it can't
-    /// read). Its signed URLs live at most an hour, while the member keeps Developer access.
+    /// read). Its signed URLs live at most an hour, while the member holds the role at Developer.
     pub const STORAGE_RESOLVE_OBJECTS: Endpoint = key_endpoint(
         "orchestrator.storage_resolve_objects",
         Method::Post,

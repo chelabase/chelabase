@@ -5421,7 +5421,7 @@ export const getStorageResolveObjectsUrl = (id: string,
 }
 
 /**
- * Storage's `POST /storage/v1/object/resolve` as the role: `{"refs": [...], "expires_in"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you keep Developer access to the database (Admin for one resolved in owner mode). Needs the role held at Viewer.
+ * Storage's `POST /storage/v1/object/resolve` as the role: `{"refs": [...], "expires_in"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you hold the role at Developer on the database (Admin for one resolved in owner mode): one resolved as a role you hold only at Viewer is refused when opened. Needs the role held at Viewer.
  * @summary Resolve object refs to URLs as a role
  */
 export const storageResolveObjects = async (id: string,
@@ -5524,7 +5524,7 @@ export const getStorageSignObjectUrl = (id: string,
 }
 
 /**
- * Storage's signed download URL, minted as the role (it must be able to read the object). `expires_in` is 1 to 3600 seconds (default 3600). The URL works while it is the object's current version and while you keep Developer access to the database; it stops when you are removed or your access drops. Needs the role held at Developer.
+ * Storage's signed download URL, minted as the role (it must be able to read the object). `expires_in` is 1 to 3600 seconds (default 3600). The URL works while it is the object's current version and while you still hold the role at Developer on the database; it stops when you are removed or the role's level drops below Developer. Needs the role held at Developer.
  * @summary Create a signed download URL as a role
  */
 export const storageSignObject = async (id: string,
