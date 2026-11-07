@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "init", "server", "studio", "identity"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "init", "server", "studio", "identity", "functions-runtime"]
 }
 
 target "_app" {
@@ -109,4 +109,17 @@ target "identity" {
   }
   annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags        = ["${REPO}/identity:${TAG}"]
+}
+# The functions runtime (edge-functions m1): workerd and the supervisor; its own Dockerfile, no
+# cargo build. In the default group (`just images`); not in the release scripts yet (publish,
+# pin, image-inputs).
+target "functions-runtime" {
+  context    = "."
+  dockerfile = "infra/images/functions-runtime.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
+  tags        = ["${REPO}/functions-runtime:${TAG}"]
 }
