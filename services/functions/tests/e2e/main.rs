@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod app_users;
+mod scheduled;
 
 /// How soon a change must apply (NATS drops the cached resolution).
 const WITHIN: Duration = Duration::from_secs(2);
