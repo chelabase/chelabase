@@ -14,9 +14,10 @@ pub struct Config {
     /// `CHELABASE_FUNCTIONS_ADDR` (default `127.0.0.1:8091`): the public listener, behind the
     /// gateway.
     pub addr: SocketAddr,
-    /// `CHELABASE_FUNCTIONS_INTERNAL_ADDR` (default `127.0.0.1:8092`): the internal listener,
-    /// `host:port`, resolved at start; compose names the service's alias on the `functions`
-    /// network only, so it listens there and nowhere else.
+    /// `CHELABASE_FUNCTIONS_INTERNAL_ADDR` (default `127.0.0.1:8092`): the internal listener's
+    /// comma-separated `host:port`s, each resolved at start (every address it names is bound);
+    /// compose names the service's aliases on the internal networks only, so it listens there
+    /// and nowhere else.
     pub internal_addr: String,
     /// `CHELABASE_FUNCTIONS_RUNTIME_URL` (default `http://127.0.0.1:8080`).
     pub runtime_url: String,
