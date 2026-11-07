@@ -4,6 +4,7 @@
  * Chelabase Management API
  * OpenAPI spec version: 1
  */
+import type { StorageRefDesc } from './storageRefDesc.ts';
 
 export interface ColumnDesc {
   array: boolean;
@@ -15,5 +16,6 @@ export interface ColumnDesc {
   generated: boolean;
   has_default: boolean;
   nullable: boolean;
+  storage_ref?: StorageRefDesc | null;
   type: string;
 }

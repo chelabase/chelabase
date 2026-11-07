@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chelabase_types::data_api_schema::{
-    AppUsersTable, ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc, SchemaEntry, TableDesc,
-    TableKind,
+    AppUsersTable, ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc,
+    SchemaEntry, StorageRefDesc, TableDesc, TableKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -78,7 +78,12 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
         FROM pg_catalog.unnest(c.reloptions) o WHERE o LIKE 'security_invoker=%'), false),
       (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(a.attname, a.atttypid::int8,
           pg_catalog.format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
-          a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a') ORDER BY a.attnum), '[]')
+          a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a',
+          pg_catalog.col_description(c.oid, a.attnum),
+          EXISTS (SELECT FROM pg_catalog.pg_constraint f WHERE f.conrelid = c.oid AND f.contype = 'f'
+            AND f.conkey = ARRAY[a.attnum] AND f.confrelid = pg_catalog.to_regclass('storage.objects')
+            AND f.confkey = ARRAY[(SELECT x.attnum FROM pg_catalog.pg_attribute x
+              WHERE x.attrelid = f.confrelid AND x.attname = 'id')])) ORDER BY a.attnum), '[]')
         FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped),
       (SELECT coalesce(pg_catalog.json_agg(a.attname ORDER BY k.ord), '[]')
         FROM pg_catalog.pg_constraint con
@@ -127,8 +132,10 @@ pub enum IntrospectError {
 
 /// `(oid, schema, name, typtype, typelem, typbasetype, typcategory, typlen, format_type)`.
 type RawType = (u32, String, String, String, u32, u32, String, i16, String);
-/// `(name, type oid, format_type with typmod, nullable, has_default, generated)`.
-type RawColumn = (String, u32, String, bool, bool, bool);
+/// `(name, type oid, format_type with typmod, nullable, has_default, generated, comment,
+/// a single-column foreign key to `storage.objects(id)`)`. The comment is read only for the
+/// `@storage_ref` hint ([`storage_bucket_of`]); its text never reaches the API.
+type RawColumn = (String, u32, String, bool, bool, bool, Option<String>, bool);
 /// `(oid, schema, name, relkind, rls, security_invoker, columns, primary key columns)`.
 /// `security_invoker` is true only for a view whose options set it (any spelling Postgres
 /// reads as true: the value is cast to `boolean`). The primary key's columns come in the
@@ -190,6 +197,24 @@ pub struct Column {
     pub ty: TypeDesc,
     pub nullable: bool,
     pub has_default: bool,
+    /// How the column references a stored object, if it does.
+    pub storage_ref: Option<StorageRefDesc>,
+}
+
+/// The bucket a column comment's `@storage_ref bucket=<name>` names: the word right after
+/// `@storage_ref` (words split at whitespace), when it is `bucket=` and a non-empty name.
+pub fn storage_bucket_of(comment: &str) -> Option<String> {
+    let mut words = comment.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "@storage_ref" {
+            return words
+                .next()?
+                .strip_prefix("bucket=")
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +421,34 @@ impl Types {
         Some(format!("{}.{}", quote_ident(&t.1), quote_ident(&t.2)))
     }
 
+    /// How a column of type `oid` (with `comment`, and `storage_object` when a single-column
+    /// foreign key makes it `storage.objects(id)`) references a stored object: the foreign
+    /// key first, then the type `storage.object_ref` (by its schema, never another type of
+    /// that name), then a text column's (or text array's) `@storage_ref bucket=` comment.
+    fn storage_ref(
+        &self,
+        oid: u32,
+        comment: Option<&str>,
+        storage_object: bool,
+    ) -> Option<StorageRefDesc> {
+        if storage_object {
+            return Some(StorageRefDesc::Id);
+        }
+        let mut t = self.base(oid)?;
+        if Self::is_array(t) {
+            t = self.base(t.4)?;
+        }
+        if t.1 == "storage" && t.2 == "object_ref" {
+            return Some(StorageRefDesc::Ref);
+        }
+        if t.6 == "S" {
+            return comment
+                .and_then(storage_bucket_of)
+                .map(|bucket| StorageRefDesc::Path { bucket });
+        }
+        None
+    }
+
     /// The type by its own schema and name, each quoted, without modifiers (an array is its
     /// `_` type, a domain itself): never resolved through the search path.
     fn qualified(&self, oid: u32) -> Option<String> {
@@ -437,7 +490,16 @@ impl Schema {
                     columns: columns
                         .into_iter()
                         .map(
-                            |(name, typid, formatted, nullable, has_default, generated)| {
+                            |(
+                                name,
+                                typid,
+                                formatted,
+                                nullable,
+                                has_default,
+                                generated,
+                                comment,
+                                storage_object,
+                            )| {
                                 let ty = types.desc(typid).unwrap_or(TypeDesc {
                                     name: formatted.clone(),
                                     array: false,
@@ -445,6 +507,8 @@ impl Schema {
                                 });
                                 let text_like =
                                     !ty.array && types.base(typid).is_some_and(|b| b.6 == "S");
+                                let storage_ref =
+                                    types.storage_ref(typid, comment.as_deref(), storage_object);
                                 let type_qualified =
                                     types.qualified(typid).unwrap_or_else(|| formatted.clone());
                                 Column {
@@ -461,6 +525,7 @@ impl Schema {
                                     ty,
                                     nullable,
                                     has_default,
+                                    storage_ref,
                                 }
                             },
                         )
@@ -572,6 +637,7 @@ impl Schema {
                         has_default: c.has_default,
                         generated: c.info.generated,
                         r#enum: c.ty.enum_ref.clone(),
+                        storage_ref: c.storage_ref.clone(),
                     },
                 );
             }
@@ -886,6 +952,7 @@ mod tests {
             ty,
             nullable,
             has_default,
+            storage_ref: None,
         }
     }
 

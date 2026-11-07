@@ -467,14 +467,14 @@ fn introspection_qualifies_every_column_type() {
         "relations": [[
             40000, "public", "t", "r", false, false,
             [
-                ["id", 20, "bigint", false, false, false],
-                ["ids", 1016, "bigint[]", true, false, false],
-                ["name", 1043, "character varying(3)", true, false, false],
-                ["u", 2950, "uuid", true, false, false],
-                ["at", 1184, "timestamp(3) with time zone", true, false, false],
-                ["mood", 90001, "mood", true, false, false],
-                ["pos", 90003, "\"My Schema\".\"Pos \"\"Int\"\"\"", true, false, false],
-                ["t", 25, "text", true, false, false]
+                ["id", 20, "bigint", false, false, false, null, false],
+                ["ids", 1016, "bigint[]", true, false, false, null, false],
+                ["name", 1043, "character varying(3)", true, false, false, null, false],
+                ["u", 2950, "uuid", true, false, false, null, false],
+                ["at", 1184, "timestamp(3) with time zone", true, false, false, null, false],
+                ["mood", 90001, "mood", true, false, false, null, false],
+                ["pos", 90003, "\"My Schema\".\"Pos \"\"Int\"\"\"", true, false, false, null, false],
+                ["t", 25, "text", true, false, false, null, false]
             ],
             ["id"]
         ]],
