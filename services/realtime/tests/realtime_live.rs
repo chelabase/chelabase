@@ -1763,7 +1763,7 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
 
         // AC 1: an upload as `authenticated` reaches both members and owner mode.
         let started = Instant::now();
-        let shown = storage_upload(&fx, &ana_token, "media", "docs/a.txt", Some("authenticated")).await;
+        let shown = storage_upload(&fx, &ana_token, "media", "notes/a.txt", Some("authenticated")).await;
         let want = keys(&[&shown.to_string()]);
         let (a, b, o) = tokio::join!(
             collect_rows(&mut ana, &ch, Duration::from_secs(3)),
