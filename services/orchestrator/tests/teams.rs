@@ -138,7 +138,9 @@ impl Tw {
         self.w.app.cache.clear();
     }
 
-    /// Waits until no spawned publish has landed for 300 ms (10 s at most).
+    /// Waits until no spawned publish has landed for 1.5 s (10 s at most). Login rows are
+    /// published again 1 s after the first time (`publish_password_updated`), so a shorter quiet
+    /// spell can end between the two and the re-send lands on a later check.
     async fn quiesce(&self) {
         let seen = || {
             (
@@ -150,7 +152,7 @@ impl Tw {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last = seen();
         while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             let now = seen();
             if now == last {
                 return;
