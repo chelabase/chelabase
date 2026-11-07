@@ -640,6 +640,43 @@ mod tests {
         ));
     }
 
+    /// The allowlist is exact: `runner` (any case) passes, by name or resolved; a name that only
+    /// contains, ends or starts with it, its address as a literal, or a trailing-dot spelling
+    /// stay public-only.
+    #[tokio::test]
+    async fn the_allowlist_matches_hosts_exactly() {
+        let inside = &["172.18.0.5"][..];
+        let fake = Fake::with(&[
+            ("runner", &[inside]),
+            ("RUNNER", &[inside]),
+            ("runner.evil.com", &[inside]),
+            ("xrunner", &[inside]),
+            ("runnerx", &[inside]),
+            ("evil.runner", &[inside]),
+            ("runner.", &[inside]),
+        ]);
+        let o = Outbound::new().allow_http(true).allow_hosts(["runner"]).with_lookup(fake);
+        assert!(o.check_resolved("http://runner:8080/hook").await.is_ok());
+        assert!(o.check_resolved("http://RUNNER/hook").await.is_ok());
+        for url in [
+            "http://runner.evil.com/",
+            "http://xrunner/",
+            "http://runnerx/",
+            "http://evil.runner/",
+            "http://runner./",
+            "http://172.18.0.5/",
+        ] {
+            assert!(
+                matches!(o.check_resolved(url).await, Err(Refused::NotPublic { .. })),
+                "{url}: {:?}",
+                o.check_resolved(url).await
+            );
+        }
+        // Listed, the address passes too.
+        let listed = Outbound::new().allow_http(true).allow_hosts(["runner", "172.18.0.5"]);
+        assert!(listed.check_url("http://172.18.0.5/").is_ok());
+    }
+
     /// A local server counting the connections it accepts; it answers `reply` to each.
     async fn server(reply: String) -> (u16, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

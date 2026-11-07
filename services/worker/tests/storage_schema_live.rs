@@ -4345,42 +4345,6 @@ async fn storage_ref_foreign_key_live() {
 
 // --- m18: storage webhooks, end to end ------------------------------------------------------
 
-/// `docker compose` on the stack's project with the stack's files (never the task checkout's),
-/// with `env` in the command's environment: the worker's `environment:` passes the webhook
-/// settings through from it.
-async fn stack_compose(env: &[(&str, &str)], args: &[&str]) {
-    let var = |v: &str| std::env::var(v).unwrap_or_else(|_| panic!("{v} is unset (the stack's runner sets it)"));
-    let checkout = std::env::var("CHELABASE_STACK_CHECKOUT").unwrap_or_else(|_| var("CHELABASE_CHECKOUT"));
-    let out = tokio::process::Command::new("docker")
-        .args(["compose", "-p", &var("CHELABASE_COMPOSE_PROJECT"), "-f"])
-        .arg(format!("{checkout}/infra/compose/docker-compose.yml"))
-        .arg("-f")
-        .arg(format!("{checkout}/infra/compose/docker-compose.workbench.yml"))
-        .arg("--env-file")
-        .arg(format!("{}/env/stack.env", var("CHELABASE_STACK_DIR")))
-        .args(args)
-        .env("CHELABASE_CHECKOUT", &checkout)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .expect("run docker compose");
-    assert!(out.status.success(), "docker compose {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-}
-
-/// The runner container's name: the stack's worker reaches it by that name on the default
-/// network.
-async fn runner_host() -> String {
-    let hostname = std::fs::read_to_string("/etc/hostname").expect("the container's hostname");
-    let out = tokio::process::Command::new("docker")
-        .args(["inspect", "--format", "{{.Name}}", hostname.trim()])
-        .output()
-        .await
-        .expect("docker inspect");
-    assert!(out.status.success(), "docker inspect: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('/').to_string()
-}
-
 /// One request an endpoint received: its headers (lower-case names) and body.
 struct Received {
     headers: std::collections::HashMap<String, String>,
@@ -4440,24 +4404,16 @@ async fn webhook_endpoint() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Receiv
 
 /// AC 1: an endpoint in the runner's network for `object.created` on bucket `files` gets one
 /// signed POST with the event's fields within seconds of an upload there; an upload to another
-/// bucket sends nothing. The stack's worker is recreated with the runner's host allowlisted
-/// (and `http` allowed) for the test, then recreated plain, pass or fail.
+/// bucket sends nothing. The workbench worker allows exactly the host `runner` (the runner's
+/// alias) over http, for this receiver.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
 async fn storage_webhooks_live() {
-    let host = runner_host().await;
-    let allow: &'static str = Box::leak(host.clone().into_boxed_str());
-    stack_compose(
-        &[("CHELABASE_WEBHOOKS_ALLOW_HTTP", "true"), ("CHELABASE_WEBHOOKS_ALLOW_HOSTS", allow)],
-        &["up", "-d", "--force-recreate", "--no-deps", "worker"],
-    )
-    .await;
     let fx = Arc::new(Fx::provision().await);
     let task = fx.clone();
-    let outcome = tokio::spawn(async move { storage_webhooks(&task, &host).await }).await;
+    let outcome = tokio::spawn(async move { storage_webhooks(&task, "runner").await }).await;
     fx.purge_blobs(&object_store().await).await;
     fx.teardown().await;
-    stack_compose(&[], &["up", "-d", "--force-recreate", "--no-deps", "worker"]).await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
@@ -4490,7 +4446,7 @@ async fn storage_webhooks(fx: &Fx, host: &str) {
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
     let uploaded = json_of(&b);
 
-    // The worker reads the endpoints every 5 s and has just restarted: well within 90 s.
+    // The worker reads the endpoints every 5 s: well within 90 s.
     let got = tokio::time::timeout(Duration::from_secs(90), received.recv())
         .await
         .expect("a delivery within 90 s")
