@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use chelabase_auth::internal::{IDENTITY_HEADER, InternalVerifier};
@@ -132,25 +132,49 @@ fn not_found() -> Response<Body> {
 /// The request as it came, for an invocation.
 struct Incoming {
     method: Method,
+    /// What the function sees as its path: `/{name}[/{rest}]`, exactly as the client sent it
+    /// (still percent-encoded, dot segments kept).
+    path: String,
     headers: HeaderMap,
     query: Option<String>,
     body: Body,
 }
 
+/// The request path without its first `skip` segments, exactly as sent: the route's own
+/// segments go and the function's `/{name}[/{rest}]` stays percent-encoded. The decoded `Path`
+/// would turn `%3F` into a query and `%2F..%2F` into dot segments the client never sent.
+fn raw_tail(path: &str, skip: usize) -> String {
+    let mut rest = path;
+    for _ in 0..skip {
+        let s = rest.strip_prefix('/').unwrap_or(rest);
+        rest = s.find('/').map_or("", |i| &s[i..]);
+    }
+    rest.to_owned()
+}
+
+/// `/functions/v1/{name}…`: two route segments.
+const KEY_PREFIX: usize = 2;
+/// `/functions/v1/public/{branch_id}/{name}…`: four.
+const PUBLIC_PREFIX: usize = 4;
+/// `/internal/invoke/{branch_id}/{name}`: three.
+const INTERNAL_PREFIX: usize = 3;
+
 async fn invoke_key(
     State(s): State<Shared>,
     Path(name): Path<String>,
+    uri: Uri,
     RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
+    let path = raw_tail(uri.path(), KEY_PREFIX);
     key_form(
         s,
         name,
-        None,
         Incoming {
             method,
+            path,
             headers,
             query,
             body,
@@ -161,22 +185,21 @@ async fn invoke_key(
 
 async fn invoke_key_rest(
     State(s): State<Shared>,
-    Path((name, rest)): Path<(String, String)>,
+    Path((name, _rest)): Path<(String, String)>,
+    uri: Uri,
     RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
-    key_form(
-        s,
-        name,
-        Some(rest),
-        Incoming {
-            method,
-            headers,
-            query,
-            body,
-        },
+    invoke_key(
+        State(s),
+        Path(name),
+        uri,
+        RawQuery(query),
+        method,
+        headers,
+        body,
     )
     .await
 }
@@ -184,18 +207,20 @@ async fn invoke_key_rest(
 async fn invoke_public(
     State(s): State<Shared>,
     Path((branch, name)): Path<(String, String)>,
+    uri: Uri,
     RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
+    let path = raw_tail(uri.path(), PUBLIC_PREFIX);
     public_form(
         s,
         branch,
         name,
-        None,
         Incoming {
             method,
+            path,
             headers,
             query,
             body,
@@ -206,29 +231,27 @@ async fn invoke_public(
 
 async fn invoke_public_rest(
     State(s): State<Shared>,
-    Path((branch, name, rest)): Path<(String, String, String)>,
+    Path((branch, name, _rest)): Path<(String, String, String)>,
+    uri: Uri,
     RawQuery(query): RawQuery,
     method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
-    public_form(
-        s,
-        branch,
-        name,
-        Some(rest),
-        Incoming {
-            method,
-            headers,
-            query,
-            body,
-        },
+    invoke_public(
+        State(s),
+        Path((branch, name)),
+        uri,
+        RawQuery(query),
+        method,
+        headers,
+        body,
     )
     .await
 }
 
 /// The branch is the key's, never anything in the request.
-async fn key_form(s: Shared, name: String, rest: Option<String>, req: Incoming) -> Response<Body> {
+async fn key_form(s: Shared, name: String, req: Incoming) -> Response<Body> {
     let claims = req
         .headers
         .get(IDENTITY_HEADER)
@@ -243,34 +266,20 @@ async fn key_form(s: Shared, name: String, rest: Option<String>, req: Incoming) 
             "a data API key is required",
         );
     };
-    invoke(&s, branch, &name, rest, Form::Key, caller, req).await
+    invoke(&s, branch, &name, Form::Key, caller, req).await
 }
 
-async fn public_form(
-    s: Shared,
-    branch: String,
-    name: String,
-    rest: Option<String>,
-    req: Incoming,
-) -> Response<Body> {
+async fn public_form(s: Shared, branch: String, name: String, req: Incoming) -> Response<Body> {
     let Ok(branch) = Uuid::parse_str(&branch) else {
         return not_found();
     };
-    invoke(
-        &s,
-        branch,
-        &name,
-        rest,
-        Form::Public,
-        Caller::Anonymous,
-        req,
-    )
-    .await
+    invoke(&s, branch, &name, Form::Public, Caller::Anonymous, req).await
 }
 
 async fn invoke_internal(
     State(s): State<Shared>,
     Path((branch, name)): Path<(String, String)>,
+    uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
@@ -282,27 +291,18 @@ async fn invoke_internal(
     };
     let req = Incoming {
         method: Method::POST,
+        path: raw_tail(uri.path(), INTERNAL_PREFIX),
         headers,
         query: None,
         body,
     };
-    invoke(
-        &s,
-        branch,
-        &name,
-        None,
-        Form::Internal,
-        Caller::Internal,
-        req,
-    )
-    .await
+    invoke(&s, branch, &name, Form::Internal, Caller::Internal, req).await
 }
 
 async fn invoke(
     s: &AppState,
     branch: Uuid,
     name: &str,
-    rest: Option<String>,
     form: Form,
     caller: Caller,
     req: Incoming,
@@ -347,11 +347,7 @@ async fn invoke(
     let Ok(body) = to_bytes(req.body, MAX_BODY_BYTES).await else {
         return too_big();
     };
-    let mut path_and_query = format!("/{name}");
-    if let Some(rest) = rest {
-        path_and_query.push('/');
-        path_and_query.push_str(&rest);
-    }
+    let mut path_and_query = req.path;
     if let Some(q) = req.query {
         path_and_query.push('?');
         path_and_query.push_str(&q);

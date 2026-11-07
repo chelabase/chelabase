@@ -36,8 +36,6 @@ reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-# `last_error` (a statement the metadata crate doesn't have).
-sqlx = { workspace = true }
 # The internal listener's bearers, compared in constant time.
 subtle = { workspace = true }
 tokio = { workspace = true }
@@ -48,4 +46,6 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# ResolvedFunction's compatibility date, in the metadata fake.
+chrono = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }
