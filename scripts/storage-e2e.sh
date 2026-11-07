@@ -70,15 +70,17 @@ done
 
 # --- the stack's compose project, and the S3 swap ------------------------------------------------
 
-# The stack's own checkout, never the task checkout the runner works in: recreated services must
-# stay on the stack's files and binaries.
+# Recreated services must stay on the stack's own checkout (its binaries), never the task
+# checkout the runner works in: CHELABASE_CHECKOUT is the stack's when Compose interpolates. The
+# compose files themselves are read from this checkout (the runner mounts only this one), so a
+# task checkout's files must match the stack's for the services it recreates.
 stack_checkout="${CHELABASE_STACK_CHECKOUT:-${CHELABASE_CHECKOUT:?run through just workbench run}}"
 SWAP_FILE="$state/storage-e2e/s3-swap.yml"
 SWAP_ENDPOINT=http://seaweedfs-s3:8333
 SWAP_BUCKET=chelabase-storage-s3
 # compose [-f extra] <args…>: docker compose on the stack's project, base file and overlay first.
 compose() {
-  local files=(-f "$stack_checkout/infra/compose/docker-compose.yml" -f "$stack_checkout/infra/compose/docker-compose.workbench.yml")
+  local files=(-f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml")
   if [[ "${1:-}" == -f ]]; then
     files+=(-f "$2")
     shift 2
