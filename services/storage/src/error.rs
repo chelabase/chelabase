@@ -100,6 +100,19 @@ impl Failure {
         )
     }
 
+    /// 409: a foreign key to `storage.objects(id)` (#102) still references the object, so it
+    /// isn't deleted. A fixed message: Postgres's names the referencing table and constraint,
+    /// which the caller may not be allowed to see.
+    pub fn object_referenced() -> Self {
+        let mut f = QueryFailure::new(
+            StatusCode::CONFLICT,
+            "referenced",
+            "the object is still referenced by a foreign key to storage.objects(id); remove or change the referencing rows first (or declare the key ON DELETE SET NULL or CASCADE)",
+        );
+        f.sqlstate = Some("23503".into());
+        Failure(f)
+    }
+
     /// 413: the body is over the bucket's file size limit.
     pub fn too_large(limit: i64) -> Self {
         Self::new(

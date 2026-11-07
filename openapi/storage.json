@@ -1295,7 +1295,7 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once; nothing is deleted",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them. Either way nothing is deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1726,7 +1726,7 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it (nothing is deleted)",
             "content": {
               "application/json": {
                 "schema": {
