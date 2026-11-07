@@ -120,8 +120,9 @@ pub struct ObjectChange {
 /// The two strings that can still be longer are left out, not cut, since a cut value would
 /// name a different user or type: a `sub` claim past [`MAX_SUB_BYTES`] as JSON writes it (it
 /// comes from the caller's token), and a stored type past [`MAX_CONTENT_TYPE_BYTES`] (one
-/// written with SQL, then copied, moved or deleted through the API). Bucket names come from
-/// the API's grammar; a bucket made with SQL outside it is SQL's change, like any other.
+/// written with SQL, then copied, moved or deleted through the API). A bucket's name is
+/// within [`valid_bucket_name`](crate::buckets::valid_bucket_name): object writes refuse any
+/// other ([`check_object_bucket`](crate::buckets::check_object_bucket)).
 pub fn event_of(data: &DataIdentity, at: &crate::engine::Located, change: ObjectChange) -> ObjectEvent {
     ObjectEvent {
         id: Uuid::new_v4(),

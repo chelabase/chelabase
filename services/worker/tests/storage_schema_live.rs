@@ -2906,6 +2906,30 @@ async fn storage_urls_content_type_live() {
     .await;
 }
 
+/// m18 re-audit B4: a bucket the API couldn't have created (a 64-byte name, made with SQL)
+/// takes no object write, so no write's event outgrows the stream's limit: an upload, a
+/// resumable upload, an upload URL and a copy into it are 400 `invalid_request`.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sql_bucket_takes_no_writes_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let long = "b".repeat(chelabase_nats::storage_objects::MAX_BUCKET_BYTES + 1);
+        fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{long}'); COMMIT;")).await;
+        let (status, _, b) = object("POST", &format!("/storage/v1/object/{long}/a.txt"), &secret, Some(b"a".to_vec().into()), &[]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (400, json!("invalid_request")), "{}", json_of(&b));
+        assert_eq!(open_upload(&secret, &long, "a.txt", "text/plain", &[]).await.0, 400);
+        assert_eq!(mint("upload/sign", &format!("{long}/a.txt"), &secret, 60).await.0, 400);
+        let (status, _, b) = object("POST", "/storage/v1/object/files/src.txt", &secret, Some(b"src".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, b) = storage("POST", "/storage/v1/object/copy", &secret, Some(json!({ "bucket": "files", "from": "src.txt", "to": "a.txt", "to_bucket": long }))).await;
+        assert_eq!((status, b["error"]["code"].clone()), (400, json!("invalid_request")), "{b}");
+        assert_eq!(fx.value(&format!("SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = '{long}'")).await, "0");
+    }))
+    .await;
+}
+
 /// S1: whether an upload URL may overwrite is the minter's choice, bound into the token; the
 /// uploader's `x-upsert` or `?upsert=` doesn't change it.
 #[tokio::test]

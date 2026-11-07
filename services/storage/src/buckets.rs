@@ -39,6 +39,14 @@ fn check_name(name: &str) -> Result<(), Failure> {
     }
 }
 
+/// 400 `invalid_request` unless an object write's bucket has a name the API could have
+/// created ([`valid_bucket_name`]). A bucket made with SQL under another name can still be
+/// read, but no object is written to or deleted from it through the API, so every write's
+/// event stays within its bound ([`chelabase_nats::storage_objects::MAX_BUCKET_BYTES`]).
+pub fn check_object_bucket(name: &str) -> Result<(), Failure> {
+    check_name(name)
+}
+
 /// Literal segments the storage routes use where a bucket name goes (`/object/list/…`,
 /// `/object/copy`, `/upload/session/…`, …, and the ones later milestones add): never a bucket's name.
 pub const RESERVED_BUCKET_NAMES: [&str; 8] = [
@@ -373,6 +381,19 @@ mod tests {
             "é",
         ] {
             assert!(!valid_bucket_name(bad), "{bad:?}");
+        }
+    }
+
+    /// m18 re-audit B4: an object write refuses a bucket the API couldn't have created (one
+    /// made with SQL), so its event's bucket stays within `MAX_BUCKET_BYTES`.
+    #[test]
+    fn an_object_write_needs_a_bucket_name_the_api_allows() {
+        use chelabase_nats::storage_objects::MAX_BUCKET_BYTES;
+        assert!(check_object_bucket(&"a".repeat(MAX_BUCKET_BYTES)).is_ok());
+        assert!(check_object_bucket("avatars").is_ok());
+        for bad in [&"a".repeat(MAX_BUCKET_BYTES + 1), "Avatars", "a b", "a\u{1}", "a\"b", &"a".repeat(6000)] {
+            let refused = check_object_bucket(bad).unwrap_err().0;
+            assert_eq!((refused.status.as_u16(), refused.code), (400, "invalid_request"), "{bad:?}");
         }
     }
 

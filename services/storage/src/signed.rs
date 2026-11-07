@@ -631,6 +631,7 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
     json: Result<Json<SignUploadBody>, JsonRejection>,
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
+    crate::buckets::check_object_bucket(&bucket)?;
     check_object_name(&name)?;
     let asked = body(json)?;
     let ttl = ttl_of(asked.expires_in)?;
