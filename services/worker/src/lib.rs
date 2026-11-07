@@ -27,6 +27,8 @@ pub mod config;
 pub mod credentials;
 pub mod data_api;
 pub mod delete;
+pub mod fn_bundle_sweep;
+pub mod fn_schedules;
 #[cfg(test)]
 mod f2_coder_tests;
 #[cfg(test)]

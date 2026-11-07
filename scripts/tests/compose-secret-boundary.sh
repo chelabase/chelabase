@@ -147,6 +147,8 @@ worker	db/metadata.password	ro
 worker	storage-s3/access-key	ro
 worker	storage-s3/secret-key	ro
 worker	tokens/worker-functions.token	ro
+worker	functions-s3/access-key	ro
+worker	functions-s3/secret-key	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
@@ -288,9 +290,9 @@ leaks="$(jq -r '.services | to_entries[] | .key as $s
 # init-secrets, which makes the files, is the one name besides their readers: grpc-tls/ is
 # seaweedfs's; storage-s3/ (the `storage` identity) is seaweedfs's, the storage service's and the
 # worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
-# functions-s3/ (the `functions` identity, edge-functions m1) is seaweedfs's alone until the
-# functions service (m4) and the worker's bundle sweep (m7) mount it; never the runtime's.
-for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:functions seaweedfs "; do
+# functions-s3/ (the `functions` identity, edge-functions m1) is seaweedfs's, the functions
+# service's (m4) and the worker's (the bundle sweep, m7); never the runtime's.
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:functions seaweedfs worker "; do
   dir="${want%%:*}"
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
@@ -299,7 +301,7 @@ done
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
 [[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("functions-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
-[[ "$users" == "functions seaweedfs " ]] || err "workbench services mounting functions-s3/: got [$users], want [functions seaweedfs ]"
+[[ "$users" == "functions seaweedfs worker " ]] || err "workbench services mounting functions-s3/: got [$users], want [functions seaweedfs worker ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
   | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
   err "an admin S3 identity or key file is back"

@@ -223,7 +223,9 @@ expected_state_binds='[
   "seaweedfs:S/functions-s3/access-key->/run/chelabase/secrets/functions-s3/access-key",
   "seaweedfs:S/functions-s3/secret-key->/run/chelabase/secrets/functions-s3/secret-key",
   "functions:S/functions-s3/access-key->/run/chelabase/secrets/functions-s3/access-key",
-  "functions:S/functions-s3/secret-key->/run/chelabase/secrets/functions-s3/secret-key"
+  "functions:S/functions-s3/secret-key->/run/chelabase/secrets/functions-s3/secret-key",
+  "worker:S/functions-s3/access-key->/run/chelabase/secrets/functions-s3/access-key",
+  "worker:S/functions-s3/secret-key->/run/chelabase/secrets/functions-s3/secret-key"
 ]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink

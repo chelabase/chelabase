@@ -47,6 +47,8 @@ uuid = { workspace = true }
 # The storage sweep (object-storage m8): user blobs.
 chelabase-storage = { workspace = true }
 bytes = { workspace = true }
+# Edge functions m7: the scheduled runs' invoker port.
+async-trait = { workspace = true }
 
 [dev-dependencies]
 worker = { path = ".", features = ["test-support"] }

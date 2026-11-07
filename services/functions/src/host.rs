@@ -13,6 +13,9 @@ use crate::directory::Resolution;
 /// The runtime's request headers (`infra/functions-runtime/supervisor.js`).
 pub const BUNDLE_HEADER: &str = "x-chelabase-bundle";
 pub const ENV_HEADER: &str = "x-chelabase-env";
+/// Set on the worker's scheduled invocations only (m7): the runtime runs the bundle's
+/// `scheduled` handler with the body's `cron` and `scheduledTime`.
+pub const EVENT_HEADER: &str = "x-chelabase-event";
 /// Why the runtime refused (a bundle that can't start, a bad manifest): the `last_error`.
 pub const ERROR_HEADER: &str = "x-chelabase-error";
 

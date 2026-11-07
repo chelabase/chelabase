@@ -1093,6 +1093,11 @@ services:
       CHELABASE_STORAGE_SWEEP_GRACE_SECS: ${CHELABASE_STORAGE_SWEEP_GRACE_SECS:-}
       CHELABASE_STORAGE_SWEEP_SECS: ${CHELABASE_STORAGE_SWEEP_SECS:-}
       CHELABASE_STORAGE_SWEEP_DRY_RUN: ${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
+      # Edge functions m7: the bundle sweep reads and deletes unreferenced function bundles as
+      # the `functions` identity (bucket chelabase-functions only), over the settings above.
+      CHELABASE_FUNCTIONS_S3_BUCKET: chelabase-functions
+      CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/functions-s3/access-key
+      CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE: /run/chelabase/secrets/functions-s3/secret-key
       # object-storage m18: where it delivers storage webhooks (checked again on each delivery).
       # Blank: https to public addresses only.
       CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
@@ -1118,6 +1123,8 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/access-key, read_only: true, volume: {subpath: functions-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/secret-key, read_only: true, volume: {subpath: functions-s3/secret-key}}
       - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
     healthcheck:
       <<: *app-health

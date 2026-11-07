@@ -2466,6 +2466,9 @@
         }
       ],
       "environment": {
+        "CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/functions-s3/access-key",
+        "CHELABASE_FUNCTIONS_S3_BUCKET": "chelabase-functions",
+        "CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/functions-s3/secret-key",
         "CHELABASE_IDENTITY_TOKEN_FILE": "/m/.chelabase/tokens/worker-identity.token",
         "CHELABASE_IDENTITY_URL": "http://identity:8080",
         "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_worker",
@@ -2543,6 +2546,14 @@
         {
           "source": "s3-storage-secret-key",
           "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        },
+        {
+          "source": "s3-functions-access-key",
+          "target": "/run/chelabase/secrets/functions-s3/access-key"
+        },
+        {
+          "source": "s3-functions-secret-key",
+          "target": "/run/chelabase/secrets/functions-s3/secret-key"
         },
         {
           "source": "token-worker-identity",

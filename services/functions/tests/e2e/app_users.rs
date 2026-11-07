@@ -47,7 +47,7 @@ const NOTES: &str = r#"export default {
 };"#;
 
 /// The owner's SQL on a database (Studio's SQL editor route).
-trait Sql {
+pub(crate) trait Sql {
     async fn sql(&self, db: DatabaseId, sql: &str) -> Vec<Vec<Option<String>>>;
 }
 
@@ -83,7 +83,7 @@ impl Sql for Api {
 }
 
 /// Polls `f` once a second until it returns `Some`, for at most `secs`.
-async fn until<T, F: std::future::Future<Output = Option<T>>>(
+pub(crate) async fn until<T, F: std::future::Future<Output = Option<T>>>(
     secs: u64,
     what: &str,
     f: impl Fn() -> F,

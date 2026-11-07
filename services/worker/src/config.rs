@@ -539,6 +539,57 @@ pub fn metadata_config(
     Ok(chelabase_metadata::MetadataConfig { database_url })
 }
 
+/// Edge functions m7: what scheduled runs and the bundle sweep need.
+#[derive(Debug, Default)]
+pub struct FunctionsSettings {
+    /// `CHELABASE_FUNCTIONS_INTERNAL_URL` and the worker's bearer
+    /// (`CHELABASE_WORKER_FUNCTIONS_TOKEN[_FILE]`); `None` when either is unset (no scheduled
+    /// runs).
+    pub invoke: Option<(String, String)>,
+    /// The bundles bucket as the `functions` S3 identity: `CHELABASE_FUNCTIONS_S3_BUCKET` and
+    /// its own `CHELABASE_FUNCTIONS_S3_{ACCESS,SECRET}_KEY_FILE`, over the
+    /// `CHELABASE_STORAGE_*` backend, endpoint and region; `None` when the bucket is unset (no
+    /// bundle sweep).
+    pub bundles: Option<chelabase_storage::StorageConfig>,
+}
+
+pub const FUNCTIONS_BUCKET: &str = "CHELABASE_FUNCTIONS_S3_BUCKET";
+pub const FUNCTIONS_ACCESS_KEY_FILE: &str = "CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE";
+pub const FUNCTIONS_SECRET_KEY_FILE: &str = "CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE";
+
+pub fn functions_settings(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<FunctionsSettings> {
+    use chelabase_storage::config::{ENV_ACCESS_KEY_FILE, ENV_BUCKET, ENV_SECRET_KEY_FILE};
+    let token = chelabase_types::secret_env::lookup_secret(&get, "CHELABASE_WORKER_FUNCTIONS_TOKEN")
+        .map_err(anyhow::Error::msg)?;
+    let invoke = non_blank(&get, "CHELABASE_FUNCTIONS_INTERNAL_URL").zip(token);
+    let bundles = match non_blank(&get, FUNCTIONS_BUCKET) {
+        None => None,
+        Some(_) => {
+            let names = |k: &str| match k {
+                ENV_BUCKET => FUNCTIONS_BUCKET,
+                ENV_ACCESS_KEY_FILE => FUNCTIONS_ACCESS_KEY_FILE,
+                ENV_SECRET_KEY_FILE => FUNCTIONS_SECRET_KEY_FILE,
+                _ => "",
+            };
+            let config = chelabase_storage::StorageConfig::from_lookup(|k| match names(k) {
+                "" => get(k),
+                ours => get(ours),
+            })
+            .map_err(|e| {
+                // The storage crate names its own variables; say which ones the worker reads.
+                let message = e
+                    .to_string()
+                    .replace(ENV_ACCESS_KEY_FILE, FUNCTIONS_ACCESS_KEY_FILE)
+                    .replace(ENV_SECRET_KEY_FILE, FUNCTIONS_SECRET_KEY_FILE)
+                    .replace(ENV_BUCKET, FUNCTIONS_BUCKET);
+                anyhow!("the bundle sweep's store: {message}")
+            })?;
+            Some(config)
+        }
+    };
+    Ok(FunctionsSettings { invoke, bundles })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,5 +1193,64 @@ mod tests {
         let empty = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_MEMBER_LOGIN_CIDRS", "")])).unwrap();
         assert_eq!(empty.member_login_cidrs, Some(vec![]), "empty: no address rule");
         assert!(WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_MEMBER_LOGIN_CIDRS", "nope")])).is_err());
+    }
+
+    /// Edge functions m7: scheduled runs need the functions service's control URL and the
+    /// worker's bearer; the bundle sweep reads the bundles bucket with the `functions` identity's
+    /// own key files, never the storage identity's.
+    #[test]
+    fn functions_settings_use_their_own_identity() {
+        let none = functions_settings(lookup(&[])).unwrap();
+        assert!(none.invoke.is_none() && none.bundles.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let token = "w".repeat(40);
+        let (token_file, fa, fs, sa, ss) = (
+            file("token", &token),
+            file("fa", "fn-access"),
+            file("fs", "fn-secret"),
+            file("sa", "st-access"),
+            file("ss", "st-secret"),
+        );
+        let got = functions_settings(lookup(&[
+            ("CHELABASE_FUNCTIONS_INTERNAL_URL", "http://functions-control:8080/"),
+            ("CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE", &token_file),
+            ("CHELABASE_STORAGE_BACKEND", "seaweedfs"),
+            ("CHELABASE_STORAGE_S3_ENDPOINT", "http://seaweedfs:8333"),
+            ("CHELABASE_STORAGE_S3_BUCKET", "chelabase-storage"),
+            ("CHELABASE_STORAGE_S3_ACCESS_KEY_FILE", &sa),
+            ("CHELABASE_STORAGE_S3_SECRET_KEY_FILE", &ss),
+            ("CHELABASE_FUNCTIONS_S3_BUCKET", "chelabase-functions"),
+            ("CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE", &fa),
+            ("CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE", &fs),
+        ]))
+        .unwrap();
+        assert_eq!(
+            got.invoke,
+            Some(("http://functions-control:8080/".to_string(), token))
+        );
+        let store = got.bundles.unwrap();
+        assert_eq!(store.bucket, "chelabase-functions");
+        assert_eq!(store.endpoint.as_deref(), Some("http://seaweedfs:8333"));
+        assert_eq!(
+            store.credentials,
+            chelabase_storage::CredentialSource::KeyFiles {
+                access_key_file: fa.into(),
+                secret_key_file: fs.into(),
+            }
+        );
+        // The bucket without its own key files is an error, not the storage identity's keys.
+        let err = functions_settings(lookup(&[
+            ("CHELABASE_STORAGE_S3_ENDPOINT", "http://seaweedfs:8333"),
+            ("CHELABASE_STORAGE_S3_ACCESS_KEY_FILE", &sa),
+            ("CHELABASE_STORAGE_S3_SECRET_KEY_FILE", &ss),
+            ("CHELABASE_FUNCTIONS_S3_BUCKET", "chelabase-functions"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE"), "{err}");
     }
 }

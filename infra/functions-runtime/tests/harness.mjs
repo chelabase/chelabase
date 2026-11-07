@@ -136,8 +136,8 @@ export async function waitReady(rt, ms) {
 }
 
 // Invokes a bundle the way the functions service will: the bundle and env headers.
-export function invoke(rt, db, sha, { env, headers = {}, path = "/", timeout = 10_000 } = {}) {
+export function invoke(rt, db, sha, { env, headers = {}, path = "/", method = "GET", body, timeout = 10_000 } = {}) {
   const h = { "x-chelabase-bundle": `${db}/${sha}`, ...headers };
   if (env !== undefined) h["x-chelabase-env"] = Buffer.from(JSON.stringify(env)).toString("base64");
-  return fetch(new URL(path, rt.url), { headers: h, signal: AbortSignal.timeout(timeout) });
+  return fetch(new URL(path, rt.url), { method, headers: h, body, signal: AbortSignal.timeout(timeout) });
 }

@@ -46,6 +46,8 @@ const config :Workerd.Config = (
 const supervisor :Workerd.Worker = (
   modules = [(name = "supervisor.js", esModule = embed "supervisor.js")],
   compatibilityDate = "2026-10-01",
+  # Fetcher.scheduled() on a loaded worker's entrypoint (m7's scheduled runs).
+  compatibilityFlags = ["service_binding_extra_handlers"],
   globalOutbound = "none",
   bindings = [
     (name = "LOADER", workerLoader = ()),
