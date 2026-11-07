@@ -37,9 +37,12 @@
           "privileges": null,
           "columns": {
             "id": { "type": "uuid", "array": false, "nullable": false, "has_default": true, "generated": false },
-            "avatar": { "type": "object_ref", "array": false, "nullable": true, "has_default": false, "generated": false },
-            "banner": { "type": "object_ref", "array": false, "nullable": false, "has_default": false, "generated": false },
-            "gallery": { "type": "object_ref", "array": true, "nullable": true, "has_default": false, "generated": false }
+            "avatar": { "type": "object_ref", "array": false, "nullable": true, "has_default": false, "generated": false, "storage_ref": { "kind": "ref" } },
+            "banner": { "type": "object_ref", "array": false, "nullable": false, "has_default": false, "generated": false, "storage_ref": { "kind": "ref" } },
+            "gallery": { "type": "object_ref", "array": true, "nullable": true, "has_default": false, "generated": false, "storage_ref": { "kind": "ref" } },
+            "avatar_path": { "type": "text", "array": false, "nullable": true, "has_default": false, "generated": false, "storage_ref": { "kind": "path", "bucket": "avatars" } },
+            "photo_id": { "type": "uuid", "array": false, "nullable": true, "has_default": false, "generated": false, "storage_ref": { "kind": "id" } },
+            "lookalike": { "type": "object_ref", "array": false, "nullable": true, "has_default": false, "generated": false }
           }
         },
         "order_stats": {
