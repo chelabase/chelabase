@@ -431,8 +431,15 @@ async fn storage_saturated_limiter_waits_and_carries_instead_of_changed() {
         "bucket B's change reached bucket A's viewer"
     );
     drop(held);
-    // The next window checks what was carried: O1 (bucket A) arrives, O2 (bucket B) never.
+    // A later window joins the carry unchecked; the retry checks it all: O1 (bucket A) and O3
+    // arrive, O2 (bucket B) never.
     f.deliver(&window(&[O3], &[], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "only the retry sends carried keys"
+    );
+    f.filter.retry().await;
     assert_eq!(
         keys_by_op(&drain(&mut reader)),
         vec![(ChangeOp::Insert, ks(O1)), (ChangeOp::Insert, ks(O3))]
@@ -486,13 +493,14 @@ async fn storage_failed_check_carries_instead_of_changed() {
     f.checker.fail_checks(Some("authenticated"), None);
     f.checker.fail_probe(Some("authenticated"), true);
     f.deliver(&window(&[O3], &[], &[])).await;
+    f.filter.retry().await;
     assert_eq!(
         drain(&mut reader),
         vec![],
         "a failed probe sends nothing either"
     );
     f.checker.fail_probe(Some("authenticated"), false);
-    f.deliver(&window(&[], &[], &[])).await;
+    f.filter.retry().await;
     assert_eq!(
         keys_by_op(&drain(&mut reader)),
         vec![(ChangeOp::Insert, ks(O1)), (ChangeOp::Insert, ks(O3))]
@@ -519,7 +527,7 @@ async fn storage_carried_keys_are_bounded_newest_kept() {
         f.deliver(&window(&[k], &[], &[])).await;
     }
     drop(held);
-    f.deliver(&window(&[], &[], &[])).await;
+    f.filter.retry().await;
     let got = keys_by_op(&drain(&mut reader));
     // At most ten windows' worth of keys (10 × max_keys) wait; the oldest beyond that go.
     let want: Vec<(ChangeOp, String)> = refs[2..]
@@ -642,15 +650,82 @@ async fn storage_trimmed_move_out_lets_no_bucket_b_delete_through() {
         f.deliver(&window(&[k], &[], &[])).await;
     }
     drop(held);
-    f.deliver(&window(&[], &[], &[])).await;
+    f.filter.retry().await;
     drain(&mut reader);
     f.checker.delete_rows(REL, &[O1]);
     f.deliver(&window(&[], &[], &[O1])).await;
-    f.deliver(&window(&[], &[], &[])).await;
     assert_eq!(
         drain(&mut reader),
         vec![],
         "a delete in bucket B reached bucket A's viewer"
+    );
+}
+
+// --- carried keys retry on their own clock (#129's re-audit, S2) ------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn storage_carried_keys_retry_on_their_own_clock_never_on_another_window() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(limiter.clone(), FilterSettings::default());
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    let held = limiter.try_permit().unwrap();
+    f.deliver(&window(&[O1], &[], &[])).await;
+    assert_eq!(drain(&mut reader), vec![]);
+    let carried_at = Instant::now();
+    assert_eq!(
+        f.filter.retry_at(),
+        Some(carried_at + realtime::filter::RETRY_FIRST),
+        "a carry schedules its retry"
+    );
+    drop(held);
+    // Bucket B's window, slots free again: O1's frame doesn't go out with it, and the retry
+    // keeps its own time.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    f.deliver(&window(&[], &[O2], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a carried frame went out timed to bucket B's window"
+    );
+    assert_eq!(
+        f.filter.retry_at(),
+        Some(carried_at + realtime::filter::RETRY_FIRST)
+    );
+    // No further window: the retry alone brings O1.
+    tokio::time::sleep_until(f.filter.retry_at().unwrap()).await;
+    f.filter.retry().await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &[O1])])]
+    );
+    assert_eq!(f.filter.retry_at(), None, "nothing left to retry");
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_failed_retries_back_off_up_to_the_cap() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.checker.fail_checks(
+        Some("authenticated"),
+        Some(realtime::check::CheckError::Timeout),
+    );
+    f.deliver(&window(&[O1], &[], &[])).await;
+    let mut gaps = vec![];
+    for _ in 0..7 {
+        let at = f.filter.retry_at().unwrap();
+        gaps.push(at - Instant::now());
+        tokio::time::sleep_until(at).await;
+        f.filter.retry().await;
+    }
+    let ms: Vec<u128> = gaps.iter().map(Duration::as_millis).collect();
+    assert_eq!(ms, vec![250, 500, 1000, 2000, 4000, 5000, 5000]);
+    assert_eq!(drain(&mut reader), vec![]);
+    f.checker.fail_checks(Some("authenticated"), None);
+    tokio::time::sleep_until(f.filter.retry_at().unwrap()).await;
+    f.filter.retry().await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &[O1])])]
     );
 }
 
@@ -687,6 +762,10 @@ enum Step {
         bulk: bool,
         starved: bool,
     },
+    /// The carry's retry, when one is due (its time is the filter's; the model only orders it).
+    Retry {
+        starved: bool,
+    },
 }
 
 const OBJECTS: usize = 4;
@@ -700,6 +779,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Run),
         1 => Just(Step::Land),
         3 => (any::<bool>(), any::<bool>()).prop_map(|(bulk, starved)| Step::Deliver { bulk, starved }),
+        2 => any::<bool>().prop_map(|starved| Step::Retry { starved }),
     ]
 }
 
@@ -732,10 +812,12 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
         checker.clone(),
         limiter.clone(),
         VisibilityCache::new(Duration::from_millis(100)),
-        // One key per check and a carry of two keys: chunks, and a carry that overflows.
+        // One key per check, a carry of two keys and a view log of two: chunks, and a carry and
+        // a log that overflow.
         FilterSettings {
             max_keys: 1,
             carry_windows: 2,
+            view_log: 2,
             ..FilterSettings::default()
         },
     );
@@ -747,10 +829,11 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
     // Truth when the open window started.
     let mut before: Vec<Truth> = truth.clone();
     let mut touched: Vec<usize> = vec![];
-    // Since the last delivery the filter could check: touched objects, and whether a bulk
-    // window (keys lost) came. Some may have been trimmed from the carry instead of checked.
+    // Objects delivered since the last delivery or retry that checked everything carried (a
+    // bulk window's are lost, not carried); trimmed ones leave it (`trimmed!`).
     let mut unchecked: Vec<usize> = vec![];
-    let mut bulk_unchecked = false;
+    // What the viewer was shown when bulk windows (keys lost) came since: what they re-check.
+    let mut bulk_shown: HashSet<String> = HashSet::new();
     // Keys the viewer was told exist (an insert or update frame, or a view confirmed after
     // every checked window that could have changed it) and not told gone since.
     let mut shown: HashSet<String> = HashSet::new();
@@ -758,6 +841,93 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
     // follow until shown again.
     let mut gone: HashSet<String> = HashSet::new();
     let mut open: Option<OpenView> = None;
+
+    // Keys offered to the carry (`$offered`) that it no longer holds after a delivery or retry
+    // that checked nothing were trimmed: the filter forgot them then, unchecked.
+    macro_rules! trimmed {
+        ($offered:expr) => {{
+            let held = filter.carried_keys();
+            for k in $offered.iter().filter(|k| !held.contains(*k)) {
+                if shown.remove(k) {
+                    gone.insert(k.clone());
+                }
+                unchecked.retain(|&i| ks(&ids[i]) != *k);
+                bulk_shown.remove(k);
+            }
+        }};
+    }
+
+    // What a delivery or retry that checked everything carried sent: the oracle.
+    macro_rules! checked {
+        ($events:expr) => {{
+            let events = $events;
+            let visible = |k: &str| {
+                (0..OBJECTS).any(|i| ids[i] == k[2..k.len() - 2] && shown_to_role(truth[i]))
+            };
+            for e in &events {
+                let ChannelEvent::Rows(changes) = e else {
+                    return Err(TestCaseError::fail(format!("not rows: {e:?}")));
+                };
+                for c in changes {
+                    let Some(keys) = &c.keys else {
+                        return Err(TestCaseError::fail(format!("keyless: {c:?}")));
+                    };
+                    for k in keys {
+                        match c.op {
+                            ChangeOp::Insert | ChangeOp::Update => {
+                                prop_assert!(
+                                    visible(k),
+                                    "{:?} of {} the role can't list in bucket A",
+                                    c.op,
+                                    k
+                                );
+                                gone.remove(k);
+                                shown.insert(k.clone());
+                            }
+                            ChangeOp::Delete => {
+                                // A retry replays carried deletes in order: the object may
+                                // have been made again in a window not delivered yet.
+                                prop_assert!(
+                                    !visible(k) || touched.iter().any(|&i| ks(&ids[i]) == *k),
+                                    "a delete of {} it still sees",
+                                    k
+                                );
+                                prop_assert!(
+                                    shown.contains(k),
+                                    "a delete of {} it was never shown",
+                                    k
+                                );
+                                prop_assert!(
+                                    !gone.contains(k),
+                                    "a delete of {} checked gone before",
+                                    k
+                                );
+                                shown.remove(k);
+                            }
+                            other => return Err(TestCaseError::fail(format!("{other:?}"))),
+                        }
+                    }
+                }
+            }
+            // Everything carried so far was checked now, or trimmed from the carry: what the
+            // viewer was shown and no longer sees is gone (a bulk window re-checks everything
+            // it was shown then).
+            let mut checked: Vec<String> = unchecked.iter().map(|&i| ks(&ids[i])).collect();
+            checked.extend(bulk_shown.drain());
+            for k in &checked {
+                if shown.contains(k) && !visible(k) {
+                    shown.remove(k);
+                    gone.insert(k.clone());
+                }
+            }
+            // An open view's answer no longer speaks for what these windows changed.
+            if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
+                o.stale.extend(unchecked.iter().map(|&i| ks(&ids[i])));
+            }
+            unchecked.clear();
+            prop_assert_eq!(filter.retry_at(), None, "everything was checked");
+        }};
+    }
 
     for step in steps {
         match step {
@@ -853,13 +1023,45 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                         }
                     }
                 }
-                unchecked.append(&mut touched);
-                bulk_unchecked |= bulk;
+                // A bulk window's keys are lost: it re-checks what the viewer was shown.
+                if bulk {
+                    touched.clear();
+                    bulk_shown.extend(shown.iter().cloned());
+                    // Nor does an open view's answer speak for anything any more.
+                    if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
+                        o.all = true;
+                    }
+                } else {
+                    unchecked.append(&mut touched);
+                }
                 before = truth.clone();
+                // A carry waits for its retry: the window joins it unchecked.
+                let waiting = filter.retry_at();
+                let mut offered = filter.carried_keys();
+                offered.extend(
+                    w.inserts
+                        .iter()
+                        .chain(&w.updates)
+                        .chain(&w.deletes)
+                        .map(|t| ks(&t[0])),
+                );
+                offered.extend(bulk_shown.iter().cloned());
                 let held = starved.then(|| limiter.try_permit().unwrap());
                 filter.deliver(&w, &[10], Instant::now()).await;
                 drop(held);
                 let events = drain(&mut rx);
+                if waiting.is_some() || starved {
+                    trimmed!(offered);
+                }
+                if waiting.is_some() {
+                    prop_assert_eq!(events, vec![], "a window sent carried frames");
+                    prop_assert_eq!(
+                        filter.retry_at(),
+                        waiting,
+                        "a window moved the carry's retry"
+                    );
+                    continue;
+                }
                 if starved {
                     prop_assert_eq!(
                         events,
@@ -868,69 +1070,25 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                     );
                     continue;
                 }
-                let visible = |k: &str| {
-                    (0..OBJECTS).any(|i| ids[i] == k[2..k.len() - 2] && shown_to_role(truth[i]))
+                checked!(events);
+            }
+            Step::Retry { starved } => {
+                let Some(at) = filter.retry_at() else {
+                    continue;
                 };
-                for e in &events {
-                    let ChannelEvent::Rows(changes) = e else {
-                        return Err(TestCaseError::fail(format!("not rows: {e:?}")));
-                    };
-                    for c in changes {
-                        let Some(keys) = &c.keys else {
-                            return Err(TestCaseError::fail(format!("keyless: {c:?}")));
-                        };
-                        for k in keys {
-                            match c.op {
-                                ChangeOp::Insert | ChangeOp::Update => {
-                                    prop_assert!(
-                                        visible(k),
-                                        "{:?} of {} the role can't list in bucket A",
-                                        c.op,
-                                        k
-                                    );
-                                    gone.remove(k);
-                                    shown.insert(k.clone());
-                                }
-                                ChangeOp::Delete => {
-                                    prop_assert!(!visible(k), "a delete of {} it still sees", k);
-                                    prop_assert!(
-                                        shown.contains(k),
-                                        "a delete of {} it was never shown",
-                                        k
-                                    );
-                                    prop_assert!(
-                                        !gone.contains(k),
-                                        "a delete of {} checked gone before",
-                                        k
-                                    );
-                                    shown.remove(k);
-                                }
-                                other => return Err(TestCaseError::fail(format!("{other:?}"))),
-                            }
-                        }
-                    }
+                tokio::time::sleep_until(at).await;
+                let offered = filter.carried_keys();
+                let held = starved.then(|| limiter.try_permit().unwrap());
+                filter.retry().await;
+                drop(held);
+                let events = drain(&mut rx);
+                if starved {
+                    trimmed!(offered);
+                    prop_assert_eq!(events, vec![], "a starved retry sends nothing");
+                    prop_assert!(filter.retry_at().is_some_and(|next| next > at));
+                    continue;
                 }
-                // Everything carried so far was checked now, or trimmed from the carry: what the
-                // viewer was shown and no longer sees is gone (a bulk window re-checks everything
-                // it was shown).
-                let checked: Vec<String> = if bulk_unchecked {
-                    shown.iter().cloned().collect()
-                } else {
-                    unchecked.iter().map(|&i| ks(&ids[i])).collect()
-                };
-                for k in &checked {
-                    if shown.contains(k) && !visible(k) {
-                        shown.remove(k);
-                        gone.insert(k.clone());
-                    }
-                }
-                // An open view's answer no longer speaks for what these windows changed.
-                if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
-                    o.all |= bulk_unchecked;
-                    o.stale.extend(unchecked.iter().map(|&i| ks(&ids[i])));
-                }
-                unchecked.clear();
-                bulk_unchecked = false;
+                checked!(events);
             }
         }
     }
