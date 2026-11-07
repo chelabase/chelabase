@@ -46,7 +46,7 @@ pub use storage_webhooks::{
 pub use ddl::DdlTx;
 pub use functions::{
     BranchFunction, DeploymentRecord, FunctionAuth, FunctionKind, FunctionRecord, MAX_BUNDLE_SIZE,
-    MAX_SECRET_BYTES, NewDeployment, NewSchedule, NewTrigger, ResolvedFunction, ScheduleRecord,
+    MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment, NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleRecord,
     TriggerRecord, TriggerSource, TriggerState, valid_function_name, valid_secret_name,
 };
 pub use merges::{
@@ -226,6 +226,15 @@ pub enum MetadataError {
     /// A sealed value didn't open (wrong key, or a value made for another row).
     #[error("secret error: {0}")]
     Secret(String),
+    /// The function is active on a live protected branch: deleting it or changing its kind
+    /// would change that branch, which takes the branch's own (Admin) route. Nothing was
+    /// written.
+    #[error("the function is active on a protected branch")]
+    FunctionActiveOnProtectedBranch,
+    /// The data key is a function's run-as key: only its function revokes or replaces it.
+    /// Nothing was written.
+    #[error("the key is managed by a function")]
+    ManagedKey,
 }
 
 impl MetadataError {
@@ -467,7 +476,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261107000002).
+        // this file when adding one (last: 20261107000003).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,

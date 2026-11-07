@@ -12,10 +12,11 @@ mod functions {
     use std::borrow::Cow;
 
     use chelabase_metadata::{
-        CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionKind, MAX_BUNDLE_SIZE,
-        MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDeployment, NewSchedule,
-        NewTrigger, TriggerSource, TriggerState,
+        CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
+        MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
+        NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerSource, TriggerState,
     };
+    use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_secrets::SecretKey;
     use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
     use chrono::{NaiveDate, Utc};
@@ -235,6 +236,45 @@ mod functions {
             id
         }
 
+        /// A function with a deployment active (and enabled) on `branch`.
+        async fn active(&self, db: DatabaseId, branch: BranchId, name: &str) -> Uuid {
+            let f = self.function(db, name).await;
+            let d = self.deployment(f, &sha('b')).await;
+            self.client.set_active_deployment(branch, f, d).await.unwrap();
+            assert!(self.client.set_enabled(branch, f, true).await.unwrap());
+            f
+        }
+
+        /// The live keys `function` manages: `(id, role, role_oid, sealed)`.
+        async fn managed_keys(&self, function: Uuid) -> Vec<(Uuid, String, Option<i64>, Option<String>)> {
+            sqlx::query_as(
+                "SELECT id, role, role_oid, sealed FROM data_api_keys
+                 WHERE managed_by_function_id = $1 AND revoked_at IS NULL ORDER BY created_at",
+            )
+            .bind(function)
+            .fetch_all(self.pool())
+            .await
+            .unwrap()
+        }
+
+        /// `(revoked, sealed is null)` of a key.
+        async fn key_state(&self, key: Uuid) -> (bool, bool) {
+            sqlx::query_as(
+                "SELECT revoked_at IS NOT NULL, sealed IS NULL FROM data_api_keys WHERE id = $1",
+            )
+            .bind(key)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+        }
+
+        /// `(run_as_role, run_as_key_id)` of the function on the branch.
+        async fn run_as_columns(&self, branch: BranchId, f: Uuid) -> (Option<String>, Option<Uuid>) {
+            let listed = self.client.list_for_branch(branch).await.unwrap();
+            let row = listed.iter().find(|r| r.function_id == f).expect("branch state");
+            (row.run_as_role.clone(), row.run_as_key_id)
+        }
+
         /// Rows in each per-branch function table for `branch`.
         async fn branch_rows(&self, branch: BranchId) -> [i64; 4] {
             let mut out = [0; 4];
@@ -292,6 +332,21 @@ mod functions {
             bucket: Some("avatars"),
             prefix: Some("in/"),
             events,
+        }
+    }
+
+    /// A run-as role with a freshly generated key; the plaintext is the key itself.
+    fn run_as(role: &str, oid: i64) -> RunAs {
+        let generated = data_key::generate(DataKeyKind::Secret);
+        RunAs {
+            role: role.to_string(),
+            role_oid: oid,
+            role_timeline: Some("tl-1".into()),
+            role_bypass_rls: false,
+            key_id: Uuid::new_v4(),
+            prefix: generated.prefix,
+            sha256: generated.sha256,
+            secret: generated.key,
         }
     }
 
@@ -1006,9 +1061,10 @@ mod functions {
             .execute(s.pool())
             .await
             .unwrap();
+        let err = s.client.revoke_data_key(main, key).await.unwrap_err();
         assert!(
-            !s.client.revoke_data_key(main, key).await.unwrap(),
-            "a managed key isn't revoked directly"
+            matches!(err, MetadataError::ManagedKey),
+            "a managed key isn't revoked directly: {err:?}"
         );
         // Deleting the function revokes its keys.
         assert!(s.client.delete_function(db, f).await.unwrap());
@@ -1055,6 +1111,365 @@ mod functions {
                 .await
                 .unwrap();
         assert_eq!(managed, None);
+        s.finish().await;
+    }
+
+    /// m3a: the auth mode is per branch; a branch without the function's state changes nothing.
+    #[tokio::test]
+    #[ignore]
+    async fn auth_set_per_branch() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let child = s.branch(db, main, "dev").await;
+        let bare = s.branch(db, main, "bare").await;
+        let other = s.function(db, "other").await;
+        let c = &s.client;
+        assert!(c.set_function_auth(child, f, FunctionAuth::Public).await.unwrap());
+        assert_eq!(c.list_for_branch(child).await.unwrap()[0].auth, FunctionAuth::Public);
+        assert_eq!(c.list_for_branch(main).await.unwrap()[0].auth, FunctionAuth::Key);
+        assert!(!c.set_function_auth(main, other, FunctionAuth::AppUser).await.unwrap());
+        let _ = bare;
+        // Another database's branch: not found, nothing written.
+        let (_, other_main) = s.database().await;
+        let err = c.set_function_auth(other_main, f, FunctionAuth::Public).await.unwrap_err();
+        assert!(matches!(err, MetadataError::FunctionNotFound), "{err:?}");
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_creates_sealed_managed_key() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+
+        let keys = s.managed_keys(f).await;
+        assert_eq!(keys.len(), 1);
+        let (id, role, oid, sealed) = &keys[0];
+        assert_eq!((*id, role.as_str(), *oid), (ra.key_id, "reporter", Some(4242)));
+        assert!(sealed.as_deref().is_some_and(|v| !v.contains(&ra.secret)), "sealed, not plain");
+        assert_eq!(s.run_as_columns(main, f).await, (Some("reporter".into()), Some(ra.key_id)));
+        assert_eq!(
+            c.managed_run_as_key(main, f).await.unwrap(),
+            Some((ra.key_id, ra.secret.clone()))
+        );
+        // The key works as any secret key, and the listing names its function.
+        let looked_up = c.lookup_data_key(&ra.sha256).await.unwrap().expect("live key");
+        assert_eq!(looked_up.role, "reporter");
+        let listed = c.list_data_keys(main).await.unwrap();
+        let managed = listed.iter().find(|k| k.id == ra.key_id).unwrap();
+        assert_eq!(managed.kind, DataKeyKind::Secret);
+        assert_eq!(managed.managed_by_function, Some((f, "hello".to_string())));
+        assert!(listed.iter().filter(|k| k.id != ra.key_id).all(|k| k.managed_by_function.is_none()));
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_replace_revokes_old() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let first = run_as("reporter", 4242);
+        let second = run_as("writer", 5151);
+        assert!(c.set_run_as(main, f, Some(&first)).await.unwrap());
+        assert!(c.set_run_as(main, f, Some(&second)).await.unwrap());
+        assert_eq!(s.key_state(first.key_id).await, (true, true), "revoked, sealed value gone");
+        let keys = s.managed_keys(f).await;
+        assert_eq!(keys.iter().map(|k| k.0).collect::<Vec<_>>(), vec![second.key_id]);
+        assert_eq!(s.run_as_columns(main, f).await, (Some("writer".into()), Some(second.key_id)));
+        assert_eq!(
+            c.managed_run_as_key(main, f).await.unwrap(),
+            Some((second.key_id, second.secret.clone()))
+        );
+        assert!(c.lookup_data_key(&first.sha256).await.unwrap().is_none());
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_clear() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        assert!(c.set_run_as(main, f, None).await.unwrap());
+        assert_eq!(s.key_state(ra.key_id).await, (true, true));
+        assert!(s.managed_keys(f).await.is_empty());
+        assert_eq!(s.run_as_columns(main, f).await, (None, None));
+        assert_eq!(c.managed_run_as_key(main, f).await.unwrap(), None);
+        // A function without state on the branch: false, and no key is minted.
+        let other = s.function(db, "other").await;
+        assert!(!c.set_run_as(main, other, Some(&run_as("reporter", 4242))).await.unwrap());
+        assert!(s.managed_keys(other).await.is_empty());
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn delete_and_kind_refused_on_protected_branch() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let child = s.branch(db, main, "dev").await;
+        let c = &s.client;
+        c.protect_branch(main, "h", &[]).await.unwrap().expect("protected");
+
+        let err = c.delete_function_unprotected(db, f).await.unwrap_err();
+        assert!(matches!(err, MetadataError::FunctionActiveOnProtectedBranch), "{err:?}");
+        let err = c.set_function_kind(db, f, FunctionKind::Service).await.unwrap_err();
+        assert!(matches!(err, MetadataError::FunctionActiveOnProtectedBranch), "{err:?}");
+        let listed = c.list_functions(db).await.unwrap();
+        assert_eq!((listed.len(), listed[0].kind), (1, FunctionKind::Function), "nothing changed");
+        assert_eq!(s.branch_rows(main).await[0], 1);
+        assert_eq!(s.branch_rows(child).await[0], 1);
+
+        // Unprotected: a function with deployments keeps its kind (its bundles are a function's).
+        c.set_branch_protected(main, false).await.unwrap();
+        let err = c.set_function_kind(db, f, FunctionKind::Service).await.unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
+        assert!(c.delete_function_unprotected(db, f).await.unwrap());
+        assert!(c.list_functions(db).await.unwrap().is_empty());
+        assert!(!c.delete_function_unprotected(db, f).await.unwrap(), "already gone");
+
+        // No deployment yet: the kind changes; the same kind is a no-op.
+        let g = s.function(db, "svc").await;
+        assert!(c.set_function_kind(db, g, FunctionKind::Service).await.unwrap());
+        assert!(c.set_function_kind(db, g, FunctionKind::Service).await.unwrap());
+        assert_eq!(c.list_functions(db).await.unwrap()[0].kind, FunctionKind::Service);
+        // Another database's function: false.
+        let (other, _) = s.database().await;
+        assert!(!c.set_function_kind(other, g, FunctionKind::Function).await.unwrap());
+        assert!(!c.delete_function_unprotected(other, g).await.unwrap());
+        s.finish().await;
+    }
+
+    /// m3a: protecting main while a delete of a function active there is in flight. Either
+    /// the protect waits for the delete (which saw main unprotected), or the delete waits for
+    /// the protect and is refused: never a deleted function with main protected unseen.
+    #[tokio::test]
+    #[ignore]
+    async fn protect_races_delete_function() {
+        // 1. The delete first: it holds main's row, the protect waits for it.
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let mut hold = s.pool().begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM functions WHERE id = $1 FOR UPDATE")
+            .bind(f)
+            .execute(&mut *hold)
+            .await
+            .unwrap();
+        let client = s.client.clone();
+        let delete = tokio::spawn(async move { client.delete_function_unprotected(db, f).await });
+        lock_waiters(&s, 1).await;
+        let client = s.client.clone();
+        let protect = tokio::spawn(async move { client.protect_branch(main, "h", &[]).await });
+        lock_waiters(&s, 2).await;
+        hold.commit().await.unwrap();
+        assert!(delete.await.unwrap().unwrap());
+        assert!(protect.await.unwrap().unwrap().expect("main").protected);
+        assert!(s.client.list_functions(db).await.unwrap().is_empty());
+        s.finish().await;
+
+        // 2. The protect first (uncommitted): the delete waits for it, then is refused.
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let mut protecting = s.pool().begin().await.unwrap();
+        sqlx::query("UPDATE branches SET protected = true WHERE id = $1")
+            .bind(main.as_uuid())
+            .execute(&mut *protecting)
+            .await
+            .unwrap();
+        let client = s.client.clone();
+        let delete = tokio::spawn(async move { client.delete_function_unprotected(db, f).await });
+        lock_waiters(&s, 1).await;
+        protecting.commit().await.unwrap();
+        let err = delete.await.unwrap().unwrap_err();
+        assert!(matches!(err, MetadataError::FunctionActiveOnProtectedBranch), "{err:?}");
+        assert_eq!(s.client.list_functions(db).await.unwrap().len(), 1);
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn managed_key_revoke_rotate_refused() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        let before = s.managed_keys(f).await;
+
+        let err = c.revoke_data_key(main, ra.key_id).await.unwrap_err();
+        assert!(matches!(err, MetadataError::ManagedKey), "{err:?}");
+        let generated = data_key::generate(DataKeyKind::Secret);
+        let replacement = NewDataKey {
+            id: Uuid::new_v4(),
+            branch_id: main,
+            kind: DataKeyKind::Secret,
+            role: "reporter".into(),
+            name: "hello".into(),
+            prefix: generated.prefix,
+            sha256: generated.sha256,
+            sealed: None,
+            databases: None,
+            role_oid: Some(4242),
+            role_timeline: Some("tl-1".into()),
+            role_bypass_rls: false,
+        };
+        let err = c.rotate_secret_key(main, ra.key_id, &replacement).await.unwrap_err();
+        assert!(matches!(err, MetadataError::ManagedKey), "{err:?}");
+        let err = c.rotate_data_key(main, ra.key_id, &replacement).await.unwrap_err();
+        assert!(matches!(err, MetadataError::ManagedKey), "{err:?}");
+        assert_eq!(s.managed_keys(f).await, before, "the key is untouched");
+        assert!(c.list_data_keys(main).await.unwrap().iter().all(|k| k.id != replacement.id));
+        // An unknown key is still plain false.
+        assert!(!c.revoke_data_key(main, Uuid::new_v4()).await.unwrap());
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn managed_key_aad_bound() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f1 = s.active(db, main, "one").await;
+        let f2 = s.active(db, main, "two").await;
+        let c = &s.client;
+        let (k1, k2) = (run_as("reporter", 4242), run_as("reporter", 4242));
+        assert!(c.set_run_as(main, f1, Some(&k1)).await.unwrap());
+        assert!(c.set_run_as(main, f2, Some(&k2)).await.unwrap());
+
+        // Another function's key named as this one's run-as key: not this function's.
+        sqlx::query("UPDATE branch_functions SET run_as_key_id = $3 WHERE branch_id = $1 AND function_id = $2")
+            .bind(main.as_uuid())
+            .bind(f1)
+            .bind(k2.key_id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(c.managed_run_as_key(main, f1).await.unwrap(), None);
+        sqlx::query("UPDATE branch_functions SET run_as_key_id = $3 WHERE branch_id = $1 AND function_id = $2")
+            .bind(main.as_uuid())
+            .bind(f1)
+            .bind(k1.key_id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+
+        // k2's sealed value copied onto k1's row: sealed for k2's id, it doesn't open as k1.
+        sqlx::query(
+            "UPDATE data_api_keys SET sealed = (SELECT sealed FROM data_api_keys WHERE id = $2)
+             WHERE id = $1",
+        )
+        .bind(k1.key_id)
+        .bind(k2.key_id)
+        .execute(s.pool())
+        .await
+        .unwrap();
+        let err = c.managed_run_as_key(main, f1).await.unwrap_err();
+        assert!(matches!(err, MetadataError::Secret(_)), "{err:?}");
+        assert_eq!(c.managed_run_as_key(main, f2).await.unwrap(), Some((k2.key_id, k2.secret.clone())));
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn managed_key_none_on_tombstone() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let child = s.branch(db, main, "dev").await;
+        let c = &s.client;
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(child, f, Some(&ra)).await.unwrap());
+        assert!(c.managed_run_as_key(child, f).await.unwrap().is_some());
+        // A tombstone that hasn't purged yet (rows left by hand) already hides the key.
+        sqlx::query("UPDATE branches SET status = 'deleting' WHERE id = $1")
+            .bind(child.as_uuid())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(c.managed_run_as_key(child, f).await.unwrap(), None);
+        sqlx::query("UPDATE branches SET status = 'ready' WHERE id = $1")
+            .bind(child.as_uuid())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        c.mark_branch_deleted(child).await.unwrap();
+        assert_eq!(c.managed_run_as_key(child, f).await.unwrap(), None);
+        // A deleting database hides it too.
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        sqlx::query("UPDATE databases SET status = 'deleting' WHERE id = $1")
+            .bind(db.as_uuid())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(c.managed_run_as_key(main, f).await.unwrap(), None);
+        s.finish().await;
+    }
+
+    /// The managed-key migration keeps the old rule for every other key: a public key is
+    /// sealed, an unmanaged secret key never is.
+    #[tokio::test]
+    #[ignore]
+    async fn only_managed_secret_keys_are_sealed() {
+        let s = Scratch::new().await;
+        let (_, main) = s.database().await;
+        let key = s.data_key(main).await;
+        let err = sqlx::query("UPDATE data_api_keys SET sealed = 'x' WHERE id = $1")
+            .bind(key)
+            .execute(s.pool())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("data_api_keys_sealed"), "{err}");
+        s.finish().await;
+    }
+
+    /// m3a for m4: the functions service records a function's last error (at most 1,024
+    /// characters) on a live branch; a tombstoned branch keeps what it had.
+    #[tokio::test]
+    #[ignore]
+    async fn last_error_capped_on_live_branch() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let last = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT last_error FROM branch_functions WHERE branch_id = $1 AND function_id = $2",
+            )
+            .bind(main.as_uuid())
+            .bind(f)
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+        };
+        c.set_function_last_error(main, f, Some("boom")).await.unwrap();
+        assert_eq!(last().await.as_deref(), Some("boom"));
+        let long: String = std::iter::repeat_n('é', 2000).collect();
+        c.set_function_last_error(main, f, Some(&long)).await.unwrap();
+        assert_eq!(last().await.map(|e| e.chars().count()), Some(1024));
+        c.set_function_last_error(main, f, None).await.unwrap();
+        assert_eq!(last().await, None);
+        sqlx::query("UPDATE branches SET status = 'deleting' WHERE id = $1")
+            .bind(main.as_uuid())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        c.set_function_last_error(main, f, Some("late")).await.unwrap();
+        assert_eq!(last().await, None, "a deleting branch isn't written");
         s.finish().await;
     }
 }
