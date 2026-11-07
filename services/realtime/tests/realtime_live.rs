@@ -774,7 +774,7 @@ async fn join_live(ws: &mut Socket, r: &str, join: Value, within: Duration) -> S
 }
 
 /// The keys of each op in every `rows` frame of `channel` for `within`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Got {
     inserts: std::collections::BTreeSet<String>,
     updates: std::collections::BTreeSet<String>,
@@ -1761,19 +1761,40 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
         join_live(&mut bob, "1", storage_join("1", &fx, media, Some("authenticated")), Duration::from_secs(60)).await;
         join_live(&mut admin, "1", storage_join("1", &fx, media, None), Duration::from_secs(60)).await;
 
-        // AC 1: an upload as `authenticated` reaches both members and owner mode.
-        let started = Instant::now();
-        let shown = storage_upload(&fx, &ana_token, "media", "notes/a.txt", Some("authenticated")).await;
-        let want = keys(&[&shown.to_string()]);
-        let (a, b, o) = tokio::join!(
-            collect_rows(&mut ana, &ch, Duration::from_secs(3)),
-            collect_rows(&mut bob, &ch, Duration::from_secs(3)),
-            collect_rows(&mut admin, &ch, Duration::from_secs(3)),
+        // AC 1: an upload as `authenticated` reaches both members and owner mode within the
+        // 2 s promise of the upload's answer (500 ms of margin for the sockets).
+        let upload = async {
+            let r = storage_call(&fx, &ana_token, reqwest::Method::POST, "object/media/notes/a.txt", Some("authenticated"), b"hello".to_vec(), false).await;
+            (r, Instant::now())
+        };
+        let (((status, body), uploaded), (a_at, a), (b_at, b), (o_at, o)) = tokio::join!(
+            upload,
+            first_rows(&mut ana, &ch, Duration::from_secs(20)),
+            first_rows(&mut bob, &ch, Duration::from_secs(20)),
+            first_rows(&mut admin, &ch, Duration::from_secs(20)),
         );
-        assert_eq!(a.inserts, want, "{a:?}");
-        assert_eq!(b.inserts, want, "{b:?}");
-        assert_eq!(o.inserts, want, "{o:?}");
-        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(status == 200 || status == 201, "upload: {status} {body}");
+        let shown: Uuid = fx
+            .psql(&fx.pg_database, "SELECT o.id FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = 'media' AND o.name = 'notes/a.txt'")
+            .await
+            .trim()
+            .parse()
+            .expect("the object's id");
+        let want = keys(&[&shown.to_string()]);
+        for (who, at, frame) in [("ana", a_at, &a), ("bob", b_at, &b), ("owner", o_at, &o)] {
+            assert_eq!(frame["changes"], json!([{"op": "insert", "keys": want}]), "{who}: {frame}");
+            let after = at.saturating_duration_since(uploaded);
+            assert!(after <= Duration::from_millis(2500), "{who}: the insert came {after:?} after the upload");
+        }
+        // Nothing else follows (and the joins' presence frames are read past).
+        let (a, b, o) = tokio::join!(
+            collect_rows(&mut ana, &ch, Duration::from_secs(2)),
+            collect_rows(&mut bob, &ch, Duration::from_secs(2)),
+            collect_rows(&mut admin, &ch, Duration::from_secs(2)),
+        );
+        for got in [&a, &b, &o] {
+            assert_eq!(got, &Got::default(), "{got:?}");
+        }
 
         // AC 2: an object `authenticated` can't read reaches owner mode only; the others get
         // no frame of any kind.
@@ -1795,12 +1816,44 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
         );
         assert!(a.is_empty(), "{a:?}");
         assert!(o.is_empty(), "{o:?}");
+
+        // #129 S1: Studio sends each folder row's one object as a view key (`notes/` holds only
+        // a.txt, bob's screen shows the root), so deleting a folder's last object reaches the
+        // viewer as a key.
+        send(&mut bob, json!({"type": "view", "channel": ch, "keys": want})).await;
+        // The view frame is checked before the delete commits.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (status, body) = storage_call(&fx, &fx.token, reqwest::Method::DELETE, "object/media/notes/a.txt", None, vec![], false).await;
+        assert!(status == 200 || status == 204, "delete: {status} {body}");
+        let b = collect_rows(&mut bob, &ch, Duration::from_secs(3)).await;
+        assert_eq!(b.deletes, want, "{b:?}");
+        assert_eq!((b.changed, b.keyless_deletes), (0, 0), "{b:?}");
         live.rt.shutdown();
         for id in [ana_id, bob_id] {
             let _ = api(&fx.token, reqwest::Method::DELETE, &format!("/v1/members/{id}"), None).await;
         }
     })
     .await;
+}
+
+/// The first `rows` frame of `channel` and when it was read; panics after `within`.
+async fn first_rows(ws: &mut Socket, channel: &str, within: Duration) -> (Instant, Value) {
+    let deadline = Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, ws.next()).await {
+            Err(_) => panic!("no rows on {channel} within {within:?}"),
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                if v["type"] == "rows" && v["channel"] == channel {
+                    return (Instant::now(), v);
+                }
+            }
+            Ok(Some(Ok(Message::Close(f)))) => panic!("closed: {f:?}"),
+            Ok(Some(Ok(_))) => continue,
+            Ok(other) => panic!("socket ended: {other:?}"),
+        }
+    }
 }
 
 /// Every frame of `channel` within `within`.
