@@ -18,7 +18,8 @@
 //
 // A loaded worker is cached by the loader under `{database_id}/{sha256}:{sha256(env header)}`,
 // so two deployments sharing a bundle never share an env. User workers get only their own env,
-// the `egress` service as their global outbound (public addresses only), and the request
+// `env.CHELABASE` (the gateway binding, below), the `egress` service as their global outbound
+// (public addresses only), and the request
 // without any x-chelabase-* header; their response loses any x-chelabase-* header too, so
 // `x-chelabase-error` only ever comes from the supervisor.
 const BUNDLE_HEADER = "x-chelabase-bundle";
@@ -79,7 +80,7 @@ function badManifest(why) {
 }
 
 // Fetches and checks a bundle; returns the loader's WorkerCode.
-async function loadCode(bindings, db, sha, env) {
+async function loadCode(bindings, db, sha, env, gatewayBinding) {
   const res = await bindings.BUNDLES.fetch(`http://functions/internal/bundles/${db}/${sha}`);
   if (res.status !== 200) {
     await res.body?.cancel();
@@ -132,7 +133,7 @@ async function loadCode(bindings, db, sha, env) {
     compatibilityFlags: flags,
     mainModule: m.mainModule,
     modules,
-    env,
+    env: { ...env, CHELABASE: gatewayBinding },
     globalOutbound: bindings.EGRESS,
   };
 }
@@ -162,7 +163,7 @@ const PROBE_CODE = {
 };
 
 export default {
-  async fetch(request, bindings) {
+  async fetch(request, bindings, ctx) {
     try {
       const match = BUNDLE_RE.exec(request.headers.get(BUNDLE_HEADER) ?? "");
       if (!match) throw new Refused(400, "x-chelabase-bundle must be {database_id}/{sha256}");
@@ -172,9 +173,9 @@ export default {
       const id = `${db}/${sha}:${await sha256(new TextEncoder().encode(envHeader))}`;
       let worker;
       if (verified.has(id)) {
-        worker = bindings.LOADER.get(id, () => loadCode(bindings, db, sha, env));
+        worker = bindings.LOADER.get(id, () => loadCode(bindings, db, sha, env, gateway(ctx)));
       } else {
-        const code = await loadCode(bindings, db, sha, env);
+        const code = await loadCode(bindings, db, sha, env, gateway(ctx));
         worker = bindings.LOADER.get(id, async () => code);
         remember(id);
       }
@@ -211,5 +212,38 @@ export const probe = {
   async fetch(_request, bindings) {
     const worker = bindings.LOADER.get("__probe", async () => PROBE_CODE);
     return worker.getEntrypoint().fetch("http://probe/");
+  },
+};
+
+// The binding a loaded worker gets as `env.CHELABASE`: this isolate's `chelabaseApi` entrypoint,
+// as a stub the loader can hand over (a bare loopback stub isn't serialisable).
+const gateway = (ctx) => ctx.exports.chelabaseApi({ props: {} });
+
+// The gateway binding (#183): what a loaded worker calls as `env.CHELABASE`. Its request goes to
+// the gateway (GATEWAY, on the `functions` network) on the API host and nowhere else: the path
+// and query are the caller's, the host is always CHELABASE_API_HOST (a Host header or another
+// host in the URL is ignored), and redirects come back to the caller. It adds nothing: the
+// gateway sees only the caller's own headers (less any x-chelabase-* one) and authenticates
+// them like any API request.
+export const chelabaseApi = {
+  async fetch(request, bindings) {
+    const host = bindings.API_HOST;
+    if (typeof host !== "string" || host === "") {
+      return new Response("the gateway binding has no API host\n", { status: 503 });
+    }
+    const url = new URL(request.url);
+    const headers = new Headers();
+    for (const [k, v] of request.headers) {
+      const name = k.toLowerCase();
+      if (name !== "host" && !name.startsWith(PRIVATE_PREFIX)) headers.append(k, v);
+    }
+    return bindings.GATEWAY.fetch(
+      new Request(`http://${host}${url.pathname}${url.search}`, {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: "manual",
+      }),
+    );
   },
 };

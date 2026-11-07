@@ -33,6 +33,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod app_users;
+
 /// How soon a change must apply (NATS drops the cached resolution).
 const WITHIN: Duration = Duration::from_secs(2);
 
@@ -41,6 +43,10 @@ fn env(name: &str) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| panic!("{name} is unset (run through `just functions-e2e`)"))
+}
+
+fn secrets_key() -> SecretKey {
+    SecretKey::from_env().expect("CHELABASE_SECRETS_KEY")
 }
 
 struct Stack {
@@ -55,14 +61,20 @@ struct Stack {
     key: String,
 }
 
+async fn metadata() -> MetadataClient {
+    MetadataClient::connect(&MetadataConfig {
+        database_url: env("CHELABASE_METADATA_DATABASE_URL"),
+    })
+    .await
+    .expect("metadata database")
+    .with_secrets_key(secrets_key())
+}
+
 impl Stack {
+    /// A pending database of its own (no compute: the gateway only resolves the key) with a
+    /// public key on its main branch.
     async fn new() -> Self {
-        let metadata = MetadataClient::connect(&MetadataConfig {
-            database_url: env("CHELABASE_METADATA_DATABASE_URL"),
-        })
-        .await
-        .expect("metadata database")
-        .with_secrets_key(SecretKey::from_env().expect("CHELABASE_SECRETS_KEY"));
+        let metadata = metadata().await;
         let db = DatabaseId::new();
         metadata
             .insert_database_pending(
@@ -76,16 +88,23 @@ impl Stack {
         // The main branch has the database's id.
         let branch = BranchId(db.as_uuid());
         let generated = generate(DataKeyKind::Public);
+        let key_id = Uuid::new_v4();
         metadata
             .insert_data_key(&NewDataKey {
-                id: Uuid::new_v4(),
+                id: key_id,
                 branch_id: branch,
                 kind: DataKeyKind::Public,
                 role: "anon".into(),
                 name: "functions-e2e".into(),
                 prefix: generated.prefix.clone(),
                 sha256: generated.sha256,
-                sealed: None,
+                // A public key is stored sealed for display, as the orchestrator stores it.
+                sealed: Some(chelabase_secrets::seal_credential(
+                    &secrets_key(),
+                    &key_id.to_string(),
+                    chelabase_secrets::Purpose::DataKey,
+                    &generated.key,
+                )),
                 databases: None,
                 role_oid: None,
                 role_timeline: None,
@@ -93,6 +112,11 @@ impl Stack {
             })
             .await
             .expect("the branch's public key");
+        Self::with(metadata, db, branch, generated.key)
+    }
+
+    /// The stack's clients for functions on `branch` of `db`, called with the public `key`.
+    fn with(metadata: MetadataClient, db: DatabaseId, branch: BranchId, key: String) -> Self {
         Stack {
             metadata,
             http: reqwest::Client::new(),
@@ -110,7 +134,7 @@ impl Stack {
             .expect("the orchestrator's functions bearer"),
             db,
             branch,
-            key: generated.key,
+            key,
         }
     }
 

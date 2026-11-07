@@ -19,6 +19,10 @@ pub struct Config {
     /// compose names the service's aliases on the internal networks only, so it listens there
     /// and nowhere else.
     pub internal_addr: String,
+    /// `CHELABASE_FUNCTIONS_CONTROL_ADDR` (default `127.0.0.1:8093`): the internal listener's
+    /// control side (bundle uploads and invocations), listed and resolved like
+    /// `CHELABASE_FUNCTIONS_INTERNAL_ADDR`, which serves bundle GETs only.
+    pub control_addr: String,
     /// `CHELABASE_FUNCTIONS_RUNTIME_URL` (default `http://127.0.0.1:8080`).
     pub runtime_url: String,
     /// `CHELABASE_URL` in a function's env: the public API base (`CHELABASE_PUBLIC_SCHEME`,
@@ -73,6 +77,7 @@ impl Config {
         Ok(Config {
             addr: env_or("CHELABASE_FUNCTIONS_ADDR", "127.0.0.1:8091"),
             internal_addr: env_or("CHELABASE_FUNCTIONS_INTERNAL_ADDR", "127.0.0.1:8092"),
+            control_addr: env_or("CHELABASE_FUNCTIONS_CONTROL_ADDR", "127.0.0.1:8093"),
             runtime_url: env_or("CHELABASE_FUNCTIONS_RUNTIME_URL", "http://127.0.0.1:8080"),
             public_url: entry.api_base(),
             timeout: Duration::from_millis(timeout_ms),

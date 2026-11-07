@@ -6,6 +6,10 @@
 #   bundles     the functions service's bundle store (`functions-internal:8080`, its alias on the
 #               internal `functions` network;
 #               `--external-addr bundles=<host:port>` moves it).
+#   chelabase-api  the gateway (`gateway-functions:8000`, its alias on the `functions` network;
+#               compose moves the port with `--external-addr chelabase-api=<host:port>`). Only
+#               the supervisor's `chelabaseApi` entrypoint calls it, always on the API host
+#               (CHELABASE_API_HOST); loaded workers reach it as `env.CHELABASE` (#183).
 #   egress      the loaded workers' global outbound: public addresses only. DNS answers are
 #               filtered per connection, so a name that resolves to a denied address fails.
 #   none        no address at all.
@@ -15,6 +19,7 @@ const config :Workerd.Config = (
   services = [
     (name = "supervisor", worker = .supervisor),
     (name = "bundles", external = (address = "functions-internal:8080", http = ())),
+    (name = "chelabase-api", external = (address = "gateway-functions:8000", http = ())),
     (name = "egress",
      network = (
        allow = ["public"],
@@ -46,5 +51,7 @@ const supervisor :Workerd.Worker = (
     (name = "LOADER", workerLoader = ()),
     (name = "BUNDLES", service = "bundles"),
     (name = "EGRESS", service = "egress"),
+    (name = "GATEWAY", service = "chelabase-api"),
+    (name = "API_HOST", fromEnvironment = "CHELABASE_API_HOST"),
   ],
 );

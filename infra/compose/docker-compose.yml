@@ -1161,12 +1161,16 @@ services:
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
     ports:
       - "${CHELABASE_HTTP_ADDR:-127.0.0.1}:${CHELABASE_HTTP_PORT:-${CHELABASE_PUBLIC_PORT:-8000}}:${CHELABASE_PUBLIC_PORT:-8000}"
+    # #183: also on the runtime's `functions` network as `gateway-functions`, the address of the
+    # functions' `env.CHELABASE` binding (always on the API host; it grants nothing by itself).
     networks:
       default:
         aliases:
           - ${CHELABASE_STUDIO_HOST_NAME:-studio.chelabase.localhost}
           - ${CHELABASE_API_HOST_NAME:-api.chelabase.localhost}
           - ${CHELABASE_AUTH_HOST_NAME:-auth.chelabase.localhost}
+      functions:
+        aliases: [gateway-functions]
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-signing.pem, read_only: true, volume: {subpath: gateway/internal-signing.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
@@ -1366,7 +1370,10 @@ services:
     environment:
       <<: *app-env
       CHELABASE_FUNCTIONS_ADDR: functions-public:8091,127.0.0.1:8091
-      CHELABASE_FUNCTIONS_INTERNAL_ADDR: functions-internal:8080,functions-control:8080
+      # The internal listener in two sides (#181): bundle GETs for the runtime, uploads and
+      # invocations for the orchestrator and the worker.
+      CHELABASE_FUNCTIONS_INTERNAL_ADDR: functions-internal:8080
+      CHELABASE_FUNCTIONS_CONTROL_ADDR: functions-control:8080
       CHELABASE_FUNCTIONS_RUNTIME_URL: http://functions-runtime:8080
       CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
       CHELABASE_NATS_USER: functions
@@ -1423,6 +1430,13 @@ services:
   # CHELABASE_IMAGE_REPO=chelabase and CHELABASE_IMAGE_TAG=latest.
   functions-runtime:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
+    # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
+    # its listening port, always on the API host.
+    command: ["/usr/local/bin/workerd", "serve", "--experimental",
+              "--external-addr", "chelabase-api=gateway-functions:${CHELABASE_PUBLIC_PORT:-8000}",
+              "/etc/functions-runtime/config.capnp"]
+    environment:
+      CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
     restart: always
     user: "65532:65532"
     read_only: true
@@ -1457,7 +1471,8 @@ networks:
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).
   compute: {}
-  # Edge functions (m1): the functions service to the runtime, nothing else; no route out.
+  # Edge functions (m1): the functions service and the runtime, and the gateway's alias for the
+  # runtime's `env.CHELABASE` binding (#183); nothing else, no route out.
   functions:
     internal: true
   # Edge functions (m4b): the orchestrator and the worker to the functions service's internal

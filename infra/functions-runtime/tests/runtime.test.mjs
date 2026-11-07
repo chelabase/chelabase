@@ -102,9 +102,11 @@ describe("functions runtime", () => {
       const r1 = await (await invoke(rt, DB, e, { env: one })).json();
       const r2 = await (await invoke(rt, DB, e, { env: two })).json();
       const r0 = await (await invoke(rt, DB, e)).json();
-      assert.deepEqual(r1.env, one);
-      assert.deepEqual(r2.env, two);
-      assert.deepEqual(r0.envKeys, [], "no env header: an empty env, never the supervisor's bindings");
+      // Besides its own strings, every worker has the gateway binding (#183) and nothing else.
+      const own = ({ CHELABASE, ...rest }) => rest;
+      assert.deepEqual(own(r1.env), one);
+      assert.deepEqual(own(r2.env), two);
+      assert.deepEqual(r0.envKeys, ["CHELABASE"], "no env header: only the gateway binding, never the supervisor's bindings");
     }
   });
 

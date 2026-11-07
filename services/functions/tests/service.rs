@@ -18,7 +18,7 @@ use chelabase_auth::internal::{
 use chelabase_metadata::FunctionAuth;
 use chelabase_storage::{MemoryStore, ObjectStore};
 use chelabase_types::data_key::DataKeyKind;
-use functions::app::{AppState, internal_router, public_router};
+use functions::app::{AppState, control_router, public_router, runtime_router};
 use functions::bundles::Bundles;
 use functions::directory::{Directory, Parts};
 use functions::host::Workerd;
@@ -162,7 +162,10 @@ impl Directory for Fake {
 
 struct H {
     public: String,
-    internal: String,
+    /// The internal listener's runtime side (bundle GET only).
+    runtime: String,
+    /// Its control side (bundle PUT and invoke only).
+    control: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     dir: Arc<Fake>,
     store: Arc<MemoryStore>,
@@ -219,7 +222,8 @@ async fn harness_with(runtime_url: Option<String>) -> H {
     ));
     H {
         public: serve(public_router(state.clone())).await,
-        internal: serve(internal_router(state)).await,
+        runtime: serve(runtime_router(state.clone())).await,
+        control: serve(control_router(state)).await,
         seen,
         dir,
         store,
@@ -755,7 +759,7 @@ async fn the_public_listener_serves_no_internal_route() {
         .http
         .get(format!(
             "{}/functions/v1/public/{}/open",
-            h.internal, h.branch
+            h.runtime, h.branch
         ))
         .send()
         .await
@@ -773,7 +777,8 @@ async fn bundle_put_and_get() {
     let body =
         br#"{"compatibilityDate":"2026-10-01","mainModule":"main.js","modules":[]}"#.to_vec();
     let hash = sha(&body);
-    let url = format!("{}/internal/bundles/{}/{hash}", h.internal, h.db);
+    let url = format!("{}/internal/bundles/{}/{hash}", h.control, h.db);
+    let get_url = format!("{}/internal/bundles/{}/{hash}", h.runtime, h.db);
     let put = |bearer: Option<&str>, body: Vec<u8>, url: String| {
         let mut req = h.http.put(url).body(body);
         if let Some(b) = bearer {
@@ -832,7 +837,7 @@ async fn bundle_put_and_get() {
     assert_eq!(listed[0].modified, second);
 
     // GET needs no bearer and serves the exact bytes.
-    let resp = h.http.get(&url).send().await.unwrap();
+    let resp = h.http.get(&get_url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap(), body);
 
@@ -841,7 +846,7 @@ async fn bundle_put_and_get() {
     h.dir.live.lock().unwrap().insert(other);
     let resp = h
         .http
-        .get(format!("{}/internal/bundles/{other}/{hash}", h.internal))
+        .get(format!("{}/internal/bundles/{other}/{hash}", h.runtime))
         .send()
         .await
         .unwrap();
@@ -852,7 +857,7 @@ async fn bundle_put_and_get() {
     ] {
         let resp = h
             .http
-            .get(format!("{}/internal/bundles/{bad}", h.internal))
+            .get(format!("{}/internal/bundles/{bad}", h.runtime))
             .send()
             .await
             .unwrap();
@@ -864,7 +869,7 @@ async fn bundle_put_and_get() {
     let resp = put(
         Some(ORCH),
         body.clone(),
-        format!("{}/internal/bundles/{gone}/{hash}", h.internal),
+        format!("{}/internal/bundles/{gone}/{hash}", h.control),
     )
     .await
     .unwrap();
@@ -876,7 +881,7 @@ async fn bundle_put_and_get() {
     let resp = put(
         Some(ORCH),
         big.clone(),
-        format!("{}/internal/bundles/{}/{}", h.internal, h.db, sha(&big)),
+        format!("{}/internal/bundles/{}/{}", h.control, h.db, sha(&big)),
     )
     .await
     .unwrap();
@@ -886,7 +891,7 @@ async fn bundle_put_and_get() {
 #[tokio::test]
 async fn internal_invoke_takes_the_workers_bearer_only() {
     let h = harness().await;
-    let url = format!("{}/internal/invoke/{}/users", h.internal, h.branch);
+    let url = format!("{}/internal/invoke/{}/users", h.control, h.branch);
     assert_eq!(h.http.post(&url).send().await.unwrap().status(), 401);
     assert_eq!(
         h.http
@@ -916,7 +921,7 @@ async fn internal_invoke_takes_the_workers_bearer_only() {
         None,
         "the worker's bearer stays here"
     );
-    let off = format!("{}/internal/invoke/{}/off", h.internal, h.branch);
+    let off = format!("{}/internal/invoke/{}/off", h.control, h.branch);
     assert_eq!(
         h.http
             .post(&off)
@@ -938,4 +943,30 @@ async fn wait_for(cond: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("condition not met");
+}
+
+/// #181 (audit S1): the runtime's side of the internal listener serves bundle GETs only, so a
+/// runtime (or anything on its network) can't upload a bundle or invoke a function, bearer or
+/// not; the control side (the orchestrator's and the worker's network) serves no GET.
+#[tokio::test]
+async fn each_internal_side_serves_only_its_own_calls() {
+    let h = harness().await;
+    let body = br#"{"compatibilityDate":"2026-10-01","mainModule":"main.js","modules":[]}"#.to_vec();
+    let hash = sha(&body);
+    let path = format!("/internal/bundles/{}/{hash}", h.db);
+    let put = |base: &str, bearer: &str| h.http.put(format!("{base}{path}")).bearer_auth(bearer).body(body.clone()).send();
+    for bearer in [ORCH, WORKER, "none"] {
+        assert_eq!(put(&h.runtime, bearer).await.unwrap().status(), 404, "runtime-side PUT with {bearer}");
+    }
+    assert!(h.store.list("").await.unwrap().is_empty(), "nothing was written");
+    let invoke = format!("/internal/invoke/{}/users", h.branch);
+    for bearer in [WORKER, ORCH, "none"] {
+        let resp = h.http.post(format!("{}{invoke}", h.runtime)).bearer_auth(bearer).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "runtime-side invoke with {bearer}");
+    }
+    assert_eq!(h.calls(), 0, "no function ran");
+    // The control side takes them, and serves no bundle.
+    assert_eq!(put(&h.control, ORCH).await.unwrap().status(), 204);
+    assert_eq!(h.http.get(format!("{}{path}", h.control)).send().await.unwrap().status(), 404);
+    assert_eq!(h.http.get(format!("{}{path}", h.runtime)).send().await.unwrap().status(), 200);
 }
