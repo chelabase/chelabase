@@ -532,6 +532,8 @@ services:
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
       # Edge functions (m4b): its bearer for the functions service's invocations.
       - CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-functions.token
+      # Edge functions (m10): its bearer for the service runner.
+      - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
       # object-storage m18, dev only: storage webhooks may reach the live test's local receiver in
       # the runner (`runner`, its alias on the default network: `chelabase workbench test` runs it
       # with --use-aliases), over http. Exactly that host; every other one stays public-only.
@@ -558,6 +560,7 @@ services:
       - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
       - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
       - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
+      - {source: token-worker-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
       - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
     depends_on: !override
       metadata-db:
@@ -725,7 +728,7 @@ services:
     env_file:
       - *stack-env
     environment: !override
-      - CHELABASE_FUNCTIONS_ADDR=functions-public:8091,127.0.0.1:8091
+      - CHELABASE_FUNCTIONS_ADDR=functions-public:8091,functions-services:8091,127.0.0.1:8091
       - CHELABASE_FUNCTIONS_INTERNAL_ADDR=functions-internal:8080
       - CHELABASE_FUNCTIONS_CONTROL_ADDR=functions-control:8080
       - CHELABASE_FUNCTIONS_RUNTIME_URL=http://functions-runtime:8080
@@ -734,6 +737,7 @@ services:
       - CHELABASE_NATS_INBOX_PREFIX=_INBOX_functions
       - CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token
       - CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-functions.token
+      - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
       - CHELABASE_STORAGE_BACKEND=seaweedfs
       - CHELABASE_STORAGE_S3_ENDPOINT=http://seaweedfs:8333
       - CHELABASE_STORAGE_S3_BUCKET=chelabase-functions
@@ -750,6 +754,7 @@ services:
       - {source: nats-functions, target: "${CHELABASE_KEYS_DIR}/nats/functions.password"}
       - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
       - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
+      - {source: token-functions-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
       - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
       - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
     healthcheck:
@@ -762,6 +767,37 @@ services:
         condition: service_healthy
       seaweedfs:
         condition: service_started
+
+  # Edge functions (m10): the host-built binary in the base file's profile `services`, on its
+  # aliases there, in the Docker group like the orchestrator and the worker. The metadata URL in
+  # stack.env carries the password.
+  service-runner:
+    <<: *workbench
+    entrypoint: !reset []
+    command: ["${CHELABASE_CHECKOUT}/target/debug/service-runner"]
+    read_only: !reset null
+    env_file:
+      - *stack-env
+    environment: !override
+      - CHELABASE_SERVICE_RUNNER_ADDR=service-runner-control:8094,127.0.0.1:8094
+      - CHELABASE_SERVICES_NETWORK=${COMPOSE_PROJECT_NAME}_services
+      - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
+      - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
+    group_add: ["${CHELABASE_DOCKER_GID}"]
+    volumes: !override
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+      - *docker-sock
+    secrets:
+      - {source: token-functions-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
+      - {source: token-worker-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8094/health"]
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
 
   # Its static address on `control` is outside the computes' range and in the chelabase_realtime
   # login rule.
@@ -1028,6 +1064,9 @@ secrets:
   token-storage-internal: {file: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
   token-orchestrator-functions: {file: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
   token-worker-functions: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
+  # Edge functions (m10): the service runner's callers.
+  token-functions-service-runner: {file: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
+  token-worker-service-runner: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
   token-proxy-api: {file: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
   token-storcon-hook: {file: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
   # Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped

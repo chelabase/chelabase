@@ -35,6 +35,10 @@
 #   7. the functions service's boundary (edge functions m4b): its NATS password and each internal
 #      bearer (the orchestrator's, the worker's), only the gateway mounting the signing key, no
 #      Docker socket for functions or the runtime, and the runtime's networks.
+#   8. the service runner's boundary (edge functions m10): profile `services`, the only new
+#      Docker socket holder, each caller's bearer, and the `services` network (service containers
+#      reach the functions service's public listener only).
+# Every render takes every profile (sites, runner, services), so profile services are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -52,10 +56,10 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -147,6 +151,7 @@ worker	db/metadata.password	ro
 worker	storage-s3/access-key	ro
 worker	storage-s3/secret-key	ro
 worker	tokens/worker-functions.token	ro
+worker	tokens/worker-service-runner.token	ro
 worker	functions-s3/access-key	ro
 worker	functions-s3/secret-key	ro
 gateway	gateway/internal-signing.pem	ro
@@ -178,8 +183,12 @@ functions	db/metadata.password	ro
 functions	nats/functions.password	ro
 functions	tokens/orchestrator-functions.token	ro
 functions	tokens/worker-functions.token	ro
+functions	tokens/functions-service-runner.token	ro
 functions	functions-s3/access-key	ro
 functions	functions-s3/secret-key	ro
+service-runner	db/metadata.password	ro
+service-runner	tokens/functions-service-runner.token	ro
+service-runner	tokens/worker-service-runner.token	ro
 realtime	gateway/internal-verify.pem	ro
 realtime	compute-ca/ca.crt	ro
 realtime	nats/realtime.password	ro
@@ -464,7 +473,7 @@ for render in base wb; do
       err "$render: $svc must not be on the runtime's network"
   done
   got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
-  [[ "$got" == '{"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"]}' ]] ||
+  [[ "$got" == '{"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services":["functions-services"],"services-control":[]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
 # #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
@@ -474,13 +483,63 @@ for render in base wb; do
   [[ "$render" == wb ]] && f="$tmp/wb.json"
   fenv="$(jq -c '.services.functions.environment | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
     | {CHELABASE_FUNCTIONS_ADDR, CHELABASE_FUNCTIONS_INTERNAL_ADDR, CHELABASE_FUNCTIONS_CONTROL_ADDR}' "$f")"
-  [[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080","CHELABASE_FUNCTIONS_CONTROL_ADDR":"functions-control:8080"}' ]] ||
+  [[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,functions-services:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080","CHELABASE_FUNCTIONS_CONTROL_ADDR":"functions-control:8080"}' ]] ||
     err "$render: functions binds its aliases only, one side per network: got $fenv"
 done
 grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
   err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
 [[ "$(jq -r '.services["functions-runtime"].profiles // [] | length' "$tmp/base.json")" == 0 ]] ||
   err "functions-runtime runs in every install (no profile)"
+
+# 8. The service runner (edge functions m10), in both renders.
+for render in base wb; do
+  boundary tokens/functions-service-runner.token "functions service-runner" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-service-runner.token "service-runner worker" "$render" "$tmp/readers.$render"
+done
+for render in base wb; do
+  f="$tmp/base.json"
+  runner=""
+  [[ "$render" == wb ]] && { f="$tmp/wb.json"; runner="runner "; }
+  # The Docker socket: the computes' two holders, the service runner, and the workbench's test
+  # runner; never functions, the runtime or anything else, in any profile.
+  got="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.source // "") | contains("docker.sock"))) | .key' "$f" | sort | tr '\n' ' ')"
+  [[ "$got" == "orchestrator ${runner}service-runner worker " ]] || err "$render: the Docker socket is mounted by [$got]"
+  [[ "$(jq -c '.services["service-runner"].profiles // []' "$f")" == '["services"]' ]] ||
+    err "$render: service-runner runs in profile services only (off by default)"
+  # `services`: the functions service alone (the runner's containers join it at run time); not
+  # internal (services reach the internet). `services-control`: the runner and its two callers,
+  # internal. The runner itself is never on `services`, `functions` or `functions-control`.
+  got="$(members services "$f")"
+  [[ "$got" == "functions " ]] || err "$render: the services network holds [$got], expected [functions ]"
+  [[ "$(jq -r '.networks.services.internal // false' "$f")" == false ]] || err "$render: the services network reaches the internet"
+  got="$(members services-control "$f")"
+  [[ "$got" == "functions service-runner worker " ]] || err "$render: the services-control network holds [$got]"
+  [[ "$(jq -r '.networks["services-control"].internal' "$f")" == true ]] || err "$render: services-control must be internal"
+  got="$(jq -r '.services["service-runner"].networks // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "default services-control" ]] || err "$render: service-runner is on [$got]"
+  got="$(jq -c '.services["service-runner"].networks["services-control"].aliases // []' "$f")"
+  [[ "$got" == '["service-runner-control"]' ]] || err "$render: service-runner's alias on services-control: got $got"
+  senv="$(jq -c '.services["service-runner"].environment | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
+    | {CHELABASE_SERVICE_RUNNER_ADDR, CHELABASE_SERVICES_NETWORK}' "$f")"
+  [[ "$senv" == '{"CHELABASE_SERVICE_RUNNER_ADDR":"service-runner-control:8094,127.0.0.1:8094","CHELABASE_SERVICES_NETWORK":"'"$(jq -r .name "$f")"'_services"}' ]] ||
+    err "$render: service-runner binds its control alias only and runs containers on the project's services network: got $senv"
+done
+for sub in tokens/functions-service-runner.token tokens/worker-service-runner.token db/metadata.password; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services["service-runner"].environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "service-runner reads $sub through a *_FILE setting"
+done
+for pair in functions:FUNCTIONS worker:WORKER; do
+  svc="${pair%%:*}"
+  var="CHELABASE_${pair##*:}_SERVICE_RUNNER_TOKEN_FILE"
+  [[ "$(jq -r --arg s "$svc" --arg v "$var" '.services[$s].environment[$v] // ""' "$tmp/base.json")" == "/run/chelabase/secrets/tokens/$svc-service-runner.token" ]] ||
+    err "$svc reads its service-runner bearer through $var"
+done
+sr="$(jq -c '.services["service-runner"] | {read_only, image}' "$tmp/base.json")"
+[[ "$sr" == '{"read_only":true,"image":"ghcr.io/chelabase/service-runner:unpublished"}' ]] ||
+  err "service-runner runs its release image read-only: got $sr"
+[[ "$(jq -r '.services["service-runner"].environment.CHELABASE_SERVICE_RUNNER_URL // ""' "$tmp/base.json")" == http://service-runner-control:8094 ]] ||
+  err "CHELABASE_SERVICE_RUNNER_URL is the runner's control alias"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

@@ -43,6 +43,7 @@ universe='[
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
   "K/tokens/app-sessions.token", "K/tokens/storage-internal.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/tokens/orchestrator-functions.token", "K/tokens/worker-functions.token",
+  "K/tokens/functions-service-runner.token", "K/tokens/worker-service-runner.token",
   "K/auth/member-jwt.key", "K/auth/member-jwt.pub", "K/identity/secret", "K/identity/db.password",
   "K/tokens/auth-identity.token", "K/tokens/orchestrator-identity.token", "K/tokens/worker-identity.token",
   "K/tokens/bootstrap-identity.token",
@@ -95,7 +96,8 @@ expected='{
     "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw",
     "K/realtime-tls/current/client.crt": "rw", "K/realtime-tls/current/client.key": "rw", "K/realtime-tls/current/ca.crt": "rw",
     "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro",
-    "K/tokens/worker-identity.token": "ro", "K/tokens/worker-functions.token": "ro"
+    "K/tokens/worker-identity.token": "ro", "K/tokens/worker-functions.token": "ro",
+    "K/tokens/worker-service-runner.token": "ro"
   },
   "gateway": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -127,7 +129,12 @@ expected='{
     "C/scripts/tests/workbench-compose.sh": "ro",
     "K/secrets/secrets.key": "ro", "K/gateway/internal-verify.pem": "ro",
     "K/nats/functions.password": "ro",
-    "K/tokens/orchestrator-functions.token": "ro", "K/tokens/worker-functions.token": "ro"
+    "K/tokens/orchestrator-functions.token": "ro", "K/tokens/worker-functions.token": "ro",
+    "K/tokens/functions-service-runner.token": "ro"
+  },
+  "service-runner": {
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "K/tokens/functions-service-runner.token": "ro", "K/tokens/worker-service-runner.token": "ro"
   },
   "realtime": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -238,7 +245,7 @@ check() {
   config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE "$@" docker compose -p chelabase-feat-x \
     -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" \
     -f "${COMPOSE_OVERLAY_UNDER_TEST:-$root/infra/compose/docker-compose.workbench.yml}" --env-file "$fixture" \
-    --profile sites --profile runner config --no-env-resolution --format json |
+    --profile sites --profile runner --profile services config --no-env-resolution --format json |
     jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" ||
     fail "$label: compose config failed"
   local got want
@@ -347,7 +354,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs functions gateway identity landing orchestrator realtime rest runner storage studio worker" ]] ||
+  [[ "$mounting" == "auth docs functions gateway identity landing orchestrator realtime rest runner service-runner storage studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

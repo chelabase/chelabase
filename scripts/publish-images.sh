@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build, test and publish the release images as ghcr.io/chelabase/<image>:<sha12>: the per-app
-# images (storage and functions among them), Studio, the identity service and the functions runtime
+# images (storage, functions and service-runner among them), Studio, the identity service and the functions runtime
 # (the ones self-host compose pulls by digest). The all-in-one chelabase/server is local only. Build once, test those exact images, push them as they are. Every run names its
 # images: --service <image> (repeatable) takes exactly those, even unchanged ones (with a note);
 # --all takes the images whose inputs changed since their pins (scripts/image-inputs.sh) and

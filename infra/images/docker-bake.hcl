@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "init", "server", "studio", "identity", "functions-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime"]
 }
 
 target "_app" {
@@ -83,6 +83,12 @@ target "functions" {
   inherits = ["_app"]
   target   = "functions"
   tags     = ["${REPO}/functions:${TAG}"]
+}
+# Edge functions (m10): the service runner (profile `services`). Unpublished until its first pin.
+target "service-runner" {
+  inherits = ["_app"]
+  target   = "service-runner"
+  tags     = ["${REPO}/service-runner:${TAG}"]
 }
 target "init" {
   inherits = ["_app"]
