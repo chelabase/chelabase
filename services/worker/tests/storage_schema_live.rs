@@ -4099,3 +4099,139 @@ COMMIT;"
     }))
     .await;
 }
+
+/// #102, the other two forms: a text column whose comment says `@storage_ref bucket=` and a
+/// column with a foreign key to `storage.objects(id)` are described in the schema (only that
+/// hint, never the comment's text) and typed `StoragePath<…>` and `StorageObjectId`; a type
+/// merely named `object_ref` isn't a ref. `{bucket, name}` and `{id}` refs resolve in one
+/// batch under the same rule: an object the caller can't read (or a bucket it can't see) is
+/// `null`.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_forms_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_forms_live() {
+    with_fx(|fx| Box::pin(async move {
+        // The table first: the data API reads the schema on its first request here.
+        fx.owner(
+            "CREATE TYPE object_ref AS (x int);
+             CREATE TABLE docs (id int PRIMARY KEY, path text, photo uuid, look object_ref);
+             COMMENT ON COLUMN docs.path IS 'The file, internal. @storage_ref bucket=files';
+             COMMENT ON COLUMN docs.photo IS 'internal photo note';
+             GRANT SELECT, INSERT ON docs TO authenticated;",
+        )
+        .await
+        .expect("the docs table");
+        // The owner holds no REFERENCES on storage.objects (#102's open decision): the
+        // superuser adds the foreign key.
+        fx.admin("ALTER TABLE docs ADD FOREIGN KEY (photo) REFERENCES storage.objects(id)").await;
+        let secret = fx.secret_key("st-ref-forms", None).await;
+        let public = fx.public_key().await;
+        for b in ["files", "closed"] {
+            fx.bucket(b).await;
+        }
+        for (name, table, command, using, check) in [
+            ("b_select", "buckets", "SELECT", "'name <> ''closed'''", "NULL"),
+            ("o_select", "objects", "SELECT", "'name NOT LIKE ''hidden/%'''", "NULL"),
+            ("o_insert", "objects", "INSERT", "NULL", "'true'"),
+        ] {
+            fx.owner(&format!(
+                "SELECT storage.create_policy('{name}', '{table}', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for (path, body) in [("files/a.txt", "v1"), ("files/hidden/x.txt", "h")] {
+            let (status, _, b) = object("POST", &format!("/storage/v1/object/{path}"), &secret, Some(body.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
+            assert_eq!(status, 200, "{path}: {}", json_of(&b));
+        }
+        let closed = fx.value("SELECT id FROM storage.buckets WHERE name = 'closed'").await;
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage;
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role)
+  VALUES ('00000000-0000-0000-0000-0000000000f2', '{closed}', 'c.txt', 1, 'e', now() + interval '5 minutes', 'chelabase_storage');
+INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('{closed}', 'c.txt', 1, 'e', '00000000-0000-0000-0000-0000000000f2');
+COMMIT;"
+        ))
+        .await;
+        let by_name = "SELECT id FROM storage.objects WHERE name =";
+        let a = fx.value(&format!("{by_name} 'a.txt'")).await;
+        let hidden = fx.value(&format!("{by_name} 'hidden/x.txt'")).await;
+        let in_closed = fx.value(&format!("{by_name} 'c.txt'")).await;
+
+        // The schema names each form, and only the hint: no comment text.
+        let (status, _, schema) = object("GET", "/data/v1/schema", &secret, None, &[]).await;
+        let schema_text = String::from_utf8_lossy(&schema).to_string();
+        assert_eq!(status, 200, "{schema_text}");
+        let schema: Value = serde_json::from_str(&schema_text).unwrap();
+        let cols = &schema["schemas"]["public"]["tables"]["docs"]["columns"];
+        assert_eq!(cols["path"]["storage_ref"], json!({ "kind": "path", "bucket": "files" }), "{cols}");
+        assert_eq!(cols["photo"]["storage_ref"], json!({ "kind": "id" }), "{cols}");
+        assert!(cols["look"].get("storage_ref").is_none(), "{cols}");
+        assert!(cols["id"].get("storage_ref").is_none(), "{cols}");
+        assert!(!schema_text.contains("internal"), "{schema_text}");
+        // The public key's role can't reach docs: nothing of it is described.
+        let (status, _, anon) = object("GET", "/data/v1/schema", &public, None, &[]).await;
+        let anon: Value = serde_json::from_slice(&anon).unwrap();
+        assert_eq!(status, 200, "{anon}");
+        assert!(anon["schemas"]["public"]["tables"].get("docs").is_none(), "{anon}");
+
+        // The generated types.
+        let (status, _, ts) = object("GET", "/data/v1/types", &secret, None, &[]).await;
+        let ts = String::from_utf8_lossy(&ts);
+        assert_eq!(status, 200, "{ts}");
+        for line in ["path: StoragePath<\"files\"> | null;", "photo: StorageObjectId | null;", "look: string | null;"] {
+            assert!(ts.contains(line), "{line}\n{ts}");
+        }
+        assert!(ts.contains("import type { StorageObjectId, StoragePath, TypeMap } from \"@chelabase/client\";"), "{ts}");
+
+        // Both forms round-trip through the query API as plain strings.
+        let (status, body) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "insert", "into": "docs", "values": [{ "id": 1, "path": "a.txt", "photo": a }],
+        })))
+        .await;
+        assert!((200..300).contains(&status), "insert: {status} {body}");
+        let (status, rows) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "select", "from": "docs", "select": ["path", "photo"],
+        })))
+        .await;
+        assert_eq!((status, rows), (200, json!([{ "path": "a.txt", "photo": a }])));
+
+        // One batch of id and bucket-name refs, in order; unreadable ones are null.
+        let refs = json!([
+            { "id": a },
+            { "id": hidden },
+            { "id": in_closed },
+            { "id": "00000000-0000-0000-0000-000000000000" },
+            { "bucket": "files", "name": "a.txt" },
+            { "bucket": "files", "name": "hidden/x.txt" },
+            { "bucket": "closed", "name": "c.txt" },
+            { "bucket": "nope", "name": "a.txt" },
+            { "bucket": "files", "name": "../a.txt" },
+        ]);
+        let (status, body) = resolve_refs(&secret, refs.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        let urls = body["urls"].as_array().expect("urls").clone();
+        assert_eq!(urls.len(), 9, "{body}");
+        for i in [1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(urls[i], Value::Null, "slot {i}: {body}");
+        }
+        for i in [0, 4] {
+            let url = urls[i].as_str().unwrap_or_else(|| panic!("slot {i}: {body}"));
+            assert!(url.starts_with("/storage/v1/object/sign/files/a.txt?token="), "{url}");
+            let (status, _, got) = keyless("GET", url, None).await;
+            assert_eq!((status, &got[..]), (200, &b"v1"[..]), "slot {i}");
+        }
+        // The public key's role reads nothing: every slot null, not an error.
+        let (status, body) = resolve_refs(&public, refs).await;
+        assert_eq!((status, body["urls"].as_array().map(Vec::len)), (200, Some(9)), "{body}");
+        assert!(body["urls"].as_array().unwrap().iter().all(Value::is_null), "{body}");
+        // A ref naming an object two ways is 400; so is a 1001st id ref.
+        assert_eq!(resolve_refs(&secret, json!([{ "id": a, "bucket": "files", "name": "a.txt" }])).await.0, 400);
+        let many: Vec<Value> = (0..1001).map(|_| json!({ "id": a })).collect();
+        assert_eq!(resolve_refs(&secret, json!(many)).await.0, 400);
+    }))
+    .await;
+}
