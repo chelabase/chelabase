@@ -4096,6 +4096,14 @@ COMMIT;"
         let (status, body) = resolve_refs(&secret, json!(many)).await;
         assert_eq!((status, &body["error"]["code"]), (400, &json!("invalid_request")), "{body}");
         assert_eq!(resolve_refs(&secret, json!([{ "bucket_id": "nope", "name": "a" }])).await.0, 400);
+
+        // An empty or all-invalid batch still asks about the database first (m11 audit N1).
+        let listed = fx.secret_key("st-resolve-listed", Some(vec![fx.database.clone()])).await;
+        for refs in [json!([]), json!([{ "bucket": "files", "name": "/bad" }])] {
+            let path = "/storage/v1/object/resolve?database=postgres";
+            let (status, body) = storage("POST", path, &listed, Some(json!({ "refs": refs }))).await;
+            assert_eq!((status, &body["error"]["code"]), (403, &json!("database_not_allowed")), "{refs}: {body}");
+        }
     }))
     .await;
 }
