@@ -661,6 +661,105 @@ async fn storage_trimmed_move_out_lets_no_bucket_b_delete_through() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn storage_trim_while_a_view_check_is_open_confirms_nothing_trimmed() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(
+        limiter.clone(),
+        FilterSettings {
+            max_keys: 1,
+            ..FilterSettings::default()
+        },
+    );
+    let ids: Vec<String> = (100..112).map(oid).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    f.checker.insert_rows(REL, &refs);
+    f.checker.place(&refs, BUCKET_A);
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    // Studio's view frame, checked while O1 is still in bucket A.
+    let ask = f.filter.ask_keys(2, &[ks(O1)], false).unwrap();
+    let seen = ask.run().await;
+    // O1 moves out; the move is carried, then trimmed by later carried keys.
+    let held = limiter.try_permit().unwrap();
+    f.checker.place(&[O1], BUCKET_B);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    for k in &refs {
+        f.deliver(&window(&[k], &[], &[])).await;
+    }
+    drop(held);
+    f.filter.set_view(2, &ask, vec![ks(O1)], seen);
+    f.filter.retry().await;
+    drain(&mut reader);
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a delete in bucket B reached bucket A's viewer"
+    );
+}
+
+/// A view log that overflows while a check is open: the answer confirms nothing, not even a
+/// key the log no longer holds.
+#[tokio::test(start_paused = true)]
+async fn storage_view_log_overflow_confirms_nothing() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(
+        limiter.clone(),
+        FilterSettings {
+            view_log: 1,
+            ..FilterSettings::default()
+        },
+    );
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    let ask = f.filter.ask_keys(2, &[ks(O1)], false).unwrap();
+    let seen = ask.run().await;
+    assert_eq!(seen, Ok(vec![true]));
+    // O1 moves to bucket B, in a window with one more key: the log keeps only O3. Starved, so
+    // the move isn't checked (and forgotten) before the answer lands.
+    let held = limiter.try_permit().unwrap();
+    f.checker.place(&[O1], BUCKET_B);
+    f.deliver(&window(&[], &[O1, O3], &[])).await;
+    f.filter.set_view(2, &ask, vec![ks(O1)], seen);
+    // O1's delete in bucket B joins the carry; the retry checks both.
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    drop(held);
+    f.filter.retry().await;
+    assert_eq!(
+        keys_by_op(&drain(&mut reader)),
+        vec![(ChangeOp::Update, ks(O3))],
+        "only O3's update: O1's delete in bucket B reached bucket A's viewer"
+    );
+}
+
+/// A key whose plugin text isn't its session form: the brought-key log holds the plugin form,
+/// so only the forgotten-key log (the session's form, as view keys are) stops the answer.
+#[tokio::test(start_paused = true)]
+async fn storage_view_answer_after_a_move_of_a_converted_key_confirms_nothing() {
+    const O4: &str = "00000000-0000-4000-8000-00000000000a";
+    const O4_PLUGIN: &str = "00000000-0000-4000-8000-00000000000A";
+    let mut f = fx();
+    f.checker.insert_rows(REL, &[O4]);
+    f.checker.place(&[O4], BUCKET_A);
+    f.checker.convert_as(&[O4_PLUGIN], &ks(O4));
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    let ask = f.filter.ask_keys(2, &[ks(O4)], false).unwrap();
+    let seen = ask.run().await;
+    assert_eq!(seen, Ok(vec![true]));
+    f.checker.place(&[O4], BUCKET_B);
+    f.deliver(&window(&[], &[O4_PLUGIN], &[])).await;
+    assert_eq!(drain(&mut reader), vec![]);
+    f.filter.set_view(2, &ask, vec![ks(O4)], seen);
+    f.checker.delete_rows(REL, &[O4]);
+    f.deliver(&window(&[], &[], &[O4_PLUGIN])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a delete in bucket B reached bucket A's viewer"
+    );
+}
+
 // --- carried keys retry on their own clock (#129's re-audit, S2) ------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -843,7 +942,8 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
     let mut open: Option<OpenView> = None;
 
     // Keys offered to the carry (`$offered`) that it no longer holds after a delivery or retry
-    // that checked nothing were trimmed: the filter forgot them then, unchecked.
+    // that checked nothing were trimmed: the filter forgot them then, unchecked. Nor does an
+    // open view's answer speak for them any more: their change is never checked.
     macro_rules! trimmed {
         ($offered:expr) => {{
             let held = filter.carried_keys();
@@ -853,6 +953,9 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                 }
                 unchecked.retain(|&i| ks(&ids[i]) != *k);
                 bulk_shown.remove(k);
+                if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
+                    o.stale.insert(k.clone());
+                }
             }
         }};
     }
@@ -1051,6 +1154,17 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                 drop(held);
                 let events = drain(&mut rx);
                 if waiting.is_some() || starved {
+                    // The window's keys wait in the carry: an open view's answer, already run,
+                    // may predate their change.
+                    if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
+                        o.stale.extend(
+                            w.inserts
+                                .iter()
+                                .chain(&w.updates)
+                                .chain(&w.deletes)
+                                .map(|t| ks(&t[0])),
+                        );
+                    }
                     trimmed!(offered);
                 }
                 if waiting.is_some() {
@@ -1115,6 +1229,216 @@ proptest! {
             .unwrap();
         rt.block_on(run_storage_model(steps))?;
     }
+}
+
+// --- the model on fixed inputs: earlier shrinks and the guards one at a time (#129, S3) --------
+//
+// Proptest's saved seeds stop replaying their inputs once `Step` or its strategy changes, so
+// the shrinks that found B1–B4 are kept here as step lists. Each sequence below also fails the
+// model when one of `filter.rs`'s guards is left out, which the random search alone finds too
+// rarely.
+
+fn put(i: usize, in_a: bool) -> Step {
+    Step::Put {
+        i,
+        in_a,
+        hidden: false,
+    }
+}
+
+fn deliver(bulk: bool, starved: bool) -> Step {
+    Step::Deliver { bulk, starved }
+}
+
+async fn replay(steps: Vec<Step>) {
+    if let Err(e) = run_storage_model(steps).await {
+        panic!("{e}");
+    }
+}
+
+/// Round 1 (B1): a keyless window with nothing shown.
+#[tokio::test(start_paused = true)]
+async fn storage_model_round1_bulk_window_alone() {
+    replay(vec![deliver(true, false)]).await;
+}
+
+/// Round 1 (B2): an object made again in bucket A after a starved delete, then a view and a
+/// keyless window.
+#[tokio::test(start_paused = true)]
+async fn storage_model_round1_remade_after_a_starved_delete_then_viewed() {
+    replay(vec![
+        put(2, false),
+        Step::Delete { i: 2 },
+        deliver(false, true),
+        put(2, true),
+        Step::View { mask: 204 },
+        deliver(true, false),
+    ])
+    .await;
+}
+
+/// Round 1 (B2): a carried insert, viewed, moved to bucket B, then a keyless window.
+#[tokio::test(start_paused = true)]
+async fn storage_model_round1_viewed_then_moved_out() {
+    replay(vec![
+        put(2, true),
+        deliver(false, true),
+        Step::View { mask: 4 },
+        put(2, false),
+        deliver(false, false),
+        deliver(true, false),
+    ])
+    .await;
+}
+
+/// Round 1 (B2): a starved keyless window over a carried delete, then a view.
+#[tokio::test(start_paused = true)]
+async fn storage_model_round1_starved_bulk_over_a_carried_delete() {
+    replay(vec![
+        put(2, false),
+        Step::Delete { i: 2 },
+        deliver(false, true),
+        put(2, true),
+        deliver(true, true),
+        Step::View { mask: 52 },
+        deliver(false, false),
+    ])
+    .await;
+}
+
+/// Round 2 (B3): a view check runs, its object moves to bucket B and that window is checked,
+/// then the answer lands. Also fails with brought- and forgotten-key logging both left out.
+#[tokio::test(start_paused = true)]
+async fn storage_model_round2_view_answer_lands_after_a_move() {
+    replay(vec![
+        put(1, true),
+        Step::Ask { mask: 2 },
+        Step::Run,
+        put(1, false),
+        deliver(false, false),
+        Step::Land,
+        deliver(true, false),
+    ])
+    .await;
+}
+
+/// B3 with bucket B's update and delete after the landed answer.
+#[tokio::test(start_paused = true)]
+async fn storage_model_b3_bucket_b_changes_after_a_landed_answer() {
+    replay(vec![
+        put(0, true),
+        Step::Ask { mask: 1 },
+        Step::Run,
+        put(0, false),
+        deliver(false, false),
+        Step::Land,
+        put(0, false),
+        deliver(false, false),
+        Step::Delete { i: 0 },
+        deliver(false, false),
+    ])
+    .await;
+}
+
+/// B3 through a keyless window: the move arrives without keys, so nothing is brought or
+/// forgotten; only the keyless-window check stops the answer.
+#[tokio::test(start_paused = true)]
+async fn storage_model_b3_keyless_window_before_a_landed_answer() {
+    replay(vec![
+        put(0, true),
+        Step::Ask { mask: 1 },
+        Step::Run,
+        put(0, false),
+        deliver(true, false),
+        Step::Land,
+        put(0, false),
+        deliver(false, false),
+        Step::Delete { i: 0 },
+        deliver(false, false),
+    ])
+    .await;
+}
+
+/// B3 through the carry: the move is carried (not checked, so not forgotten) before the
+/// answer lands, and its delete joins the carry. Only the brought-key log stops the delete.
+#[tokio::test(start_paused = true)]
+async fn storage_model_b3_carried_move_then_delete_after_a_landed_answer() {
+    replay(vec![
+        put(0, false),
+        deliver(false, false),
+        put(0, true),
+        Step::Ask { mask: 1 },
+        Step::Run,
+        put(0, false),
+        deliver(false, true),
+        Step::Land,
+        Step::Delete { i: 0 },
+        deliver(false, false),
+        Step::Retry { starved: false },
+    ])
+    .await;
+}
+
+/// B4: a delivered object's move out is carried, then trimmed by later carried keys; its
+/// delete in bucket B must not follow.
+#[tokio::test(start_paused = true)]
+async fn storage_model_b4_trimmed_move_out_then_delete() {
+    replay(vec![
+        put(0, true),
+        deliver(false, false),
+        put(0, false),
+        deliver(false, true),
+        put(1, true),
+        put(2, true),
+        deliver(false, false),
+        Step::Retry { starved: false },
+        Step::Delete { i: 0 },
+        deliver(false, false),
+    ])
+    .await;
+}
+
+/// B3 and B4 together (the round-3 audit): a move carried and trimmed while a view check is
+/// open, then the answer lands. Fails with brought- and trimmed-key logging both left out.
+#[tokio::test(start_paused = true)]
+async fn storage_model_b4_trim_while_a_view_check_is_open() {
+    replay(vec![
+        put(0, true),
+        deliver(false, false),
+        Step::Ask { mask: 1 },
+        Step::Run,
+        put(0, false),
+        deliver(false, true),
+        put(1, true),
+        put(2, true),
+        deliver(false, false),
+        Step::Land,
+        Step::Delete { i: 0 },
+        Step::Retry { starved: false },
+        deliver(false, false),
+    ])
+    .await;
+}
+
+/// A key carried before a view check and trimmed while it is open: the trim takes it off the
+/// viewer's sets, and the answer landing after mustn't put it back (only the trimmed-key log
+/// says so: no window brought it since the check was made).
+#[tokio::test(start_paused = true)]
+async fn storage_model_b4_key_carried_before_a_view_check_trimmed_during_it() {
+    replay(vec![
+        put(0, true),
+        deliver(false, true),
+        Step::Ask { mask: 1 },
+        Step::Run,
+        put(1, true),
+        put(2, true),
+        deliver(false, false),
+        Step::Land,
+        Step::Delete { i: 0 },
+        Step::Retry { starved: false },
+        deliver(false, false),
+    ])
+    .await;
 }
 
 // --- the socket (AC 4) -----------------------------------------------------------------------
