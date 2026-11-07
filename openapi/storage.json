@@ -713,7 +713,7 @@
           "storage"
         ],
         "summary": "Resolve object refs to URLs",
-        "description": "For each `storage.object_ref` (`bucket_id`, `name`), in order: a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
+        "description": "For each ref, in order (`{bucket_id, name}` as a `storage.object_ref` holds it, `{bucket, name}` for a text column marked `@storage_ref bucket=`, or `{id}` for a foreign key to `storage.objects(id)`): a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
         "operationId": "resolveObjects",
         "parameters": [
           {
@@ -2315,6 +2315,41 @@
           }
         }
       },
+      "BucketIdRef": {
+        "type": "object",
+        "description": "An object by its bucket's id and its name: a `storage.object_ref` value.",
+        "required": [
+          "bucket_id",
+          "name"
+        ],
+        "properties": {
+          "bucket_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "BucketRef": {
+        "type": "object",
+        "description": "An object by its bucket's name and its name: a text column marked\n`@storage_ref bucket=<bucket>` holds the name.",
+        "required": [
+          "bucket",
+          "name"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateBucket": {
         "type": "object",
         "description": "A new bucket.",
@@ -2372,6 +2407,20 @@
               "type": "string"
             },
             "description": "At most 1000."
+          }
+        },
+        "additionalProperties": false
+      },
+      "IdRef": {
+        "type": "object",
+        "description": "An object by its id: a column with a foreign key to `storage.objects(id)`.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
           }
         },
         "additionalProperties": false
@@ -2438,22 +2487,18 @@
         "additionalProperties": false
       },
       "ObjectRef": {
-        "type": "object",
-        "description": "One `storage.object_ref` value: an object by its bucket's id and its name.",
-        "required": [
-          "bucket_id",
-          "name"
-        ],
-        "properties": {
-          "bucket_id": {
-            "type": "string",
-            "format": "uuid"
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/BucketIdRef"
           },
-          "name": {
-            "type": "string"
+          {
+            "$ref": "#/components/schemas/BucketRef"
+          },
+          {
+            "$ref": "#/components/schemas/IdRef"
           }
-        },
-        "additionalProperties": false
+        ],
+        "description": "One object to resolve, named one of three ways."
       },
       "Relocate": {
         "type": "object",
@@ -2503,7 +2548,7 @@
             "items": {
               "$ref": "#/components/schemas/ObjectRef"
             },
-            "description": "At most 1000."
+            "description": "At most 1000, each `{bucket_id, name}`, `{bucket, name}` or `{id}`."
           }
         },
         "additionalProperties": false
