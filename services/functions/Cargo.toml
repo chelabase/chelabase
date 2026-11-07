@@ -49,3 +49,5 @@ zeroize = { workspace = true }
 # ResolvedFunction's compatibility date, in the metadata fake.
 chrono = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }
+# The e2e suite cleans up the rows it wrote directly to the metadata database.
+sqlx = { workspace = true }

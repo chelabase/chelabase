@@ -415,7 +415,7 @@ impl MetadataClient {
         for fix in fixes {
             let query = match fix {
                 KeyRoleFix::Revoke { id, role, oid } => sqlx::query(
-                    "UPDATE data_api_keys SET revoked_at = now()
+                    "UPDATE data_api_keys SET revoked_at = now(), sealed = NULL
                      WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
                        AND role = $3 AND role_oid IS NOT DISTINCT FROM $4",
                 )
@@ -617,8 +617,9 @@ impl MetadataClient {
     }
 
     /// Replaces a live key's database list (`None` is every served database). False for an
-    /// unknown or revoked key, or one of another branch. The list's bounds (1 to 20 names) are
-    /// the column's CHECK; callers validate first for a friendly message.
+    /// unknown or revoked key, or one of another branch; a key a function manages is
+    /// [`MetadataError::ManagedKey`], untouched. The list's bounds (1 to 20 names) are the
+    /// column's CHECK; callers validate first for a friendly message.
     pub async fn set_key_databases(
         &self,
         branch: BranchId,
@@ -627,7 +628,8 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE data_api_keys SET databases = $3
-             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL",
+             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL",
         )
         .bind(key_id)
         .bind(branch.as_uuid())
@@ -635,6 +637,9 @@ impl MetadataClient {
         .execute(&self.pool)
         .await?
         .rows_affected();
+        if updated == 0 && live_managed_key(&self.pool, branch, key_id).await? {
+            return Err(MetadataError::ManagedKey);
+        }
         Ok(updated == 1)
     }
 
