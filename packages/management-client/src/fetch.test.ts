@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
 import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, fetchStorageObject, managementConnection, parseExact, streamRequest } from "./fetch";
-import { exportMergePlan } from "./generated/endpoints";
+import { exportMergePlan, storageUploadObject } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
   return new Response(body, { status, headers: { "content-type": type } });
@@ -283,5 +283,36 @@ describe("managementConnection", () => {
     expect(c.token).toBe("t2");
     expect(c.onUnauthorized()).toBe(true);
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("customFetch content types", () => {
+  const sentType = async (call: () => Promise<unknown>) => {
+    const f = vi.fn(async () => res("{}"));
+    setup(f as unknown as typeof fetch);
+    await call();
+    const [, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    return { type: new Headers(init.headers).get("content-type"), body: init.body };
+  };
+
+  // #105: a caller's Content-Type is the body's; customFetch used to relabel every body JSON.
+  it("a_generated_upload_sends_the_callers_content_type_and_the_blob_as_is", async () => {
+    const blob = new Blob(["png"], { type: "image/png" });
+    const { type, body } = await sentType(() => storageUploadObject("d", "b", "docs", "a.png", blob, undefined, { headers: { "Content-Type": "image/png" } }));
+    expect(type).toBe("image/png");
+    expect(body).toBe(blob);
+    // Without one, the generated default (octet-stream) stands.
+    expect((await sentType(() => storageUploadObject("d", "b", "docs", "a.bin", blob))).type).toBe("application/octet-stream");
+  });
+
+  it("a_non_json_body_without_a_content_type_is_not_labelled_json", async () => {
+    for (const body of [new Blob(["x"]), new ArrayBuffer(1), new Uint8Array(1), new URLSearchParams("a=1"), new FormData(), new ReadableStream()]) {
+      const { type } = await sentType(() => customFetch("/v1/x", { method: "POST", body, ...(body instanceof ReadableStream ? { duplex: "half" } : {}) } as RequestInit));
+      expect(type === null || !type.startsWith("application/json")).toBe(true);
+    }
+  });
+
+  it("a_json_body_still_gets_application_json", async () => {
+    expect((await sentType(() => customFetch("/v1/x", { method: "POST", body: '{"a":1}' }))).type).toBe("application/json");
   });
 });

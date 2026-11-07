@@ -15,8 +15,8 @@ import type { UploadApi } from "./runner";
 
 /**
  * The runner's routes over Studio's storage console routes, as the Act as role (owner mode when
- * none). Bytes (a single upload, a part) go by XHR: `fetch` reports no upload progress, and the
- * generated calls would label every body JSON. The rest use the generated calls.
+ * none). Bytes (a single upload, a part) go by XHR, since `fetch` reports no upload progress;
+ * the rest use the generated calls.
  */
 
 /** A file's own type, else storage's default (storage reads the declared type, then sniffs). */
