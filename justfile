@@ -324,6 +324,12 @@ storage-iam-e2e:
 storage-e2e *args:
     cargo run -q -p chelabase -- workbench run scripts/storage-e2e.sh "$@"
 
+# Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
+# it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
+# and call a public function on the keyless form. Shared-state: writes and removes its own rows.
+functions-e2e:
+    cargo run -q -p chelabase -- workbench test -p chelabase-functions --test e2e -- --run-ignored only
+
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:
     cargo run -q -p chelabase -- workbench run scripts/data-e2e.sh
