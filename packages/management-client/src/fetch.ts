@@ -1,6 +1,6 @@
 import { ApiError } from "./error";
-import { getConsoleQueryUrl, getExportMergePlanUrl, getGetDataApiTypesUrl } from "./generated/endpoints";
-import type { ConsoleRequest, GetDataApiTypesParams } from "./generated/model";
+import { getConsoleQueryUrl, getExportMergePlanUrl, getGetDataApiTypesUrl, getStorageDownloadObjectUrl } from "./generated/endpoints";
+import type { ConsoleRequest, GetDataApiTypesParams, StorageDownloadObjectParams } from "./generated/model";
 import type { ErrorCode } from "./generated/model/errorCode";
 
 export interface ManagementClientConfig {
@@ -184,6 +184,40 @@ export const fetchMergePlanSql = async (id: string, mergeId: string): Promise<st
  */
 export const fetchDataApiTypes = async (id: string, branchId: string, params?: GetDataApiTypesParams): Promise<string> =>
   send<string>(getGetDataApiTypesUrl(id, branchId, params), { method: "GET" }, (text) => text);
+
+/**
+ * An object's bytes through Studio's storage console route (`GET …/storage/object/{bucket}/{name}`), as the role
+ * (the generated `storageDownloadObject` would parse them as JSON). `range` (one `bytes=` range) passes through and a
+ * 206 is a success; the Blob's type is the served Content-Type.
+ */
+export async function fetchStorageObject(
+  id: string,
+  branchId: string,
+  bucket: string,
+  name: string,
+  params?: StorageDownloadObjectParams,
+  options: { range?: string; signal?: AbortSignal } = {},
+): Promise<Blob> {
+  if (!config) throw new Error("Management client is not configured; call configureManagementClient first");
+  const token = config.getToken();
+  const init: RequestInit = { method: "GET", signal: options.signal };
+  const headers = buildHeaders(init, token ? { Authorization: `Bearer ${token}` } : {});
+  headers.set("Accept", "*/*");
+  if (options.range) headers.set("Range", options.range);
+  const fetchImpl = config.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  let response: Response;
+  try {
+    response = await fetchImpl(`${config.baseUrl}${getStorageDownloadObjectUrl(id, branchId, bucket, name, params)}`, { ...init, headers });
+  } catch (e) {
+    if (options.signal?.aborted || (e instanceof Error && e.name === "AbortError")) throw e;
+    throw new ApiError(0, "network", NETWORK_MESSAGE);
+  }
+  if (!response.ok) {
+    const restarted = response.status === 401 ? config.onUnauthorized() === true : false;
+    throw await readApiError(response, restarted);
+  }
+  return response.blob();
+}
 
 /**
  * POSTs `body` as JSON and returns the response body stream (for NDJSON endpoints).

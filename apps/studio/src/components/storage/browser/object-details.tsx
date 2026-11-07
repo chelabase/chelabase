@@ -20,6 +20,8 @@ export interface ObjectDetailsProps {
   publicUrl: string | null;
   /** Mints a signed URL (Developer and above); null for roles that can't sign. */
   sign: ((expiresIn: number) => Promise<{ url: string; expiresAt: number | null }>) | null;
+  /** The object's bytes through the console download route, as the role (Viewer and above). */
+  fetchObject: (range: string | undefined, signal?: AbortSignal) => Promise<Blob>;
   /** Rename, move, copy and delete (Developer and above). */
   canWrite: boolean;
   onSignUrl: () => void;
@@ -30,10 +32,11 @@ export interface ObjectDetailsProps {
   onClose: () => void;
 }
 
-/** Starts a download through a temporary link to a signed URL with `download` set (an attachment). */
-function startDownload(url: string): void {
+/** Starts a download through a temporary link: a signed URL with `download` set (an attachment), or a Blob's URL. */
+function startDownload(href: string, filename?: string): void {
   const a = document.createElement("a");
-  a.href = `${url}${url.includes("?") ? "&" : "?"}download=`;
+  a.href = href;
+  if (filename !== undefined) a.download = filename;
   a.rel = "noopener";
   document.body.append(a);
   a.click();
@@ -41,7 +44,7 @@ function startDownload(url: string): void {
 }
 
 /** The focused object: a preview, its details and the actions the role may take. */
-export function ObjectDetails({ item, publicUrl, sign, canWrite, onSignUrl, onRename, onMove, onCopy, onDelete, onClose }: ObjectDetailsProps) {
+export function ObjectDetails({ item, publicUrl, sign, fetchObject, canWrite, onSignUrl, onRename, onMove, onCopy, onDelete, onClose }: ObjectDetailsProps) {
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const name = baseName(item.name);
@@ -52,11 +55,19 @@ export function ObjectDetails({ item, publicUrl, sign, canWrite, onSignUrl, onRe
     ["Last modified", item.updatedAt === null ? "Unknown" : updatedText(item.updatedAt), false],
   ];
   async function download() {
-    if (!sign) return;
     setDownloadError(null);
     setDownloading(true);
     try {
-      startDownload((await sign(DOWNLOAD_TTL)).url);
+      if (sign) {
+        const { url } = await sign(DOWNLOAD_TTL);
+        startDownload(`${url}${url.includes("?") ? "&" : "?"}download=`);
+      } else {
+        // A Viewer can't sign: the bytes come through the console route, saved as an octet stream.
+        const blob = await fetchObject(undefined);
+        const href = URL.createObjectURL(new Blob([blob], { type: "application/octet-stream" }));
+        startDownload(href, name);
+        setTimeout(() => URL.revokeObjectURL(href), 0);
+      }
     } catch (err) {
       setDownloadError(errorText(err));
     } finally {
@@ -74,13 +85,11 @@ export function ObjectDetails({ item, publicUrl, sign, canWrite, onSignUrl, onRe
         </Button>
       </div>
       <div className="space-y-4 p-4 text-sm">
-        <ObjectPreview key={`${item.name}\n${item.etag ?? ""}`} name={name} contentType={item.contentType} size={item.size} sign={sign ? async () => (await sign(PREVIEW_TTL)).url : null} />
+        <ObjectPreview key={`${item.name}\n${item.etag ?? ""}`} name={name} contentType={item.contentType} size={item.size} source={sign ? { kind: "signed", sign: async () => (await sign(PREVIEW_TTL)).url } : { kind: "download", fetch: fetchObject }} />
         <div className="flex flex-wrap gap-2">
-          {sign && (
-            <Button size="sm" disabled={downloading} onClick={() => void download()}>
-              Download
-            </Button>
-          )}
+          <Button size="sm" disabled={downloading} onClick={() => void download()}>
+            Download
+          </Button>
           <CopyButton value={item.name} label="Copy path" text="Copy path" />
           {publicUrl && <CopyButton value={publicUrl} label="Copy public URL" text="Copy public URL" />}
           {sign && (

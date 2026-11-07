@@ -7,6 +7,14 @@ export const TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;
 /** Images above this aren't loaded for a preview. */
 export const IMAGE_PREVIEW_BYTES = 25 * 1024 * 1024;
 
+/** Media previewed through the download route is held in memory whole: none above this. */
+export const DOWNLOAD_PREVIEW_BYTES = 25 * 1024 * 1024;
+
+/** A content type's lower-case essence (`image/png` of `image/png; q=1`). */
+export function essenceOf(contentType: string | null | undefined): string {
+  return (contentType ?? "").split(";")[0].trim().toLowerCase();
+}
+
 const TOKEN = /^[a-z0-9!#$&^_.+-]+$/;
 
 /**

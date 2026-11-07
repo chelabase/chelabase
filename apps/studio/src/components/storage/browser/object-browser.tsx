@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useReducer, useState, type MouseEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { fetchStorageObject } from "@chelabase/management-client";
 import { LayoutGrid, List, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { errorText } from "@/lib/errors";
-import { invalidateStorage, publicObjectUrl, signObjectUrl, type Bucket, type StorageItem } from "@/lib/storage-api";
+import { invalidateStorage, publicObjectUrl, signObjectUrl, storageParams, type Bucket, type StorageItem } from "@/lib/storage-api";
 import { cn } from "@/lib/utils";
 import { DeleteObjectsDialog, RelocateDialog, RenameDialog, SignDialog, type ObjectPlace } from "./object-dialogs";
 import { ObjectDetails } from "./object-details";
@@ -99,6 +100,8 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
 
   const place: ObjectPlace = { databaseId, branchId, role, bucket: bucket.name };
   const sign = canWrite ? (expiresIn: number) => signObjectUrl(apiUrl, databaseId, branchId, role, bucket.name, focused?.name ?? "", expiresIn) : null;
+  const fetchObject = (range: string | undefined, signal?: AbortSignal) =>
+    fetchStorageObject(databaseId, branchId, bucket.name, focused?.name ?? "", storageParams(role), { range, signal });
   const refresh = () => invalidateStorage(queryClient, databaseId, branchId);
   const loadMore = useCallback(() => void pages.loadMore(), [pages]);
 
@@ -272,6 +275,7 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
             item={focused}
             publicUrl={bucket.public ? publicObjectUrl(apiUrl, branchId, pgDatabase, bucket.name, focused.name) : null}
             sign={sign}
+            fetchObject={fetchObject}
             canWrite={canWrite}
             onSignUrl={() => setDialog("sign")}
             onRename={() => setDialog("rename")}

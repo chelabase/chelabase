@@ -1,44 +1,64 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { errorText } from "@/lib/errors";
-import { IMAGE_PREVIEW_BYTES, TEXT_PREVIEW_BYTES, prettyText, previewKind } from "./preview-kind";
+import { DOWNLOAD_PREVIEW_BYTES, IMAGE_PREVIEW_BYTES, TEXT_PREVIEW_BYTES, essenceOf, prettyText, previewKind } from "./preview-kind";
+
+/**
+ * Where a preview's bytes come from: a signed URL (Developer and above: media streams from the
+ * API host), or Studio's console download route as the role (a Viewer: the bytes come back as a
+ * Blob and play from a `blob:` URL typed as the preview's own type).
+ */
+export type PreviewSource =
+  | { kind: "signed"; sign: () => Promise<string> }
+  | { kind: "download"; fetch: (range: string | undefined, signal: AbortSignal) => Promise<Blob> };
 
 export interface ObjectPreviewProps {
   name: string;
   contentType: string | null;
   size: number | null;
-  /** Mints a signed URL for the object; null when the role can't sign (below Developer). */
-  sign: (() => Promise<string>) | null;
+  /** None when the role can't read the object's bytes here. */
+  source: PreviewSource | null;
 }
 
 type Loaded = { state: "loading" } | { state: "error"; message: string } | { state: "ready"; url: string; text?: string };
 
-function Note({ children }: { children: React.ReactNode }) {
+function Note({ children }: { children: ReactNode }) {
   return <p className="border border-line p-4 text-sm text-chalk-dim">{children}</p>;
 }
 
+const TEXT_RANGE = `bytes=0-${TEXT_PREVIEW_BYTES - 1}`;
+
 /**
- * A side-panel preview from a signed URL: images, video, audio and PDF load from it (storage
- * serves them sandboxed, never sniffed); text and JSON are read as text (at most the first
- * 2 MiB, by range) and shown as source, so stored HTML never renders here. SVG and unknown types
- * get no preview.
+ * A side-panel preview: images (never SVG), video, audio and PDF from a signed URL or a typed
+ * `blob:` URL; text and JSON read as text (at most the first 2 MiB, by range) and shown as source,
+ * so stored HTML never renders here. Unknown types get no preview.
  */
-export function ObjectPreview({ name, contentType, size, sign }: ObjectPreviewProps) {
+export function ObjectPreview({ name, contentType, size, source }: ObjectPreviewProps) {
   const kind = previewKind(contentType);
-  const tooBig = kind === "image" && size !== null && size > IMAGE_PREVIEW_BYTES;
-  const wanted = kind !== "none" && !tooBig && sign !== null;
+  const limit = source?.kind === "download" && kind !== "text" ? DOWNLOAD_PREVIEW_BYTES : kind === "image" ? IMAGE_PREVIEW_BYTES : Infinity;
+  const tooBig = kind !== "text" && size !== null && size > limit;
+  const wanted = kind !== "none" && !tooBig && source !== null;
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
 
   useEffect(() => {
-    if (!wanted || !sign) return;
+    if (!wanted || !source) return;
     let live = true;
+    let blobUrl: string | null = null;
     const controller = new AbortController();
     setLoaded({ state: "loading" });
-    (async () => {
-      const url = await sign();
-      if (kind !== "text") return { state: "ready" as const, url };
-      const response = await fetch(url, { headers: { Range: `bytes=0-${TEXT_PREVIEW_BYTES - 1}` }, signal: controller.signal });
+    (async (): Promise<Loaded> => {
+      if (source.kind === "download") {
+        if (kind === "text") return { state: "ready", url: "", text: prettyText(await (await source.fetch(TEXT_RANGE, controller.signal)).text(), contentType) };
+        const bytes = await source.fetch(undefined, controller.signal);
+        // Typed as what's previewed, whatever the response said: never a document on Studio's origin.
+        blobUrl = URL.createObjectURL(new Blob([bytes], { type: essenceOf(contentType) }));
+        if (!live) URL.revokeObjectURL(blobUrl);
+        return { state: "ready", url: blobUrl };
+      }
+      const url = await source.sign();
+      if (kind !== "text") return { state: "ready", url };
+      const response = await fetch(url, { headers: { Range: TEXT_RANGE }, signal: controller.signal });
       if (!response.ok) throw new Error(`The file couldn't be read (${response.status})`);
-      return { state: "ready" as const, url, text: prettyText(await response.text(), contentType) };
+      return { state: "ready", url, text: prettyText(await response.text(), contentType) };
     })().then(
       (next) => live && setLoaded(next),
       (err: unknown) => live && !controller.signal.aborted && setLoaded({ state: "error", message: errorText(err) }),
@@ -46,14 +66,15 @@ export function ObjectPreview({ name, contentType, size, sign }: ObjectPreviewPr
     return () => {
       live = false;
       controller.abort();
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
     };
-    // One load per object: `sign` is a new function each render.
+    // One load per object: `source` is a new object each render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wanted, name, contentType, kind]);
+  }, [wanted, name, contentType, kind, source?.kind]);
 
   if (kind === "none") return <Note>No preview for this type. Download the file to open it.</Note>;
   if (tooBig) return <Note>Too large to preview here. Download the file to open it.</Note>;
-  if (!sign) return <Note>Previews load from a signed URL, and signing needs Developer access.</Note>;
+  if (!source) return <Note>This file can&apos;t be previewed with your access.</Note>;
   if (loaded.state === "loading") return <Note>Loading preview…</Note>;
   if (loaded.state === "error")
     return (

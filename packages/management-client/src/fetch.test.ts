@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, parseExact, streamRequest } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, fetchStorageObject, parseExact, streamRequest } from "./fetch";
 import { exportMergePlan } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
@@ -224,5 +224,49 @@ describe("fetchDataApiTypes", () => {
   it("errors_are_api_errors", async () => {
     setup((async () => res('{"error":{"code":"forbidden","message":"this needs role:x","required":"role:x"}}', 403)) as typeof fetch);
     await expect(fetchDataApiTypes("d", "b")).rejects.toMatchObject({ status: 403, code: "forbidden" });
+  });
+});
+
+describe("fetchStorageObject", () => {
+  it("returns_the_bytes_as_a_blob_with_the_role_and_an_encoded_key", async () => {
+    const f = vi.fn(async () => new Response(new Uint8Array([0, 159, 255]), { status: 200, headers: { "content-type": "image/png" } }));
+    setup(f as unknown as typeof fetch);
+    const blob = await fetchStorageObject("d", "b", "avatars", "photos/a b.png", { role: "reporter" });
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe("image/png");
+    expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([0, 159, 255]);
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/v1/databases/d/branches/b/storage/object/avatars/photos%2Fa%20b.png?role=reporter");
+    expect(init.method).toBe("GET");
+    const h = new Headers(init.headers);
+    expect(h.get("authorization")).toBe("Bearer tok");
+    expect(h.get("range")).toBeNull();
+  });
+
+  it("sends_a_range_and_reads_a_206", async () => {
+    const f = vi.fn(async () => new Response("hello", { status: 206, headers: { "content-type": "text/plain" } }));
+    setup(f as unknown as typeof fetch);
+    const blob = await fetchStorageObject("d", "b", "docs", "a.txt", undefined, { range: "bytes=0-4" });
+    expect(await blob.text()).toBe("hello");
+    const [, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(new Headers(init.headers).get("range")).toBe("bytes=0-4");
+  });
+
+  it("errors_are_api_errors_and_a_401_calls_onUnauthorized", async () => {
+    setup((async () => res('{"error":{"code":"object_not_found","message":"no such object"}}', 404)) as typeof fetch);
+    await expect(fetchStorageObject("d", "b", "docs", "a.txt")).rejects.toMatchObject({ status: 404, code: "object_not_found", message: "no such object" });
+    const onUnauthorized = vi.fn(() => true);
+    setup((async () => res('{"error":{"code":"unauthorized","message":"expired"}}', 401)) as typeof fetch, "tok", onUnauthorized);
+    await expect(fetchStorageObject("d", "b", "docs", "a.txt")).rejects.toMatchObject({ status: 401, signInRestarted: true });
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it("a_network_failure_is_a_network_error_but_an_abort_stays_an_abort", async () => {
+    setup((async () => Promise.reject(new TypeError("fetch failed"))) as typeof fetch);
+    await expect(fetchStorageObject("d", "b", "docs", "a.txt")).rejects.toMatchObject({ code: "network" });
+    const controller = new AbortController();
+    controller.abort();
+    setup((async () => Promise.reject(new DOMException("aborted", "AbortError"))) as typeof fetch);
+    await expect(fetchStorageObject("d", "b", "docs", "a.txt", undefined, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
   });
 });

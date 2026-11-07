@@ -261,3 +261,52 @@ describe("ObjectBrowser", () => {
     expect(await screen.findByText(/The bucket is write-once/)).toBeInTheDocument();
   });
 });
+
+describe("ObjectBrowser: a Viewer reads through the download route", () => {
+  it("a_viewer_previews_an_image_and_a_text_file_and_gets_no_signed_url", async () => {
+    let n = 0;
+    Object.assign(URL, { createObjectURL: vi.fn(() => `blob:v-${++n}`), revokeObjectURL: vi.fn() });
+    const { f, user } = setup("viewer", {
+      me: meAs("viewer", ["reporter"]),
+      items: [file("a.png"), file("notes.txt", 11, "text/plain")],
+      routes: {
+        [`GET ${S}/object/avatars/a.png`]: () => new Response(new Uint8Array([137, 80]), { headers: { "content-type": "image/png" } }),
+        [`GET ${S}/object/avatars/notes.txt`]: () => new Response("hello notes", { status: 206, headers: { "content-type": "text/plain" } }),
+      },
+    });
+    const rows = within(await objects());
+    await user.click(await rows.findByRole("button", { name: "a.png" }));
+    let details = within(await screen.findByRole("complementary", { name: "Object details" }));
+    expect(await details.findByRole("img", { name: "a.png" })).toHaveAttribute("src", expect.stringMatching(/^blob:v-/));
+    expect(details.getByRole("button", { name: "Download" })).toBeInTheDocument();
+    expect(details.queryByRole("button", { name: "Copy signed URL" })).toBeNull();
+    const downloads = () => f.calls.filter((r) => r.method === "GET" && new URL(r.url).pathname.startsWith(`${S}/object/avatars/`));
+    expect(new URL(downloads()[0].url).searchParams.get("role")).toBe("reporter");
+    // Nothing was signed.
+    expect(f.calls.some((r) => new URL(r.url).pathname.includes("/object/sign/"))).toBe(false);
+
+    await user.click(rows.getByRole("button", { name: "notes.txt" }));
+    details = within(await screen.findByRole("complementary", { name: "Object details" }));
+    expect(await details.findByText("hello notes")).toBeInTheDocument();
+    expect(downloads().at(-1)!.headers.get("range")).toBe("bytes=0-2097151");
+    expect(details.queryByRole("button", { name: "Copy signed URL" })).toBeNull();
+  });
+
+  it("a_viewer_downloads_through_the_download_route", async () => {
+    Object.assign(URL, { createObjectURL: vi.fn(() => "blob:dl"), revokeObjectURL: vi.fn() });
+    const clicked: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push(`${this.getAttribute("href")} ${this.download}`);
+    });
+    const { f, user } = setup("viewer", {
+      me: meAs("viewer", ["reporter"]),
+      items: [file("data.bin", 3, "application/octet-stream")],
+      routes: { [`GET ${S}/object/avatars/data.bin`]: () => new Response(new Uint8Array([1, 2, 3]), { headers: { "content-type": "application/octet-stream" } }) },
+    });
+    await user.click(await within(await objects()).findByRole("button", { name: "data.bin" }));
+    await user.click(within(await screen.findByRole("complementary", { name: "Object details" })).getByRole("button", { name: "Download" }));
+    await waitFor(() => expect(clicked).toEqual(["blob:dl data.bin"]));
+    const get = f.calls.find((r) => r.method === "GET" && new URL(r.url).pathname === `${S}/object/avatars/data.bin`)!;
+    expect(get.headers.get("range")).toBeNull();
+  });
+});
