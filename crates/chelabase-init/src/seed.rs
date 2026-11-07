@@ -98,6 +98,11 @@ pub const SEED_KEYS: &[SeedKey] = &[
         Rule::Secret,
     ),
     s(
+        "CHELABASE_SEED_NATS_FUNCTIONS_PASSWORD",
+        "nats/functions.password",
+        Rule::Secret,
+    ),
+    s(
         "CHELABASE_SEED_VALKEY_PROXY_PASSWORD",
         "valkey/proxy.password",
         Rule::Secret,
@@ -155,6 +160,16 @@ pub const SEED_KEYS: &[SeedKey] = &[
     s(
         "CHELABASE_SEED_STORAGE_INTERNAL_TOKEN",
         "tokens/storage-internal.token",
+        Rule::Secret,
+    ),
+    s(
+        "CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN",
+        "tokens/orchestrator-functions.token",
+        Rule::Secret,
+    ),
+    s(
+        "CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN",
+        "tokens/worker-functions.token",
         Rule::Secret,
     ),
     s(

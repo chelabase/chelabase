@@ -193,6 +193,7 @@ pub const LAYOUT: &[Entry] = &[
     e("nats/realtime.password", M, Gen::Text32, P),
     e("nats/runner.password", M, Gen::Text32, P),
     e("nats/storage.password", M, Gen::Text32, P),
+    e("nats/functions.password", M, Gen::Text32, P),
     e("valkey/proxy.password", M, Gen::Text32, P),
     e("valkey/control.password", M, Gen::Text32, P),
     e("valkey/realtime.password", M, Gen::Text32, P),
@@ -212,6 +213,9 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/app-auth.token", M, Gen::Text32, P),
     e("tokens/app-sessions.token", M, Gen::Text32, P),
     e("tokens/storage-internal.token", M, Gen::Text32, P),
+    // Edge functions m4b: the functions service's internal listener, one bearer per caller.
+    e("tokens/orchestrator-functions.token", M, Gen::Text32, P),
+    e("tokens/worker-functions.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
     e("tokens/auth-identity.token", M, Gen::Token32, P),
@@ -2268,20 +2272,49 @@ mod tests {
     /// ones included.
     #[test]
     fn upgrade_adds_storage_secrets_and_keeps_the_rest() {
-        const STORAGE: [&str; 2] = ["nats/storage.password", "tokens/storage-internal.token"];
+        assert_upgrade_adds(&["nats/storage.password", "tokens/storage-internal.token"], "storage");
+    }
+
+    /// Edge functions m4b: likewise an install from before the functions service.
+    #[test]
+    fn upgrade_adds_functions_secrets_and_keeps_the_rest() {
+        assert_upgrade_adds(
+            &["nats/functions.password", "tokens/orchestrator-functions.token", "tokens/worker-functions.token"],
+            "functions",
+        );
+    }
+
+    /// Edge functions m4b: the functions bearers (the orchestrator's bundle uploads, the
+    /// worker's invocations) are made by a fresh run, at least 32 characters and different,
+    /// and a second run leaves them byte for byte.
+    #[test]
+    fn functions_bearers_are_made_once_and_differ() {
         let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
-        for f in STORAGE {
+        let read = |f: &str| std::fs::read(t.path().join(f)).unwrap();
+        let (orch, worker) = (read("tokens/orchestrator-functions.token"), read("tokens/worker-functions.token"));
+        assert!(orch.len() >= 32 && worker.len() >= 32);
+        assert_ne!(orch, worker);
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
+        assert_eq!(read("tokens/orchestrator-functions.token"), orch);
+        assert_eq!(read("tokens/worker-functions.token"), worker);
+    }
+
+    fn assert_upgrade_adds(files: &[&str], user: &str) {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        for f in files {
             std::fs::remove_file(t.path().join(f)).unwrap();
         }
-        // NATS's users as such an install rendered them: no storage user.
+        // NATS's users as such an install rendered them: without `user`.
         let rendered = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
         let start = rendered
-            .find("    {\n      user: \"storage\"\n")
-            .expect("a storage user in auth.conf");
+            .find(&format!("    {{\n      user: \"{user}\"\n"))
+            .expect("the user in auth.conf");
         let end = start + rendered[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
         let auth = format!("{}{}", &rendered[..start], &rendered[end..]);
-        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key("storage"));
+        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key(user));
         assert_eq!(
             crate::kinds::service_auth::previous_nats_hashes(&auth).len(),
             crate::kinds::stack_secrets::NATS_USERS.len() - 1
@@ -2291,7 +2324,9 @@ mod tests {
         let r = ensure_secrets(t.path(), &opts()).unwrap();
         let mut created = r.created.clone();
         created.sort();
-        assert_eq!(created, STORAGE.map(|f| t.path().join(f)));
+        let mut want: Vec<_> = files.iter().map(|f| t.path().join(f)).collect();
+        want.sort();
+        assert_eq!(created, want);
         assert_eq!(r.rewritten, [t.path().join("nats/auth.conf")]);
         assert!(r.auth_files.nats && !r.auth_files.valkey);
         let after = snapshot(t.path());
@@ -2323,7 +2358,7 @@ mod tests {
             );
             assert!(before.contains_key(Path::new(kept)), "{kept}");
         }
-        // The other users keep their passwords; storage's new one verifies.
+        // The other users keep their passwords; the new one verifies.
         let new = String::from_utf8(after[Path::new("nats/auth.conf")].0.clone()).unwrap();
         assert_ne!(new, auth);
         let hashes = crate::kinds::service_auth::previous_nats_hashes(&new);
