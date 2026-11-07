@@ -282,6 +282,29 @@ async fn flow(api: &Api, project: &str) {
             && !body.contains("hidden row"),
         "fn_hidden as fn_reporter: {status} {body}"
     );
+
+    // m2's note on #165: a branch of a parent with function secrets is made through the
+    // orchestrator (its metadata client has the secrets key: the copy opens and seals again
+    // each secret for the child), and the child has the secret.
+    s.secret("notes", "API_KEY", "for the child").await;
+    let child = api
+        .ok(
+            reqwest::Method::POST,
+            &format!("/v1/databases/{db}/branches"),
+            Some(json!({ "name": format!("fn-child-{stamp}"), "parent_branch_id": db })),
+            &[201, 202],
+        )
+        .await;
+    let child = child["id"].as_str().expect("the child's id");
+    let names = api
+        .ok(
+            reqwest::Method::GET,
+            &format!("/v1/databases/{db}/branches/{child}/functions/notes/secrets"),
+            None,
+            &[200],
+        )
+        .await;
+    assert_eq!(names, json!(["API_KEY"]), "the child's secrets");
 }
 
 async fn s_within(
