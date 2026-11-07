@@ -28,6 +28,12 @@ export interface DataKey {
   kind: DataKeyKind;
   /** @nullable */
   last_used_at: string | null;
+  /**
+     * The function whose run-as key this is (edge functions m3): it can't be rotated,
+     * revoked or narrowed here. Absent for every other key.
+     * @nullable
+     */
+  managed_by_function?: string | null;
   name: string;
   prefix: string;
   role: string;

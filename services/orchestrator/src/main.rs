@@ -157,6 +157,18 @@ async fn main() -> anyhow::Result<()> {
     for entry in webhooks.allow_hosts_with_port() {
         warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
     }
+    // Edge functions m3: bundles go to the functions service's internal listener.
+    let bundles: orchestrator::functions::Bundles = Arc::new(orchestrator::functions::HttpBundleSink::new(
+        std::env::var("CHELABASE_FUNCTIONS_INTERNAL_URL").ok().filter(|v| !v.trim().is_empty()),
+        chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_default(),
+        // Never a redirect (#26): the bearer goes to the functions service only.
+        chelabase_http::client_builder().build()?,
+    ));
+    if std::env::var("CHELABASE_FUNCTIONS_INTERNAL_URL").is_err() {
+        warn!("CHELABASE_FUNCTIONS_INTERNAL_URL is not set: function deployments answer 503");
+    }
     let state = AppState {
         metadata,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
@@ -195,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
         webhooks,
+        bundles,
         compute_tls: Some(compute_tls),
     };
 
