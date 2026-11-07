@@ -1,7 +1,7 @@
 // #102: `client.storage.resolve` turns `StorageRef`s (a `storage.object_ref` column's values)
 // into URLs in one batched request.
 import { expect, test } from "vitest";
-import { createClient, type StorageRef } from "./index.ts";
+import { createClient, type StorageRef, type StorageRefLike } from "./index.ts";
 
 const url = "http://localhost:8000";
 const key = "chk_pub_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
@@ -15,7 +15,7 @@ interface Call {
 }
 
 /** A fake resolve endpoint: answers each ref with `answer`, recording every call. */
-function server(answer: (r: StorageRef) => string | null) {
+function server(answer: (r: StorageRef & { id?: string }) => string | null) {
   const calls: Call[] = [];
   const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -93,4 +93,32 @@ test("a public bucket's URL comes back as the server gives it, made absolute", a
   const s = server((r) => `/storage/v1/object/public/br/pub/${r.name}`);
   const storage = createClient({ url, key, fetch: s.fetch }).storage;
   expect(await storage.resolve({ bucket_id: B1, name: "logo.png" })).toBe(`${url}/storage/v1/object/public/br/pub/logo.png`);
+});
+
+test("#102: an object id (a foreign key) and a bucket's name with a path resolve in the same batch", async () => {
+  const s = server((r) => `/storage/v1/object/sign/b/${r.name ?? r.id}?token=t`);
+  const storage = createClient({ url, key, fetch: s.fetch }).storage;
+  const refs: StorageRefLike[] = [
+    { id: B2 },
+    { bucket: "avatars", name: "u1/me.png" },
+    { bucket_id: B1, name: "a.png" },
+  ];
+  const urls = await storage.resolve(refs);
+  expect(urls).toEqual([
+    `${url}/storage/v1/object/sign/b/${B2}?token=t`,
+    `${url}/storage/v1/object/sign/b/u1/me.png?token=t`,
+    `${url}/storage/v1/object/sign/b/a.png?token=t`,
+  ]);
+  expect(s.calls).toHaveLength(1);
+  // Each ref is sent as its own shape, nothing more.
+  expect(s.calls[0]!.body).toEqual({ refs: [{ id: B2 }, { bucket: "avatars", name: "u1/me.png" }, { bucket_id: B1, name: "a.png" }] });
+  expect(await storage.resolve({ id: B1 })).toBe(`${url}/storage/v1/object/sign/b/${B1}?token=t`);
+});
+
+test("#102: extra fields on a ref (a whole row) are not sent", async () => {
+  const s = server(signed);
+  const storage = createClient({ url, key, fetch: s.fetch }).storage;
+  const row = { bucket_id: B1, name: "a.png", owner: "u1" } as StorageRef;
+  await storage.resolve([row, { id: B2, other: 1 } as StorageRefLike]);
+  expect(s.calls[0]!.body).toEqual({ refs: [{ bucket_id: B1, name: "a.png" }, { id: B2 }] });
 });
