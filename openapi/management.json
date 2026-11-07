@@ -13868,7 +13868,7 @@
           "storage"
         ],
         "summary": "Create a storage webhook",
-        "description": "Registers an endpoint for the database's storage object events (every branch's, made through the storage API; changes made with SQL directly on `storage.objects` send none). Each event is POSTed as JSON, signed with `Chelabase-Signature: t=<unix>,v1=<hex HMAC-SHA256 of \"<t>.<body>\">`, at least once, retried with backoff for up to 24 hours. The secret is in this response only. A database has at most 20 endpoints.",
+        "description": "Registers an endpoint for the database's storage object events (every branch's, made through the storage API; changes made with SQL directly on `storage.objects` send none). Each event is POSTed as JSON, signed with `Chelabase-Signature: t=<unix>,v1=<hex HMAC-SHA256 of \"<t>.<body>\">`, at least once, retried with backoff for up to 24 hours. A database keeps at most 100,000 undelivered events: past that its oldest events are dropped unsent. The secret is in this response only. A database has at most 20 endpoints.",
         "operationId": "createStorageWebhook",
         "parameters": [
           {
