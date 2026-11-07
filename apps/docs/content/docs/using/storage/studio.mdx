@@ -25,7 +25,7 @@ Studio's routes check your access on every request, the same as the API: see the
 
 ## Signed URLs from Studio
 
-**Copy signed URL** needs the role you act as held at Developer (Admin in owner mode). The URL lasts at most an hour, and works while the object's version is current and while you can still act as that role at Developer, or are still an Admin, for one made in owner mode: it stops when you're removed, when that role drops to Viewer or leaves your grant, or when the role becomes Admin-only (owner-level, LOGIN or ADMIN).
+**Copy signed URL** needs the role you act as held at Developer (Admin in owner mode). The URL lasts at most an hour, and works while the object's version is current and while you can still act as that role at Developer, or are still an Admin, for one made in owner mode: it stops when you're removed, when the granted role you reach it through drops to Viewer or leaves your grant, or when the role becomes Admin-only (owner-level, LOGIN or ADMIN).
 
 The table editor resolves object references through a route that needs only Viewer access, so a Viewer can see which references exist and are visible to their role, and preview through Studio's own download route. The signed URLs that route returns open only while you can act as that role at Developer, the same as **Copy signed URL**.
 
