@@ -48,7 +48,7 @@ await db.storage.from("docs").upload("reports/2026-11.pdf", source.body!, {
 });
 ```
 
-A secret key's role is `authenticated`, so bucket changes need a policy on `storage.buckets` too, or create buckets in SQL as the owner.
+A secret key's role is `authenticated`, so bucket changes need a policy on `storage.buckets` too, or create buckets in SQL as the owner. Name them within the [bucket-name grammar](/using/storage#bucket-names): a bucket created in SQL outside it can be read, but uploads, copies into it, moves and deletes answer 400.
 
 ## Upload
 

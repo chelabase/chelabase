@@ -44,6 +44,8 @@ What each call needs:
 
 The owner itself bypasses row-level security, so it can create buckets in SQL. Objects are different: an object row is only valid with the bytes behind it, so even the owner writes objects through the storage API, never with `INSERT` on `storage.objects`.
 
+Bucket names in these examples follow the [bucket-name grammar](/using/storage#bucket-names) (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit). A bucket you insert with a name outside it can be read, but uploads, deletes, moves and copies into it answer 400.
+
 ## A private bucket for your server
 
 Only your server's secret key (role `authenticated`, no app user) may use `docs`:

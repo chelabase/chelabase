@@ -423,6 +423,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
     security(("bearer" = [])),
     responses(
         (status = 200, description = "`id` (the session), `bucket`, `name`, `expires_at` (Unix seconds), `min_part_size`, `max_part_size`", body = Value),
+        (status = 400, description = "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: no policy allows the write, or the caller can't see the bucket", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert); `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
@@ -673,7 +674,7 @@ pub async fn abort<S: ConnSource, M: ConnSource>(
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
-        (status = 400, description = "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last; `invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: the policies no longer allow it", body = StorageErrorEnvelope),
         (status = 404, description = "`upload_not_found`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won; `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),

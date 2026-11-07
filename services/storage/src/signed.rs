@@ -624,7 +624,7 @@ pub async fn signed_download<S: ConnSource, M: ConnSource>(
     security(("bearer" = [])),
     responses(
         (status = 200, description = "`signed_url` (a path on the API host) and `expires_at`", body = Value),
-        (status = 400, description = "`invalid_request`", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`", body = StorageErrorEnvelope),
     ),
 )]
