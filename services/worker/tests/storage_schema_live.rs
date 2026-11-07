@@ -2456,6 +2456,7 @@ async fn in_process_storage_with(store: Arc<FailingStore>, branch: BranchId, inf
         store,
         urls: storage::control::Urls::new(Arc::new(storage::control::Orchestrator::new(&url, &token))),
         inflight,
+        events: storage::events::ObjectEvents::none(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -4340,4 +4341,182 @@ async fn storage_ref_foreign_key_live() {
         assert_eq!(call("DELETE", &up("a2.txt"), vec![], &[]).await.0, 204);
     }))
     .await;
+}
+
+// --- m18: storage webhooks, end to end ------------------------------------------------------
+
+/// `docker compose` on the stack's project with the stack's files (never the task checkout's),
+/// with `env` in the command's environment: the worker's `environment:` passes the webhook
+/// settings through from it.
+async fn stack_compose(env: &[(&str, &str)], args: &[&str]) {
+    let var = |v: &str| std::env::var(v).unwrap_or_else(|_| panic!("{v} is unset (the stack's runner sets it)"));
+    let checkout = std::env::var("CHELABASE_STACK_CHECKOUT").unwrap_or_else(|_| var("CHELABASE_CHECKOUT"));
+    let out = tokio::process::Command::new("docker")
+        .args(["compose", "-p", &var("CHELABASE_COMPOSE_PROJECT"), "-f"])
+        .arg(format!("{checkout}/infra/compose/docker-compose.yml"))
+        .arg("-f")
+        .arg(format!("{checkout}/infra/compose/docker-compose.workbench.yml"))
+        .arg("--env-file")
+        .arg(format!("{}/env/stack.env", var("CHELABASE_STACK_DIR")))
+        .args(args)
+        .env("CHELABASE_CHECKOUT", &checkout)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run docker compose");
+    assert!(out.status.success(), "docker compose {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The runner container's name: the stack's worker reaches it by that name on the default
+/// network.
+async fn runner_host() -> String {
+    let hostname = std::fs::read_to_string("/etc/hostname").expect("the container's hostname");
+    let out = tokio::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Name}}", hostname.trim()])
+        .output()
+        .await
+        .expect("docker inspect");
+    assert!(out.status.success(), "docker inspect: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('/').to_string()
+}
+
+/// One request an endpoint received: its headers (lower-case names) and body.
+struct Received {
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// An endpoint on every interface of the runner, answering 200 to each POST and handing each
+/// request to the returned channel.
+async fn webhook_endpoint() -> (u16, tokio::sync::mpsc::UnboundedReceiver<Received>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let (head_end, length) = loop {
+                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..at]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        break (at + 4, length);
+                    }
+                };
+                while buf.len() < head_end + length {
+                    let Ok(n) = sock.read(&mut chunk).await else { return };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let headers = head
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect();
+                let body = buf[head_end..(head_end + length).min(buf.len())].to_vec();
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                let _ = tx.send(Received { headers, body });
+            });
+        }
+    });
+    (port, rx)
+}
+
+/// AC 1: an endpoint in the runner's network for `object.created` on bucket `files` gets one
+/// signed POST with the event's fields within seconds of an upload there; an upload to another
+/// bucket sends nothing. The stack's worker is recreated with the runner's host allowlisted
+/// (and `http` allowed) for the test, then recreated plain, pass or fail.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_webhooks_live() {
+    let host = runner_host().await;
+    let allow: &'static str = Box::leak(host.clone().into_boxed_str());
+    stack_compose(
+        &[("CHELABASE_WEBHOOKS_ALLOW_HTTP", "true"), ("CHELABASE_WEBHOOKS_ALLOW_HOSTS", allow)],
+        &["up", "-d", "--force-recreate", "--no-deps", "worker"],
+    )
+    .await;
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_webhooks(&task, &host).await }).await;
+    fx.purge_blobs(&object_store().await).await;
+    fx.teardown().await;
+    stack_compose(&[], &["up", "-d", "--force-recreate", "--no-deps", "worker"]).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_webhooks(fx: &Fx, host: &str) {
+    let secret = objects_fixture(fx, &[("INSERT", "NULL", "'true'"), ("SELECT", "'true'", "NULL")]).await;
+    let (port, mut received) = webhook_endpoint().await;
+    let webhook_id = Uuid::new_v4();
+    let signing = format!("whsec_live_{}", Uuid::new_v4().simple());
+    let events = vec!["object.created".to_string()];
+    let url = format!("http://{host}:{port}/hook");
+    fx.metadata
+        .create_storage_webhook(&chelabase_metadata::NewStorageWebhook {
+            id: webhook_id,
+            database_id: fx.id.as_uuid(),
+            url: &url,
+            events: &events,
+            bucket: Some("files"),
+            prefix: None,
+            secret_enc: &chelabase_secrets::seal_webhook_secret(&fx.worker.key, webhook_id, &signing),
+        })
+        .await
+        .expect("create the endpoint")
+        .expect("under the cap");
+
+    let (status, _, b) = object("POST", "/storage/v1/object/other/skip.txt", &secret, Some(b"no".to_vec().into()), &[("content-type", "text/plain")]).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
+    let (status, _, b) = object("POST", "/storage/v1/object/files/a.txt", &secret, Some(b"abc".to_vec().into()), &[("content-type", "text/plain")]).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
+    let uploaded = json_of(&b);
+
+    // The worker reads the endpoints every 5 s and has just restarted: well within 90 s.
+    let got = tokio::time::timeout(Duration::from_secs(90), received.recv())
+        .await
+        .expect("a delivery within 90 s")
+        .expect("the endpoint still listens");
+    let signature = got.headers.get("chelabase-signature").expect("a signature").clone();
+    let now = chrono::Utc::now().timestamp();
+    assert_eq!(worker::storage_webhooks::verify(&signing, &signature, &got.body, now, 300), Ok(()));
+    let event: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(event["type"], "object.created");
+    assert_eq!(event["bucket"], "files");
+    assert_eq!(event["name"], "a.txt");
+    assert_eq!(event["database_id"], json!(fx.id.as_uuid()));
+    assert_eq!(event["branch_id"], json!(fx.main.as_uuid()));
+    assert_eq!(event["pg_database"], json!(fx.database));
+    assert_eq!(event["version_id"], uploaded["version_id"]);
+    assert_eq!(event["size"], 3);
+    assert_eq!(event["content_type"], "text/plain");
+    assert_eq!(event["actor"]["role"], "authenticated");
+    assert_eq!(got.headers.get("chelabase-event-id"), event["id"].as_str().map(str::to_string).as_ref());
+    assert!(!String::from_utf8_lossy(&got.body).contains("abc"), "never the contents");
+
+    // Nothing for the other bucket, nor a second copy (given time for both).
+    let extra = tokio::time::timeout(Duration::from_secs(15), received.recv()).await;
+    assert!(extra.is_err(), "an unexpected delivery: {:?}", extra.ok().flatten().map(|r| String::from_utf8_lossy(&r.body).to_string()));
+    let attempts = fx.metadata.list_storage_webhook_attempts(fx.id.as_uuid(), webhook_id, 10).await.unwrap();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!((attempts[0].outcome.as_str(), attempts[0].status), ("delivered", Some(200)));
+    assert!(fx.metadata.delete_storage_webhook(fx.id.as_uuid(), webhook_id).await.unwrap());
 }

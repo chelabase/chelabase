@@ -508,6 +508,10 @@ services:
       - CHELABASE_STORAGE_SWEEP_DRY_RUN=${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
       - CHELABASE_IDENTITY_URL=http://identity:8080
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      # object-storage m18: bare names, taken from the caller's env (unset when it has none). The
+      # runner's webhook live test recreates the worker with these to reach its own endpoint.
+      - CHELABASE_WEBHOOKS_ALLOW_HTTP
+      - CHELABASE_WEBHOOKS_ALLOW_HOSTS
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes: !override
       - *checkout-ro
