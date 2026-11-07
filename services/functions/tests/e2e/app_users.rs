@@ -6,23 +6,24 @@
 //! The database, its app users and the table are made through the management API and SQL, as
 //! `scripts/app-users-e2e.sh` makes them (a project, a database in it, app users on, a table
 //! with an own-row policy on `chelabase.user_id()`), and the users sign up through the gateway.
-//! The function is deployed as in the other e2e (TODO(#165): the management API).
+//! The function is deployed, and its run-as role set, through the management API (#165).
 
 use std::time::{Duration, Instant};
 
-use chelabase_metadata::{DEMO_TENANT_ID, RunAs};
-use chelabase_types::data_key::{DataKeyKind, generate};
+use chelabase_metadata::DEMO_TENANT_ID;
 use chelabase_types::{BranchId, DatabaseId};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{Stack, env, metadata};
+use super::{Api, Stack, metadata};
 
-/// The function: the notes it can read through the binding, as its caller (`?as=caller`) or as
-/// its run-as role (`?as=service`). `x-has-service-key` says whether it got a service key.
+/// The function: the rows of a table (`?table=`, `notes` by default) it can read through the
+/// binding, as its caller (`?as=caller`) or as its run-as role (`?as=service`).
+/// `x-has-service-key` says whether it got a service key.
 const NOTES: &str = r#"export default {
   async fetch(request, env) {
-    const as = new URL(request.url).searchParams.get("as") ?? "caller";
+    const params = new URL(request.url).searchParams;
+    const as = params.get("as") ?? "caller";
     const headers = { "content-type": "application/json" };
     if (as === "service") {
       headers.authorization = `Bearer ${env.CHELABASE_SERVICE_KEY ?? "none"}`;
@@ -36,7 +37,7 @@ const NOTES: &str = r#"export default {
     const res = await env.CHELABASE.fetch(new URL("/data/v1/query", env.CHELABASE_URL), {
       method: "POST",
       headers,
-      body: JSON.stringify({ v: 1, op: "select", from: "notes", select: ["body"] }),
+      body: JSON.stringify({ v: 1, op: "select", from: params.get("table") ?? "notes" }),
     });
     return new Response(await res.text(), {
       status: res.status,
@@ -45,56 +46,12 @@ const NOTES: &str = r#"export default {
   },
 };"#;
 
-/// The management API as the workbench's dev member (`chelabase dev token`, per request: it is
-/// short-lived).
-struct Api {
-    http: reqwest::Client,
-    base: String,
+/// The owner's SQL on a database (Studio's SQL editor route).
+trait Sql {
+    async fn sql(&self, db: DatabaseId, sql: &str) -> Vec<Vec<Option<String>>>;
 }
 
-impl Api {
-    fn token() -> String {
-        let out = std::process::Command::new(env("CHELABASE_CLI"))
-            .args(["dev", "token"])
-            .output()
-            .expect("chelabase dev token");
-        assert!(
-            out.status.success(),
-            "chelabase dev token: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    }
-
-    async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
-        let mut req = self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .bearer_auth(Self::token());
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-        let resp = req.send().await.expect("the gateway");
-        let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
-        (
-            status,
-            serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        )
-    }
-
-    async fn ok(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<Value>,
-        want: &[u16],
-    ) -> Value {
-        let (status, body) = self.call(method.clone(), path, body).await;
-        assert!(want.contains(&status), "{method} {path}: {status} {body}");
-        body
-    }
-
+impl Sql for Api {
     /// The script's rows (each a list of text cells), as the owner; panics on an error event.
     async fn sql(&self, db: DatabaseId, sql: &str) -> Vec<Vec<Option<String>>> {
         let resp = self
@@ -259,7 +216,9 @@ async fn flow(api: &Api, project: &str) {
                  owner uuid NOT NULL DEFAULT chelabase.user_id(), body text NOT NULL);
              ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
              CREATE POLICY notes_own ON notes FOR SELECT TO authenticated USING (owner = chelabase.user_id());
-             GRANT SELECT ON notes TO authenticated;
+             GRANT SELECT ON notes TO authenticated, anon;
+             CREATE TABLE fn_hidden (body text NOT NULL);
+             INSERT INTO fn_hidden VALUES ('hidden row');
              INSERT INTO notes (owner, body) VALUES ('{a}', 'note of a'), ('{b}', 'note of b');"
         ),
     )
@@ -282,52 +241,28 @@ async fn flow(api: &Api, project: &str) {
         status == 200 && body.contains("note of b") && !body.contains("note of a"),
         "app user b: {status} {body}"
     );
+    // The public key alone is `anon`: granted, but no policy lets it see a row.
     let (status, _, body) = notes(&s, "", None).await;
-    assert!(
-        !body.contains("note of a") && !body.contains("note of b"),
-        "the public key alone: {status} {body}"
+    assert_eq!(
+        (status, serde_json::from_str::<Value>(&body).ok()),
+        (200, Some(json!([]))),
+        "the public key alone: {body}"
     );
 
     // Run-as: a role that reads every note; the function's service key queries as it.
-    let oid = api
-        .sql(
-            db,
-            "CREATE ROLE fn_reporter NOLOGIN; GRANT fn_reporter TO authenticator;
+    api.sql(
+        db,
+        "CREATE ROLE fn_reporter NOLOGIN; GRANT fn_reporter TO authenticator;
              GRANT USAGE ON SCHEMA public TO fn_reporter; GRANT SELECT ON notes TO fn_reporter;
              CREATE POLICY notes_reporter ON notes FOR SELECT TO fn_reporter USING (true);
-             SELECT oid::text FROM pg_roles WHERE rolname = 'fn_reporter';",
-        )
-        .await
-        .into_iter()
-        .find_map(|r| r.into_iter().next().flatten())
-        .expect("fn_reporter's oid");
-    let function = s
-        .metadata
-        .list_functions(db)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|f| f.name == "notes")
-        .unwrap()
-        .id;
-    let key = generate(DataKeyKind::Secret);
-    let run_as = RunAs {
-        role: "fn_reporter".into(),
-        role_oid: oid.parse().unwrap(),
-        role_timeline: None,
-        role_bypass_rls: false,
-        key_id: Uuid::new_v4(),
-        prefix: key.prefix.clone(),
-        sha256: key.sha256,
-        secret: key.key.clone(),
-    };
-    assert!(
-        s.metadata
-            .set_run_as(s.branch, function, Some(&run_as))
-            .await
-            .unwrap()
-    );
-    s.changed("notes").await;
+             SELECT 1;",
+    )
+    .await;
+    let set = s
+        .patch("notes", json!({ "run_as_role": "fn_reporter" }))
+        .await;
+    assert_eq!(set["run_as_role"], json!("fn_reporter"), "{set}");
+    assert_eq!(set["run_as_active"], json!(true), "{set}");
     let (status, has_key, body) = s_within_query(&s, "?as=service", |st, b| {
         st == 200 && b.contains("note of a") && b.contains("note of b")
     })
@@ -336,6 +271,16 @@ async fn flow(api: &Api, project: &str) {
     assert!(
         status == 200 && body.contains("note of a") && body.contains("note of b"),
         "as fn_reporter: {status} {body}"
+    );
+    // And only as fn_reporter: a table it has no grant on is refused (the data API hides it,
+    // `unknown_table`, or Postgres refuses it, `permission_denied`), where an RLS-bypassing
+    // owner would read it.
+    let (status, _, body) = notes(&s, "?as=service&table=fn_hidden", None).await;
+    assert!(
+        matches!(status, 403 | 404)
+            && (body.contains("unknown_table") || body.contains("permission_denied"))
+            && !body.contains("hidden row"),
+        "fn_hidden as fn_reporter: {status} {body}"
     );
 }
 
@@ -373,12 +318,7 @@ async fn poll<F: std::future::Future<Output = (u16, String, String)>>(
 #[tokio::test]
 #[ignore = "needs the workbench stack with the gateway binding (#183): just functions-e2e"]
 async fn app_user_rls_and_run_as_through_the_binding() {
-    let api = Api {
-        http: reqwest::Client::new(),
-        base: env("CHELABASE_ENTRY_API_URL")
-            .trim_end_matches('/')
-            .to_owned(),
-    };
+    let api = Api::new();
     let name = format!(
         "functions-e2e-{}",
         &Uuid::new_v4().simple().to_string()[..6]
@@ -397,10 +337,7 @@ async fn app_user_rls_and_run_as_through_the_binding() {
     );
     let run = {
         let id = id.clone();
-        let api = Api {
-            http: api.http.clone(),
-            base: api.base.clone(),
-        };
+        let api = Api::new();
         tokio::spawn(async move { flow(&api, &id).await })
     };
     let result = run.await;
