@@ -1441,6 +1441,7 @@ mod tests {
             ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}", "storageDeleteObjects"),
             ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/copy", "storageCopyObject"),
             ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/move", "storageMoveObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/resolve", "storageResolveObjects"),
             ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{name}", "storageSignObject"),
             ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/{bucket}/{name}", "storageCreateUpload"),
             ("PUT /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/{part}", "storageUploadPart"),
