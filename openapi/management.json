@@ -25928,6 +25928,7 @@
           "tenant_id",
           "member",
           "instance_admin",
+          "functions_available",
           "projects",
           "user",
           "tenant",
@@ -25940,6 +25941,10 @@
               "null"
             ],
             "description": "The member's email (null when unknown), else the token's."
+          },
+          "functions_available": {
+            "type": "boolean",
+            "description": "Whether members may manage and run edge functions on this instance (false in platform\nmode, where every functions route answers 403 `not_available_in_platform_mode`)."
           },
           "instance_admin": {
             "type": "boolean",
