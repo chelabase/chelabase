@@ -12,9 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chelabase_metadata::members::MemberStatus;
-use chelabase_metadata::{BranchKind, BranchStatus, DataKeyLookup};
-use chelabase_types::access::{PlatformRole, tenant_admin_effective};
+use chelabase_metadata::{BranchKind, BranchStatus, DataKeyLookup, DatabaseStatus};
+use chelabase_types::access::{PlatformRole, Requested};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_neon::ComputeLocator;
 use chelabase_secrets::{Purpose, derive_key};
@@ -24,7 +23,9 @@ use serde_json::{Value, json};
 use tracing::error;
 use uuid::Uuid;
 
-use super::{InternalState, NeonMetadataPort};
+use super::{ConsoleUrlFacts, InternalState, NeonMetadataPort};
+use crate::access::{RoleGraph, act_as_allowed, act_as_reads_graph, member_facts};
+use crate::roles;
 
 /// The URL-signing key's current generation. A new one (a rotation) makes every URL signed
 /// with an older one fail.
@@ -91,14 +92,14 @@ struct LiveQuery {
 }
 
 /// How a console URL was minted, as its signed claims say.
-#[derive(Clone, Copy)]
-enum Minted<'a> {
+#[derive(Clone, Copy, Debug)]
+pub enum ConsoleMinter<'a> {
     Owner,
     Role(&'a str),
 }
 
 /// The live key with this id (as the gateway's lookup answers it); else, for a URL minted from
-/// the console (m9, the member as its key), the member while [`console_signer_live`] says so,
+/// the console (m9, the member as its key), the member while [`console_url_live`] says so,
 /// on `?branch=`; 404 for anything else.
 async fn live_key<M, L>(
     State(state): St<M, L>,
@@ -120,11 +121,11 @@ where
     // A console URL names exactly one of owner mode and its role; one naming neither (minted
     // before #100) or both is never live.
     let minted = match (q.owner, q.role.as_deref()) {
-        (true, None) => Minted::Owner,
-        (false, Some(role)) if !role.is_empty() => Minted::Role(role),
+        (true, None) => ConsoleMinter::Owner,
+        (false, Some(role)) if !role.is_empty() => ConsoleMinter::Role(role),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    match console_signer_live(&state, key_id, BranchId(branch), minted).await {
+    match console_url_live(&state.metadata, key_id, BranchId(branch), minted).await {
         Ok(Some(project)) => Json(json!({
             "key_id": key_id,
             "branch_id": branch,
@@ -140,48 +141,66 @@ where
     }
 }
 
-/// Whether `member` may still use a URL they minted from the console on `branch`: the branch is
-/// a normal one not being deleted, the member is active (not offboarded) in the tenant of the
-/// branch's project, and their access on the branch's database (their own and team grants,
-/// with the database's override; a tenant admin's is Admin with every role) still holds the
-/// role the URL was minted as at Developer (#100: the role's own level, as console `sign`
-/// needs it), or is Admin for a URL minted in owner mode. The project when so.
-async fn console_signer_live<M, L>(
-    state: &InternalState<M, L>,
+/// Whether `member` may still use a URL they minted from the console on `branch` (#100): the
+/// branch is a normal one not being deleted, and console `sign` by the member, as the role the
+/// URL was minted as (or in owner mode), on that branch, would be authorized now. That is
+/// [`act_as_allowed`] at Developer (`sign`'s level) on the same facts [`authorize`] reads: the
+/// database (not deleted, in the member's tenant), the member (active, not offboarded; a
+/// tenant admin as [`tenant_admin_effective`]), their own and team grants with the database's
+/// override, the branch's role graph (chains, R21; owner-level, LOGIN and ADMIN roles, R16,
+/// R22, R23) and the personal logins (MH-21). The project when so.
+///
+/// Nothing here is cached: storage keeps each answer for `LIVENESS_TTL` (5 s) and drops them
+/// on an access event, so a grant change counts at once and a role graph change (DDL, which
+/// sends no access event) within 5 s.
+///
+/// [`authorize`]: crate::access::authorize
+/// [`tenant_admin_effective`]: chelabase_types::access::tenant_admin_effective
+pub async fn console_url_live<F: ConsoleUrlFacts>(
+    facts: &F,
     member: Uuid,
     branch: BranchId,
-    minted: Minted<'_>,
-) -> Result<Option<ProjectId>, chelabase_metadata::MetadataError>
-where
-    M: NeonMetadataPort,
-    L: ComputeLocator,
-{
-    let Some(b) = state.metadata.get_branch(branch).await? else {
+    minted: ConsoleMinter<'_>,
+) -> Result<Option<ProjectId>, chelabase_metadata::MetadataError> {
+    let Some(b) = facts.get_branch(branch).await? else {
         return Ok(None);
     };
     if b.kind != BranchKind::Normal || matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted) {
         return Ok(None);
     }
-    let Some(project) = state.metadata.database_project(b.database_id).await? else {
+    let Some(db) = facts.get_database(b.database_id).await? else {
         return Ok(None);
     };
-    let Some(p) = state.metadata.project_by_id(project).await? else {
+    if db.status == DatabaseStatus::Deleted {
+        return Ok(None);
+    }
+    let Some((m, sources)) = facts.member_access(member, db.project_id, db.database_id).await? else {
         return Ok(None);
     };
-    let Some((m, sources)) = state.metadata.member_access(member, project, b.database_id).await? else {
+    if m.tenant_id != db.tenant_id {
         return Ok(None);
+    }
+    let caller = member_facts(Some(&m));
+    let grant = sources.effective();
+    let requested = match minted {
+        ConsoleMinter::Owner => Requested::Owner,
+        ConsoleMinter::Role(role) => Requested::Role(role),
     };
-    let active = m.status == MemberStatus::Active && !m.offboarded && m.tenant_id == p.tenant_id;
-    let effective = if m.tenant_admin { Some(tenant_admin_effective()) } else { sources.effective() };
-    let enough = effective.is_some_and(|e| match minted {
-        Minted::Owner => e.platform_role == PlatformRole::Admin,
-        Minted::Role(role) => {
-            e.platform_role >= PlatformRole::Developer
-                && e.roles.may_act_as(role)
-                && e.level_of(role).is_some_and(|l| l >= PlatformRole::Developer)
-        }
-    });
-    Ok((active && enough).then_some(project))
+    let owner = roles::owner_name(&db);
+    let min = PlatformRole::Developer;
+    let graph = match (&b.endpoint_id, act_as_reads_graph(caller, grant.as_ref(), min, requested, owner)) {
+        (Some(endpoint), true) => Some(RoleGraph::new(owner, facts.list_roles(endpoint).await?)),
+        _ => None,
+    };
+    let personal_login = match minted {
+        ConsoleMinter::Owner => false,
+        ConsoleMinter::Role(role) => match Requested::from_name(role, owner) {
+            Requested::Role(name) => facts.is_personal_login_name(db.database_id, name).await?,
+            Requested::Owner => false,
+        },
+    };
+    let allowed = act_as_allowed(caller, grant.as_ref(), min, requested, owner, graph.as_ref(), personal_login);
+    Ok(allowed.is_ok().then_some(db.project_id))
 }
 
 #[derive(Deserialize)]

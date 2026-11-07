@@ -13,6 +13,7 @@ pub mod realtime;
 mod signup;
 mod spec;
 mod storage;
+pub use storage::{ConsoleMinter, console_url_live};
 
 pub use signup::{SETUP_NONCE_TTL, SetupCode, load_setup_code};
 
@@ -50,8 +51,43 @@ pub(crate) const DDL_BODY_LIMIT: usize = 64 * 1024;
 /// `(tenant, token_hash)` of each accepted invite of one identity user, newest first.
 pub type AcceptedInvites = Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>;
 
+/// What console URL liveness reads (#100, [`console_url_live`]): the same facts console
+/// act-as ([`crate::access::authorize`]) reads, each the [`MetadataClient`] method of the same
+/// name. A trait of its own so a test can answer it from the console's fake and run both
+/// sides on one world.
+pub trait ConsoleUrlFacts: Send + Sync {
+    fn get_branch(
+        &self,
+        id: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+    /// The database (any status).
+    fn get_database(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError>> + Send;
+    /// A member by id (any status) and their access sources on `project`, with `database`'s
+    /// override.
+    fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> impl Future<Output = Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError>> + Send;
+    /// An endpoint's roles as 6a records them (the role graph).
+    fn list_roles(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::RoleRow>, MetadataError>> + Send;
+    /// Whether `name` is a personal login of the database (any status).
+    fn is_personal_login_name(
+        &self,
+        database: DatabaseId,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+}
+
 /// The metadata the internal routes read. Abstracted so tests can use an in-memory fake.
-pub trait NeonMetadataPort: Send + Sync + 'static {
+pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
     /// The DDL receiver's transaction.
     type Ddl: DdlPort;
 
@@ -152,23 +188,11 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         project: ProjectId,
     ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
-    fn get_branch(
-        &self,
-        id: BranchId,
-    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
     /// The project the database belongs to, deleted or not.
     fn database_project(
         &self,
         db: DatabaseId,
     ) -> impl Future<Output = Result<Option<ProjectId>, MetadataError>> + Send;
-    /// Object storage m9: a member by id (any status) and their access sources on `project`,
-    /// with `database`'s override; the liveness of a URL they minted from the console.
-    fn member_access(
-        &self,
-        member: Uuid,
-        project: ProjectId,
-        database: DatabaseId,
-    ) -> impl Future<Output = Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError>> + Send;
     /// The database's main branch, unless it's deleted.
     fn main_branch(
         &self,
@@ -309,6 +333,33 @@ pub struct SignUpFacts {
 
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
 // path, or a rename would make it call itself.
+impl ConsoleUrlFacts for MetadataClient {
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::get_branch(self, id).await
+    }
+    async fn get_database(&self, db: DatabaseId) -> Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError> {
+        MetadataClient::get_database(self, db).await
+    }
+    async fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        let Some(record) = MetadataClient::member(self, member).await? else {
+            return Ok(None);
+        };
+        let sources = MetadataClient::grant_sources(self, member, project.as_uuid(), Some(database.as_uuid())).await?;
+        Ok(Some((record, sources)))
+    }
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<chelabase_metadata::RoleRow>, MetadataError> {
+        MetadataClient::list_roles(self, endpoint_id).await
+    }
+    async fn is_personal_login_name(&self, database: DatabaseId, name: &str) -> Result<bool, MetadataError> {
+        MetadataClient::is_personal_login_name(self, database.as_uuid(), name).await
+    }
+}
+
 impl NeonMetadataPort for MetadataClient {
     type Ddl = chelabase_metadata::DdlTx;
 
@@ -401,25 +452,10 @@ impl NeonMetadataPort for MetadataClient {
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         MetadataClient::project_auth(self, project).await
     }
-    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
-        MetadataClient::get_branch(self, id).await
-    }
     async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
         Ok(MetadataClient::get_database(self, db)
             .await?
             .map(|d| d.project_id))
-    }
-    async fn member_access(
-        &self,
-        member: Uuid,
-        project: ProjectId,
-        database: DatabaseId,
-    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
-        let Some(record) = MetadataClient::member(self, member).await? else {
-            return Ok(None);
-        };
-        let sources = MetadataClient::grant_sources(self, member, project.as_uuid(), Some(database.as_uuid())).await?;
-        Ok(Some((record, sources)))
     }
     async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
         Ok(MetadataClient::list_branches(self, db)
