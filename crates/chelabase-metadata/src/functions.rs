@@ -20,6 +20,7 @@
 //! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes) | branch create copies (insert), tombstone purge (delete) |
+//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
 //! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync |
 //!
@@ -28,7 +29,9 @@
 //! (5) before it revokes or inserts a key (6). A function delete writes key rows without an
 //! endpoint row: it revokes only its own managed keys (at most one live per branch) and waits
 //! for nothing after them, so a role drop holding the endpoint and one of those rows can't
-//! wait on it in a cycle. `set_function_last_error` updates its state row alone.
+//! wait on it in a cycle. `set_function_last_error` updates its state row alone, and the
+//! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
+//! alone, skipping any another transaction holds, and takes nothing after them.
 //! `function_writes_keep_the_lock_order` (`tests/functions_live.rs`) runs each function write
 //! against each existing writer, stalled on each row in turn, in both orders.
 //!
@@ -185,6 +188,118 @@ pub struct ScheduleRecord {
     pub timezone: String,
     pub next_run_at: Option<DateTime<Utc>>,
     pub enabled: bool,
+}
+
+/// A schedule's part a caller got wrong ([`Schedule::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleError {
+    Cron(String),
+    Timezone(String),
+}
+
+impl ScheduleError {
+    /// The request field it names: `cron` or `timezone`.
+    pub fn field(&self) -> &'static str {
+        match self {
+            ScheduleError::Cron(_) => "cron",
+            ScheduleError::Timezone(_) => "timezone",
+        }
+    }
+}
+
+impl std::fmt::Display for ScheduleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScheduleError::Cron(why) | ScheduleError::Timezone(why) => {
+                write!(f, "{}: {why}", self.field())
+            }
+        }
+    }
+}
+
+/// A checked schedule: a 5-field cron (minute granularity, no seconds or years) in an IANA
+/// time zone. Times in a DST gap run at the first instant after it; times a fall-back repeats
+/// run once.
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    cron: croner::Cron,
+    tz: chrono_tz::Tz,
+}
+
+impl Schedule {
+    pub fn parse(cron: &str, timezone: &str) -> Result<Schedule, ScheduleError> {
+        use croner::parser::{CronParser, Seconds, Year};
+        if cron.is_empty() || cron.len() > 100 {
+            return Err(ScheduleError::Cron("1 to 100 characters".into()));
+        }
+        if timezone.is_empty() || timezone.len() > 64 {
+            return Err(ScheduleError::Timezone("1 to 64 characters".into()));
+        }
+        let parsed = CronParser::builder()
+            .seconds(Seconds::Disallowed)
+            .year(Year::Disallowed)
+            .build()
+            .parse(cron)
+            .map_err(|e| ScheduleError::Cron(format!("not a 5-field cron ({e})")))?;
+        let tz = timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| ScheduleError::Timezone(format!("unknown IANA time zone {timezone:?}")))?;
+        Ok(Schedule { cron: parsed, tz })
+    }
+
+    /// The first time strictly after `after`; `None` when there is none (a date that never
+    /// comes).
+    pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.cron
+            .find_next_occurrence(&after.with_timezone(&self.tz), false)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
+}
+
+/// What a claim does with one due schedule ([`advance`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advance {
+    /// The new `next_run_at`.
+    pub next: Option<DateTime<Utc>>,
+    /// Run the function for this tick (the `scheduledTime`): the due `next_run_at`, once, however
+    /// many ticks were missed; `None` for a disabled or undeployed function, or a schedule that
+    /// had no time yet.
+    pub run: Option<DateTime<Utc>>,
+    /// The schedule stays enabled; false when its cron or time zone no longer parses or it has
+    /// no time left.
+    pub enabled: bool,
+}
+
+/// A due schedule's step at `now`: missed ticks coalesce into one run, and `next_run_at` moves
+/// to the first tick after `now`, whether the function runs or not.
+pub fn advance(
+    cron: &str,
+    timezone: &str,
+    due: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    function_enabled: bool,
+) -> Advance {
+    let next = Schedule::parse(cron, timezone)
+        .ok()
+        .and_then(|s| s.next_after(now));
+    Advance {
+        next,
+        run: due.filter(|_| function_enabled && next.is_some()),
+        enabled: next.is_some(),
+    }
+}
+
+/// A schedule a claim advanced ([`MetadataClient::claim_due_schedules`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedSchedule {
+    pub id: Uuid,
+    pub branch_id: BranchId,
+    pub function_name: String,
+    pub cron: String,
+    /// The tick to run, `None` when nothing runs ([`Advance::run`]).
+    pub run: Option<DateTime<Utc>>,
+    pub next_run_at: Option<DateTime<Utc>>,
 }
 
 /// A trigger to add. `table`: `schema_name`, `table_name` and events from insert, update and
@@ -1287,6 +1402,154 @@ impl MetadataClient {
             enabled: r.get("enabled"),
         })
         .collect())
+    }
+
+    /// Changes a schedule of the function on the branch: what is given of `cron`, `timezone`
+    /// and `enabled`. A changed cron or time zone, or turning it on, moves `next_run_at` to the
+    /// first tick after now. `None` when the branch has no such schedule for the function.
+    pub async fn update_schedule(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        id: Uuid,
+        cron: Option<&str>,
+        timezone: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<ScheduleRecord>, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let row = sqlx::query(
+            "SELECT cron, timezone, next_run_at, enabled, now() AS now FROM function_schedules
+             WHERE id = $1 AND branch_id = $2 AND function_id = $3 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let was: (String, String, bool) = (row.get("cron"), row.get("timezone"), row.get("enabled"));
+        let new_cron = cron.unwrap_or(&was.0);
+        let new_tz = timezone.unwrap_or(&was.1);
+        let new_enabled = enabled.unwrap_or(was.2);
+        let schedule = Schedule::parse(new_cron, new_tz).map_err(|e| invalid(e.to_string()))?;
+        let mut next: Option<DateTime<Utc>> = row.get("next_run_at");
+        if new_cron != was.0 || new_tz != was.1 || (new_enabled && !was.2) {
+            next = schedule.next_after(row.get("now"));
+        }
+        sqlx::query(
+            "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(new_cron)
+        .bind(new_tz)
+        .bind(new_enabled)
+        .bind(next)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_check)?;
+        tx.commit().await?;
+        Ok(Some(ScheduleRecord {
+            id,
+            branch_id: branch,
+            function_id,
+            cron: new_cron.to_owned(),
+            timezone: new_tz.to_owned(),
+            next_run_at: next,
+            enabled: new_enabled,
+        }))
+    }
+
+    /// Deletes a schedule of the function on the branch. False when there was none.
+    pub async fn delete_schedule(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let deleted = sqlx::query(
+            "DELETE FROM function_schedules WHERE id = $1 AND branch_id = $2 AND function_id = $3",
+        )
+        .bind(id)
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(deleted == 1)
+    }
+
+    /// The worker's claim: up to `limit` enabled schedules due by the database's `now()` (or
+    /// with no time yet) on a live branch of a live database, locked `FOR UPDATE SKIP LOCKED`
+    /// so concurrent claimers never take the same row, each advanced by [`advance`] in the same
+    /// transaction. The caller runs the ones with [`ClaimedSchedule::run`] after this returns
+    /// (at most once: a failed run isn't retried).
+    pub async fn claim_due_schedules(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ClaimedSchedule>, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT s.id, s.branch_id, f.name, s.cron, s.timezone, s.next_run_at,
+                    coalesce(bf.enabled, false) AS function_enabled, now() AS now
+             FROM function_schedules s
+             JOIN branches b ON b.id = s.branch_id AND b.status NOT IN ('deleting', 'deleted')
+             JOIN databases db ON db.id = b.database_id AND db.status NOT IN ('deleting', 'deleted')
+             JOIN functions f ON f.id = s.function_id AND f.database_id = db.id
+             LEFT JOIN branch_functions bf
+               ON bf.branch_id = s.branch_id AND bf.function_id = s.function_id
+             WHERE s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+             ORDER BY s.next_run_at NULLS FIRST, s.id
+             LIMIT $1
+             FOR UPDATE OF s SKIP LOCKED",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        let (mut ids, mut nexts, mut enabled) = (Vec::new(), Vec::new(), Vec::new());
+        for r in &rows {
+            let cron: String = r.get("cron");
+            let step = advance(
+                &cron,
+                r.get("timezone"),
+                r.get("next_run_at"),
+                r.get("now"),
+                r.get("function_enabled"),
+            );
+            let id: Uuid = r.get("id");
+            ids.push(id);
+            nexts.push(step.next);
+            enabled.push(step.enabled);
+            claimed.push(ClaimedSchedule {
+                id,
+                branch_id: BranchId(r.get("branch_id")),
+                function_name: r.get("name"),
+                cron,
+                run: step.run,
+                next_run_at: step.next,
+            });
+        }
+        if !ids.is_empty() {
+            sqlx::query(
+                "UPDATE function_schedules AS s SET next_run_at = v.next, enabled = v.enabled
+                 FROM unnest($1::uuid[], $2::timestamptz[], $3::bool[]) AS v(id, next, enabled)
+                 WHERE s.id = v.id",
+            )
+            .bind(ids)
+            .bind(nexts)
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     /// Adds a trigger for the function on the branch: a table trigger `pending_install` (the

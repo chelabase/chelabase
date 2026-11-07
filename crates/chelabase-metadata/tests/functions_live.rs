@@ -1641,6 +1641,7 @@ mod functions {
         deployment: Uuid,
         managed_key: Uuid,
         other_key: Uuid,
+        schedule: Uuid,
     }
 
     impl Scratch {
@@ -1659,7 +1660,17 @@ mod functions {
             c.put_secret(main, f, "API_KEY", "v").await.unwrap();
             let other_key = Uuid::new_v4();
             c.create_secret_key(&secret_key(other_key, main, "other", 77)).await.unwrap();
-            Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key }
+            let schedule = c
+                .add_schedule(&NewSchedule {
+                    branch_id: main,
+                    function_id: f,
+                    cron: "* * * * *",
+                    timezone: "UTC",
+                    next_run_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                })
+                .await
+                .unwrap();
+            Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key, schedule }
         }
     }
 
@@ -1684,7 +1695,7 @@ mod functions {
     type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MetadataError>> + Send>>;
     type Op = fn(MetadataClient, Contended) -> Fut;
 
-    /// The function writes (m2, m3a).
+    /// The function writes (m2, m3a, m7's schedule writes and claim).
     fn function_writes() -> Vec<(&'static str, Op)> {
         vec![
             ("set_run_as", |c, x| Box::pin(async move { c.set_run_as(x.main, x.f, Some(&run_as("writer", 5151))).await.map(drop) })),
@@ -1695,6 +1706,9 @@ mod functions {
             ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t").await })),
             ("set_active_deployment", |c, x| Box::pin(async move { c.set_active_deployment(x.main, x.f, x.deployment).await })),
             ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
+            ("update_schedule", |c, x| Box::pin(async move { c.update_schedule(x.main, x.f, x.schedule, Some("*/5 * * * *"), None, None).await.map(drop) })),
+            ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
+            ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
         ]
     }
 
@@ -1810,12 +1824,13 @@ mod functions {
     async fn function_writes_keep_the_lock_order() {
         let s = Scratch::new().await;
         // The rows a write can be stalled on, as SQL taking them FOR UPDATE.
-        let stalls: [(&str, &str); 6] = [
+        let stalls: [(&str, &str); 7] = [
             ("database", "SELECT 1 FROM databases WHERE id = $1 FOR UPDATE"),
             ("branch", "SELECT 1 FROM branches WHERE id = $2 FOR UPDATE"),
             ("endpoint", "SELECT 1 FROM neon_endpoints WHERE id = $3 FOR UPDATE"),
             ("function", "SELECT 1 FROM functions WHERE id = $4 FOR UPDATE"),
             ("branch state", "SELECT 1 FROM branch_functions WHERE function_id = $4 FOR UPDATE"),
+            ("schedule", "SELECT 1 FROM function_schedules WHERE function_id = $4 FOR UPDATE"),
             ("managed key", "SELECT 1 FROM data_api_keys WHERE id = $5 FOR UPDATE"),
         ];
         let mut pairs = Vec::new();
@@ -1854,6 +1869,49 @@ mod functions {
             }
         }
         assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+        s.finish().await;
+    }
+
+    /// m7: a schedule's update recomputes `next_run_at` when its cron or time zone changes or it
+    /// is turned on, keeps it otherwise, refuses a bad cron, and finds only the function's own
+    /// schedule on the branch; a delete deletes once.
+    #[tokio::test]
+    #[ignore]
+    async fn schedule_update_and_delete() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let g = s.function(db, "other").await;
+        let c = &s.client;
+        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::days(1), 6);
+        let id = c
+            .add_schedule(&NewSchedule {
+                branch_id: main,
+                function_id: f,
+                cron: "* * * * *",
+                timezone: "UTC",
+                next_run_at: Some(past),
+            })
+            .await
+            .unwrap();
+        let off = c.update_schedule(main, f, id, None, None, Some(false)).await.unwrap().unwrap();
+        assert_eq!((off.enabled, off.next_run_at), (false, Some(past)), "only the flag changes");
+        let on = c.update_schedule(main, f, id, None, None, Some(true)).await.unwrap().unwrap();
+        assert!(on.enabled && on.next_run_at.unwrap() > Utc::now(), "on again: the next tick");
+        let moved = c
+            .update_schedule(main, f, id, Some("0 9 * * *"), Some("Europe/London"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((moved.cron.as_str(), moved.timezone.as_str()), ("0 9 * * *", "Europe/London"));
+        assert_eq!(c.list_schedules(main).await.unwrap(), vec![moved.clone()]);
+        let err = c.update_schedule(main, f, id, Some("nope"), None, None).await.unwrap_err();
+        assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.starts_with("cron: ")), "{err:?}");
+        assert_eq!(c.update_schedule(main, g, id, None, None, Some(false)).await.unwrap(), None);
+        assert!(!c.delete_schedule(main, g, id).await.unwrap());
+        assert!(c.delete_schedule(main, f, id).await.unwrap());
+        assert!(!c.delete_schedule(main, f, id).await.unwrap());
+        assert!(c.list_schedules(main).await.unwrap().is_empty());
         s.finish().await;
     }
 
