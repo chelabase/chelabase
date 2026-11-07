@@ -2,8 +2,15 @@
 //! when `chelabase.fn.changed.<branch>` arrives, so a change applies within a second while NATS
 //! is up and within the TTL when it isn't. Unknown functions are cached too (as `None`), so a
 //! flood of bad names doesn't reach the database. Errors are never cached.
+//!
+//! A change can arrive while a lookup is reading the old row. moka's invalidation only drops
+//! entries inserted before it, so each branch has a generation that [`Resolver::forget_branch`]
+//! bumps (and [`Resolver::forget_all`] bumps for every branch). A lookup notes the generation
+//! before it loads; when it moved meanwhile, the loaded entry is dropped and the answer is
+//! loaded again, uncached.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chelabase_nats::NatsConfig;
@@ -19,10 +26,17 @@ const RETRY: Duration = Duration::from_secs(2);
 
 type Key = (Uuid, String);
 
+/// Branch generations are striped: two branches sharing a stripe only cost an extra lookup.
+const STRIPES: usize = 1024;
+
 pub struct Resolver {
     directory: Arc<dyn Directory>,
     public_url: String,
     cache: Cache<Key, Option<Arc<Resolution>>>,
+    /// Bumped by `forget_all`.
+    epoch: AtomicU64,
+    /// Bumped by `forget_branch` for the branch's stripe.
+    generations: Box<[AtomicU64]>,
 }
 
 impl Resolver {
@@ -35,7 +49,21 @@ impl Resolver {
                 .time_to_live(ttl)
                 .support_invalidation_closures()
                 .build(),
+            epoch: AtomicU64::new(0),
+            generations: (0..STRIPES).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    fn stripe(&self, branch: Uuid) -> &AtomicU64 {
+        let n = branch.as_u128();
+        &self.generations[((n ^ (n >> 64)) as usize) % STRIPES]
+    }
+
+    fn generation(&self, branch: Uuid) -> (u64, u64) {
+        (
+            self.epoch.load(Ordering::SeqCst),
+            self.stripe(branch).load(Ordering::SeqCst),
+        )
     }
 
     pub fn directory(&self) -> &Arc<dyn Directory> {
@@ -47,20 +75,31 @@ impl Resolver {
         branch: Uuid,
         name: &str,
     ) -> anyhow::Result<Option<Arc<Resolution>>> {
-        let load = async {
-            let parts = self.directory.resolve(branch, name).await?;
-            Ok::<_, anyhow::Error>(
-                parts.map(|p| Arc::new(Resolution::build(p, branch, &self.public_url))),
-            )
-        };
-        self.cache
-            .try_get_with((branch, name.to_owned()), load)
+        let key = (branch, name.to_owned());
+        let before = self.generation(branch);
+        let found = self
+            .cache
+            .try_get_with(key.clone(), self.load(branch, name))
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve {name} on {branch}: {e}"))?;
+        if self.generation(branch) == before {
+            return Ok(found);
+        }
+        // A change arrived while this was loading: what it read may be the old row.
+        self.cache.invalidate(&key).await;
+        self.load(branch, name)
             .await
             .map_err(|e| anyhow::anyhow!("resolve {name} on {branch}: {e}"))
     }
 
-    /// Drops every cached resolution of `branch`.
+    async fn load(&self, branch: Uuid, name: &str) -> anyhow::Result<Option<Arc<Resolution>>> {
+        let parts = self.directory.resolve(branch, name).await?;
+        Ok(parts.map(|p| Arc::new(Resolution::build(p, branch, &self.public_url))))
+    }
+
+    /// Drops every cached resolution of `branch`, and any a lookup in flight would cache.
     pub fn forget_branch(&self, branch: Uuid) {
+        self.stripe(branch).fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self
             .cache
             .invalidate_entries_if(move |(b, _), _| *b == branch)
@@ -71,6 +110,7 @@ impl Resolver {
     }
 
     pub fn forget_all(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.cache.invalidate_all();
     }
 }
@@ -121,7 +161,7 @@ mod tests {
     use crate::directory::Parts;
     use chelabase_metadata::FunctionAuth;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     /// A directory whose answer the test sets, counting lookups.
     #[derive(Default)]
@@ -215,6 +255,69 @@ mod tests {
         *fake.enabled.lock().unwrap() = Some(false);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!r.resolve(b, "hello").await.unwrap().unwrap().enabled);
+    }
+
+    /// A directory that holds a lookup between reading the row and returning it.
+    #[derive(Default)]
+    struct Gated {
+        enabled: std::sync::atomic::AtomicBool,
+        gate: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Directory for Gated {
+        async fn resolve(&self, _branch: Uuid, _name: &str) -> anyhow::Result<Option<Parts>> {
+            let enabled = self.enabled.load(Ordering::SeqCst);
+            if self.gate.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Some(Parts {
+                database_id: Uuid::nil(),
+                function_id: Uuid::nil(),
+                bundle_sha256: "a".repeat(64),
+                auth: FunctionAuth::Key,
+                enabled,
+                secrets: Vec::new(),
+                service_key: None,
+            }))
+        }
+        async fn record_error(&self, _: Uuid, _: Uuid, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn database_live(&self, _: Uuid) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A lookup that read the old row before a change event arrived must not cache it: the
+    /// next call sees the change, not the stale state for the whole TTL.
+    #[tokio::test]
+    async fn a_change_during_a_lookup_is_not_lost() {
+        for forget_all in [false, true] {
+            let gate = Arc::new(Gated::default());
+            gate.enabled.store(true, Ordering::SeqCst);
+            gate.gate.store(true, Ordering::SeqCst);
+            let r = Arc::new(Resolver::new(gate.clone(), "u".into(), TTL));
+            let b = Uuid::new_v4();
+            let r2 = r.clone();
+            let inflight = tokio::spawn(async move { r2.resolve(b, "hello").await.unwrap() });
+            gate.entered.notified().await;
+            gate.enabled.store(false, Ordering::SeqCst); // the disable commits
+            if forget_all {
+                r.forget_all(); // a resubscription
+            } else {
+                r.forget_branch(b); // the change event arrives
+            }
+            gate.release.notify_one();
+            inflight.await.unwrap();
+            assert!(
+                !r.resolve(b, "hello").await.unwrap().unwrap().enabled,
+                "the disabled function is still served from the cache (forget_all: {forget_all})"
+            );
+        }
     }
 
     #[test]
