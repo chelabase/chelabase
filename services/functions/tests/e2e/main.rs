@@ -33,6 +33,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod app_users;
+
 /// How soon a change must apply (NATS drops the cached resolution).
 const WITHIN: Duration = Duration::from_secs(2);
 
@@ -59,14 +61,20 @@ struct Stack {
     key: String,
 }
 
+async fn metadata() -> MetadataClient {
+    MetadataClient::connect(&MetadataConfig {
+        database_url: env("CHELABASE_METADATA_DATABASE_URL"),
+    })
+    .await
+    .expect("metadata database")
+    .with_secrets_key(secrets_key())
+}
+
 impl Stack {
+    /// A pending database of its own (no compute: the gateway only resolves the key) with a
+    /// public key on its main branch.
     async fn new() -> Self {
-        let metadata = MetadataClient::connect(&MetadataConfig {
-            database_url: env("CHELABASE_METADATA_DATABASE_URL"),
-        })
-        .await
-        .expect("metadata database")
-        .with_secrets_key(secrets_key());
+        let metadata = metadata().await;
         let db = DatabaseId::new();
         metadata
             .insert_database_pending(
@@ -104,6 +112,11 @@ impl Stack {
             })
             .await
             .expect("the branch's public key");
+        Self::with(metadata, db, branch, generated.key)
+    }
+
+    /// The stack's clients for functions on `branch` of `db`, called with the public `key`.
+    fn with(metadata: MetadataClient, db: DatabaseId, branch: BranchId, key: String) -> Self {
         Stack {
             metadata,
             http: reqwest::Client::new(),
@@ -121,7 +134,7 @@ impl Stack {
             .expect("the orchestrator's functions bearer"),
             db,
             branch,
-            key: generated.key,
+            key,
         }
     }
 
