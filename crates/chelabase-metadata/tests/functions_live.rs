@@ -1856,4 +1856,23 @@ mod functions {
         assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
         s.finish().await;
     }
+
+    /// m3: a function's deployments for the management API, newest first; another
+    /// function's never appear.
+    #[tokio::test]
+    #[ignore]
+    async fn deployments_listed_newest_first() {
+        let s = Scratch::new().await;
+        let (db, _) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let g = s.function(db, "other").await;
+        let first = s.deployment(f, &sha('1')).await;
+        let second = s.deployment(f, &sha('2')).await;
+        s.deployment(g, &sha('3')).await;
+        let listed = s.client.list_deployments(f).await.unwrap();
+        assert_eq!(listed.iter().map(|d| d.id).collect::<Vec<_>>(), vec![second, first]);
+        assert_eq!(listed[0].bundle_sha256.as_deref(), Some(sha('2').as_str()));
+        assert!(s.client.list_deployments(Uuid::new_v4()).await.unwrap().is_empty());
+        s.finish().await;
+    }
 }
