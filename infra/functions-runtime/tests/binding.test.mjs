@@ -75,6 +75,16 @@ describe("the gateway binding", () => {
     }
   });
 
+  test("client-address headers a function sets never reach the gateway", async () => {
+    seen.length = 0;
+    const out = await call({ path: "/data/v1/schema", spoof: "1" });
+    assert.equal(out.status, 200, JSON.stringify(out));
+    const h = seen[0].headers;
+    for (const k of ["x-forwarded-for", "forwarded", "x-real-ip", "x-forwarded-host", "x-forwarded-proto", "true-client-ip", "cf-connecting-ip"]) {
+      assert.equal(h[k], undefined, `${k} reached the gateway: ${h[k]}`);
+    }
+  });
+
   test("a direct fetch of the gateway is still refused", async () => {
     const g = store.add(DB, manifest("egress"));
     for (const url of [`http://gateway-functions:${gateway.address().port}/`, `http://${API_HOST}/`]) {
