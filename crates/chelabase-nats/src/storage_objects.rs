@@ -26,6 +26,11 @@ const SUBJECT_PREFIX: &str = "chelabase.storage.events";
 /// How long the stream keeps an event: the 24 h retry window plus an hour's margin.
 pub const RETENTION: std::time::Duration = std::time::Duration::from_secs(25 * 3600);
 
+/// Events the stream keeps for one database (one subject): a busy database drops its own
+/// oldest events past this, never another database's pending ones. A tenth of the stream's
+/// whole count, so ten such databases fit before the stream-wide limits apply.
+pub const MAX_EVENTS_PER_DATABASE: i64 = 100_000;
+
 /// How long a consumer nobody pulls from lives on (an endpoint deleted while no worker ran).
 pub const CONSUMER_INACTIVE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
@@ -37,10 +42,11 @@ pub fn subject(database_id: Uuid) -> String {
 /// What happened to an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum ObjectEventType {
-    /// A new object (an upload, a completed resumable upload, a copy to a free name).
+    /// A new object (an upload, a completed resumable upload, a copy: a copy never replaces
+    /// an existing name).
     #[serde(rename = "object.created")]
     Created,
-    /// An existing object replaced (an upsert, a copy over a name).
+    /// An existing object replaced by an upsert.
     #[serde(rename = "object.updated")]
     Updated,
     #[serde(rename = "object.deleted")]
@@ -113,8 +119,9 @@ pub struct ObjectEvent {
 }
 
 /// The stream: limits retention (each endpoint's consumer reads independently; nothing is
-/// consumed away), [`RETENTION`], bounded in count and bytes with the oldest dropped first, and
-/// a duplicate window so a retried publish (same `Nats-Msg-Id`, the event id) is stored once.
+/// consumed away), [`RETENTION`], bounded in count and bytes with the oldest dropped first,
+/// each database also bounded on its own ([`MAX_EVENTS_PER_DATABASE`]), and a duplicate window
+/// so a retried publish (same `Nats-Msg-Id`, the event id) is stored once.
 pub fn stream_config() -> async_nats::jetstream::stream::Config {
     use async_nats::jetstream::stream::{Config, DiscardPolicy, RetentionPolicy, StorageType};
     Config {
@@ -124,6 +131,7 @@ pub fn stream_config() -> async_nats::jetstream::stream::Config {
         storage: StorageType::File,
         max_age: RETENTION,
         max_messages: 1_000_000,
+        max_messages_per_subject: MAX_EVENTS_PER_DATABASE,
         max_bytes: 512 * 1024 * 1024,
         max_message_size: 64 * 1024,
         discard: DiscardPolicy::Old,
@@ -142,6 +150,7 @@ fn drifted(
         || have.storage != want.storage
         || have.max_age != want.max_age
         || have.max_messages != want.max_messages
+        || have.max_messages_per_subject != want.max_messages_per_subject
         || have.max_bytes != want.max_bytes
         || have.max_message_size != want.max_message_size
         || have.discard != want.discard
@@ -324,6 +333,20 @@ mod tests {
                 .iter()
                 .any(|s| s.starts_with(SUBJECT_PREFIX))
         );
+    }
+
+    /// One database can hold only its share of the stream: past that, its own oldest events go,
+    /// never another database's. A stream without the cap counts as drifted, so an existing
+    /// one is updated at start.
+    #[test]
+    fn each_database_is_capped_within_the_stream() {
+        let want = stream_config();
+        assert!(want.max_messages_per_subject > 0);
+        assert!(want.max_messages_per_subject * 10 <= want.max_messages);
+        let mut have = want.clone();
+        assert!(!drifted(&have, &want));
+        have.max_messages_per_subject = -1;
+        assert!(drifted(&have, &want), "an uncapped stream is updated");
     }
 
     #[test]
