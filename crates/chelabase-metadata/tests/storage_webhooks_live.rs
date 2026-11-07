@@ -469,3 +469,29 @@ async fn a_failure_after_a_quiet_spell_starts_a_new_run() {
     assert_eq!(w.consecutive_failures, 2);
     s.finish().await;
 }
+
+/// An attempt recorded out of order (older than the last one) never moves `last_attempt_at`
+/// back: it stays the newest attempt's time, the base of the next window check.
+#[tokio::test]
+#[ignore]
+async fn an_out_of_order_attempt_never_moves_the_last_attempt_back() {
+    let s = Scratch::new().await;
+    let db = s.database().await;
+    let id = s.webhook(db, "https://example.com/hook").await;
+    let newer = Utc::now() - Duration::minutes(1);
+    s.client
+        .record_storage_webhook_attempt(id, &attempt("http_error", newer))
+        .await
+        .unwrap();
+    s.client
+        .record_storage_webhook_attempt(id, &attempt("timeout", newer - Duration::seconds(30)))
+        .await
+        .unwrap();
+    let w = s.client.get_storage_webhook(db, id).await.unwrap().unwrap();
+    assert_eq!(
+        w.last_attempt_at.map(|t| t.timestamp_micros()),
+        Some(newer.timestamp_micros())
+    );
+    assert_eq!(w.consecutive_failures, 2);
+    s.finish().await;
+}

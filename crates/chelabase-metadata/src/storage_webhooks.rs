@@ -366,10 +366,12 @@ impl MetadataClient {
             consecutive_failures: row.get("consecutive_failures"),
         }
         .after(row.get("last_attempt_at"), delivered, attempt.attempted_at);
-        // As stored (microseconds): the value a later disable compares with.
+        // As stored (microseconds): the value a later disable compares with. An attempt older
+        // than the last one (recorded out of order) never moves `last_attempt_at` back.
         let failing_since: Option<DateTime<Utc>> = sqlx::query_scalar(
             "UPDATE storage_webhooks
-             SET failing_since = $2, consecutive_failures = $3, last_attempt_at = $4
+             SET failing_since = $2, consecutive_failures = $3,
+                 last_attempt_at = GREATEST(last_attempt_at, $4)
              WHERE id = $1 RETURNING failing_since",
         )
         .bind(webhook)
