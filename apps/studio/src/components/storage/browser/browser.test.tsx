@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { B, BRANCHES, D, PROJECTS, ROLES, meAs, pgDb, type Level } from "@/test/table-editor-fixtures";
@@ -259,6 +259,72 @@ describe("ObjectBrowser", () => {
     await user.click(within(await screen.findByRole("complementary", { name: "Object details" })).getByRole("button", { name: "Delete" }));
     await user.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Delete 1 object" }));
     expect(await screen.findByText(/The bucket is write-once/)).toBeInTheDocument();
+  });
+});
+
+/** Records each XHR upload and answers it 200. */
+function fakeXhr() {
+  const sent: { method: string; url: string; headers: Record<string, string>; body: Blob }[] = [];
+  class FakeXhr {
+    upload: { onprogress: ((e: { loaded: number }) => void) | null } = { onprogress: null };
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    status = 0;
+    responseText = "";
+    private req = { method: "", url: "", headers: {} as Record<string, string> };
+    open(method: string, url: string) {
+      this.req.method = method;
+      this.req.url = url;
+    }
+    setRequestHeader(k: string, v: string) {
+      this.req.headers[k.toLowerCase()] = v;
+    }
+    send(body: Blob) {
+      sent.push({ ...this.req, body });
+      queueMicrotask(() => {
+        this.upload.onprogress?.({ loaded: body.size });
+        this.status = 200;
+        this.responseText = "{}";
+        this.onload?.();
+      });
+    }
+    abort() {
+      this.onabort?.();
+    }
+  }
+  vi.stubGlobal("XMLHttpRequest", FakeXhr);
+  return sent;
+}
+
+describe("ObjectBrowser uploads", () => {
+  // #105 AC7
+  it("a_viewer_gets_no_upload_buttons_and_a_read_only_drop_zone", async () => {
+    setup("viewer", { me: meAs("viewer", ["reporter"]) });
+    const list = await objects();
+    expect(screen.queryByRole("button", { name: "Upload" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Upload folder" })).toBeNull();
+    fireEvent.dragEnter(list, { dataTransfer: { types: ["Files"], files: [], items: [] } });
+    expect(await screen.findByText(/read-only/)).toBeInTheDocument();
+  });
+
+  // #105 AC1, with the listing refreshed after
+  it("a_chosen_file_uploads_into_the_open_folder_as_the_role_and_the_listing_refreshes", async () => {
+    const sent = fakeXhr();
+    const { f, user } = setup("admin", { params: { ...PLACE, path: "photos" }, items: [] });
+    await screen.findByText(/This folder is empty/);
+    const before = (await browserLists(f)).length;
+    const input = screen.getByLabelText("Files to upload");
+    await user.upload(input, new File(["hello"], "c.txt", { type: "text/plain" }));
+    const tray = within(await screen.findByRole("region", { name: "Uploads" }));
+    expect(await tray.findByText("Uploaded")).toBeInTheDocument();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.method).toBe("POST");
+    expect(new URL(sent[0]!.url).pathname).toBe(`${S}/object/avatars/${encodeURIComponent("photos/c.txt")}`);
+    expect(sent[0]!.headers["content-type"]).toBe("text/plain");
+    expect(sent[0]!.headers.authorization).toBe("Bearer test-token");
+    await waitFor(async () => expect((await browserLists(f)).length).toBeGreaterThan(before));
+    vi.unstubAllGlobals();
   });
 });
 

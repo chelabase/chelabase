@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useMemo, useReducer, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type MouseEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { fetchStorageObject } from "@chelabase/management-client";
-import { LayoutGrid, List, Search } from "lucide-react";
+import { FolderUp, LayoutGrid, List, Search, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { errorText } from "@/lib/errors";
 import { invalidateStorage, publicObjectUrl, signObjectUrl, storageParams, type Bucket, type StorageItem } from "@/lib/storage-api";
 import { cn } from "@/lib/utils";
+import { consoleUploadApi } from "../upload/console-api";
+import { inputFiles, type DroppedFile } from "../upload/drop-entries";
+import { UploadTray } from "../upload/upload-tray";
+import { useUploadQueue } from "../upload/use-upload-queue";
+import { DropZone } from "./drop-zone";
 import { DeleteObjectsDialog, RelocateDialog, RenameDialog, SignDialog, type ObjectPlace } from "./object-dialogs";
 import { ObjectDetails } from "./object-details";
 import { ObjectList, type ObjectView } from "./object-list";
@@ -103,6 +108,11 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
   const fetchObject = (range: string | undefined, signal?: AbortSignal) =>
     fetchStorageObject(databaseId, branchId, bucket.name, focused?.name ?? "", storageParams(role), { range, signal });
   const refresh = () => invalidateStorage(queryClient, databaseId, branchId);
+  const uploadApi = useMemo(() => consoleUploadApi(databaseId, branchId, role), [databaseId, branchId, role]);
+  const uploads = useUploadQueue({ api: uploadApi, onUploaded: () => void invalidateStorage(queryClient, databaseId, branchId) });
+  const upload = (files: DroppedFile[]) => uploads.add(bucket.name, prefix, files);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
   const loadMore = useCallback(() => void pages.loadMore(), [pages]);
 
   const selectedNames = [...selection.selected];
@@ -146,6 +156,7 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
     body = (
       <p role="status" className="p-6 text-sm text-chalk-dim">
         {search !== "" ? `No objects match “${search}”.` : prefix === "" ? "This bucket is empty." : "This folder is empty."}
+        {search === "" && canWrite && " Drop files or folders here to upload them."}
       </p>
     );
   } else {
@@ -217,6 +228,40 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
             ))}
           </Select>
         </label>
+        {canWrite && (
+          <div className="flex gap-1">
+            <Button size="sm" variant="outline" onClick={() => fileInput.current?.click()}>
+              <Upload aria-hidden="true" strokeWidth={1.5} />
+              Upload
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => folderInput.current?.click()}>
+              <FolderUp aria-hidden="true" strokeWidth={1.5} />
+              Upload folder
+            </Button>
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              aria-label="Files to upload"
+              onChange={(e) => {
+                upload(inputFiles(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+            <input
+              ref={folderInput}
+              type="file"
+              hidden
+              aria-label="Folder to upload"
+              {...{ webkitdirectory: "" }}
+              onChange={(e) => {
+                upload(inputFiles(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+          </div>
+        )}
         <div className="flex">
           {(["list", "grid"] as const).map((v) => (
             <Button
@@ -267,7 +312,7 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
           )}
         </div>
       )}
-      <div className="flex min-h-0 flex-1">
+      <DropZone canWrite={canWrite} onFiles={upload} className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">{body}</div>
         {focused && (
           <ObjectDetails
@@ -285,7 +330,8 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
             onClose={() => setFocused(null)}
           />
         )}
-      </div>
+      </DropZone>
+      <UploadTray queue={uploads} writeOnce={bucket.write_once} />
       {canWrite && (
         <>
           <DeleteObjectsDialog open={dialog === "delete"} onOpenChange={(o) => !o && setDialog(null)} place={place} names={deleting} onDone={afterDelete} />

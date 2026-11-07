@@ -6389,7 +6389,7 @@ export const getStorageUploadPartUrl = (id: string,
 }
 
 /**
- * One part (5 MiB to 64 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.
+ * One part (5 MiB to 100 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.
  * @summary Upload one part of a resumable upload
  */
 export const storageUploadPart = async (id: string,

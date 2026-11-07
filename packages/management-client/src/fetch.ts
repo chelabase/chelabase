@@ -22,6 +22,16 @@ export function configureManagementClient(next: ManagementClientConfig): void {
   config = next;
 }
 
+/**
+ * What a request sent outside `customFetch` needs to reach the gateway as the member: the base
+ * URL, the current token and the 401 hook. Studio's uploads send their bytes by XHR, since
+ * `fetch` reports no upload progress.
+ */
+export function managementConnection(): { baseUrl: string; token: string | undefined; onUnauthorized: () => boolean | void } {
+  if (!config) throw new Error("Management client is not configured; call configureManagementClient first");
+  return { baseUrl: config.baseUrl, token: config.getToken(), onUnauthorized: config.onUnauthorized };
+}
+
 /** Reads a non-2xx response into an ApiError (our `{"error":{...}}` body, else a generic one). */
 export async function readApiError(response: Response, signInRestarted = false): Promise<ApiError> {
   const status = response.status;
@@ -67,10 +77,15 @@ export async function requestJson<T>(
   throw await readApiError(response, restarted);
 }
 
+/**
+ * The request's headers with Accept, the `extra` ones, and `application/json` for a string body
+ * (the JSON the client serialised) that names no type. A caller's Content-Type is kept, and a
+ * Blob, buffer, stream or form body is never labelled JSON.
+ */
 export function buildHeaders(init: RequestInit, extra: Record<string, string> = {}): Headers {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
-  if (init.body != null) headers.set("Content-Type", "application/json");
+  if (typeof init.body === "string" && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   for (const [k, v] of Object.entries(extra)) headers.set(k, v);
   return headers;
 }
