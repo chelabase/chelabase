@@ -1583,6 +1583,11 @@ pub mod functions {
         Auth::Public,
         Access::Public,
     );
+    /// m9: an external service, proxied by the functions service with the rest and query.
+    pub const CALL_SERVICE: Endpoint =
+        invoke("functions.call_service", "/services/v1/{name}", Auth::DataKey, Access::DataKey);
+    pub const CALL_SERVICE_PATH: Endpoint =
+        invoke("functions.call_service_path", "/services/v1/{name}/{*rest}", Auth::DataKey, Access::DataKey);
 }
 
 /// Every public endpoint the gateway exposes.
@@ -1810,6 +1815,8 @@ pub const ENDPOINTS: &[Endpoint] = &[
     functions::INVOKE_PATH,
     functions::INVOKE_PUBLIC,
     functions::INVOKE_PUBLIC_PATH,
+    functions::CALL_SERVICE,
+    functions::CALL_SERVICE_PATH,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2797,6 +2804,9 @@ mod tests {
             ("functions.invoke_path", Access::DataKey),
             ("functions.invoke_public", Access::Public),
             ("functions.invoke_public_path", Access::Public),
+            // Edge functions m9: external services.
+            ("functions.call_service", Access::DataKey),
+            ("functions.call_service_path", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.
@@ -3068,6 +3078,34 @@ mod tests {
             match_endpoint(Scope::Api, "TRACE", "/functions/v1/hello"),
             Match::MethodNotAllowed(vec![Method::Any])
         );
+    }
+
+    /// Edge functions m9: an external service's URL, with a data key, any method, served by
+    /// the functions service (which proxies it).
+    #[test]
+    fn service_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            for (path, name) in [
+                ("/services/v1/stub", "functions.call_service"),
+                ("/services/v1/stub/a", "functions.call_service_path"),
+                ("/services/v1/stub/a/b/c", "functions.call_service_path"),
+                ("/services/v1/public", "functions.call_service"),
+            ] {
+                let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                    panic!("{method} {path} isn't routed");
+                };
+                assert_eq!((ep.name, ep.policy, ep.method), (name, key, Method::Any), "{method} {path}");
+                assert_eq!(ep.service, Service::Functions, "{method} {path}");
+                assert!(!ep.websocket);
+            }
+        }
+        for path in ["/services/v1", "/services/v1/", "/services/v1/stub/"] {
+            assert!(
+                !matches!(match_endpoint(Scope::Api, "GET", path), Match::Found(ep) if ep.service == Service::Functions),
+                "{path}"
+            );
+        }
     }
 
     /// Whether `a` and `b` tie for some path: [`match_in`] keeps whichever is declared first,
