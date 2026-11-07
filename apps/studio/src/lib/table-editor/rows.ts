@@ -1,4 +1,5 @@
 import { ApiError, type ColumnDesc, type Table, type TypeEntry } from "@chelabase/management-client";
+import { storageRefOf } from "@/components/table-editor/cells/storage-ref";
 
 /** Cells show at most this many characters (S2). */
 export const CELL_LIMIT = 200;
@@ -67,6 +68,8 @@ export function columnDescs(table: Table, catalog: TypeEntry[]): RowColumn[] {
       const type = byOid.get(c.type_oid);
       const isEnum = type?.kind === "enum";
       const generated = !!c.generated;
+      // An object reference (m11's storage_ref forms): its cells show and upload files (#106).
+      const storageRef = storageRefOf(c, table, type);
       return {
         name: c.name,
         desc: {
@@ -76,6 +79,7 @@ export function columnDescs(table: Table, catalog: TypeEntry[]): RowColumn[] {
           generated,
           has_default: c.default != null || !!c.identity,
           nullable: !c.not_null,
+          ...(storageRef ? { storage_ref: storageRef } : {}),
         },
         labels: isEnum ? (type.labels ?? []) : null,
         readOnly: generated || c.identity?.generation === "always",
