@@ -647,7 +647,20 @@ impl Inner {
         filter: Arc<tokio::sync::Mutex<TableFilter>>,
         mut rx: mpsc::UnboundedReceiver<TableWork>,
     ) {
-        while let Some(work) = rx.recv().await {
+        loop {
+            // A storage channel's carried keys are retried on their own clock (#129, S2): never
+            // when some other window happens to arrive.
+            let due = filter.lock().await.retry_at();
+            let work = tokio::select! {
+                work = rx.recv() => match work {
+                    Some(work) => work,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                    filter.lock().await.retry().await;
+                    continue;
+                }
+            };
             let mut f = filter.lock().await;
             match work {
                 TableWork::Window { window, xids, at } => {

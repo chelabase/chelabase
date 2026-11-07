@@ -34,9 +34,11 @@
 //! delete only for a key on its screen or delivered to it, and never a keyless one.
 //!
 //! **Storage invariant:** a storage channel's frames are derived only from keys checked visible
-//! to that viewer, in that bucket, except a TRUNCATE. Every window of `storage.objects` reaches
-//! every bucket's filter, so nothing that isn't such a key may turn into a frame (#129's
-//! white-room audit, B1 and B2). A bucket filter therefore departs from the rules above:
+//! to that viewer, in that bucket, at a point after every delivered window that could have
+//! changed them. Every window of `storage.objects` reaches every bucket's filter, so nothing
+//! else may turn into a frame, nor into a key a later frame is derived from (#129's white-room
+//! audits, B1 to B4). The worst case is a missed frame (the next reload shows it), never a
+//! leaked one. A bucket filter therefore departs from the rules above:
 //!
 //! - No keyless `changed`, ever. A keyless window (the plugin's `c`: a TRUNCATE, or a
 //!   transaction past its key limit; a schema change; keys this relation can't take) re-checks
@@ -49,14 +51,24 @@
 //!   `rows` event per chunk.
 //! - A check waits for a [`Limiter`] permit (instead of failing at once) up to the window's
 //!   deadline. A check that misses the deadline, errors, fails its probe, or never sees the
-//!   window's xids sends nothing: its keys (and those of every later chunk) are carried into the
-//!   group's next window and checked there. The carry is bounded: at most
-//!   [`CARRY_WINDOWS`] × `max_keys` distinct keys per group (and [`CARRY_XIDS`] xids); past that
-//!   the oldest keys are dropped with a warning (their changes show at the next reload). A group
-//!   that leaves drops its carry.
+//!   window's xids sends nothing: its keys (and those of every later chunk) are carried.
+//! - S2: carried keys are checked by [`TableFilter::retry`], on the filter's own clock
+//!   ([`TableFilter::retry_at`]: [`FilterSettings::retry_first`] after they were carried, each
+//!   failed retry doubling the gap up to [`FilterSettings::retry_max`]). While a group carries
+//!   keys, a new window's keys join its carry unchecked, so a carried frame never goes out timed
+//!   to another bucket's window, and a quiet database still gets it.
+//! - The carry is bounded: at most `carry_windows` × `max_keys` distinct keys per group
+//!   ([`CARRY_WINDOWS`]) and [`CARRY_XIDS`] xids. B4: past that the oldest keys are dropped with
+//!   a warning and leave the group's viewers' view and delivered sets, since their changes (a
+//!   move out, a hide) will never be checked. A group that leaves drops its carry.
 //! - A key its read no longer returns (an update that moved the object to another bucket or hid
 //!   it, a re-check) leaves the viewer's view and delivered sets, so that object's later delete
 //!   never reaches it; so does a key once its keyed delete is sent.
+//! - B3: a view frame's check runs without the filter, so windows may be delivered meanwhile.
+//!   [`TableFilter::set_view`] confirms no key that a delivery since the check was made brought
+//!   or forgot, and nothing after a keyless window since. The filter logs those keys only while
+//!   a check is open, at most [`FilterSettings::view_log`] ([`VIEW_LOG`]) of them; a check older
+//!   than an entry the log had to drop confirms nothing.
 //!
 //! Table channels keep every rule above (R19).
 //!
@@ -65,7 +77,7 @@
 //! (`CheckRequest::convert`): the check answers the session's key strings of the rows it sees,
 //! and only a key whose conversion is in that answer is released.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -91,10 +103,19 @@ pub struct FilterSettings {
     pub visibility_poll: Duration,
     pub window_deadline: Duration,
     pub max_keys: usize,
+    /// A bucket filter carries at most this many windows' worth of keys (× `max_keys`) per
+    /// group ([`CARRY_WINDOWS`]).
+    pub carry_windows: usize,
+    /// A bucket filter's first retry of carried keys comes this long after they were carried
+    /// ([`RETRY_FIRST`]), each next one twice as long after the last, up to `retry_max`.
+    pub retry_first: Duration,
+    pub retry_max: Duration,
+    /// A bucket filter logs at most this many keys for view checks in flight ([`VIEW_LOG`]).
+    pub view_log: usize,
 }
 
 impl Default for FilterSettings {
-    /// 8, 2 s, 50 ms, 5 s, 1000.
+    /// 8, 2 s, 50 ms, 5 s, 1000, 10, 250 ms, 5 s, 4096.
     fn default() -> Self {
         Self {
             concurrency: CONCURRENCY,
@@ -102,6 +123,10 @@ impl Default for FilterSettings {
             visibility_poll: VISIBILITY_POLL,
             window_deadline: WINDOW_DEADLINE,
             max_keys: MAX_KEYS,
+            carry_windows: CARRY_WINDOWS,
+            retry_first: RETRY_FIRST,
+            retry_max: RETRY_MAX,
+            view_log: VIEW_LOG,
         }
     }
 }
@@ -139,6 +164,10 @@ pub struct KeyCheck {
     generation: u64,
     /// The filter's bucket (a storage channel's).
     bucket: Option<uuid::Uuid>,
+    /// The filter's delivery count when the check was made (B3: see [`TableFilter::set_view`]).
+    seq: u64,
+    /// Held while the check is open: the filter logs keys for it only then.
+    _open: Arc<()>,
 }
 
 impl KeyCheck {
@@ -188,6 +217,12 @@ impl KeyCheck {
 pub const CARRY_WINDOWS: usize = 10;
 /// And at most this many of the carried windows' xids (the newest).
 pub const CARRY_XIDS: usize = 1024;
+/// A bucket filter's first retry of carried keys, after they were carried.
+pub const RETRY_FIRST: Duration = Duration::from_millis(250);
+/// Its longest gap between retries (each doubles the last).
+pub const RETRY_MAX: Duration = Duration::from_secs(5);
+/// A bucket filter's log of keys touched while view checks are in flight holds at most this many.
+pub const VIEW_LOG: usize = 4096;
 
 /// What a key comes to in a bucket filter's pending work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,15 +311,16 @@ impl Pending {
             })
             .collect()
     }
-    /// Keeps the newest `max` keys and [`CARRY_XIDS`] xids; the number of keys dropped.
-    fn trim(&mut self, max: usize) -> usize {
+    /// Keeps the newest `max` keys and [`CARRY_XIDS`] xids; the keys dropped.
+    fn trim(&mut self, max: usize) -> Vec<Vec<String>> {
         let over = self.order.len().saturating_sub(max);
-        for k in self.order.drain(..over) {
-            self.ops.remove(&k);
+        let dropped: Vec<Vec<String>> = self.order.drain(..over).collect();
+        for k in &dropped {
+            self.ops.remove(k);
         }
         let xover = self.xids.len().saturating_sub(CARRY_XIDS);
         self.xids.drain(..xover);
-        over
+        dropped
     }
 }
 
@@ -352,8 +388,21 @@ pub struct TableFilter {
     changed_only: bool,
     /// Object storage m17: a storage channel's bucket (see the module docs).
     bucket: Option<uuid::Uuid>,
-    /// A bucket filter's keys carried into each group's next window (see the module docs).
+    /// A bucket filter's keys carried to each group's next retry (see the module docs).
     carry: HashMap<GroupKey, Pending>,
+    /// The next retry of the carry, and how many retries came before it.
+    retry: Option<(Instant, u32)>,
+    /// A bucket filter's deliveries (windows and retries) so far.
+    seq: u64,
+    /// While a view check is open: every key a delivery brought or forgot, with its delivery's
+    /// `seq`, oldest first, at most [`FilterSettings::view_log`] (B3).
+    log: VecDeque<(u64, String)>,
+    /// The newest `seq` of an entry pushed out of the log.
+    log_lost: u64,
+    /// The `seq` of the last keyless (reconciling) window.
+    reconciled: u64,
+    /// Cloned into every [`KeyCheck`]: more than one holder means a check is open.
+    open: Arc<()>,
 }
 
 impl TableFilter {
@@ -377,6 +426,12 @@ impl TableFilter {
             changed_only: false,
             bucket: None,
             carry: HashMap::new(),
+            retry: None,
+            seq: 0,
+            log: VecDeque::new(),
+            log_lost: 0,
+            reconciled: 0,
+            open: Arc::new(()),
         }
     }
     /// Object storage m17: scopes every check to `bucket` (a storage channel's filter of
@@ -512,6 +567,12 @@ impl TableFilter {
     }
     /// The viewer's view set from a check `ask` made for it (`seen`: its answers): only the
     /// keys it confirmed visible. Nothing when the viewer left or the relation changed since.
+    ///
+    /// B3: a bucket filter's check runs without the filter, so windows may be delivered while it
+    /// runs. A key any delivery since `ask` brought or forgot (moved, hidden, deleted, trimmed)
+    /// isn't confirmed: the answer may predate that change. A keyless window since `ask`, or a
+    /// log that overflowed since, confirms nothing. The viewer then just lacks keyed deletes for
+    /// those keys until its next view frame; it is never told about a key it can't see.
     #[allow(clippy::result_unit_err)]
     pub fn set_view(
         &mut self,
@@ -523,7 +584,7 @@ impl TableFilter {
         if ask.rel_oid != self.relation.oid {
             return;
         }
-        let confirmed: HashSet<String> = match seen {
+        let mut confirmed: HashSet<String> = match seen {
             Ok(seen) => keys
                 .into_iter()
                 .zip(seen)
@@ -531,6 +592,15 @@ impl TableFilter {
                 .collect(),
             Err(()) => HashSet::new(),
         };
+        if self.bucket.is_some() {
+            if self.reconciled > ask.seq || self.log_lost > ask.seq {
+                confirmed.clear();
+            } else {
+                for (_, k) in self.log.iter().filter(|(s, _)| *s > ask.seq) {
+                    confirmed.remove(k);
+                }
+            }
+        }
         if let Some(v) = self.viewers.get_mut(&viewer) {
             v.view = confirmed;
         }
@@ -636,33 +706,57 @@ impl TableFilter {
         self.cache.flush();
     }
 
-    /// A bucket filter's window (see the module docs): each group checks its carried keys and
-    /// the window's, in chunks, waiting for permits up to the deadline; what isn't checked by
-    /// then is carried again. Never a keyless frame.
+    /// A bucket filter's window (see the module docs): each group checks the window's keys, in
+    /// chunks, waiting for permits up to the deadline; what isn't checked by then is carried to
+    /// the group's next retry. A group that already carries keys adds the window's to them
+    /// unchecked: they all wait for that retry, which runs on its own clock
+    /// ([`Self::retry_at`]), so a carried frame never goes out timed to another window.
+    /// Never a keyless frame.
     async fn deliver_bucket(&mut self, window: &RelWindow, xids: &[u64], closed_at: Instant) {
+        self.seq += 1;
         if self.viewers.is_empty() {
             self.carry.clear();
+            self.retry = None;
             return;
         }
         let supported = keys_supported(&self.relation);
-        let key = &self.relation.key;
-        let fits = |texts: &Vec<String>| {
+        let fits = |rel: &Relation, texts: &Vec<String>| {
             supported
-                && texts.len() == key.len()
-                && texts.iter().zip(key).all(|(t, c)| key_text_allowed(c, t))
+                && texts.len() == rel.key.len()
+                && texts
+                    .iter()
+                    .zip(&rel.key)
+                    .all(|(t, c)| key_text_allowed(c, t))
         };
         // Keyless, or keys this relation can't take (no object of the bucket): re-check.
         let reconcile = window.changed || self.changed_only || !self.checkable(window);
+        if reconcile {
+            self.reconciled = self.seq;
+        }
+        let brought: Vec<String> = window
+            .inserts
+            .iter()
+            .chain(&window.updates)
+            .chain(&window.deletes)
+            .filter(|k| fits(&self.relation, k))
+            .map(|k| key_string(k))
+            .collect();
+        for k in brought {
+            self.log_key(k);
+        }
         let mut carry = std::mem::take(&mut self.carry);
         let mut work: Vec<(GroupKey, CheckIdentity, Pending)> = Vec::new();
+        let mut deferred: Vec<(GroupKey, Pending)> = Vec::new();
         for (gkey, g) in &self.groups {
-            let mut p = carry.remove(gkey).unwrap_or_default();
+            let carried = carry.remove(gkey);
+            let waiting = carried.is_some();
+            let mut p = carried.unwrap_or_default();
             for (keys, op) in [
                 (&window.inserts, KeyOp::Insert),
                 (&window.updates, KeyOp::Update),
                 (&window.deletes, KeyOp::Delete),
             ] {
-                for k in keys.iter().filter(|k| fits(k)) {
+                for k in keys.iter().filter(|k| fits(&self.relation, k)) {
                     p.push(k, op);
                 }
             }
@@ -682,13 +776,80 @@ impl TableFilter {
                     }
                 }
             }
-            if !p.is_empty() {
-                p.add_xids(xids);
+            if p.is_empty() {
+                continue;
+            }
+            p.add_xids(xids);
+            if waiting {
+                deferred.push((gkey.clone(), p));
+            } else {
                 work.push((gkey.clone(), g.identity.clone(), p));
             }
         }
         // `carry` now holds only groups that left: dropped.
+        for (gkey, p) in deferred {
+            self.keep_carry(gkey, p);
+        }
         let deadline = closed_at + self.settings.window_deadline;
+        self.check_work(work, deadline).await;
+        if self.carry.is_empty() {
+            self.retry = None;
+        } else if self.retry.is_none() {
+            self.retry = Some((Instant::now() + self.settings.retry_first, 0));
+        }
+    }
+
+    /// When the carried keys are checked again ([`Self::retry`]); `None`: nothing carried.
+    /// Only the retry's own backoff sets it: no window brings it forward.
+    pub fn retry_at(&self) -> Option<Instant> {
+        self.retry.map(|(at, _)| at)
+    }
+
+    /// Every group's carried keys, as key strings (diagnostics and tests).
+    pub fn carried_keys(&self) -> HashSet<String> {
+        self.carry
+            .values()
+            .flat_map(|p| p.order.iter().map(|t| key_string(t)))
+            .collect()
+    }
+
+    /// Checks every group's carried keys again (S2): what is checked now is sent now; what
+    /// misses its deadline again waits for the next retry, twice as long after this one
+    /// ([`FilterSettings::retry_max`] at most).
+    pub async fn retry(&mut self) {
+        self.cache.flush();
+        self.seq += 1;
+        let attempt = self.retry.take().map_or(0, |(_, n)| n);
+        let mut carry = std::mem::take(&mut self.carry);
+        let work: Vec<(GroupKey, CheckIdentity, Pending)> = self
+            .groups
+            .iter()
+            .filter_map(|(k, g)| {
+                let p = carry.remove(k)?;
+                Some((k.clone(), g.identity.clone(), p))
+            })
+            .collect();
+        let deadline = Instant::now() + self.settings.window_deadline;
+        self.check_work(work, deadline).await;
+        if !self.carry.is_empty() {
+            let next = attempt.saturating_add(1);
+            let wait = self
+                .settings
+                .retry_first
+                .saturating_mul(1u32.checked_shl(next.min(16)).unwrap_or(u32::MAX))
+                .min(self.settings.retry_max);
+            self.retry = Some((Instant::now() + wait, next));
+        }
+        self.cache.flush();
+    }
+
+    /// Checks each group's pending keys in chunks up to `deadline`, sends what was checked, and
+    /// carries the rest.
+    async fn check_work(
+        &mut self,
+        work: Vec<(GroupKey, CheckIdentity, Pending)>,
+        deadline: Instant,
+    ) {
         let max = self.settings.max_keys.max(1);
         let results: Vec<(GroupKey, Vec<Checked>, Pending)> = {
             let this = &*self;
@@ -711,7 +872,7 @@ impl TableFilter {
             }))
             .await
         };
-        for (gkey, done, mut left) in results {
+        for (gkey, done, left) in results {
             let viewers = self
                 .group(&gkey)
                 .map(|g| g.viewers.clone())
@@ -721,19 +882,65 @@ impl TableFilter {
                     let changes = self.compose(*id, c);
                     self.send(*id, changes);
                 }
+                let forgot: Vec<String> = c
+                    .hidden_updates
+                    .iter()
+                    .chain(&c.gone)
+                    .chain(c.deletes.iter().flatten())
+                    .cloned()
+                    .collect();
+                for k in forgot {
+                    self.log_key(k);
+                }
             }
             if !left.is_empty() && !viewers.is_empty() {
-                let dropped = left.trim(max * CARRY_WINDOWS);
-                if dropped > 0 {
-                    tracing::warn!(
-                        relation = self.relation.oid,
-                        dropped,
-                        "storage channel: checks kept missing their deadline; the oldest carried keys were dropped"
-                    );
-                }
-                self.carry.insert(gkey, left);
+                self.keep_carry(gkey, left);
             }
         }
+    }
+
+    /// Carries `p` for the group, trimmed to its bound. B4: a trimmed key's change is never
+    /// checked, so it leaves the group's viewers' view and delivered sets (its later changes
+    /// send nothing; the next reload shows them) and confirms no open view check.
+    fn keep_carry(&mut self, gkey: GroupKey, mut p: Pending) {
+        let max = self.settings.max_keys.max(1) * self.settings.carry_windows.max(1);
+        let dropped = p.trim(max);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                relation = self.relation.oid,
+                dropped = dropped.len(),
+                "storage channel: checks kept missing their deadline; the oldest carried keys were dropped"
+            );
+            let viewers = self
+                .group(&gkey)
+                .map(|g| g.viewers.clone())
+                .unwrap_or_default();
+            for texts in &dropped {
+                let k = key_string(texts);
+                for id in &viewers {
+                    if let Some(v) = self.viewers.get_mut(id) {
+                        v.view.remove(&k);
+                        v.delivered.remove(&k);
+                    }
+                }
+                self.log_key(k);
+            }
+        }
+        self.carry.insert(gkey, p);
+    }
+
+    /// B3: logs `key` for the view checks in flight (none: nothing is kept).
+    fn log_key(&mut self, key: String) {
+        if Arc::strong_count(&self.open) == 1 {
+            self.log.clear();
+            return;
+        }
+        if self.log.len() >= self.settings.view_log.max(1)
+            && let Some((s, _)) = self.log.pop_front()
+        {
+            self.log_lost = self.log_lost.max(s);
+        }
+        self.log.push_back((self.seq, key));
     }
 
     /// One viewer's changes of a checked window (and its delivered set updated).
@@ -1002,6 +1209,8 @@ impl TableFilter {
             ask,
             generation: self.cache.generation(),
             bucket: self.bucket,
+            seq: self.seq,
+            _open: self.open.clone(),
         })
     }
 }

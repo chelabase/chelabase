@@ -1817,10 +1817,49 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
         assert!(a.is_empty(), "{a:?}");
         assert!(o.is_empty(), "{o:?}");
 
-        // #129 S1: Studio sends each folder row's one object as a view key (`notes/` holds only
-        // a.txt, bob's screen shows the root), so deleting a folder's last object reaches the
-        // viewer as a key.
-        send(&mut bob, json!({"type": "view", "channel": ch, "keys": want})).await;
+        // #129 N4: the listing itself gives each folder row the id of an object under it, as
+        // the role sees it: `notes/` holds only a.txt; `docs/` has a placeholder object named
+        // `docs/` (storage's API refuses such a name: an upload renamed in SQL, which its guard
+        // trigger allows), whose id it prefers.
+        storage_upload(&fx, &fx.token, "media", "docs/b.txt", None).await;
+        let placeholder = storage_upload(&fx, &fx.token, "media", "docs/p.txt", None).await;
+        fx.psql(&fx.pg_database, &format!("UPDATE storage.objects SET name = 'docs/' WHERE id = '{placeholder}'"))
+            .await;
+        let (status, listed) = storage_call(
+            &fx,
+            &bob_token,
+            reqwest::Method::POST,
+            "object/list/media",
+            Some("authenticated"),
+            json!({"prefix": "", "delimiter": "/"}).to_string().into_bytes(),
+            true,
+        )
+        .await;
+        assert_eq!(status, 200, "list: {listed}");
+        let row = |name: &str| {
+            listed["items"]
+                .as_array()
+                .and_then(|items| items.iter().find(|i| i["name"] == name))
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} in {listed}"))
+        };
+        let notes = row("notes/");
+        assert_eq!((&notes["folder"], &notes["id"]), (&json!(true), &json!(shown.to_string())), "{notes}");
+        let docs_row = row("docs/");
+        assert_eq!((&docs_row["folder"], &docs_row["id"]), (&json!(true), &json!(placeholder.to_string())), "{docs_row}");
+        // The docs/ uploads' own frames pass.
+        tokio::join!(
+            collect_rows(&mut ana, &ch, Duration::from_secs(3)),
+            collect_rows(&mut bob, &ch, Duration::from_secs(3)),
+            collect_rows(&mut admin, &ch, Duration::from_secs(3)),
+        );
+
+        // #129 S1: Studio sends each folder row's one object as a view key (bob's screen shows
+        // the root), so deleting a folder's last object reaches the viewer as a key. The key is
+        // the listing's own.
+        let listed_key = keys(&[notes["id"].as_str().expect("notes/'s id")]);
+        assert_eq!(listed_key, want);
+        send(&mut bob, json!({"type": "view", "channel": ch, "keys": listed_key})).await;
         // The view frame is checked before the delete commits.
         tokio::time::sleep(Duration::from_secs(1)).await;
         let (status, body) = storage_call(&fx, &fx.token, reqwest::Method::DELETE, "object/media/notes/a.txt", None, vec![], false).await;
