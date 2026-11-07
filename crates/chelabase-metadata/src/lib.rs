@@ -38,8 +38,9 @@ pub use saved_queries::{
     SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
 pub use storage_webhooks::{
-    DeliveryTarget, NewStorageWebhook, STORAGE_WEBHOOK_ATTEMPTS_KEPT, STORAGE_WEBHOOK_CAP, StorageWebhook,
-    StorageWebhookAttempt, StorageWebhookPatch,
+    DeliveryTarget, FailureRun, NewStorageWebhook, STORAGE_WEBHOOK_ATTEMPTS_KEPT,
+    STORAGE_WEBHOOK_CAP, STORAGE_WEBHOOK_RETRY_WINDOW, StorageWebhook, StorageWebhookAttempt,
+    StorageWebhookPatch,
 };
 pub use ddl::DdlTx;
 pub use merges::{

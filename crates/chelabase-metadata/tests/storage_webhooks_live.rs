@@ -429,3 +429,43 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
     );
     s.finish().await;
 }
+
+/// A failure after a quiet spell longer than the retry window starts a new run: the old run's
+/// start doesn't carry over, so the endpoint isn't disabled at its first failure back.
+#[tokio::test]
+#[ignore]
+async fn a_failure_after_a_quiet_spell_starts_a_new_run() {
+    let s = Scratch::new().await;
+    let db = s.database().await;
+    let id = s.webhook(db, "https://example.com/hook").await;
+    let t0 = Utc::now() - Duration::days(5);
+    for h in 0..=24 {
+        s.client
+            .record_storage_webhook_attempt(id, &attempt("http_error", t0 + Duration::hours(h)))
+            .await
+            .unwrap();
+    }
+    let back = t0 + Duration::days(4);
+    let since = s
+        .client
+        .record_storage_webhook_attempt(id, &attempt("http_error", back))
+        .await
+        .unwrap();
+    assert_eq!(
+        since.map(|t| t.timestamp_micros()),
+        Some(back.timestamp_micros()),
+        "a new run"
+    );
+    let w = s.client.get_storage_webhook(db, id).await.unwrap().unwrap();
+    assert_eq!(w.consecutive_failures, 1);
+    // Within the window the run goes on.
+    let next = s
+        .client
+        .record_storage_webhook_attempt(id, &attempt("timeout", back + Duration::hours(1)))
+        .await
+        .unwrap();
+    assert_eq!(next, since);
+    let w = s.client.get_storage_webhook(db, id).await.unwrap().unwrap();
+    assert_eq!(w.consecutive_failures, 2);
+    s.finish().await;
+}
