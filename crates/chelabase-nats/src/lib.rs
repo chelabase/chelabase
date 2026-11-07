@@ -8,6 +8,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub mod fn_events;
 pub mod rt;
 pub mod storage_objects;
 

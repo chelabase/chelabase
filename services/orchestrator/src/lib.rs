@@ -1955,6 +1955,14 @@ pub struct AppState<M, J> {
     pub webhooks: chelabase_http::outbound::Outbound,
 }
 
+/// The metadata client with the orchestrator's secrets key (edge functions m2/m3): function
+/// secrets are sealed and opened with it, and a branch create re-seals its parent's. Without
+/// it `put_secret` and `decrypt_secrets` fail, and so does creating a branch of a parent with
+/// function secrets.
+pub fn with_function_secrets(metadata: MetadataClient, secrets: &SecretKey) -> MetadataClient {
+    metadata.with_secrets_key(secrets.clone())
+}
+
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
 pub fn data_api_database_cap(value: Option<&str>) -> Result<u32, String> {
     const NAME: &str = "CHELABASE_BRANCH_DATA_API_DATABASE_CAP";
@@ -3571,5 +3579,32 @@ mod proxy_address_tests {
         }
         let blank = ProxyAddress::from_lookup(lookup(&[("CHELABASE_PROXY_HTTP_PORT", " ")]));
         assert_eq!(blank.unwrap().http_port, 4444);
+    }
+}
+
+#[cfg(test)]
+mod function_secrets_key_tests {
+    use super::*;
+    use chelabase_metadata::{MetadataConfig, MetadataError};
+
+    /// Edge functions m3: the orchestrator's metadata client carries its secrets key, so
+    /// function secrets seal and open (and a branch of a parent with secrets can be made).
+    /// Without the key, `put_secret` fails at once with a config error, before any query.
+    #[tokio::test]
+    async fn the_metadata_client_seals_function_secrets_with_the_orchestrator_key() {
+        let config = MetadataConfig { database_url: "postgres://u:p@127.0.0.1:1/none".into() };
+        let put = |client: MetadataClient| async move {
+            let branch = BranchId(Uuid::new_v4());
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client.put_secret(branch, Uuid::new_v4(), "API_KEY", "value"),
+            )
+            .await
+        };
+        let bare = MetadataClient::connect_lazy(&config).unwrap();
+        assert!(matches!(put(bare).await, Ok(Err(MetadataError::Config(_)))));
+        let keyed = with_function_secrets(MetadataClient::connect_lazy(&config).unwrap(), &SecretKey::generate());
+        // Sealed, then waiting on (or refused by) the database: anything but the config error.
+        assert!(!matches!(put(keyed).await, Ok(Err(MetadataError::Config(_)))));
     }
 }

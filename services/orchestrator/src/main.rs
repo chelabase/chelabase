@@ -72,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
 
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
+    // Every later use (the API, the internal listener) seals function secrets with it.
+    let metadata = orchestrator::with_function_secrets(metadata, &secrets);
 
     let data_api_database_cap = orchestrator::data_api_database_cap(
         std::env::var("CHELABASE_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
