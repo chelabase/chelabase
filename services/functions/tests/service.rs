@@ -934,6 +934,53 @@ async fn internal_invoke_takes_the_workers_bearer_only() {
     );
 }
 
+/// Edge functions m7: the worker's `{"type": "scheduled"}` body is marked for the runtime with
+/// `x-chelabase-event: scheduled` (its supervisor then runs the `scheduled` handler); any other
+/// body, and the same body on a public call (even with a forged header), is a plain request.
+#[tokio::test]
+async fn a_scheduled_body_from_the_worker_is_marked_for_the_runtime() {
+    let h = harness().await;
+    let url = format!("{}/internal/invoke/{}/users", h.control, h.branch);
+    let body = r#"{"type":"scheduled","cron":"* * * * *","scheduledTime":1767225600000}"#;
+    let resp = h
+        .http
+        .post(&url)
+        .bearer_auth(WORKER)
+        .header("x-chelabase-event", "forged")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen = h.last();
+    assert_eq!(seen.header("x-chelabase-event"), Some("scheduled"));
+    assert_eq!(seen.headers.get_all("x-chelabase-event").iter().count(), 1);
+    assert_eq!(seen.body, body.as_bytes());
+
+    for other in [r#"{"type":"table"}"#, "not json", ""] {
+        let resp = h
+            .http
+            .post(&url)
+            .bearer_auth(WORKER)
+            .body(other)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(h.last().header("x-chelabase-event"), None, "{other}");
+    }
+
+    let resp = h
+        .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
+        .header("x-chelabase-event", "scheduled")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("x-chelabase-event"), None);
+}
+
 /// Polls `cond` for up to 2 s (the error is written in the background).
 async fn wait_for(cond: impl Fn() -> bool) {
     for _ in 0..200 {

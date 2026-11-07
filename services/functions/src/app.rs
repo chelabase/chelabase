@@ -8,7 +8,8 @@
 //! Internal, in two sides on two networks (#181, audit S1): the runtime's side serves only
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
 //! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
-//! /internal/invoke/{branch_id}/{name}` (the worker's bearer).
+//! /internal/invoke/{branch_id}/{name}` (the worker's bearer; a `{"type": "scheduled"}` body
+//! reaches the runtime marked `x-chelabase-event: scheduled`, m7).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use uuid::Uuid;
 use crate::bundles::{self, Bundles, MAX_BUNDLE_BYTES, Put};
 use crate::caller::{self, Caller, Form, Refusal};
 use crate::directory::Resolution;
-use crate::host::{ERROR_HEADER, FunctionHost, HostError, Invocation};
+use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
 use crate::resolver::Resolver;
 
 /// A request body may be at most 6 MiB.
@@ -360,7 +361,10 @@ async fn invoke(
         path_and_query.push('?');
         path_and_query.push_str(&q);
     }
-    let headers = function_headers(&req.headers, &caller);
+    let mut headers = function_headers(&req.headers, &caller);
+    if form == Form::Internal && is_scheduled(&body) {
+        headers.insert(EVENT_HEADER, HeaderValue::from_static("scheduled"));
+    }
     let inv = Invocation {
         method: req.method,
         path_and_query,
@@ -398,6 +402,17 @@ async fn invoke(
             )
         }
     }
+}
+
+/// The worker's scheduled event (m7): a JSON object whose `type` is `scheduled`. The runtime
+/// checks the rest of it.
+fn is_scheduled(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Event<'a> {
+        #[serde(borrow, rename = "type")]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Event>(body).is_ok_and(|e| e.kind.as_deref() == Some("scheduled"))
 }
 
 /// Drops the headers that are ours or the hop's: every `x-chelabase-*` and `chelabase-*` (the
