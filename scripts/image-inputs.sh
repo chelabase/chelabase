@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the nine release images
+#   scripts/image-inputs.sh images                  the ten release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD
@@ -18,19 +18,21 @@
 #   Rust images   the service's closure of workspace path crates (normal and build deps, from
 #                 `cargo metadata`), the manifest of every crate any Rust image builds (one cargo
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
-#                 .cargo/
+#                 .cargo/ (storage's package is chelabase-storage-service; the others are named
+#                 after their image)
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
 #                 the build reads outside the graph: studio.Caddyfile, openapi/,
 #                 infra/compose/.env.example (its pin block left out: pinning rewrites it)
 #   identity      services/identity and its workspace: dependencies, package.json, pnpm-lock.yaml,
 #                 pnpm-workspace.yaml, identity.Dockerfile
-# A pin commit missing from history counts as changed, with a warning.
+# A pin commit missing from history (or no pin yet: the default tag `unpublished`) counts as
+# changed, with a warning.
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime init studio identity)
-rust=(gateway orchestrator worker rest auth realtime init)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity)
+rust=(gateway orchestrator worker rest auth realtime storage init)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
@@ -38,7 +40,15 @@ die() { echo "image-inputs: $*" >&2; exit 2; }
 known() { [[ " ${images[*]} " == *" $1 "* ]]; }
 
 meta="" # cargo metadata, read once by the main part
-rust_dirs() { # rust_dirs <package>...: the workspace crate dirs those packages build with
+package() { # package <image>: the cargo package it builds (server.Dockerfile's `-p`)
+  case "$1" in
+    storage) echo chelabase-storage-service ;;
+    *) echo "$1" ;;
+  esac
+}
+rust_dirs() { # rust_dirs <image>...: the workspace crate dirs those images' packages build with
+  local i pkgs=()
+  for i in "$@"; do pkgs+=("$(package "$i")"); done
   jq -r --arg root "$root/" --args '
     (.packages | map({key: .name, value: .}) | from_entries) as $pk
     | def deps($n): [$pk[$n].dependencies[] | select(.path != null and (.kind == null or .kind == "build")) | .name];
@@ -46,7 +56,7 @@ rust_dirs() { # rust_dirs <package>...: the workspace crate dirs those packages 
         if ($todo | length) == 0 then $seen
         elif ($seen | index($todo[0])) then close($seen; $todo[1:])
         else close($seen + [$todo[0]]; $todo[1:] + deps($todo[0])) end;
-    close([]; $ARGS.positional)[] | $pk[.].manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml")' "$@" <<<"$meta"
+    close([]; $ARGS.positional)[] | $pk[.].manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml")' "${pkgs[@]}" <<<"$meta"
 }
 
 pnpm_dirs() { # pnpm_dirs <dir>: <dir> and the workspace packages it depends on, transitively

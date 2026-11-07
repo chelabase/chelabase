@@ -347,7 +347,11 @@ Every `publish-images.sh` run selects its images:
 - `--all` takes the images whose inputs changed since their pins. If none did, it says so and builds nothing.
 - With neither, it refuses and prints the changed set. Naming every image with `--service` rebuilds them all.
 
-`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block); for the identity service, `services/identity` and its `workspace:` packages, the pnpm lockfile and workspace files and `identity.Dockerfile`. `server.Dockerfile`, `docker-bake.hcl` and `.dockerignore` are inputs of every image; the release scripts aren't, since they only select, push and pin. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
+`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block); for the identity service, `services/identity` and its `workspace:` packages, the pnpm lockfile and workspace files and `identity.Dockerfile`. `server.Dockerfile`, `docker-bake.hcl` and `.dockerignore` are inputs of every image; the release scripts aren't, since they only select, push and pin. A pin whose commit isn't in your history counts as changed, and so does an image with no pin yet.
+
+A new release image starts unpublished: its compose default tag is `unpublished`, `.env.example` has no pin for it, and it is listed in `unpublished` in `scripts/tests/compose-image-pins.sh`. Its first `pin-images.sh` run writes both pins like any other; the pin PR also drops it from that list. Storage is unpublished until its first release.
+
+`just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
 
 ```bash
 # 1. On main, after the merge: build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a

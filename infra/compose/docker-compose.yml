@@ -1270,14 +1270,13 @@ services:
   # chelabase-storage as the `storage` identity, and listens on NATS as `storage` (cache events)
   # and publishes object events there (webhooks, which the worker delivers). It runs its binary
   # directly as the image's user (10001, the owner of its files), on a read-only root.
-  # The image isn't published or pinned yet: that happens from `main` once the object-storage
-  # epic merges, when the release scripts learn to publish and pin it like the others (and
-  # CHELABASE_STORAGE_IMAGE_TAG goes). Until then the default tag `unpublished` doesn't exist:
-  # build it from the clone with docker-compose.build.yml, or with `just images` (or
-  # `docker buildx bake -f infra/images/docker-bake.hcl storage`) and set CHELABASE_IMAGE_TAG,
-  # or CHELABASE_STORAGE_IMAGE_TAG for this image alone, to its tag.
+  # Its image is a release image like the apps' (CHELABASE_IMAGE_REPO and CHELABASE_IMAGE_TAG
+  # pick it too), but not published yet: scripts/pin-images.sh writes its pin here at its first
+  # release. Until then the default tag `unpublished` doesn't exist: build it from the clone with
+  # docker-compose.build.yml, or with `just images` and set CHELABASE_IMAGE_REPO=chelabase and
+  # CHELABASE_IMAGE_TAG=latest.
   storage:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_STORAGE_IMAGE_TAG:-${CHELABASE_IMAGE_TAG:-unpublished}}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-unpublished}
     restart: unless-stopped
     read_only: true
     environment:

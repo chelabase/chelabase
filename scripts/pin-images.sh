@@ -8,7 +8,9 @@
 # `scripts/publish-images.sh --push-only` prints it (the lines starting with `pin `, minus that
 # word, or the whole output: other lines are ignored). Only those images' pins change; the rest
 # stay as they are. A line for an unknown image, or a malformed `pin` line, fails before any
-# file is touched. Check the result with scripts/tests/compose-image-pins.sh <digests-file>.
+# file is touched. An image that isn't published yet (compose default tag `unpublished`, no
+# .env.example pin) gets its first pin from a line for it, and stays as it is otherwise. Check the
+# result with scripts/tests/compose-image-pins.sh <digests-file>.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
@@ -19,7 +21,7 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 [[ $# -eq 1 && -f "$1" ]] || { echo "usage: $0 <digests-file>" >&2; exit 2; }
-images=(gateway orchestrator worker rest auth realtime init studio identity)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity)
 declare -A ref
 pin_re='^[0-9a-f]{12}$'
 digest_re='^sha256:[0-9a-f]{64}$'
@@ -40,8 +42,10 @@ declare -A old
 while read -r line; do
   [[ "$line" =~ ^#\ ghcr\.io/chelabase/([a-z]+):(.*)$ ]] && old[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
 done < <(sed -n '/^# BEGIN image pins/,/^# END image pins/p' "$envex")
+unpublished() { grep -qE "^\s*image: \\\$\{CHELABASE_IMAGE_REPO:-[^}]*\}/$1:\\\$\{CHELABASE_IMAGE_TAG:-unpublished\}\$" "$compose"; }
 for i in "${images[@]}"; do
-  [[ -n "${ref[$i]:-}${old[$i]:-}" ]] || { echo "pin-images: .env.example has no pin for $i" >&2; exit 1; }
+  [[ -n "${ref[$i]:-}${old[$i]:-}" ]] || unpublished "$i" ||
+    { echo "pin-images: .env.example has no pin for $i" >&2; exit 1; }
 done
 
 pinned=()
@@ -50,7 +54,9 @@ for i in "${images[@]}"; do
   pinned+=("$i")
   sed -i -E "s#^(\s*image: )\\$\{CHELABASE_IMAGE_REPO:-[^}]*\}/$i:\\$\{CHELABASE_IMAGE_TAG:-[^}]*\}\$#\1\${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/$i:\${CHELABASE_IMAGE_TAG:-${ref[$i]}}#" "$compose" "${overlays[@]}"
 done
-block="$(for i in "${images[@]}"; do echo "# ghcr.io/chelabase/$i:${ref[$i]:-${old[$i]}}"; done)"
+block="$(for i in "${images[@]}"; do
+  [[ -n "${ref[$i]:-}${old[$i]:-}" ]] && echo "# ghcr.io/chelabase/$i:${ref[$i]:-${old[$i]}}"
+done)"
 tmp="$(mktemp)"
 awk -v block="$block" '
   /^# BEGIN image pins/ { print; print block; skip = 1; next }

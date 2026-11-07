@@ -281,18 +281,16 @@ if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]] && compgen -v CHELABASE_IMAGE_TAG_ 
   svc=""
   while IFS= read -r line; do
     [[ "$line" =~ ^\ \ ([a-z0-9-]+):$ ]] && svc="${BASH_REMATCH[1]}"
-    # Storage's tag nests its own variable until its first pin (#152):
-    # ${CHELABASE_STORAGE_IMAGE_TAG:-${CHELABASE_IMAGE_TAG:-unpublished}}.
-    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{(CHELABASE_[A-Z]+_IMAGE_TAG:-\$\{)?CHELABASE_IMAGE_TAG:-([^}]*)\}\}?$ ]] || continue
+    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
     img="${BASH_REMATCH[2]}"
     var="CHELABASE_IMAGE_TAG_${img^^}"
     if [[ -n "${!var:-}${CHELABASE_IMAGE_TAG:-}" ]]; then
       ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:${!var:-$CHELABASE_IMAGE_TAG}"
-    elif [[ "${BASH_REMATCH[4]}" == unpublished ]]; then
+    elif [[ "${BASH_REMATCH[3]}" == unpublished ]]; then
       # No pin to fall back to yet: the image `just images` built.
       ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:latest"
     else
-      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[4]}"
+      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[3]}"
       docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null
     fi
     printf '  %s:\n    image: %s\n' "$svc" "$ref" >>"$tmp/images.yml"
