@@ -2194,6 +2194,7 @@ impl WorkerMetadata for FakeMetadata {
                 role_oid: k.role_oid,
                 role_timeline: k.role_timeline.clone(),
                 role_bypass_rls: k.role_bypass_rls,
+                managed_by_function: None,
             })
             .collect())
     }

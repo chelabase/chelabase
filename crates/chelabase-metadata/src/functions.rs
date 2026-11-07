@@ -27,6 +27,8 @@ use crate::{MetadataClient, MetadataError};
 pub const MAX_BUNDLE_SIZE: i64 = 10 * 1024 * 1024;
 /// A secret value may be at most 64 KiB.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
+/// A function's recorded last error is cut to this many characters.
+pub const MAX_LAST_ERROR_CHARS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
@@ -195,6 +197,38 @@ pub struct TriggerRecord {
     pub events: Vec<String>,
 }
 
+/// A function's run-as role and the secret data key minted for it ([`MetadataClient::set_run_as`]).
+/// The caller generates the key and checks the role on the compute (its OID, timeline and
+/// BYPASSRLS, as for any secret key); the store seals `secret` for display to the functions
+/// service only.
+#[derive(Clone)]
+pub struct RunAs {
+    pub role: String,
+    pub role_oid: i64,
+    pub role_timeline: Option<String>,
+    pub role_bypass_rls: bool,
+    pub key_id: Uuid,
+    pub prefix: String,
+    pub sha256: [u8; 32],
+    /// The key's plaintext.
+    pub secret: String,
+}
+
+impl std::fmt::Debug for RunAs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunAs")
+            .field("role", &self.role)
+            .field("role_oid", &self.role_oid)
+            .field("role_timeline", &self.role_timeline)
+            .field("role_bypass_rls", &self.role_bypass_rls)
+            .field("key_id", &self.key_id)
+            .field("prefix", &self.prefix)
+            .field("sha256", &"<redacted>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 /// `^[a-z][a-z0-9-]{0,62}$`, as the schema checks.
 pub fn valid_function_name(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -282,6 +316,107 @@ async fn lock_branch_function(
         None => None,
     };
     ours.map(|_| ()).ok_or(MetadataError::FunctionNotFound)
+}
+
+/// Takes the branch's endpoint row `FOR SHARE` (waiting at most 5 s), after the branch row:
+/// the order `create_secret_key` and the DDL receiver use.
+async fn lock_endpoint_share(
+    tx: &mut Transaction<'static, Postgres>,
+    branch: BranchId,
+) -> Result<(), MetadataError> {
+    sqlx::query("SELECT set_config('lock_timeout', '5s', true)")
+        .execute(&mut **tx)
+        .await?;
+    let endpoint: Option<Option<String>> =
+        sqlx::query_scalar("SELECT endpoint_id FROM branches WHERE id = $1")
+            .bind(branch.as_uuid())
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(Some(endpoint)) = endpoint {
+        sqlx::query("SELECT id FROM neon_endpoints WHERE id = $1 FOR SHARE")
+            .bind(&endpoint)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| crate::ddl::lock_timeout(e, &endpoint))?;
+    }
+    sqlx::query("SELECT set_config('lock_timeout', '0', true)")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// For a write to a function as a whole (its kind, its deletion), which changes every branch
+/// that has it active: takes the database row `FOR SHARE`, then every live branch row of the
+/// database `FOR SHARE` (by id), then the function row `FOR UPDATE`, and refuses with
+/// [`MetadataError::FunctionActiveOnProtectedBranch`] when a live protected branch has the
+/// function active. The function's kind, or `None` for an unknown function or another
+/// database's.
+///
+/// Protecting a branch updates its row, so it waits for this transaction, or this waits for it
+/// and then reads the branch protected (each statement reads what committed before it). A
+/// branch create holds the database row `FOR NO KEY UPDATE`, so no branch appears meanwhile.
+/// The order (database, branches, function) is the per-branch writes' ([`lock_branch_function`]).
+async fn lock_function_unprotected(
+    tx: &mut Transaction<'static, Postgres>,
+    database: DatabaseId,
+    function: Uuid,
+) -> Result<Option<FunctionKind>, MetadataError> {
+    sqlx::query("SELECT 1 FROM databases WHERE id = $1 FOR SHARE")
+        .bind(database.as_uuid())
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "SELECT id FROM branches
+         WHERE database_id = $1 AND status NOT IN ('deleting', 'deleted')
+         ORDER BY id FOR SHARE",
+    )
+    .bind(database.as_uuid())
+    .execute(&mut **tx)
+    .await?;
+    let kind: Option<String> = sqlx::query_scalar(
+        "SELECT kind FROM functions WHERE id = $1 AND database_id = $2 FOR UPDATE",
+    )
+    .bind(function)
+    .bind(database.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    let protected: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM branch_functions bf JOIN branches b ON b.id = bf.branch_id
+             WHERE bf.function_id = $1 AND b.protected
+               AND b.status NOT IN ('deleting', 'deleted'))",
+    )
+    .bind(function)
+    .fetch_one(&mut **tx)
+    .await?;
+    if protected {
+        return Err(MetadataError::FunctionActiveOnProtectedBranch);
+    }
+    Ok(Some(FunctionKind::parse(&kind)?))
+}
+
+/// Revokes the keys a function manages (dropping their sealed values, before the delete nulls
+/// `managed_by_function_id`) and deletes it, with its deployments and every branch's state.
+/// The caller holds the function row `FOR UPDATE`.
+async fn delete_locked_function(
+    tx: &mut Transaction<'static, Postgres>,
+    function: Uuid,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "UPDATE data_api_keys SET revoked_at = coalesce(revoked_at, now()), sealed = NULL
+         WHERE managed_by_function_id = $1 AND (revoked_at IS NULL OR sealed IS NOT NULL)",
+    )
+    .bind(function)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM functions WHERE id = $1")
+        .bind(function)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn function_from_row(r: &PgRow) -> Result<FunctionRecord, MetadataError> {
@@ -520,17 +655,238 @@ impl MetadataClient {
         if found.is_none() {
             return Ok(false);
         }
-        sqlx::query(
-            "UPDATE data_api_keys SET revoked_at = now()
-             WHERE managed_by_function_id = $1 AND revoked_at IS NULL",
+        delete_locked_function(&mut tx, function_id).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Sets how the function is called on the branch. False when it has no deployment there.
+    pub async fn set_function_auth(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        auth: FunctionAuth,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let updated = sqlx::query(
+            "UPDATE branch_functions SET auth = $3, updated_at = now()
+             WHERE branch_id = $1 AND function_id = $2",
         )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(auth.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(updated == 1)
+    }
+
+    /// Sets (or with `None` clears) the role the function runs as on the branch, in one
+    /// transaction: every live key the function manages on the branch is revoked (its sealed
+    /// value dropped), then for `Some` a secret key bound to the role's identity is stored with
+    /// `managed_by_function_id`, its plaintext sealed with `Purpose::DataKey` and the key's id
+    /// as AAD (the public key's seal), and `run_as_role` and `run_as_key_id` name it. False,
+    /// nothing written, when the function has no deployment on the branch.
+    ///
+    /// Lock order: the branch-function locks ([`lock_branch_function`]), the state row, then
+    /// the branch's endpoint row `FOR SHARE` (as `create_secret_key`: the DDL receiver holds it
+    /// `FOR UPDATE` while it drops or renames roles with live keys, so a DROP after this commit
+    /// sees the key). A wait over 5 s for it is [`MetadataError::EndpointLockTimeout`].
+    pub async fn set_run_as(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        run_as: Option<&RunAs>,
+    ) -> Result<bool, MetadataError> {
+        let sealed = match run_as {
+            Some(r) => Some(chelabase_secrets::seal_credential(
+                self.secrets_key()?,
+                &r.key_id.to_string(),
+                chelabase_secrets::Purpose::DataKey,
+                &r.secret,
+            )),
+            None => None,
+        };
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT f.name FROM branch_functions bf JOIN functions f ON f.id = bf.function_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2 FOR NO KEY UPDATE OF bf",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(name) = name else {
+            return Ok(false);
+        };
+        sqlx::query(
+            "UPDATE data_api_keys SET revoked_at = now(), sealed = NULL
+             WHERE branch_id = $1 AND managed_by_function_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(branch.as_uuid())
         .bind(function_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM functions WHERE id = $1")
+        if let Some(r) = run_as {
+            lock_endpoint_share(&mut tx, branch).await?;
+            sqlx::query(
+                "INSERT INTO data_api_keys
+                     (id, branch_id, kind, role, name, prefix, sha256, sealed, role_oid,
+                      role_timeline, role_bypass_rls, managed_by_function_id)
+                 VALUES ($1, $2, 'secret', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(r.key_id)
+            .bind(branch.as_uuid())
+            .bind(&r.role)
+            .bind(&name)
+            .bind(&r.prefix)
+            .bind(r.sha256.as_slice())
+            .bind(&sealed)
+            .bind(r.role_oid)
+            .bind(&r.role_timeline)
+            .bind(r.role_bypass_rls)
             .bind(function_id)
             .execute(&mut *tx)
+            .await
+            .map_err(map_check)?;
+        }
+        sqlx::query(
+            "UPDATE branch_functions SET run_as_role = $3, run_as_key_id = $4, updated_at = now()
+             WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(run_as.map(|r| r.role.as_str()))
+        .bind(run_as.map(|r| r.key_id))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_check)?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The function's run-as key on the branch, opened: `(key id, plaintext)`. Only a live
+    /// secret key the function itself manages, named by its state row, on a live `normal`
+    /// branch of a live database; `None` otherwise. A sealed value that doesn't open for that
+    /// key id is [`MetadataError::Secret`].
+    pub async fn managed_run_as_key(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+    ) -> Result<Option<(Uuid, String)>, MetadataError> {
+        let row: Option<(Uuid, String)> = sqlx::query_as(
+            "SELECT k.id, k.sealed
+             FROM branch_functions bf
+             JOIN data_api_keys k ON k.id = bf.run_as_key_id AND k.branch_id = bf.branch_id
+             JOIN branches b ON b.id = bf.branch_id
+             JOIN databases d ON d.id = b.database_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2
+               AND k.managed_by_function_id = bf.function_id AND k.kind = 'secret'
+               AND k.revoked_at IS NULL AND k.sealed IS NOT NULL
+               AND b.kind = 'normal' AND b.status NOT IN ('deleting', 'deleted')
+               AND d.status NOT IN ('deleting', 'deleted')",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, sealed)) = row else {
+            return Ok(None);
+        };
+        let secret = chelabase_secrets::open_credential(
+            self.secrets_key()?,
+            &id.to_string(),
+            chelabase_secrets::Purpose::DataKey,
+            &sealed,
+        )
+        .map_err(|e| MetadataError::Secret(format!("run-as key {id}: {e}")))?;
+        Ok(Some((id, secret)))
+    }
+
+    /// Records the function's last invocation error on the branch (`None` clears it), cut to
+    /// [`MAX_LAST_ERROR_CHARS`] characters. A branch or database that is deleting or deleted, or
+    /// a function without state there, is left as it is.
+    pub async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        let error: Option<String> = error.map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect());
+        sqlx::query(
+            "UPDATE branch_functions bf SET last_error = $3, updated_at = now()
+             FROM branches b JOIN databases d ON d.id = b.database_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2 AND b.id = bf.branch_id
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND d.status NOT IN ('deleting', 'deleted')",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Changes a function's kind. False for an unknown function or one of another database;
+    /// the same kind is a no-op. Refused with
+    /// [`MetadataError::FunctionActiveOnProtectedBranch`] while a live protected branch has it
+    /// active ([`lock_function_unprotected`]), and with [`MetadataError::InvalidFunction`] once
+    /// it has a deployment (a deployment is a function's bundle or a service's spec, never
+    /// both).
+    pub async fn set_function_kind(
+        &self,
+        database_id: DatabaseId,
+        function_id: Uuid,
+        kind: FunctionKind,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = lock_function_unprotected(&mut tx, database_id, function_id).await?
+        else {
+            return Ok(false);
+        };
+        if current == kind {
+            return Ok(true);
+        }
+        let deployed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM function_deployments WHERE function_id = $1)",
+        )
+        .bind(function_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if deployed {
+            return Err(invalid(
+                "a function with deployments keeps its kind (delete it and create it again)",
+            ));
+        }
+        sqlx::query("UPDATE functions SET kind = $2 WHERE id = $1")
+            .bind(function_id)
+            .bind(kind.as_str())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// [`Self::delete_function`] for the management API: refused with
+    /// [`MetadataError::FunctionActiveOnProtectedBranch`], nothing written, while a live
+    /// protected branch has the function active ([`lock_function_unprotected`]).
+    pub async fn delete_function_unprotected(
+        &self,
+        database_id: DatabaseId,
+        function_id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        if lock_function_unprotected(&mut tx, database_id, function_id)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        delete_locked_function(&mut tx, function_id).await?;
         tx.commit().await?;
         Ok(true)
     }
