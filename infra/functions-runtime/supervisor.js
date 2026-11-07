@@ -223,8 +223,21 @@ const gateway = (ctx) => ctx.exports.chelabaseApi({ props: {} });
 // the gateway (GATEWAY, on the `functions` network) on the API host and nowhere else: the path
 // and query are the caller's, the host is always CHELABASE_API_HOST (a Host header or another
 // host in the URL is ignored), and redirects come back to the caller. It adds nothing: the
-// gateway sees only the caller's own headers (less any x-chelabase-* one) and authenticates
+// gateway sees only the caller's own headers (less any x-chelabase-* or client-address one) and authenticates
 // them like any API request.
+// Headers that claim who the client is or how it connected. A function must never set them for the
+// gateway: where the operator trusts proxies covering the runtime's address, they would let member
+// code pose as any client address and get around per-IP limits (#183 audit S1).
+const CLIENT_ADDRESS_HEADER = (name) =>
+  name === "forwarded" ||
+  name.startsWith("x-forwarded-") ||
+  name === "x-real-ip" ||
+  name === "x-client-ip" ||
+  name === "true-client-ip" ||
+  name === "cf-connecting-ip" ||
+  name === "fastly-client-ip" ||
+  name === "x-cluster-client-ip";
+
 export const chelabaseApi = {
   async fetch(request, bindings) {
     const host = bindings.API_HOST;
@@ -235,7 +248,8 @@ export const chelabaseApi = {
     const headers = new Headers();
     for (const [k, v] of request.headers) {
       const name = k.toLowerCase();
-      if (name !== "host" && !name.startsWith(PRIVATE_PREFIX)) headers.append(k, v);
+      if (name === "host" || name.startsWith(PRIVATE_PREFIX) || CLIENT_ADDRESS_HEADER(name)) continue;
+      headers.append(k, v);
     }
     return bindings.GATEWAY.fetch(
       new Request(`http://${host}${url.pathname}${url.search}`, {
