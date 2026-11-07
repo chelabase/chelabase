@@ -19,7 +19,8 @@
 // A loaded worker is cached by the loader under `{database_id}/{sha256}:{sha256(env header)}`,
 // so two deployments sharing a bundle never share an env. User workers get only their own env,
 // the `egress` service as their global outbound (public addresses only), and the request
-// without any x-chelabase-* header.
+// without any x-chelabase-* header; their response loses any x-chelabase-* header too, so
+// `x-chelabase-error` only ever comes from the supervisor.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
@@ -141,6 +142,17 @@ function remember(id) {
   verified.add(id);
 }
 
+// The user worker's response without any x-chelabase-* header: those are the supervisor's to
+// set (a function's own 5xx must not choose its `last_error`). Status, status text, body and
+// every other header (set-cookie included) pass through.
+function withoutPrivateHeaders(res) {
+  const ours = [...res.headers.keys()].filter((k) => k.toLowerCase().startsWith(PRIVATE_PREFIX));
+  if (ours.length === 0) return res;
+  const out = new Response(res.body, res);
+  for (const k of ours) out.headers.delete(k);
+  return out;
+}
+
 const PROBE_CODE = {
   compatibilityDate: "2026-10-01",
   mainModule: "probe.js",
@@ -170,8 +182,9 @@ export default {
       for (const [k, v] of request.headers) {
         if (!k.toLowerCase().startsWith(PRIVATE_PREFIX)) headers.append(k, v);
       }
+      let res;
       try {
-        return await worker.getEntrypoint().fetch(new Request(request, { headers }));
+        res = await worker.getEntrypoint().fetch(new Request(request, { headers }));
       } catch (e) {
         // An exception from the handler comes back marked `remote` and stays a 500. Anything
         // else is the loader failing to start the worker (a syntax error, an unknown
@@ -180,6 +193,7 @@ export default {
         if (e?.remote) throw e;
         throw new Refused(502, START_FAILED);
       }
+      return withoutPrivateHeaders(res);
     } catch (e) {
       // `x-chelabase-error` carries the reason to the functions service (its `last_error`); it
       // strips every x-chelabase-* header before the response reaches the caller.
