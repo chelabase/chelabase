@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { fetchStorageObject } from "@chelabase/management-client";
 import { FolderUp, LayoutGrid, List, Search, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { LiveBadge } from "@/components/table-editor/live-badge";
 import { Select } from "@/components/ui/select";
 import { errorText } from "@/lib/errors";
 import { invalidateStorage, publicObjectUrl, signObjectUrl, storageParams, type Bucket, type StorageItem } from "@/lib/storage-api";
@@ -12,6 +13,7 @@ import { inputFiles, type DroppedFile } from "../upload/drop-entries";
 import { UploadTray } from "../upload/upload-tray";
 import { useUploadQueue } from "../upload/use-upload-queue";
 import { DropZone } from "./drop-zone";
+import { useLiveObjects } from "./live-objects";
 import { DeleteObjectsDialog, RelocateDialog, RenameDialog, SignDialog, type ObjectPlace } from "./object-dialogs";
 import { ObjectDetails } from "./object-details";
 import { ObjectList, type ObjectView } from "./object-list";
@@ -102,6 +104,11 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
   const items = pages.items;
   const fileNames = useMemo(() => items.filter((i) => !i.folder).map((i) => i.name), [items]);
   useEffect(() => dispatch({ type: "keep", names: fileNames }), [fileNames]);
+  // m17: other people's changes in this bucket, as the role sees them, read the listing again.
+  const fileIds = useMemo(() => items.flatMap((i) => (!i.folder && i.id ? [i.id] : [])), [items]);
+  const refetchPages = pages.refetch;
+  const relist = useCallback(() => void refetchPages(), [refetchPages]);
+  const liveStatus = useLiveObjects({ databaseId, branchId, pgDatabase, bucketId: bucket.id, role }, fileIds, relist);
 
   const place: ObjectPlace = { databaseId, branchId, role, bucket: bucket.name };
   const sign = canWrite ? (expiresIn: number) => signObjectUrl(apiUrl, databaseId, branchId, role, bucket.name, focused?.name ?? "", expiresIn) : null;
@@ -207,6 +214,7 @@ export function ObjectBrowser({ databaseId, branchId, role, bucket, pgDatabase, 
             })}
           </ol>
         </nav>
+        {liveStatus && <LiveBadge status={liveStatus} />}
         <label className="relative flex items-center">
           <span className="sr-only">Search objects</span>
           <Search aria-hidden="true" size={14} strokeWidth={1.5} className="pointer-events-none absolute left-2 text-chalk-dim" />
