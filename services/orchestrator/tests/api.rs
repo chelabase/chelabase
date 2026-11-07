@@ -5373,6 +5373,206 @@ use chelabase_identity::Pool;
 use chelabase_identity::mock::FakeIdentity;
 use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
 
+// ---- storage webhooks (object-storage m18)
+
+impl Branching {
+    fn webhooks(&self) -> String {
+        format!("/v1/databases/{}/storage/webhooks", self.db)
+    }
+
+    async fn create_webhook(&self, body: Value) -> Value {
+        let resp = self.send(Method::POST, &self.webhooks(), Some(body)).await;
+        assert_eq!(resp.status(), 201);
+        resp.json().await.unwrap()
+    }
+}
+
+/// AC 5: the secret is in the create (and rotate) answer only; list and get never carry it; it
+/// is stored sealed for its own endpoint.
+#[tokio::test]
+async fn a_webhook_secret_is_shown_once() {
+    let t = branching().await;
+    let created = t
+        .create_webhook(json!({ "url": "https://hooks.example.test/in", "events": ["object.created"], "bucket": "avatars" }))
+        .await;
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("whsec_") && secret.len() == 6 + 64, "{secret}");
+    let w = &created["webhook"];
+    assert_eq!(w["url"], "https://hooks.example.test/in");
+    assert_eq!(w["events"], json!(["object.created"]));
+    assert_eq!((w["bucket"].as_str(), w["enabled"].as_bool()), (Some("avatars"), Some(true)));
+    let id: uuid::Uuid = w["id"].as_str().unwrap().parse().unwrap();
+
+    let one = format!("{}/{id}", t.webhooks());
+    for path in [t.webhooks(), one.clone()] {
+        let resp = t.send(Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains(&secret) && !text.contains("secret"), "{path}: {text}");
+    }
+    let sealed = t.metadata.storage_webhooks.lock().unwrap()[0].1.clone();
+    assert!(!sealed.contains(&secret));
+    assert_eq!(chelabase_secrets::open_webhook_secret(&t.app.key, id, &sealed).unwrap(), secret);
+    assert!(chelabase_secrets::open_webhook_secret(&t.app.key, uuid::Uuid::new_v4(), &sealed).is_err());
+
+    let rotated = t.send(Method::POST, &format!("{one}/rotate-secret"), None).await;
+    assert_eq!(rotated.status(), 200);
+    let rotated: Value = rotated.json().await.unwrap();
+    let new_secret = rotated["secret"].as_str().unwrap();
+    assert_ne!(new_secret, secret);
+    let sealed = t.metadata.storage_webhooks.lock().unwrap()[0].1.clone();
+    assert_eq!(chelabase_secrets::open_webhook_secret(&t.app.key, id, &sealed).unwrap(), new_secret);
+    let text = t.send(Method::GET, &one, None).await.text().await.unwrap();
+    assert!(!text.contains(new_secret));
+}
+
+/// AC 3 at registration: private, loopback, link-local, metadata and IPv6 loopback literals in
+/// any spelling, a name resolving privately, an unresolvable one, http, and credentials are
+/// refused (nothing stored); an allowlisted internal host passes.
+#[tokio::test]
+async fn webhook_urls_must_reach_only_public_addresses() {
+    let t = branching().await;
+    for url in [
+        "https://127.0.0.1/hook",
+        "https://2130706433/",
+        "https://0177.0.0.1/",
+        "https://10.0.0.1/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://[::1]/",
+        "https://[::ffff:127.0.0.1]/",
+        "https://100.64.0.1/",
+        "https://private.example.test/hook",
+        "https://nowhere.example.test/",
+        "http://hooks.example.test/",
+        "https://user:pw@hooks.example.test/",
+        "ftp://hooks.example.test/",
+        "not a url",
+    ] {
+        let body = error_of(
+            t.send(Method::POST, &t.webhooks(), Some(json!({ "url": url, "events": ["object.created"] }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&body), "invalid_request", "{url}");
+        assert!(message_of(&body).contains("url"), "{url}: {body}");
+    }
+    assert!(t.metadata.storage_webhooks.lock().unwrap().is_empty());
+    t.create_webhook(json!({ "url": "https://inside.example.test/hook", "events": ["object.deleted"] })).await;
+    // A change of URL is checked the same way.
+    let id = t.metadata.storage_webhooks.lock().unwrap()[0].0.id;
+    let body = error_of(
+        t.send(Method::PATCH, &format!("{}/{id}", t.webhooks()), Some(json!({ "url": "https://10.1.2.3/" }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&body), "invalid_request");
+}
+
+#[tokio::test]
+async fn webhook_events_and_filters_are_checked_and_capped() {
+    let t = branching().await;
+    for body in [
+        json!({ "url": "https://hooks.example.test/", "events": [] }),
+        json!({ "url": "https://hooks.example.test/", "events": ["object.read"] }),
+        json!({ "url": "https://hooks.example.test/", "events": ["webhook.test"] }),
+        json!({ "url": "https://hooks.example.test/", "events": ["object.created"], "bucket": "" }),
+        json!({ "url": "https://hooks.example.test/", "events": ["object.created"], "bucket": "b".repeat(101) }),
+        json!({ "url": "https://hooks.example.test/", "events": ["object.created"], "prefix": "p".repeat(1025) }),
+        json!({ "url": "https://hooks.example.test/", "events": ["object.created"], "secret": "mine" }),
+        json!({ "events": ["object.created"] }),
+    ] {
+        let resp = t.send(Method::POST, &t.webhooks(), Some(body.clone())).await;
+        assert_eq!(resp.status(), 422, "{body}");
+    }
+    let w = t
+        .create_webhook(json!({ "url": "https://hooks.example.test/", "events": ["object.moved", "object.created", "object.created"] }))
+        .await;
+    assert_eq!(w["webhook"]["events"], json!(["object.created", "object.moved"]), "deduplicated, in order");
+    for _ in 1..chelabase_metadata::STORAGE_WEBHOOK_CAP {
+        t.create_webhook(json!({ "url": "https://hooks.example.test/", "events": ["object.created"] })).await;
+    }
+    let body = error_of(
+        t.send(Method::POST, &t.webhooks(), Some(json!({ "url": "https://hooks.example.test/", "events": ["object.created"] }))).await,
+        409,
+    )
+    .await;
+    assert_eq!(code_of(&body), "conflict");
+}
+
+/// Patch, disable and enable, delete: each only within the database in the path; another
+/// database's endpoint is 404.
+#[tokio::test]
+async fn webhooks_change_only_within_their_database() {
+    let t = branching().await;
+    let w = t.create_webhook(json!({ "url": "https://hooks.example.test/", "events": ["object.created"], "bucket": "a" })).await;
+    let id = w["webhook"]["id"].as_str().unwrap();
+    let one = format!("{}/{id}", t.webhooks());
+    let resp = t.send(Method::PATCH, &one, Some(json!({ "bucket": null, "prefix": "img/", "enabled": false }))).await;
+    assert_eq!(resp.status(), 200);
+    let patched: Value = resp.json().await.unwrap();
+    assert_eq!((patched["bucket"].clone(), patched["prefix"].clone()), (Value::Null, json!("img/")));
+    assert_eq!((patched["enabled"].clone(), patched["disabled_reason"].clone()), (json!(false), json!("member")));
+    let resp = t.send(Method::PATCH, &one, Some(json!({ "enabled": true }))).await;
+    let enabled: Value = resp.json().await.unwrap();
+    assert_eq!((enabled["enabled"].clone(), enabled["disabled_reason"].clone()), (json!(true), Value::Null));
+
+    let other = format!("/v1/databases/{}/storage/webhooks/{id}", uuid::Uuid::new_v4());
+    for (method, path) in [(Method::GET, other.clone()), (Method::DELETE, other.clone())] {
+        assert_eq!(t.send(method, &path, None).await.status(), 404);
+    }
+    let missing = format!("{}/{}", t.webhooks(), uuid::Uuid::new_v4());
+    for (method, path, body) in [
+        (Method::GET, missing.clone(), None),
+        (Method::PATCH, missing.clone(), Some(json!({ "enabled": false }))),
+        (Method::DELETE, missing.clone(), None),
+        (Method::POST, format!("{missing}/rotate-secret"), None),
+        (Method::POST, format!("{missing}/test"), None),
+        (Method::GET, format!("{missing}/attempts"), None),
+    ] {
+        let status = t.send(method.clone(), &path, body).await.status();
+        assert_eq!(status, 404, "{method} {path}");
+    }
+    assert_eq!(t.send(Method::DELETE, &one, None).await.status(), 204);
+    assert_eq!(t.send(Method::GET, &one, None).await.status(), 404);
+}
+
+/// A test event goes to the worker for this database's endpoint and answers its attempt; no
+/// worker is 503.
+#[tokio::test]
+async fn a_webhook_test_asks_the_worker_and_answers_the_attempt() {
+    let t = branching().await;
+    let w = t.create_webhook(json!({ "url": "https://hooks.example.test/", "events": ["object.created"] })).await;
+    let id: uuid::Uuid = w["webhook"]["id"].as_str().unwrap().parse().unwrap();
+    let test = format!("{}/{id}/test", t.webhooks());
+    let resp = t.send(Method::POST, &test, None).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({ "outcome": "delivered", "status": 200, "duration_ms": 7 }));
+    assert_eq!(
+        *t.jobs.webhook_tests.lock().unwrap(),
+        [chelabase_nats::storage_objects::TestRequest { database_id: t.db.as_uuid(), webhook_id: id }]
+    );
+    *t.jobs.webhook_test_reply.lock().unwrap() = Some(Err(ResetError::Transport("no worker listening".into())));
+    let body = error_of(t.send(Method::POST, &test, None).await, 503).await;
+    assert_eq!(code_of(&body), "worker_unavailable");
+
+    t.metadata.storage_webhook_attempts.lock().unwrap().push((
+        id,
+        chelabase_metadata::StorageWebhookAttempt {
+            event_id: uuid::Uuid::new_v4(),
+            event_type: "object.created".into(),
+            attempt: 2,
+            outcome: "http_error".into(),
+            status: Some(500),
+            duration_ms: 31,
+            attempted_at: chrono::Utc::now(),
+        },
+    ));
+    let attempts: Value = t.send(Method::GET, &format!("{}/{id}/attempts", t.webhooks()), None).await.json().await.unwrap();
+    assert_eq!(attempts.as_array().unwrap().len(), 1);
+    assert_eq!((attempts[0]["status"].clone(), attempts[0]["outcome"].clone()), (json!(500), json!("http_error")));
+}
+
 // ---- saved queries
 
 impl Branching {

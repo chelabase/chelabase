@@ -262,6 +262,7 @@ fn path_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> String {
         .replace("{name}", "web1")
         .replace("{key_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{query_id}", &uuid::Uuid::new_v4().to_string())
+        .replace("{webhook_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{run_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{user_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{member_id}", &uuid::Uuid::new_v4().to_string())
@@ -318,6 +319,11 @@ fn body_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> Option<Value> {
             json!({ "name": "q", "sql": "select 1" }),
         ),
         (r::UPDATE_SAVED_QUERY.name, json!({ "version": 1 })),
+        (
+            r::CREATE_STORAGE_WEBHOOK.name,
+            json!({ "url": "https://hooks.example.test/", "events": ["object.created"] }),
+        ),
+        (r::UPDATE_STORAGE_WEBHOOK.name, json!({ "enabled": true })),
         (
             r::RUN_SQL.name,
             json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" }),

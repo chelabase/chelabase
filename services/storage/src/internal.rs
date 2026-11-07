@@ -279,6 +279,7 @@ mod tests {
             store: Arc::new(chelabase_storage::MemoryStore::default()),
             urls: Urls::new(Arc::new(Orchestrator::new("http://127.0.0.1:9", "t"))),
             inflight: crate::limits::InFlight::new(1 << 30),
+            events: crate::events::ObjectEvents::none(),
         })
     }
 

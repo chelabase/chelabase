@@ -12,7 +12,10 @@
 # (67156a23). The object-storage epic (#93, #96, #99) changed the workbench stack on purpose
 # (SeaweedFS's file-held, scoped S3 identities, its storage bucket and gRPC mTLS, the storage
 # service, its internal token and the worker's blob sweeper), so REV is now its last compose
-# commit (a9e41cce). At a REV with only docker-compose.yml, that file alone is the reference.
+# commit (a9e41cce). Its m9 (#100: storage's own NATS login) and m18 (#130: the worker's webhook
+# settings, passed through for the live test) changed it on purpose again, so REV is now m18's
+# compose commit (0d175d8f). At a REV with only docker-compose.yml, that file alone is the
+# reference.
 #
 #   scripts/tests/compose-overlay-equiv.sh [--env-file <stack.env>] [--rev <git rev>]
 #
@@ -33,7 +36,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
 # The last intended change of the workbench shape: the object-storage epic's last compose commit.
-rev=a9e41cce
+rev=0d175d8f
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;

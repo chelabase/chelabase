@@ -57,9 +57,30 @@ const CONTROL_CONSUMER_API: [&str; 6] = [
     "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_CONTROL.>",
     "$JS.ACK.CHELABASE_CONTROL.>",
 ];
-/// Object storage's cache events (m9: `chelabase-nats`'s `storage` subjects): the orchestrator
-/// publishes them, storage listens.
-const STORAGE_EVENTS: &str = "chelabase.storage.>";
+/// Object storage's cache events (m9: `chelabase-nats`'s `SUBJECT_STORAGE_EVENTS`): the
+/// orchestrator publishes them, storage listens. Exactly that subject: the object events one
+/// token deeper (m18) are storage's alone to publish.
+const STORAGE_EVENTS: &str = "chelabase.storage.events";
+/// m18: object events, one Chelabase database token deep (`storage_objects::subject`): storage
+/// publishes them, the worker reads them through its consumers.
+const STORAGE_OBJECT_EVENTS: &str = "chelabase.storage.events.*";
+/// Creating or fixing the object events stream (`storage_objects::ensure_stream`): the
+/// orchestrator only (R10).
+const STORAGE_OBJECT_STREAM_API: [&str; 3] = [
+    "$JS.API.STREAM.INFO.CHELABASE_STORAGE_EVENTS",
+    "$JS.API.STREAM.CREATE.CHELABASE_STORAGE_EVENTS",
+    "$JS.API.STREAM.UPDATE.CHELABASE_STORAGE_EVENTS",
+];
+/// The worker's webhook consumers (`storage_objects::endpoint_consumer`): a durable consumer
+/// filtered to one database's subject (`CREATE.<stream>.<name>.<filter>`, so an unfiltered or
+/// otherwise filtered create is refused), its info, pulls, acks and delete. No stream API.
+const STORAGE_OBJECT_CONSUMER_API: [&str; 5] = [
+    "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS.*.chelabase.storage.events.*",
+    "$JS.API.CONSUMER.INFO.CHELABASE_STORAGE_EVENTS.*",
+    "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_STORAGE_EVENTS.*",
+    "$JS.API.CONSUMER.DELETE.CHELABASE_STORAGE_EVENTS.*",
+    "$JS.ACK.CHELABASE_STORAGE_EVENTS.>",
+];
 /// The tenant-attached events (carried gaps T4, P9): the subjects the orchestrator publishes.
 const NEON_EVENTS: &str = "chelabase.neon.attached.*";
 /// Creating or fixing the events stream (`ensure_neon_events_stream`): the orchestrator only
@@ -112,6 +133,7 @@ fn orchestrator() -> NatsPermissions {
     publish.extend(CONTROL_STREAM_API);
     publish.push(NEON_EVENTS);
     publish.extend(NEON_EVENTS_STREAM_API);
+    publish.extend(STORAGE_OBJECT_STREAM_API);
     NatsPermissions {
         publish,
         publish_deny: vec![],
@@ -129,6 +151,7 @@ fn worker() -> NatsPermissions {
     publish.extend(CONTROL_CONSUMER_API);
     publish.extend(["_INBOX_orchestrator.>", "_INBOX_runner.>"]);
     publish.extend(NEON_EVENTS_WAIT_API);
+    publish.extend(STORAGE_OBJECT_CONSUMER_API);
     let mut subscribe = vec!["chelabase.rpc.>"];
     subscribe.extend(CORE_EVENTS);
     subscribe.push("_INBOX_worker.>");
@@ -155,11 +178,13 @@ fn realtime() -> NatsPermissions {
 /// pools and schema check (the orchestrator's project events and storage branch events), and
 /// what makes it drop a signed URL's cached key liveness (access events and storage key
 /// events). Exactly the subjects it handles: one project or tenant token (`chelabase.rt.*`'s
-/// layout), and the one storage events subject. It publishes nothing and answers nobody.
+/// layout), and the one storage events subject. m18: it publishes object events (one database
+/// token, never the cache subject) and nothing else; it answers nobody (a JetStream ack comes
+/// back on its own inbox).
 fn storage() -> NatsPermissions {
     NatsPermissions {
-        publish: vec![],
-        publish_deny: vec![">"],
+        publish: vec![STORAGE_OBJECT_EVENTS],
+        publish_deny: vec![],
         subscribe: vec![
             "chelabase.rt.project.*",
             "chelabase.rt.access.*",
@@ -201,6 +226,7 @@ fn runner() -> NatsPermissions {
         publish_deny: vec![
             "$JS.API.STREAM.DELETE.CHELABASE_CONTROL",
             "$JS.API.STREAM.DELETE.CHELABASE_NEON_EVENTS",
+            "$JS.API.STREAM.DELETE.CHELABASE_STORAGE_EVENTS",
             "$JS.API.STREAM.DELETE.KV_CHELABASE_RT_LEASES",
             "$JS.API.STREAM.DELETE.KV_CHELABASE_RT_SLOTS",
             "$JS.API.STREAM.PURGE.>",
@@ -280,7 +306,7 @@ pub fn render_nats_auth_reusing(
             "    {{\n      user: \"{name}\"\n      password: \"{hash}\"\n"
         ));
         out.push_str("      permissions: {\n");
-        // A user that publishes nothing (storage) gets a deny-all list only: an empty allow
+        // A user that publishes nothing would get a deny-all list only: an empty allow
         // list would be no restriction.
         let mut publish = Vec::new();
         if !p.publish.is_empty() {

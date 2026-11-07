@@ -508,6 +508,11 @@ services:
       - CHELABASE_STORAGE_SWEEP_DRY_RUN=${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
       - CHELABASE_IDENTITY_URL=http://identity:8080
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      # object-storage m18, dev only: storage webhooks may reach the live test's local receiver in
+      # the runner (`runner`, its alias on the default network: `chelabase workbench test` runs it
+      # with --use-aliases), over http. Exactly that host; every other one stays public-only.
+      - CHELABASE_WEBHOOKS_ALLOW_HOSTS=runner
+      - CHELABASE_WEBHOOKS_ALLOW_HTTP=true
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes: !override
       - *checkout-ro

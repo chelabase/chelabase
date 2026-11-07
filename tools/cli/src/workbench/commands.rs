@@ -1927,7 +1927,9 @@ pub(crate) fn runner_command(
         ));
     }
     pairs.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
-    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps"];
+    // `--use-aliases`: the runner is `runner` on the stack's networks (object-storage m18: the
+    // worker's webhooks reach the live test's receiver by that name, the one host it allows).
+    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps", "--use-aliases"];
     for p in &pairs {
         args.extend(["-e", p.as_str()]);
     }

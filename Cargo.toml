@@ -71,6 +71,8 @@ sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "ch
 async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "aws-lc-rs", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 dotenvy = "0.15.7"
 chrono = { version = "0.4.45", features = ["serde"] }
+# async-nats's own time type (a consumer's start time); already in the tree through it.
+time = "0.3.55"
 humantime = "2.4.0"
 urlencoding = "2.1.3"
 bollard = "0.21.1"

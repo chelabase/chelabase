@@ -63,6 +63,7 @@ pub mod schema_base;
 pub mod settings;
 pub mod storage_schema;
 pub mod storage_sweep;
+pub mod storage_webhooks;
 #[cfg(test)]
 mod storage_sweep_tests;
 #[cfg(test)]

@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub mod rt;
+pub mod storage_objects;
 
 #[cfg(test)]
 mod t4_tests;
