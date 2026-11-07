@@ -4169,11 +4169,9 @@ COMMIT;"
         assert!(cols["look"].get("storage_ref").is_none(), "{cols}");
         assert!(cols["id"].get("storage_ref").is_none(), "{cols}");
         assert!(!schema_text.contains("internal"), "{schema_text}");
-        // The public key's role can't reach docs: nothing of it is described.
+        // The schema (hints included) is for secret keys only: a publishable key gets none of it.
         let (status, _, anon) = object("GET", "/data/v1/schema", &public, None, &[]).await;
-        let anon: Value = serde_json::from_slice(&anon).unwrap();
-        assert_eq!(status, 200, "{anon}");
-        assert!(anon["schemas"]["public"]["tables"].get("docs").is_none(), "{anon}");
+        assert_eq!(status, 401, "{}", String::from_utf8_lossy(&anon));
 
         // The generated types.
         let (status, _, ts) = object("GET", "/data/v1/types", &secret, None, &[]).await;
