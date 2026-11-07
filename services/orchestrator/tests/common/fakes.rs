@@ -2191,6 +2191,7 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             role_oid: key.role_oid,
             role_timeline: key.role_timeline.clone(),
             role_bypass_rls: key.kind == DataKeyKind::Secret && key.role_bypass_rls,
+            managed_by_function: None,
         },
         key.sha256,
     ));
