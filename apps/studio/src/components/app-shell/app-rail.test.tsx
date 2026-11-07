@@ -342,11 +342,13 @@ describe("AppRail", () => {
     expect(screen.getByRole("link", { name: "SQL editor" })).not.toHaveAttribute("aria-current");
   });
 
-  it("data_api_item_links_between_storage_and_api_reference", async () => {
+  it("data_api_item_links_between_storage_and_functions", async () => {
     const { nav } = await renderRail("expanded");
     const names = [...nav.querySelectorAll("a")].map((a) => a.textContent);
     expect(names.indexOf("Data API")).toBe(names.indexOf("Storage") + 1);
-    expect(names.indexOf("API reference")).toBe(names.indexOf("Data API") + 1);
+    expect(names.indexOf("Functions")).toBe(names.indexOf("Data API") + 1);
+    expect(names.indexOf("API reference")).toBe(names.indexOf("Functions") + 1);
     expect(screen.getByRole("link", { name: "Data API" })).toHaveAttribute("href", "/app/data-api");
+    expect(screen.getByRole("link", { name: "Functions" })).toHaveAttribute("href", "/app/functions");
   });
 });

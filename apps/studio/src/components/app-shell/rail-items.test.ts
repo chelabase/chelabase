@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { meAs } from "@/test/table-editor-fixtures";
-import { RAIL_ENTRIES, canUseSql, isRailItemActive } from "./rail-items";
+import { RAIL_ENTRIES, canUseSql, hiddenRailItems, isRailItemActive } from "./rail-items";
 
 describe("isRailItemActive", () => {
   it("tables_item_active_on_editor_routes", () => {
@@ -38,6 +38,16 @@ describe("isRailItemActive", () => {
     expect(isRailItemActive("projects", "/app/data-api")).toBe(false);
   });
 
+  it("functions_item_active_on_functions_routes", () => {
+    expect(isRailItemActive("functions", "/app/functions")).toBe(true);
+    expect(isRailItemActive("functions", "/app/functions/")).toBe(true);
+    expect(isRailItemActive("functions", "/app/functions/p1/d1/b1")).toBe(true);
+    expect(isRailItemActive("functions", "/app/functionsx")).toBe(false);
+    expect(isRailItemActive("functions", "/app/data-api/p1")).toBe(false);
+    expect(isRailItemActive("data-api", "/app/functions")).toBe(false);
+    expect(isRailItemActive("projects", "/app/functions")).toBe(false);
+  });
+
   it("projects is active on /app, /app/ and /app/projects/p1", () => {
     expect(isRailItemActive("projects", "/app")).toBe(true);
     expect(isRailItemActive("projects", "/app/")).toBe(true);
@@ -69,17 +79,18 @@ describe("isRailItemActive", () => {
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, Table editor, SQL editor, Storage, Data API, API reference and Members (last) in order", () => {
+  it("lists Projects, Table editor, SQL editor, Storage, Data API, Functions, API reference and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
       ["link", "tables", "Table editor"],
       ["link", "sql", "SQL editor"],
       ["link", "storage", "Storage"],
       ["link", "data-api", "Data API"],
+      ["link", "functions", "Functions"],
       ["link", "api", "API reference"],
       ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/storage", "/app/data-api", "/app/api", "/app/members"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/storage", "/app/data-api", "/app/functions", "/app/api", "/app/members"]);
   });
 });
 
@@ -89,5 +100,18 @@ describe("canUseSql", () => {
     expect(canUseSql(meAs("admin") as never)).toBe(true);
     expect(canUseSql(meAs("viewer") as never)).toBe(false);
     expect(canUseSql(undefined)).toBe(false);
+  });
+});
+
+describe("hiddenRailItems", () => {
+  it("hides_functions_in_platform_mode_only", () => {
+    expect(hiddenRailItems(meAs("developer") as never, { functionsUnavailable: false })).toEqual([]);
+    expect(hiddenRailItems(meAs("developer") as never, { functionsUnavailable: true })).toEqual(["functions"]);
+  });
+
+  it("hides_sql_for_a_viewer_alongside", () => {
+    expect(hiddenRailItems(meAs("viewer") as never, { functionsUnavailable: false })).toEqual(["sql"]);
+    expect(hiddenRailItems(meAs("viewer") as never, { functionsUnavailable: true })).toEqual(["sql", "functions"]);
+    expect(hiddenRailItems(undefined, { functionsUnavailable: false })).toEqual(["sql"]);
   });
 });
