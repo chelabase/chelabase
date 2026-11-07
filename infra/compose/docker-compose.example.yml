@@ -28,7 +28,7 @@
 
 services:
   example-seed:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:80e82d1fbdefe0f1306bfacf09181a687d7095abcf80778cb4f000e41bab19e0}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:88b4b76616b55880528324b70db1d8de58bf7d382772a9650a1d58f7d70dd946}
     restart: "no"
     command: ["chelabase-init", "example"]
     environment:
