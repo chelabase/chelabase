@@ -9,10 +9,33 @@
 //! transaction ([`purge_branch_functions`]). Branch and database rows are never deleted, so FK
 //! cascades never do that work.
 //!
-//! Lock order for every per-branch write (the same as `create_branch`'s): the database row
-//! `FOR SHARE`, then the branch row `FOR SHARE`. A branch create (database row `FOR NO KEY
-//! UPDATE`) therefore copies a parent no write is changing, and a tombstone (an `UPDATE` of
-//! the branch or database row) either waits for a write or makes it refused.
+//! # Lock order
+//!
+//! Every function write takes the rows it locks in this order (the crate's order, `branches.rs`,
+//! extended with the function tables); the existing writers of the same rows take a subsequence:
+//!
+//! | # | Row | Function writes | Existing writers |
+//! |---|---|---|---|
+//! | 1 | `databases` | `FOR SHARE` (all) | `create_branch` `FOR NO KEY UPDATE`; database tombstone `UPDATE` |
+//! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
+//! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
+//! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes) | branch create copies (insert), tombstone purge (delete) |
+//! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
+//! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync |
+//!
+//! No writer takes a row of a lower number while holding a higher one: no writer of an
+//! endpoint or key row (5, 6) touches 3 or 4 afterwards, and `set_run_as` takes the endpoint
+//! (5) before it revokes or inserts a key (6). A function delete writes key rows without an
+//! endpoint row: it revokes only its own managed keys (at most one live per branch) and waits
+//! for nothing after them, so a role drop holding the endpoint and one of those rows can't
+//! wait on it in a cycle. `set_function_last_error` updates its state row alone.
+//! `function_writes_keep_the_lock_order` (`tests/functions_live.rs`) runs each function write
+//! against each existing writer, stalled on each row in turn, in both orders.
+//!
+//! So a branch create (database row `FOR NO KEY UPDATE`) copies a parent no write is
+//! changing, a tombstone (an `UPDATE` of the branch or database row) either waits for a write
+//! or makes it refused, and protecting a branch either waits for a kind change or delete or is
+//! seen by it.
 
 use chelabase_secrets::SecretKey;
 use chelabase_types::{BranchId, DatabaseId};
@@ -690,10 +713,11 @@ impl MetadataClient {
     /// as AAD (the public key's seal), and `run_as_role` and `run_as_key_id` name it. False,
     /// nothing written, when the function has no deployment on the branch.
     ///
-    /// Lock order: the branch-function locks ([`lock_branch_function`]), the state row, then
-    /// the branch's endpoint row `FOR SHARE` (as `create_secret_key`: the DDL receiver holds it
-    /// `FOR UPDATE` while it drops or renames roles with live keys, so a DROP after this commit
-    /// sees the key). A wait over 5 s for it is [`MetadataError::EndpointLockTimeout`].
+    /// Lock order (module docs): the branch-function locks ([`lock_branch_function`]), the
+    /// state row, then the branch's endpoint row `FOR SHARE` before any key row (the DDL
+    /// receiver, a role drop and a rename hold it `FOR UPDATE` and then write key rows, so a
+    /// DROP after this commit sees the key). A wait over 5 s for it is
+    /// [`MetadataError::EndpointLockTimeout`].
     pub async fn set_run_as(
         &self,
         branch: BranchId,
@@ -722,6 +746,9 @@ impl MetadataClient {
         let Some(name) = name else {
             return Ok(false);
         };
+        // Before any key row (audit B1): a role drop or rename holds the endpoint `FOR UPDATE`
+        // and then writes key rows.
+        lock_endpoint_share(&mut tx, branch).await?;
         sqlx::query(
             "UPDATE data_api_keys SET revoked_at = now(), sealed = NULL
              WHERE branch_id = $1 AND managed_by_function_id = $2 AND revoked_at IS NULL",
@@ -731,7 +758,6 @@ impl MetadataClient {
         .execute(&mut *tx)
         .await?;
         if let Some(r) = run_as {
-            lock_endpoint_share(&mut tx, branch).await?;
             sqlx::query(
                 "INSERT INTO data_api_keys
                      (id, branch_id, kind, role, name, prefix, sha256, sealed, role_oid,

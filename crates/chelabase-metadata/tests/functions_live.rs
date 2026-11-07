@@ -14,7 +14,7 @@ mod functions {
     use chelabase_metadata::{
         CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
-        NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerSource, TriggerState,
+        KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerSource, TriggerState,
     };
     use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_secrets::SecretKey;
@@ -273,6 +273,46 @@ mod functions {
             let listed = self.client.list_for_branch(branch).await.unwrap();
             let row = listed.iter().find(|r| r.function_id == f).expect("branch state");
             (row.run_as_role.clone(), row.run_as_key_id)
+        }
+
+        /// A compute endpoint linked to `branch`, with its owner role and the roles `reporter`
+        /// and `other` (SQL-made copies), as a ready branch has.
+        async fn endpoint(&self, branch: BranchId) -> String {
+            let ep = format!("ep-{}", &Uuid::new_v4().simple().to_string()[..12]);
+            sqlx::query(
+                "INSERT INTO neon_endpoints (id, tenant_id, timeline_id, compute_token_sha256)
+                 VALUES ($1, 't', $2, 'aa')",
+            )
+            .bind(&ep)
+            .bind(Uuid::new_v4().simple().to_string())
+            .execute(self.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE branches SET endpoint_id = $2 WHERE id = $1")
+                .bind(branch.as_uuid())
+                .bind(&ep)
+                .execute(self.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO neon_roles (endpoint_id, name, origin, scram_verifier)
+                 VALUES ($1, 'owner', 'owner', 'SCRAM-SHA-256$x')",
+            )
+            .bind(&ep)
+            .execute(self.pool())
+            .await
+            .unwrap();
+            for role in ["reporter", "other"] {
+                sqlx::query(
+                    "INSERT INTO neon_roles (endpoint_id, name, origin, login) VALUES ($1, $2, 'sql', false)",
+                )
+                .bind(&ep)
+                .bind(role)
+                .execute(self.pool())
+                .await
+                .unwrap();
+            }
+            ep
         }
 
         /// Rows in each per-branch function table for `branch`.
@@ -1470,6 +1510,350 @@ mod functions {
             .unwrap();
         c.set_function_last_error(main, f, Some("late")).await.unwrap();
         assert_eq!(last().await, None, "a deleting branch isn't written");
+        s.finish().await;
+    }
+
+    /// Audit B1 (m3a fix): replacing a run-as key while the old role is dropped through the
+    /// control plane (`delete_role_copy`: endpoint `FOR UPDATE`, then key rows). `set_run_as`
+    /// takes the endpoint before it writes any key row, so the two never deadlock.
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_replace_waits_for_role_drop() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let ep = s.endpoint(main).await;
+        let f = s.active(db, main, "hello").await;
+        assert!(s.client.set_run_as(main, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        let mut drop_tx = s.pool().begin().await.unwrap();
+        sqlx::query("SELECT id FROM neon_endpoints WHERE id = $1 FOR UPDATE")
+            .bind(&ep)
+            .execute(&mut *drop_tx)
+            .await
+            .unwrap();
+        let client = s.client.clone();
+        let replace =
+            tokio::spawn(async move { client.set_run_as(main, f, Some(&run_as("writer", 5151))).await });
+        lock_waiters(&s, 1).await;
+        let dropped = sqlx::query(
+            "UPDATE data_api_keys k SET revoked_at = now(),
+                 sealed = CASE WHEN k.managed_by_function_id IS NULL THEN k.sealed END
+             FROM branches b
+             WHERE b.endpoint_id = $1 AND k.branch_id = b.id AND k.role = $2
+               AND k.kind = 'secret' AND k.revoked_at IS NULL",
+        )
+        .bind(&ep)
+        .bind("reporter")
+        .execute(&mut *drop_tx)
+        .await;
+        let drop_ok = dropped.is_ok() && drop_tx.commit().await.is_ok();
+        let replaced = replace.await.unwrap();
+        assert!(drop_ok && replaced.is_ok(), "a deadlock aborted one side: drop {drop_ok}, replace {replaced:?}");
+        assert_eq!(s.managed_keys(f).await.len(), 1);
+        s.finish().await;
+    }
+
+    /// Audit S1 (m3a fix): every path that revokes a managed key drops its sealed value (the
+    /// resync, a role dropped through the control plane, a dropped database emptying the key's
+    /// list), and the schema refuses a revoked secret key that keeps one.
+    #[tokio::test]
+    #[ignore]
+    async fn every_revoke_drops_a_managed_secret() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let ep = s.endpoint(main).await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+
+        // The resync.
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        let fix = KeyRoleFix::Revoke { id: ra.key_id, role: "reporter".into(), oid: Some(4242) };
+        assert_eq!(c.fix_key_roles(main, &[fix]).await.unwrap(), 1);
+        assert_eq!(s.key_state(ra.key_id).await, (true, true), "resync");
+
+        // A role dropped through the control plane.
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        assert!(c.delete_role_copy(&ep, "reporter").await.unwrap());
+        assert_eq!(s.key_state(ra.key_id).await, (true, true), "role drop");
+
+        // A dropped database that was the key's only one.
+        let ra = run_as("other", 77);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        let mut ddl = c.begin_ddl(&ep).await.unwrap().expect("endpoint");
+        ddl.upsert_database("app", "other").await.unwrap();
+        ddl.commit().await.unwrap();
+        sqlx::query("UPDATE data_api_keys SET databases = ARRAY['app'] WHERE id = $1")
+            .bind(ra.key_id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        let mut ddl = c.begin_ddl(&ep).await.unwrap().expect("endpoint");
+        assert!(ddl.remove_database("app").await.unwrap());
+        ddl.commit().await.unwrap();
+        assert_eq!(s.key_state(ra.key_id).await, (true, true), "database drop");
+
+        // The schema: a revoked secret key never keeps a sealed value.
+        let ra = run_as("other", 77);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        let err = sqlx::query("UPDATE data_api_keys SET revoked_at = now() WHERE id = $1")
+            .bind(ra.key_id)
+            .execute(s.pool())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("data_api_keys_revoked_unsealed"), "{err}");
+        s.finish().await;
+    }
+
+    /// m3a fix: a managed key's database list is its function's to shape, as its revocation.
+    #[tokio::test]
+    #[ignore]
+    async fn managed_key_databases_refused() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+        let err = c
+            .set_key_databases(main, ra.key_id, Some(vec!["app".into()]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetadataError::ManagedKey), "{err:?}");
+        let databases: Option<Vec<String>> =
+            sqlx::query_scalar("SELECT databases FROM data_api_keys WHERE id = $1")
+                .bind(ra.key_id)
+                .fetch_one(s.pool())
+                .await
+                .unwrap();
+        assert_eq!(databases, None, "untouched");
+        assert!(!c.set_key_databases(main, Uuid::new_v4(), None).await.unwrap());
+        s.finish().await;
+    }
+
+    /// The rows the lock-order harness contends on.
+    #[derive(Clone)]
+    struct Contended {
+        db: DatabaseId,
+        main: BranchId,
+        ep: String,
+        f: Uuid,
+        deployment: Uuid,
+        managed_key: Uuid,
+        other_key: Uuid,
+    }
+
+    impl Scratch {
+        /// A database whose main branch has an endpoint, a function active with a run-as key
+        /// and a secret, and an unmanaged secret key for `other`.
+        async fn contended(&self) -> Contended {
+            let (db, main) = self.database().await;
+            let ep = self.endpoint(main).await;
+            let f = self.function(db, "hello").await;
+            let deployment = self.deployment(f, &sha('c')).await;
+            let c = &self.client;
+            c.set_active_deployment(main, f, deployment).await.unwrap();
+            assert!(c.set_enabled(main, f, true).await.unwrap());
+            let ra = run_as("reporter", 4242);
+            assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
+            c.put_secret(main, f, "API_KEY", "v").await.unwrap();
+            let other_key = Uuid::new_v4();
+            c.create_secret_key(&secret_key(other_key, main, "other", 77)).await.unwrap();
+            Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key }
+        }
+    }
+
+    fn secret_key(id: Uuid, branch: BranchId, role: &str, oid: i64) -> NewDataKey {
+        let generated = data_key::generate(DataKeyKind::Secret);
+        NewDataKey {
+            id,
+            branch_id: branch,
+            kind: DataKeyKind::Secret,
+            role: role.into(),
+            name: format!("{role}-key"),
+            prefix: generated.prefix,
+            sha256: generated.sha256,
+            sealed: None,
+            databases: None,
+            role_oid: Some(oid),
+            role_timeline: Some("tl-1".into()),
+            role_bypass_rls: false,
+        }
+    }
+
+    type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MetadataError>> + Send>>;
+    type Op = fn(MetadataClient, Contended) -> Fut;
+
+    /// The function writes (m2, m3a).
+    fn function_writes() -> Vec<(&'static str, Op)> {
+        vec![
+            ("set_run_as", |c, x| Box::pin(async move { c.set_run_as(x.main, x.f, Some(&run_as("writer", 5151))).await.map(drop) })),
+            ("clear_run_as", |c, x| Box::pin(async move { c.set_run_as(x.main, x.f, None).await.map(drop) })),
+            ("set_function_auth", |c, x| Box::pin(async move { c.set_function_auth(x.main, x.f, FunctionAuth::Public).await.map(drop) })),
+            ("set_function_kind", |c, x| Box::pin(async move { c.set_function_kind(x.db, x.f, FunctionKind::Service).await.map(drop) })),
+            ("delete_function_unprotected", |c, x| Box::pin(async move { c.delete_function_unprotected(x.db, x.f).await.map(drop) })),
+            ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t").await })),
+            ("set_active_deployment", |c, x| Box::pin(async move { c.set_active_deployment(x.main, x.f, x.deployment).await })),
+            ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
+        ]
+    }
+
+    /// The existing paths that take the same rows for update.
+    fn row_writers() -> Vec<(&'static str, Op)> {
+        vec![
+            ("create_branch", |c, x| Box::pin(async move {
+                c.create_branch(&NewBranch {
+                    id: BranchId::new(),
+                    database_id: x.db,
+                    name: "dev",
+                    parent_branch_id: x.main,
+                    branched_at_time: None,
+                    branched_at_lsn: None,
+                })
+                .await
+                .map(drop)
+            })),
+            ("protect_branch", |c, x| Box::pin(async move { c.protect_branch(x.main, "h", &[]).await.map(drop) })),
+            ("delete_role_copy", |c, x| Box::pin(async move { c.delete_role_copy(&x.ep, "reporter").await.map(drop) })),
+            ("rename_role_copy", |c, x| Box::pin(async move {
+                c.rename_role_copy(&x.ep, x.main, "reporter", "reporter2", None, None).await.map(drop)
+            })),
+            ("rotate_secret_key", |c, x| Box::pin(async move {
+                c.rotate_secret_key(x.main, x.other_key, &secret_key(Uuid::new_v4(), x.main, "other", 77)).await.map(drop)
+            })),
+            ("mark_branch_deleted", |c, x| Box::pin(async move { c.mark_branch_deleted(x.main).await })),
+        ]
+    }
+
+    /// Refusals a write may answer when the other one changed its rows first.
+    fn expected(result: &Result<(), MetadataError>) -> bool {
+        matches!(
+            result,
+            Ok(())
+                | Err(MetadataError::FunctionNotFound
+                    | MetadataError::FunctionActiveOnProtectedBranch
+                    | MetadataError::ManagedKey
+                    | MetadataError::InvalidFunction(_))
+        )
+    }
+
+    /// Waits until each task has finished or waits on a lock (the blocker never waits).
+    async fn settle<T>(s: &Scratch, tasks: &[&tokio::task::JoinHandle<T>]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let n = tasks.iter().filter(|t| !t.is_finished()).count() as i64;
+            if n == 0 {
+                return;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+            if waiting >= n {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let busy: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT wait_event_type, wait_event, left(query, 120) FROM pg_stat_activity
+                     WHERE datname = current_database() AND state <> 'idle' AND pid <> pg_backend_pid()",
+                )
+                .fetch_all(s.pool())
+                .await
+                .unwrap();
+                panic!("{waiting} of {n} waiters; busy sessions: {busy:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// What must hold after any two writes: a branch state's run-as key is a key its function
+    /// manages on that branch, and a live managed key on a live branch is its function's
+    /// current run-as key. (A revoked managed key with a sealed value is the schema's CHECK.)
+    async fn consistent(s: &Scratch) -> Result<(), String> {
+        let dangling: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM branch_functions bf
+             LEFT JOIN data_api_keys k ON k.id = bf.run_as_key_id AND k.branch_id = bf.branch_id
+             WHERE bf.run_as_key_id IS NOT NULL
+               AND k.managed_by_function_id IS DISTINCT FROM bf.function_id",
+        )
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM data_api_keys k JOIN branches b ON b.id = k.branch_id
+             WHERE k.managed_by_function_id IS NOT NULL AND k.revoked_at IS NULL
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND NOT EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.run_as_key_id = k.id)",
+        )
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+        if dangling == 0 && orphans == 0 {
+            Ok(())
+        } else {
+            Err(format!("{dangling} dangling run-as keys, {orphans} orphaned managed keys"))
+        }
+    }
+
+    /// The invariant behind audit B1 and m2's delete fix: every function write and every
+    /// existing writer of the same rows take them in one order (functions.rs module docs), so
+    /// no two deadlock. Exhaustive at row granularity: for each ordered pair (one function
+    /// write, one existing writer, either first), the first is stalled on each contended row
+    /// in turn (a blocker holds it `FOR UPDATE`, so the first holds everything it took
+    /// before), the second runs into it, then the blocker lets go. No side may fail with
+    /// anything but a refusal (never 40P01), and the rows stay consistent.
+    #[tokio::test]
+    #[ignore]
+    async fn function_writes_keep_the_lock_order() {
+        let s = Scratch::new().await;
+        // The rows a write can be stalled on, as SQL taking them FOR UPDATE.
+        let stalls: [(&str, &str); 6] = [
+            ("database", "SELECT 1 FROM databases WHERE id = $1 FOR UPDATE"),
+            ("branch", "SELECT 1 FROM branches WHERE id = $2 FOR UPDATE"),
+            ("endpoint", "SELECT 1 FROM neon_endpoints WHERE id = $3 FOR UPDATE"),
+            ("function", "SELECT 1 FROM functions WHERE id = $4 FOR UPDATE"),
+            ("branch state", "SELECT 1 FROM branch_functions WHERE function_id = $4 FOR UPDATE"),
+            ("managed key", "SELECT 1 FROM data_api_keys WHERE id = $5 FOR UPDATE"),
+        ];
+        let mut pairs = Vec::new();
+        for w in function_writes() {
+            for p in row_writers() {
+                pairs.push((w, p));
+                pairs.push((p, w));
+            }
+        }
+        let mut failures = Vec::new();
+        for ((first_name, first), (second_name, second)) in pairs {
+            for (stall_name, stall_sql) in stalls {
+                let x = s.contended().await;
+                let mut blocker = s.pool().begin().await.unwrap();
+                sqlx::query(AssertSqlSafe(stall_sql))
+                    .bind(x.db.as_uuid())
+                    .bind(x.main.as_uuid())
+                    .bind(&x.ep)
+                    .bind(x.f)
+                    .bind(x.managed_key)
+                    .execute(&mut *blocker)
+                    .await
+                    .unwrap();
+                let a = tokio::spawn(first(s.client.clone(), x.clone()));
+                settle(&s, &[&a]).await;
+                let b = tokio::spawn(second(s.client.clone(), x.clone()));
+                settle(&s, &[&a, &b]).await;
+                blocker.commit().await.unwrap();
+                let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+                let case = format!("{first_name} stalled on {stall_name}, then {second_name}");
+                if !expected(&ra) || !expected(&rb) {
+                    failures.push(format!("{case}: {ra:?} / {rb:?}"));
+                } else if let Err(e) = consistent(&s).await {
+                    failures.push(format!("{case}: {e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
         s.finish().await;
     }
 }

@@ -46,8 +46,9 @@ pub use storage_webhooks::{
 pub use ddl::DdlTx;
 pub use functions::{
     BranchFunction, DeploymentRecord, FunctionAuth, FunctionKind, FunctionRecord, MAX_BUNDLE_SIZE,
-    MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment, NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleRecord,
-    TriggerRecord, TriggerSource, TriggerState, valid_function_name, valid_secret_name,
+    MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment, NewSchedule, NewTrigger,
+    ResolvedFunction, RunAs, ScheduleRecord, TriggerRecord, TriggerSource, TriggerState,
+    valid_function_name, valid_secret_name,
 };
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
@@ -301,7 +302,8 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
 /// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `data_api_keys.sealed`
-/// (orchestrator data keys, `Purpose::DataKey`); `neon_roles.password_enc` (worker roles, branch
+/// (orchestrator public keys, `Purpose::DataKey` with AAD the key id; and a function's run-as
+/// key, live only, sealed the same way by [`MetadataClient::set_run_as`]); `neon_roles.password_enc` (worker roles, branch
 /// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
 /// (worker member roles, `seal_member_role_password`); `branch_auth_sync.password_sealed`
 /// (worker app users, `seal_role_password`); `app_sessions.grace_refresh_sealed` (orchestrator
@@ -476,7 +478,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261107000003).
+        // this file when adding one (last: 20261107000004).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
