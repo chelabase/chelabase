@@ -29,7 +29,7 @@ use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 use chelabase_types::mode::Mode;
 use chelabase_types::role_settings::RoleSettings;
 use orchestrator::internal::{
-    BoxFuture, CachePort, DdlPort, InternalState, NeonMetadataPort, ResyncPort,
+    BoxFuture, CachePort, ConsoleUrlFacts, DdlPort, InternalState, NeonMetadataPort, ResyncPort,
     build_internal_router,
 };
 use std::collections::BTreeMap;
@@ -107,6 +107,10 @@ struct FakeNeon {
     upload_tokens: Arc<Mutex<UploadTokens>>,
     /// Object storage m9: members by id with their access sources (one project each here).
     members: Arc<Mutex<Vec<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>>>,
+    /// #100: each endpoint's role rows (the role graph console act-as reads), and the
+    /// personal-login names of each database.
+    role_rows: Arc<Mutex<HashMap<String, Vec<chelabase_metadata::RoleRow>>>>,
+    personal_login_names: Arc<Mutex<std::collections::HashSet<(DatabaseId, String)>>>,
 }
 
 /// The fake's fresh-install claim rows: a model of `claim_setup`'s rules (the real ones are
@@ -458,6 +462,23 @@ impl FakeNeon {
         e.static_lsn = static_lsn.map(str::to_string);
     }
 
+    /// #100: a NOLOGIN group role on an endpoint that is a member of `member_of`.
+    fn add_group_role(&self, endpoint: &str, name: &str, member_of: &[&str]) {
+        self.role_rows.lock().unwrap().entry(endpoint.into()).or_default().push(chelabase_metadata::RoleRow {
+            name: name.into(),
+            origin: RoleOrigin::Sql,
+            level: RoleLevel::Plain,
+            login: false,
+            password: chelabase_metadata::PasswordState::Generated,
+            created_at: chrono::Utc::now(),
+            pending: false,
+            attributes: chelabase_metadata::RoleAttributes {
+                member_of: member_of.iter().map(|r| r.to_string()).collect(),
+                ..Default::default()
+            },
+        });
+    }
+
     fn break_it(&self) {
         *self.fail.lock().unwrap() = true;
     }
@@ -472,6 +493,62 @@ impl FakeNeon {
             return Err(MetadataError::Config("metadata is down".into()));
         }
         Ok(())
+    }
+}
+
+impl ConsoleUrlFacts for FakeNeon {
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
+    }
+
+    /// A `Ready` database of its `db_projects` project, owned by `postgres`.
+    async fn get_database(&self, db: DatabaseId) -> Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError> {
+        self.check()?;
+        let rows = self.app.lock().unwrap();
+        let Some(project) = rows.db_projects.get(&db).copied() else {
+            return Ok(None);
+        };
+        let Some(tenant_id) = rows.projects.iter().find(|p| p.id == project).map(|p| p.tenant_id) else {
+            return Ok(None);
+        };
+        Ok(Some(chelabase_metadata::DatabaseRecord {
+            database_id: db,
+            project_id: project,
+            tenant_id,
+            name: "web".into(),
+            status: chelabase_metadata::DatabaseStatus::Ready,
+            database_name: Some("web".into()),
+            owner_role: Some("postgres".into()),
+            error: None,
+            neon_tenant_id: None,
+            history_window: std::time::Duration::from_secs(86_400),
+            max_branches: 10,
+            max_rows: 1000,
+            statement_timeout_ms: 8000,
+            max_connections: 10,
+            storage_max_connections: 10,
+        }))
+    }
+
+    async fn member_access(
+        &self,
+        member: uuid::Uuid,
+        _project: ProjectId,
+        _database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        self.check()?;
+        Ok(self.members.lock().unwrap().iter().find(|(m, _)| m.id == member).cloned())
+    }
+
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<chelabase_metadata::RoleRow>, MetadataError> {
+        self.check()?;
+        Ok(self.role_rows.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default())
+    }
+
+    async fn is_personal_login_name(&self, database: DatabaseId, name: &str) -> Result<bool, MetadataError> {
+        self.check()?;
+        Ok(self.personal_login_names.lock().unwrap().contains(&(database, name.to_string())))
     }
 }
 
@@ -822,24 +899,9 @@ impl NeonMetadataPort for FakeNeon {
         Ok(true)
     }
 
-    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
-        self.check()?;
-        Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
-    }
-
     async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
         self.check()?;
         Ok(self.app.lock().unwrap().db_projects.get(&db).copied())
-    }
-
-    async fn member_access(
-        &self,
-        member: uuid::Uuid,
-        _project: ProjectId,
-        _database: DatabaseId,
-    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
-        self.check()?;
-        Ok(self.members.lock().unwrap().iter().find(|(m, _)| m.id == member).cloned())
     }
 
     async fn main_branch(&self, db: DatabaseId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -2617,6 +2679,48 @@ async fn a_console_url_without_a_held_role_is_not_live() {
             assert_eq!(code, 404, "{path}: {body}");
         }
     }
+}
+
+/// #100 B2 (regression): a console URL minted as a role reached through a granted role's
+/// chain (R21) is live, as console `sign` as that role is authorized.
+#[tokio::test]
+async fn adv_a_console_url_of_a_chain_reached_role_is_live() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    neon.add_group_role("ep-1", "billing", &[]);
+    neon.add_group_role("ep-1", "billing_admin", &["billing"]);
+    let member = MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: false,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let id = member.id;
+    let grant = Grant { platform_role: PlatformRole::Developer, roles: RoleSet::Only([PgRole::Named("billing_admin".into())].into()) };
+    neon.members.lock().unwrap().push((member, GrantSources::new(Some(grant), Vec::new(), None)));
+    let url = |role: &str| format!("/internal/storage/keys/{id}?branch={}&role={role}", branch.as_uuid());
+    assert_eq!(app.get(&url("billing_admin"), Some(STORAGE_TOKEN)).await.0, 200);
+    let (code, body) = app.get(&url("billing"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "a URL signed as a chain-reached role (R21) is dead on arrival: {body}");
 }
 
 /// Object storage m6 fix (B1, S3): an app user's upload token (its claims carry the session's

@@ -759,3 +759,217 @@ async fn resolve_as_a_viewer_level_role_of_a_developer_names_that_role() {
     assert_eq!(caller["member_id"], json!(mix), "{caller}");
     assert!(caller.get("owner").is_none_or(|o| o == false), "{caller}");
 }
+
+/// #100 B2 (regression): console `sign` as a role reached through a granted role's chain
+/// (R21) reaches storage, naming that role and the member.
+#[tokio::test]
+async fn adv_sign_as_a_chain_reached_role_reaches_storage() {
+    let (w, storage) = world().await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    w.metadata.add_group_role(&ep, "billing", &[]);
+    w.metadata.add_group_role(&ep, "billing_admin", &["billing"]);
+    let lead = w.metadata.add_granted(w.tenant, "lead", w.project, PlatformRole::Developer, &["billing_admin"]);
+    let before = storage.calls();
+    let resp = call(&w, "lead", "POST", &format!("{}/object/sign/b/a.txt?role=billing", base(&w))).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(storage.calls(), before + 1);
+    let caller: Value = serde_json::from_slice(storage.last().headers["x-chelabase-console"].as_bytes()).unwrap();
+    assert_eq!(caller["role"], "billing", "{caller}");
+    assert_eq!(caller["member_id"], json!(lead), "{caller}");
+}
+
+/// Console URL liveness read from the console's own fake (each read is the `MetadataPort` or
+/// `MembersPort` method `MetadataClient` answers it with), so both sides run on one world.
+struct Facts<'a>(&'a FakeMetadata);
+
+impl orchestrator::internal::ConsoleUrlFacts for Facts<'_> {
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataPort::get_branch(self.0, id).await
+    }
+    async fn get_database(&self, db: DatabaseId) -> Result<Option<DatabaseRecord>, MetadataError> {
+        MetadataPort::get_database(self.0, db).await
+    }
+    async fn member_access(
+        &self,
+        member: uuid::Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> Result<Option<(MemberRecord, GrantSources)>, MetadataError> {
+        let Some(m) = orchestrator::members::MembersPort::member(self.0, member).await? else {
+            return Ok(None);
+        };
+        let sources = MetadataPort::grant_sources(self.0, member, project.as_uuid(), Some(database.as_uuid())).await?;
+        Ok(Some((m, sources)))
+    }
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<RoleRow>, MetadataError> {
+        MetadataPort::list_roles(self.0, endpoint_id).await
+    }
+    async fn is_personal_login_name(&self, database: DatabaseId, name: &str) -> Result<bool, MetadataError> {
+        orchestrator::members::MembersPort::is_personal_login_name(self.0, database.as_uuid(), name).await
+    }
+}
+
+/// A member's access in [`sign_and_url_liveness_agree`].
+#[derive(Clone, Debug)]
+enum Access {
+    /// Their own grant.
+    Own(PlatformRole, &'static [&'static str]),
+    /// A team's grant only.
+    Team(PlatformRole, &'static [&'static str]),
+    /// Their own grant and a team's.
+    Both((PlatformRole, &'static [&'static str]), (PlatformRole, &'static [&'static str])),
+    /// Their own grant, narrowed on the database (level, roles).
+    Narrowed((PlatformRole, &'static [&'static str]), Option<PlatformRole>, Option<&'static [&'static str]>),
+    /// A tenant admin, with this own grant or none.
+    TenantAdmin(Option<PlatformRole>),
+    /// Their own grant, then offboarded, removed or suspended.
+    Gone((PlatformRole, &'static [&'static str]), &'static str),
+}
+
+/// #100's invariant: a console URL is live exactly when console `sign` by its member, as its
+/// role, on its branch, would be authorized now. Every case runs console `sign` (does it
+/// reach storage?) and asks liveness about the URL storage would mint (the role
+/// `x-chelabase-console` names, or owner mode), or about the requested role when `sign` is
+/// refused; the two must agree.
+///
+/// Case space (67 members × 14 requests, 938 cases): the access sources (own, team, own and
+/// team at mixed levels, own narrowed by a database override, tenant admin with and without a
+/// grant, offboarded, removed, suspended) × the granting level (Viewer, Developer, Admin) ×
+/// the granted roles (a plain role, a chain head, a LOGIN role, a role reaching a LOGIN, an
+/// ADMIN holder, an owner-level role, a data API role, a personal login, two roles) × the
+/// requested role (direct, chain-reached, LOGIN, chain to LOGIN, ADMIN holder, owner-level,
+/// personal login, `anon`, `authenticated`, reserved, unknown, owner mode, the owner's name).
+#[tokio::test]
+async fn sign_and_url_liveness_agree() {
+    use orchestrator::internal::{ConsoleMinter, console_url_live};
+    use PlatformRole::{Admin, Developer, Viewer};
+    let (w, storage) = world().await;
+    let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+    // `billing_admin` → `billing` (R21); `via_login` → `app_login` (LOGIN, R22); `adm_role`
+    // holds ADMIN on `billing` (R23); `su_role` is owner-level (R16); `pl_jo` a personal login.
+    w.metadata.add_group_role(&ep, "billing", &[]);
+    w.metadata.add_group_role(&ep, "billing_admin", &["billing"]);
+    w.metadata.add_role(&ep, "app_login", RoleOrigin::Sql, false, false);
+    w.metadata.add_group_role(&ep, "via_login", &["app_login"]);
+    w.metadata.add_group_role_with(&ep, "adm_role", &["billing"], &[], &["billing"]);
+    w.metadata.add_group_role(&ep, "su_role", &[]);
+    w.metadata.roles.lock().unwrap().get_mut(&ep).unwrap().last_mut().unwrap().level = RoleLevel::OwnerLevel;
+    let holder = w.metadata.add_member(w.tenant, "holder", MemberStatus::Active, false);
+    w.metadata.seed_personal_login(holder, w.db, "pl_jo");
+
+    const GRANTED: &[&[&str]] = &[
+        &["billing_admin"],
+        &["billing"],
+        &["app_login"],
+        &["via_login"],
+        &["adm_role"],
+        &["su_role"],
+        &["authenticated"],
+        &["pl_jo"],
+        &["writer", "billing_admin"],
+    ];
+    let mut cases = Vec::new();
+    for level in [Viewer, Developer, Admin] {
+        for roles in GRANTED {
+            cases.push(Access::Own(level, roles));
+            cases.push(Access::Team(level, roles));
+        }
+    }
+    cases.extend([
+        Access::Both((Developer, &["writer"]), (Viewer, &["billing_admin"])),
+        Access::Both((Viewer, &["billing_admin"]), (Developer, &["writer"])),
+        Access::Both((Viewer, &["writer"]), (Developer, &["billing"])),
+        Access::Narrowed((Developer, &["billing_admin"]), Some(Viewer), None),
+        Access::Narrowed((Developer, &["billing_admin", "writer"]), None, Some(&["writer"])),
+        Access::Narrowed((Admin, &[]), None, Some(&["billing_admin"])),
+        Access::Narrowed((Admin, &[]), Some(Developer), None),
+        Access::Narrowed((Admin, &[]), Some(Developer), Some(&["via_login", "billing_admin"])),
+        Access::TenantAdmin(None),
+        Access::TenantAdmin(Some(Viewer)),
+        Access::Gone((Developer, &["billing_admin"]), "offboarded"),
+        Access::Gone((Developer, &["billing_admin"]), "removed"),
+        Access::Gone((Admin, &[]), "suspended"),
+    ]);
+    const REQUESTED: &[Option<&str>] = &[
+        Some("billing_admin"),
+        Some("billing"),
+        Some("writer"),
+        Some("app_login"),
+        Some("via_login"),
+        Some("adm_role"),
+        Some("su_role"),
+        Some("pl_jo"),
+        Some("anon"),
+        Some("authenticated"),
+        Some("chelabase_storage"),
+        Some("nobody"),
+        None,
+        Some("postgres"),
+    ];
+    let row = |(level, roles): (PlatformRole, &[&str])| GrantRow {
+        platform_role: level,
+        pg_roles: roles.iter().map(|r| r.to_string()).collect(),
+    };
+    let (mut checked, mut live, mut disagree) = (0, 0, Vec::new());
+    for (i, case) in cases.iter().enumerate() {
+        let sub = format!("m{i}");
+        let admin = matches!(case, Access::TenantAdmin(_));
+        let id = w.metadata.add_member(w.tenant, &sub, MemberStatus::Active, admin);
+        match case.clone() {
+            Access::Own(level, roles) => w.metadata.grant(id, w.project, level, roles),
+            Access::Team(level, roles) => w.metadata.team_grant(id, w.project, row((level, roles)).to_grant()),
+            Access::Both(own, team) => {
+                w.metadata.grant(id, w.project, own.0, own.1);
+                w.metadata.team_grant(id, w.project, row(team).to_grant());
+            }
+            Access::Narrowed(own, level, roles) => {
+                w.metadata.grant(id, w.project, own.0, own.1);
+                w.metadata.narrow(id, w.db, OverrideRow {
+                    platform_role: level,
+                    pg_roles: roles.map(|r| r.iter().map(|n| n.to_string()).collect()),
+                });
+            }
+            Access::TenantAdmin(level) => {
+                if let Some(level) = level {
+                    w.metadata.grant(id, w.project, level, &["billing"]);
+                }
+            }
+            Access::Gone(own, how) => {
+                w.metadata.grant(id, w.project, own.0, own.1);
+                w.metadata.set_member(w.tenant, &sub, |m| match how {
+                    "offboarded" => m.offboarded = true,
+                    "removed" => m.status = MemberStatus::Removed,
+                    _ => m.status = MemberStatus::Suspended,
+                });
+            }
+        }
+        for requested in REQUESTED {
+            let query = requested.map(|r| format!("?role={r}")).unwrap_or_default();
+            let before = storage.calls();
+            let resp = call(&w, &sub, "POST", &format!("{}/object/sign/b/a.txt{query}", base(&w))).await;
+            let status = resp.status().as_u16();
+            let signed = storage.calls() > before;
+            let minted = if signed {
+                assert_eq!(status, 200, "{case:?} as {requested:?}");
+                let caller: Value = serde_json::from_slice(storage.last().headers["x-chelabase-console"].as_bytes()).unwrap();
+                caller["role"].as_str().map(str::to_owned)
+            } else {
+                assert!(matches!(status, 403 | 404), "{case:?} as {requested:?}: {status}, not an access answer");
+                requested.map(str::to_owned)
+            };
+            let minter = minted.as_deref().map_or(ConsoleMinter::Owner, ConsoleMinter::Role);
+            let is_live = console_url_live(&Facts(&w.metadata), id, w.dev, minter).await.unwrap().is_some();
+            if is_live != signed {
+                disagree.push(format!("{case:?} as {requested:?} (minted {minter:?}): sign {status}, live {is_live}"));
+            }
+            checked += 1;
+            live += usize::from(is_live);
+        }
+    }
+    assert_eq!(checked, 938, "the case space changed: update the doc");
+    assert!(disagree.is_empty(), "{} of {checked} cases disagree:\n{}", disagree.len(), disagree.join("\n"));
+    // Both answers are exercised, not one by accident.
+    assert!(live > 50 && checked - live > 50, "{live} live of {checked}");
+}
