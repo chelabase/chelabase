@@ -242,6 +242,9 @@ pub struct Loaded {
     pub warning: Option<String>,
 }
 
+/// Layout paths whose seeds may not hold the same value.
+const DISTINCT_SEEDS: [(&str, &str); 1] = [("tokens/orchestrator-functions.token", "tokens/worker-functions.token")];
+
 impl Seeds {
     pub fn is_empty(&self) -> bool {
         self.by_path.is_empty()
@@ -302,6 +305,15 @@ impl Seeds {
                     seeds.by_path.insert(seed.path, (seed, SeedValue(v)));
                 }
                 Err(what) => problems.push(format!("line {line}: {key} {what}")),
+            }
+        }
+        // Seeds that must differ: each grants its own calls (edge functions #181: the
+        // orchestrator's bundle uploads, the worker's invocations). Values are never echoed.
+        for (a, b) in DISTINCT_SEEDS {
+            if let (Some((ka, va)), Some((kb, vb))) = (seeds.get(a), seeds.get(b))
+                && va.as_bytes() == vb.as_bytes()
+            {
+                problems.push(format!("{} and {} hold the same value; each needs its own", ka.key, kb.key));
             }
         }
         if !problems.is_empty() {
@@ -610,6 +622,23 @@ mod tests {
         // Nothing but blank lines, comments and other keys: no seeds.
         assert!(Seeds::parse("A=1\n# x\n\nB='2'\n").unwrap().is_empty());
         assert!(Seeds::parse("").unwrap().is_empty());
+    }
+
+    /// #181 (audit N4): each functions bearer grants its own calls (the orchestrator's bundle
+    /// uploads, the worker's invocations), so the two seeds may not be the same value.
+    #[test]
+    fn refuses_one_value_for_both_functions_bearers() {
+        let same = "CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN=one-value-for-both-0123456789abcdef\n\
+            CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN=one-value-for-both-0123456789abcdef\n";
+        let err = format!("{:#}", Seeds::parse(same).unwrap_err());
+        assert!(err.contains("CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN"), "{err}");
+        assert!(err.contains("CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN"), "{err}");
+        assert!(!err.contains("one-value-for-both"), "the value is never echoed: {err}");
+        let different = "CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN=orchestrator-0123456789abcdef0123\n\
+            CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN=worker-0123456789abcdef0123456789\n";
+        assert_eq!(Seeds::parse(different).unwrap().len(), 2);
+        let one = "CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN=worker-0123456789abcdef0123456789\n";
+        assert_eq!(Seeds::parse(one).unwrap().len(), 1);
     }
 
     #[test]
