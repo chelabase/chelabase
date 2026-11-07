@@ -84,15 +84,18 @@ describe("parseObjectPage", () => {
   it("reads_items_and_the_cursor_dropping_malformed_ones", () => {
     const page = parseObjectPage({
       items: [
-        { name: "photos/", folder: true, size: null, etag: null, content_type: null, updated_at: null },
-        { name: "photos/a.png", folder: false, size: 10, etag: "e1", content_type: "image/png", updated_at: 1762000000 },
+        { name: "photos/", folder: true, size: null, etag: null, content_type: null, updated_at: null, id: "not-a-file" },
+        { name: "photos/a.png", folder: false, size: 10, etag: "e1", content_type: "image/png", updated_at: 1762000000, id: "o-1" },
+        { name: "photos/b.png", folder: false, size: 1, etag: "e2", content_type: "image/png", updated_at: 1 },
         { name: 4 },
       ],
       next_cursor: "c",
     });
     expect(page.items).toEqual([
-      { name: "photos/", folder: true, size: null, etag: null, contentType: null, updatedAt: null },
-      { name: "photos/a.png", folder: false, size: 10, etag: "e1", contentType: "image/png", updatedAt: 1762000000 },
+      // m17: a file's object id (live view keys); a folder never has one.
+      { name: "photos/", folder: true, size: null, etag: null, contentType: null, updatedAt: null, id: null },
+      { name: "photos/a.png", folder: false, size: 10, etag: "e1", contentType: "image/png", updatedAt: 1762000000, id: "o-1" },
+      { name: "photos/b.png", folder: false, size: 1, etag: "e2", contentType: "image/png", updatedAt: 1, id: null },
     ]);
     expect(page.nextCursor).toBe("c");
     expect(parseObjectPage({ items: [], next_cursor: null }).nextCursor).toBeNull();

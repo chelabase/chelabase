@@ -106,6 +106,7 @@ async fn a_publish_in_flight_at_the_fencing_deadline_never_goes_out() {
         pg_database: "app".into(),
         schema: "public".into(),
         table: "items".into(),
+        bucket: None,
     };
     let (tx, mut rx) = mpsc::channel(256);
     let (_handle, _info) = src.watch(&ch, &role("billing"), tx).await.expect("joined");

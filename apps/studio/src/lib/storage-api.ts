@@ -145,6 +145,8 @@ export interface StorageItem {
   contentType: string | null;
   /** Seconds since the epoch. */
   updatedAt: number | null;
+  /** A file's object id (m17: live view keys); null for a folder, or when storage didn't send it. */
+  id: string | null;
 }
 
 /** A listing page as the browser reads it. */
@@ -169,6 +171,7 @@ export function parseObjectPage(body: unknown): ObjectPage {
       etag: strOrNull(item.etag),
       contentType: strOrNull(item.content_type),
       updatedAt: numOrNull(item.updated_at),
+      id: item.folder === true ? null : strOrNull(item.id),
     });
   }
   const next = typeof body.next_cursor === "string" && body.next_cursor !== "" ? body.next_cursor : null;

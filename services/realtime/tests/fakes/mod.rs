@@ -141,6 +141,10 @@ struct State {
     separate_converts: usize,
     /// Each check's `convert` keys (converted in the check's own session).
     check_converts: Vec<Vec<Vec<String>>>,
+    /// Object storage m17: each object's (key string's) bucket.
+    buckets: HashMap<String, Uuid>,
+    /// The bucket every check was scoped to, in order.
+    check_buckets: Vec<Option<Uuid>>,
 }
 
 /// See the module docs. Every role is a bypass role unless [`FakeChecker::set_bypass`] says
@@ -326,6 +330,18 @@ impl FakeChecker {
     pub fn check_converts(&self) -> Vec<Vec<Vec<String>>> {
         self.state.lock().unwrap().check_converts.clone()
     }
+    /// Object storage m17: these objects are in `bucket` (a check scoped to another bucket
+    /// doesn't return them).
+    pub fn place(&self, keys: &[&str], bucket: Uuid) {
+        let mut s = self.state.lock().unwrap();
+        for k in keys {
+            s.buckets.insert(ks(k), bucket);
+        }
+    }
+    /// The bucket each check was scoped to, in order.
+    pub fn check_buckets(&self) -> Vec<Option<Uuid>> {
+        self.state.lock().unwrap().check_buckets.clone()
+    }
     pub fn clear_calls(&self) {
         self.state.lock().unwrap().calls.clear();
     }
@@ -395,6 +411,7 @@ impl Checker for FakeChecker {
                 keys: req.keys.clone(),
             });
             s.check_converts.push(req.convert.clone());
+            s.check_buckets.push(req.bucket);
             if !req.convert.is_empty() {
                 // Converted in the check's session: recorded like a conversion, for the tests
                 // that look at which keys were converted as whom.
@@ -440,7 +457,12 @@ impl Checker for FakeChecker {
             let hidden = s.hidden.get(&g).cloned().unwrap_or_default();
             for t in req_keys {
                 let k = Self::key_of(&s, t);
-                if rows.contains(&k) && (bypass || !hidden.contains(&k)) && !keys.contains(&k) {
+                let in_bucket = req.bucket.is_none_or(|b| s.buckets.get(&k) == Some(&b));
+                if rows.contains(&k)
+                    && in_bucket
+                    && (bypass || !hidden.contains(&k))
+                    && !keys.contains(&k)
+                {
                     keys.push(k);
                 }
             }

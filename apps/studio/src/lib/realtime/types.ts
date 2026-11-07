@@ -13,6 +13,16 @@ export interface TableJoinParams {
   role: string | null;
 }
 
+/** Object storage m17: a bucket's objects (`storage.objects` of one bucket), as the Act-as role. */
+export interface StorageJoinParams {
+  database_id: string;
+  branch_id: string;
+  pg_database: string;
+  bucket_id: string;
+  /** The Act-as role; null = owner mode. */
+  role: string | null;
+}
+
 export type StatusReason =
   | "no_slot"
   | "waiting"
@@ -100,6 +110,15 @@ export interface TableSubscription {
   presence(state: PresenceState): void;
 }
 
+/** A storage channel: keys are object ids (`JSON.stringify([id])`); no presence. */
+export interface StorageSubscription {
+  /** The canonical channel id (`storage:` + compact JSON array). */
+  readonly channel: string;
+  leave(): void;
+  /** R19: the object keys on screen (at most 1000 are sent; replaces the previous set). */
+  view(keys: Key[]): void;
+}
+
 export interface ProjectSubscription {
   readonly channel: string;
   leave(): void;
@@ -121,6 +140,8 @@ export interface SessionEvents {
 export interface RealtimeClient {
   joinTable(params: TableJoinParams, handlers: TableHandlers): TableSubscription;
   joinProject(projectId: string, handlers: ProjectHandlers): ProjectSubscription;
+  /** Object storage m17: a bucket's object changes (the table handlers, without presence frames). */
+  joinStorage(params: StorageJoinParams, handlers: TableHandlers): StorageSubscription;
   /** A renewed member token: an `auth` frame goes out at once on an open socket; later tickets and `auth` frames use it. */
   setToken(token: string): void;
   /** Renewal on every `userLoaded`; sign-out on `userSignedOut` and `userUnloaded` (W32). Returns the detach function. */

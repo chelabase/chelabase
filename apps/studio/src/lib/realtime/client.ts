@@ -6,6 +6,8 @@ import type {
   ProjectSubscription,
   RealtimeClient,
   RealtimeError,
+  StorageJoinParams,
+  StorageSubscription,
   TableHandlers,
   TableJoinParams,
   TableSubscription,
@@ -32,6 +34,11 @@ export function socketUrl(apiUrl: string, ticket: string): string {
 /** The canonical table channel id: `table:` + compact JSON `[database_id,branch_id,pg_database,schema,table]` (no role). */
 export function tableChannelId(p: { database_id: string; branch_id: string; pg_database: string; schema: string; table: string }): string {
   return `table:${JSON.stringify([p.database_id, p.branch_id, p.pg_database, p.schema, p.table])}`;
+}
+
+/** The canonical storage channel id: `storage:` + compact JSON `[database_id,branch_id,pg_database,bucket_id]` (no role). */
+export function storageChannelId(p: { database_id: string; branch_id: string; pg_database: string; bucket_id: string }): string {
+  return `storage:${JSON.stringify([p.database_id, p.branch_id, p.pg_database, p.bucket_id])}`;
 }
 
 /** Reconnect delay: `min(30000, 1000 * 2^attempt) * (0.5 + 0.5 * random())`. */
@@ -377,6 +384,21 @@ export function createRealtimeClient(opts: RealtimeClientOptions): RealtimeClien
         presence(state) {
           e.presence = { ...state };
           if (e.joined) send({ type: "presence", channel: e.channel, state: e.presence });
+        },
+      };
+    },
+    joinStorage(params: StorageJoinParams, handlers: TableHandlers): StorageSubscription {
+      // A table entry in all but its join: rows, status and resyncs by channel, parked while hidden.
+      const e: Entry = { ...entry("table", storageChannelId(params), { channel: "storage", params: { ...params } }), table: handlers };
+      if (!closed) add(e);
+      return {
+        get channel() {
+          return e.channel;
+        },
+        leave: () => leave(e),
+        view(keys) {
+          e.view = keys.slice(0, MAX_VIEW_KEYS);
+          if (e.joined) send({ type: "view", channel: e.channel, keys: e.view });
         },
       };
     },

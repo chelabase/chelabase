@@ -30,6 +30,7 @@ fn items() -> TableChannel {
         pg_database: "app".into(),
         schema: "public".into(),
         table: "items".into(),
+        bucket: None,
     }
 }
 

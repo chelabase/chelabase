@@ -1623,3 +1623,203 @@ async fn fr_a_second_table_on_a_streaming_database_is_told_live() {
     })
     .await;
 }
+
+// --- Object storage m17: the storage channel ----------------------------------------------------
+
+/// A console storage call through the gateway as the demo member (`role`: `None` is owner
+/// mode), with a raw body: (status, body).
+#[allow(clippy::too_many_arguments)]
+async fn storage_call(fx: &Fx, token: &str, method: reqwest::Method, path: &str, role: Option<&str>, body: Vec<u8>, json_body: bool) -> (u16, Value) {
+    let query = role.map(|r| format!("?role={r}")).unwrap_or_default();
+    let resp = reqwest::Client::new()
+        .request(method, format!("{}{}/storage/{path}{query}", gateway(), fx.branch()))
+        .bearer_auth(token)
+        .header("content-type", if json_body { "application/json" } else { "text/plain" })
+        .body(body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .expect("the gateway answers");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// A bucket made in owner mode once the database's storage schema is installed: its id.
+async fn storage_bucket(fx: &Fx, name: &str) -> Uuid {
+    let mut last = (0, Value::Null);
+    for _ in 0..60 {
+        last = storage_call(fx, &fx.token, reqwest::Method::POST, "bucket", None, json!({"name": name}).to_string().into_bytes(), true).await;
+        if last.0 == 201 || last.0 == 200 {
+            let id = fx.psql(&fx.pg_database, &format!("SELECT id FROM storage.buckets WHERE name = '{name}'")).await;
+            return id.trim().parse().expect("the bucket's id");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    panic!("bucket {name}: {last:?}");
+}
+
+/// Uploads `name` into `bucket` with `token` as `role` (`None`: owner mode): the object's id.
+async fn storage_upload(fx: &Fx, token: &str, bucket: &str, name: &str, role: Option<&str>) -> Uuid {
+    let (status, body) = storage_call(fx, token, reqwest::Method::POST, &format!("object/{bucket}/{name}"), role, b"hello".to_vec(), false).await;
+    assert!(status == 200 || status == 201, "upload {name} as {role:?}: {status} {body}");
+    let id = fx
+        .psql(&fx.pg_database, &format!("SELECT o.id FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = '{bucket}' AND o.name = '{name}'"))
+        .await;
+    id.trim().parse().expect("the object's id")
+}
+
+/// A member of the demo tenant made for one test, as the worker's storage live tests make one:
+/// invited by link, accepted (which signs in), then granted on the demo project. Acting as
+/// `authenticated` needs a grant naming it (R18: the dev member, a tenant admin, never holds
+/// the data API's roles). Its access token.
+async fn granted_member(admin: &str, grant: Value) -> (String, String) {
+    let studio = env("CHELABASE_ENTRY_STUDIO_URL").expect("CHELABASE_ENTRY_STUDIO_URL (run through just workbench test)");
+    let email = format!("rt-storage-{}@example.com", Uuid::new_v4().simple());
+    let password = format!("Rt-pass-{}A!", &Uuid::new_v4().simple().to_string()[..8]);
+    let (status, body) = api(admin, reqwest::Method::POST, "/v1/invites", Some(json!({ "email": email, "grants": [], "delivery": "link" }))).await;
+    assert_eq!(status, 201, "invite: {body}");
+    let id = body["member"]["id"].as_str().expect("the member id").to_string();
+    let link = body["invite_url"].as_str().expect("an invite link").to_string();
+    let param = |name: &str| {
+        link.split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in {link}"))
+            .to_string()
+    };
+    let client = reqwest::Client::new();
+    let as_studio = |path: &str| {
+        client
+            .post(format!("{}/auth/v1/{path}", gateway()))
+            .header("origin", &studio)
+            .header("x-chelabase-studio", "1")
+            .timeout(Duration::from_secs(60))
+    };
+    let res = as_studio("accept-invite")
+        .json(&json!({ "t": param("t"), "user": param("user"), "code": param("code"), "password": password }))
+        .send()
+        .await
+        .expect("accept-invite answers");
+    let cookies: Vec<String> = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or_default().to_string())
+        .collect();
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!((status, &body["next"]), (200, &json!("studio")), "accept-invite: {body}");
+    let res = as_studio("token").header("cookie", cookies.join("; ")).send().await.expect("token answers");
+    let status = res.status().as_u16();
+    let body: Value = res.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "token: {body}");
+    let token = body["access_token"].as_str().expect("an access token").to_string();
+    let (status, body) = api(admin, reqwest::Method::PUT, &format!("/v1/projects/{DEMO_PROJECT_ID}/grants/{id}"), Some(grant)).await;
+    assert_eq!(status, 200, "grant: {body}");
+    (id, token)
+}
+
+fn storage_join(r: &str, fx: &Fx, bucket: Uuid, role: Option<&str>) -> Value {
+    json!({"type": "join", "ref": r, "channel": "storage", "params": {
+        "database_id": fx.id, "branch_id": fx.id, "pg_database": fx.pg_database, "bucket_id": bucket, "role": role}})
+}
+
+/// AC 1, 2, 5: two members watching one bucket as `authenticated` see each other's uploads
+/// within about 2 s; an object `authenticated` can't read (its `hidden/` prefix) reaches only
+/// owner mode, and produces no frame at all for the others; an upload to another bucket reaches
+/// nobody. A `table` join of `storage.objects` is refused (AC 3).
+#[tokio::test]
+#[ignore = "needs the workbench stack (just workbench test -p realtime --test realtime_live -- --run-ignored only)"]
+async fn storage_uploads_reach_only_viewers_who_can_list_them() {
+    with_database(|fx| async move {
+        let media = storage_bucket(&fx, "media").await;
+        storage_bucket(&fx, "other").await;
+        fx.psql(
+            &fx.pg_database,
+            "SELECT storage.create_policy('b_read', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL); \
+             SELECT storage.create_policy('o_read', 'objects', 'SELECT', ARRAY['authenticated']::name[], $$name NOT LIKE 'hidden/%'$$, NULL); \
+             SELECT storage.create_policy('o_write', 'objects', 'INSERT', ARRAY['authenticated']::name[], NULL, $$name NOT LIKE 'hidden/%'$$);",
+        )
+        .await;
+        // Two members acting as `authenticated` (R18 needs a grant naming it), and the dev
+        // member (a tenant admin) in owner mode.
+        let grant = json!({ "platform_role": "developer", "pg_roles": ["authenticated"] });
+        let (ana_id, ana_token) = granted_member(&fx.token, grant.clone()).await;
+        let (bob_id, bob_token) = granted_member(&fx.token, grant).await;
+        let live = live_one().await;
+        let mut ana = live.socket(&ana_token).await;
+        let mut bob = live.socket(&bob_token).await;
+        let mut admin = live.socket(&fx.token).await;
+
+        // AC 3: storage.objects isn't a table channel.
+        send(&mut ana, join_in("t", &fx, &fx.pg_database, "storage", "objects", None)).await;
+        let refused = reply(&mut ana, "t").await;
+        assert_eq!((refused["type"].as_str(), refused["code"].as_str()), (Some("error"), Some("invalid")), "{refused}");
+
+        let ch = join_live(&mut ana, "1", storage_join("1", &fx, media, Some("authenticated")), Duration::from_secs(60)).await;
+        assert_eq!(ch, format!(r#"storage:["{}","{}","{}","{media}"]"#, fx.id, fx.id, fx.pg_database));
+        join_live(&mut bob, "1", storage_join("1", &fx, media, Some("authenticated")), Duration::from_secs(60)).await;
+        join_live(&mut admin, "1", storage_join("1", &fx, media, None), Duration::from_secs(60)).await;
+
+        // AC 1: an upload as `authenticated` reaches both members and owner mode.
+        let started = Instant::now();
+        let shown = storage_upload(&fx, &ana_token, "media", "docs/a.txt", Some("authenticated")).await;
+        let want = keys(&[&shown.to_string()]);
+        let (a, b, o) = tokio::join!(
+            collect_rows(&mut ana, &ch, Duration::from_secs(3)),
+            collect_rows(&mut bob, &ch, Duration::from_secs(3)),
+            collect_rows(&mut admin, &ch, Duration::from_secs(3)),
+        );
+        assert_eq!(a.inserts, want, "{a:?}");
+        assert_eq!(b.inserts, want, "{b:?}");
+        assert_eq!(o.inserts, want, "{o:?}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+
+        // AC 2: an object `authenticated` can't read reaches owner mode only; the others get
+        // no frame of any kind.
+        let hidden = storage_upload(&fx, &fx.token, "media", "hidden/s.txt", None).await;
+        let (a, b, o) = tokio::join!(
+            frames_of(&mut ana, &ch, Duration::from_secs(5)),
+            frames_of(&mut bob, &ch, Duration::from_secs(5)),
+            collect_rows(&mut admin, &ch, Duration::from_secs(5)),
+        );
+        assert_eq!(o.inserts, keys(&[&hidden.to_string()]), "{o:?}");
+        assert!(a.is_empty(), "nothing reaches ana: {a:?}");
+        assert!(b.is_empty(), "nothing reaches bob: {b:?}");
+
+        // AC 5: another bucket's upload reaches nobody watching media.
+        storage_upload(&fx, &fx.token, "other", "x.txt", None).await;
+        let (a, o) = tokio::join!(
+            frames_of(&mut ana, &ch, Duration::from_secs(5)),
+            frames_of(&mut admin, &ch, Duration::from_secs(5)),
+        );
+        assert!(a.is_empty(), "{a:?}");
+        assert!(o.is_empty(), "{o:?}");
+        live.rt.shutdown();
+        for id in [ana_id, bob_id] {
+            let _ = api(&fx.token, reqwest::Method::DELETE, &format!("/v1/members/{id}"), None).await;
+        }
+    })
+    .await;
+}
+
+/// Every frame of `channel` within `within`.
+async fn frames_of(ws: &mut Socket, channel: &str, within: Duration) -> Vec<Value> {
+    let deadline = Instant::now() + within;
+    let mut out = vec![];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, ws.next()).await {
+            Err(_) => return out,
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                if v["channel"] == channel {
+                    out.push(v);
+                }
+            }
+            Ok(Some(Ok(Message::Close(f)))) => panic!("closed: {f:?}"),
+            Ok(Some(Ok(_))) => continue,
+            Ok(other) => panic!("socket ended: {other:?}"),
+        }
+    }
+}

@@ -27,6 +27,12 @@
 //!   after it closed is sent as keyless `changed`.
 //! - The R12 cache is flushed on every window (the source flushes it for the whole database).
 //!
+//! Object storage m17: a filter with a bucket ([`TableFilter::set_bucket`], a storage
+//! channel's `storage.objects`) scopes every check of every group to that bucket, so a key is
+//! released only for an object of that bucket the group's own read sees. Its groups are never
+//! bypass groups: a deleted row has no bucket left to check, so even owner mode gets a keyed
+//! delete only for a key on its screen or delivered to it, and never a keyless one.
+//!
 //! The inserts' and updates' plugin texts are mapped to the group's key strings by converting
 //! them in the group's own session (as deletes are), in the check's own transaction
 //! (`CheckRequest::convert`): the check answers the session's key strings of the rows it sees,
@@ -104,6 +110,8 @@ pub struct KeyCheck {
     ask: Vec<(usize, Vec<String>)>,
     /// The R12 cache's generation when the check was made.
     generation: u64,
+    /// The filter's bucket (a storage channel's).
+    bucket: Option<uuid::Uuid>,
 }
 
 impl KeyCheck {
@@ -117,6 +125,7 @@ impl KeyCheck {
                 xids: Vec::new(),
                 keys: Some(self.ask.iter().map(|(_, t)| t.clone()).collect()),
                 convert: Vec::new(),
+                bucket: self.bucket,
             };
             let permit = self.limiter.try_permit().ok_or(())?;
             let answer = self
@@ -183,6 +192,8 @@ pub struct TableFilter {
     groups: Vec<(GroupKey, Group)>,
     /// A legacy inheritance parent (R16): every window is `changed`.
     changed_only: bool,
+    /// Object storage m17: a storage channel's bucket (see the module docs).
+    bucket: Option<uuid::Uuid>,
 }
 
 impl TableFilter {
@@ -204,7 +215,17 @@ impl TableFilter {
             viewers: HashMap::new(),
             groups: Vec::new(),
             changed_only: false,
+            bucket: None,
         }
+    }
+    /// Object storage m17: scopes every check to `bucket` (a storage channel's filter of
+    /// `storage.objects`; set before any viewer is added).
+    pub fn set_bucket(&mut self, bucket: Option<uuid::Uuid>) {
+        self.bucket = bucket;
+    }
+    /// The bucket every check is scoped to.
+    pub fn bucket(&self) -> Option<uuid::Uuid> {
+        self.bucket
     }
     /// The relation the filter checks against.
     pub fn relation(&self) -> &Relation {
@@ -257,6 +278,8 @@ impl TableFilter {
         overflowed: Arc<AtomicBool>,
     ) {
         self.remove(viewer);
+        // A bucket's groups are never bypass groups (see the module docs).
+        let bypass = bypass && self.bucket.is_none();
         let key = group_key(&identity);
         match self.group_mut(&key) {
             Some(g) => {
@@ -563,6 +586,7 @@ impl TableFilter {
                 xids: Vec::new(),
                 keys: None,
                 convert: all,
+                bucket: self.bucket,
             }
         } else {
             CheckRequest {
@@ -570,6 +594,7 @@ impl TableFilter {
                 xids: xids.to_vec(),
                 keys: Some(read),
                 convert: all,
+                bucket: self.bucket,
             }
         };
         let Some(answer) = self.poll(id, &req).await else {
@@ -598,7 +623,8 @@ impl TableFilter {
             }
         }
         Outcome::Checked(Checked {
-            bypass: answer.bypass,
+            // A bucket's groups are never bypass groups (see the module docs).
+            bypass: answer.bypass && self.bucket.is_none(),
             inserts,
             updates,
             hidden_updates,
@@ -677,6 +703,7 @@ impl TableFilter {
             known: out,
             ask,
             generation: self.cache.generation(),
+            bucket: self.bucket,
         })
     }
 }
