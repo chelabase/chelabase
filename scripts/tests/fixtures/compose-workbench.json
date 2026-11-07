@@ -1,4 +1,14 @@
 {
+  "configs": {
+    "s3-functions-access-key": {
+      "content": "chelabase-functions-dev",
+      "name": "chelabase-feat-x_s3-functions-access-key"
+    },
+    "s3-functions-secret-key": {
+      "content": "chelabase-functions-dev-secret",
+      "name": "chelabase-feat-x_s3-functions-secret-key"
+    }
+  },
   "name": "chelabase-feat-x",
   "networks": {
     "compute": {
@@ -1810,7 +1820,17 @@
     },
     "seaweedfs": {
       "command": [
-        "set -e\numask 077\n# The S3 identities' keys go from their files into s3.json through stdin and stdout only\n# (tr drops the newline), so no key is ever a program argument or a shell variable.\nkey() { tr -d '\\n' < \"/run/chelabase/secrets/$$1\"; }\n{\n  printf '{\"identities\": [\\n  {\"name\": \"neon\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key s3/access-key; printf '\", \"secretKey\": \"'; key s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:neon\", \"Write:neon\", \"List:neon\", \"Tagging:neon\"]},\\n'\n  printf '  {\"name\": \"storage\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key storage-s3/access-key; printf '\", \"secretKey\": \"'; key storage-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-storage\", \"Write:chelabase-storage\", \"List:chelabase-storage\", \"Tagging:chelabase-storage\"]}]}\\n'\n} > /tmp/s3.json\nD=/run/chelabase/secrets/grpc-tls\nmkdir -p /etc/seaweedfs\n{\n  echo '[grpc]'; echo \"ca = \\\"$$D/ca.crt\\\"\"\n  for c in master volume filer s3; do\n    printf '[grpc.%s]\\ncert = \"%s/server.crt\"\\nkey = \"%s/server.key\"\\nclient_cert = \"%s/client.crt\"\\nclient_key = \"%s/client.key\"\\n' \"$$c\" \"$$D\" \"$$D\" \"$$D\" \"$$D\"\n  done\n  printf '[grpc.client]\\ncert = \"%s/client.crt\"\\nkey = \"%s/client.key\"\\n' \"$$D\" \"$$D\"\n} > /etc/seaweedfs/security.toml\n# The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's\n# start_period covers it). On exhaustion it logs the last output and ends the container\n# (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.\n# On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.\n(\n  i=0; out=\n  while [ \"$$i\" -lt 40 ]; do\n    out=\"$$(printf 's3.bucket.create -name neon\\ns3.bucket.create -name chelabase-storage\\ns3.bucket.list\\n' |\n      timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)\"\n    if printf '%s' \"$$out\" | grep -qw neon && printf '%s' \"$$out\" | grep -qw chelabase-storage; then\n      touch /tmp/buckets-ready; exec sleep 2147483647\n    fi\n    i=$$((i + 1)); sleep 2\n  done\n  echo \"seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:\" >&2\n  printf '%s\\n' \"$$out\" >&2\n  kill 1\n) &\nexec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
+        "set -e\numask 077\n# The S3 identities' keys go from their files into s3.json through stdin and stdout only\n# (tr drops the newline), so no key is ever a program argument or a shell variable.\nkey() { tr -d '\\n' < \"/run/chelabase/secrets/$$1\"; }\n{\n  printf '{\"identities\": [\\n  {\"name\": \"neon\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key s3/access-key; printf '\", \"secretKey\": \"'; key s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:neon\", \"Write:neon\", \"List:neon\", \"Tagging:neon\"]},\\n'\n  printf '  {\"name\": \"storage\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key storage-s3/access-key; printf '\", \"secretKey\": \"'; key storage-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-storage\", \"Write:chelabase-storage\", \"List:chelabase-storage\", \"Tagging:chelabase-storage\"]},\\n'\n  printf '  {\"name\": \"functions\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key functions-s3/access-key; printf '\", \"secretKey\": \"'; key functions-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-functions\", \"Write:chelabase-functions\", \"List:chelabase-functions\"]}]}\\n'\n} > /tmp/s3.json\nD=/run/chelabase/secrets/grpc-tls\nmkdir -p /etc/seaweedfs\n{\n  echo '[grpc]'; echo \"ca = \\\"$$D/ca.crt\\\"\"\n  for c in master volume filer s3; do\n    printf '[grpc.%s]\\ncert = \"%s/server.crt\"\\nkey = \"%s/server.key\"\\nclient_cert = \"%s/client.crt\"\\nclient_key = \"%s/client.key\"\\n' \"$$c\" \"$$D\" \"$$D\" \"$$D\" \"$$D\"\n  done\n  printf '[grpc.client]\\ncert = \"%s/client.crt\"\\nkey = \"%s/client.key\"\\n' \"$$D\" \"$$D\"\n} > /etc/seaweedfs/security.toml\n# The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's\n# start_period covers it). On exhaustion it logs the last output and ends the container\n# (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.\n# On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.\n(\n  i=0; out=\n  while [ \"$$i\" -lt 40 ]; do\n    out=\"$$(printf 's3.bucket.create -name neon\\ns3.bucket.create -name chelabase-storage\\ns3.bucket.create -name chelabase-functions\\ns3.bucket.list\\n' |\n      timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)\"\n    if printf '%s' \"$$out\" | grep -qw neon && printf '%s' \"$$out\" | grep -qw chelabase-storage &&\n      printf '%s' \"$$out\" | grep -qw chelabase-functions; then\n      touch /tmp/buckets-ready; exec sleep 2147483647\n    fi\n    i=$$((i + 1)); sleep 2\n  done\n  echo \"seaweedfs: buckets neon, chelabase-storage and chelabase-functions not created after 40 tries; last weed shell output:\" >&2\n  printf '%s\\n' \"$$out\" >&2\n  kill 1\n) &\nexec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
+      ],
+      "configs": [
+        {
+          "source": "s3-functions-access-key",
+          "target": "/run/chelabase/secrets/functions-s3/access-key"
+        },
+        {
+          "source": "s3-functions-secret-key",
+          "target": "/run/chelabase/secrets/functions-s3/secret-key"
+        }
       ],
       "entrypoint": [
         "/bin/sh",

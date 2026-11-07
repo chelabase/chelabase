@@ -205,7 +205,8 @@ services:
         for d in bootstrap; do
           [ -d "$$S/$$d" ] || mkdir -m 0700 "$$S/$$d"
         done
-        # The object-store identity `storage` (bucket chelabase-storage only) beside Neon's `s3/`
+        # The object-store identities `storage` (bucket chelabase-storage only) and `functions`
+        # (bucket chelabase-functions only: function bundles, edge-functions m1) beside Neon's `s3/`
         # pair (chelabase-init makes that one), and SeaweedFS's gRPC mutual TLS: one CA and a
         # server and a client certificate (P-256, ten years). Each is made only when missing, so
         # an upgraded install keeps every key it has and only gains these. Same owner, group and
@@ -219,6 +220,8 @@ services:
         }
         new_key storage-s3/access-key 20
         new_key storage-s3/secret-key 40
+        new_key functions-s3/access-key 20
+        new_key functions-s3/secret-key 40
         T="$$S/grpc-tls"
         install -d -m 0700 "$$T"
         ec="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"
@@ -373,11 +376,13 @@ services:
 
   # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL,
   # and for user objects (bucket `chelabase-storage`, written by the storage service).
-  # Two S3 identities are rendered from their key files into a private file of the container
+  # and for function bundles (bucket `chelabase-functions`, written by the functions service).
+  # Three S3 identities are rendered from their key files into a private file of the container
   # (SeaweedFS takes them only in that JSON; the key files hold no quote or backslash):
-  #   neon     Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
-  #   storage  the same on bucket `chelabase-storage` only
-  # No admin identity exists: both buckets are made over loopback by `weed shell` (below).
+  #   neon       Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
+  #   storage    the same on bucket `chelabase-storage` only
+  #   functions  Read/Write/List on bucket `chelabase-functions` only
+  # No admin identity exists: every bucket is made over loopback by `weed shell` (below).
   # Master (9333), volume (8080) and filer (8888) have no auth and bypass S3 IAM, and so do the
   # gRPC ports (+10000) of those three and of the S3 server (18333). The first three bind to and
   # advertise 127.0.0.1; S3 (8333) and its gRPC listen on the network, so every gRPC listener
@@ -385,7 +390,7 @@ services:
   # grpc-tls files; the paths are in it, no secret). The Iceberg and Lance catalog ports and the
   # embedded IAM API are off, so identities change only through the s3.json.
   # `weed server` stays the container's process (a crash restarts it); the bucket step is a
-  # background loop that touches /tmp/buckets-ready once both buckets are listed.
+  # background loop that touches /tmp/buckets-ready once every bucket is listed.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     restart: unless-stopped
@@ -403,7 +408,10 @@ services:
           printf '"}],\n   "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},\n'
           printf '  {"name": "storage",\n   "credentials": [{"accessKey": "'
           key storage-s3/access-key; printf '", "secretKey": "'; key storage-s3/secret-key
-          printf '"}],\n   "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]}]}\n'
+          printf '"}],\n   "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]},\n'
+          printf '  {"name": "functions",\n   "credentials": [{"accessKey": "'
+          key functions-s3/access-key; printf '", "secretKey": "'; key functions-s3/secret-key
+          printf '"}],\n   "actions": ["Read:chelabase-functions", "Write:chelabase-functions", "List:chelabase-functions"]}]}\n'
         } > /tmp/s3.json
         D=/run/chelabase/secrets/grpc-tls
         mkdir -p /etc/seaweedfs
@@ -421,14 +429,15 @@ services:
         (
           i=0; out=
           while [ "$$i" -lt 40 ]; do
-            out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.list\n' |
+            out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.create -name chelabase-functions\ns3.bucket.list\n' |
               timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)"
-            if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage; then
+            if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage &&
+              printf '%s' "$$out" | grep -qw chelabase-functions; then
               touch /tmp/buckets-ready; exec sleep 2147483647
             fi
             i=$$((i + 1)); sleep 2
           done
-          echo "seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:" >&2
+          echo "seaweedfs: buckets neon, chelabase-storage and chelabase-functions not created after 40 tries; last weed shell output:" >&2
           printf '%s\n' "$$out" >&2
           kill 1
         ) &
@@ -439,12 +448,14 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/secret-key, read_only: true, volume: {subpath: s3/secret-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/access-key, read_only: true, volume: {subpath: functions-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/secret-key, read_only: true, volume: {subpath: functions-s3/secret-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/ca.crt, read_only: true, volume: {subpath: grpc-tls/ca.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.crt, read_only: true, volume: {subpath: grpc-tls/server.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.key, read_only: true, volume: {subpath: grpc-tls/server.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.crt, read_only: true, volume: {subpath: grpc-tls/client.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.key, read_only: true, volume: {subpath: grpc-tls/client.key}}
-    # Healthy = both buckets exist and S3 answers an unsigned request with its error document.
+    # Healthy = every bucket exists and S3 answers an unsigned request with its error document.
     healthcheck:
       test:
         - CMD-SHELL
@@ -1324,6 +1335,36 @@ services:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_STUDIO_HOST_NAME:-studio.chelabase.localhost}", "http://127.0.0.1:3000/"]
 
+  # Edge functions (m1): workerd running member bundles, loaded by hash through its Worker Loader
+  # from the functions service (m4), the only other member of the internal `functions` network.
+  # Its outbound is `functions-egress` alone, and workerd's `egress` service lets user code reach
+  # public addresses only (infra/functions-runtime/config.capnp). No secret, no published port,
+  # no volume; non-root on a read-only root with every capability dropped. workerd runs all
+  # isolates on one thread, so a bundle in a busy loop stalls the others: the image's watchdog
+  # probes a trivial worker every 2s and after 3 failures ends the container, which `always`
+  # restarts. Profile `functions` until the functions service lands (m4). Its image isn't
+  # published yet: build it with `docker buildx bake -f infra/images/docker-bake.hcl
+  # functions-runtime` and set CHELABASE_IMAGE_REPO=chelabase and CHELABASE_IMAGE_TAG=latest.
+  functions-runtime:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["functions"]
+    restart: always
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CHELABASE_FUNCTIONS_RUNTIME_MEMORY:-1g}
+    pids_limit: 256
+    networks:
+      functions: {}
+      functions-egress: {}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/busybox", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:9090/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
 networks:
   # Orchestrator and realtime to computes (<project>_control), with static addresses for the
   # login rules; computes take addresses from the upper /23 only. Change it in .env when it
@@ -1341,6 +1382,11 @@ networks:
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).
   compute: {}
+  # Edge functions (m1): the functions service to the runtime, nothing else; no route out.
+  functions:
+    internal: true
+  # The runtime's only way out (workerd allows public addresses only); nothing else is on it.
+  functions-egress: {}
 
 volumes:
   # Every key, password and token, chelabase-init's layout (plus bootstrap/). Never delete it
