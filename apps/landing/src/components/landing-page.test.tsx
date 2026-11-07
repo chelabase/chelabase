@@ -81,17 +81,23 @@ describe("LandingPage", () => {
     const section = screen.getByRole("region", { name: "Everything in one place." });
     const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace(/Coming soon|Soon/g, ""));
     expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
-    expect(names.slice(-2)).toEqual(["Object storage", "CLI"]);
+    expect(names.slice(-2)).toEqual(["Object storage", "Edge functions"]);
     const gateway = within(section).getByRole("link", { name: /^Gateway/ });
     expect(gateway.getAttribute("href")).toBe(`${DOCS}/architecture/gateway`);
     expect(within(section).getAllByRole("link")).toHaveLength(names.length - 1);
   });
 
-  it("labels_the_cli_coming_soon_without_a_link", () => {
+  it("labels_edge_functions_coming_soon_without_a_link", () => {
     renderPage();
-    const card = screen.getByRole("heading", { level: 3, name: /^CLI/ }).parentElement!;
+    const card = screen.getByRole("heading", { level: 3, name: /^Edge functions/ }).parentElement!;
     expect(card.tagName).not.toBe("A");
     expect(card).toHaveTextContent(/coming soon/i);
+  });
+
+  it("no_longer_lists_the_cli_as_a_platform_piece", () => {
+    renderPage();
+    const section = screen.getByRole("region", { name: "Everything in one place." });
+    expect(within(section).queryByRole("heading", { level: 3, name: /^CLI/ })).toBeNull();
   });
 
   it("links_object_storage_to_its_docs_and_says_what_shipped", () => {

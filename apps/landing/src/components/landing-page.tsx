@@ -11,9 +11,9 @@ import {
   LayoutDashboard,
   Maximize2,
   Radio,
-  SquareTerminal,
   Waypoints,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
@@ -397,10 +397,10 @@ const PIECES: Piece[] = [
     to: "using/storage",
   },
   {
-    id: "cli",
-    icon: SquareTerminal,
-    title: "CLI",
-    body: "A command-line tool for setup and management from the terminal: generate types, run migrations and more. Not available yet.",
+    id: "functions",
+    icon: Zap,
+    title: "Edge functions",
+    body: "Your own TypeScript and WASM, run next to your database, deployed per branch and hot-loaded from your machine. Triggered over HTTP, on a schedule, or by row and storage events. Not available yet.",
     soon: true,
   },
 ];
