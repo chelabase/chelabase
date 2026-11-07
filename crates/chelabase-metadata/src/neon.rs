@@ -1613,7 +1613,7 @@ impl MetadataClient {
             return Ok(false);
         }
         sqlx::query(
-            "UPDATE data_api_keys k SET revoked_at = now()
+            "UPDATE data_api_keys k SET revoked_at = now(), sealed = NULL
              FROM branches b
              WHERE b.endpoint_id = $1 AND k.branch_id = b.id
                AND k.role = $2 AND k.kind = 'secret' AND k.revoked_at IS NULL",
