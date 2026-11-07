@@ -784,6 +784,19 @@ fn realtime_is_one_of_the_stacks_rust_apps() {
     assert_eq!(restart_targets(&["realtime".into()]).unwrap(), ["realtime"]);
 }
 
+// Edge functions m4b: `up` builds, records and restarts the functions service with the other Rust
+// apps and starts it with the late apps; the runtime is infra (an image, no binary).
+#[test]
+fn functions_is_one_of_the_stacks_rust_apps() {
+    use super::commands::{APPS, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    assert!(RUST_APPS.contains(&"functions"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"functions"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"functions"), "{LATE_APPS:?}");
+    assert!(INFRA.contains(&"functions-runtime"), "{INFRA:?}");
+    assert!(!RUST_APPS.contains(&"functions-runtime"));
+    assert_eq!(restart_targets(&["functions".into()]).unwrap(), ["functions"]);
+}
+
 // auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be
 // healthy before the bootstrap (which creates its members pool through it); it is an app of the
 // stack (restartable, checked by `test --stack`), not a Rust app (no binary).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline check that the app tunables in infra/compose/.env.example reach a self-hosted install
 # (epic selfhost-install, close-out S1): every `CHELABASE_*=` line, commented or not, in the
-# sections "Mode", "Database credentials", "App users" and "Object storage" must arrive, with the value .env gives
+# sections "Mode", "Database credentials", "App users", "Object storage" and "Edge functions" must arrive, with the value .env gives
 # it, in the environment of at least one service of the base file. Compose reads .env only for
 # its own substitutions, so a setting docker-compose.yml doesn't pass through is silently
 # ignored. Each tunable is set to a unique marker in a scratch env file and looked up in
@@ -24,7 +24,7 @@ err() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-sections='Mode|Database credentials|App users|Object storage'
+sections='Mode|Database credentials|App users|Object storage|Edge functions'
 awk -v want="^# --- ($sections)( .*)? ---\$" '
   /^# --- .* ---$/ { on = ($0 ~ want); next }
   on && match($0, /^(# )?CHELABASE_[A-Z0-9_]+=/) {

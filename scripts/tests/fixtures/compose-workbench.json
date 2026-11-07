@@ -1,14 +1,4 @@
 {
-  "configs": {
-    "s3-functions-access-key": {
-      "content": "chelabase-functions-dev",
-      "name": "chelabase-feat-x_s3-functions-access-key"
-    },
-    "s3-functions-secret-key": {
-      "content": "chelabase-functions-dev-secret",
-      "name": "chelabase-feat-x_s3-functions-secret-key"
-    }
-  },
   "name": "chelabase-feat-x",
   "networks": {
     "compute": {
@@ -29,6 +19,20 @@
     "default": {
       "ipam": {},
       "name": "chelabase-feat-x_default"
+    },
+    "functions": {
+      "internal": true,
+      "ipam": {},
+      "name": "chelabase-feat-x_functions"
+    },
+    "functions-control": {
+      "internal": true,
+      "ipam": {},
+      "name": "chelabase-feat-x_functions-control"
+    },
+    "functions-egress": {
+      "ipam": {},
+      "name": "chelabase-feat-x_functions-egress"
     }
   },
   "secrets": {
@@ -100,6 +104,10 @@
       "file": "/m/.chelabase/auth/member-jwt.pub",
       "name": "chelabase-feat-x_member-jwt-public"
     },
+    "nats-functions": {
+      "file": "/m/.chelabase/nats/functions.password",
+      "name": "chelabase-feat-x_nats-functions"
+    },
     "nats-orchestrator": {
       "file": "/m/.chelabase/nats/orchestrator.password",
       "name": "chelabase-feat-x_nats-orchestrator"
@@ -131,6 +139,14 @@
     "realtime-ticket": {
       "file": "/m/.chelabase/realtime/ticket.key",
       "name": "chelabase-feat-x_realtime-ticket"
+    },
+    "s3-functions-access-key": {
+      "file": "/m/.chelabase/stacks/feat-x/functions-s3/access-key",
+      "name": "chelabase-feat-x_s3-functions-access-key"
+    },
+    "s3-functions-secret-key": {
+      "file": "/m/.chelabase/stacks/feat-x/functions-s3/secret-key",
+      "name": "chelabase-feat-x_s3-functions-secret-key"
     },
     "s3-neon-access-key": {
       "file": "/m/.chelabase/stacks/feat-x/s3/access-key",
@@ -200,6 +216,10 @@
       "file": "/m/.chelabase/tokens/data-keys.token",
       "name": "chelabase-feat-x_token-data-keys"
     },
+    "token-orchestrator-functions": {
+      "file": "/m/.chelabase/tokens/orchestrator-functions.token",
+      "name": "chelabase-feat-x_token-orchestrator-functions"
+    },
     "token-orchestrator-identity": {
       "file": "/m/.chelabase/tokens/orchestrator-identity.token",
       "name": "chelabase-feat-x_token-orchestrator-identity"
@@ -219,6 +239,10 @@
     "token-storcon-hook": {
       "file": "/m/.chelabase/tokens/storcon-hook.token",
       "name": "chelabase-feat-x_token-storcon-hook"
+    },
+    "token-worker-functions": {
+      "file": "/m/.chelabase/tokens/worker-functions.token",
+      "name": "chelabase-feat-x_token-worker-functions"
     },
     "token-worker-identity": {
       "file": "/m/.chelabase/tokens/worker-identity.token",
@@ -409,6 +433,164 @@
         }
       ],
       "working_dir": "/w/feat-x"
+    },
+    "functions": {
+      "command": [
+        "/w/feat-x/target/debug/functions"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "nats": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "seaweedfs": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,127.0.0.1:8091",
+        "CHELABASE_FUNCTIONS_INTERNAL_ADDR": "functions-internal:8080,functions-control:8080",
+        "CHELABASE_FUNCTIONS_RUNTIME_URL": "http://functions-runtime:8080",
+        "CHELABASE_FUNCTIONS_TIMEOUT_MS": "",
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_functions",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/functions.password",
+        "CHELABASE_NATS_USER": "functions",
+        "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-functions.token",
+        "CHELABASE_STORAGE_BACKEND": "seaweedfs",
+        "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/functions-s3/access-key",
+        "CHELABASE_STORAGE_S3_BUCKET": "chelabase-functions",
+        "CHELABASE_STORAGE_S3_ENDPOINT": "http://seaweedfs:8333",
+        "CHELABASE_STORAGE_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/functions-s3/secret-key",
+        "CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/worker-functions.token"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8091/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": {
+          "aliases": [
+            "functions-public"
+          ]
+        },
+        "functions": {
+          "aliases": [
+            "functions-internal"
+          ]
+        },
+        "functions-control": {
+          "aliases": [
+            "functions-control"
+          ]
+        }
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "secrets-key",
+          "target": "/m/.chelabase/secrets/secrets.key"
+        },
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "nats-functions",
+          "target": "/m/.chelabase/nats/functions.password"
+        },
+        {
+          "source": "token-orchestrator-functions",
+          "target": "/m/.chelabase/tokens/orchestrator-functions.token"
+        },
+        {
+          "source": "token-worker-functions",
+          "target": "/m/.chelabase/tokens/worker-functions.token"
+        },
+        {
+          "source": "s3-functions-access-key",
+          "target": "/run/chelabase/secrets/functions-s3/access-key"
+        },
+        {
+          "source": "s3-functions-secret-key",
+          "target": "/run/chelabase/secrets/functions-s3/secret-key"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "functions-runtime": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": null,
+      "entrypoint": null,
+      "healthcheck": {
+        "interval": "5s",
+        "retries": 3,
+        "start_period": "10s",
+        "test": [
+          "CMD",
+          "/usr/local/bin/busybox",
+          "wget",
+          "-q",
+          "-T",
+          "2",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:9090/"
+        ],
+        "timeout": "3s"
+      },
+      "image": "chelabase/functions-runtime:latest",
+      "mem_limit": "1073741824",
+      "networks": {
+        "functions": {},
+        "functions-egress": {}
+      },
+      "pids_limit": 256,
+      "pull_policy": "never",
+      "read_only": true,
+      "restart": "always",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "user": "65532:65532"
     },
     "gateway": {
       "command": [
@@ -815,6 +997,7 @@
         "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_orchestrator",
         "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/orchestrator.password",
         "CHELABASE_NATS_USER": "orchestrator",
+        "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-functions.token",
         "CHELABASE_PASSWORD_STRENGTH": null,
         "CHELABASE_PROXY_API_TOKEN_FILE": "/m/.chelabase/tokens/proxy-api.token",
         "CHELABASE_PROXY_PG_PORT": "4537",
@@ -846,7 +1029,8 @@
         "control": {
           "ipv4_address": "10.213.4.10"
         },
-        "default": {}
+        "default": {},
+        "functions-control": {}
       },
       "restart": "unless-stopped",
       "secrets": [
@@ -897,6 +1081,10 @@
         {
           "source": "token-storage-internal",
           "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "token-orchestrator-functions",
+          "target": "/m/.chelabase/tokens/orchestrator-functions.token"
         },
         {
           "source": "token-proxy-api",
@@ -1364,6 +1552,7 @@
         "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_runner",
         "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/runner.password",
         "CHELABASE_NATS_USER": "runner",
+        "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-functions.token",
         "CHELABASE_PROXY_API_TOKEN_FILE": "/m/.chelabase/tokens/proxy-api.token",
         "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE": "/m/.chelabase/realtime/internal.token",
         "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
@@ -1385,7 +1574,8 @@
         "control": {
           "ipv4_address": "10.213.4.11"
         },
-        "default": {}
+        "default": {},
+        "functions-control": {}
       },
       "profiles": [
         "runner"
@@ -1487,6 +1677,10 @@
         {
           "source": "token-storage-internal",
           "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "token-orchestrator-functions",
+          "target": "/m/.chelabase/tokens/orchestrator-functions.token"
         },
         {
           "source": "storage-pem",
@@ -1822,16 +2016,6 @@
       "command": [
         "set -e\numask 077\n# The S3 identities' keys go from their files into s3.json through stdin and stdout only\n# (tr drops the newline), so no key is ever a program argument or a shell variable.\nkey() { tr -d '\\n' < \"/run/chelabase/secrets/$$1\"; }\n{\n  printf '{\"identities\": [\\n  {\"name\": \"neon\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key s3/access-key; printf '\", \"secretKey\": \"'; key s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:neon\", \"Write:neon\", \"List:neon\", \"Tagging:neon\"]},\\n'\n  printf '  {\"name\": \"storage\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key storage-s3/access-key; printf '\", \"secretKey\": \"'; key storage-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-storage\", \"Write:chelabase-storage\", \"List:chelabase-storage\", \"Tagging:chelabase-storage\"]},\\n'\n  printf '  {\"name\": \"functions\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key functions-s3/access-key; printf '\", \"secretKey\": \"'; key functions-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-functions\", \"Write:chelabase-functions\", \"List:chelabase-functions\"]}]}\\n'\n} > /tmp/s3.json\nD=/run/chelabase/secrets/grpc-tls\nmkdir -p /etc/seaweedfs\n{\n  echo '[grpc]'; echo \"ca = \\\"$$D/ca.crt\\\"\"\n  for c in master volume filer s3; do\n    printf '[grpc.%s]\\ncert = \"%s/server.crt\"\\nkey = \"%s/server.key\"\\nclient_cert = \"%s/client.crt\"\\nclient_key = \"%s/client.key\"\\n' \"$$c\" \"$$D\" \"$$D\" \"$$D\" \"$$D\"\n  done\n  printf '[grpc.client]\\ncert = \"%s/client.crt\"\\nkey = \"%s/client.key\"\\n' \"$$D\" \"$$D\"\n} > /etc/seaweedfs/security.toml\n# The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's\n# start_period covers it). On exhaustion it logs the last output and ends the container\n# (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.\n# On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.\n(\n  i=0; out=\n  while [ \"$$i\" -lt 40 ]; do\n    out=\"$$(printf 's3.bucket.create -name neon\\ns3.bucket.create -name chelabase-storage\\ns3.bucket.create -name chelabase-functions\\ns3.bucket.list\\n' |\n      timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)\"\n    if printf '%s' \"$$out\" | grep -qw neon && printf '%s' \"$$out\" | grep -qw chelabase-storage &&\n      printf '%s' \"$$out\" | grep -qw chelabase-functions; then\n      touch /tmp/buckets-ready; exec sleep 2147483647\n    fi\n    i=$$((i + 1)); sleep 2\n  done\n  echo \"seaweedfs: buckets neon, chelabase-storage and chelabase-functions not created after 40 tries; last weed shell output:\" >&2\n  printf '%s\\n' \"$$out\" >&2\n  kill 1\n) &\nexec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
       ],
-      "configs": [
-        {
-          "source": "s3-functions-access-key",
-          "target": "/run/chelabase/secrets/functions-s3/access-key"
-        },
-        {
-          "source": "s3-functions-secret-key",
-          "target": "/run/chelabase/secrets/functions-s3/secret-key"
-        }
-      ],
       "entrypoint": [
         "/bin/sh",
         "-c"
@@ -1886,6 +2070,14 @@
         {
           "source": "grpc-tls-client-key",
           "target": "/run/chelabase/secrets/grpc-tls/client.key"
+        },
+        {
+          "source": "s3-functions-access-key",
+          "target": "/run/chelabase/secrets/functions-s3/access-key"
+        },
+        {
+          "source": "s3-functions-secret-key",
+          "target": "/run/chelabase/secrets/functions-s3/secret-key"
         }
       ],
       "volumes": [
@@ -2278,7 +2470,8 @@
         "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/control.password",
         "CHELABASE_VALKEY_USER": "control",
         "CHELABASE_WEBHOOKS_ALLOW_HOSTS": "runner",
-        "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true"
+        "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true",
+        "CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/worker-functions.token"
       },
       "group_add": [
         "973"
@@ -2298,7 +2491,8 @@
       "image": "chelabase-workbench:fixture000000",
       "networks": {
         "compute": {},
-        "default": {}
+        "default": {},
+        "functions-control": {}
       },
       "restart": "unless-stopped",
       "secrets": [
@@ -2337,6 +2531,10 @@
         {
           "source": "token-worker-identity",
           "target": "/m/.chelabase/tokens/worker-identity.token"
+        },
+        {
+          "source": "token-worker-functions",
+          "target": "/m/.chelabase/tokens/worker-functions.token"
         }
       ],
       "user": "1000:1000",

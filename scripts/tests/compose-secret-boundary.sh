@@ -32,6 +32,9 @@
 #      a secret in argv or its environment), read-only, and names every secret by a `*_FILE`
 #      path. NATS restarts when init-secrets is updated, so an upgrade's new NATS users (storage's)
 #      reach it.
+#   7. the functions service's boundary (edge functions m4b): its NATS password and each internal
+#      bearer (the orchestrator's, the worker's), only the gateway mounting the signing key, no
+#      Docker socket for functions or the runtime, and the runtime's networks.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -122,6 +125,7 @@ orchestrator	tokens/data-keys.token	ro
 orchestrator	tokens/app-auth.token	ro
 orchestrator	tokens/app-sessions.token	ro
 orchestrator	tokens/storage-internal.token	ro
+orchestrator	tokens/orchestrator-functions.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
 orchestrator	tokens/orchestrator-identity.token	ro
@@ -142,6 +146,7 @@ worker	realtime-tls	rw
 worker	db/metadata.password	ro
 worker	storage-s3/access-key	ro
 worker	storage-s3/secret-key	ro
+worker	tokens/worker-functions.token	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
@@ -165,6 +170,14 @@ storage	tokens/storage-internal.token	ro
 storage	nats/storage.password	ro
 storage	storage-s3/access-key	ro
 storage	storage-s3/secret-key	ro
+functions	secrets/secrets.key	ro
+functions	gateway/internal-verify.pem	ro
+functions	db/metadata.password	ro
+functions	nats/functions.password	ro
+functions	tokens/orchestrator-functions.token	ro
+functions	tokens/worker-functions.token	ro
+functions	functions-s3/access-key	ro
+functions	functions-s3/secret-key	ro
 realtime	gateway/internal-verify.pem	ro
 realtime	compute-ca/ca.crt	ro
 realtime	nats/realtime.password	ro
@@ -277,7 +290,7 @@ leaks="$(jq -r '.services | to_entries[] | .key as $s
 # worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
 # functions-s3/ (the `functions` identity, edge-functions m1) is seaweedfs's alone until the
 # functions service (m4) and the worker's bundle sweep (m7) mount it; never the runtime's.
-for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:seaweedfs "; do
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:functions seaweedfs "; do
   dir="${want%%:*}"
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
@@ -285,6 +298,8 @@ for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functi
 done
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
 [[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
+users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("functions-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
+[[ "$users" == "functions seaweedfs " ]] || err "workbench services mounting functions-s3/: got [$users], want [functions seaweedfs ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
   | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
   err "an admin S3 identity or key file is back"
@@ -361,6 +376,82 @@ done
 # An upgrade re-renders nats/auth.conf with the new users; NATS reads it at start only.
 [[ "$(jq -r '.services.nats.depends_on["init-secrets"].restart' "$tmp/base.json")" == true ]] ||
   err "nats restarts when init-secrets is updated (depends_on init-secrets: restart: true)"
+
+# 7. The functions service (edge functions m4b), in both renders (the runner left out): its NATS
+# password is its own; each internal bearer goes to its one caller and the service.
+for render in base wb; do
+  boundary nats/functions.password "functions" "$render" "$tmp/readers.$render"
+  boundary tokens/orchestrator-functions.token "functions orchestrator" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-functions.token "functions worker" "$render" "$tmp/readers.$render"
+done
+# Only the gateway mounts the signing key, under any name; the runtime and the functions service
+# never mount the Docker socket.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  got="$(jq -r '.services | to_entries[] | select(.key != "runner")
+    | select(any(.value.volumes[]?; ((.target // "") + " " + (.source // "")) | contains("internal-signing.pem"))) | .key' "$f" | sort | tr '\n' ' ')"
+  [[ "$got" == "gateway " ]] || err "$render: internal-signing.pem is mounted by [$got], expected [gateway ]"
+  for svc in functions functions-runtime; do
+    jq -e --arg s "$svc" '.services[$s]' "$f" >/dev/null || { err "$render: no $svc service"; continue; }
+    ! jq -e --arg s "$svc" 'any(.services[$s].volumes[]?; (.source // "") | contains("docker.sock"))' "$f" >/dev/null ||
+      err "$render: $svc mounts the Docker socket"
+  done
+done
+fs="$(jq -c '.services.functions // {} | {entrypoint, command, read_only, user}' "$tmp/base.json")"
+[[ "$fs" == '{"entrypoint":null,"command":null,"read_only":true,"user":null}' ]] ||
+  err "functions runs its image's binary as its user, read-only, with no entrypoint or command: got $fs"
+img="$(jq -r '.services.functions.image // ""' "$tmp/base.json")"
+[[ "$img" == ghcr.io/chelabase/functions:* ]] || err "functions runs the ghcr.io/chelabase/functions release image: got $img"
+for sub in nats/functions.password tokens/orchestrator-functions.token tokens/worker-functions.token \
+  functions-s3/access-key functions-s3/secret-key db/metadata.password; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services.functions.environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "functions reads $sub through a *_FILE setting"
+done
+for svc in orchestrator worker; do
+  token="tokens/$svc-functions.token"
+  var="CHELABASE_$(tr a-z A-Z <<<"$svc")_FUNCTIONS_TOKEN_FILE"
+  [[ "$(jq -r --arg s "$svc" --arg v "$var" '.services[$s].environment[$v] // ""' "$tmp/base.json")" == "/run/chelabase/secrets/$token" ]] ||
+    err "$svc reads $token through $var"
+done
+# Networks (the runtime's boundary): the runtime is on `functions` and `functions-egress` only;
+# `functions` holds the runtime and the functions service; `functions-control` holds the service
+# and its two callers (and the workbench runner, for the e2e); both are internal. The listeners
+# bind named aliases, never 0.0.0.0, and the runtime's bundle store is the internal alias.
+members() { # members <network> <render file>
+  jq -r --arg n "$1" '.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key' "$2" | sort | tr '\n' ' '
+}
+for render in base wb; do
+  f="$tmp/base.json"
+  runner=""
+  [[ "$render" == wb ]] && { f="$tmp/wb.json"; runner="runner "; }
+  got="$(jq -r '.services["functions-runtime"].networks // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "functions functions-egress" ]] || err "$render: functions-runtime is on [$got], expected [functions functions-egress]"
+  got="$(members functions "$f")"
+  [[ "$got" == "functions functions-runtime " ]] || err "$render: the functions network holds [$got]"
+  got="$(members functions-control "$f")"
+  [[ "$got" == "functions orchestrator ${runner}worker " ]] || err "$render: the functions-control network holds [$got]"
+  got="$(members functions-egress "$f")"
+  [[ "$got" == "functions-runtime " ]] || err "$render: the functions-egress network holds [$got]"
+  for n in functions functions-control; do
+    [[ "$(jq -r --arg n "$n" '.networks[$n].internal' "$f")" == true ]] || err "$render: the $n network must be internal"
+  done
+  for svc in orchestrator worker; do
+    ! jq -e --arg s "$svc" '.services[$s].networks // {} | has("functions")' "$f" >/dev/null ||
+      err "$render: $svc must not be on the runtime's network"
+  done
+  got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
+  [[ "$got" == '{"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"]}' ]] ||
+    err "$render: the functions service's network aliases: got $got"
+done
+fenv="$(jq -c '.services.functions.environment | {CHELABASE_FUNCTIONS_ADDR, CHELABASE_FUNCTIONS_INTERNAL_ADDR}' "$tmp/base.json")"
+[[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080,functions-control:8080"}' ]] ||
+  err "functions binds its aliases only: got $fenv"
+grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
+  err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
+[[ "$(jq -r '.services["functions-runtime"].profiles // [] | length' "$tmp/base.json")" == 0 ]] ||
+  err "functions-runtime runs in every install (no profile)"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

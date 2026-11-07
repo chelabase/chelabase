@@ -40,11 +40,11 @@ impl Site {
 }
 
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
-pub(super) const RUST_APPS: [&str; 7] =
-    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage"];
+pub(super) const RUST_APPS: [&str; 8] =
+    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage", "functions"];
 /// Every app container (the Rust apps, Studio and the identity service; the sites are added by
 /// `--with`).
-pub(super) const APPS: [&str; 9] = [
+pub(super) const APPS: [&str; 10] = [
     "orchestrator",
     "worker",
     "gateway",
@@ -52,6 +52,7 @@ pub(super) const APPS: [&str; 9] = [
     "rest",
     "realtime",
     "storage",
+    "functions",
     "studio",
     "identity",
 ];
@@ -70,6 +71,8 @@ pub(super) const INFRA: &[&str] = &[
     "storage-controller",
     "pageserver",
     "proxy",
+    // Edge functions (m4b): its image is built by `up` (`ensure_functions_runtime_image`).
+    "functions-runtime",
 ];
 /// Started with the infra and waited on until healthy: the bootstrap creates the identity
 /// service's members pool by calling `http://identity:8080` directly on the stack network
@@ -79,7 +82,7 @@ pub(super) const FRONT: &[&str] = &["mailpit", "gateway", "identity"];
 /// Started before the bootstrap, which waits on the orchestrator and (the dev member's sign-up)
 /// auth.
 pub(super) const LATE_APPS: &[&str] =
-    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "studio"];
+    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "functions", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -421,6 +424,10 @@ const OBJECT_STORE_DEV_KEYS: [(&str, &str); 2] = [
     ("storage-s3/secret-key", "chelabase-storage-dev-secret"),
 ];
 
+/// The `functions` S3 identity's key files in the stack's state dir and their lengths.
+const FUNCTIONS_S3_KEYS: [(&str, usize); 2] = [("functions-s3/access-key", 20), ("functions-s3/secret-key", 40)];
+const FUNCTIONS_S3_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
 /// SeaweedFS's gRPC mutual TLS files under `<state>/grpc-tls/`: a CA (`ca.crt`, and `ca.key`,
 /// which no service mounts) and a server and a client certificate with their keys, all valid for
 /// a century (a dev stack has no renewal). The base file's init-secrets makes the same files
@@ -450,6 +457,12 @@ fn ensure_object_store_dev_files(state: &Path) -> anyhow::Result<()> {
     }
     for (rel, value) in OBJECT_STORE_DEV_KEYS {
         write_private_file_if_missing(&state.join(rel), value.as_bytes())?;
+    }
+    // Edge functions (m4b): the `functions` identity's pair (bucket chelabase-functions only),
+    // random per stack, as the self-hosted init-secrets makes it (20 and 40 characters).
+    for (rel, len) in FUNCTIONS_S3_KEYS {
+        let key = chelabase_init::random::from_alphabet(FUNCTIONS_S3_ALPHABET, len);
+        write_private_file_if_missing(&state.join(rel), key.as_bytes())?;
     }
     let dir = state.join("grpc-tls");
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().filter(|t| !t.is_empty());
@@ -983,6 +996,8 @@ fn start_stack(
     let image = phases.run("workbench image", || ensure_image(stack))?;
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
     let mut extra = phases.run("Neon images", || neon_images(stack))?;
+    let runtime_tag = phases.run("functions runtime image", || ensure_functions_runtime_image(stack))?;
+    extra.push(("CHELABASE_FUNCTIONS_RUNTIME_TAG".into(), runtime_tag));
     let nextest = host_nextest();
     if nextest.is_none() {
         eprintln!(
@@ -1144,6 +1159,49 @@ fn ensure_image(stack: &Stack) -> anyhow::Result<String> {
     Ok(tag)
 }
 
+/// What the functions runtime's image is built from (relative to the checkout).
+pub(super) const FUNCTIONS_RUNTIME_INPUTS: [&str; 4] = [
+    "infra/images/functions-runtime.Dockerfile",
+    "infra/functions-runtime/config.capnp",
+    "infra/functions-runtime/supervisor.js",
+    "infra/functions-runtime/watchdog.sh",
+];
+
+/// The functions runtime image's workbench tag: `wb-<first 12 hex of the SHA-256 of its inputs>`
+/// (each input's path and bytes), so a change to any of them makes `up` build it again.
+pub(super) fn functions_runtime_tag(checkout: &Path) -> anyhow::Result<String> {
+    let mut h = Sha256::new();
+    for rel in FUNCTIONS_RUNTIME_INPUTS {
+        let bytes = std::fs::read(checkout.join(rel)).with_context(|| format!("reading {rel}"))?;
+        h.update(rel.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    Ok(format!("wb-{}", &hex::encode(h.finalize())[..12]))
+}
+
+/// Builds `chelabase/functions-runtime:<tag>` from the checkout unless it is there; returns the
+/// tag (the overlay's `CHELABASE_FUNCTIONS_RUNTIME_TAG`).
+fn ensure_functions_runtime_image(stack: &Stack) -> anyhow::Result<String> {
+    let tag = functions_runtime_tag(&stack.checkout)?;
+    let image = format!("chelabase/functions-runtime:{tag}");
+    let present = Command::new("docker")
+        .args(["image", "inspect", &image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if present {
+        eprintln!("[workbench]   {image} is there");
+    } else {
+        let mut cmd = Command::new("docker");
+        cmd.args(["build", "-t", &image, "-f", FUNCTIONS_RUNTIME_INPUTS[0], "."])
+            .current_dir(&stack.checkout);
+        run(cmd)?;
+    }
+    Ok(tag)
+}
+
 /// `scripts/neon-images.sh`'s choice (a local `just neon-build`, else the pinned images), plus
 /// the compute image the worker starts.
 fn neon_images(stack: &Stack) -> anyhow::Result<Vec<(String, String)>> {
@@ -1180,6 +1238,7 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
 fn package_of(app: &str) -> &str {
     match app {
         "storage" => "chelabase-storage-service",
+        "functions" => "chelabase-functions",
         other => other,
     }
 }
@@ -2374,6 +2433,54 @@ mod key_phase_tests {
             .map(|f| read(&format!("grpc-tls/{f}")))
             .collect();
         assert_eq!(before, after, "a second run changes no certificate");
+    }
+
+    // Edge functions m4b: the `functions` S3 pair is generated per stack (never a fixed value),
+    // owner-only, and kept once written.
+    #[test]
+    fn the_functions_s3_keys_are_generated_per_stack_and_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        super::ensure_object_store_dev_files(&a).unwrap();
+        super::ensure_object_store_dev_files(&b).unwrap();
+        let read = |s: &Path, p: &str| std::fs::read_to_string(s.join(p)).unwrap();
+        for p in ["functions-s3/access-key", "functions-s3/secret-key"] {
+            let (ka, kb) = (read(&a, p), read(&b, p));
+            assert_ne!(ka, kb, "{p} differs per stack");
+            assert!(ka.len() >= 20 && ka.bytes().all(|c| c.is_ascii_alphanumeric()), "{p}: {ka:?}");
+            assert!(!ka.contains("chelabase-functions-dev"), "{p}");
+            let mode = std::fs::metadata(a.join(p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{p}");
+        }
+        assert!(read(&a, "functions-s3/secret-key").len() >= 40);
+        let kept = read(&a, "functions-s3/secret-key");
+        std::fs::write(a.join("functions-s3/access-key"), "kept").unwrap();
+        super::ensure_object_store_dev_files(&a).unwrap();
+        assert_eq!(read(&a, "functions-s3/access-key"), "kept", "an existing key is left alone");
+        assert_eq!(read(&a, "functions-s3/secret-key"), kept);
+    }
+
+    // Edge functions m4b: `up` builds the functions runtime's image under a tag of its inputs'
+    // hash, so a change to the supervisor, its config, the watchdog or the Dockerfile rebuilds it.
+    #[test]
+    fn the_functions_runtime_tag_follows_its_inputs() {
+        let t = tempfile::tempdir().unwrap();
+        let co = t.path();
+        std::fs::create_dir_all(co.join("infra/functions-runtime")).unwrap();
+        std::fs::create_dir_all(co.join("infra/images")).unwrap();
+        for f in super::FUNCTIONS_RUNTIME_INPUTS {
+            std::fs::write(co.join(f), f.as_bytes()).unwrap();
+        }
+        let first = super::functions_runtime_tag(co).unwrap();
+        assert!(first.starts_with("wb-") && first.len() == 15, "{first}");
+        assert_eq!(super::functions_runtime_tag(co).unwrap(), first);
+        for f in super::FUNCTIONS_RUNTIME_INPUTS {
+            std::fs::write(co.join(f), "changed").unwrap();
+            assert_ne!(super::functions_runtime_tag(co).unwrap(), first, "{f}");
+            std::fs::write(co.join(f), f.as_bytes()).unwrap();
+        }
+        std::fs::remove_file(co.join(super::FUNCTIONS_RUNTIME_INPUTS[0])).unwrap();
+        assert!(super::functions_runtime_tag(co).is_err());
     }
 
     /// After `damage` runs on a complete grpc-tls dir, a second `ensure` leaves a set in which

@@ -1,6 +1,5 @@
 //! The service's settings, from the environment (blank values count as unset).
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use chelabase_storage::StorageConfig;
@@ -12,11 +11,13 @@ pub const WORKER_TOKEN: &str = "CHELABASE_WORKER_FUNCTIONS_TOKEN";
 
 pub struct Config {
     /// `CHELABASE_FUNCTIONS_ADDR` (default `127.0.0.1:8091`): the public listener, behind the
-    /// gateway.
-    pub addr: SocketAddr,
-    /// `CHELABASE_FUNCTIONS_INTERNAL_ADDR` (default `127.0.0.1:8092`): the internal listener,
-    /// `host:port`, resolved at start; compose names the service's alias on the `functions`
-    /// network only, so it listens there and nowhere else.
+    /// gateway; comma-separated `host:port`s resolved at start like the internal one (compose
+    /// names the service's alias on the default network).
+    pub addr: String,
+    /// `CHELABASE_FUNCTIONS_INTERNAL_ADDR` (default `127.0.0.1:8092`): the internal listener's
+    /// comma-separated `host:port`s, each resolved at start (every address it names is bound);
+    /// compose names the service's aliases on the internal networks only, so it listens there
+    /// and nowhere else.
     pub internal_addr: String,
     /// `CHELABASE_FUNCTIONS_RUNTIME_URL` (default `http://127.0.0.1:8080`).
     pub runtime_url: String,
@@ -70,7 +71,7 @@ impl Config {
                 anyhow::anyhow!("CHELABASE_FUNCTIONS_TIMEOUT_MS must be a positive integer")
             })?;
         Ok(Config {
-            addr: env_or("CHELABASE_FUNCTIONS_ADDR", "127.0.0.1:8091").parse()?,
+            addr: env_or("CHELABASE_FUNCTIONS_ADDR", "127.0.0.1:8091"),
             internal_addr: env_or("CHELABASE_FUNCTIONS_INTERNAL_ADDR", "127.0.0.1:8092"),
             runtime_url: env_or("CHELABASE_FUNCTIONS_RUNTIME_URL", "http://127.0.0.1:8080"),
             public_url: entry.api_base(),

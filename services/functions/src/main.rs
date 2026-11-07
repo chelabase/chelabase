@@ -60,30 +60,53 @@ async fn main() -> anyhow::Result<()> {
         config.orchestrator_token.clone(),
         config.worker_token.clone(),
     ));
-    let internal_addr = tokio::net::lookup_host(&config.internal_addr)
-        .await
-        .with_context(|| {
-            format!(
-                "resolve CHELABASE_FUNCTIONS_INTERNAL_ADDR {}",
-                config.internal_addr
-            )
-        })?
-        .next()
-        .with_context(|| {
-            format!(
-                "CHELABASE_FUNCTIONS_INTERNAL_ADDR {} has no address",
-                config.internal_addr
-            )
-        })?;
-    let public = tokio::net::TcpListener::bind(config.addr).await?;
-    let internal = tokio::net::TcpListener::bind(internal_addr).await?;
+    let public_addrs = resolve_all("CHELABASE_FUNCTIONS_ADDR", &config.addr).await?;
+    // The internal listener's: compose names the service's aliases on the internal networks
+    // only (the runtime's, and the orchestrator's and the worker's), so it listens there and
+    // nowhere else.
+    let internal_addrs = resolve_all("CHELABASE_FUNCTIONS_INTERNAL_ADDR", &config.internal_addr).await?;
+    let mut public = Vec::new();
+    for addr in &public_addrs {
+        public.push(tokio::net::TcpListener::bind(addr).await?);
+    }
+    let mut internal = Vec::new();
+    for addr in &internal_addrs {
+        internal.push(tokio::net::TcpListener::bind(addr).await?);
+    }
     info!(
-        "functions listening on {} and {internal_addr} (internal), runtime {}, bucket {}",
-        config.addr, config.runtime_url, config.store.bucket
+        "functions listening on {public_addrs:?} and {internal_addrs:?} (internal), runtime {}, bucket {}",
+        config.runtime_url, config.store.bucket
     );
-    let (public_app, internal_app) = (public_router(state.clone()), internal_router(state));
-    tokio::try_join!(async { axum::serve(public, public_app).await }, async {
-        axum::serve(internal, internal_app).await
-    },)?;
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in public {
+        let app = public_router(state.clone());
+        servers.spawn(async move { axum::serve(listener, app).await });
+    }
+    for listener in internal {
+        let app = internal_router(state.clone());
+        servers.spawn(async move { axum::serve(listener, app).await });
+    }
+    // The first listener to end ends the service.
+    if let Some(ended) = servers.join_next().await {
+        ended??;
+        anyhow::bail!("a listener ended");
+    }
     Ok(())
+}
+
+/// Every address the comma-separated `host:port` entries of `var` name, each resolved now.
+async fn resolve_all(var: &str, list: &str) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let mut addrs = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let found: Vec<_> = tokio::net::lookup_host(entry)
+            .await
+            .with_context(|| format!("resolve {var} entry {entry}"))?
+            .collect();
+        anyhow::ensure!(!found.is_empty(), "{var} entry {entry} has no address");
+        addrs.extend(found);
+    }
+    addrs.sort();
+    addrs.dedup();
+    anyhow::ensure!(!addrs.is_empty(), "{var} names no address");
+    Ok(addrs)
 }

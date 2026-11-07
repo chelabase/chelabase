@@ -17,7 +17,7 @@ export const IMAGE = process.env.FUNCTIONS_RUNTIME_IMAGE ?? "chelabase/functions
 export const FIXTURES = new URL("../fixtures/", import.meta.url).pathname;
 export const COMPAT_DATE = "2026-10-01";
 // Names user code must not reach; each resolves to the host running the stub store.
-export const INTERNAL_NAMES = ["functions", "metadata-db", "nats", "orchestrator"];
+export const INTERNAL_NAMES = ["functions", "functions-internal", "functions-control", "metadata-db", "nats", "orchestrator"];
 
 const TYPES = { ".js": "js", ".wasm": "wasm", ".txt": "text", ".bin": "data" };
 

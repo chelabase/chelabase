@@ -28,9 +28,10 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime storage init studio identity)
-unpublished=()
-re='^ghcr\.io/chelabase/([a-z]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
+images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime)
+# Edge functions (m4b): the functions service and its runtime, until their first pin.
+unpublished=(functions functions-runtime)
+re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }
 
@@ -38,7 +39,7 @@ declare -A seen_compose seen_env
 
 # Base file: image: ${CHELABASE_IMAGE_REPO:-<repo>}/<image>:${CHELABASE_IMAGE_TAG:-<tag>}
 while IFS= read -r line; do
-  if [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]]; then
+  if [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z-]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]]; then
     ref="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
     name="${BASH_REMATCH[2]}"
     seen_compose[$name]="$ref"
@@ -56,7 +57,7 @@ while IFS= read -r line; do
   case "$line" in
     "# BEGIN image pins"*) in_block=1 ;;
     "# END image pins"*) in_block=0 ;;
-    *) if [[ $in_block -eq 1 && "$line" =~ ^#\ (ghcr\.io/chelabase/([a-z]+):[^[:space:]]*)$ ]]; then
+    *) if [[ $in_block -eq 1 && "$line" =~ ^#\ (ghcr\.io/chelabase/([a-z-]+):[^[:space:]]*)$ ]]; then
          ref="${BASH_REMATCH[1]}"
          seen_env[${BASH_REMATCH[2]}]="$ref"
          [[ "$ref" =~ $re ]] || err ".env.example: ${BASH_REMATCH[2]} is not pinned: $ref"
@@ -67,7 +68,7 @@ done <"$envex"
 # Overlays (the example seed) reuse base images: each of their image lines is the base file's pin.
 for overlay in "${overlays[@]}"; do
   while IFS= read -r line; do
-    if [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]]; then
+    if [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z-]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]]; then
       ref="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
       [[ "$ref" == "${seen_compose[${BASH_REMATCH[2]}]:-}" ]] ||
         err "${overlay##*/}: ${BASH_REMATCH[2]} is $ref, not the base pin ${seen_compose[${BASH_REMATCH[2]}]:-none}"
@@ -101,11 +102,11 @@ if base_images="$(render_images -f "$compose")" && built_images="$(render_images
   while read -r svc img _; do
     [[ "$img" == ghcr.io/chelabase/* && "$img" != ghcr.io/chelabase/neon-* ]] || continue
     got="$(awk -v s="$svc" '$1 == s { print $2 }' <<<"$built_images")"
-    [[ "$got" =~ ^chelabase/[a-z]+:local$ ]] ||
+    [[ "$got" =~ ^chelabase/[a-z-]+:local$ ]] ||
       err "docker-compose.build.yml: $svc runs $got, not a local build (base: $img)"
   done <<<"$base_images"
   # Each local image is built by a service of the overlay (the others reuse it).
-  for img in $(awk '$2 ~ /^chelabase\/[a-z]+:local$/ { print $2 }' <<<"$built_images" | sort -u); do
+  for img in $(awk '$2 ~ /^chelabase\/[a-z-]+:local$/ { print $2 }' <<<"$built_images" | sort -u); do
     awk -v i="$img" '$2 == i && $3 == "true"' <<<"$built_images" | grep -q . ||
       err "docker-compose.build.yml: nothing builds $img"
   done

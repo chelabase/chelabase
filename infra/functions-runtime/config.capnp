@@ -3,7 +3,8 @@
 #
 #   supervisor  the only worker; port 8080 for the functions service, 127.0.0.1:9090 for the
 #               watchdog's probe. Its own outbound is `none`: it reaches only BUNDLES.
-#   bundles     the functions service's bundle store (`functions:8080` on the internal network;
+#   bundles     the functions service's bundle store (`functions-internal:8080`, its alias on the
+#               internal `functions` network;
 #               `--external-addr bundles=<host:port>` moves it).
 #   egress      the loaded workers' global outbound: public addresses only. DNS answers are
 #               filtered per connection, so a name that resolves to a denied address fails.
@@ -13,7 +14,7 @@ using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
     (name = "supervisor", worker = .supervisor),
-    (name = "bundles", external = (address = "functions:8080", http = ())),
+    (name = "bundles", external = (address = "functions-internal:8080", http = ())),
     (name = "egress",
      network = (
        allow = ["public"],

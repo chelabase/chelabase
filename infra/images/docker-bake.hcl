@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "init", "server", "studio", "identity", "functions-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "init", "server", "studio", "identity", "functions-runtime"]
 }
 
 target "_app" {
@@ -77,6 +77,13 @@ target "storage" {
   target   = "storage"
   tags     = ["${REPO}/storage:${TAG}"]
 }
+# Edge functions (m4b): the functions service. In the default group and the release scripts
+# (publish, pin, image-inputs); its first pin is from `main` once the edge-functions epic merges.
+target "functions" {
+  inherits = ["_app"]
+  target   = "functions"
+  tags     = ["${REPO}/functions:${TAG}"]
+}
 target "init" {
   inherits = ["_app"]
   target   = "init"
@@ -111,8 +118,7 @@ target "identity" {
   tags        = ["${REPO}/identity:${TAG}"]
 }
 # The functions runtime (edge-functions m1): workerd and the supervisor; its own Dockerfile, no
-# cargo build. In the default group (`just images`); not in the release scripts yet (publish,
-# pin, image-inputs).
+# cargo build. In the default group (`just images`) and the release scripts (m4b).
 target "functions-runtime" {
   context    = "."
   dockerfile = "infra/images/functions-runtime.Dockerfile"
