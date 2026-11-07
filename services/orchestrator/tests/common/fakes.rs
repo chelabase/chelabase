@@ -178,6 +178,8 @@ struct FakeFunctions {
     /// Each branch's state of a function.
     states: Vec<(BranchId, chelabase_metadata::BranchFunction)>,
     secrets: std::collections::BTreeMap<(uuid::Uuid, uuid::Uuid, String), String>,
+    /// Edge functions m7: every branch's schedules, oldest first.
+    schedules: Vec<chelabase_metadata::ScheduleRecord>,
 }
 
 /// Members hub step 2 (T23): one team as the fake keeps it.
@@ -5510,5 +5512,59 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             .filter(|(b, f, _)| *b == branch.as_uuid() && *f == function)
             .map(|(_, _, n)| n.clone())
             .collect())
+    }
+}
+
+impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
+    async fn add_schedule(&self, s: &chelabase_metadata::NewSchedule<'_>) -> Result<uuid::Uuid, MetadataError> {
+        self.fn_scope(s.branch_id, s.function_id)?;
+        let id = uuid::Uuid::new_v4();
+        self.functions.lock().unwrap().schedules.push(chelabase_metadata::ScheduleRecord {
+            id,
+            branch_id: s.branch_id,
+            function_id: s.function_id,
+            cron: s.cron.to_string(),
+            timezone: s.timezone.to_string(),
+            next_run_at: s.next_run_at,
+            enabled: true,
+        });
+        Ok(id)
+    }
+
+    async fn list_schedules(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        Ok(self.functions.lock().unwrap().schedules.iter().filter(|s| s.branch_id == branch).cloned().collect())
+    }
+
+    async fn update_schedule(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        id: uuid::Uuid,
+        cron: Option<&str>,
+        timezone: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let Some(s) = fs.schedules.iter_mut().find(|s| s.id == id && s.branch_id == branch && s.function_id == function) else {
+            return Ok(None);
+        };
+        let (new_cron, new_tz) = (cron.unwrap_or(&s.cron).to_string(), timezone.unwrap_or(&s.timezone).to_string());
+        let parsed = chelabase_metadata::Schedule::parse(&new_cron, &new_tz)
+            .map_err(|e| MetadataError::InvalidFunction(e.to_string()))?;
+        let new_enabled = enabled.unwrap_or(s.enabled);
+        if new_cron != s.cron || new_tz != s.timezone || (new_enabled && !s.enabled) {
+            s.next_run_at = parsed.next_after(chrono::Utc::now());
+        }
+        (s.cron, s.timezone, s.enabled) = (new_cron, new_tz, new_enabled);
+        Ok(Some(s.clone()))
+    }
+
+    async fn delete_schedule(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let before = fs.schedules.len();
+        fs.schedules.retain(|s| !(s.id == id && s.branch_id == branch && s.function_id == function));
+        Ok(fs.schedules.len() < before)
     }
 }

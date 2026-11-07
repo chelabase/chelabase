@@ -1257,6 +1257,22 @@ pub mod orchestrator {
         key_endpoint("orchestrator.put_function_secret", Method::Put, FUNCTION_SECRET, BRANCH);
     pub const DELETE_FUNCTION_SECRET: Endpoint =
         key_endpoint("orchestrator.delete_function_secret", Method::Delete, FUNCTION_SECRET, BRANCH);
+    /// Edge functions m7: a function's schedules on a branch, as its secrets.
+    const FUNCTION_SCHEDULES: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules";
+    const FUNCTION_SCHEDULE: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}";
+    pub const LIST_FUNCTION_SCHEDULES: Endpoint = key_endpoint(
+        "orchestrator.list_function_schedules",
+        Method::Get,
+        FUNCTION_SCHEDULES,
+        Access::Project(Viewer),
+    );
+    pub const CREATE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.create_function_schedule", Method::Post, FUNCTION_SCHEDULES, BRANCH);
+    pub const UPDATE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.update_function_schedule", Method::Patch, FUNCTION_SCHEDULE, BRANCH);
+    pub const DELETE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.delete_function_schedule", Method::Delete, FUNCTION_SCHEDULE, BRANCH);
 
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
@@ -1786,6 +1802,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::LIST_FUNCTION_SECRETS,
     orchestrator::PUT_FUNCTION_SECRET,
     orchestrator::DELETE_FUNCTION_SECRET,
+    orchestrator::LIST_FUNCTION_SCHEDULES,
+    orchestrator::CREATE_FUNCTION_SCHEDULE,
+    orchestrator::UPDATE_FUNCTION_SCHEDULE,
+    orchestrator::DELETE_FUNCTION_SCHEDULE,
     functions::INVOKE,
     functions::INVOKE_PATH,
     functions::INVOKE_PUBLIC,
@@ -2767,6 +2787,11 @@ mod tests {
             ("orchestrator.list_function_secrets", Access::Project(Viewer)),
             ("orchestrator.put_function_secret", BRANCH),
             ("orchestrator.delete_function_secret", BRANCH),
+            // Edge functions m7: schedules.
+            ("orchestrator.list_function_schedules", Access::Project(Viewer)),
+            ("orchestrator.create_function_schedule", BRANCH),
+            ("orchestrator.update_function_schedule", BRANCH),
+            ("orchestrator.delete_function_schedule", BRANCH),
             // Edge functions m3: invocations (served by m4).
             ("functions.invoke", Access::DataKey),
             ("functions.invoke_path", Access::DataKey),
@@ -3134,6 +3159,10 @@ mod tests {
             ("GET", "/hello/secrets", "orchestrator.list_function_secrets", Access::Project(Viewer)),
             ("PUT", "/hello/secrets/API_KEY", "orchestrator.put_function_secret", branch),
             ("DELETE", "/hello/secrets/API_KEY", "orchestrator.delete_function_secret", branch),
+            ("GET", "/hello/schedules", "orchestrator.list_function_schedules", Access::Project(Viewer)),
+            ("POST", "/hello/schedules", "orchestrator.create_function_schedule", branch),
+            ("PATCH", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_schedule", branch),
+            ("DELETE", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_schedule", branch),
         ] {
             let path = format!("{base}{tail}");
             let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {

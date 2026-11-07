@@ -514,7 +514,7 @@ impl std::fmt::Debug for PutSecretRequest {
 /// The checks every functions route starts with: functions are available (not in platform
 /// mode), the caller passes the route's access on the branch, and the branch is the
 /// database's.
-async fn begin<M, J>(
+pub(crate) async fn begin<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
     access: Access,
@@ -588,7 +588,7 @@ fn refused(reason: &str, message: &str) -> ApiError {
 
 /// A metadata error as the API answers it. Never echoes a value: the metadata's messages name
 /// only names, sizes and hashes.
-fn metadata_error(what: &str, err: MetadataError) -> ApiError {
+pub(crate) fn metadata_error(what: &str, err: MetadataError) -> ApiError {
     match err {
         MetadataError::FunctionNotFound => not_found(),
         MetadataError::InvalidFunction(message) => unprocessable(&message),
@@ -614,7 +614,7 @@ fn metadata_error(what: &str, err: MetadataError) -> ApiError {
 }
 
 /// The database's function `name` (404 when there's none).
-async fn find<M, J>(
+pub(crate) async fn find<M, J>(
     state: &AppState<M, J>,
     record: &DatabaseRecord,
     name: &str,
@@ -719,7 +719,7 @@ where
         .ok_or_else(not_found)
 }
 
-fn respond(result: Result<Response, ApiError>) -> Response {
+pub(crate) fn respond(result: Result<Response, ApiError>) -> Response {
     result.unwrap_or_else(IntoResponse::into_response)
 }
 

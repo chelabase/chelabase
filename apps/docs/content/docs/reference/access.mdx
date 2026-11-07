@@ -128,6 +128,10 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}` | Member token | Branch: Developer unprotected, Admin protected |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/deployments` | Member token | Project Viewer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/deployments` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/schedules` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/schedules` | Member token | Branch: Developer unprotected, Admin protected |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/schedules/\{schedule_id\}` | Member token | Branch: Developer unprotected, Admin protected |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/schedules/\{schedule_id\}` | Member token | Branch: Developer unprotected, Admin protected |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets` | Member token | Project Viewer |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets/\{secret\}` | Member token | Branch: Developer unprotected, Admin protected |
 | PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets/\{secret\}` | Member token | Branch: Developer unprotected, Admin protected |

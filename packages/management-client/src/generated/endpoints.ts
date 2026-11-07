@@ -45,6 +45,7 @@ import type {
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
   CreateFunctionDeploymentRequest,
+  CreateFunctionScheduleRequest,
   CreateInviteRequest,
   CreateKeyRequest,
   CreateMergeRequest,
@@ -70,6 +71,7 @@ import type {
   FinishRequest,
   Function,
   FunctionDeployment,
+  FunctionSchedule,
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
@@ -159,6 +161,7 @@ import type {
   UpdateBranchRequest,
   UpdateDatabaseRequest,
   UpdateFunctionRequest,
+  UpdateFunctionScheduleRequest,
   UpdateInstanceSettingsRequest,
   UpdateKeyRequest,
   UpdateMemberRequest,
@@ -2304,6 +2307,393 @@ export const useCreateFunctionDeployment = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getCreateFunctionDeploymentMutationOptions(options), queryClient);
+    }
+
+export const getListFunctionSchedulesUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules`
+}
+
+/**
+ * @summary List a function's schedules on the branch
+ */
+export const listFunctionSchedules = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule[]> => {
+
+  return customFetch<FunctionSchedule[]>(getListFunctionSchedulesUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionSchedulesQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/schedules`
+    ] as const;
+    }
+
+
+export const getListFunctionSchedulesQueryOptions = <TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionSchedulesQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctionSchedules>>> = ({ signal }) => listFunctionSchedules(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionSchedulesQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctionSchedules>>>
+export type ListFunctionSchedulesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSchedules>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSchedules>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSchedules>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSchedules>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a function's schedules on the branch
+ */
+
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionSchedulesQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules`
+}
+
+/**
+ * At each due time the function's `scheduled(controller, env, ctx)` handler runs once, with `controller.cron` and `controller.scheduledTime`, while the function is enabled on the branch. A cron has 5 fields (minute granularity); ticks missed while the worker was down run once. A new branch inherits the schedules.
+ * @summary Add a schedule to a function on the branch
+ */
+export const createFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    createFunctionScheduleRequest: CreateFunctionScheduleRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionSchedule>(getCreateFunctionScheduleUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createFunctionScheduleRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateFunctionScheduleMutationKey = () => ['createFunctionSchedule'] as const;
+
+export const getCreateFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getCreateFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createFunctionSchedule>>, CreateFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  createFunctionSchedule(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof createFunctionSchedule>>>
+    export type CreateFunctionScheduleMutationBody = CreateFunctionScheduleRequest
+    export type CreateFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type CreateFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;data: CreateFunctionScheduleRequest}
+
+    /**
+ * @summary Add a schedule to a function on the branch
+ */
+export const useCreateFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createFunctionSchedule>>,
+        TError,
+        CreateFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateFunctionScheduleMutationOptions(options), queryClient);
+    }
+
+export const getDeleteFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules/${encodeURIComponent(String(scheduleId))}`
+}
+
+/**
+ * @summary Delete a function's schedule on the branch
+ */
+export const deleteFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteFunctionScheduleUrl(id,branchId,name,scheduleId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteFunctionScheduleMutationKey = () => ['deleteFunctionSchedule'] as const;
+
+export const getDeleteFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getDeleteFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteFunctionSchedule>>, DeleteFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,scheduleId} = props ?? {};
+
+          return  deleteFunctionSchedule(id,branchId,name,scheduleId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof deleteFunctionSchedule>>>
+
+    export type DeleteFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;scheduleId: string}
+
+    /**
+ * @summary Delete a function's schedule on the branch
+ */
+export const useDeleteFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteFunctionSchedule>>,
+        TError,
+        DeleteFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteFunctionScheduleMutationOptions(options), queryClient);
+    }
+
+export const getUpdateFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules/${encodeURIComponent(String(scheduleId))}`
+}
+
+/**
+ * Changes what the body names. A new cron or time zone, or turning the schedule on, sets its next run from now.
+ * @summary Change a function's schedule on the branch
+ */
+export const updateFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,
+    updateFunctionScheduleRequest: UpdateFunctionScheduleRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionSchedule>(getUpdateFunctionScheduleUrl(id,branchId,name,scheduleId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFunctionScheduleRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateFunctionScheduleMutationKey = () => ['updateFunctionSchedule'] as const;
+
+export const getUpdateFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getUpdateFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateFunctionSchedule>>, UpdateFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,scheduleId,data} = props ?? {};
+
+          return  updateFunctionSchedule(id,branchId,name,scheduleId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof updateFunctionSchedule>>>
+    export type UpdateFunctionScheduleMutationBody = UpdateFunctionScheduleRequest
+    export type UpdateFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;scheduleId: string;data: UpdateFunctionScheduleRequest}
+
+    /**
+ * @summary Change a function's schedule on the branch
+ */
+export const useUpdateFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateFunctionSchedule>>,
+        TError,
+        UpdateFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateFunctionScheduleMutationOptions(options), queryClient);
     }
 
 export const getListFunctionSecretsUrl = (id: string,

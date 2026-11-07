@@ -895,6 +895,22 @@ impl functions::FunctionsPort for Doc {
 }
 
 #[allow(unused_variables)]
+impl crate::functions_schedules::SchedulesPort for Doc {
+    async fn add_schedule(&self, schedule: &chelabase_metadata::NewSchedule<'_>) -> Result<Uuid, MetadataError> {
+        match *self {}
+    }
+    async fn list_schedules(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn update_schedule(&self, branch: BranchId, function: Uuid, id: Uuid, cron: Option<&str>, timezone: Option<&str>, enabled: Option<bool>) -> Result<Option<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_schedule(&self, branch: BranchId, function: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
 impl members::MemberRolesQueue for Doc {
     async fn enqueue_member_roles(&self, branch: BranchId) -> Result<(), BoxError> {
         match *self {}
@@ -1233,6 +1249,7 @@ mod tests {
                 "deleteBranch",
             ),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}", "deleteFunction"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "deleteFunctionSchedule"),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}", "deleteFunctionSecret"),
             (
                 "DELETE /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
@@ -1292,6 +1309,7 @@ mod tests {
             ),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions", "listFunctions"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "listFunctionDeployments"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "listFunctionSchedules"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets", "listFunctionSecrets"),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/guard-exemptions",
@@ -1363,6 +1381,7 @@ mod tests {
                 "updateBranch",
             ),
             ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}", "updateFunction"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "updateFunctionSchedule"),
             (
                 "PATCH /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
                 "updateKey",
@@ -1390,6 +1409,7 @@ mod tests {
                 "consoleQuery",
             ),
             ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "createFunctionDeployment"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "createFunctionSchedule"),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys",
                 "createKey",
@@ -1709,6 +1729,7 @@ mod tests {
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
             "CreateFunctionDeploymentRequest",
+            "CreateFunctionScheduleRequest",
             "CreateInviteRequest",
             "CreateKeyRequest",
             "CreateMergeRequest",
@@ -1759,6 +1780,7 @@ mod tests {
             "FunctionDesc",
             "FunctionKind",
             "FunctionRef",
+            "FunctionSchedule",
             "Grant",
             "GrantOverride",
             "Grantee",
@@ -1900,6 +1922,7 @@ mod tests {
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
             "UpdateFunctionRequest",
+            "UpdateFunctionScheduleRequest",
             "UpdateInstanceSettingsRequest",
             "UpdateKeyRequest",
             "UpdateMemberRequest",
