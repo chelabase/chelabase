@@ -912,6 +912,8 @@ mod tests {
         for schema in ["storage", "chelabase", "chelabase_merge", "chelabase_quarantine_1"] {
             assert!(is_reserved(schema), "{schema}");
         }
+        // Edge functions m8: the function triggers' outbox schema.
+        assert!(is_reserved("chelabase_functions"));
         for schema in ["public", "storage_app", "app_chelabase"] {
             assert!(!is_reserved(schema), "{schema}");
         }

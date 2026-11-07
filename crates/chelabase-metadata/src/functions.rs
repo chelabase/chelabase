@@ -1811,6 +1811,28 @@ impl MetadataClient {
         Ok(ids.into_iter().map(BranchId).collect())
     }
 
+    /// Up to `limit` ready `normal` branches (of live databases) with a function that has a
+    /// `run_as_role` but no key, and no error or a `run_as_key_pending: …` one: the worker's
+    /// sweep mints their run-as keys (edge functions m8). A read; it locks nothing.
+    pub async fn pending_run_as_branches(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BranchId>, MetadataError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT b.id FROM branches b JOIN databases d ON d.id = b.database_id
+             WHERE b.status = 'ready' AND b.kind = 'normal'
+               AND d.status NOT IN ('deleting', 'deleted')
+               AND EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.branch_id = b.id
+                           AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL
+                           AND (bf.last_error IS NULL OR bf.last_error LIKE 'run\\_as\\_key\\_pending: %'))
+             ORDER BY b.id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().map(BranchId).collect())
+    }
+
     /// Bundle hashes any deployment of the database still names (for the bundle sweep, with
     /// [`Self::live_database`]: a missing or tombstoned database references nothing).
     pub async fn referenced_bundles(
