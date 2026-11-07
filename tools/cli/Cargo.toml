@@ -24,11 +24,13 @@ clap = { workspace = true }
 rcgen = { workspace = true }
 hex = { workspace = true }
 jsonwebtoken = { workspace = true }
+notify = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -39,3 +41,7 @@ chelabase-init = { workspace = true, features = ["test-support"] }
 bcrypt = "0.19.3"
 tempfile = { workspace = true }
 axum = { workspace = true }
+# functions_live makes its own database rows.
+chelabase-metadata = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }

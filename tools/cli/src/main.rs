@@ -1,7 +1,9 @@
 //! Chelabase local CLI — local development setup / token mint (foundation for a fuller control-plane CLI).
 
 mod dev;
+mod functions;
 mod generate;
+mod login;
 mod neon;
 mod paths;
 mod workbench;
@@ -32,6 +34,23 @@ enum Commands {
     Gen {
         #[command(subcommand)]
         command: GenCommands,
+    },
+    /// Sign in to an instance (kept per instance URL in ~/.config/chelabase/credentials.json)
+    Login {
+        /// The instance's API URL
+        #[arg(long)]
+        url: String,
+        /// The account's email (prompted when missing); the password is always prompted or
+        /// read from stdin
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Deploy and manage edge functions on a branch
+    Functions {
+        #[command(flatten)]
+        target: functions::Target,
+        #[command(subcommand)]
+        command: functions::Command,
     },
     /// This checkout's isolated stack: up, test, run, down (W2)
     Workbench {
@@ -353,6 +372,8 @@ async fn main() -> anyhow::Result<()> {
                 neon::password_updated(&endpoint, &role).await
             }
         },
+        Commands::Login { url, email } => login::run(&url, email).await,
+        Commands::Functions { target, command } => functions::run(target, command).await,
         Commands::Workbench { command } => {
             use workbench::commands as wb;
             match command {
