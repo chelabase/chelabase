@@ -152,11 +152,21 @@ async fn main() -> anyhow::Result<()> {
 
     let rt_events: Arc<dyn orchestrator::internal::realtime::RtEvents> = Arc::new(nats.clone());
     // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
-    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::WEBHOOKS_ENV, |name| std::env::var(name).ok())
         .map_err(anyhow::Error::msg)?;
     for entry in webhooks.allow_hosts_with_port() {
         warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
     }
+    // Edge functions m9: where external services' URLs may point (CHELABASE_SERVICES_*, never
+    // the webhooks' settings), checked at save time; the functions service checks again at
+    // every connection. The stack's names, loopback, link-local and its networks
+    // (CHELABASE_INTERNAL_SUBNETS and those this container is on) are refused even when allowed.
+    let mut internal_nets = chelabase_http::outbound::parse_nets(&std::env::var("CHELABASE_INTERNAL_SUBNETS").unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("CHELABASE_INTERNAL_SUBNETS: {e}"))?;
+    internal_nets.extend(chelabase_http::outbound::attached_nets());
+    let services = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::SERVICES_ENV, |name| std::env::var(name).ok())
+        .map_err(anyhow::Error::msg)?
+        .deny_stack(internal_nets);
     // Edge functions m3: bundles go to the functions service's internal listener.
     let functions_url = std::env::var("CHELABASE_FUNCTIONS_INTERNAL_URL").ok().filter(|v| !v.trim().is_empty());
     if functions_url.is_none() {
@@ -208,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
         webhooks,
+        services,
         bundles,
         compute_tls: Some(compute_tls),
     };

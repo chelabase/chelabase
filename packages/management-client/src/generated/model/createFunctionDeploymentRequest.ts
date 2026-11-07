@@ -5,9 +5,11 @@
  * OpenAPI spec version: 1
  */
 import type { CreateFunctionDeploymentRequestManifest } from './createFunctionDeploymentRequestManifest.ts';
+import type { ServiceSpec } from './serviceSpec.ts';
 
 /**
- * A deployment: the bundle manifest (the runtime's format) and its hash.
+ * A deployment: a function's bundle manifest (the runtime's format) and its hash, or a
+ * service's `spec`.
  */
 export interface CreateFunctionDeploymentRequest {
   /**
@@ -21,10 +23,17 @@ export interface CreateFunctionDeploymentRequest {
      * @nullable
      */
   compatibility_date?: string | null;
-  /** The bundle manifest, as the runtime loads it. Stored byte for byte as sent. */
-  manifest: CreateFunctionDeploymentRequestManifest;
+  /**
+     * A function's bundle manifest, as the runtime loads it. Stored byte for byte as sent.
+     * @nullable
+     */
+  manifest?: CreateFunctionDeploymentRequestManifest;
   /** @nullable */
   note?: string | null;
-  /** SHA-256 of the manifest's bytes as sent, lowercase hex. */
-  sha256: string;
+  /**
+     * SHA-256 of the manifest's bytes as sent, lowercase hex.
+     * @nullable
+     */
+  sha256?: string | null;
+  spec?: ServiceSpec | null;
 }

@@ -850,6 +850,9 @@ impl JobPort for Doc {
 
 #[allow(unused_variables)]
 impl functions::FunctionsPort for Doc {
+    async fn set_service_signing_secret(&self, database: DatabaseId, function: Uuid, secret: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
     async fn create_function(&self, database: DatabaseId, name: &str, kind: chelabase_metadata::FunctionKind) -> Result<chelabase_metadata::FunctionRecord, MetadataError> {
         match *self {}
     }

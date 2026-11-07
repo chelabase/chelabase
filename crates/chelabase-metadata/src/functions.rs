@@ -30,7 +30,10 @@
 //! (5) before it revokes or inserts a key (6). A function delete writes key rows without an
 //! endpoint row: it revokes only its own managed keys (at most one live per branch) and waits
 //! for nothing after them, so a role drop holding the endpoint and one of those rows can't
-//! wait on it in a cycle. `set_function_last_error` updates its state row alone, and the
+//! wait on it in a cycle. `set_function_last_error` updates its state row alone,
+//! `set_service_signing_secret` (m9) its function row (3) alone, and `set_service_health` (m9)
+//! takes a `service_health` row (beside 3, written by nobody else) and, inserting it, its
+//! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
 //! alone, skipping any another transaction holds, and takes nothing after them.
 //! The worker's trigger settle ([`MetadataClient::settle_trigger_installs`]) updates trigger rows (4b)
@@ -156,6 +159,17 @@ pub struct BranchFunction {
     pub run_as_key_id: Option<Uuid>,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// m9: what the last health check of the active deployment saw (`healthy` or
+    /// `unhealthy`); `None` before any, and for a function.
+    pub health: Option<String>,
+}
+
+/// m9: an external service's deployment that some live branch serves enabled: what the health
+/// checks poll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceTarget {
+    pub deployment_id: Uuid,
+    pub spec: serde_json::Value,
 }
 
 /// What serving a function on a branch needs: its active deployment and how it's called.
@@ -405,6 +419,10 @@ fn valid_sha256(hash: &str) -> bool {
 /// A secret's AAD: it opens only for that branch, function and name.
 fn secret_aad(branch: Uuid, function: Uuid, name: &str) -> String {
     format!("fn-secret:{branch}:{function}:{name}")
+}
+
+fn signing_aad(function: Uuid) -> String {
+    format!("{function}:service-signing")
 }
 
 fn invalid(reason: impl Into<String>) -> MetadataError {
@@ -1216,8 +1234,10 @@ impl MetadataClient {
     ) -> Result<Vec<BranchFunction>, MetadataError> {
         sqlx::query(
             "SELECT bf.function_id, f.name, f.kind, bf.deployment_id, bf.enabled, bf.auth,
-                    bf.run_as_role, bf.run_as_key_id, bf.last_error, bf.updated_at
+                    bf.run_as_role, bf.run_as_key_id, bf.last_error, bf.updated_at,
+                    h.status AS health
              FROM branch_functions bf JOIN functions f ON f.id = bf.function_id
+             LEFT JOIN service_health h ON h.deployment_id = bf.deployment_id
              WHERE bf.branch_id = $1 ORDER BY f.name",
         )
         .bind(branch.as_uuid())
@@ -1236,6 +1256,7 @@ impl MetadataClient {
                 run_as_key_id: r.get("run_as_key_id"),
                 last_error: r.get("last_error"),
                 updated_at: r.get("updated_at"),
+                health: r.get("health"),
             })
         })
         .collect()
@@ -1279,6 +1300,89 @@ impl MetadataClient {
             })
         })
         .transpose()
+    }
+
+    /// m9: sets the service's signing secret, sealed for the function. False when the database
+    /// has no such function (or is going away). Updates the function row alone.
+    pub async fn set_service_signing_secret(
+        &self,
+        database_id: DatabaseId,
+        function_id: Uuid,
+        secret: &str,
+    ) -> Result<bool, MetadataError> {
+        let sealed = chelabase_secrets::seal(self.secrets_key()?, &signing_aad(function_id), secret);
+        let updated = sqlx::query(
+            "UPDATE functions f SET signing_secret = $3
+             WHERE f.id = $1 AND f.database_id = $2
+               AND EXISTS (SELECT 1 FROM databases d WHERE d.id = f.database_id
+                           AND d.status NOT IN ('deleting', 'deleted'))",
+        )
+        .bind(function_id)
+        .bind(database_id.as_uuid())
+        .bind(sealed)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// m9: the service's signing secret, opened; `None` when it has none.
+    pub async fn service_signing_secret(
+        &self,
+        function_id: Uuid,
+    ) -> Result<Option<String>, MetadataError> {
+        let sealed: Option<Option<String>> =
+            sqlx::query_scalar("SELECT signing_secret FROM functions WHERE id = $1")
+                .bind(function_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        sealed
+            .flatten()
+            .map(|s| {
+                chelabase_secrets::open(self.secrets_key()?, &signing_aad(function_id), &s)
+                    .map_err(|e| MetadataError::Secret(format!("service signing secret: {e}")))
+            })
+            .transpose()
+    }
+
+    /// m9: the external services' deployments active and enabled on a live branch, each once.
+    pub async fn list_service_targets(&self) -> Result<Vec<ServiceTarget>, MetadataError> {
+        Ok(sqlx::query_as::<_, (Uuid, serde_json::Value)>(
+            "SELECT DISTINCT d.id, d.spec
+             FROM branch_functions bf
+             JOIN functions f ON f.id = bf.function_id
+             JOIN function_deployments d ON d.id = bf.deployment_id
+             JOIN branches b ON b.id = bf.branch_id
+             JOIN databases db ON db.id = b.database_id
+             WHERE bf.enabled AND f.kind = 'service' AND d.spec->>'backend' = 'external'
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND db.status NOT IN ('deleting', 'deleted')",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(deployment_id, spec)| ServiceTarget { deployment_id, spec })
+        .collect())
+    }
+
+    /// m9: records what a health check of the deployment saw. A deployment that is gone is
+    /// skipped.
+    pub async fn set_service_health(
+        &self,
+        deployment_id: Uuid,
+        healthy: bool,
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "INSERT INTO service_health (deployment_id, status)
+             SELECT id, $2 FROM function_deployments WHERE id = $1
+             ON CONFLICT (deployment_id)
+             DO UPDATE SET status = EXCLUDED.status, checked_at = now()",
+        )
+        .bind(deployment_id)
+        .bind(if healthy { "healthy" } else { "unhealthy" })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Sets a secret of the function on the branch, sealed for that branch, function and name.

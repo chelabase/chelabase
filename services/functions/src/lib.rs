@@ -8,6 +8,8 @@
 //! - The **internal** listener, bound on the `functions` network only, serves bundles to the
 //!   runtime (`GET`, no bearer), stores them for the orchestrator (`PUT`, its bearer) and invokes
 //!   functions for the worker (`POST /internal/invoke`, its bearer).
+//! - m9: the public listener also proxies `/services/v1/*` to external services
+//!   ([`services`]), signed, health-checked, never to the stack's own network.
 
 pub mod app;
 pub mod bundles;
@@ -16,3 +18,4 @@ pub mod config;
 pub mod directory;
 pub mod host;
 pub mod resolver;
+pub mod services;

@@ -1671,6 +1671,7 @@ mod functions {
                 })
                 .await
                 .unwrap();
+            c.set_service_health(deployment, true).await.unwrap();
             c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
             Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key, schedule }
         }
@@ -1711,6 +1712,8 @@ mod functions {
             ("update_schedule", |c, x| Box::pin(async move { c.update_schedule(x.main, x.f, x.schedule, Some("*/5 * * * *"), None, None).await.map(drop) })),
             ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
+            ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
+            ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
             ("settle_trigger_installs", |c, x| Box::pin(async move {
                 let installs: Vec<TriggerInstall> = c
                     .list_triggers(x.main)
@@ -1856,7 +1859,7 @@ mod functions {
     async fn function_writes_keep_the_lock_order() {
         let s = Scratch::new().await;
         // The rows a write can be stalled on, as SQL taking them FOR UPDATE.
-        let stalls: [(&str, &str); 8] = [
+        let stalls: [(&str, &str); 9] = [
             ("database", "SELECT 1 FROM databases WHERE id = $1 FOR UPDATE"),
             ("branch", "SELECT 1 FROM branches WHERE id = $2 FOR UPDATE"),
             ("endpoint", "SELECT 1 FROM neon_endpoints WHERE id = $3 FOR UPDATE"),
@@ -1865,6 +1868,7 @@ mod functions {
             ("schedule", "SELECT 1 FROM function_schedules WHERE function_id = $4 FOR UPDATE"),
             ("trigger", "SELECT 1 FROM function_triggers WHERE function_id = $4 FOR UPDATE"),
             ("managed key", "SELECT 1 FROM data_api_keys WHERE id = $5 FOR UPDATE"),
+            ("service health", "SELECT 1 FROM service_health h JOIN function_deployments d ON d.id = h.deployment_id WHERE d.function_id = $4 FOR UPDATE OF h"),
         ];
         let mut pairs = Vec::new();
         for w in function_writes() {
@@ -2060,6 +2064,77 @@ mod functions {
                 .unwrap();
             s.ready(main).await;
         }
+        s.finish().await;
+    }
+
+    /// m9: a service's signing secret is sealed for its function (another function's id
+    /// doesn't open it); the health checks poll each enabled external deployment on a live
+    /// branch once, and what they record shows on the branch's listing.
+    #[tokio::test]
+    #[ignore]
+    async fn external_services_secrets_targets_and_health() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let (other_db, _) = s.database().await;
+        let c = &s.client;
+        let svc = c.create_function(db, "stub", FunctionKind::Service).await.unwrap().id;
+        assert_eq!(c.service_signing_secret(svc).await.unwrap(), None);
+        assert!(c.set_service_signing_secret(db, svc, "whsec_one").await.unwrap());
+        assert!(!c.set_service_signing_secret(other_db, svc, "whsec_two").await.unwrap(), "another database's");
+        assert_eq!(c.service_signing_secret(svc).await.unwrap().as_deref(), Some("whsec_one"));
+        let sealed: String = sqlx::query_scalar("SELECT signing_secret FROM functions WHERE id = $1")
+            .bind(svc)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert!(!sealed.contains("whsec_one"));
+        sqlx::query("UPDATE functions SET signing_secret = $2 WHERE id = $1")
+            .bind(s.function(db, "other").await)
+            .bind(&sealed)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        let other: Uuid = sqlx::query_scalar("SELECT id FROM functions WHERE name = 'other' AND database_id = $1")
+            .bind(db.as_uuid())
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert!(matches!(c.service_signing_secret(other).await, Err(MetadataError::Secret(_))));
+
+        let spec = serde_json::json!({"backend": "external", "url": "https://svc.example/api", "health_path": "/healthz"});
+        let deployment = c
+            .create_deployment(&NewDeployment {
+                id: Uuid::new_v4(),
+                function_id: svc,
+                bundle_sha256: None,
+                bundle_size: None,
+                spec: &spec,
+                compatibility_date: date(),
+                created_by: "member-1",
+                note: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        c.set_active_deployment(main, svc, deployment).await.unwrap();
+        assert!(c.list_service_targets().await.unwrap().iter().all(|t| t.deployment_id != deployment), "disabled");
+        assert!(c.set_enabled(main, svc, true).await.unwrap());
+        let child = s.branch(db, main, "dev").await;
+        let targets: Vec<_> = c.list_service_targets().await.unwrap().into_iter().filter(|t| t.deployment_id == deployment).collect();
+        assert_eq!(targets.len(), 1, "each deployment once, though two branches serve it");
+        assert_eq!(targets[0].spec, spec);
+        let health = |b| async move {
+            c.list_for_branch(b).await.unwrap().into_iter().find(|f| f.function_id == svc).unwrap().health
+        };
+        assert_eq!(health(main).await, None);
+        c.set_service_health(deployment, false).await.unwrap();
+        assert_eq!(health(main).await.as_deref(), Some("unhealthy"));
+        c.set_service_health(deployment, true).await.unwrap();
+        assert_eq!(health(child).await.as_deref(), Some("healthy"));
+        c.set_service_health(Uuid::new_v4(), true).await.unwrap();
+        c.mark_branch_deleted(child).await.unwrap();
+        assert!(c.set_enabled(main, svc, false).await.unwrap());
+        assert!(c.list_service_targets().await.unwrap().iter().all(|t| t.deployment_id != deployment));
         s.finish().await;
     }
 

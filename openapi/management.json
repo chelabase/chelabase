@@ -2662,8 +2662,8 @@
         "tags": [
           "functions"
         ],
-        "summary": "Deploy a bundle",
-        "description": "Stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service, then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.",
+        "summary": "Deploy a bundle, or a service's spec",
+        "description": "A function: stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service. A service: checks the `spec`'s URL (a tenant admin only). Then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.",
         "operationId": "createFunctionDeployment",
         "parameters": [
           {
@@ -2738,7 +2738,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: a service's spec needs a tenant admin; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2768,7 +2768,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, or the function is a service",
+            "description": "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, a bundle for a service or a spec for a function, or a refused URL or health path",
             "content": {
               "application/json": {
                 "schema": {
@@ -23919,11 +23919,7 @@
       },
       "CreateFunctionDeploymentRequest": {
         "type": "object",
-        "description": "A deployment: the bundle manifest (the runtime's format) and its hash.",
-        "required": [
-          "manifest",
-          "sha256"
-        ],
+        "description": "A deployment: a function's bundle manifest (the runtime's format) and its hash, or a\nservice's `spec`.",
         "properties": {
           "activate": {
             "type": [
@@ -23941,8 +23937,11 @@
             "description": "Defaults to the manifest's `compatibilityDate`."
           },
           "manifest": {
-            "type": "object",
-            "description": "The bundle manifest, as the runtime loads it. Stored byte for byte as sent."
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A function's bundle manifest, as the runtime loads it. Stored byte for byte as sent."
           },
           "note": {
             "type": [
@@ -23951,8 +23950,22 @@
             ]
           },
           "sha256": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "SHA-256 of the manifest's bytes as sent, lowercase hex."
+          },
+          "spec": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceSpec",
+                "description": "A service's target (needs a tenant admin)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -25182,7 +25195,8 @@
           "run_as_role",
           "run_as_active",
           "last_error",
-          "updated_at"
+          "updated_at",
+          "health"
         ],
         "properties": {
           "auth": {
@@ -25209,6 +25223,17 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealth",
+                "description": "A service's health on the branch (checked every 15 s); null before the first check, and\nfor a function."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "id": {
             "type": "string",
@@ -25238,6 +25263,13 @@
             ],
             "description": "The role the function runs as on the branch: its live run-as key's role (which follows\na rename), else the role set; null for none."
           },
+          "signing_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A service's signing secret: only in the answer that made the service or rotated it."
+          },
           "updated_at": {
             "type": [
               "string",
@@ -25266,7 +25298,8 @@
           "compatibility_date",
           "created_by",
           "created_at",
-          "note"
+          "note",
+          "spec"
         ],
         "properties": {
           "bundle_sha256": {
@@ -25304,6 +25337,13 @@
               "string",
               "null"
             ]
+          },
+          "spec": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A service's spec (`{backend: \"external\", url, health_path}`); null for a function."
           }
         }
       },
@@ -29490,6 +29530,38 @@
           "update"
         ]
       },
+      "ServiceHealth": {
+        "type": "string",
+        "description": "What a service's last health check saw.",
+        "enum": [
+          "healthy",
+          "unhealthy"
+        ]
+      },
+      "ServiceSpec": {
+        "type": "object",
+        "description": "An external service: requests to `/services/v1/{name}/{rest}` go to `url` with the rest\nunder its path; `health_path` (under it too) is polled every 15 s.",
+        "required": [
+          "backend",
+          "url",
+          "health_path"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "`external`."
+          },
+          "health_path": {
+            "type": "string",
+            "description": "Starts with `/`, at most 256 printable ASCII characters, no `#`."
+          },
+          "url": {
+            "type": "string",
+            "description": "`https` (or `http` where the operator allows it), no credentials, query or fragment; a\npublic address, or an allowlisted host outside the platform."
+          }
+        },
+        "additionalProperties": false
+      },
       "SkipReason": {
         "type": "string",
         "enum": [
@@ -30448,6 +30520,13 @@
               "null"
             ],
             "description": "Turns the function on or off on the branch."
+          },
+          "rotate_signing_secret": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "A service only: `true` makes a new signing secret (in this answer only; the old one\nstops working). Needs a tenant admin."
           },
           "run_as_role": {
             "type": [

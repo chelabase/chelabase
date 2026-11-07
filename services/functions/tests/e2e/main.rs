@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 mod app_users;
 mod scheduled;
+mod services;
 
 /// How soon a change must apply (NATS drops the cached resolution).
 const WITHIN: Duration = Duration::from_secs(2);

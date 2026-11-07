@@ -20,6 +20,12 @@ export interface UpdateFunctionRequest {
      */
   enabled?: boolean | null;
   /**
+     * A service only: `true` makes a new signing secret (in this answer only; the old one
+     * stops working). Needs a tenant admin.
+     * @nullable
+     */
+  rotate_signing_secret?: boolean | null;
+  /**
      * The role the function runs as: a function-managed secret key for it is made (and the
      * previous one revoked); null clears both. A role with BYPASSRLS needs Admin.
      * @nullable

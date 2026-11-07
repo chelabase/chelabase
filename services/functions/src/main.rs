@@ -51,6 +51,17 @@ async fn main() -> anyhow::Result<()> {
         resolver.clone(),
         chelabase_nats::NatsConfig::from_env().map_err(anyhow::Error::msg)?,
     );
+    // m9: where external services may be, and their health checks.
+    let outbound = functions::services::outbound_from_lookup(|name| std::env::var(name).ok())?;
+    for entry in outbound.allow_hosts_with_port() {
+        tracing::warn!(entry, "CHELABASE_SERVICES_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
+    }
+    let services = functions::services::Services::new(&outbound)?;
+    functions::services::health::spawn(
+        resolver.directory().clone(),
+        services.client.clone(),
+        services.health.clone(),
+    );
     let store = Arc::new(chelabase_storage::S3Store::new(&config.store).await);
     let state = Arc::new(AppState::new(
         resolver,
@@ -59,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
         Bundles::new(store),
         config.orchestrator_token.clone(),
         config.worker_token.clone(),
-    ));
+    )
+    .with_services(services));
     let public_addrs = resolve_all("CHELABASE_FUNCTIONS_ADDR", &config.addr).await?;
     // The internal listener's two sides: compose names the service's alias on the runtime's
     // network (bundle GETs) and on the orchestrator's and the worker's (uploads, invocations),

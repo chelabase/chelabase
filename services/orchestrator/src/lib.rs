@@ -1971,6 +1971,9 @@ pub struct AppState<M, J> {
     /// `CHELABASE_WEBHOOKS_ALLOW_HOSTS`): checked at registration; the worker checks again at
     /// every connection.
     pub webhooks: chelabase_http::outbound::Outbound,
+    /// Edge functions m9: where external services' URLs may point (`CHELABASE_SERVICES_*`, and
+    /// the stack's hard deny), checked when a deployment is saved.
+    pub services: chelabase_http::outbound::Outbound,
     /// Edge functions m3: where deployments' bundles are stored (the functions service).
     pub bundles: functions::Bundles,
 }
