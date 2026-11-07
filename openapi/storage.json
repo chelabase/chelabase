@@ -1295,7 +1295,17 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message). Either way nothing is deleted",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the delete ran past the timeout (nothing is deleted; try again)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1726,7 +1736,17 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted)",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the delete ran past the timeout (nothing is deleted; try again)",
             "content": {
               "application/json": {
                 "schema": {

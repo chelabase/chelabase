@@ -48,7 +48,9 @@
 
 use std::sync::Arc;
 
-use chelabase_query::engine::{QueryCache, console_session, with_transaction};
+use chelabase_query::engine::{
+    QueryCache, console_session, console_session_mapped, with_transaction,
+};
 use chelabase_query::{Lease, Op, QueryClient, QueryFailure, RunAs, RunSettings, Schema};
 use serde_json::Value;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -157,6 +159,28 @@ impl RoleSession {
             self.run_as(),
             settings,
             request_id,
+            f,
+        )
+        .await
+    }
+
+    /// [`Self::transaction`], with a failed `COMMIT` mapped by `on_commit`
+    /// ([`chelabase_query::with_transaction_mapped`]).
+    pub async fn transaction_mapped<T>(
+        &self,
+        database: &str,
+        settings: &RunSettings,
+        request_id: &str,
+        on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+        f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+    ) -> Result<T, QueryFailure> {
+        console_session_mapped(
+            &self.lease,
+            database,
+            self.run_as(),
+            settings,
+            request_id,
+            on_commit,
             f,
         )
         .await

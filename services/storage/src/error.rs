@@ -126,6 +126,34 @@ impl Failure {
         )
     }
 
+    /// 409 `retry` (the data API's code for it): the delete was rolled back by a transient
+    /// conflict (a serialization failure or deadlock, SQLSTATE class 40, or a lock it couldn't
+    /// get, 55P03). A fixed message: Postgres's detail names other backends' pids and the
+    /// relations they hold, and a trigger raising one of these picks its own text. `sqlstate`
+    /// is Postgres's code (one of those, never text).
+    pub fn delete_retry(sqlstate: &str) -> Self {
+        let mut f = QueryFailure::new(
+            StatusCode::CONFLICT,
+            "retry",
+            "the delete ran into a concurrent transaction or a held lock and was rolled back; nothing was deleted; try again",
+        );
+        f.sqlstate = Some(sqlstate.to_owned());
+        Failure(f)
+    }
+
+    /// 504 `timeout` (the data API's code for it): the delete ran past the statement or
+    /// transaction timeout (57014, 25P04) and was cancelled. A fixed message, as for
+    /// [`Self::delete_retry`].
+    pub fn delete_timeout(sqlstate: &str) -> Self {
+        let mut f = QueryFailure::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            "the delete ran past the timeout and was cancelled; nothing was deleted; try again",
+        );
+        f.sqlstate = Some(sqlstate.to_owned());
+        Failure(f)
+    }
+
     /// 409: a delete in a write-once bucket (m7). The schema's own message, fixed here so a
     /// user's trigger raising the same SQLSTATE can't pass its text through.
     pub fn write_once_delete() -> Self {

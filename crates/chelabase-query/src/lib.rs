@@ -28,7 +28,8 @@ pub mod shape;
 pub mod sql;
 
 pub use engine::{
-    QueryCache, RunAs, RunSettings, SchemaKey, console_session, load_schema, run, schema_for, with_transaction,
+    QueryCache, RunAs, RunSettings, SchemaKey, console_session, console_session_mapped, load_schema, run, schema_for,
+    with_transaction, with_transaction_mapped,
 };
 pub use error::QueryFailure;
 pub use pipeline::{Lease, QueryClient};

@@ -154,8 +154,8 @@ pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFai
 }
 
 /// A row delete's failure, from the error's SQLSTATE (`None`: not a Postgres error), whether
-/// Postgres raised it inside a function or a nested statement (`nested`: it has a context
-/// line), and the data API's reading of it (`f`).
+/// Postgres raised it inside a function or a nested statement, or at COMMIT (`nested`), and
+/// the data API's reading of it (`f`).
 ///
 /// **Invariant (#102, m11 audit B1): no storage error body ever carries Postgres message,
 /// detail or hint text from a user's objects.** On a delete, a user's objects come in through
@@ -166,31 +166,57 @@ pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFai
 /// - a foreign key violation (23503) is 409 `referenced` ([`Failure::object_referenced`]);
 /// - every other integrity violation (class 23) is 409 `delete_refused`;
 /// - the schema's write-once refusal ([`WRITE_ONCE`]) is its fixed 409 `write_once`;
+/// - a transient failure stays one, with a fixed text (m11 re-audit S2): class 40 and 55P03
+///   are 409 `retry` ([`Failure::delete_retry`]), 57014 and 25P04 are 504 `timeout`
+///   ([`Failure::delete_timeout`]);
 /// - any other nested error is 409 `delete_refused` (a user's trigger picks its own SQLSTATE
 ///   and text; an RLS policy function's error lands here too);
-/// - what's left was raised by the `DELETE` on `storage.objects` itself (RLS, privileges,
-///   timeouts, conflicts), whose text names only storage's own objects, and is left as it was.
+/// - what's left was raised by the `DELETE` on `storage.objects` itself (RLS, privileges),
+///   whose text names only storage's own objects, and is left as it was.
 ///
-/// `delete_rows` runs the keys immediately before and after the `DELETE`, so nothing a user
-/// table defers is left for COMMIT, which this mapping doesn't see.
+/// A deferred trigger can always defer the keys again, so a user's deferred work can still
+/// fail at COMMIT, after every statement passed (m11 re-audit B1′). `delete_rows` maps that
+/// COMMIT's failure here too, as nested ([`delete_commit_error`]): whatever runs at COMMIT
+/// was queued by a user's table. Its `SET CONSTRAINTS ALL IMMEDIATE` calls only make a
+/// deferred key fail early, at the statement; safety doesn't rest on them.
 pub fn deleted_failure(code: Option<&str>, nested: bool, f: QueryFailure) -> Failure {
     match code {
         None => Failure(f),
         Some(FOREIGN_KEY_VIOLATION) => Failure::object_referenced(),
         Some(c) if c.starts_with(INTEGRITY_CLASS) => Failure::delete_refused(),
         Some(WRITE_ONCE) => Failure::write_once_delete(),
+        Some(c) if c.starts_with(TRANSACTION_ROLLBACK_CLASS) || c == LOCK_NOT_AVAILABLE => {
+            Failure::delete_retry(c)
+        }
+        Some(c @ (QUERY_CANCELED | TRANSACTION_TIMEOUT)) => Failure::delete_timeout(c),
         Some(_) if nested => Failure::delete_refused(),
         Some(_) => Failure(f),
     }
 }
 
+/// A row delete's failure (`at_commit`: its COMMIT's), through [`delete_failure_of`].
+fn delete_failure(e: &tokio_postgres::Error, at_commit: bool, request_id: &str) -> QueryFailure {
+    let db = e.as_db_error();
+    let (code, context) = (db.map(|d| d.code().code()), db.is_some_and(|d| d.where_().is_some()));
+    delete_failure_of(code, context, at_commit, QueryFailure::from_pg(e, request_id)).0
+}
+
+/// [`deleted_failure`] for an error with SQLSTATE `code` that has a context line or not
+/// (`context`: raised in a function or nested statement), from a statement or the COMMIT
+/// (`at_commit`, always nested).
+fn delete_failure_of(code: Option<&str>, context: bool, at_commit: bool, f: QueryFailure) -> Failure {
+    deleted_failure(code, context || at_commit, f)
+}
+
 /// A row delete's statement failure, through [`deleted_failure`].
 fn delete_error(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
-    move |e| {
-        let db = e.as_db_error();
-        let (code, nested) = (db.map(|d| d.code().code()), db.is_some_and(|d| d.where_().is_some()));
-        deleted_failure(code, nested, QueryFailure::from_pg(&e, request_id)).0
-    }
+    move |e| delete_failure(&e, false, request_id)
+}
+
+/// A row delete's COMMIT failure, through [`deleted_failure`] as nested: once every
+/// statement passed, what fails at COMMIT is deferred work a user's table queued.
+fn delete_commit_error(request_id: &str) -> impl FnOnce(&tokio_postgres::Error) -> QueryFailure + '_ {
+    move |e| delete_failure(e, true, request_id)
 }
 
 /// Postgres's foreign key violation.
@@ -199,8 +225,21 @@ const FOREIGN_KEY_VIOLATION: &str = "23503";
 /// Postgres's integrity constraint violations, SQLSTATE class 23.
 const INTEGRITY_CLASS: &str = "23";
 
-/// Every deferrable key and constraint trigger checked now, in the delete's transaction: one
-/// a user's table defers would otherwise fail at COMMIT, past [`deleted_failure`].
+/// Postgres's transaction rollbacks (serialization failure, deadlock), SQLSTATE class 40.
+const TRANSACTION_ROLLBACK_CLASS: &str = "40";
+
+/// Postgres's "lock not available" (`lock_timeout`, `NOWAIT`).
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// Postgres's "query canceled" (the statement timeout, a cancel request).
+const QUERY_CANCELED: &str = "57014";
+
+/// Postgres's transaction timeout.
+const TRANSACTION_TIMEOUT: &str = "25P04";
+
+/// Every deferrable key and constraint trigger checked now, in the delete's transaction, so a
+/// key a user's table defers fails at the statement with its precise code. A trigger can
+/// defer them again; the COMMIT's failure is mapped too ([`delete_commit_error`]).
 const KEYS_NOW: &str = "SET CONSTRAINTS ALL IMMEDIATE";
 
 /// The row an upload or copy writes.
@@ -920,10 +959,14 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         }
         let at = self.engine.locate(data, q.database.as_deref(), rid).await?;
         let (bucket_id, _) = self.bucket(data, &at, bucket, rid).await?;
+        // Every failure out of the transaction, its COMMIT's included, goes through
+        // `deleted_failure` (the invariant there).
         let (deleted, _) = self
-            .caller(data, &at, rid, async |c, _| {
+            .engine
+            .as_caller_mapped(data, Some(&at.database), rid, delete_commit_error(rid), async |c, _| {
                 // Before: a deferred key fails in the statement. After: a trigger the delete
-                // set off may have deferred the keys again; this checks what it put off.
+                // set off may have deferred the keys again; this checks what it put off
+                // (it can defer them once more, which COMMIT then runs).
                 c.batch_execute(KEYS_NOW).await.map_err(delete_error(rid))?;
                 let rows = c
                     .query("DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name", &[&bucket_id, &names])
@@ -932,7 +975,8 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                 c.batch_execute(KEYS_NOW).await.map_err(delete_error(rid))?;
                 Ok(rows.iter().map(|r| r.get(0)).collect::<Vec<String>>())
             })
-            .await?;
+            .await
+            .map_err(Failure::refusal)?;
         Ok(deleted)
     }
 }
@@ -945,7 +989,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     summary = "Delete an object",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     security(("bearer" = [])),
-    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted)", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -978,7 +1022,7 @@ pub struct DeleteObjects {
     params(("bucket" = String, Path), ObjectParams),
     request_body = DeleteObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message). Either way nothing is deleted", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete_many<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1348,24 +1392,28 @@ mod tests {
         );
         assert!(!got.0.message.contains("secret"), "{}", got.0.message);
         assert_eq!(got.0.detail, None);
-        // The DELETE's own failures (not nested, not class 23) are left as they were.
-        for other in ["42501", "40001", "57014"] {
+        // The DELETE's own failures (not nested, not class 23, not transient) are left as
+        // they were.
+        for other in ["42501", "XX000"] {
             assert_eq!(deleted_failure(Some(other), false, failure(other).0), failure(other), "{other}");
         }
         assert_eq!(deleted_failure(None, false, failure("x").0), failure("x"));
     }
 
-    /// The invariant on [`deleted_failure`] (m11 audit B1, the second leak in the delete
-    /// path): no storage error body ever carries Postgres message, detail or hint text from a
-    /// user's objects. Exhaustive over every class 23 SQLSTATE, the schema's own codes, and a
-    /// spread of codes a user's trigger or function might raise, each nested and not: every
-    /// one that can come from a user's object gets a fixed 409 whose text and SQLSTATE are
-    /// the same whatever Postgres said.
+    /// The invariant on [`deleted_failure`] (m11 audit B1 and re-audit B1′, the leaks in the
+    /// delete path): no storage error body ever carries Postgres message, detail or hint text
+    /// from a user's objects. Exhaustive over every class 23 SQLSTATE, the schema's own codes,
+    /// the transient codes, and a spread of codes a user's trigger or function might raise,
+    /// from a statement (with a context line and without) and from the COMMIT: every one that
+    /// can come from a user's object gets a fixed answer whose text and SQLSTATE are the same
+    /// whatever Postgres said. Transient ones stay transient (re-audit S2): 409 `retry` or
+    /// 504 `timeout`, never `delete_refused`.
     #[test]
     fn a_refused_delete_never_carries_the_users_text() {
         const SECRET: &str = "secret_table";
         let class_23 = ["23000", "23001", "23502", "23503", "23505", "23514", "23P01"];
-        let raised = [WRITE_ONCE, TICKET_MISSING, "P0001", "42501", "40001", "40P01", "55P03", "57014", "22023", "XX000", "ZZ999"];
+        let transient = ["40000", "40001", "40002", "40003", "40P01", "55P03", "57014", "25P04"];
+        let raised = [WRITE_ONCE, TICKET_MISSING, "P0001", "42501", "22023", "XX000", "ZZ999"];
         let from_user = |code: &str| {
             let mut f = QueryFailure::new(StatusCode::BAD_REQUEST, "raised", format!("{SECRET} row 1 ({code})"));
             f.detail = Some(format!("Failing row contains ({SECRET})"));
@@ -1374,27 +1422,41 @@ mod tests {
             f
         };
         let mut checked = 0;
-        for code in class_23.iter().chain(&raised) {
-            for nested in [false, true] {
-                let user_reachable = code.starts_with("23") || nested || *code == WRITE_ONCE;
+        for code in class_23.iter().chain(&transient).chain(&raised) {
+            // (context line, at COMMIT): a statement's error without and with one, and the
+            // COMMIT's (whatever its context).
+            for (context, at_commit) in [(false, false), (true, false), (false, true), (true, true)] {
+                let case = format!("{code} context={context} at_commit={at_commit}");
+                let user_reachable = code.starts_with("23")
+                    || transient.contains(code)
+                    || context
+                    || at_commit
+                    || *code == WRITE_ONCE;
                 if !user_reachable {
                     continue;
                 }
-                let got = deleted_failure(Some(code), nested, from_user(code)).0;
+                let got = delete_failure_of(Some(code), context, at_commit, from_user(code)).0;
                 let body = format!("{} {:?} {:?} {:?}", got.message, got.detail, got.hint, got.sqlstate);
-                assert!(!body.contains(SECRET), "{code} nested={nested}: {body}");
-                assert_eq!((&got.detail, &got.hint), (&None, &None), "{code} nested={nested}");
-                assert_eq!(got.status, StatusCode::CONFLICT, "{code} nested={nested}");
+                assert!(!body.contains(SECRET), "{case}: {body}");
+                assert_eq!((&got.detail, &got.hint), (&None, &None), "{case}");
                 let want = match *code {
                     "23503" => Failure::object_referenced(),
                     WRITE_ONCE => Failure::write_once_delete(),
+                    "57014" | "25P04" => Failure::delete_timeout(code),
+                    c if transient.contains(&c) => Failure::delete_retry(c),
                     _ => Failure::delete_refused(),
                 };
-                assert_eq!(Failure(got), want, "{code} nested={nested}");
+                let status = if matches!(*code, "57014" | "25P04") { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::CONFLICT };
+                assert_eq!(got.status, status, "{case}");
+                assert_eq!(Failure(got), want, "{case}");
                 checked += 1;
             }
         }
-        assert_eq!(checked, class_23.len() * 2 + 2 + (raised.len() - 1), "every reachable case");
+        // Not reachable: a non-transient, non-class-23 code other than write-once, raised by
+        // the DELETE itself (no context line, not at COMMIT): left as it was, above.
+        let unreachable = raised.len() - 1;
+        let all = (class_23.len() + transient.len() + raised.len()) * 4;
+        assert_eq!(checked, all - unreachable, "every reachable case");
     }
 
     /// The trigger's `CB003` keeps its SQLSTATE (the data API's mapping has no row for it and

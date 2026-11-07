@@ -50,7 +50,7 @@
 //! # }
 //! ```
 
-use chelabase_query::{Lease, QueryClient, QueryFailure, with_transaction};
+use chelabase_query::{Lease, QueryClient, QueryFailure, with_transaction, with_transaction_mapped};
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 /// The parameter types a [`StatementText`] lists (re-exported for [`named_statement!`](crate::named_statement)).
@@ -268,13 +268,15 @@ impl<S: ConnSource> ServicePool<S> {
     /// object handlers), never a caller's text. The Postgres boundary above holds as for
     /// [`Self::query`]: the connection is checked to be the service's login with no
     /// memberships, so nothing it runs can become another role; it reaches what that login's
-    /// grants reach. A failed reset or a cancelled call closes the connection.
+    /// grants reach. A failed reset or a cancelled call closes the connection. A failed
+    /// `COMMIT` goes through `on_commit` ([`with_transaction_mapped`]).
     pub async fn transaction<T>(
         &self,
         branch: Uuid,
         database: &str,
         statement_timeout_ms: i64,
         request_id: &str,
+        on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
         f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, QueryFailure>,
     ) -> Result<T, ServiceError> {
         let conn = self.pools.acquire(branch, database).await?;
@@ -282,7 +284,7 @@ impl<S: ConnSource> ServicePool<S> {
         // Declared after `permits`: dropped (pooled or closed) before they're released.
         let mut lease = Lease::new(conn.client);
         let timeout = statement_timeout_ms.max(0).to_string();
-        let out = with_transaction(&lease, RESET_SQL, request_id, async |c| {
+        let out = with_transaction_mapped(&lease, RESET_SQL, request_id, on_commit, async |c| {
             c.query_typed(
                 "SELECT pg_catalog.set_config('statement_timeout', $1, true), pg_catalog.set_config('transaction_timeout', $1, true)",
                 &[(&timeout, Type::TEXT)],
