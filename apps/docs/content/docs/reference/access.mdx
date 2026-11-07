@@ -78,6 +78,10 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | POST | `/data/v1/query` | any data key | Data API key |
 | GET | `/data/v1/schema` | secret data key | Data API key |
 | GET | `/data/v1/types` | secret data key | Data API key |
+| GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/public/\{branch_id\}/\{name\}` | none | Public |
+| GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/public/\{branch_id\}/\{name\}/\{*rest\}` | none | Public |
+| GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/\{name\}` | any data key | Data API key |
+| GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/\{name\}/\{*rest\}` | any data key | Data API key |
 | GET | `/health` | none | Public |
 | GET | `/storage/v1/bucket` | any data key | Data API key |
 | POST | `/storage/v1/bucket` | any data key | Data API key |
