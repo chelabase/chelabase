@@ -377,8 +377,9 @@ async fn sealed_lock() -> sqlx::PgConnection {
     advisory_lock("SELECT pg_advisory_lock_shared($1)").await
 }
 
-/// The environment's real key-check value, restored after a key-check test so
-/// running these tests never locks the local services out.
+/// The stored key-check value. Every key-check test runs on a [`KeyCheckScratch`] database,
+/// never the stack's own: a test that panicked half-way through rewriting the shared row would
+/// leave the stack's services refusing to start.
 async fn saved_key_check(client: &MetadataClient) -> Option<String> {
     sqlx::query_scalar("SELECT value FROM control_settings WHERE key = 'secrets_key_check'")
         .fetch_optional(client.pool())
@@ -405,27 +406,22 @@ async fn restore_key_check(client: &MetadataClient, saved: Option<String>) {
 #[ignore]
 async fn key_check_records_matches_and_refuses_a_different_key_while_credentials_exist() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
-    sqlx::query("DELETE FROM control_settings WHERE key = 'secrets_key_check'")
-        .execute(client.pool())
-        .await
-        .unwrap();
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
 
     let first = client.ensure_key_check("check-a", |v| v == "check-a").await.unwrap();
     let same = client.ensure_key_check("check-a2", |v| v == "check-a").await.unwrap();
 
     // Stored credentials exist (on a branch now): a different key must be refused.
-    let id = insert_pending(&client).await;
+    let id = insert_pending(client).await;
     sqlx::query("UPDATE branches SET owner_password_enc = 'v1:x' WHERE id = $1")
         .bind(id.as_uuid())
         .execute(client.pool())
         .await
         .unwrap();
     let other = client.ensure_key_check("check-b", |v| v == "check-b").await.unwrap();
-    cleanup(&client, id).await;
-    restore_key_check(&client, saved).await;
+    scratch.finish().await;
 
     assert_eq!(first, KeyCheck::Recorded);
     assert_eq!(same, KeyCheck::Matches);
@@ -546,6 +542,16 @@ impl SealedFixture {
                     .await
                     .unwrap();
             }
+            // The storage login's password always has its salt beside it.
+            ("branches", "storage_password_enc") => {
+                sqlx::query(
+                    "UPDATE branches SET storage_password_enc = 'v1:x', storage_password_salt = '\\x00000000000000000000000000000000' WHERE id = $1",
+                )
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             ("data_api_keys", "sealed") => {
                 sqlx::query(
                     "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed)
@@ -634,22 +640,22 @@ impl SealedFixture {
 #[ignore]
 async fn key_check_refuses_when_only_one_column_is_sealed() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
     let mut wrong = Vec::new();
     for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         // Other live binaries seal values without `sealed_lock`, so the count can move under
         // a check. A wrong count is retried while the environment moved (or the check lost a
         // deadlock to a writer), and fails once it is wrong with the environment stable.
         for attempt in 1..=KEY_CHECK_ATTEMPTS {
-            let before = sealed_values(&client).await;
-            let fixture = SealedFixture::new(&client, table, column).await;
-            restore_key_check(&client, Some("check-a".into())).await;
+            let before = sealed_values(client).await;
+            let fixture = SealedFixture::new(client, table, column).await;
+            restore_key_check(client, Some("check-a".into())).await;
             let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
-            let after = sealed_values(&client).await;
-            let stored = saved_key_check(&client).await;
-            fixture.remove(&client).await;
+            let after = sealed_values(client).await;
+            let stored = saved_key_check(client).await;
+            fixture.remove(client).await;
             let report = format!(
                 "{table}.{column}: {outcome:?} ({before} before, {after} after), stored check {stored:?}"
             );
@@ -670,7 +676,7 @@ async fn key_check_refuses_when_only_one_column_is_sealed() {
             eprintln!("retrying {table}.{column}: the environment moved ({report})");
         }
     }
-    restore_key_check(&client, saved).await;
+    scratch.finish().await;
     assert!(wrong.is_empty(), "a wrong key was not refused: {wrong:#?}");
 }
 
@@ -736,34 +742,37 @@ async fn key_check_ignores_an_expired_grace_token() {
 #[ignore]
 async fn key_check_waits_for_an_inflight_sealed_write() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
-    let database = insert_pending(&client).await;
-    restore_key_check(&client, Some("check-a".into())).await;
-    let writer = raw_pool().await;
-    let mut tx = writer.begin().await.unwrap();
-    sqlx::query("UPDATE branches SET authenticator_password_enc = 'v1:x' WHERE id = $1")
-        .bind(main_of(database).as_uuid())
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    let check = client.ensure_key_check("check-b", |v| v == "check-b");
-    tokio::pin!(check);
-    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut check).await;
-    let (finished_early, outcome) = match early {
-        Ok(outcome) => {
-            tx.commit().await.unwrap();
-            (true, outcome)
-        }
-        Err(_) => {
-            tx.commit().await.unwrap();
-            (false, check.await)
-        }
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
+    let database = insert_pending(client).await;
+    restore_key_check(client, Some("check-a".into())).await;
+    let (finished_early, outcome, stored) = {
+        let writer = client.pool().clone();
+        let mut tx = writer.begin().await.unwrap();
+        sqlx::query("UPDATE branches SET authenticator_password_enc = 'v1:x' WHERE id = $1")
+            .bind(main_of(database).as_uuid())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let check = client.ensure_key_check("check-b", |v| v == "check-b");
+        tokio::pin!(check);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut check).await;
+        let (finished_early, outcome) = match early {
+            Ok(outcome) => {
+                tx.commit().await.unwrap();
+                (true, outcome)
+            }
+            Err(_) => {
+                tx.commit().await.unwrap();
+                (false, check.await)
+            }
+        };
+        let stored = saved_key_check(client).await;
+        (finished_early, outcome, stored)
     };
-    let stored = saved_key_check(&client).await;
-    cleanup(&client, database).await;
-    restore_key_check(&client, saved).await;
+    cleanup(client, database).await;
+    scratch.finish().await;
     assert!(!finished_early, "the check finished while a sealed write was uncommitted: {outcome:?}");
     assert!(matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows >= 1), "{outcome:?}");
     assert_eq!(stored.as_deref(), Some("check-a"));
@@ -2968,6 +2977,8 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         SettingsPatch { statement_timeout_ms: Some(120_001), ..Default::default() },
         SettingsPatch { max_connections: Some(0), ..Default::default() },
         SettingsPatch { max_connections: Some(51), ..Default::default() },
+        SettingsPatch { storage_max_connections: Some(0), ..Default::default() },
+        SettingsPatch { storage_max_connections: Some(21), ..Default::default() },
         // One bad field spoils the whole patch.
         SettingsPatch { max_branches: Some(9), max_rows: Some(0), ..Default::default() },
     ];
@@ -2982,6 +2993,7 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         max_rows: Some(100_000),
         statement_timeout_ms: Some(100),
         max_connections: Some(50),
+        storage_max_connections: Some(20),
         max_branches: Some(7),
         ..Default::default()
     };
@@ -3003,6 +3015,8 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         (defaults.max_rows, defaults.statement_timeout_ms, defaults.max_connections),
         (1000, 8000, 5)
     );
+    assert_eq!(defaults.storage_max_connections, 2);
+    assert_eq!((after.storage_max_connections, partial.storage_max_connections), (20, 20));
     assert_eq!(rejected, bad.len());
     assert_eq!(unchanged, defaults);
     assert!(applied);
@@ -3035,6 +3049,14 @@ async fn branch_connection_returns_settings() {
     // A second write never replaces it: a racing run reads the first one back.
     client.set_authenticator_password(main_of(id), "v1:later").await.unwrap();
     let with_password = client.branch_connection(main_of(id)).await.unwrap().expect("row");
+    client
+        .update_database_settings(id, &SettingsPatch { storage_max_connections: Some(7), ..Default::default() })
+        .await
+        .unwrap();
+    // The storage login's password and salt are stored together, once.
+    client.set_storage_password(main_of(id), "v1:storage", &[7; 16]).await.unwrap();
+    client.set_storage_password(main_of(id), "v1:later", &[8; 16]).await.unwrap();
+    let with_storage = client.branch_connection(main_of(id)).await.unwrap().expect("row");
     let missing = client.branch_connection(BranchId::new()).await.unwrap();
     let record = main_branch(&client, id).await;
     cleanup(&client, id).await;
@@ -3046,6 +3068,11 @@ async fn branch_connection_returns_settings() {
     assert_eq!(ready.authenticator_password_enc, None);
     assert_eq!((ready.settings.max_rows, ready.settings.statement_timeout_ms), (1000, 8000));
     assert_eq!(ready.settings.max_connections, 5);
+    assert_eq!(ready.settings.storage_max_connections, 2);
+    assert_eq!((ready.storage_password_enc.as_deref(), ready.storage_password_salt.as_deref()), (None, None));
+    assert_eq!(with_storage.settings.storage_max_connections, 7);
+    assert_eq!(with_storage.storage_password_enc.as_deref(), Some("v1:storage"));
+    assert_eq!(with_storage.storage_password_salt.as_deref(), Some(&[7u8; 16][..]));
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
     assert!(missing.is_none());
@@ -8478,6 +8505,48 @@ async fn an_exemption_name_may_hold_any_character_but_nul() {
     cleanup(&client, id).await;
     assert!(added.unwrap());
     assert_eq!(listed.unwrap(), ["a\u{1}b"]);
+}
+
+/// Object storage m6: an upload token is recorded only for a live key and spent once, before
+/// its expiry, while its key is live; two concurrent spends (two replicas) get it once.
+#[tokio::test]
+#[ignore]
+async fn storage_upload_tokens_spend_once() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (key, _) = new_key(branch, DataKeyKind::Secret, "authenticated", "uploads");
+    client.insert_data_key(&key).await.unwrap();
+    let live = client.live_data_key(key.id).await.unwrap();
+    let unknown = client.live_data_key(uuid::Uuid::new_v4()).await.unwrap();
+    let later = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let claims = serde_json::json!({ "sub": "u1" });
+    let (token, expired, revoked) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let recorded = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
+    let again = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
+    let dead_key = client.insert_upload_token(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), &claims, later).await;
+    client
+        .insert_upload_token(expired, key.id, &claims, chrono::Utc::now() - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(client.consume_upload_token(token), client.consume_upload_token(token));
+    let spends: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+    let after = client.consume_upload_token(token).await.unwrap();
+    let past = client.consume_upload_token(expired).await.unwrap();
+    client.insert_upload_token(revoked, key.id, &claims, later).await.unwrap();
+    client.revoke_data_key(branch, key.id).await.unwrap();
+    let of_revoked = client.consume_upload_token(revoked).await.unwrap();
+    let live_after = client.live_data_key(key.id).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(live.map(|k| k.branch_id), Some(branch));
+    assert!(unknown.is_none());
+    assert!(recorded && !again);
+    assert!(matches!(dead_key, Ok(false)), "{dead_key:?}");
+    assert_eq!(spends.len(), 1, "{spends:?}");
+    assert_eq!(spends[0].0.key_id, key.id);
+    assert_eq!(spends[0].1, claims);
+    assert!(after.is_none() && past.is_none() && of_revoked.is_none());
+    assert!(live_after.is_none());
 }
 
 // --- Identity ids -----------------------------------------------------------------------------

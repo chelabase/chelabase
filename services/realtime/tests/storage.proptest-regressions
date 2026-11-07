@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f4fefef445b2486db131f721a1e6d642913c84bc30adde2d3184fde02da9b19a # shrinks to steps = [Put { i: 1, in_a: true, hidden: false }, Deliver { bulk: true, starved: true }, Put { i: 2, in_a: false, hidden: false }, Deliver { bulk: false, starved: true }, View { mask: 146 }, Put { i: 1, in_a: false, hidden: false }, Retry { starved: false }, Deliver { bulk: false, starved: false }]
+cc 0d2277a34d318547f198e94c4f3ed9ac9c5680cc2f3b65165f7fcd610ec870e0 # shrinks to steps = [Put { i: 3, in_a: true, hidden: false }, Deliver { bulk: false, starved: false }, Delete { i: 3 }, Deliver { bulk: false, starved: true }, Put { i: 3, in_a: true, hidden: false }, Retry { starved: false }]
+cc 91060545c2d47a6b3d9d4c6492df4a6089b038cf54dfb8a1116ee73132786e93 # shrinks to steps = [Put { i: 0, in_a: true, hidden: false }, Put { i: 1, in_a: false, hidden: false }, Deliver { bulk: false, starved: true }, Put { i: 2, in_a: false, hidden: false }, Deliver { bulk: false, starved: false }, View { mask: 19 }, Delete { i: 0 }, Retry { starved: false }, Deliver { bulk: false, starved: false }]
+cc bda800bc5ad87409684c6cc95ee1f5b3655ab9e8c047f43599afcb81e8bd15db # shrinks to steps = [Put { i: 0, in_a: true, hidden: false }, Deliver { bulk: true, starved: true }, Ask { mask: 71 }, Run, Put { i: 1, in_a: false, hidden: false }, Deliver { bulk: false, starved: false }, Run, Land, Put { i: 0, in_a: false, hidden: false }, Deliver { bulk: false, starved: false }]
+cc c361b70955bfe5e6d3047714511ac5b36548a1bfba0b453c4c74962e123ebd55 # shrinks to steps = [Ask { mask: 8 }, Put { i: 3, in_a: true, hidden: false }, Run, Delete { i: 3 }, Deliver { bulk: true, starved: false }, Land, Deliver { bulk: true, starved: false }]
+cc fae2d6ad3f68232586f7eb09d9b49af552b1de0c26903a6688c8467729b5eec5 # shrinks to steps = [Put { i: 0, in_a: true, hidden: false }, View { mask: 43 }, Put { i: 2, in_a: false, hidden: false }, Put { i: 1, in_a: false, hidden: false }, Deliver { bulk: false, starved: true }, Deliver { bulk: true, starved: false }, Delete { i: 0 }, Retry { starved: false }]

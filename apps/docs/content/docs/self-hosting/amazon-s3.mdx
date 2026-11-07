@@ -1,0 +1,107 @@
+---
+title: Using Amazon S3
+description: Keep your app's files in an Amazon S3 bucket (or another S3-compatible store) instead of the bundled SeaweedFS.
+---
+
+By default the self-hosted install keeps your app's files in the bundled SeaweedFS, in its `chelabase-storage` bucket. You can keep them in Amazon S3 instead. Only the environment of two services changes, `storage` and `worker` (its sweep deletes unreferenced files); no code or data format does. Neon's own data (pageserver layers and WAL) stays in SeaweedFS either way.
+
+Start from a working install: see [Install](/self-hosting/install).
+
+## 1. A bucket and an IAM identity
+
+Create a bucket for Chelabase alone, for example `acme-chelabase-files` in `eu-west-1`:
+
+- keep **Block Public Access** on: Chelabase serves public and signed URLs itself, through the gateway, and never hands out S3 URLs;
+- add no lifecycle rule that deletes objects: Chelabase's [sweep](/architecture/storage#the-sweep) decides when a file can go, because a branch or a restore may still need it;
+- leave versioning off (or expire noncurrent versions), or every deleted file keeps costing storage;
+- default encryption (SSE-S3) needs nothing more. With SSE-KMS, also allow `kms:GenerateDataKey` and `kms:Decrypt` on the key.
+
+Give Chelabase an identity that may use that bucket and nothing else:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::acme-chelabase-files"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::acme-chelabase-files/*"
+    }
+  ]
+}
+```
+
+Use an IAM user's access key, or, on AWS compute, a role (instance profile, IRSA, EKS Pod Identity or an ECS task role).
+
+## 2. The key files
+
+With an access key, put it in two files next to `docker-compose.yml`, readable only by the storage service's user (uid 10001):
+
+```bash
+mkdir -p aws && chmod 700 aws
+printf '%s' 'AKIA…' > aws/access-key
+printf '%s' '…secret…' > aws/secret-key
+sudo chown 10001:10001 aws/access-key aws/secret-key
+sudo chmod 0400 aws/access-key aws/secret-key
+```
+
+The files are read again every five minutes, so you can rotate the key by replacing them, with no restart. Never put the keys in `.env` or in an `environment:` value: they'd show in `docker inspect`.
+
+## 3. An override for storage and the worker
+
+Create `docker-compose.s3.yml` beside `docker-compose.yml`:
+
+```yaml
+x-s3-backend: &s3-backend
+  CHELABASE_STORAGE_BACKEND: s3
+  CHELABASE_STORAGE_S3_ENDPOINT: ""          # blank: AWS's own endpoint for the region
+  CHELABASE_STORAGE_S3_REGION: eu-west-1
+  CHELABASE_STORAGE_S3_BUCKET: acme-chelabase-files
+  CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/aws/access-key
+  CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/aws/secret-key
+
+services:
+  storage:
+    environment: *s3-backend
+    secrets: &aws-keys
+      - {source: aws-access-key, target: /run/chelabase/aws/access-key}
+      - {source: aws-secret-key, target: /run/chelabase/aws/secret-key}
+  worker:
+    environment: *s3-backend
+    secrets: *aws-keys
+
+secrets:
+  aws-access-key: {file: ./aws/access-key}
+  aws-secret-key: {file: ./aws/secret-key}
+```
+
+With an AWS role instead of a key, leave out both `secrets:` blocks and set the two `…_KEY_FILE` variables to `""`: with backend `s3` and no key files, the AWS default credential chain is used.
+
+Pass the file with every Compose command from now on (or add it to `COMPOSE_FILE` in `.env`: `COMPOSE_FILE=docker-compose.yml:docker-compose.s3.yml`):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --wait storage worker
+```
+
+Every setting, with its default, is on [Storage settings](/self-hosting/storage-settings).
+
+## 4. Existing files
+
+Files already stored in SeaweedFS aren't moved for you. Before you switch, stop `storage` and `worker`, copy the `chelabase-storage` bucket's whole contents to the new bucket with the same keys (any S3 copy tool works, such as `aws s3 sync` or `rclone sync`, run inside the Compose network against `http://seaweedfs:8333` with the `storage-s3` keys from the secrets volume), then start them with the override. The key layout is the same on every backend.
+
+On a fresh install there's nothing to copy.
+
+## 5. Check it
+
+Upload a file through your app or Studio, download it, and look for its blob under `<database id>/` in the bucket. `docker compose logs storage worker` shows any credential or permission error, naming the setting at fault (never a key).
+
+Chelabase's own test of this swap is `just storage-e2e --backend s3` in a development checkout: it switches the workbench's storage and worker to backend `s3` against a second S3-compatible endpoint, changing only their environment, and runs the whole storage story, from a policy to the sweep.
+
+## Other S3-compatible stores
+
+The same override works for any store that speaks the S3 API, such as MinIO, Cloudflare R2 or a second SeaweedFS: set `CHELABASE_STORAGE_S3_ENDPOINT` to its URL, and `CHELABASE_STORAGE_S3_PATH_STYLE: "true"` if it doesn't serve buckets as host names. It needs `CopyObject`, `UploadPartCopy` and multipart uploads, and `ListMultipartUploads` for the sweep.

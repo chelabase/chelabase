@@ -355,6 +355,13 @@ struct UpdatePgDatabaseRequest {
     grant_existing: bool,
 }
 
+/// Schemas the data API never serves, so never a default schema: `storage` (object
+/// metadata, which `grant_existing` would grant on), every `chelabase…` and `pg_…` schema and
+/// `information_schema` (rest's own list: [`chelabase_query::schema::is_reserved`]).
+fn reserved_default_schema(schema: &str) -> bool {
+    chelabase_query::schema::is_reserved(schema) || schema.starts_with("pg_") || schema == "information_schema"
+}
+
 #[utoipa::path(
     patch,
     path = "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}",
@@ -402,6 +409,9 @@ where
     };
     if !valid_schema_name(&request.default_schema) {
         return unprocessable("default_schema must match ^[a-z_][a-z0-9_]{0,62}$").into_response();
+    }
+    if reserved_default_schema(&request.default_schema) {
+        return unprocessable(&format!("default_schema {:?} is reserved", request.default_schema)).into_response();
     }
     let rows = match state.metadata.branch_databases(branch.id).await {
         Ok(rows) => rows,

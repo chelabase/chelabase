@@ -62,7 +62,7 @@ const RETRY_AFTER_SECS: u32 = 2;
 /// The longest a schema read may take, its settings and 12 queries together.
 const SCHEMA_DEADLINE: Duration = Duration::from_secs(35);
 /// Roles the editor never runs as (besides any `pg_` name).
-const RESERVED_ROLES: [&str; 6] = [
+const RESERVED_ROLES: [&str; 7] = [
     "cloud_admin",
     "neon_superuser",
     "authenticator",
@@ -70,6 +70,8 @@ const RESERVED_ROLES: [&str; 6] = [
     "chelabase_auth_sync",
     // RT1 P15: realtime's replication login.
     "chelabase_realtime",
+    // Object storage m3: the storage service's BYPASSRLS role.
+    "chelabase_storage",
 ];
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
@@ -1098,6 +1100,16 @@ mod tests {
     fn the_realtime_role_is_reserved() {
         assert!(RESERVED_ROLES.contains(&"chelabase_realtime"), "{RESERVED_ROLES:?}");
         assert!(invalid_role(Some("chelabase_realtime")).is_some());
+    }
+
+    // Object storage m3: the storage service's BYPASSRLS role (and any `chelabase_storage…`
+    // name), named in the explicit list too.
+    #[test]
+    fn the_storage_role_is_reserved() {
+        assert!(RESERVED_ROLES.contains(&"chelabase_storage"), "{RESERVED_ROLES:?}");
+        for role in ["chelabase_storage", "chelabase_storage_x", "Chelabase_Storage"] {
+            assert!(invalid_role(Some(role)).is_some(), "{role}");
+        }
     }
 
     fn rejected(code: &str) -> ConnectError {

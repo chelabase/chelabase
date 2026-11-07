@@ -1,0 +1,2785 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chelabase Storage API",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/storage/v1/bucket": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List the buckets the caller may see",
+        "operationId": "listBuckets",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The buckets the caller's policies show, by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {}
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create a bucket",
+        "description": "Runs as the key's role: an insert policy on `storage.buckets` decides.",
+        "operationId": "createBucket",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bucket"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`, `invalid_value`, `reserved_bucket_name`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied` (no policy allows it), `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: a bucket of that name exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/bucket/{name}": {
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete an empty bucket",
+        "description": "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused (a write-once one holding objects, for good: its objects can't be deleted).",
+        "operationId": "deleteBucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The bucket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "`database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`bucket_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`bucket_not_empty`: it holds objects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Change a bucket",
+        "description": "Runs as the key's role: the update policy on `storage.buckets` decides.",
+        "operationId": "updateBucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The bucket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "400": {
+            "description": "`invalid_request`, `invalid_value`, `reserved_bucket_name`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied`, `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`bucket_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the new name is taken; `write_once`: turned off, or a write-once bucket holding objects renamed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/copy": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Copy an object",
+        "description": "Reads the source as the caller, checks the destination's policies, copies the blob to a new version and writes the destination row as the caller.",
+        "operationId": "copyObject",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Relocate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`version_id` of the copy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the destination bucket is outside the grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit); the source may be, since a copy only reads it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The source is missing or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The destination exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the destination bucket's limit; nothing is written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: a type the destination bucket doesn't allow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/list/{bucket}": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List a bucket's objects",
+        "description": "As the caller: only the objects its policies show. With a delimiter, each folder and each file once.",
+        "operationId": "listObjects",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListObjects"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`, `id`: a file's object id, or for a folder the id of one object under it) and `next_cursor`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/move": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Move or rename an object",
+        "description": "Metadata only: the blob stays where it is. Moving to another bucket needs a ticket for the same version, written by storage once the caller can see the source.",
+        "operationId": "moveObject",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Relocate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Moved"
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes) (the source or the destination)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The source is missing or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the destination exists; `write_once`: the source's bucket is write-once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the destination bucket's limit; nothing changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: a type the destination bucket doesn't allow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/public/{branch}/{bucket}/{*name}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Download from a public bucket",
+        "description": "No key. Only a bucket with `public = true`; cached for an hour (`Cache-Control: public, max-age=3600`). `Range`, `If-None-Match` and the sandboxed headers as a signed download.",
+        "operationId": "publicDownload",
+        "parameters": [
+          {
+            "name": "branch",
+            "in": "path",
+            "description": "The branch the bucket is on",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or the bucket isn't public",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storage/v1/object/resolve": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Resolve object refs to URLs",
+        "description": "For each ref, in order (`{bucket_id, name}` as a `storage.object_ref` holds it, `{bucket, name}` for a text column marked `@storage_ref bucket=`, or `{id}` for a foreign key to `storage.objects(id)`): a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
+        "operationId": "resolveObjects",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`urls`: one per ref, in order, each a path on the API host or `null`; `expires_at`: the signed URLs' expiry (seconds since the epoch)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: over 1000 refs, a malformed ref, or `expires_in` outside 1 to 604800",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`, `database_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/sign/{bucket}/{*name}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Download through a signed URL",
+        "description": "No key: the token is the credential. `Range` and `If-None-Match` as a download. Served sandboxed (`Content-Security-Policy: sandbox`, `nosniff`); anything but an image (not SVG), video, audio, PDF or plain text is an attachment.",
+        "operationId": "signedDownload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "The token the signed URL carries.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`invalid_token`, `token_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`token_not_valid`: another object's token, or its key was revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`object_not_found`: overwritten or deleted since (the signed version is no longer current; a branch reset or restore that makes it current again serves it again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create a signed download URL",
+        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires, after an overwrite as after a delete; only revoking the key that minted it (or the URL expiring) ends it for good. Sign again to link to a new version.",
+        "operationId": "signObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`signed_url` (a path on the API host) and `expires_at` (seconds since the epoch)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: `expires_in` outside 1 to 604800",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/upload/sign/{bucket}/{*name}": {
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload through a one-time URL",
+        "description": "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters, at most 255 bytes.",
+        "operationId": "signedUpload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "description": "The token the signed URL carries.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored: `bucket`, `name`, `version_id`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters, or is over 255 bytes (refused before the URL is spent, so it takes the corrected upload)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`invalid_token`, `token_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`token_not_valid`: used already, another object's, its key was revoked or its role changed, or the app user's session ended; `not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the bucket's file size limit (the URL is spent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: the type isn't on the bucket's `allowed_mime_types` (the URL is spent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create a one-time upload URL",
+        "description": "The caller must be able to see the bucket. The URL takes one upload (`PUT`) without a key, as the caller (its role and claims): row level security decides then. Whether it may replace an existing object is fixed here (`upsert`). An app user's URL never outlives the user's session and fails once the session ends.",
+        "operationId": "signUpload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignUploadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`signed_url` (a path on the API host) and `expires_at`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/{bucket}": {
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete several objects",
+        "operationId": "deleteObjects",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteObjects"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`deleted`: the names deleted (those missing or hidden are left out)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes), or `names` lists 0 or over 1000 objects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the delete ran past the timeout (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/{bucket}/{*name}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Download an object",
+        "description": "`Range` (one range) answers 206 with `Content-Range`; a matching `If-None-Match` answers 304.",
+        "operationId": "downloadObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The range asked for"
+          },
+          "304": {
+            "description": "Not modified"
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "`range_not_satisfiable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload an object (as POST)",
+        "operationId": "putObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "As POST",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload an object",
+        "description": "Streams the body (any length, chunked included). Row level security on `storage.objects` decides, before any byte is stored and again when the row is written.",
+        "operationId": "uploadObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The object's name: at most 1024 bytes of UTF-8, no control characters, no leading `/`, no empty segment and none made only of dots (`.`, `..`, full-width or other NFKC dot forms)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored: `bucket`, `name`, `version_id`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name is taken (no upsert), or another upload changed it first; `write_once`: an upsert over an object of a write-once bucket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the bucket's file size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: the declared type, or the type the first bytes are recognised as, isn't on the bucket's `allowed_mime_types`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`storage_error`: the object store failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`, `busy` (too many uploads in flight)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete an object",
+        "operationId": "deleteObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the delete ran past the timeout (nothing is deleted; try again)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "An object's headers",
+        "operationId": "headObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object's headers"
+          },
+          "404": {
+            "description": "Missing or hidden"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "The parts received",
+        "operationId": "listParts",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`bucket`, `name`, `expires_at`, `parts` (`part_number`, `size`, `etag`)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Abort a resumable upload",
+        "operationId": "abortUpload",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Aborted: its parts are gone"
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}/complete": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Complete a resumable upload",
+        "description": "Parts 1 to n with none missing make the object, atomically: the total is held to the bucket's current `file_size_limit`, and the caller's policies on `storage.objects` decide again before and as the row is written. A refusal (403, 413, 415) aborts the upload.",
+        "operationId": "completeUpload",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored: `bucket`, `name`, `version_id`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last; `invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`: the policies no longer allow it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won; `write_once`: an upsert over an object of a write-once bucket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}/{part}": {
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload one part",
+        "description": "Part numbers are 1 to 10000; a part is 5 MiB to 100 MiB, but the last may be smaller. Sending a part again replaces it. Its bytes are counted as they arrive and held to the bucket's `file_size_limit` less the other parts'. Part 1's first bytes must be a type the bucket allows.",
+        "operationId": "uploadPart",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "part",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`part_number`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`: missing, finished, or another caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over 100 MiB or the bucket's limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`busy`: too many uploads in flight; `storage_unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/{bucket}/{*name}": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Start a resumable upload",
+        "description": "Checks the declared `Content-Type` against the bucket's `allowed_mime_types` and the caller's INSERT (or, with `upsert`, its UPDATE) policies on `storage.objects`, then opens a session for 24 hours. Upload parts of 5 MiB to 100 MiB (the last may be smaller), then complete it. The body is empty.",
+        "operationId": "createUpload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The object's name, as for an upload",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`id` (the session), `bucket`, `name`, `expires_at` (Unix seconds), `min_part_size`, `max_part_size`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`: no policy allows the write, or the caller can't see the bucket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name is taken (no upsert); `write_once`: an upsert over an object of a write-once bucket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Bucket": {
+        "type": "object",
+        "description": "A bucket as created.",
+        "required": [
+          "id",
+          "name",
+          "public",
+          "write_once"
+        ],
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "public": {
+            "type": "boolean"
+          },
+          "write_once": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BucketIdRef": {
+        "type": "object",
+        "description": "An object by its bucket's id and its name: a `storage.object_ref` value.",
+        "required": [
+          "bucket_id",
+          "name"
+        ],
+        "properties": {
+          "bucket_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "BucketRef": {
+        "type": "object",
+        "description": "An object by its bucket's name and its name: a text column marked\n`@storage_ref bucket=<bucket>` holds the name.",
+        "required": [
+          "bucket",
+          "name"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateBucket": {
+        "type": "object",
+        "description": "A new bucket.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Bytes; above 0."
+          },
+          "name": {
+            "type": "string"
+          },
+          "public": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default false."
+          },
+          "write_once": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default false. Write-once: an object is uploaded once and never overwritten, moved,\nrenamed or deleted, by anyone (409 `write_once`), so its public URL is permanent. Once\ntrue, never false again; holding objects, the bucket is neither deleted nor renamed."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeleteObjects": {
+        "type": "object",
+        "description": "Objects to delete.",
+        "required": [
+          "names"
+        ],
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "At most 1000."
+          }
+        },
+        "additionalProperties": false
+      },
+      "IdRef": {
+        "type": "object",
+        "description": "An object by its id: a column with a foreign key to `storage.objects(id)`.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListObjects": {
+        "type": "object",
+        "description": "A page of a bucket's objects.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`next_cursor` of the previous page.",
+            "default": null
+          },
+          "delimiter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Group names by the next occurrence of it after the prefix into folders (`/`, typically).",
+            "default": null
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "1 to 1000 (default 100).",
+            "default": null
+          },
+          "order": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`asc` (default) or `desc`.",
+            "default": null
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Only names starting with it.",
+            "default": ""
+          },
+          "search": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only names containing it (case-insensitive).",
+            "default": null
+          },
+          "sort_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`name` (default), `size` or `updated_at`.",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "ObjectRef": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/BucketIdRef"
+          },
+          {
+            "$ref": "#/components/schemas/BucketRef"
+          },
+          {
+            "$ref": "#/components/schemas/IdRef"
+          }
+        ],
+        "description": "One object to resolve, named one of three ways."
+      },
+      "Relocate": {
+        "type": "object",
+        "description": "A copy or a move.",
+        "required": [
+          "bucket",
+          "from",
+          "to"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "to_bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The destination bucket (default: the same)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResolveBody": {
+        "type": "object",
+        "description": "The refs to resolve, and the signed URLs' lifetime.",
+        "required": [
+          "refs"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600."
+          },
+          "refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectRef"
+            },
+            "description": "At most 1000, each `{bucket_id, name}`, `{bucket, name}` or `{id}`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SignBody": {
+        "type": "object",
+        "description": "A signed URL's lifetime.",
+        "properties": {
+          "expires_in": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds, 1 to 604800 (7 days); default 3600.",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "SignUploadBody": {
+        "type": "object",
+        "description": "An upload URL's lifetime, and whether its upload may replace an existing object.",
+        "properties": {
+          "expires_in": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds, 1 to 604800 (7 days); default 3600. An app user's URL never outlives the\nuser's session.",
+            "default": null
+          },
+          "upsert": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The upload may replace an existing object (also `?upsert=true` or `x-upsert: true` on\nthis request). Fixed here: the uploader can't change it.",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "StorageErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable: `unauthorized`, `invalid_request`, `invalid_value`, `permission_denied`,\n`database_not_allowed`, `role_not_allowed`, `bucket_not_found`, `bucket_not_empty`,\n`conflict`, `storage_unavailable`, `unavailable`, `internal`."
+          },
+          "message": {
+            "type": "string",
+            "description": "What went wrong, for a person; not stable."
+          },
+          "sqlstate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The SQLSTATE of a mapped database error."
+          }
+        }
+      },
+      "StorageErrorEnvelope": {
+        "type": "object",
+        "description": "Every storage error: `{\"error\": {...}}`, the data API's envelope.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/StorageErrorBody"
+          }
+        }
+      },
+      "UpdateBucket": {
+        "type": "object",
+        "description": "A bucket's changes; a field left out stays as it is.",
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new name (not of a write-once bucket holding objects)."
+          },
+          "public": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "write_once": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Turned on at any time, never off again (409 `write_once`)."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "data API key",
+        "description": "A data API key (`chk_pub_…` or `chk_sec_…`) as `Authorization: Bearer <key>`"
+      }
+    }
+  }
+}

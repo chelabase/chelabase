@@ -102,6 +102,13 @@ pub enum Purpose {
     /// A member's hidden login role password (`cb_m_…`, bound to its branch and name, see
     /// [`seal_member_role_password`]).
     MemberRole,
+    /// The `chelabase_storage` login's password on a branch (the storage service's own).
+    Storage,
+    /// The key storage signs its object URLs with ([`derive_key`]; never a sealed value).
+    StorageUrl,
+    /// A storage webhook endpoint's signing secret (bound to the endpoint, see
+    /// [`seal_webhook_secret`]).
+    Webhook,
 }
 
 impl Purpose {
@@ -112,8 +119,22 @@ impl Purpose {
             Purpose::DataKey => "data_key",
             Purpose::Role => "role",
             Purpose::MemberRole => "member_role",
+            Purpose::Storage => "storage",
+            Purpose::StorageUrl => "storage_url",
+            Purpose::Webhook => "webhook",
         }
     }
+}
+
+/// A 32-byte key for one `purpose` and generation (`kid`), derived from `key`:
+/// HMAC-SHA256 over a fixed label, so no two purposes or generations share a key and the
+/// derived key reveals nothing of `key`.
+pub fn derive_key(key: &SecretKey, purpose: Purpose, kid: u32) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.0.as_slice())
+        .expect("HMAC accepts any key size");
+    mac.update(format!("chelabase:derive:{}:{kid}", purpose.as_str()).as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 /// Encrypt `plaintext`, authenticated with `aad` (it only opens with the same `aad`).
@@ -175,6 +196,21 @@ pub fn open_member_role_password(
     sealed: &str,
 ) -> Result<String, SecretsError> {
     open(key, &member_role_aad(branch_id, role), sealed)
+}
+
+/// Seal a storage webhook endpoint's signing secret; the AAD is `{endpoint_id}:webhook`, so it
+/// opens only for that endpoint.
+pub fn seal_webhook_secret(key: &SecretKey, endpoint_id: uuid::Uuid, secret: &str) -> String {
+    seal_credential(key, &endpoint_id.to_string(), Purpose::Webhook, secret)
+}
+
+/// Open a value from [`seal_webhook_secret`] for the same endpoint.
+pub fn open_webhook_secret(
+    key: &SecretKey,
+    endpoint_id: uuid::Uuid,
+    sealed: &str,
+) -> Result<String, SecretsError> {
+    open_credential(key, &endpoint_id.to_string(), Purpose::Webhook, sealed)
 }
 
 fn member_role_aad(branch_id: uuid::Uuid, role: &str) -> String {
@@ -295,6 +331,46 @@ mod tests {
 }
 
 #[cfg(test)]
+mod derive_tests {
+    use super::*;
+
+    #[test]
+    fn derived_keys_are_stable_and_bound_to_key_purpose_and_generation() {
+        let key = SecretKey::from_base64(&STANDARD.encode([7u8; 32])).unwrap();
+        let a = derive_key(&key, Purpose::StorageUrl, 1);
+        assert_eq!(a, derive_key(&key, Purpose::StorageUrl, 1));
+        assert_ne!(a, derive_key(&key, Purpose::StorageUrl, 2));
+        assert_ne!(a, derive_key(&key, Purpose::Storage, 1));
+        assert_ne!(a, derive_key(&SecretKey::generate(), Purpose::StorageUrl, 1));
+        assert_ne!(&a[..], &[7u8; 32][..]);
+        assert_eq!(Purpose::StorageUrl.as_str(), "storage_url");
+    }
+}
+
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+
+    // m18: a storage webhook's signing secret opens only for its own endpoint, and never as
+    // another purpose's credential (nor the reverse).
+    #[test]
+    fn webhook_secrets_bind_their_endpoint_and_purpose() {
+        let key = SecretKey::generate();
+        assert_eq!(Purpose::Webhook.as_str(), "webhook");
+        let (endpoint, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let sealed = seal_webhook_secret(&key, endpoint, "whsec_x");
+        assert_eq!(open_webhook_secret(&key, endpoint, &sealed).unwrap(), "whsec_x");
+        assert!(matches!(open_webhook_secret(&key, other, &sealed), Err(SecretsError::Decrypt)));
+        assert_eq!(open(&key, &format!("{endpoint}:webhook"), &sealed).unwrap(), "whsec_x");
+        for purpose in [Purpose::Owner, Purpose::DataKey, Purpose::Storage] {
+            let as_other = seal_credential(&key, &endpoint.to_string(), purpose, "whsec_x");
+            assert!(open_webhook_secret(&key, endpoint, &as_other).is_err(), "{purpose:?}");
+            assert!(open_credential(&key, &endpoint.to_string(), purpose, &sealed).is_err(), "{purpose:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod key_check_tests {
     use super::*;
 
@@ -330,8 +406,9 @@ mod credential_tests {
     #[test]
     fn authenticator_and_data_key_purposes_round_trip_and_differ_in_aad() {
         let key = SecretKey::generate();
-        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey];
+        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey, Purpose::Storage];
         assert_eq!(Purpose::Owner.as_str(), "owner");
+        assert_eq!(Purpose::Storage.as_str(), "storage");
         assert_eq!(Purpose::Authenticator.as_str(), "authenticator");
         assert_eq!(Purpose::DataKey.as_str(), "data_key");
         for sealed_for in all {

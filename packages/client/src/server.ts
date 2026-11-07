@@ -15,11 +15,46 @@ import {
   sessionCookies,
 } from "./cookies.ts";
 import { toError } from "./error.ts";
+import type { StorageOptions } from "./storage.ts";
 import type { Client, DatabaseShape, TypeMap } from "./types.ts";
 
 export type { CookieAttributes, CookieOptions, CookieToSet } from "./cookies.ts";
 export { type AuthHandlerOptions, createAuthHandler } from "./handler.ts";
 export { parseCookies, serializeCookie } from "./cookies.ts";
+// Storage webhooks: verify a delivery's signature (object-storage m18).
+export {
+  type StorageEvent,
+  type StorageEventType,
+  type VerifyWebhookOptions,
+  verifyWebhook,
+  WebhookVerificationError,
+  type WebhookVerificationReason,
+} from "./webhooks.ts";
+// `StorageError` itself comes from `@chelabase/client`.
+export type { StorageErrorCode } from "./storage-errors.ts";
+export type {
+  Bucket,
+  CreateBucket,
+  DownloadOptions,
+  FileList,
+  FileObject,
+  ListOptions,
+  ObjectInfo,
+  PublicUrlOptions,
+  RelocateOptions,
+  SignedUploadUrl,
+  SignedUploadUrlOptions,
+  SignedUrl,
+  SignedUrlOptions,
+  StorageBucket,
+  StorageClient,
+  StorageOptions,
+  UpdateBucket,
+  UploadBody,
+  UploadOptions,
+  UploadProgress,
+  UploadResult,
+} from "./storage.ts";
 
 /**
  * The request's cookies. `setAll` must make the new cookies visible to later `getAll` calls
@@ -51,6 +86,8 @@ export interface ServerClientOptions {
   types?: TypeMap;
   cookieOptions?: CookieOptions;
   cookies: CookieAdapter;
+  /** Storage options: the branch id for `getPublicUrl`, and where resumable uploads are remembered. */
+  storage?: StorageOptions;
 }
 
 /**

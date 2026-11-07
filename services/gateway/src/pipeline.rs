@@ -46,6 +46,12 @@ const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     CLIENT_IP_HEADER,
 ];
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id, x-chelabase-studio";
+/// Any-origin (data key, app user) routes: the request headers `@chelabase/client` sends to the
+/// data API and storage (`x-upsert` and `range` are storage's).
+const CORS_ANY_ALLOW_HEADERS: &str = "authorization, content-type, chelabase-user, x-upsert, range";
+/// Response headers the client reads that aren't CORS-safelisted: an object's `etag`, and a
+/// ranged download's `content-range`.
+const CORS_ANY_EXPOSE_HEADERS: &str = "etag, content-range";
 const CORS_MAX_AGE_SECS: &str = "600";
 
 /// The parts of an incoming request the pipeline looks at.
@@ -310,12 +316,13 @@ impl Pipeline {
             return None;
         };
         if endpoint.policy.cors == Cors::Any {
+            // Exactly the matched endpoint's method: the route table, not a hand list.
             return Some(GatewayResponse {
                 status: 204,
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
-                    ("access-control-allow-methods", "GET, POST".to_string()),
-                    ("access-control-allow-headers", "authorization, content-type, chelabase-user".to_string()),
+                    ("access-control-allow-methods", endpoint.method.as_str().to_string()),
+                    ("access-control-allow-headers", CORS_ANY_ALLOW_HEADERS.to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
                 body: None,
@@ -350,7 +357,12 @@ impl Pipeline {
         match endpoint.policy.cors {
             Cors::None => return Vec::new(),
             // Any origin, never credentials; `*` needs no `Vary`.
-            Cors::Any => return vec![("access-control-allow-origin", "*".to_string())],
+            Cors::Any => {
+                return vec![
+                    ("access-control-allow-origin", "*".to_string()),
+                    ("access-control-expose-headers", CORS_ANY_EXPOSE_HEADERS.to_string()),
+                ]
+            }
             Cors::Studio | Cors::StudioCredentials => {}
         }
         let credentials = endpoint.policy.cors == Cors::StudioCredentials;
@@ -1084,6 +1096,12 @@ mod tests {
         assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some(STUDIO));
         assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("POST"));
         assert_eq!(header(&resp.headers, "vary"), Some("Origin"));
+        // #150: Studio's allow-list is its own, untouched by the any-origin class.
+        assert_eq!(
+            header(&resp.headers, "access-control-allow-headers"),
+            Some("authorization, content-type, x-request-id, x-chelabase-studio")
+        );
+        assert_eq!(header(&resp.headers, "access-control-expose-headers"), None);
     }
 
     #[tokio::test]
@@ -1237,6 +1255,7 @@ mod tests {
         assert_eq!(plan.identity, None);
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some(STUDIO));
         assert_eq!(header(&plan.response_headers, "access-control-allow-credentials"), Some("true"));
+        assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), None);
 
         let other = expect_plan(run(&h.pipeline, "POST", "/auth/v1/sign-in", None, &[("origin", "http://evil.example")]).await.outcome);
         assert_eq!(header(&other.response_headers, "access-control-allow-origin"), None);
@@ -1250,6 +1269,12 @@ mod tests {
             &[("origin", STUDIO), ("access-control-request-method", "POST")]).await.outcome);
         assert_eq!(resp.status, 204);
         assert_eq!(header(&resp.headers, "access-control-allow-credentials"), Some("true"));
+        assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("POST"));
+        assert_eq!(
+            header(&resp.headers, "access-control-allow-headers"),
+            Some("authorization, content-type, x-request-id, x-chelabase-studio")
+        );
+        assert_eq!(header(&resp.headers, "access-control-expose-headers"), None);
     }
 
     /// auth-replacement m8: Studio's `/token` call carries `X-Chelabase-Studio`, which auth
@@ -1452,6 +1477,110 @@ mod tests {
         assert!(h.mock.lookups() <= 25, "{}", h.mock.lookups());
     }
 
+    /// #150: an any-origin preflight allows the method of the endpoint it matched, and only
+    /// that one; a method no endpoint serves on the path gets no CORS grant.
+    #[tokio::test]
+    async fn cors_any_preflight_allows_the_matched_method() {
+        let h = data_harness().await;
+        for (path, method) in [
+            ("/storage/v1/object/upload/sign/files/a%20b.png", "PUT"),
+            ("/storage/v1/object/upload/sign/files/a.png", "POST"),
+            ("/storage/v1/upload/session/s1/1", "PUT"),
+            ("/storage/v1/upload/session/s1", "DELETE"),
+            ("/storage/v1/object/files/a.txt", "PUT"),
+            ("/storage/v1/object/files/a.txt", "DELETE"),
+            ("/storage/v1/object/files/a.txt", "HEAD"),
+            ("/storage/v1/bucket/files", "PATCH"),
+            ("/storage/v1/object/public/main/files/a.txt", "GET"),
+            ("/data/v1/schema", "GET"),
+            ("/data/v1/query", "POST"),
+        ] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[("origin", "https://app.example"), ("access-control-request-method", method)],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(resp.status, 204, "{method} {path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"), "{method} {path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some(method), "{method} {path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
+        }
+        // No grant for a method no endpoint serves on the path.
+        for (path, method) in [
+            ("/data/v1/schema", "PUT"),
+            ("/storage/v1/bucket", "PUT"),
+            ("/storage/v1/bucket", "DELETE"),
+            ("/storage/v1/upload/session/s1", "PUT"),
+        ] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[("origin", "https://app.example"), ("access-control-request-method", method)],
+                )
+                .await
+                .outcome,
+            );
+            assert_ne!(resp.status, 204, "{method} {path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), None, "{method} {path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-methods"), None, "{method} {path}");
+        }
+        assert_eq!(h.mock.lookups(), 0, "preflight does no auth");
+    }
+
+    /// #150: the headers the data API and storage clients send are allowed; the client reads
+    /// `etag` (and a ranged download's `content-range`), so responses expose them.
+    #[tokio::test]
+    async fn cors_any_allows_the_clients_headers_and_exposes_what_they_read() {
+        let h = data_harness().await;
+        for (path, method) in [("/data/v1/query", "POST"), ("/storage/v1/object/files/a.txt", "PUT")] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", method),
+                        ("access-control-request-headers", "authorization, content-type, chelabase-user, x-upsert, range"),
+                    ],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(
+                header(&resp.headers, "access-control-allow-headers"),
+                Some("authorization, content-type, chelabase-user, x-upsert, range"),
+                "{path}"
+            );
+        }
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let bearer = format!("Bearer {key}");
+        let plan = expect_plan(
+            run(
+                &h.pipeline,
+                "HEAD",
+                "/storage/v1/object/files/a.txt",
+                None,
+                &[("authorization", &bearer), ("origin", "https://app.example")],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some("*"));
+        assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), Some("etag, content-range"));
+    }
+
     #[tokio::test]
     async fn cors_any_preflight_and_response_headers() {
         let h = data_harness().await;
@@ -1469,10 +1598,10 @@ mod tests {
             );
             assert_eq!(resp.status, 204, "{path}");
             assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"));
-            assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some("GET, POST"));
+            assert_eq!(header(&resp.headers, "access-control-allow-methods"), Some(method));
             assert_eq!(
                 header(&resp.headers, "access-control-allow-headers"),
-                Some("authorization, content-type, chelabase-user")
+                Some("authorization, content-type, chelabase-user, x-upsert, range")
             );
             assert_eq!(header(&resp.headers, "access-control-max-age"), Some("600"));
             assert_eq!(header(&resp.headers, "access-control-allow-credentials"), None);
@@ -1742,10 +1871,8 @@ mod tests {
             .await
             .outcome,
         );
-        assert_eq!(
-            header(&resp.headers, "access-control-allow-headers"),
-            Some("authorization, content-type, chelabase-user")
-        );
+        let allowed = header(&resp.headers, "access-control-allow-headers").unwrap_or_default();
+        assert!(allowed.split(", ").any(|h| h == "chelabase-user"), "{allowed}");
     }
 
     /// Routes that take only a public key (`Auth::PublicDataKey`, the app auth routes) mint the

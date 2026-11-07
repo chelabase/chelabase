@@ -100,6 +100,12 @@ fn may_publish(text: &str, user: &str, subject: &str) -> bool {
             .any(|p| matches(p, subject))
 }
 
+fn may_subscribe(text: &str, user: &str, subject: &str) -> bool {
+    list(text, user, "subscribe", "allow")
+        .iter()
+        .any(|p| matches(p, subject))
+}
+
 fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -122,6 +128,9 @@ fn the_orchestrator_gets_exactly_the_events_publish_and_stream_rights() {
             "chelabase.member_roles.reconcile",
             "chelabase.rt.project.>",
             "chelabase.rt.access.>",
+            // Object storage m9: its cache events (exactly that subject: m18's object events
+            // are storage's to publish).
+            "chelabase.storage.events",
             "$JS.API.STREAM.INFO.CHELABASE_CONTROL",
             "$JS.API.STREAM.CREATE.CHELABASE_CONTROL",
             "$JS.API.STREAM.UPDATE.CHELABASE_CONTROL",
@@ -129,6 +138,10 @@ fn the_orchestrator_gets_exactly_the_events_publish_and_stream_rights() {
             "$JS.API.STREAM.INFO.CHELABASE_NEON_EVENTS",
             "$JS.API.STREAM.CREATE.CHELABASE_NEON_EVENTS",
             "$JS.API.STREAM.UPDATE.CHELABASE_NEON_EVENTS",
+            // m18: it creates or fixes the object events stream.
+            "$JS.API.STREAM.INFO.CHELABASE_STORAGE_EVENTS",
+            "$JS.API.STREAM.CREATE.CHELABASE_STORAGE_EVENTS",
+            "$JS.API.STREAM.UPDATE.CHELABASE_STORAGE_EVENTS",
         ])
     );
     assert!(list(&text, "orchestrator", "publish", "deny").is_empty());
@@ -166,6 +179,12 @@ fn the_worker_gets_exactly_the_filtered_consumer_rights() {
             "$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.*.chelabase.neon.attached.*",
             "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_NEON_EVENTS.*",
             "$JS.API.CONSUMER.DELETE.CHELABASE_NEON_EVENTS.*",
+            // m18: one webhook consumer per endpoint, filtered to its database's subject.
+            "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS.*.chelabase.storage.events.*",
+            "$JS.API.CONSUMER.INFO.CHELABASE_STORAGE_EVENTS.*",
+            "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_STORAGE_EVENTS.*",
+            "$JS.API.CONSUMER.DELETE.CHELABASE_STORAGE_EVENTS.*",
+            "$JS.ACK.CHELABASE_STORAGE_EVENTS.>",
         ])
     );
     assert_eq!(
@@ -393,4 +412,63 @@ fn up_restarts_valkey_only_for_a_changed_acl_on_a_running_stack() {
     assert!(!valkey_needs_restart(true, false));
     assert!(!valkey_needs_restart(false, true));
     assert!(!valkey_needs_restart(false, false));
+}
+
+// Object storage m9: storage's NATS user listens to exactly the subjects it handles. m18: it
+// publishes only object events, one database token deep; never a cache event, a job, an RPC
+// or a reply, and no stream or consumer API.
+#[test]
+fn storage_only_listens_to_its_cache_events() {
+    let text = rendered();
+    assert_eq!(as_set(list(&text, "storage", "publish", "allow")), set(&["chelabase.storage.events.*"]));
+    assert!(list(&text, "storage", "publish", "deny").is_empty());
+    assert!(may_publish(&text, "storage", "chelabase.storage.events.0b6c2f0e-1111-4c3e-9a3e-000000000001"));
+    for subject in [
+        "chelabase.storage.events",
+        "chelabase.storage.events.a.b",
+        "chelabase.provision",
+        "chelabase.rpc.check_data_role",
+        "_INBOX_storage.x",
+        "_INBOX_orchestrator.x",
+        "$JS.API.STREAM.DELETE.CHELABASE_STORAGE_EVENTS",
+        "$JS.API.STREAM.PURGE.CHELABASE_STORAGE_EVENTS",
+        "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS",
+    ] {
+        assert!(!may_publish(&text, "storage", subject), "{subject}");
+    }
+    assert_eq!(
+        as_set(list(&text, "storage", "subscribe", "allow")),
+        set(&["chelabase.rt.project.*", "chelabase.rt.access.*", "chelabase.storage.events", "_INBOX_storage.>"])
+    );
+    // Exactly the subjects it handles: one project or tenant token, nothing deeper.
+    for subject in ["chelabase.rt.project.p.x", "chelabase.rt.access.t.member", "chelabase.storage.other"] {
+        assert!(!may_subscribe(&text, "storage", subject), "{subject}");
+    }
+    // Only the orchestrator (and the runner, as it) publishes the storage events.
+    for user in ["worker", "realtime"] {
+        assert!(!may_publish(&text, user, "chelabase.storage.events"), "{user}");
+    }
+    assert!(may_publish(&text, "orchestrator", "chelabase.storage.events"));
+    // m18: nobody but storage (and the runner) publishes an object event; the worker reads them
+    // only through its filtered consumers.
+    let object_event = "chelabase.storage.events.0b6c2f0e-1111-4c3e-9a3e-000000000001";
+    for user in ["orchestrator", "worker", "realtime"] {
+        assert!(!may_publish(&text, user, object_event), "{user}");
+        assert!(!may_subscribe(&text, user, object_event), "{user}");
+    }
+    let filtered = format!("$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS.storage-webhook-x.{object_event}");
+    assert!(may_publish(&text, "worker", &filtered));
+    for refused in [
+        "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS",
+        "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS.storage-webhook-x",
+        "$JS.API.CONSUMER.CREATE.CHELABASE_STORAGE_EVENTS.storage-webhook-x.chelabase.storage.events",
+        "$JS.API.STREAM.DELETE.CHELABASE_STORAGE_EVENTS",
+        "$JS.API.STREAM.PURGE.CHELABASE_STORAGE_EVENTS",
+        "$JS.API.STREAM.UPDATE.CHELABASE_STORAGE_EVENTS",
+    ] {
+        assert!(!may_publish(&text, "worker", refused), "{refused}");
+    }
+    for refused in ["$JS.API.STREAM.DELETE.CHELABASE_STORAGE_EVENTS", "$JS.API.STREAM.PURGE.CHELABASE_STORAGE_EVENTS"] {
+        assert!(!may_publish(&text, "runner", refused), "{refused}");
+    }
 }

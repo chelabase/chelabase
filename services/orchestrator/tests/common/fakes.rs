@@ -9,6 +9,7 @@ use chelabase_metadata::{
     AppSession, AppUsersStatus, BeginEnable, BeginProjectDelete, BranchAuthSync, NewProjectAuth, OnDelete, ProjectAuth,
     ProjectRecord, RenameProject, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
     BranchBusy, MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
+    NewStorageWebhook, StorageWebhook, StorageWebhookAttempt, StorageWebhookPatch,
 };
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, MergeJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
@@ -93,6 +94,9 @@ struct FakeMetadata {
     project_auth_batch_reads: Arc<AtomicUsize>,
     /// Saved queries with their (database, user).
     saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
+    /// m18: storage webhooks with their sealed secrets, and attempts by webhook.
+    storage_webhooks: Arc<Mutex<Vec<(StorageWebhook, String)>>>,
+    storage_webhook_attempts: Arc<Mutex<Vec<(uuid::Uuid, StorageWebhookAttempt)>>>,
     /// Merge rows and their events.
     merges: Arc<Mutex<Vec<MergeRecord>>>,
     merge_events: Arc<Mutex<Vec<MergeEvent>>>,
@@ -611,6 +615,7 @@ fn sample_database(tenant_id: TenantId) -> Db {
         max_rows: 1000,
         statement_timeout_ms: 8000,
         max_connections: 5,
+        storage_max_connections: 2,
     })
 }
 
@@ -1045,6 +1050,9 @@ impl MetadataPort for FakeMetadata {
                 }
                 if let Some(v) = patch.max_connections {
                     db.max_connections = v;
+                }
+                if let Some(v) = patch.storage_max_connections {
+                    db.storage_max_connections = v;
                 }
                 Ok(true)
             }
@@ -1652,6 +1660,120 @@ impl MetadataPort for FakeMetadata {
         Ok(SavedQueryWrite::Saved(q.clone()))
     }
 
+    async fn create_storage_webhook(&self, new: &NewStorageWebhook<'_>) -> Result<Option<StorageWebhook>, MetadataError> {
+        let mut rows = self.storage_webhooks.lock().unwrap();
+        if rows.iter().filter(|(w, _)| w.database_id == new.database_id).count() as i64
+            >= chelabase_metadata::STORAGE_WEBHOOK_CAP
+        {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now();
+        let w = StorageWebhook {
+            id: new.id,
+            database_id: new.database_id,
+            url: new.url.to_string(),
+            events: new.events.to_vec(),
+            bucket: new.bucket.map(Into::into),
+            prefix: new.prefix.map(Into::into),
+            enabled: true,
+            enabled_since: now,
+            disabled_reason: None,
+            failing_since: None,
+            consecutive_failures: 0,
+            last_attempt_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        rows.push((w.clone(), new.secret_enc.to_string()));
+        Ok(Some(w))
+    }
+
+    async fn list_storage_webhooks(&self, database: uuid::Uuid) -> Result<Vec<StorageWebhook>, MetadataError> {
+        let rows = self.storage_webhooks.lock().unwrap();
+        Ok(rows.iter().filter(|(w, _)| w.database_id == database).map(|(w, _)| w.clone()).collect())
+    }
+
+    async fn get_storage_webhook(&self, database: uuid::Uuid, id: uuid::Uuid) -> Result<Option<StorageWebhook>, MetadataError> {
+        let rows = self.storage_webhooks.lock().unwrap();
+        Ok(rows.iter().find(|(w, _)| w.database_id == database && w.id == id).map(|(w, _)| w.clone()))
+    }
+
+    async fn update_storage_webhook(
+        &self,
+        database: uuid::Uuid,
+        id: uuid::Uuid,
+        patch: &StorageWebhookPatch,
+    ) -> Result<Option<StorageWebhook>, MetadataError> {
+        let mut rows = self.storage_webhooks.lock().unwrap();
+        let Some((w, _)) = rows.iter_mut().find(|(w, _)| w.database_id == database && w.id == id) else {
+            return Ok(None);
+        };
+        if let Some(url) = &patch.url {
+            w.url = url.clone();
+        }
+        if let Some(events) = &patch.events {
+            w.events = events.clone();
+        }
+        if let Some(bucket) = &patch.bucket {
+            w.bucket = bucket.clone();
+        }
+        if let Some(prefix) = &patch.prefix {
+            w.prefix = prefix.clone();
+        }
+        match patch.enabled {
+            Some(true) if !w.enabled => {
+                w.enabled = true;
+                w.enabled_since = chrono::Utc::now();
+                w.disabled_reason = None;
+                w.failing_since = None;
+                w.consecutive_failures = 0;
+            }
+            Some(false) if w.enabled => {
+                w.enabled = false;
+                w.disabled_reason = Some("member".into());
+            }
+            _ => {}
+        }
+        Ok(Some(w.clone()))
+    }
+
+    async fn delete_storage_webhook(&self, database: uuid::Uuid, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        let mut rows = self.storage_webhooks.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|(w, _)| !(w.database_id == database && w.id == id));
+        Ok(rows.len() < before)
+    }
+
+    async fn rotate_storage_webhook_secret(
+        &self,
+        database: uuid::Uuid,
+        id: uuid::Uuid,
+        secret_enc: &str,
+    ) -> Result<Option<StorageWebhook>, MetadataError> {
+        let mut rows = self.storage_webhooks.lock().unwrap();
+        Ok(rows.iter_mut().find(|(w, _)| w.database_id == database && w.id == id).map(|(w, sealed)| {
+            *sealed = secret_enc.to_string();
+            w.clone()
+        }))
+    }
+
+    async fn list_storage_webhook_attempts(
+        &self,
+        database: uuid::Uuid,
+        id: uuid::Uuid,
+        limit: i64,
+    ) -> Result<Vec<StorageWebhookAttempt>, MetadataError> {
+        let known = self.storage_webhooks.lock().unwrap().iter().any(|(w, _)| w.database_id == database && w.id == id);
+        let attempts = self.storage_webhook_attempts.lock().unwrap();
+        Ok(attempts
+            .iter()
+            .rev()
+            .filter(|(w, _)| known && *w == id)
+            .take(limit as usize)
+            .map(|(_, a)| a.clone())
+            .collect())
+    }
+
     async fn delete_saved_query(&self, database: uuid::Uuid, by: SavedQueryEditor, id: uuid::Uuid) -> Result<bool, MetadataError> {
         let mut rows = self.saved_queries.lock().unwrap();
         let before = rows.len();
@@ -2091,6 +2213,8 @@ enum FakeReset {
 
 #[derive(Clone, Default)]
 struct FakeJobs {
+    /// Object storage m9: the storage cache events published.
+    storage_events: Arc<Mutex<Vec<chelabase_nats::StorageEvent>>>,
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
     deleted: Arc<Mutex<Vec<DatabaseId>>>,
     resets: Arc<Mutex<Vec<(DatabaseId, BranchId)>>>,
@@ -2158,6 +2282,9 @@ struct FakeJobs {
     /// EOS-H1: each all-rows check request, and what every one answers (unset: `Clear`).
     all_rows_checks: Arc<Mutex<Vec<chelabase_nats::AllRowsCheckRequest>>>,
     all_rows_reply: Arc<Mutex<Option<Result<chelabase_nats::AllRowsCheckReply, ResetError>>>>,
+    /// m18: each storage webhook test request, and what every one answers (unset: delivered).
+    webhook_tests: Arc<Mutex<Vec<chelabase_nats::storage_objects::TestRequest>>>,
+    webhook_test_reply: Arc<Mutex<Option<Result<chelabase_nats::storage_objects::TestReply, ResetError>>>>,
 }
 
 /// A metadata store of member-role rows and the rows a reconcile writes into it.
@@ -2222,6 +2349,14 @@ impl JobPort for FakeJobs {
         Ok(())
     }
 
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.storage_events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+
     async fn check_data_role(
         &self,
         branch_id: BranchId,
@@ -2277,6 +2412,20 @@ impl JobPort for FakeJobs {
     ) -> Result<MemberRolesReply, ResetError> {
         self.member_hand_overs.lock().unwrap().push(request);
         Ok(MemberRolesReply::Done { roles: vec![] })
+    }
+
+    async fn test_storage_webhook(
+        &self,
+        request: chelabase_nats::storage_objects::TestRequest,
+    ) -> Result<chelabase_nats::storage_objects::TestReply, ResetError> {
+        self.webhook_tests.lock().unwrap().push(request);
+        self.webhook_test_reply.lock().unwrap().clone().unwrap_or(Ok(
+            chelabase_nats::storage_objects::TestReply::Sent {
+                outcome: chelabase_nats::storage_objects::AttemptOutcome::Delivered,
+                status: Some(200),
+                duration_ms: 7,
+            },
+        ))
     }
 
     async fn review(
@@ -2693,6 +2842,19 @@ async fn spawn_app(metadata: FakeMetadata, jobs: FakeJobs) -> TestApp {
 }
 
 const REST_TOKEN: &str = "rest-internal-token";
+/// m9: storage's console bearer, and where the next app built on this thread sends Studio's
+/// storage routes ([`use_storage`]; nothing listens by default).
+const STORAGE_TOKEN: &str = "storage-internal-token";
+thread_local! {
+    static STORAGE_URL: std::cell::RefCell<String> = std::cell::RefCell::new("http://127.0.0.1:9".into());
+}
+fn storage_url() -> String {
+    STORAGE_URL.with(|u| u.borrow().clone())
+}
+#[allow(dead_code)]
+fn use_storage(url: &str) {
+    STORAGE_URL.with(|u| *u.borrow_mut() = url.to_owned());
+}
 
 async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
     spawn_app_in_mode(metadata, jobs, rest_url, Mode::SelfHosted).await
@@ -2852,6 +3014,29 @@ async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: O
     .await
 }
 
+/// m18: the webhook URL policy tests use: `https` only, a fake resolver (`hooks.example.test`
+/// is public, `private.example.test` resolves to 10.0.0.7, `inside.example.test` too but is
+/// allowlisted; anything else doesn't resolve).
+fn webhook_outbound() -> chelabase_http::outbound::Outbound {
+    struct Dns;
+    impl chelabase_http::outbound::HostLookup for Dns {
+        fn lookup<'a>(
+            &'a self,
+            host: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> + Send + 'a>> {
+            let out = match host {
+                "hooks.example.test" => Ok(vec!["93.184.216.34".parse().unwrap()]),
+                "private.example.test" | "inside.example.test" => Ok(vec!["10.0.0.7".parse().unwrap()]),
+                _ => Err(std::io::Error::other("no such host")),
+            };
+            Box::pin(std::future::ready(out))
+        }
+    }
+    chelabase_http::outbound::Outbound::new()
+        .allow_hosts(["inside.example.test"])
+        .with_lookup(Arc::new(Dns))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_app_core_with(
     metadata: FakeMetadata,
@@ -2885,6 +3070,11 @@ async fn spawn_app_core_with(
             // The production client (no redirects), so tests see what production sees.
             http: chelabase_http::client_builder().build().unwrap(),
         },
+        storage: orchestrator::storage_console::StorageInternal::new(
+            &storage_url(),
+            STORAGE_TOKEN,
+        )
+        .unwrap(),
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
         operator_tenant,
         proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
@@ -2905,6 +3095,7 @@ async fn spawn_app_core_with(
         },
         rt_events: Arc::new(rt_events.clone()),
         proxy_cache: Arc::new(cache.clone()),
+        webhooks: webhook_outbound(),
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))

@@ -19,4 +19,9 @@ export interface UpdateDatabaseRequest {
   max_rows?: number | null;
   /** @nullable */
   statement_timeout_ms?: number | null;
+  /**
+     * Connections the storage service may hold to each branch, apart from `max_connections`.
+     * @nullable
+     */
+  storage_max_connections?: number | null;
 }

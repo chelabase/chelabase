@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `chelabase_pgsession::Conn: QueryClient` is not satisfied
+ --> tests/ui/conn_not_a_query_client.rs:4:13
+  |
+4 |     runs_on(conn);
+  |     ------- ^^^^ the trait `QueryClient` is not implemented for `chelabase_pgsession::Conn`
+  |     |
+  |     required by a bound introduced by this call
+  |
+help: the following other types implement trait `QueryClient`
+ --> $WORKSPACE/crates/chelabase-query/src/pipeline.rs
+  |
+  | impl QueryClient for Client {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `tokio_postgres::client::Client`
+...
+  | impl QueryClient for Lease {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^ `Lease`
+note: required by a bound in `runs_on`
+ --> tests/ui/conn_not_a_query_client.rs:3:19
+  |
+3 |     fn runs_on<C: chelabase_query::QueryClient>(_: &C) {}
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `runs_on`

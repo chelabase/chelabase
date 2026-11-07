@@ -64,7 +64,17 @@ pub fn openapi() -> OpenApi {
         }
     }
     document_access(&mut doc);
+    // m9: a `{*name}` tail (axum's) is the OpenAPI path parameter `{name}` (it may hold `/`).
+    doc.paths.paths = std::mem::take(&mut doc.paths.paths)
+        .into_iter()
+        .map(|(path, item)| (openapi_path(&path), item))
+        .collect();
     doc
+}
+
+/// A route path as OpenAPI writes it: a `{*name}` tail is `{name}`.
+pub fn openapi_path(path: &str) -> String {
+    path.replace("{*", "{")
 }
 
 /// Adds each operation's access answers (from its endpoint's `Access` in `chelabase_routes`,
@@ -545,6 +555,49 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn create_storage_webhook(
+        &self,
+        new: &chelabase_metadata::NewStorageWebhook<'_>,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn list_storage_webhooks(&self, database: Uuid) -> Result<Vec<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn get_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn update_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        patch: &chelabase_metadata::StorageWebhookPatch,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_storage_webhook(&self, database: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn rotate_storage_webhook_secret(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        secret_enc: &str,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn list_storage_webhook_attempts(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<chelabase_metadata::StorageWebhookAttempt>, MetadataError> {
+        match *self {}
+    }
     async fn create_merge(&self, merge: &NewMerge) -> Result<MergeCreate, MetadataError> {
         match *self {}
     }
@@ -688,6 +741,12 @@ impl JobPort for Doc {
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         match *self {}
     }
+    async fn publish_storage_event(
+        &self,
+        event: &chelabase_nats::StorageEvent,
+    ) -> Result<(), BoxError> {
+        match *self {}
+    }
     async fn check_data_role(
         &self,
         branch_id: BranchId,
@@ -711,6 +770,12 @@ impl JobPort for Doc {
         &self,
         request: chelabase_nats::ReviewRequest,
     ) -> Result<chelabase_nats::ReviewReply, ResetError> {
+        match *self {}
+    }
+    async fn test_storage_webhook(
+        &self,
+        request: chelabase_nats::storage_objects::TestRequest,
+    ) -> Result<chelabase_nats::storage_objects::TestReply, ResetError> {
         match *self {}
     }
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
@@ -1080,7 +1145,7 @@ mod tests {
                             | "orchestrator.openapi_json"
                     )
             })
-            .map(|e| (e.method.as_str().to_string(), e.path.to_string()))
+            .map(|e| (e.method.as_str().to_string(), openapi_path(e.path)))
             .collect();
         assert_eq!(documented, registry);
     }
@@ -1212,6 +1277,14 @@ mod tests {
             ("GET /v1/databases/{id}/merges/{merge_id}/plan.sql", "exportMergePlan"),
             ("GET /v1/databases/{id}/personal-logins", "listDatabasePersonalLogins"),
             ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
+            ("GET /v1/databases/{id}/storage/webhooks", "listStorageWebhooks"),
+            ("POST /v1/databases/{id}/storage/webhooks", "createStorageWebhook"),
+            ("GET /v1/databases/{id}/storage/webhooks/{webhook_id}", "getStorageWebhook"),
+            ("PATCH /v1/databases/{id}/storage/webhooks/{webhook_id}", "updateStorageWebhook"),
+            ("DELETE /v1/databases/{id}/storage/webhooks/{webhook_id}", "deleteStorageWebhook"),
+            ("POST /v1/databases/{id}/storage/webhooks/{webhook_id}/rotate-secret", "rotateStorageWebhookSecret"),
+            ("POST /v1/databases/{id}/storage/webhooks/{webhook_id}/test", "testStorageWebhook"),
+            ("GET /v1/databases/{id}/storage/webhooks/{webhook_id}/attempts", "listStorageWebhookAttempts"),
             ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
             ("GET /v1/instance/settings", "getInstanceSettings"),
             ("GET /v1/invites/delivery", "getInviteDelivery"),
@@ -1355,11 +1428,32 @@ mod tests {
             ),
             ("PUT /v1/teams/{team_id}/grants/{project_id}", "putTeamGrant"),
             ("PUT /v1/teams/{team_id}/members/{member_id}", "putTeamMember"),
+            // m9: Studio's storage routes.
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/bucket", "storageListBuckets"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/bucket", "storageCreateBucket"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}", "storageUpdateBucket"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}", "storageDeleteBucket"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/list/{bucket}", "storageListObjects"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageDownloadObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageUploadObject"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storagePutObject"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{name}", "storageDeleteObject"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}", "storageDeleteObjects"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/copy", "storageCopyObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/move", "storageMoveObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/resolve", "storageResolveObjects"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{name}", "storageSignObject"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/{bucket}/{name}", "storageCreateUpload"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/{part}", "storageUploadPart"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageListParts"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/complete", "storageCompleteUpload"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageAbortUpload"),
         ];
-        let expected: Vec<(String, String)> = expected
+        let mut expected: Vec<(String, String)> = expected
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        expected.sort();
         assert_eq!(ids, expected);
         let unique: BTreeSet<_> = ids.iter().map(|(_, id)| id).collect();
         assert_eq!(unique.len(), ids.len(), "operation ids are unique");
@@ -1383,7 +1477,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams", "storage"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -1563,6 +1657,7 @@ mod tests {
             "CreateProjectRequest",
             "CreateRoleRequest",
             "CreateSavedQueryRequest",
+            "CreateStorageWebhookRequest",
             "CreateTable",
             "CreateTeamRequest",
             "CreatedDataKey",
@@ -1714,6 +1809,11 @@ mod tests {
             "SequencePrivilege",
             "SkipReason",
             "StatementResult",
+            "StorageRefDesc",
+            "StorageWebhook",
+            "StorageWebhookAttempt",
+            "StorageWebhookTestResult",
+            "StorageWebhookWithSecret",
             "Table",
             "TableDesc",
             "TableGrant",
@@ -1742,6 +1842,7 @@ mod tests {
             "UpdateProjectRequest",
             "UpdateRoleRequest",
             "UpdateSavedQueryRequest",
+            "UpdateStorageWebhookRequest",
             "UpdateTeamRequest",
             "UpdateTenantRequest",
             "UserStepBody",

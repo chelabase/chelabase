@@ -5,12 +5,14 @@ import type {
   ProjectHandlers,
   ProjectSubscription,
   RealtimeClient,
+  StorageJoinParams,
+  StorageSubscription,
   TableHandlers,
   TableInfo,
   TableJoinParams,
   TableSubscription,
 } from "@/lib/realtime/types";
-import { tableChannelId } from "@/lib/realtime/client";
+import { storageChannelId, tableChannelId } from "@/lib/realtime/client";
 
 /** A fake WebSocket the client tests drive by hand. */
 export class FakeWebSocket {
@@ -66,9 +68,18 @@ export interface FakeTable {
   presence: PresenceState[];
 }
 
+export interface FakeStorage {
+  params: StorageJoinParams;
+  handlers: TableHandlers;
+  channel: string;
+  left: boolean;
+  views: string[][];
+}
+
 /** A `RealtimeClient` that records joins and lets a test play the server. */
 export class FakeRealtime implements RealtimeClient {
   tables: FakeTable[] = [];
+  storages: FakeStorage[] = [];
   projects: { projectId: string; handlers: ProjectHandlers; left: boolean }[] = [];
   tokens: string[] = [];
   closed = false;
@@ -84,6 +95,23 @@ export class FakeRealtime implements RealtimeClient {
       view: (keys) => entry.views.push(keys),
       presence: (state) => entry.presence.push(state),
     };
+  }
+  joinStorage(params: StorageJoinParams, handlers: TableHandlers): StorageSubscription {
+    const entry: FakeStorage = { params, handlers, channel: storageChannelId(params), left: false, views: [] };
+    this.storages.push(entry);
+    return {
+      channel: entry.channel,
+      leave: () => {
+        entry.left = true;
+      },
+      view: (keys) => entry.views.push(keys),
+    };
+  }
+  /** The newest active storage join. */
+  get storage(): FakeStorage {
+    const s = this.storages.filter((x) => !x.left).at(-1);
+    if (!s) throw new Error("no active storage join");
+    return s;
   }
   joinProject(projectId: string, handlers: ProjectHandlers): ProjectSubscription {
     const entry = { projectId, handlers, left: false };

@@ -1,0 +1,94 @@
+---
+title: Webhooks
+description: Signed POSTs to your endpoint for every object created, updated, moved or deleted, with retries and a verification helper.
+---
+
+A database can register endpoints that receive its storage events: make a thumbnail after an upload, index a document, clean up after a delete. Each event is POSTed as signed JSON, at least once, retried for up to 24 hours.
+
+## Register an endpoint
+
+Webhooks are managed per Chelabase database with the Management API (Developer access or above; a Viewer gets 403, a non-member 404). There's no Studio screen for them yet.
+
+```bash
+curl -X POST "$API/v1/databases/$DB/storage/webhooks" -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/hooks/storage","events":["object.created","object.deleted"],"bucket":"avatars","prefix":"public/"}'
+```
+
+- `events`: one or more of `object.created`, `object.updated` (an overwrite), `object.deleted` and `object.moved` (a move or rename).
+- `bucket` and `prefix` (optional) narrow it to one bucket and to names starting with the prefix.
+- `url`: `https`, at most 2048 bytes, no credentials, and resolving only to public addresses (see [Where events may go](#where-events-may-go)).
+
+The answer holds the endpoint and its **secret** (`whsec_…`). It's shown this once: list and get never return it. A database has at most 20 endpoints.
+
+The other routes, under `/v1/databases/{id}/storage/webhooks/{webhook_id}`: `GET`, `PATCH` (change fields, `null` clears `bucket` or `prefix`, `enabled` turns it on or off), `DELETE`, `POST …/rotate-secret` (a new secret, shown once; deliveries use it within seconds), `POST …/test` (sends one signed `webhook.test` event now and answers how it went, without retries or counting a failure) and `GET …/attempts` (the newest 100 delivery attempts: status and duration only).
+
+## What's sent
+
+Each delivery is a `POST` with a JSON body:
+
+```json
+{
+  "id": "0b7c…",
+  "type": "object.created",
+  "time": "2026-11-07T10:12:03.511Z",
+  "database_id": "95b6…",
+  "branch_id": "95b6…",
+  "pg_database": "app",
+  "bucket": "avatars",
+  "name": "public/me.png",
+  "version_id": "4c1e…",
+  "size": 48213,
+  "content_type": "image/png",
+  "actor": { "role": "authenticated", "sub": "2b1c…" }
+}
+```
+
+`object.moved` adds `from: { bucket, name }`. Events never carry the object's bytes or a URL: fetch the object with your own key if you need it. Events come from every branch of the database; use `branch_id` to tell them apart.
+
+The headers are `Chelabase-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`, keyed with the endpoint's secret, plus `Chelabase-Event-Id` and `Chelabase-Event-Type`.
+
+## Verify the signature
+
+`verifyWebhook` in `@chelabase/client/server` checks the signature against the raw body, exactly as received, and the timestamp against a tolerance (300 seconds by default), and returns the typed event:
+
+```ts
+import { verifyWebhook, WebhookVerificationError } from "@chelabase/client/server";
+
+export async function POST(request: Request): Promise<Response> {
+  const raw = await request.text(); // the raw body: never re-serialize parsed JSON
+  try {
+    const event = await verifyWebhook(process.env.STORAGE_WEBHOOK_SECRET!, request.headers, raw, { toleranceSec: 300 });
+    if (await alreadyHandled(event.id)) return new Response(null, { status: 200 });
+    if (event.type === "object.created") await makeThumbnail(event.bucket, event.name);
+    return new Response(null, { status: 200 });
+  } catch (e) {
+    if (e instanceof WebhookVerificationError) return new Response(null, { status: 400 }); // e.reason: malformed, expired or mismatch
+    throw e;
+  }
+}
+```
+
+In another language: split the header at `,`, take `t` and `v1`, compute the HMAC-SHA256 of `t + "." + body` with the secret, compare it with `v1` in constant time, and refuse a `t` too far from now.
+
+## Delivery and retries
+
+- Any `2xx` within 10 seconds is a success. Anything else, a timeout or a redirect (never followed) is a failure.
+- A failed event is retried with exponential backoff and jitter: 5 seconds, then doubling up to an hour between tries, for up to 24 hours after the event. Then it's dropped and counted.
+- Every attempt of an event carries the same `id`. Delivery is at least once, so treat an `id` you've seen as a duplicate.
+- An endpoint that keeps failing for 3 days running is disabled: `enabled` turns false, with `disabled_reason`, `failing_since` and `consecutive_failures` visible in the API. A success, or a quiet spell longer than a day, ends a run of failures. Enabling it again (`PATCH` with `enabled: true`) restarts delivery from then on and clears its failure state.
+- Events wait in a NATS stream until they're delivered. A database keeps at most 100,000 undelivered events; past that its oldest are dropped unsent. Self-hosters: the stream needs space on the NATS volume (see [Install](/self-hosting/install)).
+- If an event can't be published when the write commits, the write still succeeds; the missed event is logged and counted.
+
+Only changes made through the storage API (your app, signed upload URLs, Studio) send events. **Direct SQL on `storage.objects` isn't evented**: a delete in SQL, or one cascading from your own table, sends nothing.
+
+## Where events may go
+
+Webhook URLs are checked when an endpoint is registered or changed, and again on every delivery, at connect time:
+
+- only `https`;
+- the host must resolve only to public addresses. Loopback, private ranges (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10), link-local including the cloud metadata service (169.254.169.254) and their IPv6 equivalents are refused, however the address is written (decimal, octal, hex, IPv4-mapped IPv6). A host that resolves to any refused address is refused as a whole;
+- the address checked is the address dialled, so DNS can't change between the check and the connection; redirects are never followed and no proxy is used;
+- a refusal names the host as you wrote it, never the address it resolved to.
+
+A self-hosted install can relax this for its own network: `CHELABASE_WEBHOOKS_ALLOW_HOSTS` lists host names or IP literals (comma separated, no port) that may resolve to private addresses, and `CHELABASE_WEBHOOKS_ALLOW_HTTP=true` also accepts `http` URLs. Both are empty or false by default. See [Storage settings](/self-hosting/storage-settings).

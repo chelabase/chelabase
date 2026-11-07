@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeWebSocket } from "@/test/fake-realtime";
-import { HIDDEN_LEAVE_MS, MAX_VIEW_KEYS, SUBPROTOCOL, backoffDelay, createRealtimeClient, socketUrl, tableChannelId } from "./client";
+import { HIDDEN_LEAVE_MS, MAX_VIEW_KEYS, SUBPROTOCOL, backoffDelay, createRealtimeClient, socketUrl, storageChannelId, tableChannelId } from "./client";
 import type { SessionEvents, TableHandlers, TableJoinParams } from "./types";
 
 const PARAMS: TableJoinParams = { database_id: "d1", branch_id: "b1", pg_database: "app", schema: "public", table: "invoices", role: null };
@@ -505,5 +505,34 @@ describe("a hidden tab (P9, W23a)", () => {
     s.doc.setVisibility("visible");
     await flush();
     expect(ws.frames("join")).toHaveLength(1);
+  });
+});
+
+// Object storage m17: a bucket's storage channel.
+describe("storage channels", () => {
+  const STORAGE = { database_id: "d1", branch_id: "b1", pg_database: "app", bucket_id: "bk-1", role: "authenticated" };
+
+  it("the_storage_channel_id_is_storage_colon_compact_json_without_the_role", () => {
+    expect(storageChannelId(STORAGE)).toBe('storage:["d1","b1","app","bk-1"]');
+  });
+
+  it("joins_with_the_storage_params_and_routes_rows_and_views_by_its_channel", async () => {
+    const s = setup();
+    const h = handlers();
+    const sub = s.client.joinStorage(STORAGE, h);
+    sub.view(['["o1"]']);
+    await flush();
+    const ws = FakeWebSocket.instances.at(-1)!;
+    ws.open();
+    await flush();
+    const join = ws.frames("join").at(-1)!;
+    expect(join).toEqual({ type: "join", ref: join.ref, channel: "storage", params: STORAGE });
+    ws.receive({ type: "joined", ref: join.ref, channel: sub.channel, info: { pk: ["id"], live: true } });
+    expect(h.onJoined).toHaveBeenCalledWith({ pk: ["id"], live: true });
+    expect(ws.frames("view").at(-1)).toEqual({ type: "view", channel: sub.channel, keys: ['["o1"]'] });
+    ws.receive({ type: "rows", channel: sub.channel, seq: 1, changes: [{ op: "insert", keys: ['["o2"]'] }] });
+    expect(h.onRows).toHaveBeenCalledWith({ seq: 1, changes: [{ op: "insert", keys: ['["o2"]'] }] });
+    sub.leave();
+    expect(ws.frames("leave").at(-1)).toMatchObject({ channel: sub.channel });
   });
 });

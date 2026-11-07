@@ -1,0 +1,11 @@
+error[E0451]: fields `name`, `sql` and `types` of struct `NamedStatement` are private
+ --> tests/ui/statement_literal.rs:4:9
+  |
+3 |     let _ = chelabase_pgsession::service::NamedStatement {
+  |             -------------------------------------------- in this type
+4 |         name: "escalate",
+  |         ^^^^ private field
+5 |         sql: "SET ROLE postgres",
+  |         ^^^ private field
+6 |         types: &[],
+  |         ^^^^^ private field

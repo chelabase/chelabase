@@ -19,11 +19,22 @@
 #                      name the published proxy (<ep>.localtest.me, CHELABASE_PROXY_PORT); with the
 #                      CA fetched as the docs say, psql on the host (verify-full) creates and reads
 #                      a row, and SQL over HTTP on the host answers
+#   7b. storage         the storage service through the gateway (#152): with bucket and object
+#                      policies made as the owner, an app's data key creates a bucket (limit 1000
+#                      bytes), uploads, downloads, signs a URL that downloads without a key and
+#                      resolves refs (a missing one to null); 2000 bytes get 413; a Studio
+#                      console upload through the orchestrator is readable by the app; a webhook
+#                      to a private host off the allowlist is refused, one to the allowlisted
+#                      receiver (`hooks`, over http: CHELABASE_WEBHOOKS_ALLOW_*) gets the upload's
+#                      object.created event, and its Chelabase-Signature verifies with the secret
 #   8. email            an invite by email reaches Mailpit through the identity service's SMTP
 #                      (the password file read at 10001:0600), with its code
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
 #  10. secret reads     every running service reads its mounted secrets as its own uid and groups
 #  11. rerun            a second `up --wait` changes no secret, container or log line of the code
+#  11b. upgrade        an install from before object storage (no storage container, NATS user or
+#                      password): a recreated init-secrets adds only storage's password and NATS
+#                      user, Compose restarts NATS, and storage logs in and delivers an event
 #  12. uninstall        the documented uninstall (computes still running) leaves no container,
 #                      volume or network
 #  13. failing install  in a second project, an SMTP host with no sender fails `up --wait`: the
@@ -35,6 +46,8 @@
 # nothing is pulled for them). For a mixed release set, CHELABASE_IMAGE_TAG_<IMAGE> (e.g.
 # CHELABASE_IMAGE_TAG_STUDIO) tags one image; once any is set, the images with neither it nor
 # CHELABASE_IMAGE_TAG stay at their compose pins (pulled by digest when missing).
+# The default (build) mode runs storage from the all-in-one server image, like the other apps, so
+# the storage release image's read-only start is checked by scripts/tests/images-smoke.sh.
 #
 # Other switches: SELFHOST_E2E_SKIP_CODE=1 stubs the code check out (step 4 expects 200 instead of
 # 403, so the script must fail there: this shows its failure path). SELFHOST_E2E_KEEP=1 leaves the
@@ -72,7 +85,7 @@ tail_logs() { # tail_logs <project>
   echo "---- docker compose ps -a ($p)" >&2
   compose "$p" ps -a >&2 2>&1 || true
   # Whatever is not healthy, plus the app tier, whose logs usually say why a step failed.
-  for svc in init-secrets init-bootstrap identity orchestrator auth gateway example-seed; do
+  for svc in init-secrets init-bootstrap identity orchestrator auth gateway storage worker example-seed; do
     echo "---- logs $svc (tail 12)" >&2
     { compose "$p" logs --no-color --tail 12 "$svc" 2>&1 | cut -c1-300 >&2; } || true
   done
@@ -228,6 +241,28 @@ EOF
         condition: service_healthy
 EOF
   fi
+  if [[ -n "${WITH_HOOKS:-}" ]]; then
+    # A webhook receiver on the stack's network (the identity image's node): one JSON line per
+    # request on stdout, the Chelabase-Signature header and the body (base64, byte for byte).
+    local identity_image
+    identity_image="$(compose "$p" config --format json | jq -r '.services.identity.image')"
+    cat >>"$tmp/$p.override.yml" <<EOF
+  hooks:
+    image: $identity_image
+    pull_policy: never
+    read_only: true
+    command:
+      - node
+      - -e
+      - >-
+        require('http').createServer((q, r) => { const c = []; q.on('data', d => c.push(d));
+        q.on('end', () => { console.log(JSON.stringify({sig: q.headers['chelabase-signature'] || '',
+        body: Buffer.concat(c).toString('base64')})); r.writeHead(204); r.end(); }); }).listen(8080)
+    depends_on:
+      identity:
+        condition: service_started
+EOF
+  fi
 }
 
 # The base file's pinned Postgres image: a shell to make root-owned test files with.
@@ -246,13 +281,18 @@ if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]] && compgen -v CHELABASE_IMAGE_TAG_ 
   svc=""
   while IFS= read -r line; do
     [[ "$line" =~ ^\ \ ([a-z0-9-]+):$ ]] && svc="${BASH_REMATCH[1]}"
-    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
+    # Storage's tag nests its own variable until its first pin (#152):
+    # ${CHELABASE_STORAGE_IMAGE_TAG:-${CHELABASE_IMAGE_TAG:-unpublished}}.
+    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{(CHELABASE_[A-Z]+_IMAGE_TAG:-\$\{)?CHELABASE_IMAGE_TAG:-([^}]*)\}\}?$ ]] || continue
     img="${BASH_REMATCH[2]}"
     var="CHELABASE_IMAGE_TAG_${img^^}"
     if [[ -n "${!var:-}${CHELABASE_IMAGE_TAG:-}" ]]; then
       ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:${!var:-$CHELABASE_IMAGE_TAG}"
+    elif [[ "${BASH_REMATCH[4]}" == unpublished ]]; then
+      # No pin to fall back to yet: the image `just images` built.
+      ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:latest"
     else
-      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[3]}"
+      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[4]}"
       docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null
     fi
     printf '  %s:\n    image: %s\n' "$svc" "$ref" >>"$tmp/images.yml"
@@ -342,8 +382,9 @@ docker run --rm --network none -v "$tmp:/w" --entrypoint sh "$FILE_HELPER" -c \
   'umask 077 && printf %s "$1" >/w/smtp.password && chown 10001:10001 /w/smtp.password && chmod 600 /w/smtp.password' sh "$SMTP_PASSWORD" ||
   die "writing the SMTP password file"
 [[ "$(stat -c %u:%a "$tmp/smtp.password")" == 10001:600 ]] || die "the SMTP password file is $(stat -c %u:%a "$tmp/smtp.password")"
-WITH_MAILPIT=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 CHELABASE_SMTP_TLS=none \
-  CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password"
+WITH_MAILPIT=1 WITH_HOOKS=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 CHELABASE_SMTP_TLS=none \
+  CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password" \
+  CHELABASE_WEBHOOKS_ALLOW_HOSTS=hooks CHELABASE_WEBHOOKS_ALLOW_HTTP=true
 PROXY_PORT="$(sed -n 's/^CHELABASE_PROXY_PORT=//p' "$tmp/$PROJECT.env")"
 PROXY_HTTP_PORT="$(sed -n 's/^CHELABASE_PROXY_HTTP_PORT=//p' "$tmp/$PROJECT.env")"
 STUDIO="http://studio.chelabase.localhost:$PORT"
@@ -538,6 +579,93 @@ out="$(curl -sS --max-time 30 --resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1" --
   die "SQL over HTTP at $http_url: ${out##*$'\n'} $(head -c 300 <<<"${out%$'\n'*}")"
 pass "from the host: psql (verify-full, the CA from docker compose cp) created and read a row; SQL over HTTP read it"
 
+# ---- 7b. object storage --------------------------------------------------------------------------
+
+step "object storage through the gateway: an app's data key, a console upload and a webhook"
+# Policies as the database owner: `authenticated` may see and create buckets and objects.
+psql_host -c "
+  select storage.create_policy('b_select', 'buckets', 'SELECT', array['authenticated']::name[], 'true', null);
+  select storage.create_policy('b_insert', 'buckets', 'INSERT', array['authenticated']::name[], null, 'true');
+  select storage.create_policy('o_select', 'objects', 'SELECT', array['authenticated']::name[], 'true', null);
+  select storage.create_policy('o_insert', 'objects', 'INSERT', array['authenticated']::name[], null, 'true');" >/dev/null ||
+  die "creating the storage policies as the owner"
+[[ "$(api GET "/v1/databases/$db_id/branches")" == 200 ]] || die "GET branches: $(cat "$tmp/body")"
+branch_id="$(jq -r '[.[] | select(.parent_branch_id == null)][0].id // empty' "$tmp/body")"
+[[ -n "$branch_id" ]] || die "no main branch in $(cat "$tmp/body")"
+status="$(api POST "/v1/databases/$db_id/branches/$branch_id/keys" '{"name":"e2e-storage","role":"authenticated"}')"
+[[ "$status" == 201 ]] || die "POST keys: $status $(cat "$tmp/body")"
+DATA_KEY="$(jq -r .key "$tmp/body")"
+# st <method> <path> [curl args…]: the storage API with the data key; status to stdout, body in $tmp/sbody.
+st() {
+  local m="$1" p="$2"
+  shift 2
+  printf 'Authorization: Bearer %s\n' "$DATA_KEY" |
+    curl -sS --max-time 60 -o "$tmp/sbody" -w '%{http_code}' -X "$m" "$API$p" -H @- "$@" || echo 000
+}
+# The webhook first (events from its registration on are delivered): a private host off the
+# allowlist is refused; the allowlisted receiver is taken.
+status="$(api POST "/v1/databases/$db_id/storage/webhooks" '{"url":"http://metadata-db:5432/x","events":["object.created"]}')"
+[[ "$status" == 4* ]] || die "a webhook to metadata-db (not allowlisted) was accepted: $status $(cat "$tmp/body")"
+status="$(api POST "/v1/databases/$db_id/storage/webhooks" '{"url":"http://hooks:8080/e2e","events":["object.created"],"bucket":"files"}')"
+[[ "$status" == 201 ]] || die "POST storage/webhooks: $status $(cat "$tmp/body")"
+HOOK_SECRET="$(jq -r .secret "$tmp/body")"
+[[ "$HOOK_SECRET" == whsec_* ]] || die "the webhook answer has no secret"
+status="$(st POST /storage/v1/bucket -H 'content-type: application/json' -d '{"name":"files","file_size_limit":1000}')"
+[[ "$status" == 201 ]] || die "create bucket files: $status $(cat "$tmp/sbody")"
+status="$(st POST /storage/v1/object/files/hello.txt -H 'content-type: text/plain' --data-binary 'hello storage')"
+[[ "$status" == 200 ]] || die "upload hello.txt: $status $(cat "$tmp/sbody")"
+status="$(st GET /storage/v1/object/files/hello.txt)"
+[[ "$status" == 200 && "$(cat "$tmp/sbody")" == 'hello storage' ]] || die "download hello.txt: $status $(head -c 300 "$tmp/sbody")"
+head -c 2000 /dev/zero >"$tmp/big.bin"
+status="$(st POST /storage/v1/object/files/big.bin -H 'content-type: application/octet-stream' --data-binary @"$tmp/big.bin")"
+[[ "$status" == 413 ]] || die "2000 bytes into a bucket of 1000: $status (wanted 413) $(head -c 300 "$tmp/sbody")"
+status="$(st POST /storage/v1/object/sign/files/hello.txt -H 'content-type: application/json' -d '{"expires_in":60}')"
+signed="$(jq -r '.signed_url // empty' "$tmp/sbody" 2>/dev/null || true)"
+[[ "$status" == 200 && "$signed" == "/storage/v1/object/sign/files/hello.txt?token="* ]] || die "sign hello.txt: $status $(cat "$tmp/sbody")"
+[[ "$(curl -sS --max-time 30 "$API$signed")" == 'hello storage' ]] || die "the signed URL doesn't download hello.txt without a key"
+status="$(st POST /storage/v1/object/resolve -H 'content-type: application/json' \
+  -d '{"refs":[{"bucket":"files","name":"hello.txt"},{"bucket":"files","name":"nope.txt"}]}')"
+[[ "$status" == 200 ]] && jq -e '(.urls | length) == 2 and (.urls[0] | type) == "string" and .urls[1] == null' "$tmp/sbody" >/dev/null ||
+  die "resolve refs: $status $(cat "$tmp/sbody")"
+[[ "$(curl -sS --max-time 30 "$API$(jq -r '.urls[0]' "$tmp/sbody")")" == 'hello storage' ]] || die "the resolved URL doesn't download hello.txt"
+# Studio's console upload (owner mode), through the orchestrator's storage routes to storage's
+# internal listener; the app reads it.
+status="$(printf 'Authorization: Bearer %s\n' "$(session_token "$ADMIN_JAR")" |
+  curl -sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X POST -H @- -H 'content-type: application/octet-stream' \
+    --data-binary 'from the console' "$API/v1/databases/$db_id/branches/$branch_id/storage/object/files/console.txt" || echo 000)"
+[[ "$status" == 200 ]] || die "console upload through the orchestrator: $status $(cat "$tmp/body")"
+status="$(st GET /storage/v1/object/files/console.txt)"
+[[ "$status" == 200 && "$(cat "$tmp/sbody")" == 'from the console' ]] || die "the app reading the console upload: $status $(head -c 300 "$tmp/sbody")"
+# hook_event <name>: waits up to 90 s for the receiver to log files/<name>'s object.created
+# event; sets $event to its line ({"sig": …, "body": base64}).
+hook_event() {
+  local name="$1" line deadline=$((SECONDS + 90))
+  event=""
+  while ((SECONDS < deadline)); do
+    while IFS= read -r line; do
+      [[ "$line" == '{"sig":"t='* ]] || continue
+      if jq -r .body <<<"$line" | base64 -d 2>/dev/null |
+        jq -e --arg n "$name" '.type == "object.created" and .bucket == "files" and .name == $n' >/dev/null 2>&1; then
+        event="$line"
+        return
+      fi
+    done < <(compose "$PROJECT" logs --no-color --no-log-prefix hooks 2>/dev/null)
+    sleep 2
+  done
+  die "no object.created event for $name at the receiver after 90 s: $(compose "$PROJECT" logs --no-color --tail 5 hooks 2>&1 | cut -c1-300)"
+}
+# The receiver got hello.txt's object.created event, signed with the endpoint's secret.
+hook_event hello.txt
+sig="$(jq -r .sig <<<"$event")"
+t="${sig#t=}"
+t="${t%%,*}"
+v1="${sig#*v1=}"
+v1="${v1%%,*}"
+jq -r .body <<<"$event" | base64 -d >"$tmp/event.bin"
+want="$({ printf '%s.' "$t"; cat "$tmp/event.bin"; } | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)"
+[[ -n "$v1" && "$v1" == "$want" ]] || die "the event's Chelabase-Signature doesn't verify with the webhook's secret"
+pass "storage: bucket, upload, download, 413 over the limit, a signed URL, refs resolved, a console upload, and a signed object.created webhook delivered"
+
 # ---- 8. email through the identity service's SMTP ---------------------------------------------
 
 step "an invite by email reaches Mailpit with its code"
@@ -659,6 +787,61 @@ diff -u "$tmp/before.containers" "$tmp/after.containers" >"$tmp/containers.diff"
 diff -u "$tmp/before.code" "$tmp/after.code" >/dev/null || die "a rerun of up printed the setup code again"
 [[ "$(api GET /v1/me)" == 200 ]] || die "the claimant lost access after the rerun: $(cat "$tmp/body")"
 pass "no secret file, container or setup-code line changed ($(wc -l <"$tmp/after.secrets") secret files)"
+
+# ---- 11b. an upgrade from before object storage --------------------------------------------------
+
+# An install from before object storage has no storage container, no storage NATS user and no
+# nats/storage.password, and its NATS runs on that auth.conf. The upgrade's new init image (here:
+# a label, which changes init-secrets' config the same way) makes the password and re-renders
+# auth.conf; Compose must restart NATS (depends_on restart: true) or storage can't log in.
+step "an upgrade from before object storage restarts NATS and storage logs in"
+compose "$PROJECT" rm -sf storage >/dev/null 2>&1 || die "removing the storage container"
+# shellcheck disable=SC2016
+docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s" --entrypoint sh "$HELPER" -c '
+  set -e
+  rm /s/nats/storage.password
+  awk "{ l[NR] = \$0 } END { for (i = 1; i <= NR; i++) {
+      if (!skip && l[i] == \"    {\" && l[i + 1] == \"      user: \\\"storage\\\"\") skip = 1
+      if (!skip) print l[i]; else if (l[i] == \"    }\") skip = 0 } }" /s/nats/auth.conf >/tmp/auth.conf
+  ! grep -q "user: \"storage\"" /tmp/auth.conf
+  [ "$(grep -c "user: " /tmp/auth.conf)" -ge 4 ]
+  cat /tmp/auth.conf >/s/nats/auth.conf' || die "making the secrets volume a pre-storage install's"
+compose "$PROJECT" restart nats >/dev/null 2>&1 || die "restarting NATS on the pre-storage users"
+snapshot pre-upgrade
+nats_started="$(docker inspect -f '{{.State.StartedAt}}' "$(compose "$PROJECT" ps -q nats)")"
+init_id="$(compose "$PROJECT" ps -aq init-secrets)"
+printf 'services:\n  init-secrets:\n    labels:\n      chelabase.e2e/upgrade: "1"\n' >"$tmp/upgrade.yml"
+COMPOSE_FILES+=(-f "$tmp/upgrade.yml")
+if ! compose_up "$PROJECT"; then tail -n 40 "$tmp/$PROJECT.up" >&2; die "the upgrade's up --wait failed"; fi
+snapshot upgraded
+[[ "$(compose "$PROJECT" ps -aq init-secrets)" != "$init_id" ]] || die "the upgrade didn't recreate init-secrets"
+# Only storage's password is new and only auth.conf changed: nothing else is overwritten.
+grep -v ' \./nats/auth\.conf$' "$tmp/pre-upgrade.secrets" >"$tmp/pre-upgrade.rest"
+grep -v ' \./nats/auth\.conf$' "$tmp/upgraded.secrets" | grep -v ' \./nats/storage\.password$' >"$tmp/upgraded.rest"
+diff -u "$tmp/pre-upgrade.rest" "$tmp/upgraded.rest" >"$tmp/upgrade.diff" ||
+  die "the upgrade changed other secret files: $(sed 's/^\([-+]\)[0-9a-f]\{64\}/\1<hash>/' "$tmp/upgrade.diff" | head -20)"
+grep -q ' \./nats/storage\.password$' "$tmp/upgraded.secrets" || die "the upgrade made no nats/storage.password"
+cmp -s <(grep ' \./nats/auth\.conf$' "$tmp/pre-upgrade.secrets") <(grep ' \./nats/auth\.conf$' "$tmp/upgraded.secrets") &&
+  die "the upgrade didn't re-render nats/auth.conf"
+vol_cat nats/auth.conf | grep -q 'user: "storage"' || die "the re-rendered auth.conf has no storage user"
+new_started="$(docker inspect -f '{{.State.StartedAt}}' "$(compose "$PROJECT" ps -q nats)")"
+[[ "$new_started" != "$nats_started" ]] || die "NATS didn't restart after the upgraded init-secrets (still started at $nats_started)"
+storage_id="$(compose "$PROJECT" ps -q storage)"
+[[ -n "$storage_id" && "$(docker inspect -f '{{.State.Health.Status}}' "$storage_id")" == healthy ]] || die "storage isn't healthy after the upgrade"
+# Storage logs in to NATS with its new user (its subscriptions start) …
+connected=""
+deadline=$((SECONDS + 60))
+while ((SECONDS < deadline)); do
+  if docker logs "$storage_id" 2>&1 | grep -qF 'listening for NATS cache events'; then connected=1; break; fi
+  sleep 2
+done
+[[ -n "$connected" ]] || die "storage didn't log in to NATS after the upgrade: $(docker logs --tail 5 "$storage_id" 2>&1 | cut -c1-300)"
+# … and publishes an object event through it: an upload reaches the webhook receiver.
+status="$(st POST /storage/v1/object/files/upgraded.txt -H 'content-type: text/plain' --data-binary 'after the upgrade')"
+[[ "$status" == 200 ]] || die "upload after the upgrade: $status $(cat "$tmp/sbody")"
+hook_event upgraded.txt
+[[ "$(api GET /v1/me)" == 200 ]] || die "the claimant lost access after the upgrade: $(cat "$tmp/body")"
+pass "the upgrade made storage's NATS user and password only, NATS restarted, and storage logged in and delivered an event"
 
 # ---- 12. teardown --------------------------------------------------------------------------------
 

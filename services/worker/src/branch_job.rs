@@ -80,6 +80,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         job: BranchJob,
         attempt: Attempt,
     ) -> Result<(), String> {
+        // object-storage m8: a delete, reset or restore can leave blobs nothing references.
+        let sweep_after = match &job {
+            BranchJob::Create { .. } => None,
+            BranchJob::ResetToParent { branch_id }
+            | BranchJob::Restore { branch_id, .. }
+            | BranchJob::Delete { branch_id } => Some(*branch_id),
+        };
+        let result = self.run_branch_job(job, attempt).await;
+        if result.is_ok()
+            && let Some(branch) = sweep_after
+            && let Ok(Some(record)) = self.metadata.get_branch(branch).await
+        {
+            self.sweep_requests.request(
+                record.database_id,
+                crate::storage_sweep::SweepCause::Event(uuid::Uuid::new_v4()),
+            );
+        }
+        result
+    }
+
+    async fn run_branch_job(&self, job: BranchJob, attempt: Attempt) -> Result<(), String> {
         match job {
             BranchJob::Create { branch_id, at } => {
                 self.branch_create_attempt(branch_id, at, attempt).await

@@ -21,6 +21,7 @@ chelabase-secrets = { workspace = true }
 chelabase-typegen = { workspace = true }
 chelabase-types = { workspace = true }
 clap = { workspace = true }
+rcgen = { workspace = true }
 hex = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }

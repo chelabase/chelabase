@@ -1,8 +1,8 @@
 //! T5 review fix round (W2): one failing test per finding, written before the fix.
 
 use super::commands::{
-    alive_ps_args, check_purge, compose_command, is_legacy_compute, missing_services,
-    nextest_bin_for_env, stop_processes,
+    alive_ps_args, borrowed_stack_message, check_purge, compose_command, is_legacy_compute,
+    missing_services, nextest_bin_for_env, stop_processes,
 };
 use super::registry::{Entry, with_registry};
 use super::slots::touch_slot;
@@ -137,4 +137,23 @@ fn a_running_slot_is_refreshed() {
     .unwrap();
     assert_eq!(a, Some(99));
     assert_eq!(b, None, "a stopped stack takes no slot by being touched");
+}
+
+// `just wt-remove` purges the worktree's own stack only: one registered to another checkout is
+// skipped unless it is named.
+#[test]
+fn a_stack_of_another_checkout_is_not_purged_unnamed() {
+    let entry = |checkout: &str| -> Entry {
+        serde_json::from_value(serde_json::json!({
+            "slug": "epic-x", "checkout": checkout, "gateway_port": 8100, "proxy_port": 8101, "created_at": 1,
+        }))
+        .unwrap()
+    };
+    let here = Path::new("/r/.worktrees/task");
+    let other = entry("/r/.worktrees/epic-x");
+    let msg = borrowed_stack_message("epic-x", None, here, Some(&other)).expect("skipped");
+    assert!(msg.contains("another checkout") && msg.contains("/r/.worktrees/epic-x"), "{msg}");
+    assert!(borrowed_stack_message("epic-x", Some("epic-x"), here, Some(&other)).is_none(), "named");
+    assert!(borrowed_stack_message("task", None, here, Some(&entry("/r/.worktrees/task"))).is_none());
+    assert!(borrowed_stack_message("task", None, here, None).is_none(), "unregistered");
 }

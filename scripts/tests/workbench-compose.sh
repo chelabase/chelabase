@@ -85,10 +85,12 @@ done
 [[ "$(q '.services.runner.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
   fail "runner mounts the state dir read-write at its own path"
 
-# The one exception: the orchestrator reads the stack's setup code (#126), checked below.
+# The exceptions: the orchestrator reads the stack's setup code (#126), checked below, and the
+# worker the `storage` identity's two S3 key files for the blob sweep (object-storage m8).
 for s in orchestrator worker gateway auth rest realtime studio; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\"))
-    | select(\"$s:\" + .source != \"orchestrator:/m/.chelabase/stacks/feat-x/setup/setup.code\") | .source")" ]] ||
+    | select(\"$s:\" + .source != \"orchestrator:/m/.chelabase/stacks/feat-x/setup/setup.code\")
+    | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/storage-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
 for s in mailpit identity orchestrator worker gateway auth rest; do
@@ -140,7 +142,7 @@ tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sour
 [[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
 on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
-[[ "$on_compute" == "auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker" ]] ||
+[[ "$on_compute" == "auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
   fail "exactly the compute dependencies and the clients that dial computes are on the compute network; got: $on_compute"
 for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker; do
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
@@ -182,6 +184,7 @@ for t in REST_INTERNAL:rest-internal DATA_KEYS:data-keys APP_AUTH_INTERNAL:app-a
     want_env "$s" "CHELABASE_${t%%:*}_TOKEN_FILE" "$K/tokens/${t#*:}.token"
   done
 done
+want_env orchestrator CHELABASE_STORAGE_INTERNAL_TOKEN_FILE "$K/tokens/storage-internal.token"
 want_env gateway CHELABASE_DATA_KEYS_TOKEN_FILE "$K/tokens/data-keys.token"
 want_env gateway CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE "$K/tokens/app-sessions.token"
 want_env auth CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE "$K/tokens/app-auth.token"
@@ -190,10 +193,11 @@ want_env rest CHELABASE_REST_INTERNAL_TOKEN_FILE "$K/tokens/rest-internal.token"
 plain="$(q '[.services | to_entries[] | .key as $s | (.value.environment // {}) | to_entries[]
   | select(.key | IN("CHELABASE_NATS_PASSWORD", "CHELABASE_REST_INTERNAL_TOKEN", "CHELABASE_DATA_KEYS_TOKEN",
       "CHELABASE_APP_AUTH_INTERNAL_TOKEN", "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "CHELABASE_PROXY_API_TOKEN",
-      "CHELABASE_STORCON_HOOK_TOKEN", "CHELABASE_REALTIME_INTERNAL_TOKEN", "NEON_PROXY_TO_CONTROLPLANE_TOKEN"))
+      "CHELABASE_STORCON_HOOK_TOKEN", "CHELABASE_REALTIME_INTERNAL_TOKEN", "CHELABASE_STORAGE_INTERNAL_TOKEN",
+      "NEON_PROXY_TO_CONTROLPLANE_TOKEN"))
   | "\($s): \(.key)"] | join(", ")')"
 [[ -z "$plain" ]] || fail "a credential is set in plain in a service's environment: $plain"
-! grep -Eq 'chelabase-dev-(rest-internal|data-keys|app-auth|app-sessions|proxy-api|storcon-hook|realtime)' <<<"$config" ||
+! grep -Eq 'chelabase-dev-(rest-internal|data-keys|app-auth|app-sessions|proxy-api|storcon-hook|realtime|storage-internal)' <<<"$config" ||
   fail "a public development bearer (chelabase-dev-*) is in the rendered config"
 for k in CHELABASE_NATS_USER CHELABASE_NATS_PASSWORD CHELABASE_VALKEY_USER CHELABASE_VALKEY_PASSWORD_FILE \
   CHELABASE_REST_INTERNAL_TOKEN CHELABASE_DATA_KEYS_TOKEN CHELABASE_APP_AUTH_INTERNAL_TOKEN; do
@@ -368,6 +372,58 @@ mt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sourc
 [[ "$mt_mounts" == "runner:true" ]] || fail "metrics.token: read-only for the runner, nobody else; got: $mt_mounts"
 # S7: Valkey TLS is off in the stack (platform mode turns it on).
 [[ "$(env_of realtime CHELABASE_VALKEY_TLS)" == off ]] || fail "realtime: CHELABASE_VALKEY_TLS=off in the stack"
+# --- Object storage (epic object-storage m2): one SeaweedFS, two buckets, two identities -------
+# The identities, bucket-scoped actions, gRPC mTLS and healthcheck are the base file's (checked in
+# compose-secret-boundary.sh); the workbench runs them as is, with the key pairs and the gRPC TLS
+# files as Compose secrets from the stack's state dir (so none is in `docker inspect`). No admin
+# key exists, and create-bucket holds nothing.
+seaweed_binds() { # "target<-<dir>/<file>" of seaweedfs's key and TLS file binds, sorted
+  q '[.services.seaweedfs.volumes[]? | select(.type == "bind" and (.target | test("/secrets/(s3|storage-s3|grpc-tls)/")))
+    | "\(.target | sub("^/run/chelabase/secrets/"; ""))<-\(.source | sub("^.*/(?<d>(s3|storage-s3|grpc-tls)/[a-z.-]+)$"; "\(.d)"))"] | sort | join(" ")'
+}
+sw_want="grpc-tls/ca.crt<-grpc-tls/ca.crt grpc-tls/client.crt<-grpc-tls/client.crt grpc-tls/client.key<-grpc-tls/client.key"
+sw_want+=" grpc-tls/server.crt<-grpc-tls/server.crt grpc-tls/server.key<-grpc-tls/server.key"
+sw_want+=" s3/access-key<-s3/access-key s3/secret-key<-s3/secret-key"
+sw_want+=" storage-s3/access-key<-storage-s3/access-key storage-s3/secret-key<-storage-s3/secret-key"
+[[ "$(seaweed_binds)" == "$sw_want" ]] || fail "seaweedfs mounts the neon and storage key pairs and the gRPC TLS files; got: $(seaweed_binds)"
+others="$(q '[.services | to_entries[] | select(.key != "seaweedfs")
+  | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/(grpc-tls|s3-admin)/")))) | .key] | join(" ")')"
+[[ -z "$others" ]] || fail "only seaweedfs mounts the gRPC TLS files; got: $others"
+# m5: the `storage` identity's keys: seaweedfs, the storage service and the worker (its blob
+# sweep, m8), read-only, nobody else.
+others="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/storage-s3/"))))
+  | .key] | sort | join(" ")')"
+[[ "$others" == "seaweedfs storage worker" ]] || fail "only seaweedfs, storage and the worker mount the storage S3 keys; got: $others"
+storage_binds="$(q '[.services.storage.volumes[] | select(.type == "bind" and (.source | test("/storage-s3/")))
+  | "\(.target)\(if (.read_only // false) then "" else ":rw" end)"] | sort | join(" ")')"
+[[ "$storage_binds" == "/run/chelabase/secrets/storage-s3/access-key /run/chelabase/secrets/storage-s3/secret-key" ]] ||
+  fail "storage mounts its two key files read-only; got: $storage_binds"
+[[ "$(q '.services["create-bucket"] | [.volumes // [], .environment // {}] | tojson')" == '[[],{}]' ]] ||
+  fail "create-bucket holds no key, volume or credential"
+! grep -qE 's3-admin|chelabase-(storage|admin)-dev' <<<"$config" || fail "no admin key file and no dev S3 key of the storage identity is in the rendered config (inspect)"
+for s in pageserver safekeeper1 safekeeper2 safekeeper3; do
+  want_env "$s" AWS_ACCESS_KEY_ID chelabase-dev
+done
+[[ "$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "neon_seaweedfs_data")) | .key] | join(" ")')" == seaweedfs ]] ||
+  fail "only seaweedfs mounts its data volume (S3 is reached by URL only)"
+
+# Neon's S3 endpoint is the base file's one setting, default http://seaweedfs:8333, for the
+# safekeepers and the pageserver under the workbench too.
+neon_endpoints() { # neon_endpoints <json>
+  local svc
+  for svc in pageserver safekeeper1 safekeeper2 safekeeper3; do
+    jq -r --arg s "$svc" '.services[$s].command | map(tostring) | join(" ")' <<<"$1" |
+      grep -oP "(?<![_a-z])endpoint='[^']*'" | sed "s|^endpoint='|$svc=|; s|'\$||"
+  done | sort | tr '\n' ' ' | sed 's/ $//'
+}
+[[ "$(neon_endpoints "$config")" == "pageserver=http://seaweedfs:8333 safekeeper1=http://seaweedfs:8333 safekeeper2=http://seaweedfs:8333 safekeeper3=http://seaweedfs:8333" ]] ||
+  fail "Neon's S3 endpoint defaults to http://seaweedfs:8333 under the workbench; got: $(neon_endpoints "$config")"
+over="$(CHELABASE_NEON_S3_ENDPOINT=http://other.example:9000 env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
+  -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
+  --env-file "$fixture" --profile sites --profile runner config --no-env-resolution --format json)"
+[[ "$(neon_endpoints "$over")" == "pageserver=http://other.example:9000 safekeeper1=http://other.example:9000 safekeeper2=http://other.example:9000 safekeeper3=http://other.example:9000" ]] ||
+  fail "CHELABASE_NEON_S3_ENDPOINT changes Neon's S3 endpoint under the workbench; got: $(neon_endpoints "$over")"
+
 # auth-replacement m5 (#118): the identity service runs from the checkout's sources on the
 # workbench image, on the default network only, with no host port and no gateway route.
 [[ "$(q '.services.identity // empty | length')" -gt 0 ]] || fail "the stack runs identity"

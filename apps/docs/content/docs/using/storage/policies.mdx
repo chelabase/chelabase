@@ -1,0 +1,106 @@
+---
+title: Policies
+description: Row-level security on storage.buckets and storage.objects, with copy-paste SQL for private, public-read and per-user buckets.
+---
+
+Storage is closed until you open it. Row-level security is enabled and forced on `storage.buckets` and `storage.objects`, with no policies, so no role sees or writes anything until the database owner adds policies. Each storage call then runs as the caller's role and claims, and Postgres applies them.
+
+## Writing policies
+
+The `storage` schema belongs to Chelabase, so you can't `CREATE POLICY` on its tables directly. The owner uses two helpers instead (run them as `postgres` in [psql](/using/projects-and-databases) or in Studio's [SQL editor](/using/sql-editor) as an Admin):
+
+```sql
+storage.create_policy(policy_name, table_name, command DEFAULT 'ALL',
+  roles DEFAULT ARRAY['public'], using_expr DEFAULT NULL, check_expr DEFAULT NULL,
+  permissive DEFAULT true)
+storage.drop_policy(policy_name, table_name)
+```
+
+- `table_name` is `buckets` or `objects`; `command` is `ALL`, `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+- `using_expr` and `check_expr` are the policy's `USING` and `WITH CHECK` expressions, as text. Give at least one. They can't contain `;`.
+- The expressions are parsed with `search_path = pg_catalog, pg_temp`: qualify every function and table, such as `chelabase.user_id()` and `storage.buckets`.
+- On a [protected branch](/using/branches#protected-branches) only the owner's own session may change policies.
+
+The columns you'll use:
+
+| Table | Columns |
+|---|---|
+| `storage.buckets` | `id`, `name`, `public`, `file_size_limit`, `allowed_mime_types`, `write_once` |
+| `storage.objects` | `bucket_id` (the bucket's `id`), `name`, `owner` (the uploader's app user id, or null), `metadata`, `size`, `content_type`, `created_at`, `updated_at` |
+
+And three helpers for names: `storage.foldername('a/b/c.png')` is `{a,b}`, `storage.filename(…)` is `c.png`, and `storage.extension('x.tar.gz')` is `gz`.
+
+What each call needs:
+
+| Call | Policies |
+|---|---|
+| Any object call | `SELECT` on the bucket in `storage.buckets` |
+| List, download, sign a URL, resolve a ref | `SELECT` on the object |
+| Upload | `INSERT` on the object; with `upsert`, `UPDATE` too |
+| Move, rename | `UPDATE` on the object (its old and new row) |
+| Copy | `SELECT` on the source, `INSERT` at the destination |
+| Delete | `DELETE` on the object (and `SELECT`, to find it) |
+| Create, change, delete a bucket | `INSERT`, `UPDATE` or `DELETE` on `storage.buckets` |
+
+The owner itself bypasses row-level security, so it can create buckets in SQL. Objects are different: an object row is only valid with the bytes behind it, so even the owner writes objects through the storage API, never with `INSERT` on `storage.objects`.
+
+Bucket names in these examples follow the [bucket-name grammar](/using/storage#bucket-names) (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit). A bucket you insert with a name outside it can be read, but uploads, deletes, moves and copies into it answer 400.
+
+## A private bucket for your server
+
+Only your server's secret key (role `authenticated`, no app user) may use `docs`:
+
+```sql
+INSERT INTO storage.buckets (name) VALUES ('docs');
+
+SELECT storage.create_policy('docs_bucket', 'buckets', 'SELECT', ARRAY['authenticated'],
+  $$name = 'docs' AND chelabase.user_id() IS NULL$$);
+SELECT storage.create_policy('docs_objects', 'objects', 'ALL', ARRAY['authenticated'],
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'docs') AND chelabase.user_id() IS NULL$$,
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'docs') AND chelabase.user_id() IS NULL$$);
+```
+
+`chelabase.user_id() IS NULL` keeps signed-in app users out: they run as `authenticated` too, but with a user id. Hand files to browsers with [signed URLs](/using/storage/urls#signed-urls).
+
+## A public-read bucket
+
+Anyone may read `avatars`, through its public path or with the public key; signed-in app users may upload:
+
+```sql
+INSERT INTO storage.buckets (name, public, allowed_mime_types, file_size_limit)
+  VALUES ('avatars', true, ARRAY['image/png', 'image/jpeg', 'image/webp'], 2097152);
+
+SELECT storage.create_policy('avatars_bucket', 'buckets', 'SELECT', ARRAY['anon', 'authenticated'],
+  $$name = 'avatars'$$);
+SELECT storage.create_policy('avatars_read', 'objects', 'SELECT', ARRAY['anon', 'authenticated'],
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'avatars')$$);
+SELECT storage.create_policy('avatars_upload', 'objects', 'INSERT', ARRAY['authenticated'],
+  NULL,
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'avatars') AND chelabase.user_id() IS NOT NULL$$);
+```
+
+The public path needs no policy at all: `public = true` is enough to serve an object at `/storage/v1/object/public/{branch}/avatars/{name}`. The `avatars_read` policy is for listing and downloading with a key.
+
+## Per-user folders
+
+Each app user owns the folder named by their user id, `user-files/<user id>/…`, and sees nothing else:
+
+```sql
+INSERT INTO storage.buckets (name) VALUES ('user-files');
+
+SELECT storage.create_policy('user_files_bucket', 'buckets', 'SELECT', ARRAY['authenticated'],
+  $$name = 'user-files'$$);
+SELECT storage.create_policy('user_files_own', 'objects', 'ALL', ARRAY['authenticated'],
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'user-files')
+    AND (storage.foldername(name))[1] = chelabase.user_id()::text$$,
+  $$bucket_id = (SELECT id FROM storage.buckets WHERE name = 'user-files')
+    AND (storage.foldername(name))[1] = chelabase.user_id()::text$$);
+```
+
+The client then uploads to `` `${userId}/photo.png` ``. To tie objects to their uploader instead of their path, use the `owner` column, which storage fills from the caller's `sub` claim: `owner = chelabase.user_id()`.
+
+See [Claim helpers](/using/app-users/claim-helpers) for `chelabase.user_id()` and `chelabase.claims()`.
+
+## Checking your policies
+
+Studio's Storage tab can act as any role you may use, with claims, so you can see a bucket exactly as an app user would. See [Studio](/using/storage/studio).

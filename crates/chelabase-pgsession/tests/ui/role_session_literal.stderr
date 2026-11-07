@@ -1,0 +1,15 @@
+error[E0451]: fields `lease`, `info`, `role`, `claims` and `oid` of struct `RoleSession` are private
+  --> tests/ui/role_session_literal.rs:8:9
+   |
+ 7 |     chelabase_pgsession::RoleSession {
+   |     -------------------------------- in this type
+ 8 |         lease,
+   |         ^^^^^ private field
+ 9 |         info,
+   |         ^^^^ private field
+10 |         role: "postgres".into(),
+   |         ^^^^ private field
+11 |         claims,
+   |         ^^^^^^ private field
+12 |         oid: None,
+   |         ^^^ private field

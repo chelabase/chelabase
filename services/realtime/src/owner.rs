@@ -9,6 +9,8 @@
 //! - answer 200 `{probe: {ok, bypass}, visible, keys: [key string]}`;
 //! - with `convert_keys: [[text, …], …]` beside a check (a window's every key), the answer adds
 //!   `converted: [key string]`, printed in the same owner session and transaction;
+//! - with `bucket: "<uuid>"` beside a check (object storage m17, a storage channel's), `keys`
+//!   are object ids and only the objects of that bucket the owner session sees are returned;
 //! - convert mode (owner deletes): `convert: true` with `keys` (required; `xid` ignored) →
 //!   200 `{keys: [key string]}`, each key's texts cast through its column's type and printed in
 //!   the owner's console session, in the request's order, rows needn't exist, no probe;
@@ -96,7 +98,8 @@ pub fn parse_visible(status: u16, body: &[u8]) -> Result<CheckAnswer, CheckError
 }
 
 /// A check's request body with the keys to convert in the same owner session
-/// (`convert_keys`, left out when there are none).
+/// (`convert_keys`, left out when there are none) and a storage channel's `bucket` (left out
+/// for a table).
 pub fn check_body(
     token: &str,
     target: &CheckTarget,
@@ -104,10 +107,14 @@ pub fn check_body(
     xid: Option<u64>,
     keys: Option<&[Vec<String>]>,
     convert: &[Vec<String>],
+    bucket: Option<uuid::Uuid>,
 ) -> Value {
     let mut body = visible_body(token, target, rel_oid, xid, keys);
     if !convert.is_empty() {
         body["convert_keys"] = json!(convert);
+    }
+    if let Some(bucket) = bucket {
+        body["bucket"] = json!(bucket);
     }
     body
 }
@@ -215,7 +222,9 @@ impl OwnerClient {
     }
 
     /// [`Self::visible`] with `convert` printed in the same owner session and transaction
-    /// (`converted` in the answer, one per key in order; empty when it didn't work).
+    /// (`converted` in the answer, one per key in order; empty when it didn't work), scoped to
+    /// a storage channel's `bucket`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn check(
         &self,
         token: &str,
@@ -224,9 +233,10 @@ impl OwnerClient {
         xid: Option<u64>,
         keys: Option<&[Vec<String>]>,
         convert: &[Vec<String>],
+        bucket: Option<uuid::Uuid>,
     ) -> Result<CheckAnswer, CheckError> {
         let (status, body) = self
-            .post(check_body(token, target, rel_oid, xid, keys, convert))
+            .post(check_body(token, target, rel_oid, xid, keys, convert, bucket))
             .await?;
         parse_visible(status, &body)
     }

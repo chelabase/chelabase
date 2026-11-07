@@ -390,17 +390,17 @@ const PIECES: Piece[] = [
     to: "architecture/data-api",
   },
   {
+    id: "storage",
+    icon: Archive,
+    title: "Object storage",
+    body: "S3-compatible buckets for your app's files, guarded by row-level security, with signed and public URLs, a Studio tab, the typed client and webhooks.",
+    to: "using/storage",
+  },
+  {
     id: "cli",
     icon: SquareTerminal,
     title: "CLI",
     body: "A command-line tool for setup and management from the terminal: generate types, run migrations and more. Not available yet.",
-    soon: true,
-  },
-  {
-    id: "storage",
-    icon: Archive,
-    title: "Object storage",
-    body: "S3-compatible storage for your app's files, planned on SeaweedFS, which already holds Neon's data in the stack. Not available yet.",
     soon: true,
   },
 ];
@@ -793,7 +793,7 @@ const ROWS: Array<{ label: string; cells: Cells }> = [
   { label: "Table and SQL editors", cells: ["yes", "yes", "partial", "yes", "partial", "partial"] },
   { label: "Live rows in the editor", cells: ["yes", "no", "yes", "no", "no", "no"] },
   { label: "Realtime for your app", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
-  { label: "Object storage", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
+  { label: "Object storage", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
 ];
 
 function CompareCell({ cell }: { cell: Cell }) {

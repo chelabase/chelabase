@@ -51,6 +51,7 @@ fn win(rels: Vec<RelWindow>, all: bool) -> Window {
         rels,
         xids: vec![1],
         end_lsn: Some(PgLsn::from(1)),
+        split: vec![],
     }
 }
 
@@ -421,4 +422,107 @@ fn relation_kinds() {
     for kind in ['v', 'm', 'f', 'S', 'c', 'i', 't'] {
         assert_eq!(join_kind(kind, false), JoinKind::NotATable, "{kind}");
     }
+}
+
+// --- object storage m17: `storage.objects` is never collapsed by the window ---
+
+fn objects_ch(rel: u32, op: Op, keys: &[&[&str]]) -> RelChange {
+    RelChange {
+        schema: "storage".into(),
+        table: "objects".into(),
+        ..ch(rel, op, keys)
+    }
+}
+
+/// Storage channels must never get a keyless `changed` for another bucket's changes, so
+/// `storage.objects` keeps every key of a window past the limit (they're checked in chunks), and
+/// a `c` in the window keeps the other transactions' keys.
+#[test]
+fn storage_objects_keeps_every_key_past_the_limit() {
+    let mut m = Merger::new(2);
+    let t0 = Instant::now();
+    m.push(
+        t0,
+        &txn(0x10, 1, vec![objects_ch(7, Op::Insert, &[&["a"], &["b"]])]),
+    );
+    m.push(
+        t0,
+        &txn(0x20, 2, vec![objects_ch(7, Op::Delete, &[&["c"], &["d"]])]),
+    );
+    m.push(
+        t0,
+        &txn(0x30, 3, vec![ch(8, Op::Insert, &[&["1"], &["2"], &["3"]])]),
+    );
+    let w = m.take().unwrap();
+    let objects = only(&w, 7);
+    assert!(!objects.changed, "{objects:?}");
+    assert_eq!(objects.inserts, vec![k(&["a"]), k(&["b"])]);
+    assert_eq!(objects.deletes, vec![k(&["c"]), k(&["d"])]);
+    assert!(only(&w, 8).changed, "another table keeps the limit");
+    assert_eq!(w.split, vec![7], "only storage.objects is kept whole");
+
+    m.push(
+        t0,
+        &txn(0x40, 4, vec![objects_ch(7, Op::Insert, &[&["e"]])]),
+    );
+    m.push(t0, &txn(0x50, 5, vec![objects_ch(7, Op::Changed, &[])]));
+    m.push(
+        t0,
+        &txn(0x60, 6, vec![objects_ch(7, Op::Update, &[&["f"]])]),
+    );
+    let objects = only(&m.take().unwrap(), 7);
+    assert!(objects.changed, "the `c` is kept");
+    assert_eq!(
+        objects.inserts,
+        vec![k(&["e"])],
+        "and so are the other keys"
+    );
+    assert_eq!(objects.updates, vec![k(&["f"])]);
+}
+
+#[test]
+fn storage_objects_passes_the_fan_out_whole_and_is_published_in_chunks() {
+    // Another relation's parents don't pull storage.objects into a union over the limit.
+    let parents = HashMap::from([(11, vec![keyed(10)])]);
+    let objects = rw(7, &[&["a"], &["b"], &["c"]], &[&["d"], &["e"]], false);
+    let mut w = win(vec![objects.clone(), rw(11, &[&["1"]], &[], false)], false);
+    w.split = vec![7];
+    let out = fan_out(&w, &parents, 2);
+    assert_eq!(
+        out.iter().filter(|r| r.rel == 7).collect::<Vec<_>>(),
+        vec![&objects]
+    );
+    assert_eq!(by_rel(out)[&10].inserts, vec![k(&["1"])]);
+
+    let chunks = RelWindow {
+        changed: true,
+        ..objects.clone()
+    }
+    .chunks(2);
+    assert_eq!(chunks.len(), 3);
+    assert!(chunks.iter().all(|c| c.key_count() <= 2 && c.rel == 7));
+    assert_eq!(
+        chunks.iter().filter(|c| c.changed).count(),
+        1,
+        "`changed` once"
+    );
+    let keys: Vec<Vec<String>> = chunks
+        .iter()
+        .flat_map(|c| {
+            c.inserts
+                .iter()
+                .chain(&c.deletes)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![k(&["a"]), k(&["b"]), k(&["c"]), k(&["d"]), k(&["e"])]
+    );
+    assert_eq!(
+        objects.chunks(5),
+        vec![objects.clone()],
+        "a window that fits is one chunk"
+    );
 }

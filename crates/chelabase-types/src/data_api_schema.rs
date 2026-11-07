@@ -79,6 +79,23 @@ pub struct ColumnDesc {
     /// Qualified enum name (`schema.name`) when the column is an enum.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#enum: Option<String>,
+    /// When the column references a stored object (left out otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_ref: Option<StorageRefDesc>,
+}
+
+/// How a column references a stored object (object storage).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageRefDesc {
+    /// A `storage.object_ref`: the object's bucket id and name.
+    Ref,
+    /// An object's id: a single-column foreign key to `storage.objects(id)`.
+    Id,
+    /// An object's name in one bucket: a text column whose comment says
+    /// `@storage_ref bucket=<bucket>`.
+    Path { bucket: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

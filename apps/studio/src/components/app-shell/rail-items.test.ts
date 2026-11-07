@@ -19,6 +19,16 @@ describe("isRailItemActive", () => {
     expect(isRailItemActive("projects", "/app/sql")).toBe(false);
   });
 
+  it("storage_item_active_on_storage_routes", () => {
+    expect(isRailItemActive("storage", "/app/storage")).toBe(true);
+    expect(isRailItemActive("storage", "/app/storage/p1/d1/b1/avatars/a/b.png")).toBe(true);
+    expect(isRailItemActive("storage", "/app/storagex")).toBe(false);
+    expect(isRailItemActive("storage", "/app/sql/p1")).toBe(false);
+    expect(isRailItemActive("sql", "/app/storage")).toBe(false);
+    expect(isRailItemActive("tables", "/app/storage/p1")).toBe(false);
+    expect(isRailItemActive("projects", "/app/storage")).toBe(false);
+  });
+
   it("data_api_item_active_on_data_api_routes", () => {
     expect(isRailItemActive("data-api", "/app/data-api")).toBe(true);
     expect(isRailItemActive("data-api", "/app/data-api/p1/d1/b1/app")).toBe(true);
@@ -59,16 +69,17 @@ describe("isRailItemActive", () => {
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, Table editor, SQL editor, Data API, API reference and Members (last) in order", () => {
+  it("lists Projects, Table editor, SQL editor, Storage, Data API, API reference and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
       ["link", "tables", "Table editor"],
       ["link", "sql", "SQL editor"],
+      ["link", "storage", "Storage"],
       ["link", "data-api", "Data API"],
       ["link", "api", "API reference"],
       ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/data-api", "/app/api", "/app/members"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/storage", "/app/data-api", "/app/api", "/app/members"]);
   });
 });
 

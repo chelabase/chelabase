@@ -1314,12 +1314,14 @@ mod tests {
             port: 1,
             server_name: None,
             database: "main".into(),
+            database_id: None,
             user: "authenticator".into(),
             password: "x".into(),
             settings: rest::conn::Settings {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
                 max_connections: 4,
+                storage_max_connections: 2,
             },
             databases: vec![],
         }

@@ -1,0 +1,5 @@
+error[E0599]: no method named `lease` found for reference `&RoleSession` in the current scope
+ --> tests/ui/session_has_no_lease.rs:6:23
+  |
+6 |             let _ = s.lease().client().batch_execute("SELECT 1").await;
+  |                       ^^^^^ private field, not a method

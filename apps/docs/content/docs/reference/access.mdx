@@ -79,6 +79,30 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | GET | `/data/v1/schema` | secret data key | Data API key |
 | GET | `/data/v1/types` | secret data key | Data API key |
 | GET | `/health` | none | Public |
+| GET | `/storage/v1/bucket` | any data key | Data API key |
+| POST | `/storage/v1/bucket` | any data key | Data API key |
+| DELETE | `/storage/v1/bucket/\{name\}` | any data key | Data API key |
+| PATCH | `/storage/v1/bucket/\{name\}` | any data key | Data API key |
+| POST | `/storage/v1/object/copy` | any data key | Data API key |
+| POST | `/storage/v1/object/list/\{bucket\}` | any data key | Data API key |
+| POST | `/storage/v1/object/move` | any data key | Data API key |
+| GET | `/storage/v1/object/public/\{branch\}/\{bucket\}/\{*name\}` | none | Public |
+| POST | `/storage/v1/object/resolve` | any data key | Data API key |
+| GET | `/storage/v1/object/sign/\{bucket\}/\{*name\}` | none | Public |
+| POST | `/storage/v1/object/sign/\{bucket\}/\{*name\}` | any data key | Data API key |
+| POST | `/storage/v1/object/upload/sign/\{bucket\}/\{*name\}` | any data key | Data API key |
+| PUT | `/storage/v1/object/upload/sign/\{bucket\}/\{*name\}` | none | Public |
+| DELETE | `/storage/v1/object/\{bucket\}` | any data key | Data API key |
+| DELETE | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
+| GET | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
+| HEAD | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
+| POST | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
+| PUT | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
+| DELETE | `/storage/v1/upload/session/\{session\}` | any data key | Data API key |
+| GET | `/storage/v1/upload/session/\{session\}` | any data key | Data API key |
+| POST | `/storage/v1/upload/session/\{session\}/complete` | any data key | Data API key |
+| PUT | `/storage/v1/upload/session/\{session\}/\{part\}` | any data key | Data API key |
+| POST | `/storage/v1/upload/\{bucket\}/\{*name\}` | any data key | Data API key |
 | GET | `/v1/access-events` | Member token | Tenant admin |
 | POST | `/v1/databases` | Member token | Project Admin |
 | DELETE | `/v1/databases/\{id\}` | Member token | Project Admin |
@@ -125,6 +149,25 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql` | Member token | Act as: Developer and the role in your set |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/runs/\{run_id\}/cancel` | Member token | Project Developer |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/schema` | Member token | Act as: Developer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/bucket` | Member token | Act as: Viewer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/bucket` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/bucket/\{name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/bucket/\{name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/copy` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/list/\{bucket\}` | Member token | Act as: Viewer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/move` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/resolve` | Member token | Act as: Viewer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/sign/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Viewer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}/complete` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}/\{part\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}` | Member token | Project Viewer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/cell` | Member token | Act as: Viewer and the role in your set |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/rows/default` | Member token | Act as: Developer and the role in your set |
@@ -151,6 +194,14 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | DELETE | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
 | GET | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
 | PATCH | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| PATCH | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/attempts` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/rotate-secret` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/test` | Member token | Project Developer |
 | GET | `/v1/instance/settings` | Member token | Instance admin |
 | PATCH | `/v1/instance/settings` | Member token | Instance admin |
 | POST | `/v1/invites` | Member token | Tenant admin |

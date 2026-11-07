@@ -12,6 +12,7 @@
     "sql-editor",
     "table-api",
     "realtime",
+    "storage",
     "schema-merge",
     "neon",
     "api-generation",

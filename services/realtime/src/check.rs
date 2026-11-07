@@ -22,7 +22,9 @@
 //!   snapshot; polled every [`VISIBILITY_POLL`] up to [`VISIBILITY_WAIT`], the [`Limiter`]
 //!   permit released between polls; still not visible → `changed`.
 //! - [`Limiter`]: at most [`CONCURRENCY`] checks in flight per (branch, database); a group that
-//!   finds no free permit gets `changed` at once (R15).
+//!   finds no free permit gets `changed` at once (R15). A storage channel's group waits for one
+//!   instead, and never gets `changed` (object storage m17, [`crate::filter`]'s storage
+//!   invariant).
 //! - [`VisibilityCache`] (R12): (group, relation, key) → visible, for presence; it lives at most
 //!   one merge window and is flushed for the whole database on every window of that database.
 
@@ -64,13 +66,17 @@ pub struct CheckTarget {
 /// One check: the relation, the window's xids (all must be visible; empty = no wait), the
 /// key texts (`None` = probe only), and the keys to print in the check's own session and
 /// transaction (`convert`: a window's every key, so the check's rows and the conversion can't
-/// disagree; empty for presence and view checks).
+/// disagree; empty for presence and view checks). `bucket` (object storage m17, a storage
+/// channel's): the keys are object ids, and only the objects of that bucket the session sees
+/// (and only while it sees the bucket) are returned
+/// ([`chelabase_query::realtime::check_in_bucket`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckRequest {
     pub rel_oid: u32,
     pub xids: Vec<u64>,
     pub keys: Option<Vec<Vec<String>>>,
     pub convert: Vec<Vec<String>>,
+    pub bucket: Option<Uuid>,
 }
 
 /// `/visible`'s shape: the probe, whether every xid was visible, and the key strings of the
@@ -181,6 +187,16 @@ impl Limiter {
         self.permits
             .clone()
             .try_acquire_owned()
+            .ok()
+            .map(|p| CheckPermit { _permit: p })
+    }
+    /// A permit once one is free (object storage m17: a bucket filter waits rather than send
+    /// `changed`); `None` only if the bound were closed, which it never is.
+    pub async fn permit(&self) -> Option<CheckPermit> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
             .ok()
             .map(|p| CheckPermit { _permit: p })
     }
@@ -403,7 +419,7 @@ impl PgChecker {
             }
         }
         self.owner
-            .check(token, target, req.rel_oid, last, req.keys.as_deref(), &req.convert)
+            .check(token, target, req.rel_oid, last, req.keys.as_deref(), &req.convert, req.bucket)
             .await
     }
 }
@@ -465,9 +481,14 @@ async fn role_check(
                 return Ok(failed);
             }
             let last = last.and_then(|x| x.parse::<u64>().ok());
-            match rt::check(c, &rel, last, keys).await {
-                Ok(checked) => answer(checked.visible, checked.keys),
-                Err(_) => return Ok(failed),
+            let checked = match req.bucket {
+                None => rt::check(c, &rel, last, keys).await.map(Some),
+                Some(bucket) => rt::check_in_bucket(c, &rel, last, keys, bucket).await,
+            };
+            match checked {
+                Ok(Some(checked)) => answer(checked.visible, checked.keys),
+                // Not `storage.objects` (a bucket on another relation), or an error.
+                Ok(None) | Err(_) => return Ok(failed),
             }
         }
     };

@@ -226,6 +226,8 @@ export function windowParts(secs: number): { value: number; unit: WindowUnit } {
 export const MAX_ROWS_RANGE = [1, 100_000] as const;
 export const STATEMENT_TIMEOUT_RANGE = [100, 120_000] as const;
 export const MAX_CONNECTIONS_RANGE = [1, 50] as const;
+/** Connections the storage service may hold to each branch (the orchestrator's range). */
+export const STORAGE_MAX_CONNECTIONS_RANGE = [1, 20] as const;
 
 export interface SettingsInput {
   window: string;
@@ -234,15 +236,19 @@ export interface SettingsInput {
   maxRows: string;
   statementTimeoutMs: string;
   maxConnections: string;
+  storageMaxConnections: string;
 }
 export type SettingsErrors = Partial<Record<Exclude<keyof SettingsInput, "unit">, string>>;
 
 const whole = (text: string) => (/^\d+$/.test(text.trim()) ? Number(text.trim()) : NaN);
 const inRange = (n: number, [min, max]: readonly [number, number]) => !Number.isNaN(n) && n >= min && n <= max;
 
+/** What the settings form edits: every database setting. */
+export type FormSettings = DatabaseSettings;
+
 export function parseSettings(
   input: SettingsInput,
-): { ok: true; settings: DatabaseSettings } | ({ ok: false } & SettingsErrors) {
+): { ok: true; settings: FormSettings } | ({ ok: false } & SettingsErrors) {
   const errors: SettingsErrors = {};
   const w = whole(input.window);
   const secs = w * (input.unit === "days" ? 86400 : 3600);
@@ -263,6 +269,10 @@ export function parseSettings(
   if (!inRange(connections, MAX_CONNECTIONS_RANGE)) {
     errors.maxConnections = "Max connections must be a whole number between 1 and 50.";
   }
+  const storageConnections = whole(input.storageMaxConnections);
+  if (!inRange(storageConnections, STORAGE_MAX_CONNECTIONS_RANGE)) {
+    errors.storageMaxConnections = "Storage connections must be a whole number between 1 and 20.";
+  }
   if (Object.keys(errors).length > 0) return { ok: false, ...errors };
   return {
     ok: true,
@@ -272,6 +282,7 @@ export function parseSettings(
       max_rows: rows,
       statement_timeout_ms: timeout,
       max_connections: connections,
+      storage_max_connections: storageConnections,
     },
   };
 }

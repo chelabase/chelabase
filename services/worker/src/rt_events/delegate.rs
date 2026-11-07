@@ -606,6 +606,15 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.set_authenticator_password(branch, sealed).await
     }
 
+    async fn set_storage_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        self.inner.set_storage_password(branch, sealed, salt).await
+    }
+
     async fn branch_databases(
         &self,
         branch: BranchId,

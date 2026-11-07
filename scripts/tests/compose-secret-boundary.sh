@@ -25,6 +25,13 @@
 #      `docker run` of its own, checked in tools/cli). The workbench's runner, the test harness,
 #      sees the keys its live tests read and is left out of these checks, but never the
 #      bootstrap's token.
+#   5. the object-store keys (m2): see there. m19 (#152): the storage service's boundary, in both
+#      renders: `nats/storage.password` is storage's alone, `tokens/storage-internal.token` goes
+#      to storage and the orchestrator (the bearer both ways), `storage-s3/` to seaweedfs, storage
+#      and the worker (the blob sweep); storage runs its binary directly (no shell that could put
+#      a secret in argv or its environment), read-only, and names every secret by a `*_FILE`
+#      path. NATS restarts when init-secrets is updated, so an upgrade's new NATS users (storage's)
+#      reach it.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -58,8 +65,13 @@ valkey	valkey/users.acl	ro
 valkey	valkey/health.password	ro
 seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
-create-bucket	s3/access-key	ro
-create-bucket	s3/secret-key	ro
+seaweedfs	storage-s3/access-key	ro
+seaweedfs	storage-s3/secret-key	ro
+seaweedfs	grpc-tls/ca.crt	ro
+seaweedfs	grpc-tls/server.crt	ro
+seaweedfs	grpc-tls/server.key	ro
+seaweedfs	grpc-tls/client.crt	ro
+seaweedfs	grpc-tls/client.key	ro
 safekeeper1	s3/access-key	ro
 safekeeper1	s3/secret-key	ro
 safekeeper1	neon/compute-jwt.pub.pem	ro
@@ -107,6 +119,7 @@ orchestrator	tokens/rest-internal.token	ro
 orchestrator	tokens/data-keys.token	ro
 orchestrator	tokens/app-auth.token	ro
 orchestrator	tokens/app-sessions.token	ro
+orchestrator	tokens/storage-internal.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
 orchestrator	tokens/orchestrator-identity.token	ro
@@ -125,6 +138,8 @@ worker	compute-ca	rw
 worker	orchestrator-tls	rw
 worker	realtime-tls	rw
 worker	db/metadata.password	ro
+worker	storage-s3/access-key	ro
+worker	storage-s3/secret-key	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
@@ -142,6 +157,12 @@ auth	tokens/app-auth.token	ro
 rest	gateway/internal-verify.pem	ro
 rest	compute-ca/ca.crt	ro
 rest	tokens/rest-internal.token	ro
+storage	gateway/internal-verify.pem	ro
+storage	compute-ca/ca.crt	ro
+storage	tokens/storage-internal.token	ro
+storage	nats/storage.password	ro
+storage	storage-s3/access-key	ro
+storage	storage-s3/secret-key	ro
 realtime	gateway/internal-verify.pem	ro
 realtime	compute-ca/ca.crt	ro
 realtime	nats/realtime.password	ro
@@ -183,7 +204,7 @@ jq -r --arg k "$keys/" --arg st "$state" '.services | to_entries[] | .key as $s
   | if (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|storage-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true
@@ -235,6 +256,105 @@ for f in identity/db.password tokens/worker-identity.token; do
   awk -F'\t' -v f="$f" '$1 == "runner" && $2 == f' "$tmp/wb.have" | grep -q . ||
     err "the workbench runner doesn't see $f (members_pool_idempotent reads it)"
 done
+
+# 5. The object-store keys and SeaweedFS's gRPC TLS files (epic object-storage m2). The table
+# pins who mounts which file: Neon's `s3/` pair by seaweedfs and the four Neon services,
+# `storage-s3/` and `grpc-tls/` by seaweedfs only (until the storage service lands). Here: no
+# service gets one of them from its environment or a bind (a value there shows up in `docker
+# inspect`), no admin identity or key file exists, and only seaweedfs names these paths at all.
+leaks="$(jq -r '.services | to_entries[] | .key as $s
+  | ((.value.environment // {}) | to_entries[]
+       | select(.key | test("^(AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)|CHELABASE_STORAGE_S3_(ACCESS|SECRET)_KEY)$"))
+       | "\($s): environment \(.key) is set in the base file"),
+    ((.value.volumes // [])[] | select(.type == "bind")
+       | select(.source | test("storage-s3|grpc-tls|/s3/"))
+       | "\($s): bind \(.source)")' "$tmp/base.json")"
+[[ -z "$leaks" ]] || err "an object-store key reaches a service through its environment or a bind:"$'\n'"$leaks"
+# init-secrets, which makes the files, is the one name besides their readers: grpc-tls/ is
+# seaweedfs's; storage-s3/ (the `storage` identity) is seaweedfs's, the storage service's and the
+# worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker "; do
+  dir="${want%%:*}"
+  users="$(jq -r --arg d "$dir/" '.services | to_entries[]
+    | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
+  [[ "$users" == "${want#*:}" ]] || err "services naming $dir/: got [$users], want [${want#*:}]"
+done
+users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
+[[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
+! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
+  | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
+  err "an admin S3 identity or key file is back"
+
+# The same wiring in the base file: two identities with bucket-scoped actions, mTLS on every
+# gRPC listener, S3 directly on the network, no relay, buckets made inside, a real healthcheck.
+sw_cmd="$(jq -r '.services.seaweedfs.command | join("\n")' "$tmp/base.json")"
+for want in '"Read:neon", "Write:neon", "List:neon", "Tagging:neon"' \
+  '"Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"' \
+  '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.ip.bind=0.0.0.0' '-s3.iam=false' 'exec weed server' \
+  '/etc/seaweedfs/security.toml' '[grpc.%s]' 'for c in master volume filer s3' '[grpc.client]' \
+  's3.bucket.create -name neon' 's3.bucket.create -name chelabase-storage' '/tmp/buckets-ready'; do
+  grep -qF -- "$want" <<<"$sw_cmd" || err "seaweedfs: the command must contain: $want"
+done
+! grep -qE 'nc -lk|"Admin"|"name": "admin"|-s3.port=' <<<"$sw_cmd" || err "seaweedfs: no relay, no admin identity, no moved S3 port"
+! grep -qE '"(Read|Write|List|Tagging)"' <<<"$sw_cmd" || err "seaweedfs: no unscoped Read/Write/List/Tagging action"
+hc="$(jq -r '.services.seaweedfs.healthcheck.test | join(" ")' "$tmp/base.json")"
+for want in '/tmp/buckets-ready' '8333' '<Code>AccessDenied</Code>'; do
+  grep -qF -- "$want" <<<"$hc" || err "seaweedfs: the healthcheck must be an S3-level request ($want)"
+done
+[[ "$(jq -c '.services["create-bucket"] | [.volumes // [], .environment // {}, .depends_on.seaweedfs.condition]' "$tmp/base.json")" == '[[],{},"service_healthy"]' ]] ||
+  err "create-bucket holds no volume or credential and only waits for seaweedfs to be healthy"
+
+# Neon's S3 endpoint is one setting (default the compose SeaweedFS), in the safekeepers' args and
+# the pageserver's config, so it can be pointed at another host without editing the file. The
+# bucket step may run 8 minutes, so the healthcheck's start_period covers it.
+endpoint_uses() { # endpoint_uses <json>: "<service>=<endpoint>" for the three safekeepers and the pageserver
+  local svc
+  for svc in pageserver safekeeper1 safekeeper2 safekeeper3; do
+    jq -r --arg s "$svc" '.services[$s].command | map(tostring) | join(" ")' <<<"$1" |
+      grep -oP "(?<![_a-z])endpoint='[^']*'" | sed "s|^endpoint='|$svc=|; s|'\$||"
+  done | sort | tr '\n' ' ' | sed 's/ $//'
+}
+want_default="pageserver=http://seaweedfs:8333 safekeeper1=http://seaweedfs:8333 safekeeper2=http://seaweedfs:8333 safekeeper3=http://seaweedfs:8333"
+[[ "$(endpoint_uses "$(cat "$tmp/base.json")")" == "$want_default" ]] ||
+  err "Neon's S3 endpoint must default to http://seaweedfs:8333 in all four services; got: $(endpoint_uses "$(cat "$tmp/base.json")")"
+over="$(CHELABASE_NEON_S3_ENDPOINT=http://other.example:9000 compose chelabase-boundary "$root/infra/compose/.env.example" -f "$root/infra/compose/docker-compose.yml")"
+[[ "$(endpoint_uses "$over")" == "${want_default//http:\/\/seaweedfs:8333/http://other.example:9000}" ]] ||
+  err "CHELABASE_NEON_S3_ENDPOINT must change Neon's S3 endpoint in all four services"
+[[ "$(jq -r '.services.seaweedfs.healthcheck.start_period' "$tmp/base.json")" == 8m0s ]] ||
+  err "seaweedfs: the healthcheck start_period must cover the bucket step's 8 minutes"
+grep -qF 'kill 1' <<<"$sw_cmd" && grep -qF 'last weed shell output' <<<"$sw_cmd" ||
+  err "seaweedfs: the bucket step must log the last output and end the container when it gives up"
+
+# 6. The storage service (m19): its own secrets only, in both renders (the runner left out).
+for render in base wb; do
+  boundary nats/storage.password "storage" "$render" "$tmp/readers.$render"
+  boundary tokens/storage-internal.token "orchestrator storage" "$render" "$tmp/readers.$render"
+done
+jq -e '.services.storage' "$tmp/base.json" >/dev/null || err "the base file has no storage service"
+st="$(jq -c '.services.storage // {} | {entrypoint, command, read_only, user}' "$tmp/base.json")"
+[[ "$st" == '{"entrypoint":null,"command":null,"read_only":true,"user":null}' ]] ||
+  err "storage runs its image's binary as its user (10001), read-only, with no entrypoint or command: got $st"
+img="$(jq -r '.services.storage.image // ""' "$tmp/base.json")"
+[[ "$img" == ghcr.io/chelabase/storage:* ]] || err "storage runs the ghcr.io/chelabase/storage release image: got $img"
+# Every secret it mounts is named by a *_FILE setting (or the compute CA / verify key paths),
+# and no environment value holds a secret's contents (a path under /run/chelabase/secrets only).
+for sub in tokens/storage-internal.token nats/storage.password storage-s3/access-key storage-s3/secret-key; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services.storage.environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "storage reads $sub through a *_FILE setting"
+done
+bad="$(jq -r '.services.storage.environment // {} | to_entries[]
+  | select(.key | test("(TOKEN|PASSWORD|SECRET|_KEY)(_FILE)?$"))
+  | select((.value // "") | startswith("/run/chelabase/secrets/") | not) | .key' "$tmp/base.json")"
+[[ -z "$bad" ]] || err "storage gets a secret-named setting that isn't a mounted file's path: $bad"
+# The webhook allowlist defaults to nothing (public targets only, https only).
+for svc in orchestrator worker; do
+  got="$(jq -c --arg s "$svc" '.services[$s].environment | [.CHELABASE_WEBHOOKS_ALLOW_HOSTS, .CHELABASE_WEBHOOKS_ALLOW_HTTP]' "$tmp/base.json")"
+  [[ "$got" == '["",""]' ]] || err "$svc: the webhook allowlist defaults to empty and http to off; got $got"
+done
+# An upgrade re-renders nats/auth.conf with the new users; NATS reads it at start only.
+[[ "$(jq -r '.services.nats.depends_on["init-secrets"].restart' "$tmp/base.json")" == true ]] ||
+  err "nats restarts when init-secrets is updated (depends_on init-secrets: restart: true)"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

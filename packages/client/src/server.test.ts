@@ -273,8 +273,15 @@ describe("createServerClient", () => {
     const j = jar({ [ACCESS]: forged, [REFRESH]: "rt1" });
     const db = createServerClient({ url, key, fetch, cookies: j.cookies });
     // The module and the client expose nothing read from the cookie.
-    expect(Object.keys(serverModule).sort()).toEqual(["createAuthHandler", "createServerClient", "parseCookies", "serializeCookie"]);
-    expect(Object.keys(db).sort()).toEqual(["auth", "batch", "call", "database", "from"]);
+    expect(Object.keys(serverModule).sort()).toEqual([
+      "WebhookVerificationError",
+      "createAuthHandler",
+      "createServerClient",
+      "parseCookies",
+      "serializeCookie",
+      "verifyWebhook",
+    ]);
+    expect(Object.keys(db).sort()).toEqual(["auth", "batch", "call", "database", "from", "storage"]);
     await expect(db.auth.getUser()).rejects.toMatchObject({ status: 401, code: "user_token_invalid" });
     await expect(db.from("t").select("id")).rejects.toMatchObject({ code: "user_token_invalid" });
     expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(0);

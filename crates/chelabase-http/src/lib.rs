@@ -22,6 +22,8 @@
 
 use std::time::Duration;
 
+pub mod outbound;
+
 pub use reqwest::{IntoUrl, Method, RequestBuilder};
 
 /// A `reqwest` client that never follows a redirect: a 3xx comes back to the caller as the
@@ -71,6 +73,17 @@ impl ClientBuilder {
     /// The total timeout for each request.
     pub fn timeout(self, timeout: Duration) -> Self {
         Self(self.0.timeout(timeout))
+    }
+
+    /// The longest a connection may take to open.
+    pub fn connect_timeout(self, timeout: Duration) -> Self {
+        Self(self.0.connect_timeout(timeout))
+    }
+
+    /// The longest a response may stay silent between reads (no total timeout: a streamed
+    /// body may take long as a whole).
+    pub fn read_timeout(self, timeout: Duration) -> Self {
+        Self(self.0.read_timeout(timeout))
     }
 
     /// Headers sent on every request.

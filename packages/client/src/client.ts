@@ -3,13 +3,15 @@ import { type AuthCore, SESSION_GONE, USER_HEADER } from "./auth.ts";
 import { NO_REDIRECTS, plainError, toError } from "./error.ts";
 import { hasSourceText, parseResult, type ResultSpec, stringify } from "./json.ts";
 import { batchOf, callFn, type Runner, selectFrom } from "./query.ts";
+import { lazyStorage, resumeStore } from "./storage-lazy.ts";
+import type { StorageOptions } from "./storage.ts";
 import type { Client, DatabaseShape, QueryTree, TypeMap } from "./types.ts";
 
 const RUNTIMES = "Node 21+, Chrome 114+, Firefox 135+ or Safari 18.4+";
 
 export function buildClient<DB extends DatabaseShape, B extends boolean>(
   name: string,
-  opts: { url: string; key: string; fetch?: typeof fetch; types?: TypeMap; bigint?: B },
+  opts: { url: string; key: string; fetch?: typeof fetch; types?: TypeMap; bigint?: B; storage?: StorageOptions },
   session: (base: string, doFetch: typeof fetch) => { core: AuthCore<DB>; retryExpired: boolean },
 ): Client<DB, B> {
   const bigint = opts.bigint === true;
@@ -23,6 +25,8 @@ export function buildClient<DB extends DatabaseShape, B extends boolean>(
   const base = opts.url.replace(/\/+$/, "");
   const endpoint = `${base}/data/v1/query`;
   const { core, retryExpired } = session(base, doFetch);
+  // One resume store per client, shared by its `database()` siblings (its keys name the database).
+  const resume = resumeStore(opts.key, opts.storage);
 
   // One client per (database, types): `database()` builds a sibling bound to another database.
   const make = (types: TypeMap | undefined, database: string | undefined): unknown => {
@@ -100,6 +104,16 @@ export function buildClient<DB extends DatabaseShape, B extends boolean>(
       batch: (fn: (t: unknown) => unknown) => batchOf(runner, fn(tx(batchRunner))),
       database: (name: string, t?: TypeMap) => make(t, name),
       auth: core.auth,
+      storage: lazyStorage({
+        base,
+        key: opts.key,
+        fetch: doFetch,
+        database,
+        branch: opts.storage?.branch,
+        core,
+        retryExpired,
+        resume,
+      }),
     };
   };
 

@@ -151,7 +151,9 @@ fn another_checkouts_run_mounts_that_checkout_in_the_stacks_runner() {
     assert!(has_pair(&args, "--profile", "runner"), "{args:?}");
     let runner = args.iter().rposition(|a| a == "runner").unwrap();
     assert_eq!(&args[runner + 1..], ["scripts/x.sh", "--y"]);
-    for flag in ["run", "--rm", "--no-deps"] {
+    // `--use-aliases`: the runner is `runner` on the stack's networks, so the worker reaches the
+    // storage webhook live test's receiver by that name (object-storage m18).
+    for flag in ["run", "--rm", "--no-deps", "--use-aliases"] {
         assert!(args[..runner].iter().any(|a| a == flag), "{flag}: {args:?}");
     }
 }

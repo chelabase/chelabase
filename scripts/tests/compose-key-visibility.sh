@@ -33,6 +33,7 @@ universe='[
   "K/orchestrator-tls/current/client.crt", "K/orchestrator-tls/current/client.key", "K/orchestrator-tls/current/ca.crt",
   "K/realtime-tls/current/client.crt", "K/realtime-tls/current/client.key", "K/realtime-tls/current/ca.crt",
   "K/nats/orchestrator.password", "K/nats/worker.password", "K/nats/realtime.password", "K/nats/runner.password",
+  "K/nats/storage.password",
   "K/valkey/proxy.password", "K/valkey/control.password", "K/valkey/realtime.password", "K/valkey/runner.password",
   "K/valkey/health.password",
   "K/neon/compute-jwt.pub.pem", "K/neon/storage-tokens/pageserver-api.jwt", "K/neon/storage-tokens/safekeeper-data.jwt",
@@ -40,7 +41,7 @@ universe='[
   "K/neon/storage-tokens/metrics.token",
   "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
-  "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
+  "K/tokens/app-sessions.token", "K/tokens/storage-internal.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/auth/member-jwt.key", "K/auth/member-jwt.pub", "K/identity/secret", "K/identity/db.password",
   "K/tokens/auth-identity.token", "K/tokens/orchestrator-identity.token", "K/tokens/worker-identity.token",
   "K/tokens/bootstrap-identity.token",
@@ -80,7 +81,7 @@ expected='{
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
     "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/tokens/app-sessions.token": "ro", "K/tokens/storage-internal.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
     "K/tokens/orchestrator-identity.token": "ro", "K/auth/member-jwt.pub": "ro",
     "S/setup/setup.code": "ro"
   },
@@ -112,6 +113,13 @@ expected='{
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
     "K/tokens/rest-internal.token": "ro"
+  },
+  "storage": {
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "K/gateway/internal-verify.pem": "ro",
+    "K/compute-ca/ca.crt": "ro",
+    "K/tokens/storage-internal.token": "ro",
+    "K/nats/storage.password": "ro"
   },
   "realtime": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -152,7 +160,7 @@ expected='{
     "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/tokens/app-sessions.token": "ro", "K/tokens/storage-internal.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
     "K/auth/member-jwt.key": "ro", "K/auth/member-jwt.pub": "ro", "K/identity/secret": "ro", "K/identity/db.password": "ro",
     "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro", "K/tokens/worker-identity.token": "ro"
   }
@@ -189,7 +197,20 @@ expected_state_binds='[
   "nats:S/nats/auth.conf->/etc/nats/auth.conf",
   "valkey:S/valkey/users.acl->/etc/valkey/users.acl",
   "orchestrator:S/setup/setup.code->S/setup/setup.code",
-  "runner:S->S:rw"
+  "runner:S->S:rw",
+  "seaweedfs:S/s3/access-key->/run/chelabase/secrets/s3/access-key",
+  "seaweedfs:S/s3/secret-key->/run/chelabase/secrets/s3/secret-key",
+  "seaweedfs:S/storage-s3/access-key->/run/chelabase/secrets/storage-s3/access-key",
+  "seaweedfs:S/storage-s3/secret-key->/run/chelabase/secrets/storage-s3/secret-key",
+  "seaweedfs:S/grpc-tls/ca.crt->/run/chelabase/secrets/grpc-tls/ca.crt",
+  "seaweedfs:S/grpc-tls/server.crt->/run/chelabase/secrets/grpc-tls/server.crt",
+  "seaweedfs:S/grpc-tls/server.key->/run/chelabase/secrets/grpc-tls/server.key",
+  "seaweedfs:S/grpc-tls/client.crt->/run/chelabase/secrets/grpc-tls/client.crt",
+  "seaweedfs:S/grpc-tls/client.key->/run/chelabase/secrets/grpc-tls/client.key",
+  "storage:S/storage-s3/access-key->/run/chelabase/secrets/storage-s3/access-key",
+  "storage:S/storage-s3/secret-key->/run/chelabase/secrets/storage-s3/secret-key",
+  "worker:S/storage-s3/access-key->/run/chelabase/secrets/storage-s3/access-key",
+  "worker:S/storage-s3/secret-key->/run/chelabase/secrets/storage-s3/secret-key"
 ]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink
@@ -311,7 +332,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs gateway identity landing orchestrator realtime rest runner studio worker" ]] ||
+  [[ "$mounting" == "auth docs gateway identity landing orchestrator realtime rest runner storage studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

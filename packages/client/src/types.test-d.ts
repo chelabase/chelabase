@@ -9,10 +9,14 @@ import {
   type Int8,
   type Json,
   type Session,
+  type StorageObjectId,
+  type StoragePath,
+  type StorageRef,
 } from "./index.ts";
 import { type BrowserSession, createBrowserClient } from "./browser.ts";
 import { createServerClient } from "./server.ts";
 import { type Database, types } from "./test-db.ts";
+import { type Database as GenDatabase, types as genTypes } from "../fixtures/gen/db.ts";
 
 const opts = { url: "http://localhost:8000", key: "chk_pub_x" };
 const db = createClient<Database>({ ...opts, types });
@@ -355,3 +359,50 @@ createBrowserClient<Database>({ ...opts, bigint: true });
 createBrowserClient({ ...opts, auth: {} });
 // @ts-expect-error nor a caller-owned token
 createBrowserClient({ ...opts, accessToken: () => "t" });
+
+// --- #102: a `storage.object_ref` column is a `StorageRef`, `| null` when nullable
+expectTypeOf<StorageRef>().toEqualTypeOf<{ bucket_id: string; name: string }>();
+const gen = createClient<GenDatabase>({ ...opts, types: genTypes });
+async function storageRefs() {
+  const rows = await gen.from("profiles").select("avatar", "banner", "gallery");
+  expectTypeOf(rows[0]!.avatar).toEqualTypeOf<StorageRef | null>();
+  expectTypeOf(rows[0]!.banner).toEqualTypeOf<StorageRef>();
+  expectTypeOf(rows[0]!.gallery).toEqualTypeOf<StorageRef[] | null>();
+  // Inserted as `{ bucket_id, name }`; a bare name isn't a ref.
+  await gen.from("profiles").insert({ banner: { bucket_id: "b", name: "a.png" }, avatar: null });
+  // @ts-expect-error a ref is { bucket_id, name }, not a path
+  await gen.from("profiles").insert({ banner: "a.png" });
+  // resolve: one ref (or null) to one URL (or null), an array to an array in order.
+  expectTypeOf(gen.storage.resolve(rows[0]!.avatar)).resolves.toEqualTypeOf<string | null>();
+  expectTypeOf(gen.storage.resolve(rows[0]!.banner)).resolves.toEqualTypeOf<string | null>();
+  expectTypeOf(gen.storage.resolve(rows.map((r) => r.avatar))).resolves.toEqualTypeOf<(string | null)[]>();
+  expectTypeOf(gen.storage.resolve(rows[0]!.gallery ?? [], { expiresIn: 60 })).resolves.toEqualTypeOf<(string | null)[]>();
+}
+void storageRefs;
+
+// --- #102: a text column marked `@storage_ref bucket=` and a foreign key to storage.objects(id)
+async function storagePathsAndIds() {
+  const rows = await gen.from("profiles").select("avatar_path", "photo_id", "lookalike");
+  expectTypeOf(rows[0]!.avatar_path).toEqualTypeOf<StoragePath<"avatars"> | null>();
+  expectTypeOf(rows[0]!.photo_id).toEqualTypeOf<StorageObjectId | null>();
+  // A type merely named object_ref is not a ref.
+  expectTypeOf(rows[0]!.lookalike).toEqualTypeOf<string | null>();
+  // Both are strings: written as plain strings, filtered like one.
+  await gen.from("profiles").insert({ banner: { bucket_id: "b", name: "a" }, avatar_path: "u1/me.png", photo_id: "0000" });
+  await gen.from("profiles").select("id").where({ avatar_path: { eq: "u1/me.png" } });
+  const path: string = rows[0]!.avatar_path ?? "";
+  void path;
+  // resolve takes them as `{ bucket, name }` and `{ id }`.
+  const p = rows[0]!.avatar_path;
+  const id = rows[0]!.photo_id;
+  if (p !== null && id !== null) {
+    expectTypeOf(gen.storage.resolve({ bucket: "avatars", name: p })).resolves.toEqualTypeOf<string | null>();
+    expectTypeOf(gen.storage.resolve({ id })).resolves.toEqualTypeOf<string | null>();
+    expectTypeOf(gen.storage.resolve([{ id }, { bucket: "avatars", name: p }, null])).resolves.toEqualTypeOf<(string | null)[]>();
+  }
+  // @ts-expect-error a ref names an object one way, not two
+  void gen.storage.resolve({ id: "x", bucket: "avatars", name: "a" });
+  // @ts-expect-error a bare string isn't a ref
+  void gen.storage.resolve("u1/me.png");
+}
+void storagePathsAndIds;
