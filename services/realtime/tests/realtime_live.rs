@@ -1818,12 +1818,12 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
         assert!(o.is_empty(), "{o:?}");
 
         // #129 N4: the listing itself gives each folder row the id of an object under it, as
-        // the role sees it: `notes/` holds only a.txt; `docs/` has a placeholder object named
-        // `docs/` (storage's API refuses such a name: an upload renamed in SQL, which its guard
+        // the role sees it: `notes/` holds only a.txt; `papers/` has a placeholder object named
+        // `papers/` (storage's API refuses such a name: an upload renamed in SQL, which its guard
         // trigger allows), whose id it prefers.
-        storage_upload(&fx, &fx.token, "media", "docs/b.txt", None).await;
-        let placeholder = storage_upload(&fx, &fx.token, "media", "docs/p.txt", None).await;
-        fx.psql(&fx.pg_database, &format!("UPDATE storage.objects SET name = 'docs/' WHERE id = '{placeholder}'"))
+        storage_upload(&fx, &fx.token, "media", "papers/b.txt", None).await;
+        let placeholder = storage_upload(&fx, &fx.token, "media", "papers/p.txt", None).await;
+        fx.psql(&fx.pg_database, &format!("UPDATE storage.objects SET name = 'papers/' WHERE id = '{placeholder}'"))
             .await;
         let (status, listed) = storage_call(
             &fx,
@@ -1845,9 +1845,9 @@ async fn storage_uploads_reach_only_viewers_who_can_list_them() {
         };
         let notes = row("notes/");
         assert_eq!((&notes["folder"], &notes["id"]), (&json!(true), &json!(shown.to_string())), "{notes}");
-        let docs_row = row("docs/");
-        assert_eq!((&docs_row["folder"], &docs_row["id"]), (&json!(true), &json!(placeholder.to_string())), "{docs_row}");
-        // The docs/ uploads' own frames pass.
+        let papers_row = row("papers/");
+        assert_eq!((&papers_row["folder"], &papers_row["id"]), (&json!(true), &json!(placeholder.to_string())), "{papers_row}");
+        // The papers/ uploads' own frames pass.
         tokio::join!(
             collect_rows(&mut ana, &ch, Duration::from_secs(3)),
             collect_rows(&mut bob, &ch, Duration::from_secs(3)),
