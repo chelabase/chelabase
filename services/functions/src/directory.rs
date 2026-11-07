@@ -6,8 +6,9 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use chelabase_metadata::MetadataClient;
-use chelabase_metadata::{FunctionAuth, FunctionKind};
+use chelabase_metadata::{
+    FunctionAuth, FunctionKind, MetadataClient, MetadataError, ResolvedFunction,
+};
 use chelabase_types::{BranchId, DatabaseId};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -90,14 +91,84 @@ pub trait Directory: Send + Sync + 'static {
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool>;
 }
 
-/// The metadata database. Its client carries the secrets key (`with_secrets_key`): function
-/// secrets and the managed run-as key open with it.
-pub struct Metadata {
-    pub client: MetadataClient,
+/// What [`Metadata`] needs from the metadata database: [`MetadataClient`]'s calls, behind a
+/// trait so a test can fake them.
+#[async_trait::async_trait]
+pub trait MetadataPort: Send + Sync + 'static {
+    async fn resolve(
+        &self,
+        branch: BranchId,
+        name: &str,
+    ) -> Result<Option<ResolvedFunction>, MetadataError>;
+    /// The branch's database.
+    async fn branch_database(&self, branch: BranchId) -> Result<Option<DatabaseId>, MetadataError>;
+    async fn decrypt_secrets(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> Result<Vec<(String, String)>, MetadataError>;
+    /// The function's live managed run-as key, opened: `(key id, secret)`.
+    async fn managed_run_as_key(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> Result<Option<(Uuid, String)>, MetadataError>;
+    async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError>;
+    async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError>;
 }
 
 #[async_trait::async_trait]
-impl Directory for Metadata {
+impl MetadataPort for MetadataClient {
+    async fn resolve(
+        &self,
+        branch: BranchId,
+        name: &str,
+    ) -> Result<Option<ResolvedFunction>, MetadataError> {
+        MetadataClient::resolve(self, branch, name).await
+    }
+    async fn branch_database(&self, branch: BranchId) -> Result<Option<DatabaseId>, MetadataError> {
+        Ok(self.get_branch(branch).await?.map(|b| b.database_id))
+    }
+    async fn decrypt_secrets(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> Result<Vec<(String, String)>, MetadataError> {
+        MetadataClient::decrypt_secrets(self, branch, function).await
+    }
+    async fn managed_run_as_key(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> Result<Option<(Uuid, String)>, MetadataError> {
+        MetadataClient::managed_run_as_key(self, branch, function).await
+    }
+    async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_function_last_error(self, branch, function, error).await
+    }
+    async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError> {
+        MetadataClient::live_database(self, database).await
+    }
+}
+
+/// The metadata database. Its client carries the secrets key (`with_secrets_key`): function
+/// secrets and the managed run-as key open with it.
+pub struct Metadata<P = MetadataClient> {
+    pub client: P,
+}
+
+#[async_trait::async_trait]
+impl<P: MetadataPort> Directory for Metadata<P> {
     async fn resolve(&self, branch: Uuid, name: &str) -> anyhow::Result<Option<Parts>> {
         let Some(f) = self.client.resolve(BranchId(branch), name).await? else {
             return Ok(None);
@@ -105,7 +176,7 @@ impl Directory for Metadata {
         let (FunctionKind::Function, Some(sha)) = (f.kind, f.bundle_sha256) else {
             return Ok(None);
         };
-        let Some(record) = self.client.get_branch(BranchId(branch)).await? else {
+        let Some(database) = self.client.branch_database(BranchId(branch)).await? else {
             return Ok(None);
         };
         // A disabled function is never run: its secrets stay sealed.
@@ -126,7 +197,7 @@ impl Directory for Metadata {
             (Vec::new(), None)
         };
         Ok(Some(Parts {
-            database_id: record.database_id.as_uuid(),
+            database_id: database.as_uuid(),
             function_id: f.function_id,
             bundle_sha256: sha,
             auth: f.auth,
@@ -137,14 +208,10 @@ impl Directory for Metadata {
     }
 
     async fn record_error(&self, branch: Uuid, function: Uuid, error: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE branch_functions SET last_error = $3 WHERE branch_id = $1 AND function_id = $2",
-        )
-        .bind(branch)
-        .bind(function)
-        .bind(error)
-        .execute(self.client.pool())
-        .await?;
+        // Capped at MAX_LAST_ERROR_CHARS, and written only while the branch is live.
+        self.client
+            .set_function_last_error(BranchId(branch), function, Some(error))
+            .await?;
         Ok(())
     }
 
@@ -153,18 +220,19 @@ impl Directory for Metadata {
     }
 }
 
-impl Metadata {
-    /// The function's live managed key on the branch, opened (`run_as_role`'s key).
+impl<P: MetadataPort> Metadata<P> {
+    /// The function's live managed key on the branch, opened (`run_as_role`'s key): none once
+    /// it is revoked, or when it isn't managed by this function.
     async fn service_key(
         &self,
         branch: Uuid,
         function: Uuid,
     ) -> anyhow::Result<Option<Zeroizing<String>>> {
-        // TODO(#180): `self.client.managed_run_as_key(BranchId(branch), function)` returns the
-        // live, unrevoked key managed by this function, opened with the client's secrets key.
-        // Until #180 lands no function gets CHELABASE_SERVICE_KEY.
-        let _ = (branch, function);
-        Ok(None)
+        let key = self
+            .client
+            .managed_run_as_key(BranchId(branch), function)
+            .await?;
+        Ok(key.map(|(_, secret)| Zeroizing::new(secret)))
     }
 }
 
@@ -189,6 +257,135 @@ mod tests {
 
     fn env(r: &Resolution) -> serde_json::Value {
         serde_json::from_slice(&STANDARD.decode(r.env_header.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// The metadata database as a fake: one function, its managed key (if live), and the
+    /// `last_error` writes.
+    struct FakePort {
+        function_id: Uuid,
+        database: DatabaseId,
+        run_as_key_id: Option<Uuid>,
+        managed_key: Option<(Uuid, String)>,
+        enabled: bool,
+        errors: std::sync::Mutex<Vec<(BranchId, Uuid, Option<String>)>>,
+    }
+
+    impl FakePort {
+        fn new(run_as_key_id: Option<Uuid>, managed_key: Option<(Uuid, String)>) -> Self {
+            Self {
+                function_id: Uuid::new_v4(),
+                database: DatabaseId(Uuid::new_v4()),
+                run_as_key_id,
+                managed_key,
+                enabled: true,
+                errors: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataPort for FakePort {
+        async fn resolve(
+            &self,
+            _branch: BranchId,
+            name: &str,
+        ) -> Result<Option<ResolvedFunction>, MetadataError> {
+            Ok((name == "hello").then(|| ResolvedFunction {
+                function_id: self.function_id,
+                kind: FunctionKind::Function,
+                deployment_id: Uuid::new_v4(),
+                bundle_sha256: Some("a".repeat(64)),
+                spec: serde_json::json!({}),
+                compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                auth: FunctionAuth::Key,
+                enabled: self.enabled,
+                run_as_role: self.run_as_key_id.map(|_| "reporter".into()),
+                run_as_key_id: self.run_as_key_id,
+            }))
+        }
+        async fn branch_database(&self, _: BranchId) -> Result<Option<DatabaseId>, MetadataError> {
+            Ok(Some(self.database))
+        }
+        async fn decrypt_secrets(
+            &self,
+            _: BranchId,
+            _: Uuid,
+        ) -> Result<Vec<(String, String)>, MetadataError> {
+            Ok(vec![("API_KEY".into(), "s3cret".into())])
+        }
+        async fn managed_run_as_key(
+            &self,
+            _: BranchId,
+            function: Uuid,
+        ) -> Result<Option<(Uuid, String)>, MetadataError> {
+            assert_eq!(function, self.function_id);
+            Ok(self.managed_key.clone())
+        }
+        async fn set_function_last_error(
+            &self,
+            branch: BranchId,
+            function: Uuid,
+            error: Option<&str>,
+        ) -> Result<(), MetadataError> {
+            self.errors
+                .lock()
+                .unwrap()
+                .push((branch, function, error.map(str::to_owned)));
+            Ok(())
+        }
+        async fn live_database(&self, _: DatabaseId) -> Result<bool, MetadataError> {
+            Ok(true)
+        }
+    }
+
+    async fn service_key_of(port: FakePort) -> Option<String> {
+        let dir = Metadata { client: port };
+        let parts = dir.resolve(Uuid::new_v4(), "hello").await.unwrap().unwrap();
+        parts.service_key.map(|k| k.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_live_managed_key_becomes_the_service_key() {
+        let key = Uuid::new_v4();
+        let port = FakePort::new(Some(key), Some((key, "chk_sec_reporter".into())));
+        let dir = Metadata { client: port };
+        let branch = Uuid::new_v4();
+        let parts = dir.resolve(branch, "hello").await.unwrap().unwrap();
+        assert_eq!(
+            parts.service_key.as_deref().map(String::as_str),
+            Some("chk_sec_reporter")
+        );
+        assert_eq!(parts.database_id, dir.client.database.as_uuid());
+        let r = Resolution::build(parts, branch, "u");
+        assert_eq!(env(&r)["CHELABASE_SERVICE_KEY"], "chk_sec_reporter");
+    }
+
+    #[tokio::test]
+    async fn no_service_key_without_a_live_managed_key() {
+        let key = Uuid::new_v4();
+        // Revoked (or not managed by this function): the metadata answers no key.
+        assert_eq!(service_key_of(FakePort::new(Some(key), None)).await, None);
+        // No run-as role at all.
+        assert_eq!(service_key_of(FakePort::new(None, None)).await, None);
+        // Disabled: nothing is opened.
+        let mut off = FakePort::new(Some(key), Some((key, "chk_sec_reporter".into())));
+        off.enabled = false;
+        assert_eq!(service_key_of(off).await, None);
+    }
+
+    #[tokio::test]
+    async fn last_error_goes_through_the_metadata_call() {
+        let dir = Metadata {
+            client: FakePort::new(None, None),
+        };
+        let (branch, function) = (Uuid::new_v4(), Uuid::new_v4());
+        dir.record_error(branch, function, "timed out")
+            .await
+            .unwrap();
+        assert_eq!(
+            *dir.client.errors.lock().unwrap(),
+            vec![(BranchId(branch), function, Some("timed out".to_owned()))]
+        );
     }
 
     #[test]
