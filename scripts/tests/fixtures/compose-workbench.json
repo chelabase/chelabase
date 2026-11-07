@@ -1,0 +1,2400 @@
+{
+  "name": "chelabase-feat-x",
+  "networks": {
+    "compute": {
+      "ipam": {},
+      "name": "chelabase-feat-x_compute"
+    },
+    "control": {
+      "ipam": {
+        "config": [
+          {
+            "ip_range": "10.213.6.0/23",
+            "subnet": "10.213.4.0/22"
+          }
+        ]
+      },
+      "name": "chelabase-feat-x_control"
+    },
+    "default": {
+      "ipam": {},
+      "name": "chelabase-feat-x_default"
+    }
+  },
+  "secrets": {
+    "app-jwt-private": {
+      "file": "/m/.chelabase/auth/app-jwt.key",
+      "name": "chelabase-feat-x_app-jwt-private"
+    },
+    "app-jwt-public": {
+      "file": "/m/.chelabase/auth/app-jwt.pub",
+      "name": "chelabase-feat-x_app-jwt-public"
+    },
+    "compute-ca-cert": {
+      "file": "/m/.chelabase/compute-ca/ca.crt",
+      "name": "chelabase-feat-x_compute-ca-cert"
+    },
+    "compute-jwt-private": {
+      "file": "/m/.chelabase/neon/compute-jwt.pem",
+      "name": "chelabase-feat-x_compute-jwt-private"
+    },
+    "compute-jwt-public": {
+      "file": "/m/.chelabase/neon/compute-jwt.pub",
+      "name": "chelabase-feat-x_compute-jwt-public"
+    },
+    "cookie": {
+      "file": "/m/.chelabase/auth/cookie.key",
+      "name": "chelabase-feat-x_cookie"
+    },
+    "grpc-tls-ca": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/ca.crt",
+      "name": "chelabase-feat-x_grpc-tls-ca"
+    },
+    "grpc-tls-client-crt": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/client.crt",
+      "name": "chelabase-feat-x_grpc-tls-client-crt"
+    },
+    "grpc-tls-client-key": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/client.key",
+      "name": "chelabase-feat-x_grpc-tls-client-key"
+    },
+    "grpc-tls-server-crt": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/server.crt",
+      "name": "chelabase-feat-x_grpc-tls-server-crt"
+    },
+    "grpc-tls-server-key": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/server.key",
+      "name": "chelabase-feat-x_grpc-tls-server-key"
+    },
+    "identity-db-password": {
+      "file": "/m/.chelabase/identity/db.password",
+      "name": "chelabase-feat-x_identity-db-password"
+    },
+    "identity-secret": {
+      "file": "/m/.chelabase/identity/secret",
+      "name": "chelabase-feat-x_identity-secret"
+    },
+    "internal-signing": {
+      "file": "/m/.chelabase/gateway/internal-signing.pem",
+      "name": "chelabase-feat-x_internal-signing"
+    },
+    "internal-verify": {
+      "file": "/m/.chelabase/gateway/internal-verify.pem",
+      "name": "chelabase-feat-x_internal-verify"
+    },
+    "member-jwt-private": {
+      "file": "/m/.chelabase/auth/member-jwt.key",
+      "name": "chelabase-feat-x_member-jwt-private"
+    },
+    "member-jwt-public": {
+      "file": "/m/.chelabase/auth/member-jwt.pub",
+      "name": "chelabase-feat-x_member-jwt-public"
+    },
+    "nats-orchestrator": {
+      "file": "/m/.chelabase/nats/orchestrator.password",
+      "name": "chelabase-feat-x_nats-orchestrator"
+    },
+    "nats-realtime": {
+      "file": "/m/.chelabase/nats/realtime.password",
+      "name": "chelabase-feat-x_nats-realtime"
+    },
+    "nats-runner": {
+      "file": "/m/.chelabase/nats/runner.password",
+      "name": "chelabase-feat-x_nats-runner"
+    },
+    "nats-storage": {
+      "file": "/m/.chelabase/nats/storage.password",
+      "name": "chelabase-feat-x_nats-storage"
+    },
+    "nats-worker": {
+      "file": "/m/.chelabase/nats/worker.password",
+      "name": "chelabase-feat-x_nats-worker"
+    },
+    "realtime-internal": {
+      "file": "/m/.chelabase/realtime/internal.token",
+      "name": "chelabase-feat-x_realtime-internal"
+    },
+    "realtime-pg": {
+      "file": "/m/.chelabase/realtime/pg.password",
+      "name": "chelabase-feat-x_realtime-pg"
+    },
+    "realtime-ticket": {
+      "file": "/m/.chelabase/realtime/ticket.key",
+      "name": "chelabase-feat-x_realtime-ticket"
+    },
+    "s3-neon-access-key": {
+      "file": "/m/.chelabase/stacks/feat-x/s3/access-key",
+      "name": "chelabase-feat-x_s3-neon-access-key"
+    },
+    "s3-neon-secret-key": {
+      "file": "/m/.chelabase/stacks/feat-x/s3/secret-key",
+      "name": "chelabase-feat-x_s3-neon-secret-key"
+    },
+    "s3-storage-access-key": {
+      "file": "/m/.chelabase/stacks/feat-x/storage-s3/access-key",
+      "name": "chelabase-feat-x_s3-storage-access-key"
+    },
+    "s3-storage-secret-key": {
+      "file": "/m/.chelabase/stacks/feat-x/storage-s3/secret-key",
+      "name": "chelabase-feat-x_s3-storage-secret-key"
+    },
+    "secrets-key": {
+      "file": "/m/.chelabase/secrets/secrets.key",
+      "name": "chelabase-feat-x_secrets-key"
+    },
+    "stack-setup-code": {
+      "file": "/m/.chelabase/stacks/feat-x/setup/setup.code",
+      "name": "chelabase-feat-x_stack-setup-code"
+    },
+    "storage-generations-api": {
+      "file": "/m/.chelabase/neon/storage-tokens/generations-api.jwt",
+      "name": "chelabase-feat-x_storage-generations-api"
+    },
+    "storage-metrics": {
+      "file": "/m/.chelabase/neon/storage-tokens/metrics.token",
+      "name": "chelabase-feat-x_storage-metrics"
+    },
+    "storage-pageserver-api": {
+      "file": "/m/.chelabase/neon/storage-tokens/pageserver-api.jwt",
+      "name": "chelabase-feat-x_storage-pageserver-api"
+    },
+    "storage-pem": {
+      "file": "/m/.chelabase/neon/compute-jwt.pub.pem",
+      "name": "chelabase-feat-x_storage-pem"
+    },
+    "storage-safekeeper-data": {
+      "file": "/m/.chelabase/neon/storage-tokens/safekeeper-data.jwt",
+      "name": "chelabase-feat-x_storage-safekeeper-data"
+    },
+    "storage-storcon-admin": {
+      "file": "/m/.chelabase/neon/storage-tokens/storcon-admin.jwt",
+      "name": "chelabase-feat-x_storage-storcon-admin"
+    },
+    "token-app-auth": {
+      "file": "/m/.chelabase/tokens/app-auth.token",
+      "name": "chelabase-feat-x_token-app-auth"
+    },
+    "token-app-sessions": {
+      "file": "/m/.chelabase/tokens/app-sessions.token",
+      "name": "chelabase-feat-x_token-app-sessions"
+    },
+    "token-auth-identity": {
+      "file": "/m/.chelabase/tokens/auth-identity.token",
+      "name": "chelabase-feat-x_token-auth-identity"
+    },
+    "token-bootstrap-identity": {
+      "file": "/m/.chelabase/tokens/bootstrap-identity.token",
+      "name": "chelabase-feat-x_token-bootstrap-identity"
+    },
+    "token-data-keys": {
+      "file": "/m/.chelabase/tokens/data-keys.token",
+      "name": "chelabase-feat-x_token-data-keys"
+    },
+    "token-orchestrator-identity": {
+      "file": "/m/.chelabase/tokens/orchestrator-identity.token",
+      "name": "chelabase-feat-x_token-orchestrator-identity"
+    },
+    "token-proxy-api": {
+      "file": "/m/.chelabase/tokens/proxy-api.token",
+      "name": "chelabase-feat-x_token-proxy-api"
+    },
+    "token-rest-internal": {
+      "file": "/m/.chelabase/tokens/rest-internal.token",
+      "name": "chelabase-feat-x_token-rest-internal"
+    },
+    "token-storage-internal": {
+      "file": "/m/.chelabase/tokens/storage-internal.token",
+      "name": "chelabase-feat-x_token-storage-internal"
+    },
+    "token-storcon-hook": {
+      "file": "/m/.chelabase/tokens/storcon-hook.token",
+      "name": "chelabase-feat-x_token-storcon-hook"
+    },
+    "token-worker-identity": {
+      "file": "/m/.chelabase/tokens/worker-identity.token",
+      "name": "chelabase-feat-x_token-worker-identity"
+    },
+    "valkey-control": {
+      "file": "/m/.chelabase/valkey/control.password",
+      "name": "chelabase-feat-x_valkey-control"
+    },
+    "valkey-health": {
+      "file": "/m/.chelabase/valkey/health.password",
+      "name": "chelabase-feat-x_valkey-health"
+    },
+    "valkey-proxy": {
+      "file": "/m/.chelabase/valkey/proxy.password",
+      "name": "chelabase-feat-x_valkey-proxy"
+    },
+    "valkey-realtime": {
+      "file": "/m/.chelabase/valkey/realtime.password",
+      "name": "chelabase-feat-x_valkey-realtime"
+    },
+    "valkey-runner": {
+      "file": "/m/.chelabase/valkey/runner.password",
+      "name": "chelabase-feat-x_valkey-runner"
+    }
+  },
+  "services": {
+    "auth": {
+      "command": [
+        "/w/feat-x/target/debug/auth"
+      ],
+      "depends_on": {
+        "identity": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-auth.token",
+        "CHELABASE_IDENTITY_TOKEN_FILE": "/m/.chelabase/tokens/auth-identity.token",
+        "CHELABASE_IDENTITY_URL": "http://identity:8080"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:8084/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "cookie",
+          "target": "/m/.chelabase/auth/cookie.key"
+        },
+        {
+          "source": "app-jwt-private",
+          "target": "/m/.chelabase/auth/app-jwt.key"
+        },
+        {
+          "source": "app-jwt-public",
+          "target": "/m/.chelabase/auth/app-jwt.pub"
+        },
+        {
+          "source": "member-jwt-private",
+          "target": "/m/.chelabase/auth/member-jwt.key"
+        },
+        {
+          "source": "member-jwt-public",
+          "target": "/m/.chelabase/auth/member-jwt.pub"
+        },
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
+        },
+        {
+          "source": "token-app-auth",
+          "target": "/m/.chelabase/tokens/app-auth.token"
+        },
+        {
+          "source": "token-auth-identity",
+          "target": "/m/.chelabase/tokens/auth-identity.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "create-bucket": {
+      "command": null,
+      "depends_on": {
+        "seaweedfs": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/true"
+      ],
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "default": null
+      },
+      "restart": "no"
+    },
+    "docs": {
+      "command": [
+        "pnpm",
+        "--filter",
+        "@chelabase/docs",
+        "dev"
+      ],
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "-H",
+          "Host: docs.feat-x.chelabase.localhost",
+          "http://127.0.0.1:3001/"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": null
+      },
+      "profiles": [
+        "sites"
+      ],
+      "restart": "unless-stopped",
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "gateway": {
+      "command": [
+        "/w/feat-x/target/debug/gateway"
+      ],
+      "depends_on": {
+        "mailpit": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-sessions.token",
+        "CHELABASE_DATA_KEYS_TOKEN_FILE": "/m/.chelabase/tokens/data-keys.token"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:8137/_gateway/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": {
+          "aliases": [
+            "studio.feat-x.chelabase.localhost",
+            "api.feat-x.chelabase.localhost",
+            "auth.feat-x.chelabase.localhost",
+            "mail.feat-x.chelabase.localhost",
+            "docs.feat-x.chelabase.localhost",
+            "landing.feat-x.chelabase.localhost"
+          ]
+        }
+      },
+      "ports": [
+        {
+          "host_ip": "127.0.0.1",
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "8137",
+          "target": 8137
+        },
+        {
+          "host_ip": "::1",
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "8137",
+          "target": 8137
+        }
+      ],
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "internal-signing",
+          "target": "/m/.chelabase/gateway/internal-signing.pem"
+        },
+        {
+          "source": "app-jwt-public",
+          "target": "/m/.chelabase/auth/app-jwt.pub"
+        },
+        {
+          "source": "member-jwt-public",
+          "target": "/m/.chelabase/auth/member-jwt.pub"
+        },
+        {
+          "source": "token-data-keys",
+          "target": "/m/.chelabase/tokens/data-keys.token"
+        },
+        {
+          "source": "token-app-sessions",
+          "target": "/m/.chelabase/tokens/app-sessions.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "identity": {
+      "command": [
+        "node",
+        "/w/feat-x/services/identity/src/main.ts"
+      ],
+      "depends_on": {
+        "mailpit": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -eu\numask 077\npw=\"\"\nIFS= read -r pw <\"$$CHELABASE_IDENTITY_DB_PASSWORD_FILE\" || [ -n \"$$pw\" ]\ncase \"$$pw\" in\n  \"\" | *[!A-Za-z0-9_-]*)\n    echo \"identity: $$CHELABASE_IDENTITY_DB_PASSWORD_FILE must hold one base64url line\" >&2\n    exit 1 ;;\nesac\n# The user info is one argument: no password is ever in this file's text.\nprintf 'postgres://%s@%s/%s\\n' \"$$CHELABASE_IDENTITY_DB_USER:$$pw\" \\\n  \"$$CHELABASE_IDENTITY_DB_HOST\" \"$$CHELABASE_IDENTITY_DB_NAME\" >/run/identity/database.url\nunset pw\nexport CHELABASE_IDENTITY_DATABASE_URL_FILE=/run/identity/database.url\nexec \"$$@\"\n",
+        "identity"
+      ],
+      "environment": {
+        "CHELABASE_IDENTITY_AUTH_TOKEN_FILE": "/m/.chelabase/tokens/auth-identity.token",
+        "CHELABASE_IDENTITY_BOOTSTRAP_TOKEN_FILE": "/m/.chelabase/tokens/bootstrap-identity.token",
+        "CHELABASE_IDENTITY_DB_HOST": "metadata-db:5432",
+        "CHELABASE_IDENTITY_DB_NAME": "chelabase_metadata",
+        "CHELABASE_IDENTITY_DB_PASSWORD_FILE": "/m/.chelabase/identity/db.password",
+        "CHELABASE_IDENTITY_DB_USER": "chelabase_identity",
+        "CHELABASE_IDENTITY_HOST": "0.0.0.0",
+        "CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-identity.token",
+        "CHELABASE_IDENTITY_PORT": "8080",
+        "CHELABASE_IDENTITY_SECRET_FILE": "/m/.chelabase/identity/secret",
+        "CHELABASE_IDENTITY_WORKER_TOKEN_FILE": "/m/.chelabase/tokens/worker-identity.token",
+        "CHELABASE_SMTP_FROM": "noreply@auth.feat-x.chelabase.localhost",
+        "CHELABASE_SMTP_HOST": "mailpit",
+        "CHELABASE_SMTP_PORT": "1025",
+        "CHELABASE_SMTP_TLS": "none"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": null
+      },
+      "read_only": true,
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "identity-secret",
+          "target": "/m/.chelabase/identity/secret"
+        },
+        {
+          "source": "identity-db-password",
+          "target": "/m/.chelabase/identity/db.password"
+        },
+        {
+          "source": "token-auth-identity",
+          "target": "/m/.chelabase/tokens/auth-identity.token"
+        },
+        {
+          "source": "token-orchestrator-identity",
+          "target": "/m/.chelabase/tokens/orchestrator-identity.token"
+        },
+        {
+          "source": "token-worker-identity",
+          "target": "/m/.chelabase/tokens/worker-identity.token"
+        },
+        {
+          "source": "token-bootstrap-identity",
+          "target": "/m/.chelabase/tokens/bootstrap-identity.token"
+        }
+      ],
+      "tmpfs": [
+        "/run/identity:uid=1000,gid=1000,mode=0700"
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "target": "/tmp",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "landing": {
+      "command": [
+        "pnpm",
+        "--filter",
+        "@chelabase/landing",
+        "dev"
+      ],
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "-H",
+          "Host: landing.feat-x.chelabase.localhost",
+          "http://127.0.0.1:3002/"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": null
+      },
+      "profiles": [
+        "sites"
+      ],
+      "restart": "unless-stopped",
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "mailpit": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "MP_SMTP_AUTH_ACCEPT_ANY": "true",
+        "MP_SMTP_AUTH_ALLOW_INSECURE": "true"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "test": [
+          "CMD",
+          "/mailpit",
+          "readyz"
+        ],
+        "timeout": "5s"
+      },
+      "image": "axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped"
+    },
+    "metadata-db": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "POSTGRES_DB": "chelabase_metadata",
+        "POSTGRES_PASSWORD": "chelabase",
+        "POSTGRES_USER": "chelabase"
+      },
+      "healthcheck": {
+        "interval": "5s",
+        "retries": 10,
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U chelabase -d chelabase_metadata"
+        ],
+        "timeout": "5s"
+      },
+      "image": "postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "source": "metadata_pg_data",
+          "target": "/var/lib/postgresql/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "nats": {
+      "command": [
+        "-c",
+        "/etc/nats/nats.conf",
+        "--jetstream",
+        "--store_dir=/data",
+        "-m",
+        "8222"
+      ],
+      "entrypoint": null,
+      "healthcheck": {
+        "interval": "5s",
+        "retries": 10,
+        "test": [
+          "CMD",
+          "wget",
+          "-qO-",
+          "http://localhost:8222/healthz"
+        ],
+        "timeout": "5s"
+      },
+      "image": "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "source": "nats_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/w/feat-x/infra/compose/nats/nats.conf",
+          "target": "/etc/nats/nats.conf",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/stacks/feat-x/nats/auth.conf",
+          "target": "/etc/nats/auth.conf",
+          "type": "bind"
+        }
+      ]
+    },
+    "orchestrator": {
+      "command": [
+        "/w/feat-x/target/debug/orchestrator"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "nats": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "storage-controller": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "valkey": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-auth.token",
+        "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-sessions.token",
+        "CHELABASE_BRANCH_DATABASE_CAP": null,
+        "CHELABASE_DATA_KEYS_TOKEN_FILE": "/m/.chelabase/tokens/data-keys.token",
+        "CHELABASE_IDENTITY_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-identity.token",
+        "CHELABASE_IDENTITY_URL": "http://identity:8080",
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_orchestrator",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/orchestrator.password",
+        "CHELABASE_NATS_USER": "orchestrator",
+        "CHELABASE_PASSWORD_STRENGTH": null,
+        "CHELABASE_PROXY_API_TOKEN_FILE": "/m/.chelabase/tokens/proxy-api.token",
+        "CHELABASE_PROXY_PG_PORT": "4537",
+        "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE": "/m/.chelabase/realtime/internal.token",
+        "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
+        "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token",
+        "CHELABASE_SETUP_CODE_FILE": "/m/.chelabase/stacks/feat-x/setup/setup.code",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
+        "CHELABASE_STORCON_HOOK_TOKEN_FILE": "/m/.chelabase/tokens/storcon-hook.token",
+        "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/control.password",
+        "CHELABASE_VALKEY_USER": "control"
+      },
+      "group_add": [
+        "973"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:8081/health && curl -fsS http://127.0.0.1:8083/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "control": {
+          "ipv4_address": "10.213.4.10"
+        },
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "secrets-key",
+          "target": "/m/.chelabase/secrets/secrets.key"
+        },
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-jwt-private",
+          "target": "/m/.chelabase/neon/compute-jwt.pem"
+        },
+        {
+          "source": "compute-jwt-public",
+          "target": "/m/.chelabase/neon/compute-jwt.pub"
+        },
+        {
+          "source": "nats-orchestrator",
+          "target": "/m/.chelabase/nats/orchestrator.password"
+        },
+        {
+          "source": "valkey-control",
+          "target": "/m/.chelabase/valkey/control.password"
+        },
+        {
+          "source": "realtime-internal",
+          "target": "/m/.chelabase/realtime/internal.token"
+        },
+        {
+          "source": "token-rest-internal",
+          "target": "/m/.chelabase/tokens/rest-internal.token"
+        },
+        {
+          "source": "token-data-keys",
+          "target": "/m/.chelabase/tokens/data-keys.token"
+        },
+        {
+          "source": "token-app-auth",
+          "target": "/m/.chelabase/tokens/app-auth.token"
+        },
+        {
+          "source": "token-app-sessions",
+          "target": "/m/.chelabase/tokens/app-sessions.token"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "token-proxy-api",
+          "target": "/m/.chelabase/tokens/proxy-api.token"
+        },
+        {
+          "source": "stack-setup-code",
+          "target": "/m/.chelabase/stacks/feat-x/setup/setup.code"
+        },
+        {
+          "source": "token-storcon-hook",
+          "target": "/m/.chelabase/tokens/storcon-hook.token"
+        },
+        {
+          "source": "token-orchestrator-identity",
+          "target": "/m/.chelabase/tokens/orchestrator-identity.token"
+        },
+        {
+          "source": "member-jwt-public",
+          "target": "/m/.chelabase/auth/member-jwt.pub"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/orchestrator-tls",
+          "target": "/m/.chelabase/orchestrator-tls",
+          "type": "bind"
+        },
+        {
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "pageserver": {
+      "command": [
+        "/bin/sh",
+        "-c",
+        "set -e\nmkdir -p /data/.neon\necho 'id=1' > /data/.neon/identity.toml\numask 077\ncat > /data/.neon/pageserver.toml <<EOT\nbroker_endpoint='http://storage-broker:50051'\npg_distrib_dir='/usr/local/'\nlisten_pg_addr='0.0.0.0:6400'\nlisten_http_addr='0.0.0.0:9898'\nhttp_auth_type='NeonJWT'\npg_auth_type='NeonJWT'\nauth_validation_public_key_path='/run/storage-auth.pub.pem'\ncontrol_plane_api='http://storage-controller:1234/upcall/v1/'\ncontrol_plane_api_token='$$(cat /run/generations-api.jwt)'\nvirtual_file_io_mode='buffered'\nremote_storage={ endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }\nEOT\necho '{\"host\":\"pageserver\",\"port\":6400,\"http_host\":\"pageserver\",\"http_port\":9898,\"availability_zone_id\":\"az-1\"}' > /data/.neon/metadata.json\nexec pageserver -D /data/.neon --auth-token-file=/run/safekeeper-data.jwt\n"
+      ],
+      "depends_on": {
+        "create-bucket": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "storage-broker": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "storage-controller": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -e; getent group \"1000\" >/dev/null || echo \"chelabase:x:1000:\" >>/etc/group; getent passwd \"1000\" >/dev/null || echo \"chelabase:x:1000:1000::/data:/bin/sh\" >>/etc/passwd; [ \"$$(stat -c %u:%g /data)\" = \"1000:1000\" ] || chown -R \"1000:1000\" /data; exec setpriv --reuid=\"1000\" --regid=\"1000\" --clear-groups -- \"$$@\"",
+        "neon"
+      ],
+      "environment": {
+        "AWS_ACCESS_KEY_ID": "chelabase-dev",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_SECRET_ACCESS_KEY": "chelabase-dev-secret"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:9898/v1/status"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "storage-pem",
+          "target": "/run/storage-auth.pub.pem"
+        },
+        {
+          "source": "storage-generations-api",
+          "target": "/run/generations-api.jwt"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/run/safekeeper-data.jwt"
+        }
+      ],
+      "user": "0",
+      "volumes": [
+        {
+          "source": "neon_pageserver_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "proxy": {
+      "command": [
+        "--auth-backend=control-plane",
+        "--auth-endpoint=http://orchestrator:8083/proxy/api/v1",
+        "--proxy=0.0.0.0:4432",
+        "--wss=0.0.0.0:4444",
+        "--tls-cert=/tls/tls.crt",
+        "--tls-key=/tls/tls.key",
+        "--project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m",
+        "--redis-auth-type=plain"
+      ],
+      "depends_on": {
+        "proxy-tls": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "valkey": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "exec proxy --redis-plain=redis://proxy@valkey:6379 --redis-plain-password-file=/run/valkey-proxy.password --control-plane-token-file=/run/proxy-api.token \"$$@\"",
+        "proxy"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "bash",
+          "-c",
+          "</dev/tcp/127.0.0.1/4432"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "ports": [
+        {
+          "host_ip": "127.0.0.1",
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "4537",
+          "target": 4432
+        },
+        {
+          "host_ip": "::1",
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "4537",
+          "target": 4432
+        }
+      ],
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "valkey-proxy",
+          "target": "/run/valkey-proxy.password"
+        },
+        {
+          "source": "token-proxy-api",
+          "target": "/run/proxy-api.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "neon_proxy_tls",
+          "target": "/tls",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "proxy-tls": {
+      "command": [
+        "set -e\ncd /tls\n# The proxy runs as the stack's uid (it reads the stack's 0600 secrets too).\nowner=\"1000:1000\"\nif [ -s tls.crt ] && openssl x509 -in tls.crt -noout -subject | grep -qF '*.localtest.me'; then\n  chown \"$$owner\" tls.key tls.crt ca.crt\n  echo \"certificate for *.localtest.me exists\"; exit 0\nfi\n[ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \\\n  -keyout ca.key -out ca.crt -days 3650 -subj \"/CN=Chelabase local CA\"\nopenssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.csr \\\n  -subj \"/CN=*.localtest.me\"\nprintf 'subjectAltName=DNS:*.localtest.me\\n' > ext.cnf\nopenssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \\\n  -extfile ext.cnf -out tls.crt\nrm -f tls.csr ext.cnf\nchown \"$$owner\" tls.key tls.crt ca.crt\nchmod 600 ca.key tls.key\necho \"issued a certificate for *.localtest.me\"\n"
+      ],
+      "entrypoint": [
+        "/bin/sh",
+        "-c"
+      ],
+      "image": "neon-storage:placeholder",
+      "network_mode": "none",
+      "restart": "no",
+      "user": "0",
+      "volumes": [
+        {
+          "source": "neon_proxy_tls",
+          "target": "/tls",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "realtime": {
+      "command": [
+        "/w/feat-x/target/debug/realtime"
+      ],
+      "depends_on": {
+        "nats": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "valkey": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_realtime",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/realtime.password",
+        "CHELABASE_NATS_USER": "realtime",
+        "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE": "/m/.chelabase/realtime/internal.token",
+        "CHELABASE_REALTIME_PG_PASSWORD_FILE": "/m/.chelabase/realtime/pg.password",
+        "CHELABASE_REALTIME_TICKET_KEY_FILE": "/m/.chelabase/realtime/ticket.key",
+        "CHELABASE_REALTIME_TLS_DIR": "/m/.chelabase/realtime-tls",
+        "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/realtime.password",
+        "CHELABASE_VALKEY_TLS": "off",
+        "CHELABASE_VALKEY_USER": "realtime"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:8088/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "control": {
+          "ipv4_address": "10.213.4.12"
+        },
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
+        },
+        {
+          "source": "nats-realtime",
+          "target": "/m/.chelabase/nats/realtime.password"
+        },
+        {
+          "source": "valkey-realtime",
+          "target": "/m/.chelabase/valkey/realtime.password"
+        },
+        {
+          "source": "realtime-pg",
+          "target": "/m/.chelabase/realtime/pg.password"
+        },
+        {
+          "source": "realtime-ticket",
+          "target": "/m/.chelabase/realtime/ticket.key"
+        },
+        {
+          "source": "realtime-internal",
+          "target": "/m/.chelabase/realtime/internal.token"
+        },
+        {
+          "source": "member-jwt-public",
+          "target": "/m/.chelabase/auth/member-jwt.pub"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/realtime-tls",
+          "target": "/m/.chelabase/realtime-tls",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "register-safekeepers": {
+      "command": [
+        "set -e\nS=http://storage-controller:1234\n# The bearer goes to curl in a header file (`-H @file`), never on its command line.\numask 077\nH=\"$$(mktemp)\"\ntrap 'rm -f \"$$H\"' EXIT\n{ printf 'Authorization: Bearer '; tr -d '\\r\\n' < /run/storcon-admin.jwt; echo; } > \"$$H\"\nfor ID in 1 2 3; do\n  curl -fsS -X POST -H 'Content-Type: application/json' -H \"@$$H\" \\\n    -d \"{\\\"id\\\":$$ID,\\\"created_at\\\":\\\"2023-10-25T09:11:25Z\\\",\\\"updated_at\\\":\\\"2024-08-28T11:32:43Z\\\",\\\"region_id\\\":\\\"local\\\",\\\"host\\\":\\\"safekeeper$$ID\\\",\\\"port\\\":5454,\\\"http_port\\\":7676,\\\"https_port\\\":null,\\\"version\\\":5957,\\\"availability_zone_id\\\":\\\"az-$$ID\\\"}\" \\\n    $$S/control/v1/safekeeper/$$ID\n  curl -fsS -X POST -H 'Content-Type: application/json' -H \"@$$H\" \\\n    -d '{\"scheduling_policy\":\"Active\"}' $$S/control/v1/safekeeper/$$ID/scheduling_policy\ndone\n"
+      ],
+      "depends_on": {
+        "safekeeper1": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "safekeeper2": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "safekeeper3": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "storage-controller": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c"
+      ],
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "default": null
+      },
+      "restart": "no",
+      "secrets": [
+        {
+          "source": "storage-storcon-admin",
+          "target": "/run/storcon-admin.jwt"
+        }
+      ],
+      "user": "1000:1000"
+    },
+    "rest": {
+      "command": [
+        "/w/feat-x/target/debug/rest"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-sS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8085/"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
+        },
+        {
+          "source": "token-rest-internal",
+          "target": "/m/.chelabase/tokens/rest-internal.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "runner": {
+      "command": null,
+      "entrypoint": [],
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-auth.token",
+        "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-sessions.token",
+        "CHELABASE_DATA_KEYS_TOKEN_FILE": "/m/.chelabase/tokens/data-keys.token",
+        "CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-identity.token",
+        "CHELABASE_IDENTITY_TOKEN_FILE": "/m/.chelabase/tokens/auth-identity.token",
+        "CHELABASE_IDENTITY_URL": "http://identity:8080",
+        "CHELABASE_IDENTITY_WORKER_TOKEN_FILE": "/m/.chelabase/tokens/worker-identity.token",
+        "CHELABASE_LIVE_ENDPOINT": null,
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_runner",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/runner.password",
+        "CHELABASE_NATS_USER": "runner",
+        "CHELABASE_PROXY_API_TOKEN_FILE": "/m/.chelabase/tokens/proxy-api.token",
+        "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE": "/m/.chelabase/realtime/internal.token",
+        "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
+        "CHELABASE_REALTIME_PG_PASSWORD_FILE": "/m/.chelabase/realtime/pg.password",
+        "CHELABASE_REALTIME_TICKET_KEY_FILE": "/m/.chelabase/realtime/ticket.key",
+        "CHELABASE_REALTIME_TLS_DIR": "/m/.chelabase/realtime-tls",
+        "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
+        "CHELABASE_STORCON_HOOK_TOKEN_FILE": "/m/.chelabase/tokens/storcon-hook.token",
+        "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/runner.password",
+        "CHELABASE_VALKEY_USER": "runner"
+      },
+      "group_add": [
+        "973"
+      ],
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "control": {
+          "ipv4_address": "10.213.4.11"
+        },
+        "default": {}
+      },
+      "profiles": [
+        "runner"
+      ],
+      "restart": "no",
+      "secrets": [
+        {
+          "source": "secrets-key",
+          "target": "/m/.chelabase/secrets/secrets.key"
+        },
+        {
+          "source": "compute-jwt-private",
+          "target": "/m/.chelabase/neon/compute-jwt.pem"
+        },
+        {
+          "source": "compute-jwt-public",
+          "target": "/m/.chelabase/neon/compute-jwt.pub"
+        },
+        {
+          "source": "app-jwt-private",
+          "target": "/m/.chelabase/auth/app-jwt.key"
+        },
+        {
+          "source": "app-jwt-public",
+          "target": "/m/.chelabase/auth/app-jwt.pub"
+        },
+        {
+          "source": "nats-orchestrator",
+          "target": "/m/.chelabase/nats/orchestrator.password"
+        },
+        {
+          "source": "nats-worker",
+          "target": "/m/.chelabase/nats/worker.password"
+        },
+        {
+          "source": "nats-realtime",
+          "target": "/m/.chelabase/nats/realtime.password"
+        },
+        {
+          "source": "nats-runner",
+          "target": "/m/.chelabase/nats/runner.password"
+        },
+        {
+          "source": "valkey-proxy",
+          "target": "/m/.chelabase/valkey/proxy.password"
+        },
+        {
+          "source": "valkey-control",
+          "target": "/m/.chelabase/valkey/control.password"
+        },
+        {
+          "source": "valkey-realtime",
+          "target": "/m/.chelabase/valkey/realtime.password"
+        },
+        {
+          "source": "valkey-runner",
+          "target": "/m/.chelabase/valkey/runner.password"
+        },
+        {
+          "source": "valkey-health",
+          "target": "/m/.chelabase/valkey/health.password"
+        },
+        {
+          "source": "realtime-pg",
+          "target": "/m/.chelabase/realtime/pg.password"
+        },
+        {
+          "source": "realtime-ticket",
+          "target": "/m/.chelabase/realtime/ticket.key"
+        },
+        {
+          "source": "realtime-internal",
+          "target": "/m/.chelabase/realtime/internal.token"
+        },
+        {
+          "source": "token-rest-internal",
+          "target": "/m/.chelabase/tokens/rest-internal.token"
+        },
+        {
+          "source": "token-data-keys",
+          "target": "/m/.chelabase/tokens/data-keys.token"
+        },
+        {
+          "source": "token-app-auth",
+          "target": "/m/.chelabase/tokens/app-auth.token"
+        },
+        {
+          "source": "token-app-sessions",
+          "target": "/m/.chelabase/tokens/app-sessions.token"
+        },
+        {
+          "source": "token-proxy-api",
+          "target": "/m/.chelabase/tokens/proxy-api.token"
+        },
+        {
+          "source": "token-storcon-hook",
+          "target": "/m/.chelabase/tokens/storcon-hook.token"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "storage-pem",
+          "target": "/m/.chelabase/neon/compute-jwt.pub.pem"
+        },
+        {
+          "source": "storage-pageserver-api",
+          "target": "/m/.chelabase/neon/storage-tokens/pageserver-api.jwt"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/m/.chelabase/neon/storage-tokens/safekeeper-data.jwt"
+        },
+        {
+          "source": "storage-generations-api",
+          "target": "/m/.chelabase/neon/storage-tokens/generations-api.jwt"
+        },
+        {
+          "source": "storage-storcon-admin",
+          "target": "/m/.chelabase/neon/storage-tokens/storcon-admin.jwt"
+        },
+        {
+          "source": "storage-metrics",
+          "target": "/m/.chelabase/neon/storage-tokens/metrics.token"
+        },
+        {
+          "source": "member-jwt-private",
+          "target": "/m/.chelabase/auth/member-jwt.key"
+        },
+        {
+          "source": "member-jwt-public",
+          "target": "/m/.chelabase/auth/member-jwt.pub"
+        },
+        {
+          "source": "identity-secret",
+          "target": "/m/.chelabase/identity/secret"
+        },
+        {
+          "source": "identity-db-password",
+          "target": "/m/.chelabase/identity/db.password"
+        },
+        {
+          "source": "token-auth-identity",
+          "target": "/m/.chelabase/tokens/auth-identity.token"
+        },
+        {
+          "source": "token-orchestrator-identity",
+          "target": "/m/.chelabase/tokens/orchestrator-identity.token"
+        },
+        {
+          "source": "token-worker-identity",
+          "target": "/m/.chelabase/tokens/worker-identity.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/compute-ca",
+          "target": "/m/.chelabase/compute-ca",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/orchestrator-tls",
+          "target": "/m/.chelabase/orchestrator-tls",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/realtime-tls",
+          "target": "/m/.chelabase/realtime-tls",
+          "type": "bind"
+        },
+        {
+          "source": "/m/.chelabase/stacks/feat-x",
+          "target": "/m/.chelabase/stacks/feat-x",
+          "type": "bind"
+        },
+        {
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "source": "/usr/local/bin/cargo-nextest",
+          "target": "/usr/local/bin/cargo-nextest",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "safekeeper1": {
+      "command": [
+        "safekeeper",
+        "--id=1",
+        "-D",
+        "/data",
+        "--listen-pg=0.0.0.0:5454",
+        "--listen-http=0.0.0.0:7676",
+        "--advertise-pg=safekeeper1:5454",
+        "--availability-zone=az-1",
+        "--broker-endpoint=http://storage-broker:50051",
+        "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}",
+        "--pg-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--http-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--auth-token-path=/run/safekeeper-data.jwt"
+      ],
+      "depends_on": {
+        "create-bucket": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "storage-broker": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -e; getent group \"1000\" >/dev/null || echo \"chelabase:x:1000:\" >>/etc/group; getent passwd \"1000\" >/dev/null || echo \"chelabase:x:1000:1000::/data:/bin/sh\" >>/etc/passwd; [ \"$$(stat -c %u:%g /data)\" = \"1000:1000\" ] || chown -R \"1000:1000\" /data; exec setpriv --reuid=\"1000\" --regid=\"1000\" --clear-groups -- \"$$@\"",
+        "neon"
+      ],
+      "environment": {
+        "AWS_ACCESS_KEY_ID": "chelabase-dev",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_SECRET_ACCESS_KEY": "chelabase-dev-secret"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:7676/v1/status"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "storage-pem",
+          "target": "/run/storage-auth.pub.pem"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/run/safekeeper-data.jwt"
+        }
+      ],
+      "user": "0",
+      "volumes": [
+        {
+          "source": "neon_safekeeper1_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "safekeeper2": {
+      "command": [
+        "safekeeper",
+        "--id=2",
+        "-D",
+        "/data",
+        "--listen-pg=0.0.0.0:5454",
+        "--listen-http=0.0.0.0:7676",
+        "--advertise-pg=safekeeper2:5454",
+        "--availability-zone=az-2",
+        "--broker-endpoint=http://storage-broker:50051",
+        "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}",
+        "--pg-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--http-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--auth-token-path=/run/safekeeper-data.jwt"
+      ],
+      "depends_on": {
+        "create-bucket": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "storage-broker": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -e; getent group \"1000\" >/dev/null || echo \"chelabase:x:1000:\" >>/etc/group; getent passwd \"1000\" >/dev/null || echo \"chelabase:x:1000:1000::/data:/bin/sh\" >>/etc/passwd; [ \"$$(stat -c %u:%g /data)\" = \"1000:1000\" ] || chown -R \"1000:1000\" /data; exec setpriv --reuid=\"1000\" --regid=\"1000\" --clear-groups -- \"$$@\"",
+        "neon"
+      ],
+      "environment": {
+        "AWS_ACCESS_KEY_ID": "chelabase-dev",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_SECRET_ACCESS_KEY": "chelabase-dev-secret"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:7676/v1/status"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "storage-pem",
+          "target": "/run/storage-auth.pub.pem"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/run/safekeeper-data.jwt"
+        }
+      ],
+      "user": "0",
+      "volumes": [
+        {
+          "source": "neon_safekeeper2_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "safekeeper3": {
+      "command": [
+        "safekeeper",
+        "--id=3",
+        "-D",
+        "/data",
+        "--listen-pg=0.0.0.0:5454",
+        "--listen-http=0.0.0.0:7676",
+        "--advertise-pg=safekeeper3:5454",
+        "--availability-zone=az-3",
+        "--broker-endpoint=http://storage-broker:50051",
+        "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}",
+        "--pg-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--http-auth-public-key-path=/run/storage-auth.pub.pem",
+        "--auth-token-path=/run/safekeeper-data.jwt"
+      ],
+      "depends_on": {
+        "create-bucket": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "storage-broker": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -e; getent group \"1000\" >/dev/null || echo \"chelabase:x:1000:\" >>/etc/group; getent passwd \"1000\" >/dev/null || echo \"chelabase:x:1000:1000::/data:/bin/sh\" >>/etc/passwd; [ \"$$(stat -c %u:%g /data)\" = \"1000:1000\" ] || chown -R \"1000:1000\" /data; exec setpriv --reuid=\"1000\" --regid=\"1000\" --clear-groups -- \"$$@\"",
+        "neon"
+      ],
+      "environment": {
+        "AWS_ACCESS_KEY_ID": "chelabase-dev",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_SECRET_ACCESS_KEY": "chelabase-dev-secret"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:7676/v1/status"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "storage-pem",
+          "target": "/run/storage-auth.pub.pem"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/run/safekeeper-data.jwt"
+        }
+      ],
+      "user": "0",
+      "volumes": [
+        {
+          "source": "neon_safekeeper3_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "seaweedfs": {
+      "command": [
+        "set -e\numask 077\n# The S3 identities' keys go from their files into s3.json through stdin and stdout only\n# (tr drops the newline), so no key is ever a program argument or a shell variable.\nkey() { tr -d '\\n' < \"/run/chelabase/secrets/$$1\"; }\n{\n  printf '{\"identities\": [\\n  {\"name\": \"neon\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key s3/access-key; printf '\", \"secretKey\": \"'; key s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:neon\", \"Write:neon\", \"List:neon\", \"Tagging:neon\"]},\\n'\n  printf '  {\"name\": \"storage\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key storage-s3/access-key; printf '\", \"secretKey\": \"'; key storage-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-storage\", \"Write:chelabase-storage\", \"List:chelabase-storage\", \"Tagging:chelabase-storage\"]}]}\\n'\n} > /tmp/s3.json\nD=/run/chelabase/secrets/grpc-tls\nmkdir -p /etc/seaweedfs\n{\n  echo '[grpc]'; echo \"ca = \\\"$$D/ca.crt\\\"\"\n  for c in master volume filer s3; do\n    printf '[grpc.%s]\\ncert = \"%s/server.crt\"\\nkey = \"%s/server.key\"\\nclient_cert = \"%s/client.crt\"\\nclient_key = \"%s/client.key\"\\n' \"$$c\" \"$$D\" \"$$D\" \"$$D\" \"$$D\"\n  done\n  printf '[grpc.client]\\ncert = \"%s/client.crt\"\\nkey = \"%s/client.key\"\\n' \"$$D\" \"$$D\"\n} > /etc/seaweedfs/security.toml\n# The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's\n# start_period covers it). On exhaustion it logs the last output and ends the container\n# (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.\n# On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.\n(\n  i=0; out=\n  while [ \"$$i\" -lt 40 ]; do\n    out=\"$$(printf 's3.bucket.create -name neon\\ns3.bucket.create -name chelabase-storage\\ns3.bucket.list\\n' |\n      timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)\"\n    if printf '%s' \"$$out\" | grep -qw neon && printf '%s' \"$$out\" | grep -qw chelabase-storage; then\n      touch /tmp/buckets-ready; exec sleep 2147483647\n    fi\n    i=$$((i + 1)); sleep 2\n  done\n  echo \"seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:\" >&2\n  printf '%s\\n' \"$$out\" >&2\n  kill 1\n) &\nexec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
+      ],
+      "entrypoint": [
+        "/bin/sh",
+        "-c"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "start_period": "8m0s",
+        "test": [
+          "CMD-SHELL",
+          "[ -e /tmp/buckets-ready ] && printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -w 3 127.0.0.1 8333 | grep -q '<Code>AccessDenied</Code>'\n"
+        ]
+      },
+      "image": "chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "s3-neon-access-key",
+          "target": "/run/chelabase/secrets/s3/access-key"
+        },
+        {
+          "source": "s3-neon-secret-key",
+          "target": "/run/chelabase/secrets/s3/secret-key"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        },
+        {
+          "source": "grpc-tls-ca",
+          "target": "/run/chelabase/secrets/grpc-tls/ca.crt"
+        },
+        {
+          "source": "grpc-tls-server-crt",
+          "target": "/run/chelabase/secrets/grpc-tls/server.crt"
+        },
+        {
+          "source": "grpc-tls-server-key",
+          "target": "/run/chelabase/secrets/grpc-tls/server.key"
+        },
+        {
+          "source": "grpc-tls-client-crt",
+          "target": "/run/chelabase/secrets/grpc-tls/client.crt"
+        },
+        {
+          "source": "grpc-tls-client-key",
+          "target": "/run/chelabase/secrets/grpc-tls/client.key"
+        }
+      ],
+      "volumes": [
+        {
+          "source": "neon_seaweedfs_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "storage": {
+      "command": [
+        "/w/feat-x/target/debug/storage"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "seaweedfs": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_storage",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/storage.password",
+        "CHELABASE_NATS_USER": "storage",
+        "CHELABASE_STORAGE_BACKEND": "seaweedfs",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
+        "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/storage-s3/access-key",
+        "CHELABASE_STORAGE_S3_BUCKET": "chelabase-storage",
+        "CHELABASE_STORAGE_S3_ENDPOINT": "http://seaweedfs:8333",
+        "CHELABASE_STORAGE_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/storage-s3/secret-key"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8089/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "nats-storage",
+          "target": "/m/.chelabase/nats/storage.password"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "storage-broker": {
+      "command": [
+        "storage_broker",
+        "--listen-addr=0.0.0.0:50051"
+      ],
+      "entrypoint": null,
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "bash",
+          "-c",
+          "</dev/tcp/127.0.0.1/50051"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped"
+    },
+    "storage-controller": {
+      "command": [
+        "--listen=0.0.0.0:1234",
+        "--pageserver-jwt-token-file=/run/pageserver-api.jwt",
+        "--safekeeper-jwt-token-file=/run/safekeeper-data.jwt",
+        "--control-plane-jwt-token-file=/run/storcon-hook.token",
+        "--control-plane-url=http://orchestrator:8083/storcon",
+        "--database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller",
+        "--timelines-onto-safekeepers",
+        "--timeline-safekeeper-count=3"
+      ],
+      "depends_on": {
+        "storcon-db": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -e; export PUBLIC_KEY=\"$$(cat /run/storage-auth.pub.pem)\"; exec storage_controller \"$$@\"",
+        "storage_controller"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:1234/ready"
+        ]
+      },
+      "image": "neon-storage:placeholder",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "token-storcon-hook",
+          "target": "/run/storcon-hook.token"
+        },
+        {
+          "source": "storage-pem",
+          "target": "/run/storage-auth.pub.pem"
+        },
+        {
+          "source": "storage-pageserver-api",
+          "target": "/run/pageserver-api.jwt"
+        },
+        {
+          "source": "storage-safekeeper-data",
+          "target": "/run/safekeeper-data.jwt"
+        }
+      ],
+      "user": "1000:1000"
+    },
+    "storcon-db": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "POSTGRES_DB": "storage_controller",
+        "POSTGRES_PASSWORD": "storcon",
+        "POSTGRES_USER": "storcon"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 60,
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U storcon -d storage_controller"
+        ]
+      },
+      "image": "postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "volumes": [
+        {
+          "source": "neon_storcon_pg_data",
+          "target": "/var/lib/postgresql/data",
+          "type": "volume",
+          "volume": {}
+        }
+      ]
+    },
+    "studio": {
+      "command": [
+        "pnpm",
+        "--filter",
+        "@chelabase/studio",
+        "dev"
+      ],
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        },
+        {
+          "path": "/m/.chelabase/stacks/feat-x/studio.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_STUDIO_PORT": "3000"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "-H",
+          "Host: studio.feat-x.chelabase.localhost",
+          "http://127.0.0.1:3000/"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
+    "valkey": {
+      "command": [
+        "valkey-server",
+        "--aclfile",
+        "/etc/valkey/users.acl",
+        "--save",
+        "",
+        "--appendonly",
+        "no"
+      ],
+      "entrypoint": null,
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "test": [
+          "CMD-SHELL",
+          "VALKEYCLI_AUTH=\"$$(cat /run/valkey-health.password)\" valkey-cli --no-auth-warning --user health ping | grep -qx PONG"
+        ],
+        "timeout": "5s"
+      },
+      "image": "valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
+      "networks": {
+        "default": null
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "valkey-health",
+          "target": "/run/valkey-health.password"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "source": "valkey_data",
+          "target": "/data",
+          "type": "volume",
+          "volume": {}
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/m/.chelabase/stacks/feat-x/valkey/users.acl",
+          "target": "/etc/valkey/users.acl",
+          "type": "bind"
+        }
+      ]
+    },
+    "worker": {
+      "command": [
+        "/w/feat-x/target/debug/worker"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "nats": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "pageserver": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "register-safekeepers": {
+          "condition": "service_completed_successfully",
+          "required": true
+        },
+        "safekeeper1": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "safekeeper2": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "safekeeper3": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "storage-controller": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "valkey": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_IDENTITY_TOKEN_FILE": "/m/.chelabase/tokens/worker-identity.token",
+        "CHELABASE_IDENTITY_URL": "http://identity:8080",
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_worker",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/worker.password",
+        "CHELABASE_NATS_USER": "worker",
+        "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
+        "CHELABASE_REALTIME_PG_PASSWORD_FILE": "/m/.chelabase/realtime/pg.password",
+        "CHELABASE_REALTIME_TLS_DIR": "/m/.chelabase/realtime-tls",
+        "CHELABASE_STORAGE_BACKEND": "seaweedfs",
+        "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/storage-s3/access-key",
+        "CHELABASE_STORAGE_S3_BUCKET": "chelabase-storage",
+        "CHELABASE_STORAGE_S3_ENDPOINT": "http://seaweedfs:8333",
+        "CHELABASE_STORAGE_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/storage-s3/secret-key",
+        "CHELABASE_STORAGE_SWEEP_DRY_RUN": "",
+        "CHELABASE_STORAGE_SWEEP_GRACE_SECS": "",
+        "CHELABASE_STORAGE_SWEEP_SECS": "",
+        "CHELABASE_STORAGE_TOKEN_REFRESH_SECS": "3600",
+        "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/control.password",
+        "CHELABASE_VALKEY_USER": "control",
+        "CHELABASE_WEBHOOKS_ALLOW_HOSTS": "runner",
+        "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true"
+      },
+      "group_add": [
+        "973"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://127.0.0.1:8082/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "secrets-key",
+          "target": "/m/.chelabase/secrets/secrets.key"
+        },
+        {
+          "source": "compute-jwt-private",
+          "target": "/m/.chelabase/neon/compute-jwt.pem"
+        },
+        {
+          "source": "compute-jwt-public",
+          "target": "/m/.chelabase/neon/compute-jwt.pub"
+        },
+        {
+          "source": "nats-worker",
+          "target": "/m/.chelabase/nats/worker.password"
+        },
+        {
+          "source": "valkey-control",
+          "target": "/m/.chelabase/valkey/control.password"
+        },
+        {
+          "source": "realtime-pg",
+          "target": "/m/.chelabase/realtime/pg.password"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        },
+        {
+          "source": "token-worker-identity",
+          "target": "/m/.chelabase/tokens/worker-identity.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/m/.chelabase/compute-ca",
+          "target": "/m/.chelabase/compute-ca",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/m/.chelabase/orchestrator-tls",
+          "target": "/m/.chelabase/orchestrator-tls",
+          "type": "bind"
+        },
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "source": "/m/.chelabase/realtime-tls",
+          "target": "/m/.chelabase/realtime-tls",
+          "type": "bind"
+        },
+        {
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    }
+  },
+  "volumes": {
+    "metadata_pg_data": {
+      "name": "chelabase-feat-x_metadata_pg_data"
+    },
+    "nats_data": {
+      "name": "chelabase-feat-x_nats_data"
+    },
+    "neon_pageserver_data": {
+      "name": "chelabase-feat-x_neon_pageserver_data"
+    },
+    "neon_proxy_tls": {
+      "name": "chelabase-feat-x_neon_proxy_tls"
+    },
+    "neon_safekeeper1_data": {
+      "name": "chelabase-feat-x_neon_safekeeper1_data"
+    },
+    "neon_safekeeper2_data": {
+      "name": "chelabase-feat-x_neon_safekeeper2_data"
+    },
+    "neon_safekeeper3_data": {
+      "name": "chelabase-feat-x_neon_safekeeper3_data"
+    },
+    "neon_seaweedfs_data": {
+      "name": "chelabase-feat-x_neon_seaweedfs_data"
+    },
+    "neon_storcon_pg_data": {
+      "name": "chelabase-feat-x_neon_storcon_pg_data"
+    },
+    "valkey_data": {
+      "name": "chelabase-feat-x_valkey_data"
+    }
+  }
+}

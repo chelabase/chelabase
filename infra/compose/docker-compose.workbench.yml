@@ -26,12 +26,19 @@
 # owner), whatever the host uid is; the image's own user (uid 1000) can read them only when the
 # host uid happens to be 1000. Those without a data volume set `user:`; the pageserver and the
 # safekeepers start as root only to hand their data volume (created by the image as 1000:1000)
-# to the stack's uid once, then drop to it before anything else runs.
+# to the stack's uid once, then drop to it before anything else runs. As root they also give the
+# stack's uid and gid a passwd and group entry when the image has none (it has only 1000's): the
+# pageserver runs initdb, which refuses an effective uid it can't look up. The `user:` services
+# run nothing that looks one up (no initdb, no libpq).
 x-neon-as-stack-user: &neon-as-stack-user
   - /bin/sh
   - -c
   - >-
     set -e;
+    getent group "${CHELABASE_GID}" >/dev/null ||
+    echo "chelabase:x:${CHELABASE_GID}:" >>/etc/group;
+    getent passwd "${CHELABASE_UID}" >/dev/null ||
+    echo "chelabase:x:${CHELABASE_UID}:${CHELABASE_GID}::/data:/bin/sh" >>/etc/passwd;
     [ "$$(stat -c %u:%g /data)" = "${CHELABASE_UID}:${CHELABASE_GID}" ] ||
     chown -R "${CHELABASE_UID}:${CHELABASE_GID}" /data;
     exec setpriv --reuid="${CHELABASE_UID}" --regid="${CHELABASE_GID}" --clear-groups -- "$$@"
