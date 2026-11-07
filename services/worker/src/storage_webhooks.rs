@@ -930,7 +930,8 @@ mod tests {
             let next = run
                 .0
                 .after(run.1, attempt.outcome == "delivered", attempt.attempted_at);
-            *run = (next, Some(attempt.attempted_at));
+            // As the store: the last attempt never moves back.
+            *run = (next, run.1.max(Some(attempt.attempted_at)));
             self.attempts
                 .lock()
                 .unwrap()
