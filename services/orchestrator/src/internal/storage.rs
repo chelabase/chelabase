@@ -14,7 +14,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chelabase_metadata::members::MemberStatus;
 use chelabase_metadata::{BranchKind, BranchStatus, DataKeyLookup};
-use chelabase_types::access::PlatformRole;
+use chelabase_types::access::{PlatformRole, tenant_admin_effective};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_neon::ComputeLocator;
 use chelabase_secrets::{Purpose, derive_key};
@@ -78,13 +78,23 @@ where
     Json(json!({ "kid": URL_KEY_ID, "key": STANDARD.encode(key) })).into_response()
 }
 
-/// `?branch=`: the branch the URL was signed on.
+/// `?branch=`: the branch the URL was signed on; for a console URL, how it was minted.
 #[derive(Deserialize)]
 struct LiveQuery {
     branch: Option<Uuid>,
     /// The URL was minted in owner mode (m9): its member must still be an Admin.
     #[serde(default)]
     owner: bool,
+    /// The role the URL was minted as (#100): its member must still hold it at Developer.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// How a console URL was minted, as its signed claims say.
+#[derive(Clone, Copy)]
+enum Minted<'a> {
+    Owner,
+    Role(&'a str),
 }
 
 /// The live key with this id (as the gateway's lookup answers it); else, for a URL minted from
@@ -107,7 +117,14 @@ where
     let Some(branch) = q.branch else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match console_signer_live(&state, key_id, BranchId(branch), q.owner).await {
+    // A console URL names exactly one of owner mode and its role; one naming neither (minted
+    // before #100) or both is never live.
+    let minted = match (q.owner, q.role.as_deref()) {
+        (true, None) => Minted::Owner,
+        (false, Some(role)) if !role.is_empty() => Minted::Role(role),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match console_signer_live(&state, key_id, BranchId(branch), minted).await {
         Ok(Some(project)) => Json(json!({
             "key_id": key_id,
             "branch_id": branch,
@@ -125,14 +142,15 @@ where
 
 /// Whether `member` may still use a URL they minted from the console on `branch`: the branch is
 /// a normal one not being deleted, the member is active (not offboarded) in the tenant of the
-/// branch's project, and a tenant admin or holds Developer or above on the branch's database
-/// (their own and team grants, with the database's override); Admin for a URL minted in owner
-/// mode (`owner`). The project when so.
+/// branch's project, and their access on the branch's database (their own and team grants,
+/// with the database's override; a tenant admin's is Admin with every role) still holds the
+/// role the URL was minted as at Developer (#100: the role's own level, as console `sign`
+/// needs it), or is Admin for a URL minted in owner mode. The project when so.
 async fn console_signer_live<M, L>(
     state: &InternalState<M, L>,
     member: Uuid,
     branch: BranchId,
-    owner: bool,
+    minted: Minted<'_>,
 ) -> Result<Option<ProjectId>, chelabase_metadata::MetadataError>
 where
     M: NeonMetadataPort,
@@ -154,11 +172,15 @@ where
         return Ok(None);
     };
     let active = m.status == MemberStatus::Active && !m.offboarded && m.tenant_id == p.tenant_id;
-    let needed = if owner { PlatformRole::Admin } else { PlatformRole::Developer };
-    let enough = m.tenant_admin
-        || sources
-            .effective()
-            .is_some_and(|e| e.platform_role >= needed);
+    let effective = if m.tenant_admin { Some(tenant_admin_effective()) } else { sources.effective() };
+    let enough = effective.is_some_and(|e| match minted {
+        Minted::Owner => e.platform_role == PlatformRole::Admin,
+        Minted::Role(role) => {
+            e.platform_role >= PlatformRole::Developer
+                && e.roles.may_act_as(role)
+                && e.level_of(role).is_some_and(|l| l >= PlatformRole::Developer)
+        }
+    });
     Ok((active && enough).then_some(project))
 }
 

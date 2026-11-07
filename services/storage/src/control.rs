@@ -53,6 +53,38 @@ impl LiveKey {
     }
 }
 
+/// Who minted a signed URL, as its (signed) claims say: what its liveness is judged on (#100).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Minter {
+    /// No role in the claims: a data key's URL. A console URL without one is never live.
+    Key,
+    /// A console URL minted in owner mode: live while its member is still an Admin.
+    Owner,
+    /// A console URL minted as this role: live while its member still holds that role at
+    /// Developer.
+    Role(String),
+}
+
+impl Minter {
+    /// The minter a download token's claims name: the owner-mode marker, a role, or neither.
+    pub fn of(role: Option<&str>) -> Self {
+        match role {
+            None => Minter::Key,
+            Some(crate::internal::STORAGE_ROLE) => Minter::Owner,
+            Some(role) => Minter::Role(role.to_owned()),
+        }
+    }
+
+    /// The liveness route's query beyond `?branch=`.
+    fn query(&self) -> String {
+        match self {
+            Minter::Key => String::new(),
+            Minter::Owner => "&owner=true".into(),
+            Minter::Role(role) => format!("&role={}", crate::names::encode_path(role)),
+        }
+    }
+}
+
 /// The control plane couldn't answer (logged by the caller): 503.
 #[derive(Debug)]
 pub struct Unreachable(pub String);
@@ -60,13 +92,13 @@ pub struct Unreachable(pub String);
 pub trait Control: Send + Sync + 'static {
     fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>>;
     /// The key while it is live, for a URL signed on `branch`: a data key, or a member who
-    /// minted the URL from the console while they still have Developer access to the branch's
-    /// database (an Admin for a URL minted in owner mode, `owner`).
+    /// minted the URL from the console while they still hold its role at Developer on the
+    /// branch's database (an Admin for a URL minted in owner mode), as `minter` says.
     fn live_key(
         &self,
         key_id: Uuid,
         branch: Uuid,
-        owner: bool,
+        minter: &Minter,
     ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>>;
     /// The token's expiry as recorded (an app user's is cut to its session's), or `None` when
     /// the id is taken, the key isn't live, or the app session the claims name isn't.
@@ -90,7 +122,7 @@ pub trait Control: Send + Sync + 'static {
 pub struct Urls {
     control: Arc<dyn Control>,
     key: tokio::sync::OnceCell<UrlKey>,
-    live: Fenced<(Uuid, Uuid, bool), Option<LiveKey>>,
+    live: Fenced<(Uuid, Uuid, Minter), Option<LiveKey>>,
 }
 
 impl Urls {
@@ -130,13 +162,13 @@ impl Urls {
         &self,
         key_id: Uuid,
         branch: Uuid,
-        owner: bool,
+        minter: &Minter,
         rid: &str,
     ) -> Result<Option<LiveKey>, Failure> {
         self.live
-            .get_or_lookup((key_id, branch, owner), async {
+            .get_or_lookup((key_id, branch, minter.clone()), async {
                 self.control
-                    .live_key(key_id, branch, owner)
+                    .live_key(key_id, branch, minter)
                     .await
                     .map_err(|e| unreachable(e, rid))
             })
@@ -235,10 +267,10 @@ impl Control for Orchestrator {
         &self,
         key_id: Uuid,
         branch: Uuid,
-        owner: bool,
+        minter: &Minter,
     ) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+        let path = format!("/internal/storage/keys/{key_id}?branch={branch}{}", minter.query());
         Box::pin(async move {
-            let path = format!("/internal/storage/keys/{key_id}?branch={branch}&owner={owner}");
             match self.call("GET", &path, None).await? {
                 (200, v) => parse(v).map(Some),
                 (404, _) => Ok(None),
@@ -305,7 +337,7 @@ mod tests {
         fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>> {
             Box::pin(async { Err(Unreachable("unused".into())) })
         }
-        fn live_key(&self, key_id: Uuid, branch: Uuid, _owner: bool) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+        fn live_key(&self, key_id: Uuid, branch: Uuid, _: &Minter) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 Ok(Some(LiveKey {
@@ -335,18 +367,18 @@ mod tests {
         let (k1, k2, b1, b2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let lookups = || control.0.load(Ordering::SeqCst);
         for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
-            urls.live_key(k, b, false, "r").await.unwrap();
+            urls.live_key(k, b, &Minter::Key, "r").await.unwrap();
         }
         assert_eq!(lookups(), 3);
-        urls.live_key(k1, b1, false, "r").await.unwrap();
+        urls.live_key(k1, b1, &Minter::Key, "r").await.unwrap();
         assert_eq!(lookups(), 3, "cached");
         urls.forget_key(k1);
         for (k, b) in [(k1, b1), (k1, b2), (k2, b1)] {
-            urls.live_key(k, b, false, "r").await.unwrap();
+            urls.live_key(k, b, &Minter::Key, "r").await.unwrap();
         }
         assert_eq!(lookups(), 5, "k1 asked again on both branches, k2 still cached");
         urls.forget_all();
-        urls.live_key(k2, b1, false, "r").await.unwrap();
+        urls.live_key(k2, b1, &Minter::Key, "r").await.unwrap();
         assert_eq!(lookups(), 6);
     }
 
@@ -363,7 +395,7 @@ mod tests {
         fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>> {
             Box::pin(async { Err(Unreachable("unused".into())) })
         }
-        fn live_key(&self, key_id: Uuid, branch: Uuid, _owner: bool) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+        fn live_key(&self, key_id: Uuid, branch: Uuid, _: &Minter) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
             let first = self.lookups.fetch_add(1, Ordering::SeqCst) == 0;
             Box::pin(async move {
                 if first {
@@ -398,7 +430,7 @@ mod tests {
             let (k, b) = (Uuid::new_v4(), Uuid::new_v4());
             let in_flight = tokio::spawn({
                 let urls = urls.clone();
-                async move { urls.live_key(k, b, false, "r").await.unwrap() }
+                async move { urls.live_key(k, b, &Minter::Key, "r").await.unwrap() }
             });
             control.started.notified().await;
             if forget_all {
@@ -408,10 +440,22 @@ mod tests {
             }
             control.go_on.notify_one();
             in_flight.await.unwrap();
-            urls.live_key(k, b, false, "r").await.unwrap();
+            urls.live_key(k, b, &Minter::Key, "r").await.unwrap();
             assert_eq!(control.lookups.load(Ordering::SeqCst), 2, "forget_all: {forget_all}");
-            urls.live_key(k, b, false, "r").await.unwrap();
+            urls.live_key(k, b, &Minter::Key, "r").await.unwrap();
             assert_eq!(control.lookups.load(Ordering::SeqCst), 2, "cached again after");
         }
+    }
+
+    /// #100: a URL's claims name its minter, and the liveness route is asked about exactly
+    /// that one: owner mode, the role (encoded, so it can't add a parameter), or neither.
+    #[test]
+    fn the_liveness_route_is_asked_about_the_urls_minter() {
+        assert_eq!(Minter::of(None), Minter::Key);
+        assert_eq!(Minter::of(Some(crate::internal::STORAGE_ROLE)), Minter::Owner);
+        assert_eq!(Minter::of(Some("reader")), Minter::Role("reader".into()));
+        assert_eq!(Minter::Key.query(), "");
+        assert_eq!(Minter::Owner.query(), "&owner=true");
+        assert_eq!(Minter::Role("a b&owner=true".into()).query(), "&role=a%20b%26owner%3Dtrue");
     }
 }
