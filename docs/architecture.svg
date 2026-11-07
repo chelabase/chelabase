@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 584" width="440" height="584" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 666" width="440" height="666" role="img" aria-labelledby="title desc">
   <title id="title">Chelabase architecture</title>
-  <desc id="desc">Your app and Studio reach the Gateway over HTTPS. The Gateway forwards to Realtime, Auth, the Orchestrator and Rest. Auth keeps every account, Studio members and app users alike, in the internal Identity service. The Orchestrator hands jobs to the Worker, which provisions Postgres computes. Rest queries a compute, and psql, ORMs and migration tools connect over the Postgres protocol through the Neon proxy. Each branch has its own compute on Neon's storage: pageserver, safekeepers and object store.</desc>
+  <desc id="desc">Your app and Studio reach the Gateway over HTTPS. The Gateway forwards to Realtime, Auth, the Orchestrator, Rest and Storage. Auth keeps every account, Studio members and app users alike, in the internal Identity service. The Orchestrator hands jobs to the Worker, which provisions Postgres computes. Rest queries a compute, and psql, ORMs and migration tools connect over the Postgres protocol through the Neon proxy. Storage keeps each file's metadata in the branch's Postgres and the file in an S3 bucket. Each branch has its own compute on Neon's storage: pageserver, safekeepers and object store.</desc>
   <style>
     .card { fill: #f7f3ee; }
     .box { fill: #ffffff; stroke: #d8cfc5; stroke-width: 1.25; }
@@ -31,92 +31,71 @@
     </marker>
   </defs>
 
-  <rect class="card" x="0" y="0" width="440" height="584" rx="14"/>
+  <rect class="card" x="0" y="0" width="440" height="666" rx="14"/>
 
-  <!-- Clients -->
   <rect class="box" x="12" y="14" width="127" height="54" rx="8"/>
   <text class="t" x="75.5" y="37" text-anchor="middle">Your app</text>
   <text class="s" x="75.5" y="56" text-anchor="middle">@chelabase/client</text>
-
   <rect class="box" x="175" y="14" width="127" height="54" rx="8"/>
   <text class="t" x="238.5" y="37" text-anchor="middle">Studio</text>
   <text class="s" x="238.5" y="56" text-anchor="middle">web console</text>
-
   <rect class="box" x="318" y="14" width="110" height="54" rx="8"/>
   <text class="t" x="373" y="37" text-anchor="middle">psql, ORMs</text>
   <text class="s" x="373" y="56" text-anchor="middle">migration tools</text>
-
-  <!-- HTTPS into the gateway -->
   <path class="wire" d="M75.5 68 V105" marker-end="url(#arrow)"/>
   <path class="wire" d="M238.5 68 V105" marker-end="url(#arrow)"/>
   <text class="e" x="157" y="91" text-anchor="middle">HTTPS</text>
-
   <rect class="front" x="12" y="106" width="290" height="46" rx="8"/>
   <text class="t" x="157" y="126" text-anchor="middle">Gateway</text>
-  <text class="s" x="157" y="144" text-anchor="middle">one front door, checks every credential</text>
-
-  <!-- The gateway's spine to its services -->
-  <path class="wire" d="M157 152 V363"/>
+  <text class="s" x="157" y="143" text-anchor="middle">one front door, checks every credential</text>
+  <path class="wire" d="M157 152 V445"/>
   <path class="wire" d="M157 199 H140" marker-end="url(#arrow)"/>
   <path class="wire" d="M157 199 H174" marker-end="url(#arrow)"/>
   <path class="wire" d="M157 281 H140" marker-end="url(#arrow)"/>
   <path class="wire" d="M157 363 H174" marker-end="url(#arrow)"/>
-
   <rect class="box" x="12" y="172" width="127" height="54" rx="8"/>
   <text class="t" x="75.5" y="195" text-anchor="middle">Realtime</text>
   <text class="s" x="75.5" y="214" text-anchor="middle">live rows, presence</text>
-
   <rect class="box" x="175" y="172" width="127" height="54" rx="8"/>
   <text class="t" x="238.5" y="195" text-anchor="middle">Auth</text>
   <text class="s" x="238.5" y="214" text-anchor="middle">sign-in, tokens</text>
-
   <rect class="box" x="12" y="254" width="127" height="54" rx="8"/>
   <text class="t" x="75.5" y="277" text-anchor="middle">Orchestrator</text>
   <text class="s" x="75.5" y="296" text-anchor="middle">Management API</text>
-
-  <!-- Auth keeps its accounts in the internal identity service -->
   <path class="wire" d="M238.5 226 V253" marker-end="url(#arrow)"/>
-
   <rect class="box" x="175" y="254" width="127" height="54" rx="8"/>
   <text class="t" x="238.5" y="277" text-anchor="middle">Identity</text>
   <text class="s" x="238.5" y="296" text-anchor="middle">accounts, internal</text>
-
-  <!-- Jobs -->
   <path class="wire" d="M75.5 308 V335" marker-end="url(#arrow)"/>
   <text class="e" x="83" y="326">jobs</text>
-
   <rect class="box" x="12" y="336" width="127" height="54" rx="8"/>
   <text class="t" x="75.5" y="359" text-anchor="middle">Worker</text>
   <text class="s" x="75.5" y="378" text-anchor="middle">branches, resets</text>
-
   <rect class="box" x="175" y="336" width="127" height="54" rx="8"/>
   <text class="t" x="238.5" y="359" text-anchor="middle">Rest</text>
   <text class="s" x="238.5" y="378" text-anchor="middle">data API</text>
-
-  <!-- Postgres clients go straight to the proxy -->
+  <path class="wire" d="M157 445 H174" marker-end="url(#arrow)"/>
+  <rect class="box" x="175" y="418" width="100" height="54" rx="8"/>
+  <text class="t" x="225" y="441" text-anchor="middle">Storage</text>
+  <text class="s" x="225" y="460" text-anchor="middle">files, URLs</text>
   <path class="wire" d="M373 68 V335" marker-end="url(#arrow)"/>
   <text class="e" x="380" y="206">Postgres</text>
-
   <rect class="box" x="318" y="336" width="110" height="54" rx="8"/>
   <text class="t" x="373" y="359" text-anchor="middle">Neon proxy</text>
   <text class="s" x="373" y="378" text-anchor="middle">login roles</text>
-
-  <!-- Into Neon -->
-  <rect class="group" x="12" y="420" width="416" height="152" rx="10"/>
-  <text class="g" x="157" y="441" text-anchor="middle">Neon storage engine</text>
-
-  <path class="wire" d="M75.5 390 V453" marker-end="url(#arrow)"/>
+  <rect class="group" x="12" y="502" width="416" height="152" rx="10"/>
+  <text class="g" x="110" y="523" text-anchor="middle">Neon storage engine</text>
+  <path class="wire" d="M75.5 390 V535" marker-end="url(#arrow)"/>
   <text class="e" x="83" y="410">provisions</text>
-  <path class="wire" d="M238.5 390 V453" marker-end="url(#arrow)"/>
-  <path class="wire" d="M373 390 V453" marker-end="url(#arrow)"/>
-
-  <rect class="box" x="24" y="454" width="392" height="46" rx="8"/>
-  <text class="t" x="220" y="474" text-anchor="middle">Postgres compute</text>
-  <text class="s" x="220" y="491" text-anchor="middle">one per branch</text>
-
-  <path class="wire" d="M220 500 V514"/>
-
-  <rect class="box" x="24" y="514" width="392" height="46" rx="8"/>
-  <text class="t" x="220" y="534" text-anchor="middle">Storage</text>
-  <text class="s" x="220" y="551" text-anchor="middle">pageserver, safekeepers, object store</text>
+  <path class="wire" d="M373 390 V535" marker-end="url(#arrow)"/>
+  <path class="wire" d="M289 390 V535" marker-end="url(#arrow)"/>
+  <path class="wire" d="M225 472 V535" marker-end="url(#arrow)"/>
+  <text class="e" x="232" y="492">metadata</text>
+  <rect class="box" x="24" y="536" width="392" height="46" rx="8"/>
+  <text class="t" x="220" y="556" text-anchor="middle">Postgres compute</text>
+  <text class="s" x="220" y="573" text-anchor="middle">one per branch</text>
+  <path class="wire" d="M220 582 V596"/>
+  <rect class="box" x="24" y="596" width="392" height="46" rx="8"/>
+  <text class="t" x="220" y="616" text-anchor="middle">Page storage</text>
+  <text class="s" x="220" y="633" text-anchor="middle">pageserver, safekeepers, object store</text>
 </svg>
