@@ -7,6 +7,8 @@ use std::collections::HashMap;
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 const DEFAULT_REALTIME: &str = "127.0.0.1:8087";
 const DEFAULT_STORAGE: &str = "127.0.0.1:8089";
+/// Edge functions m3 declares `Service::Functions`; m4 adds the service and its URL setting.
+const DEFAULT_FUNCTIONS: &str = "127.0.0.1:8091";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
@@ -15,6 +17,7 @@ pub struct Upstreams {
     rest: String,
     realtime: String,
     storage: String,
+    functions: String,
     /// The pass-through sites that have an upstream.
     sites: HashMap<Site, String>,
 }
@@ -27,6 +30,7 @@ impl Upstreams {
             rest: DEFAULT_REST.to_string(),
             realtime: DEFAULT_REALTIME.to_string(),
             storage: DEFAULT_STORAGE.to_string(),
+            functions: DEFAULT_FUNCTIONS.to_string(),
             sites: HashMap::new(),
         })
     }
@@ -62,6 +66,7 @@ impl Upstreams {
             Service::Rest => &self.rest,
             Service::Realtime => &self.realtime,
             Service::Storage => &self.storage,
+            Service::Functions => &self.functions,
         }
     }
 
