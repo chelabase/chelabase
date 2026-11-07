@@ -50,8 +50,9 @@ pub const PG_NAME_BYTES: usize = 63;
 
 /// Events the stream keeps for one database (one subject). Past this, the database's own
 /// oldest events are dropped, pending or not: about 1.1 events a second sustained over
-/// [`RETENTION`] while an endpoint is down. Nothing counts those drops yet; counting them
-/// (e.g. a consumer noticing a gap in its stream sequence) is a follow-up.
+/// [`RETENTION`] while an endpoint is down. Nothing counts those drops: JetStream reports no
+/// limit discard, and a consumer's stream-sequence gaps mix them with other databases'
+/// events, so counting them needs a per-database sequence on each event (#155).
 pub const MAX_EVENTS_PER_DATABASE: i64 = 100_000;
 
 /// The largest event the stream stores, JSON payload and `Nats-Msg-Id` header together. The
@@ -91,6 +92,31 @@ pub const MAX_EVENTS: i64 = STREAM_MAX_BYTES / (MIN_EVENT_BYTES + STORED_OVERHEA
 
 /// How long a consumer nobody pulls from lives on (an endpoint deleted while no worker ran).
 pub const CONSUMER_INACTIVE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// How often storage and the worker look at their counts of lost events (storage's events it
+/// couldn't publish, the worker's deliveries it gave up on) to log a totals line.
+pub const LOSS_TOTALS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Every `every` (the first after one interval), calls `emit(total, since_last)` when
+/// `total()`, a count kept since the process started, grew since the last call: a service
+/// that lost nothing logs nothing. Runs until dropped.
+pub async fn report_loss_totals(
+    every: std::time::Duration,
+    total: impl Fn() -> u64,
+    mut emit: impl FnMut(u64, u64),
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = 0;
+    loop {
+        ticks.tick().await;
+        let now = total();
+        if now > last {
+            emit(now, now - last);
+            last = now;
+        }
+    }
+}
 
 /// `chelabase.storage.events.<database_id>`: a uuid is one token, so no value widens it.
 pub fn subject(database_id: Uuid) -> String {
@@ -654,6 +680,53 @@ mod tests {
             endpoint_consumer_name(endpoint, since),
             endpoint_consumer_name(endpoint, since + chrono::Duration::seconds(1))
         );
+    }
+
+    /// #154: a totals line every [`LOSS_TOTALS_EVERY`] while the total grows, with the
+    /// total and its growth since the last line; nothing while it stands still (zero
+    /// included), nothing before the first interval.
+    #[tokio::test(start_paused = true)]
+    async fn loss_totals_are_reported_each_interval_only_while_they_grow() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        let total = Arc::new(AtomicU64::new(0));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let (total, lines) = (total.clone(), lines.clone());
+            async move {
+                report_loss_totals(
+                    LOSS_TOTALS_EVERY,
+                    move || total.load(Ordering::SeqCst),
+                    move |t, new| lines.lock().unwrap().push((t, new)),
+                )
+                .await
+            }
+        });
+        let step = |d| async move {
+            tokio::time::advance(d).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        };
+        step(std::time::Duration::ZERO).await; // the task starts its clock now
+        total.store(2, Ordering::SeqCst);
+        step(LOSS_TOTALS_EVERY - std::time::Duration::from_secs(1)).await;
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "nothing before the first interval"
+        );
+        step(std::time::Duration::from_secs(1)).await;
+        assert_eq!(*lines.lock().unwrap(), [(2, 2)]);
+        step(LOSS_TOTALS_EVERY).await;
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [(2, 2)],
+            "an unchanged total logs nothing"
+        );
+        total.store(5, Ordering::SeqCst);
+        step(LOSS_TOTALS_EVERY).await;
+        assert_eq!(*lines.lock().unwrap(), [(2, 2), (5, 3)]);
+        task.abort();
     }
 
     #[test]

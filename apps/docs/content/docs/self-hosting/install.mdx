@@ -131,7 +131,7 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | How long a member access token lives, 60 to 900 seconds |
 | `CHELABASE_MEMBER_SESSION_CHECK_SECS` | `15` | How long the orchestrator reuses the identity service's answer that a member token's session is live, 0 to 30 seconds (0 asks every time). A token stops working at most this long after logout or a password reset |
 
-Storage webhook events wait in a NATS stream until they're delivered. The NATS volume (`nats_data`) needs about 6.2 GiB free (NATS reserves about 4.6 GiB and only uses 75% of free disk by default) when the stream is created, and the orchestrator doesn't start without it. A database keeps at most 100,000 undelivered events; past that, its oldest events are dropped unsent.
+Storage webhook events wait in a NATS stream until they're delivered. The NATS volume (`nats_data`) needs about 6.2 GiB free (NATS reserves about 4.6 GiB and only uses 75% of free disk by default) when the stream is created, and the orchestrator doesn't start without it. A database keeps at most 100,000 undelivered events; past that, its oldest events are dropped unsent. Events storage couldn't publish and deliveries the worker gave up on are logged as totals; see [lost webhook events](/self-hosting/storage-settings#lost-webhook-events-in-the-logs).
 
 Compose cannot split a host into its name and port, so when you change the hosts, `.env` has to repeat what Compose can't derive: the three `*_HOST_NAME` values, `CHELABASE_PUBLIC_PORT` and `CHELABASE_PUBLIC_SECURE`. `init-secrets` checks that they match the hosts and, if not, fails and names the exact line to fix. For example, `http` on port 9000:
 
