@@ -8,8 +8,11 @@
  * - `forbidden` (403): no policy allows it, or a signed URL's key was revoked;
  * - `not_found` (404): missing, or hidden from the caller;
  * - `timeout` (408, 504): the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS`
- *   (60 s by default), or the gateway timed out;
- * - `conflict` (409): the name is taken without `upsert`, another write won, or a bucket isn't empty;
+ *   (60 s by default), or the gateway timed out. Storage itself can also return a 504 `timeout`:
+ *   a delete that ran past the statement timeout (nothing is deleted; try again);
+ * - `conflict` (409): the name is taken without `upsert`, another write won, or a bucket isn't empty.
+ *   A delete's 409 `retry` (a concurrent transaction or held lock rolled it back; try again) also
+ *   arrives as `conflict`, with `serverCode: "retry"`;
  * - `write_once` (409): the bucket is write-once, so the object is never overwritten, moved or deleted;
  * - `referenced` (409): a row's foreign key to `storage.objects(id)` still references the object, so
  *   it isn't deleted (nothing is, for a batch); delete or change that row first, or declare the key

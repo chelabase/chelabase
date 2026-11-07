@@ -43,6 +43,13 @@ impl Failure {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
+    /// 503 `unavailable`: a delete hit a server-side failure that is not the user's (shutdown,
+    /// lost connection, insufficient resources). A fixed message with no Postgres text, detail
+    /// or hint, and no SQLSTATE.
+    pub fn delete_unavailable() -> Self {
+        Self::unavailable("the database was unavailable; nothing was deleted; try again")
+    }
+
     /// 403: the database isn't served or isn't on the key's list (one text for both).
     pub fn database_not_allowed() -> Self {
         Self::new(
@@ -130,7 +137,8 @@ impl Failure {
     /// conflict (a serialization failure or deadlock, SQLSTATE class 40, or a lock it couldn't
     /// get, 55P03). A fixed message: Postgres's detail names other backends' pids and the
     /// relations they hold, and a trigger raising one of these picks its own text. `sqlstate`
-    /// is Postgres's code (one of those, never text).
+    /// is the code's five characters, never text: Postgres's own, or a user-defined class-40
+    /// code a trigger raised, passed through as chosen.
     pub fn delete_retry(sqlstate: &str) -> Self {
         let mut f = QueryFailure::new(
             StatusCode::CONFLICT,
