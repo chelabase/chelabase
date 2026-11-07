@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
     let js = ensure_control_stream(&nats).await?;
     // The storage events (carried gaps T4, R10): only the orchestrator creates or fixes them.
     ensure_neon_events_stream(&js).await?;
+    // m18: the stream storage publishes object events to (created or fixed only here, R10).
+    chelabase_nats::storage_objects::ensure_stream(&js).await?;
 
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
@@ -184,6 +186,8 @@ async fn main() -> anyhow::Result<()> {
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
+        webhooks: chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+            .map_err(anyhow::Error::msg)?,
         compute_tls: Some(compute_tls),
     };
 

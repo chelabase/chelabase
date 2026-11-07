@@ -13772,6 +13772,851 @@
         ]
       }
     },
+    "/v1/databases/{id}/storage/webhooks": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List storage webhooks",
+        "description": "The database's webhook endpoints for storage object events (never their secrets).",
+        "operationId": "listStorageWebhooks",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The endpoints, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StorageWebhook"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database doesn't exist, or is another tenant's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create a storage webhook",
+        "description": "Registers an endpoint for the database's storage object events (every branch's, made through the storage API; changes made with SQL directly on `storage.objects` send none). Each event is POSTed as JSON, signed with `Chelabase-Signature: t=<unix>,v1=<hex HMAC-SHA256 of \"<t>.<body>\">`, at least once, retried with backoff for up to 24 hours. The secret is in this response only. A database has at most 20 endpoints.",
+        "operationId": "createStorageWebhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStorageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The endpoint and its secret (shown only now)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageWebhookWithSecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database doesn't exist, or is another tenant's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the database already has 20 endpoints",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown or missing field, a refused `url` (not https, credentials, a private, loopback, link-local or metadata address, or one that doesn't resolve), an unknown event, or a filter out of bounds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/storage/webhooks/{webhook_id}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Get a storage webhook",
+        "description": "One endpoint, with its failure state (never its secret).",
+        "operationId": "getStorageWebhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageWebhook"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete a storage webhook",
+        "description": "Deletes the endpoint and its attempts; deliveries in flight stop within seconds.",
+        "operationId": "deleteStorageWebhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Update a storage webhook",
+        "description": "Changes the given fields. `bucket` and `prefix` accept `null` to clear them. Enabling a disabled endpoint restarts delivery from now and clears its failure state.",
+        "operationId": "updateStorageWebhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStorageWebhookRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageWebhook"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an unknown field, a refused `url`, an unknown event, or a filter out of bounds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/storage/webhooks/{webhook_id}/attempts": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List a storage webhook's recent attempts",
+        "description": "The endpoint's newest delivery attempts (at most 100), newest first: status and duration only.",
+        "operationId": "listStorageWebhookAttempts",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The attempts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StorageWebhookAttempt"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/storage/webhooks/{webhook_id}/rotate-secret": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Rotate a storage webhook's secret",
+        "description": "Replaces the signing secret; deliveries are signed with the new one within seconds. The new secret is in this response only.",
+        "operationId": "rotateStorageWebhookSecret",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The endpoint and its new secret (shown only now)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageWebhookWithSecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/storage/webhooks/{webhook_id}/test": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Send a test event to a storage webhook",
+        "description": "Sends one signed `webhook.test` event now (enabled or not), without retries and without counting toward the endpoint's failures, and answers how it went.",
+        "operationId": "testStorageWebhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "webhook_id",
+            "in": "path",
+            "description": "Webhook id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The attempt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageWebhookTestResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the database is required; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database or the endpoint doesn't exist, or isn't the caller's; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: no worker answered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/instance/settings": {
       "get": {
         "tags": [
@@ -21393,6 +22238,41 @@
         },
         "additionalProperties": false
       },
+      "CreateStorageWebhookRequest": {
+        "type": "object",
+        "required": [
+          "url",
+          "events"
+        ],
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only objects of this bucket (by name, 1-100 bytes)."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "One or more of `object.created`, `object.updated`, `object.deleted`, `object.moved`."
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only object names starting with this (1-1024 bytes)."
+          },
+          "url": {
+            "type": "string",
+            "description": "Where events are POSTed: `https` (`http` only where the operator allows it), at most\n2048 bytes, no credentials, resolving only to public addresses."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateTable": {
         "type": "object",
         "required": [
@@ -26530,6 +27410,188 @@
         ],
         "description": "How a column references a stored object (object storage)."
       },
+      "StorageWebhook": {
+        "type": "object",
+        "description": "An endpoint, as the API shows it (never its secret).",
+        "required": [
+          "id",
+          "database_id",
+          "url",
+          "events",
+          "enabled",
+          "enabled_since",
+          "consecutive_failures",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only objects of this bucket (by name); `null`: every bucket."
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "disabled_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is disabled: `member` (through the API) or `failing` (three days of failed\nattempts); `null` while enabled."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "enabled_since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When delivery last (re)started: events from then on are delivered."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`object.created`, `object.updated`, `object.deleted`, `object.moved`."
+          },
+          "failing_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "The start of the current run of failed attempts; `null` after a success."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only object names starting with this; `null`: every name."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "StorageWebhookAttempt": {
+        "type": "object",
+        "description": "One delivery attempt, as recorded.",
+        "required": [
+          "event_id",
+          "event_type",
+          "attempt",
+          "outcome",
+          "duration_ms",
+          "attempted_at"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 for the first delivery of the event, then one more per retry."
+          },
+          "attempted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`delivered`, `http_error`, `timeout`, `connect_error` or `refused`."
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The HTTP status, when there was an answer."
+          }
+        }
+      },
+      "StorageWebhookTestResult": {
+        "type": "object",
+        "description": "How a test delivery went.",
+        "required": [
+          "outcome",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`delivered`, `http_error`, `timeout`, `connect_error` or `refused`."
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The endpoint's HTTP status, when it answered.",
+            "minimum": 0
+          }
+        }
+      },
+      "StorageWebhookWithSecret": {
+        "type": "object",
+        "description": "An endpoint with its signing secret: shown only here, once.",
+        "required": [
+          "webhook",
+          "secret"
+        ],
+        "properties": {
+          "secret": {
+            "type": "string",
+            "description": "The signing secret (`whsec_…`): verify each delivery's `Chelabase-Signature` with it.\nIt can't be read again; rotate it to get a new one."
+          },
+          "webhook": {
+            "$ref": "#/components/schemas/StorageWebhook"
+          }
+        }
+      },
       "Table": {
         "type": "object",
         "required": [
@@ -27392,6 +28454,48 @@
             "type": "integer",
             "format": "int32",
             "description": "The version the client last saw; a mismatch answers 409 `saved_query_conflict`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateStorageWebhookRequest": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears the filter; absent leaves it."
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`false` stops delivery; `true` restarts it from now (events in between are not sent) and\nclears the failure state."
+          },
+          "events": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears the filter; absent leaves it."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false

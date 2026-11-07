@@ -555,6 +555,49 @@ impl MetadataPort for Doc {
     ) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn create_storage_webhook(
+        &self,
+        new: &chelabase_metadata::NewStorageWebhook<'_>,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn list_storage_webhooks(&self, database: Uuid) -> Result<Vec<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn get_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn update_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        patch: &chelabase_metadata::StorageWebhookPatch,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_storage_webhook(&self, database: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn rotate_storage_webhook_secret(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        secret_enc: &str,
+    ) -> Result<Option<chelabase_metadata::StorageWebhook>, MetadataError> {
+        match *self {}
+    }
+    async fn list_storage_webhook_attempts(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<chelabase_metadata::StorageWebhookAttempt>, MetadataError> {
+        match *self {}
+    }
     async fn create_merge(&self, merge: &NewMerge) -> Result<MergeCreate, MetadataError> {
         match *self {}
     }
@@ -727,6 +770,12 @@ impl JobPort for Doc {
         &self,
         request: chelabase_nats::ReviewRequest,
     ) -> Result<chelabase_nats::ReviewReply, ResetError> {
+        match *self {}
+    }
+    async fn test_storage_webhook(
+        &self,
+        request: chelabase_nats::storage_objects::TestRequest,
+    ) -> Result<chelabase_nats::storage_objects::TestReply, ResetError> {
         match *self {}
     }
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
@@ -1228,6 +1277,14 @@ mod tests {
             ("GET /v1/databases/{id}/merges/{merge_id}/plan.sql", "exportMergePlan"),
             ("GET /v1/databases/{id}/personal-logins", "listDatabasePersonalLogins"),
             ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
+            ("GET /v1/databases/{id}/storage/webhooks", "listStorageWebhooks"),
+            ("POST /v1/databases/{id}/storage/webhooks", "createStorageWebhook"),
+            ("GET /v1/databases/{id}/storage/webhooks/{webhook_id}", "getStorageWebhook"),
+            ("PATCH /v1/databases/{id}/storage/webhooks/{webhook_id}", "updateStorageWebhook"),
+            ("DELETE /v1/databases/{id}/storage/webhooks/{webhook_id}", "deleteStorageWebhook"),
+            ("POST /v1/databases/{id}/storage/webhooks/{webhook_id}/rotate-secret", "rotateStorageWebhookSecret"),
+            ("POST /v1/databases/{id}/storage/webhooks/{webhook_id}/test", "testStorageWebhook"),
+            ("GET /v1/databases/{id}/storage/webhooks/{webhook_id}/attempts", "listStorageWebhookAttempts"),
             ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
             ("GET /v1/instance/settings", "getInstanceSettings"),
             ("GET /v1/invites/delivery", "getInviteDelivery"),
@@ -1599,6 +1656,7 @@ mod tests {
             "CreateProjectRequest",
             "CreateRoleRequest",
             "CreateSavedQueryRequest",
+            "CreateStorageWebhookRequest",
             "CreateTable",
             "CreateTeamRequest",
             "CreatedDataKey",
@@ -1751,6 +1809,10 @@ mod tests {
             "SkipReason",
             "StatementResult",
             "StorageRefDesc",
+            "StorageWebhook",
+            "StorageWebhookAttempt",
+            "StorageWebhookTestResult",
+            "StorageWebhookWithSecret",
             "Table",
             "TableDesc",
             "TableGrant",
@@ -1779,6 +1841,7 @@ mod tests {
             "UpdateProjectRequest",
             "UpdateRoleRequest",
             "UpdateSavedQueryRequest",
+            "UpdateStorageWebhookRequest",
             "UpdateTeamRequest",
             "UpdateTenantRequest",
             "UserStepBody",

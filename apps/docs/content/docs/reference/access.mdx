@@ -193,6 +193,14 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | DELETE | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
 | GET | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
 | PATCH | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| PATCH | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/attempts` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/rotate-secret` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/storage/webhooks/\{webhook_id\}/test` | Member token | Project Developer |
 | GET | `/v1/instance/settings` | Member token | Instance admin |
 | PATCH | `/v1/instance/settings` | Member token | Instance admin |
 | POST | `/v1/invites` | Member token | Tenant admin |

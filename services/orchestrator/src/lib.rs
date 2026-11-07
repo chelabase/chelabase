@@ -12,6 +12,7 @@ use chelabase_metadata::{
     DataKeyRecord, MetadataClient, MetadataError, NewBranch, NewDataKey, ProjectOverview,
     NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
     MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
+    NewStorageWebhook, StorageWebhook, StorageWebhookAttempt, StorageWebhookPatch,
 };
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob,
@@ -57,6 +58,7 @@ mod protection;
 mod roles;
 pub mod sql_editor;
 pub mod storage_console;
+mod storage_webhooks;
 mod privileges;
 mod table_api;
 mod teams;
@@ -546,6 +548,50 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         by: SavedQueryEditor,
         id: Uuid,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// m18: a new storage webhook endpoint, or `None` at the database's cap.
+    fn create_storage_webhook(
+        &self,
+        new: &NewStorageWebhook<'_>,
+    ) -> impl Future<Output = Result<Option<StorageWebhook>, MetadataError>> + Send;
+
+    fn list_storage_webhooks(
+        &self,
+        database: Uuid,
+    ) -> impl Future<Output = Result<Vec<StorageWebhook>, MetadataError>> + Send;
+
+    fn get_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+    ) -> impl Future<Output = Result<Option<StorageWebhook>, MetadataError>> + Send;
+
+    fn update_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        patch: &StorageWebhookPatch,
+    ) -> impl Future<Output = Result<Option<StorageWebhook>, MetadataError>> + Send;
+
+    fn delete_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    fn rotate_storage_webhook_secret(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        secret_enc: &str,
+    ) -> impl Future<Output = Result<Option<StorageWebhook>, MetadataError>> + Send;
+
+    fn list_storage_webhook_attempts(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<StorageWebhookAttempt>, MetadataError>> + Send;
     /// Inserts a `computing` merge, or says which merge is in the way.
     fn create_merge(
         &self,
@@ -1145,6 +1191,52 @@ impl MetadataPort for MetadataClient {
         MetadataClient::update_saved_query(self, database, by, id, version, patch).await
     }
 
+    async fn create_storage_webhook(
+        &self,
+        new: &NewStorageWebhook<'_>,
+    ) -> Result<Option<StorageWebhook>, MetadataError> {
+        MetadataClient::create_storage_webhook(self, new).await
+    }
+
+    async fn list_storage_webhooks(&self, database: Uuid) -> Result<Vec<StorageWebhook>, MetadataError> {
+        MetadataClient::list_storage_webhooks(self, database).await
+    }
+
+    async fn get_storage_webhook(&self, database: Uuid, id: Uuid) -> Result<Option<StorageWebhook>, MetadataError> {
+        MetadataClient::get_storage_webhook(self, database, id).await
+    }
+
+    async fn update_storage_webhook(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        patch: &StorageWebhookPatch,
+    ) -> Result<Option<StorageWebhook>, MetadataError> {
+        MetadataClient::update_storage_webhook(self, database, id, patch).await
+    }
+
+    async fn delete_storage_webhook(&self, database: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        MetadataClient::delete_storage_webhook(self, database, id).await
+    }
+
+    async fn rotate_storage_webhook_secret(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        secret_enc: &str,
+    ) -> Result<Option<StorageWebhook>, MetadataError> {
+        MetadataClient::rotate_storage_webhook_secret(self, database, id, secret_enc).await
+    }
+
+    async fn list_storage_webhook_attempts(
+        &self,
+        database: Uuid,
+        id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<StorageWebhookAttempt>, MetadataError> {
+        MetadataClient::list_storage_webhook_attempts(self, database, id, limit).await
+    }
+
     async fn delete_saved_query(
         &self,
         database: Uuid,
@@ -1377,6 +1469,13 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         &self,
         request: chelabase_nats::MemberRoleHandOverRequest,
     ) -> impl Future<Output = Result<chelabase_nats::MemberRolesReply, ResetError>> + Send;
+
+    /// m18: asks the worker to send one test event to a storage webhook endpoint now
+    /// (`chelabase.rpc.storage_webhooks.test`).
+    fn test_storage_webhook(
+        &self,
+        request: chelabase_nats::storage_objects::TestRequest,
+    ) -> impl Future<Output = Result<chelabase_nats::storage_objects::TestReply, ResetError>> + Send;
 
     /// Asks the worker for a branch's protection review, or one fix of it
     /// (`chelabase.rpc.review`; scanned and fixed as `cloud_admin`).
@@ -1657,6 +1756,13 @@ impl JobPort for NatsPorts {
         member_roles_rpc(&self.client, chelabase_nats::SUBJECT_REVIEW, &request).await
     }
 
+    async fn test_storage_webhook(
+        &self,
+        request: chelabase_nats::storage_objects::TestRequest,
+    ) -> Result<chelabase_nats::storage_objects::TestReply, ResetError> {
+        member_roles_rpc(&self.client, chelabase_nats::storage_objects::SUBJECT_TEST, &request).await
+    }
+
     async fn enable_data_api(&self, branch_id: BranchId, name: &str) -> Result<(), BoxError> {
         let body = serde_json::to_vec(&DataApiDatabaseRequest {
             branch_id,
@@ -1843,6 +1949,10 @@ pub struct AppState<M, J> {
     /// deletes a personal login tells it, now and again 1 s later. The same `Arc` as the
     /// internal state's `cache`.
     pub proxy_cache: Arc<dyn internal::CachePort>,
+    /// m18: where storage webhook URLs may point (`CHELABASE_WEBHOOKS_ALLOW_HTTP`,
+    /// `CHELABASE_WEBHOOKS_ALLOW_HOSTS`): checked at registration; the worker checks again at
+    /// every connection.
+    pub webhooks: chelabase_http::outbound::Outbound,
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -2518,6 +2628,7 @@ where
         .merge(data_api_types::routes())
         .merge(console::routes())
         .merge(storage_console::routes())
+        .merge(storage_webhooks::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())
         .merge(privileges::routes())

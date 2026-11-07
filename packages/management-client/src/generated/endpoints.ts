@@ -51,6 +51,7 @@ import type {
   CreateProjectRequest,
   CreateRoleRequest,
   CreateSavedQueryRequest,
+  CreateStorageWebhookRequest,
   CreateTeamRequest,
   CreatedDataKey,
   DataApiSchema,
@@ -140,6 +141,10 @@ import type {
   StorageUpdateBucketParams,
   StorageUploadObjectParams,
   StorageUploadPartParams,
+  StorageWebhook,
+  StorageWebhookAttempt,
+  StorageWebhookTestResult,
+  StorageWebhookWithSecret,
   Team,
   TeamGrantRequest,
   TenantName,
@@ -155,6 +160,7 @@ import type {
   UpdateProjectRequest,
   UpdateRoleRequest,
   UpdateSavedQueryRequest,
+  UpdateStorageWebhookRequest,
   UpdateTeamRequest,
   UpdateTenantRequest
 } from './model';
@@ -9053,6 +9059,741 @@ export const useUpdateSavedQuery = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getUpdateSavedQueryMutationOptions(options), queryClient);
+    }
+
+export const getListStorageWebhooksUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks`
+}
+
+/**
+ * The database's webhook endpoints for storage object events (never their secrets).
+ * @summary List storage webhooks
+ */
+export const listStorageWebhooks = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook[]> => {
+
+  return customFetch<StorageWebhook[]>(getListStorageWebhooksUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListStorageWebhooksQueryKey = (id: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks`
+    ] as const;
+    }
+
+
+export const getListStorageWebhooksQueryOptions = <TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListStorageWebhooksQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listStorageWebhooks>>> = ({ signal }) => listStorageWebhooks(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListStorageWebhooksQueryResult = NonNullable<Awaited<ReturnType<typeof listStorageWebhooks>>>
+export type ListStorageWebhooksQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhooks>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhooks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhooks>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhooks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List storage webhooks
+ */
+
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListStorageWebhooksQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateStorageWebhookUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks`
+}
+
+/**
+ * Registers an endpoint for the database's storage object events (every branch's, made through the storage API; changes made with SQL directly on `storage.objects` send none). Each event is POSTed as JSON, signed with `Chelabase-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, at least once, retried with backoff for up to 24 hours. The secret is in this response only. A database has at most 20 endpoints.
+ * @summary Create a storage webhook
+ */
+export const createStorageWebhook = async (id: string,
+    createStorageWebhookRequest: CreateStorageWebhookRequest, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookWithSecret> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<StorageWebhookWithSecret>(getCreateStorageWebhookUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createStorageWebhookRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateStorageWebhookMutationKey = () => ['createStorageWebhook'] as const;
+
+export const getCreateStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getCreateStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createStorageWebhook>>, CreateStorageWebhookMutationVariables> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  createStorageWebhook(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof createStorageWebhook>>>
+    export type CreateStorageWebhookMutationBody = CreateStorageWebhookRequest
+    export type CreateStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type CreateStorageWebhookMutationVariables = {id: string;data: CreateStorageWebhookRequest}
+
+    /**
+ * @summary Create a storage webhook
+ */
+export const useCreateStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createStorageWebhook>>,
+        TError,
+        CreateStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getGetStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * One endpoint, with its failure state (never its secret).
+ * @summary Get a storage webhook
+ */
+export const getStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook> => {
+
+  return customFetch<StorageWebhook>(getGetStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetStorageWebhookQueryKey = (id: string,
+    webhookId: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks/${webhookId}`
+    ] as const;
+    }
+
+
+export const getGetStorageWebhookQueryOptions = <TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetStorageWebhookQueryKey(id,webhookId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getStorageWebhook>>> = ({ signal }) => getStorageWebhook(id,webhookId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && webhookId !== null && webhookId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetStorageWebhookQueryResult = NonNullable<Awaited<ReturnType<typeof getStorageWebhook>>>
+export type GetStorageWebhookQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStorageWebhook>>,
+          TError,
+          Awaited<ReturnType<typeof getStorageWebhook>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStorageWebhook>>,
+          TError,
+          Awaited<ReturnType<typeof getStorageWebhook>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Get a storage webhook
+ */
+
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetStorageWebhookQueryOptions(id,webhookId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getDeleteStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * Deletes the endpoint and its attempts; deliveries in flight stop within seconds.
+ * @summary Delete a storage webhook
+ */
+export const deleteStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteStorageWebhookMutationKey = () => ['deleteStorageWebhook'] as const;
+
+export const getDeleteStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getDeleteStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteStorageWebhook>>, DeleteStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  deleteStorageWebhook(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof deleteStorageWebhook>>>
+
+    export type DeleteStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteStorageWebhookMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Delete a storage webhook
+ */
+export const useDeleteStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteStorageWebhook>>,
+        TError,
+        DeleteStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getUpdateStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * Changes the given fields. `bucket` and `prefix` accept `null` to clear them. Enabling a disabled endpoint restarts delivery from now and clears its failure state.
+ * @summary Update a storage webhook
+ */
+export const updateStorageWebhook = async (id: string,
+    webhookId: string,
+    updateStorageWebhookRequest: UpdateStorageWebhookRequest, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<StorageWebhook>(getUpdateStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateStorageWebhookRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateStorageWebhookMutationKey = () => ['updateStorageWebhook'] as const;
+
+export const getUpdateStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getUpdateStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateStorageWebhook>>, UpdateStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId,data} = props ?? {};
+
+          return  updateStorageWebhook(id,webhookId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof updateStorageWebhook>>>
+    export type UpdateStorageWebhookMutationBody = UpdateStorageWebhookRequest
+    export type UpdateStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateStorageWebhookMutationVariables = {id: string;webhookId: string;data: UpdateStorageWebhookRequest}
+
+    /**
+ * @summary Update a storage webhook
+ */
+export const useUpdateStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateStorageWebhook>>,
+        TError,
+        UpdateStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getListStorageWebhookAttemptsUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/attempts`
+}
+
+/**
+ * The endpoint's newest delivery attempts (at most 100), newest first: status and duration only.
+ * @summary List a storage webhook's recent attempts
+ */
+export const listStorageWebhookAttempts = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookAttempt[]> => {
+
+  return customFetch<StorageWebhookAttempt[]>(getListStorageWebhookAttemptsUrl(id,webhookId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListStorageWebhookAttemptsQueryKey = (id: string,
+    webhookId: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks/${webhookId}/attempts`
+    ] as const;
+    }
+
+
+export const getListStorageWebhookAttemptsQueryOptions = <TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListStorageWebhookAttemptsQueryKey(id,webhookId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listStorageWebhookAttempts>>> = ({ signal }) => listStorageWebhookAttempts(id,webhookId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && webhookId !== null && webhookId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListStorageWebhookAttemptsQueryResult = NonNullable<Awaited<ReturnType<typeof listStorageWebhookAttempts>>>
+export type ListStorageWebhookAttemptsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a storage webhook's recent attempts
+ */
+
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListStorageWebhookAttemptsQueryOptions(id,webhookId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getRotateStorageWebhookSecretUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/rotate-secret`
+}
+
+/**
+ * Replaces the signing secret; deliveries are signed with the new one within seconds. The new secret is in this response only.
+ * @summary Rotate a storage webhook's secret
+ */
+export const rotateStorageWebhookSecret = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookWithSecret> => {
+
+  return customFetch<StorageWebhookWithSecret>(getRotateStorageWebhookSecretUrl(id,webhookId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getRotateStorageWebhookSecretMutationKey = () => ['rotateStorageWebhookSecret'] as const;
+
+export const getRotateStorageWebhookSecretMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext> => {
+
+const mutationKey = getRotateStorageWebhookSecretMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, RotateStorageWebhookSecretMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  rotateStorageWebhookSecret(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RotateStorageWebhookSecretMutationResult = NonNullable<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>>
+
+    export type RotateStorageWebhookSecretMutationError = ErrorType<ErrorEnvelope>
+    export type RotateStorageWebhookSecretMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Rotate a storage webhook's secret
+ */
+export const useRotateStorageWebhookSecret = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof rotateStorageWebhookSecret>>,
+        TError,
+        RotateStorageWebhookSecretMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRotateStorageWebhookSecretMutationOptions(options), queryClient);
+    }
+
+export const getTestStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/test`
+}
+
+/**
+ * Sends one signed `webhook.test` event now (enabled or not), without retries and without counting toward the endpoint's failures, and answers how it went.
+ * @summary Send a test event to a storage webhook
+ */
+export const testStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookTestResult> => {
+
+  return customFetch<StorageWebhookTestResult>(getTestStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getTestStorageWebhookMutationKey = () => ['testStorageWebhook'] as const;
+
+export const getTestStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getTestStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof testStorageWebhook>>, TestStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  testStorageWebhook(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type TestStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof testStorageWebhook>>>
+
+    export type TestStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type TestStorageWebhookMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Send a test event to a storage webhook
+ */
+export const useTestStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof testStorageWebhook>>,
+        TError,
+        TestStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getTestStorageWebhookMutationOptions(options), queryClient);
     }
 
 export const getGetInstanceSettingsUrl = () => {

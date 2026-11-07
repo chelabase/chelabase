@@ -1165,6 +1165,39 @@ pub mod orchestrator {
     pub const STORAGE_ABORT_UPLOAD: Endpoint =
         key_endpoint("orchestrator.storage_abort_upload", Method::Delete, ST_SESSION, Access::ActAs(Developer));
 
+    /// m18: a database's webhook endpoints for storage object events (every branch's), and
+    /// their test events, secret rotation and recent attempts: Developer on the database.
+    const WEBHOOKS: &str = "/v1/databases/{id}/storage/webhooks";
+    const WEBHOOK: &str = "/v1/databases/{id}/storage/webhooks/{webhook_id}";
+    pub const LIST_STORAGE_WEBHOOKS: Endpoint =
+        key_endpoint("orchestrator.list_storage_webhooks", Method::Get, WEBHOOKS, Access::Project(Developer));
+    pub const CREATE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.create_storage_webhook", Method::Post, WEBHOOKS, Access::Project(Developer));
+    pub const GET_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.get_storage_webhook", Method::Get, WEBHOOK, Access::Project(Developer));
+    pub const UPDATE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.update_storage_webhook", Method::Patch, WEBHOOK, Access::Project(Developer));
+    pub const DELETE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.delete_storage_webhook", Method::Delete, WEBHOOK, Access::Project(Developer));
+    pub const ROTATE_STORAGE_WEBHOOK_SECRET: Endpoint = key_endpoint(
+        "orchestrator.rotate_storage_webhook_secret",
+        Method::Post,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/rotate-secret",
+        Access::Project(Developer),
+    );
+    pub const TEST_STORAGE_WEBHOOK: Endpoint = key_endpoint(
+        "orchestrator.test_storage_webhook",
+        Method::Post,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/test",
+        Access::Project(Developer),
+    );
+    pub const LIST_STORAGE_WEBHOOK_ATTEMPTS: Endpoint = key_endpoint(
+        "orchestrator.list_storage_webhook_attempts",
+        Method::Get,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/attempts",
+        Access::Project(Developer),
+    );
+
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
@@ -1512,6 +1545,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::GET_SAVED_QUERY,
     orchestrator::UPDATE_SAVED_QUERY,
     orchestrator::DELETE_SAVED_QUERY,
+    orchestrator::LIST_STORAGE_WEBHOOKS,
+    orchestrator::CREATE_STORAGE_WEBHOOK,
+    orchestrator::GET_STORAGE_WEBHOOK,
+    orchestrator::UPDATE_STORAGE_WEBHOOK,
+    orchestrator::DELETE_STORAGE_WEBHOOK,
+    orchestrator::ROTATE_STORAGE_WEBHOOK_SECRET,
+    orchestrator::TEST_STORAGE_WEBHOOK,
+    orchestrator::LIST_STORAGE_WEBHOOK_ATTEMPTS,
     orchestrator::RUN_SQL,
     orchestrator::CANCEL_SQL_RUN,
     orchestrator::GET_SQL_SCHEMA,
@@ -2406,6 +2447,15 @@ mod tests {
             ("orchestrator.me", Access::SignedIn),
             // Console.
             ("orchestrator.console_query", Access::ActAs(Viewer)),
+            // m18: storage webhooks, Developer on the database.
+            ("orchestrator.list_storage_webhooks", Access::Project(Developer)),
+            ("orchestrator.create_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.get_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.update_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.delete_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.rotate_storage_webhook_secret", Access::Project(Developer)),
+            ("orchestrator.test_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.list_storage_webhook_attempts", Access::Project(Developer)),
             // m9: Studio's storage, as an Act-as role.
             ("orchestrator.storage_list_buckets", Access::ActAs(Viewer)),
             ("orchestrator.storage_create_bucket", Access::ActAs(Developer)),
