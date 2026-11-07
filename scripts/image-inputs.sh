@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the twelve release images
+#   scripts/image-inputs.sh images                  the thirteen release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD
@@ -19,7 +19,8 @@
 #                 `cargo metadata`), the manifest of every crate any Rust image builds (one cargo
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
 #                 .cargo/ (storage's package is chelabase-storage-service, functions'
-#                 chelabase-functions; the others are named after their image)
+#                 chelabase-functions, service-runner's chelabase-service-runner; the others are
+#                 named after their image)
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
 #                 the build reads outside the graph: studio.Caddyfile, openapi/,
@@ -33,8 +34,8 @@
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime storage functions init studio identity functions-runtime)
-rust=(gateway orchestrator worker rest auth realtime storage functions init)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
+rust=(gateway orchestrator worker rest auth realtime storage functions service-runner init)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
@@ -46,6 +47,7 @@ package() { # package <image>: the cargo package it builds (server.Dockerfile's 
   case "$1" in
     storage) echo chelabase-storage-service ;;
     functions) echo chelabase-functions ;;
+    service-runner) echo chelabase-service-runner ;;
     *) echo "$1" ;;
   esac
 }

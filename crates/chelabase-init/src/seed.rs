@@ -34,6 +34,8 @@ pub enum Rule {
     Secret,
     /// The object store's access key, an identifier: at least [`MIN_ACCESS_KEY_LEN`].
     AccessKey,
+    /// An internal bearer whose service refuses one under [`MIN_BEARER_LEN`] characters at start.
+    Bearer,
 }
 
 /// One seedable file of [`crate::secrets::LAYOUT`].
@@ -165,12 +167,22 @@ pub const SEED_KEYS: &[SeedKey] = &[
     s(
         "CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN",
         "tokens/orchestrator-functions.token",
-        Rule::Secret,
+        Rule::Bearer,
     ),
     s(
         "CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN",
         "tokens/worker-functions.token",
-        Rule::Secret,
+        Rule::Bearer,
+    ),
+    s(
+        "CHELABASE_SEED_FUNCTIONS_SERVICE_RUNNER_TOKEN",
+        "tokens/functions-service-runner.token",
+        Rule::Bearer,
+    ),
+    s(
+        "CHELABASE_SEED_WORKER_SERVICE_RUNNER_TOKEN",
+        "tokens/worker-service-runner.token",
+        Rule::Bearer,
     ),
     s(
         "CHELABASE_SEED_PROXY_API_TOKEN",
@@ -188,6 +200,8 @@ pub const SEED_KEYS: &[SeedKey] = &[
 pub const MAX_LEN: usize = 1024;
 /// A password's or token's shortest length.
 pub const MIN_SECRET_LEN: usize = 16;
+/// The shortest internal bearer the functions service and the service runner accept.
+pub const MIN_BEARER_LEN: usize = 32;
 /// The access key's shortest length (MinIO's minimum).
 pub const MIN_ACCESS_KEY_LEN: usize = 3;
 /// The characters a value may hold: printable ASCII but space, quotes, backslash, backtick and
@@ -243,7 +257,11 @@ pub struct Loaded {
 }
 
 /// Layout paths whose seeds may not hold the same value.
-const DISTINCT_SEEDS: [(&str, &str); 1] = [("tokens/orchestrator-functions.token", "tokens/worker-functions.token")];
+const DISTINCT_SEEDS: [(&str, &str); 2] = [
+    ("tokens/orchestrator-functions.token", "tokens/worker-functions.token"),
+    // Edge functions m10: the service runner's callers.
+    ("tokens/functions-service-runner.token", "tokens/worker-service-runner.token"),
+];
 
 impl Seeds {
     pub fn is_empty(&self) -> bool {
@@ -389,6 +407,9 @@ fn check_value(rule: Rule, v: &str) -> std::result::Result<(), String> {
     match rule {
         Rule::Secret if n < MIN_SECRET_LEN => Err(format!(
             "is shorter than {MIN_SECRET_LEN} characters (a password or token)"
+        )),
+        Rule::Bearer if n < MIN_BEARER_LEN => Err(format!(
+            "is shorter than {MIN_BEARER_LEN} characters (an internal bearer; its service refuses a shorter one)"
         )),
         Rule::AccessKey if n < MIN_ACCESS_KEY_LEN => {
             Err(format!("is shorter than {MIN_ACCESS_KEY_LEN} characters"))
@@ -639,6 +660,43 @@ mod tests {
         assert_eq!(Seeds::parse(different).unwrap().len(), 2);
         let one = "CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN=worker-0123456789abcdef0123456789\n";
         assert_eq!(Seeds::parse(one).unwrap().len(), 1);
+    }
+
+    /// Edge functions m10: the service runner's two bearers (the functions service's, the
+    /// worker's) may not share a value either.
+    #[test]
+    fn refuses_one_value_for_both_service_runner_bearers() {
+        let same = "CHELABASE_SEED_FUNCTIONS_SERVICE_RUNNER_TOKEN=one-value-for-both-0123456789abcdef\n\
+            CHELABASE_SEED_WORKER_SERVICE_RUNNER_TOKEN=one-value-for-both-0123456789abcdef\n";
+        let err = format!("{:#}", Seeds::parse(same).unwrap_err());
+        assert!(err.contains("CHELABASE_SEED_FUNCTIONS_SERVICE_RUNNER_TOKEN"), "{err}");
+        assert!(err.contains("CHELABASE_SEED_WORKER_SERVICE_RUNNER_TOKEN"), "{err}");
+        assert!(!err.contains("one-value-for-both"), "the value is never echoed: {err}");
+        let different = "CHELABASE_SEED_FUNCTIONS_SERVICE_RUNNER_TOKEN=functions-0123456789abcdef0123456789\n\
+            CHELABASE_SEED_WORKER_SERVICE_RUNNER_TOKEN=worker-0123456789abcdef0123456789abc\n";
+        let seeds = Seeds::parse(different).unwrap();
+        assert_eq!(seeds.len(), 2);
+        assert!(seeds.get("tokens/functions-service-runner.token").is_some());
+        assert!(seeds.get("tokens/worker-service-runner.token").is_some());
+    }
+
+    /// The internal bearers' services refuse a bearer under 32 characters at start, so init
+    /// refuses such a seed instead of writing a file the service won't take.
+    #[test]
+    fn service_bearer_seeds_are_at_least_what_the_services_require() {
+        for key in [
+            "CHELABASE_SEED_FUNCTIONS_SERVICE_RUNNER_TOKEN",
+            "CHELABASE_SEED_WORKER_SERVICE_RUNNER_TOKEN",
+            "CHELABASE_SEED_ORCHESTRATOR_FUNCTIONS_TOKEN",
+            "CHELABASE_SEED_WORKER_FUNCTIONS_TOKEN",
+        ] {
+            let short = format!("{key}={}\n", "a".repeat(31));
+            let err = format!("{:#}", Seeds::parse(&short).unwrap_err());
+            assert!(err.contains(key) && err.contains("32"), "{key}: {err}");
+            assert_eq!(Seeds::parse(&format!("{key}={}\n", "a".repeat(32))).unwrap().len(), 1);
+        }
+        // Other tokens keep their own floor.
+        assert!(Seeds::parse(&format!("CHELABASE_SEED_DATA_KEYS_TOKEN={}\n", "a".repeat(16))).is_ok());
     }
 
     #[test]
