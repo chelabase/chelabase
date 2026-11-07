@@ -193,6 +193,26 @@ impl ObjectEvents {
         Arc::new(Self { sink: None, nats: None, retries: Vec::new(), missed: AtomicU64::new(0) })
     }
 
+    /// Events that couldn't be published since the process started.
+    pub fn missed_total(&self) -> u64 {
+        self.missed.load(Ordering::Relaxed)
+    }
+
+    /// Logs the missed total in the background every
+    /// [`LOSS_TOTALS_EVERY`](chelabase_nats::storage_objects::LOSS_TOTALS_EVERY) while it
+    /// grows ([`log_missed_totals`]).
+    pub fn spawn_totals(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            chelabase_nats::storage_objects::report_loss_totals(
+                chelabase_nats::storage_objects::LOSS_TOTALS_EVERY,
+                move || this.missed_total(),
+                log_missed_totals,
+            )
+            .await
+        });
+    }
+
     fn connected(&self, js: chelabase_nats::JetStreamContext) {
         if let Some(nats) = &self.nats
             && let Ok(mut slot) = nats.js.write()
@@ -238,6 +258,18 @@ impl ObjectEvents {
             }
         }
     }
+}
+
+/// The totals line (#154; its target, message and field names are documented on the
+/// self-hosting storage settings page, so log alerts can match them): `missed_total` events
+/// not published since storage started, `missed_since_last` of them since the previous line.
+pub fn log_missed_totals(total: u64, since_last: u64) {
+    tracing::warn!(
+        target: "storage::events",
+        missed_total = total,
+        missed_since_last = since_last,
+        "object events not published"
+    );
 }
 
 /// How long to wait before connecting again after NATS refused or couldn't be reached.
@@ -443,6 +475,48 @@ mod tests {
         let unconnected = ObjectEvents { retries: vec![Duration::ZERO], ..Arc::into_inner(unconnected).unwrap() };
         assert!(!unconnected.send(&first).await);
         assert_eq!(unconnected.missed.load(Ordering::SeqCst), 1);
+    }
+
+    /// What `f` logs, as the default text format writes it (no colours).
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(crate::DEFAULT_LOG_FILTER)
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// #154: each event that couldn't be published adds one to the missed total, and the
+    /// totals line carries it (and its growth) under a stable target, message and field
+    /// names that the default log filter keeps.
+    #[tokio::test]
+    async fn a_missed_event_is_counted_in_the_totals_line() {
+        let down = Flaky::new(usize::MAX);
+        let events = ObjectEvents::with_sink(down, vec![]);
+        let e = event_of(&data(json!({})), &located(), change(ObjectEventType::Created));
+        assert!(!events.send(&e).await);
+        assert!(!events.send(&e).await);
+        assert_eq!(events.missed_total(), 2);
+        let line = logged(|| log_missed_totals(events.missed_total(), 1));
+        assert!(line.contains(" WARN storage::events: object events not published"), "{line}");
+        assert!(line.contains("missed_total=2 missed_since_last=1"), "{line}");
     }
 
     /// Each subject and event maps to what it drops; anything else drops nothing.

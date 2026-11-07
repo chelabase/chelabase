@@ -373,11 +373,29 @@ impl<S: AttemptStore> Delivery<S> {
         }
     }
 
+    /// Events dropped since the process started.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     fn drop_event(&self, target: &StorageWebhook, event: &ObjectEvent) -> Next {
         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         warn!(webhook = %target.id, event = %event.id, dropped_total = total, "storage webhook event dropped after 24 h of retries");
         Next::Dropped
     }
+}
+
+/// The totals line (#154; its target, message and field names are documented on the
+/// self-hosting storage settings page, so log alerts can match them): `dropped_total` events
+/// given up on since the worker started (each endpoint's count; an event dropped for two
+/// endpoints counts twice), `dropped_since_last` of them since the previous line.
+pub fn log_dropped_totals(total: u64, since_last: u64) {
+    warn!(
+        target: "worker::storage_webhooks",
+        dropped_total = total,
+        dropped_since_last = since_last,
+        "storage webhook events dropped"
+    );
 }
 
 /// A test event for `webhook`: type `webhook.test`, now, as the database's own; no object and
@@ -469,6 +487,17 @@ pub async fn run(
             return;
         }
     };
+    tokio::spawn({
+        let delivery = delivery.clone();
+        async move {
+            storage_objects::report_loss_totals(
+                storage_objects::LOSS_TOTALS_EVERY,
+                move || delivery.dropped_total(),
+                log_dropped_totals,
+            )
+            .await
+        }
+    });
     let mut running: HashMap<String, Running> = HashMap::new();
     loop {
         match metadata.storage_webhook_targets().await {
@@ -1105,6 +1134,60 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
         assert!(store.attempts.lock().unwrap().is_empty());
         assert_eq!(d.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    /// What `f` logs, as the default text format writes it (no colours).
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(crate::DEFAULT_LOG_FILTER)
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// #154: each event dropped after the retry window adds one to the dropped total, and the
+    /// totals line carries it (and its growth) under a stable target, message and field
+    /// names that the default log filter keeps.
+    #[tokio::test]
+    async fn a_dropped_event_is_counted_in_the_totals_line() {
+        let d = local(Arc::new(FakeStore::default()));
+        let w = webhook(&["object.created"], None, None);
+        let now = Utc::now();
+        let stale = event(ObjectEventType::Created, "a", "b", now - MAX_AGE);
+        let payload = serde_json::to_vec(&stale).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                d.process(&w, SECRET, &payload, 9, now, 0.0).await,
+                Next::Dropped
+            );
+        }
+        assert_eq!(d.dropped_total(), 3);
+        let line = logged(|| log_dropped_totals(d.dropped_total(), 2));
+        assert!(
+            line.contains(" WARN worker::storage_webhooks: storage webhook events dropped"),
+            "{line}"
+        );
+        assert!(
+            line.contains("dropped_total=3 dropped_since_last=2"),
+            "{line}"
+        );
     }
 
     /// AC 7: an endpoint failing since three days ago is disabled at its next failure.

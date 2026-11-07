@@ -46,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
         // m18: object events, published on the NATS connection `events::spawn` makes.
         events: storage::events::ObjectEvents::nats(),
     });
+    // #154: a totals line while events go unpublished.
+    state.events.spawn_totals();
     // m9: NATS cache invalidation as storage's own user (`CHELABASE_NATS_*`), in the
     // background: storage serves on its cache lifetimes while NATS is away.
     storage::events::spawn(
