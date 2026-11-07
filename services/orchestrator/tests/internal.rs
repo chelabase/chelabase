@@ -2359,11 +2359,11 @@ async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
     assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
 }
 
-/// Object storage m9: a URL minted from the console names the member as its key. It is live,
-/// for the branch the URL was signed on, while the member is active in the database's tenant
-/// with Developer access (own grant or tenant admin) and the branch is a normal one not being
-/// deleted; a Viewer, a suspended, removed or offboarded member, another tenant's, a deleted
-/// branch or no branch at all is 404.
+/// Object storage m9: a URL minted from the console names the member as its key and the role
+/// it was minted as (#100). It is live, for the branch the URL was signed on, while the member
+/// is active in the database's tenant holding that role at Developer (own grant or tenant
+/// admin) and the branch is a normal one not being deleted; a Viewer, a suspended, removed or
+/// offboarded member, another tenant's, a deleted branch or no branch at all is 404.
 #[tokio::test]
 async fn a_console_url_lives_while_its_member_has_developer_access() {
     use chelabase_metadata::members::{MemberRecord, MemberStatus};
@@ -2395,7 +2395,10 @@ async fn a_console_url_lives_while_its_member_has_developer_access() {
         suspended_at: None,
         suspended_by: None,
     };
-    let grant = |role: PlatformRole| GrantSources::new(Some(Grant { platform_role: role, roles: RoleSet::all() }), Vec::new(), None);
+    let grant = |role: PlatformRole| {
+        let roles = RoleSet::Only([chelabase_types::access::PgRole::Named("writer".into())].into());
+        GrantSources::new(Some(Grant { platform_role: role, roles }), Vec::new(), None)
+    };
     let none = GrantSources::new(None, Vec::new(), None);
     let cases = [
         (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Developer), true),
@@ -2411,7 +2414,7 @@ async fn a_console_url_lives_while_its_member_has_developer_access() {
     for (i, (m, sources, live)) in cases.into_iter().enumerate() {
         let id = m.id;
         neon.members.lock().unwrap().push((m, sources));
-        let path = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        let path = format!("/internal/storage/keys/{id}?branch={}&role=writer", branch.as_uuid());
         let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
         if live {
             assert_eq!(code, 200, "case {i}: {body}");
@@ -2419,9 +2422,9 @@ async fn a_console_url_lives_while_its_member_has_developer_access() {
             assert_eq!(body["branch_id"], json!(branch.as_uuid()));
             assert_eq!(body["databases"], Value::Null);
             // Not on a branch being deleted, nor without a branch.
-            let on_gone = format!("/internal/storage/keys/{id}?branch={}", gone.as_uuid());
+            let on_gone = format!("/internal/storage/keys/{id}?branch={}&role=writer", gone.as_uuid());
             assert_eq!(app.get(&on_gone, Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
-            assert_eq!(app.get(&format!("/internal/storage/keys/{id}"), Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
+            assert_eq!(app.get(&format!("/internal/storage/keys/{id}?role=writer"), Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
             for bearer in [None, Some(REST_TOKEN)] {
                 assert_eq!(app.get(&path, bearer).await.0, 401, "case {i}");
             }
@@ -2462,7 +2465,10 @@ async fn an_owner_mode_url_lives_while_its_member_is_admin() {
         suspended_at: None,
         suspended_by: None,
     };
-    let grant = |role: PlatformRole| GrantSources::new(Some(Grant { platform_role: role, roles: RoleSet::all() }), Vec::new(), None);
+    let grant = |role: PlatformRole| {
+        let roles = RoleSet::Only([chelabase_types::access::PgRole::Named("writer".into())].into());
+        GrantSources::new(Some(Grant { platform_role: role, roles }), Vec::new(), None)
+    };
     for (m, sources, owner_live) in [
         (member(false), grant(PlatformRole::Developer), false),
         (member(false), grant(PlatformRole::Admin), true),
@@ -2471,9 +2477,145 @@ async fn an_owner_mode_url_lives_while_its_member_is_admin() {
         let id = m.id;
         neon.members.lock().unwrap().push((m, sources));
         let base = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
-        assert_eq!(app.get(&base, Some(STORAGE_TOKEN)).await.0, 200, "a role URL of a Developer or above");
+        assert_eq!(app.get(&format!("{base}&role=writer"), Some(STORAGE_TOKEN)).await.0, 200, "a role URL of a Developer or above");
         let (code, body) = app.get(&format!("{base}&owner=true"), Some(STORAGE_TOKEN)).await;
         assert_eq!(code, if owner_live { 200 } else { 404 }, "{body}");
+    }
+}
+
+/// #100 (the resolve route's audit, B1): a console URL minted as a role lives on that role's
+/// own level, not the member's best level on the database. A member who is a Developer
+/// through their own grant (`writer`) and holds `reader` only at Viewer through a team grant:
+/// a URL minted as `reader` is 404, as `writer` 200. Once `writer` drops to Viewer too (the
+/// own grant lowered), its URLs are 404 as well.
+#[tokio::test]
+async fn a_console_url_needs_its_role_at_developer() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: false,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let id = member.id;
+    let only = |role: PlatformRole, names: &[&str]| Grant {
+        platform_role: role,
+        roles: RoleSet::Only(names.iter().map(|n| PgRole::Named((*n).into())).collect()),
+    };
+    let team = only(PlatformRole::Viewer, &["reader"]);
+    neon.members.lock().unwrap().push((
+        member.clone(),
+        GrantSources::new(Some(only(PlatformRole::Developer, &["writer"])), vec![team.clone()], None),
+    ));
+    let url = |role: &str| format!("/internal/storage/keys/{id}?branch={}&role={role}", branch.as_uuid());
+    let (code, body) = app.get(&url("reader"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 404, "a URL minted as a role held only at Viewer is live: {body}");
+    let (code, body) = app.get(&url("writer"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    // `writer` lowered to Viewer while the member stays a Developer elsewhere: its URL ends.
+    {
+        let mut members = neon.members.lock().unwrap();
+        members.retain(|(m, _)| m.id != id);
+        members.push((
+            member,
+            GrantSources::new(
+                Some(only(PlatformRole::Developer, &["other"])),
+                vec![team, only(PlatformRole::Viewer, &["writer"])],
+                None,
+            ),
+        ));
+    }
+    let (code, body) = app.get(&url("writer"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 404, "a URL whose role was lowered to Viewer is live: {body}");
+    assert_eq!(app.get(&url("other"), Some(STORAGE_TOKEN)).await.0, 200);
+}
+
+/// #100: a console URL lives only on a role its member holds, named exactly once. No role (a
+/// URL from before #100), an empty one, a role not held, owner mode and a role both, a
+/// reserved role, and a data API role an Admin's grant doesn't name are all 404, for an Admin
+/// of the database and for a tenant admin.
+#[tokio::test]
+async fn a_console_url_without_a_held_role_is_not_live() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = |admin: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let developer = GrantSources::new(
+        Some(Grant {
+            platform_role: PlatformRole::Developer,
+            roles: RoleSet::Only([PgRole::Named("writer".into())].into()),
+        }),
+        Vec::new(),
+        None,
+    );
+    let admin = GrantSources::new(Some(Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() }), Vec::new(), None);
+    for (m, sources) in [
+        (member(false), developer),
+        (member(false), admin),
+        (member(true), GrantSources::new(None, Vec::new(), None)),
+    ] {
+        let id = m.id;
+        let admin_level = m.tenant_admin || sources.effective().is_some_and(|e| e.platform_role == PlatformRole::Admin);
+        neon.members.lock().unwrap().push((m, sources));
+        let base = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        assert_eq!(app.get(&format!("{base}&role=writer"), Some(STORAGE_TOKEN)).await.0, 200, "the held role");
+        let mut refused = vec![
+            base.clone(),
+            format!("{base}&role="),
+            format!("{base}&role=writer&owner=true"),
+            format!("{base}&role=chelabase_storage"),
+            format!("{base}&role=authenticated"),
+        ];
+        if !admin_level {
+            refused.push(format!("{base}&role=other"));
+        }
+        for path in refused {
+            let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+            assert_eq!(code, 404, "{path}: {body}");
+        }
     }
 }
 

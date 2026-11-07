@@ -222,7 +222,7 @@ mod tests {
         fn url_key(&self) -> crate::control::BoxFuture<'_, Result<crate::token::UrlKey, crate::control::Unreachable>> {
             Box::pin(async { Ok(URL_KEY) })
         }
-        fn live_key(&self, key_id: Uuid, _branch: Uuid, _owner: bool) -> crate::control::BoxFuture<'_, Result<Option<crate::control::LiveKey>, crate::control::Unreachable>> {
+        fn live_key(&self, key_id: Uuid, _branch: Uuid, _: &crate::control::Minter) -> crate::control::BoxFuture<'_, Result<Option<crate::control::LiveKey>, crate::control::Unreachable>> {
             let hit = self.live.lock().unwrap().iter().find(|k| k.key_id == key_id).cloned();
             Box::pin(async move { Ok(hit) })
         }

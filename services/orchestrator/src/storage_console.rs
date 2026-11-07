@@ -518,7 +518,7 @@ macro_rules! storage_route {
                 (status = $ok, description = $ok_description, $(content_type = $ct,)? body = Value),
                 (status = 400, description = "`invalid_request`: a path id isn't a valid UUID; storage's `invalid_request`, `invalid_value` or `reserved_bucket_name`", body = ErrorEnvelope),
                 (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-                (status = 403, description = "`forbidden`: the route needs the role held at Developer (`required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`", body = ErrorEnvelope),
+                (status = 403, description = "`forbidden`: the role isn't held at the level the route needs (Viewer or Developer, as its description says; `required`), or acting as it (or owner mode, `required: owner`) needs Admin; `role_refused`: the worker's check refused the role (it doesn't exist or is owner-level); storage's `permission_denied` (row level security refused it), `role_not_allowed` or `database_not_allowed`", body = ErrorEnvelope),
                 (status = 404, description = "`not_found`: the database (or another tenant's, or one you have no access to), the branch or the Postgres database doesn't exist; storage's `bucket_not_found`, `object_not_found` or `upload_not_found`", body = ErrorEnvelope),
                 (status = 409, description = "`data_api_disabled`: the Postgres database isn't served by the data API; `backup_branch`; `branch_not_ready`; storage's `conflict` or `write_once`", body = ErrorEnvelope),
                 (status = 413, description = "storage's `too_large`: over the bucket's file size limit", body = ErrorEnvelope),
@@ -703,7 +703,7 @@ storage_route!(
     "storageSignObject",
     ep::STORAGE_SIGN_OBJECT,
     summary = "Create a signed download URL as a role",
-    description = "Storage's signed download URL, minted as the role (it must be able to read the object). `expires_in` is 1 to 3600 seconds (default 3600). The URL works while it is the object's current version and while you keep Developer access to the database; it stops when you are removed or your access drops. Needs the role held at Developer.",
+    description = "Storage's signed download URL, minted as the role (it must be able to read the object). `expires_in` is 1 to 3600 seconds (default 3600). The URL works while it is the object's current version and while you still hold the role at Developer on the database; it stops when you are removed or the role's level drops below Developer. Needs the role held at Developer.",
     params(
         ("bucket" = String, Path, description = "Bucket name"),
         (
@@ -725,7 +725,7 @@ storage_route!(
     "storageResolveObjects",
     ep::STORAGE_RESOLVE_OBJECTS,
     summary = "Resolve object refs to URLs as a role",
-    description = "Storage's `POST /storage/v1/object/resolve` as the role: `{\"refs\": [...], \"expires_in\"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you keep Developer access to the database (Admin for one resolved in owner mode). Needs the role held at Viewer.",
+    description = "Storage's `POST /storage/v1/object/resolve` as the role: `{\"refs\": [...], \"expires_in\"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you hold the role at Developer on the database (Admin for one resolved in owner mode): one resolved as a role you hold only at Viewer is refused when opened. Needs the role held at Viewer.",
     params(),
     body(content = Value, content_type = "application/json"),
     ok = (

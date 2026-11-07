@@ -723,3 +723,39 @@ async fn dot_segments_are_refused_or_reach_storage_unchanged() {
     }
     assert!(wrong.is_empty(), "storage got another route: {wrong:#?}");
 }
+
+/// #100 (the resolve route's audit, B1): a member who is a Developer through their own grant
+/// (`writer`) and holds `reader` only at Viewer through a team grant. Console `sign` as
+/// `reader` is 403 before storage; resolve as `reader` (a Viewer route) reaches storage naming
+/// `reader` and the member, which storage binds into every URL it mints, so the URL's liveness
+/// is judged on `reader`'s level (`internal::a_console_url_needs_its_role_at_developer`).
+#[tokio::test]
+async fn resolve_as_a_viewer_level_role_of_a_developer_names_that_role() {
+    use chelabase_types::access::{Grant, PgRole, RoleSet};
+    let (w, storage) = world().await;
+    let mix = w.metadata.add_granted(w.tenant, "mix", w.project, PlatformRole::Developer, &["writer"]);
+    w.metadata.team_grant(
+        mix,
+        w.project,
+        Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: RoleSet::Only([PgRole::Named("reader".into())].into()),
+        },
+    );
+    let before = storage.calls();
+    let resp = call(&w, "mix", "POST", &format!("{}/object/sign/b/a.txt?role=reader", base(&w))).await;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["required"], "role:reader", "{body}");
+    assert_eq!(storage.calls(), before, "sign as a Viewer-level role reached storage");
+    let resp = call(&w, "mix", "POST", &format!("{}/object/resolve?role=reader", base(&w))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(storage.calls(), before + 1);
+    let seen = storage.last();
+    assert_eq!(seen.path_and_query, "/storage/v1/object/resolve?database=web1");
+    let caller: Value = serde_json::from_slice(seen.headers["x-chelabase-console"].as_bytes()).unwrap();
+    assert_eq!(caller["role"], "reader", "{caller}");
+    assert_eq!(caller["member_id"], json!(mix), "{caller}");
+    assert!(caller.get("owner").is_none_or(|o| o == false), "{caller}");
+}

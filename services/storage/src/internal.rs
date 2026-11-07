@@ -7,8 +7,8 @@
 //! `{"branch_id", "database", "role", "claims", "member_id", "request_id"}` (or `"owner": true`
 //! instead of a role and claims: owner mode, [`Mode::Owner`]): the role and claims
 //! of a key whose database list is that one database, and the member as the key id (their
-//! multipart sessions are their own; a signed URL they mint lives while they still have
-//! Developer access to the branch's database). The orchestrator checked the member may act as
+//! multipart sessions are their own; a signed URL they mint names its role and lives while they
+//! still hold that role at Developer on the branch's database, #100). The orchestrator checked the member may act as
 //! that role on that branch; storage still refuses an owner-level role, as for a secret key.
 //!
 //! The header is read only here, after the bearer: the public listener never looks at it. The

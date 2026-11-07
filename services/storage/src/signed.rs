@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use crate::app::{AppState, identity};
 use crate::buckets::body;
-use crate::control::LiveKey;
+use crate::control::{LiveKey, Minter};
 use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
 use crate::names::{self, check_object_name};
@@ -259,8 +259,13 @@ fn download_claims(
         size: Some(found.size),
         etag: Some(found.etag),
         content_type: Some(found.content_type),
-        // Owner mode (m9) marks its URL: it lives only while its member is still an Admin.
-        role: crate::internal::owner_mode().map(|_| crate::internal::STORAGE_ROLE.to_owned()),
+        // A console URL names how it was minted (#100): owner mode's marker (it lives only
+        // while its member is still an Admin) or the role it was minted as (only while its
+        // member still holds that role at Developer). A key's URL names neither.
+        role: crate::internal::console().map(|c| match c.mode {
+            crate::internal::Mode::Owner => crate::internal::STORAGE_ROLE.to_owned(),
+            crate::internal::Mode::Role => c.data.role,
+        }),
         role_oid: None,
         session_id: None,
         upsert: false,
@@ -543,10 +548,10 @@ pub async fn signed_download<S: ConnSource, M: ConnSource>(
     let claims = state
         .open_token(q.token.as_deref(), Purpose::Download, &bucket, &name, &rid)
         .await?;
-    let owner = claims.role.as_deref() == Some(crate::internal::STORAGE_ROLE);
+    let minter = Minter::of(claims.role.as_deref());
     let live = state
         .urls
-        .live_key(claims.key_id, claims.branch_id, owner, &rid)
+        .live_key(claims.key_id, claims.branch_id, &minter, &rid)
         .await?;
     if !live.is_some_and(|k| key_still_reaches(&k, &claims)) {
         return Err(Failure::token_refused());
@@ -942,9 +947,11 @@ mod tests {
     }
 
     /// The URLs sign and resolve mint carry owner mode's marker only in an owner-mode console
-    /// request: such a URL lives only while its member is still an Admin.
+    /// request (such a URL lives only while its member is still an Admin), and the role a role
+    /// caller minted it as (#100: it lives only while the member holds that role at
+    /// Developer); a key's URL names neither.
     #[tokio::test]
-    async fn only_an_owner_mode_url_is_marked() {
+    async fn a_console_url_names_how_it_was_minted() {
         let branch = Uuid::new_v4();
         let at = Located { database: "app".into(), database_id: Uuid::new_v4() };
         let found = || Found {
@@ -960,10 +967,14 @@ mod tests {
         let marked = crate::internal::in_console(owner.clone(), async { claims(&owner.data) }).await;
         assert_eq!(marked.role.as_deref(), Some(crate::internal::STORAGE_ROLE));
         assert_eq!(claims(&owner.data).role, None, "outside a console request");
+        assert_eq!(Minter::of(marked.role.as_deref()), Minter::Owner);
+        assert_eq!(Minter::of(claims(&owner.data).role.as_deref()), Minter::Key);
         let mut role = owner.clone();
         role.mode = crate::internal::Mode::Role;
-        let unmarked = crate::internal::in_console(role.clone(), async { claims(&role.data) }).await;
-        assert_eq!(unmarked.role, None, "a role caller");
+        role.data.role = "reader".into();
+        let named = crate::internal::in_console(role.clone(), async { claims(&role.data) }).await;
+        assert_eq!(named.role.as_deref(), Some("reader"), "a role caller");
+        assert_eq!(Minter::of(named.role.as_deref()), Minter::Role("reader".into()));
     }
 
     /// An app user's request names its session (`sid`); a key's doesn't; an unreadable one
