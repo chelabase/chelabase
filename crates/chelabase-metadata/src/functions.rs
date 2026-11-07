@@ -334,6 +334,9 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
 /// `pending_install` (the child's database needs its own), storage triggers `installed` from
 /// now, so the child never replays the parent's events. Secrets are opened and sealed again for
 /// the child's AAD, last: any failure rolls the whole create back.
+///
+/// Only `create_branch` copies. A backup branch (`switch_to_restored_timeline`) gets no function
+/// state, so a branch later created from a backup inherits none either.
 pub(crate) async fn copy_branch_functions(
     tx: &mut PgConnection,
     key: Option<&SecretKey>,
@@ -500,6 +503,13 @@ impl MetadataClient {
         function_id: Uuid,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
+        // The database row first, as every function write takes it: a branch create (which
+        // holds it `FOR NO KEY UPDATE` while it copies) waits for this delete, or this waits
+        // for the create, so the copy never names a function deleted under it.
+        sqlx::query("SELECT 1 FROM databases WHERE id = $1 FOR SHARE")
+            .bind(database_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
         let found: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM functions WHERE id = $1 AND database_id = $2 FOR UPDATE",
         )
@@ -881,8 +891,16 @@ impl MetadataClient {
 
     /// Adds a trigger for the function on the branch: a table trigger `pending_install` (the
     /// worker installs it), a storage trigger `installed` from now. Columns that don't fit the
-    /// source are [`MetadataError::InvalidFunction`].
+    /// source, and a repeated event, are [`MetadataError::InvalidFunction`].
     pub async fn add_trigger(&self, t: &NewTrigger<'_>) -> Result<Uuid, MetadataError> {
+        // A repeat would install `AFTER INSERT OR INSERT` or deliver one event twice.
+        if t.events
+            .iter()
+            .enumerate()
+            .any(|(i, e)| t.events[..i].contains(e))
+        {
+            return Err(invalid("a trigger names each event once"));
+        }
         let mut tx = self.pool.begin().await?;
         lock_branch_function(&mut tx, t.branch_id, t.function_id).await?;
         let id = Uuid::new_v4();

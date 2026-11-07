@@ -878,6 +878,73 @@ mod functions {
         s.finish().await;
     }
 
+    /// Waits until `n` sessions of the scratch database wait on a lock.
+    async fn lock_waiters(s: &Scratch, n: i64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+            if waiting >= n {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{waiting} of {n} waiters"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A function delete in flight while a branch is created from the same parent: the create
+    /// waits for it (both take the database row) and copies what's left, never failing on the
+    /// deleted function's foreign key.
+    #[tokio::test]
+    #[ignore]
+    async fn create_branch_races_delete_function() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let (f, _) = s.full_function(db, main, "hello").await;
+        // Holds the delete in its cascade, after it has deleted (and locked) the function row.
+        let mut hold = s.pool().begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM branch_functions WHERE function_id = $1 FOR UPDATE")
+            .bind(f)
+            .execute(&mut *hold)
+            .await
+            .unwrap();
+        let client = s.client.clone();
+        let delete = tokio::spawn(async move { client.delete_function(db, f).await });
+        lock_waiters(&s, 1).await;
+        let client = s.client.clone();
+        let child = BranchId::new();
+        let create = tokio::spawn(async move {
+            client
+                .create_branch(&NewBranch {
+                    id: child,
+                    database_id: db,
+                    name: "dev",
+                    parent_branch_id: main,
+                    branched_at_time: None,
+                    branched_at_lsn: None,
+                })
+                .await
+        });
+        lock_waiters(&s, 2).await;
+        hold.commit().await.unwrap();
+        assert!(delete.await.unwrap().unwrap());
+        assert_eq!(create.await.unwrap().unwrap(), CreateBranchOutcome::Created);
+        assert_eq!(
+            s.branch_rows(child).await,
+            [0; 4],
+            "the deleted function isn't copied"
+        );
+        s.finish().await;
+    }
+
     #[tokio::test]
     #[ignore]
     async fn trigger_columns_checked() {
@@ -896,6 +963,21 @@ mod functions {
         assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
         let err = c
             .add_trigger(&table_trigger(main, f, &[]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
+        // A repeated event would install `AFTER INSERT OR INSERT` or deliver an event twice.
+        let err = c
+            .add_trigger(&table_trigger(main, f, &["insert", "insert"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
+        let err = c
+            .add_trigger(&storage_trigger(
+                main,
+                f,
+                &["object.created", "object.created"],
+            ))
             .await
             .unwrap_err();
         assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");

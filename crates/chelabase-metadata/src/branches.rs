@@ -1223,6 +1223,9 @@ impl MetadataClient {
     /// the old timeline at `restore_lsn` (the point the restored timeline was branched at) are
     /// appended again, positioned at the restored timeline's start, so they're current after
     /// the switch.
+    ///
+    /// The backup gets no function state (functions, secrets, schedules, triggers): only
+    /// `create_branch` copies it, so a branch later created from the backup inherits none.
     pub async fn switch_to_restored_timeline(
         &self,
         id: BranchId,
