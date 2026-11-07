@@ -31,6 +31,8 @@ const SECRET_FILES: &[&str] = &[
     "tokens/storage-internal.token",
     "tokens/orchestrator-functions.token",
     "tokens/worker-functions.token",
+    "tokens/functions-service-runner.token",
+    "tokens/worker-service-runner.token",
     "tokens/proxy-api.token",
     "tokens/storcon-hook.token",
 ];
