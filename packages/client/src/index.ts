@@ -13,6 +13,8 @@ import type { AuthOptions, Client, DatabaseShape, TypeMap } from "./types.ts";
 export { DataApiError, UnsafeIntegerError } from "./error.ts";
 export { fetchTypes, type FetchTypesOptions } from "./fetch-types.ts";
 export { StorageError, type StorageErrorCode } from "./storage-errors.ts";
+// The storage webhook payload types; `verifyWebhook` is in `@chelabase/client/server`.
+export type { StorageEvent, StorageEventType } from "./webhooks.ts";
 export type {
   Bucket,
   CreateBucket,

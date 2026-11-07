@@ -21,6 +21,15 @@ import type { Client, DatabaseShape, TypeMap } from "./types.ts";
 export type { CookieAttributes, CookieOptions, CookieToSet } from "./cookies.ts";
 export { type AuthHandlerOptions, createAuthHandler } from "./handler.ts";
 export { parseCookies, serializeCookie } from "./cookies.ts";
+// Storage webhooks: verify a delivery's signature (object-storage m18).
+export {
+  type StorageEvent,
+  type StorageEventType,
+  type VerifyWebhookOptions,
+  verifyWebhook,
+  WebhookVerificationError,
+  type WebhookVerificationReason,
+} from "./webhooks.ts";
 // `StorageError` itself comes from `@chelabase/client`.
 export type { StorageErrorCode } from "./storage-errors.ts";
 export type {
