@@ -22,6 +22,16 @@ export function configureManagementClient(next: ManagementClientConfig): void {
   config = next;
 }
 
+/**
+ * What a request sent outside `customFetch` needs to reach the gateway as the member: the base
+ * URL, the current token and the 401 hook. Studio's uploads send their bytes by XHR, since
+ * `fetch` reports no upload progress (and `customFetch` sends every body as JSON).
+ */
+export function managementConnection(): { baseUrl: string; token: string | undefined; onUnauthorized: () => boolean | void } {
+  if (!config) throw new Error("Management client is not configured; call configureManagementClient first");
+  return { baseUrl: config.baseUrl, token: config.getToken(), onUnauthorized: config.onUnauthorized };
+}
+
 /** Reads a non-2xx response into an ApiError (our `{"error":{...}}` body, else a generic one). */
 export async function readApiError(response: Response, signInRestarted = false): Promise<ApiError> {
   const status = response.status;

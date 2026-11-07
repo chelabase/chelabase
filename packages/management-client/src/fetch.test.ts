@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, fetchStorageObject, parseExact, streamRequest } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, fetchStorageObject, managementConnection, parseExact, streamRequest } from "./fetch";
 import { exportMergePlan } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
@@ -268,5 +268,20 @@ describe("fetchStorageObject", () => {
     controller.abort();
     setup((async () => Promise.reject(new DOMException("aborted", "AbortError"))) as typeof fetch);
     await expect(fetchStorageObject("d", "b", "docs", "a.txt", undefined, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+describe("managementConnection", () => {
+  // #105: Studio's uploads send bytes by XHR (fetch reports no upload progress) as the member.
+  it("hands_out_the_base_url_the_current_token_and_the_401_hook", () => {
+    let token: string | undefined = "t1";
+    const onUnauthorized = vi.fn(() => true);
+    configureManagementClient({ baseUrl: "https://api.test", getToken: () => token, onUnauthorized, fetchImpl: vi.fn() as unknown as typeof fetch });
+    expect(managementConnection()).toMatchObject({ baseUrl: "https://api.test", token: "t1" });
+    token = "t2";
+    const c = managementConnection();
+    expect(c.token).toBe("t2");
+    expect(c.onUnauthorized()).toBe(true);
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
   });
 });
