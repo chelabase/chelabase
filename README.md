@@ -23,13 +23,14 @@ compute on Neon's storage engine, so branches are copy-on-write and can be made 
 point in time.
 
 <p align="center">
-  <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator and Rest; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; psql and ORMs connect over Postgres through the Neon proxy.">
+  <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator, Rest and Storage; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; Storage keeps each file's metadata in the branch's Postgres; psql and ORMs connect over Postgres through the Neon proxy.">
 </p>
 
 - **[Gateway](https://docs.chelabase.com/architecture/gateway/)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.
 - **[Studio](https://docs.chelabase.com/using/studio/)** is the web console: projects, databases, branches, the table and SQL editors, keys, members and app users.
 - **[Orchestrator](https://docs.chelabase.com/architecture/orchestrator/)** serves the Management API (`/v1`), decides who may do what and keeps the platform's own state. The **Worker** runs its jobs: creating, branching, resetting, restoring, merging and deleting databases.
 - **[Rest](https://docs.chelabase.com/architecture/data-api/)** is the data API. It turns a JSON query into SQL and runs it as the key's role, so Postgres row-level security decides what each caller sees.
+- **[Storage](https://docs.chelabase.com/architecture/storage/)** stores files in S3-compatible buckets, SeaweedFS or Amazon S3. Each file's metadata lives in the branch's Postgres, so row-level security decides who reads and writes it, and apps share files through signed URLs.
 - **[Auth](https://docs.chelabase.com/architecture/app-users/)** signs in Studio members and your app's own users (sign-up, sign-in, sessions), with helpers for RLS policies.
 - **[Identity](https://docs.chelabase.com/architecture/identity/)** holds every account, Studio members and each project's app users, on [Better Auth](https://www.better-auth.com). It is internal only: nothing outside the stack reaches it.
 - **[Realtime](https://docs.chelabase.com/architecture/realtime/)** pushes live rows and presence to Studio over a WebSocket.
