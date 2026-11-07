@@ -1,0 +1,128 @@
+---
+title: Client and server
+description: Upload, download, list and manage files with client.storage, or with the HTTP API.
+---
+
+`client.storage` in [`@chelabase/client`](/using/client) wraps the storage HTTP API. It's loaded the first time you use it, so an app that only queries never ships it. Every call runs as the client's key, or as the signed-in app user, so your [policies](/using/storage/policies) decide.
+
+## In the browser
+
+A browser client uses the public key; a signed-in app user's calls run as `authenticated` with their user id (see [App users in the client](/using/client/auth)).
+
+```ts
+import { createBrowserClient } from "@chelabase/client/browser";
+import { type Database, types } from "./db";
+
+const db = createBrowserClient<Database>({
+  url: "https://api.example.com",
+  key: "chk_pub_…",
+  types,
+  // Only getPublicUrl needs the branch: it builds the URL without a request.
+  storage: { branch: "<branch id>", resume: "localStorage" },
+});
+
+const userId = (await db.auth.getUser()).id;
+const file = (document.querySelector("input[type=file]") as HTMLInputElement).files![0]!;
+
+const stored = await db.storage.from("user-files").upload(`${userId}/${file.name}`, file, {
+  upsert: true,
+  onProgress: ({ loaded, total }) => console.log(loaded, total),
+});
+```
+
+## On the server
+
+A server job uses `createClient` with the secret key. (To act as the signed-in user from a server route, use `createServerClient` and its cookies instead; see [Server-side rendering](/using/client/ssr).)
+
+```ts
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+
+const db = createClient<Database>({ url: process.env.CHELABASE_URL!, key: process.env.CHELABASE_SECRET_KEY!, types });
+
+await db.storage.createBucket({ name: "docs", file_size_limit: 50 * 1024 * 1024 });
+// Any stream works, sent as it's read: a web ReadableStream, or a Node Readable such as fs.createReadStream(…).
+const source = await fetch("https://reports.internal.example/2026-11.pdf");
+await db.storage.from("docs").upload("reports/2026-11.pdf", source.body!, {
+  contentType: "application/pdf",
+});
+```
+
+A secret key's role is `authenticated`, so bucket changes need a policy on `storage.buckets` too, or create buckets in SQL as the owner.
+
+## Upload
+
+`upload(path, body, options)` takes a `Blob` or `File`, bytes, a string, a web `ReadableStream`, or any async iterable of bytes (a Node `Readable`), and resolves to `{ bucket, name, version_id, size, etag }`.
+
+- A `Blob` over `multipartThreshold` (8 MiB) goes up as a [resumable upload](/using/storage#uploads-and-limits) in parts of `partSize` (8 MiB; 5 to 100 MiB). After a failure, the same upload again (same bucket, name, data and options, on the same client) sends only the parts the server is missing. `resume: "localStorage"` makes that survive a page reload.
+- A part, or a small upload, is retried after a network error, 408, 429 or 5xx (`retries`, default 3, with doubling delays).
+- A stream is sent as it's read, never buffered whole, in one request: it can't be resumed or retried.
+- `upsert: true` replaces an existing object; without it a taken name is 409 `conflict`. A [write-once bucket](/using/storage#write-once-buckets) refuses any overwrite.
+- `signal` stops an upload; a resumable one can be resumed later.
+
+## Download, list and the rest
+
+```ts
+const bucket = db.storage.from("docs");
+
+const res = await bucket.download("reports/2026-11.pdf");          // a Response: stream res.body, or res.blob()
+const head = await bucket.download("video.mp4", { range: { start: 0, end: 1023 } }); // 206
+
+const page = await bucket.list({ prefix: "reports/", folders: true, limit: 100 });
+const next = page.nextCursor ? await bucket.list({ prefix: "reports/", cursor: page.nextCursor }) : null;
+
+await bucket.exists("reports/2026-11.pdf");       // false when missing or hidden
+await bucket.info("reports/2026-11.pdf");         // { size, contentType, etag }
+await bucket.move("reports/2026-11.pdf", "archive/2026-11.pdf");
+await bucket.copy("archive/2026-11.pdf", "2026-11.pdf", { toBucket: "public-docs" });
+const removed = await bucket.remove(["a.txt", "b.txt"]); // the names deleted; missing or hidden ones are left out
+```
+
+`list` returns at most 1000 entries a page (100 by default). `folders: true` groups names at the next `/` after the prefix, each folder once. `search`, `sortBy` (`name`, `size`, `updated_at`) and `order` narrow and sort it.
+
+Buckets: `listBuckets()`, `createBucket({ name, public, file_size_limit, allowed_mime_types, write_once })`, `updateBucket(name, changes)` and `deleteBucket(name)`.
+
+URLs and references have their own pages: [signed and public URLs](/using/storage/urls) and [`resolve`](/using/storage/refs).
+
+## Errors
+
+A refusal rejects with `StorageError`: `status` is the HTTP status, `code` one of a short stable list (`invalid_request`, `unauthorized`, `forbidden`, `not_found`, `timeout`, `conflict`, `write_once`, `referenced`, `delete_refused`, `expired`, `too_large`, `unsupported_type`, `range_not_satisfiable`, `rate_limited`, `unavailable`, `internal`), and `serverCode` the server's own, finer code (see [Errors](/using/storage#errors)). Network failures and aborts are rethrown as they are.
+
+```ts
+import { StorageError } from "@chelabase/client";
+
+try {
+  await db.storage.from("avatars").upload("me.png", file);
+} catch (e) {
+  if (e instanceof StorageError && e.code === "conflict") {
+    // the name is taken: upload with upsert, or pick another name
+  } else throw e;
+}
+```
+
+## The HTTP API
+
+The same calls over HTTP, with a key as the bearer:
+
+```bash
+KEY=chk_sec_…
+API=https://api.example.com
+
+# a bucket (as the key's role: a policy on storage.buckets decides)
+curl -X POST "$API/storage/v1/bucket" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"name":"docs","file_size_limit":52428800}'
+
+# upload, download, delete
+curl -X POST "$API/storage/v1/object/docs/reports/2026-11.pdf" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/pdf' --data-binary @report.pdf
+curl "$API/storage/v1/object/docs/reports/2026-11.pdf" -H "Authorization: Bearer $KEY" -o report.pdf
+curl -X DELETE "$API/storage/v1/object/docs/reports/2026-11.pdf" -H "Authorization: Bearer $KEY"
+
+# a listing
+curl -X POST "$API/storage/v1/object/list/docs" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"prefix":"reports/","delimiter":"/"}'
+```
+
+`x-upsert: true` (or `?upsert=true`) on an upload replaces an existing object. A resumable upload is `POST /storage/v1/upload/{bucket}/{name}` (it answers the session `id`), then `PUT /storage/v1/upload/session/{id}/{part}` for each part, `GET` on the session for the parts received, and `POST …/complete`; `DELETE` on the session aborts it.
+
+The full contract is [`openapi/storage.json`](https://github.com/chelabase/chelabase/blob/main/openapi/storage.json).

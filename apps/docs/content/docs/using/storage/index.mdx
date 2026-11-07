@@ -1,0 +1,90 @@
+---
+title: Storage
+description: Files in buckets, guarded by row-level security, served through the gateway at /storage/v1.
+---
+
+Every database has object storage: files in **buckets**, each file an **object** with a name such as `avatars/2b1c…/me.png`. Objects are stored in an S3-compatible object store (SeaweedFS in the self-hosted install, or [Amazon S3](/self-hosting/amazon-s3)), and their metadata is a row in the branch's own Postgres database, in the `storage` schema.
+
+That has three consequences you'll see throughout these pages:
+
+- **Postgres decides who may do what.** Every storage call runs as the caller's role, with its claims, so [row-level security policies](/using/storage/policies) on `storage.buckets` and `storage.objects` decide. With no policy, nothing is visible or writable.
+- **Branches copy files for free.** A branch copies the metadata rows with the rest of the database, and the stored bytes are shared until one side changes them. See [Branches and files](/using/storage/branches).
+- **The object store is never exposed.** Apps talk to the gateway; only the storage service holds the object store's credentials. Signed and public URLs point at the gateway too. See [the architecture page](/architecture/storage).
+
+## How to call it
+
+| From | How |
+|---|---|
+| Your app | `client.storage` in [`@chelabase/client`](/using/storage/client), or the HTTP API at `/storage/v1` with a [data API key](/using/data-api/keys) as the bearer |
+| A browser with no key | A [signed URL](/using/storage/urls#signed-urls), a one-time upload URL, or a [public bucket's](/using/storage/urls#public-urls) path |
+| Studio | The **Storage** tab of a branch: [buckets, the object browser, uploads and live updates](/using/storage/studio) |
+| Another service | [Webhooks](/using/storage/webhooks) for every object created, updated, moved or deleted |
+
+A key belongs to one branch, so each call works on that branch's objects. A public key runs as `anon`, a secret key and a signed-in app user as `authenticated` (or the key's role). Owner-level roles are refused (403 `role_not_allowed`).
+
+The HTTP API's contract is [`openapi/storage.json`](https://github.com/chelabase/chelabase/blob/main/openapi/storage.json). Who may call each route is in the [access table](/reference/access).
+
+## Buckets
+
+A bucket is a row of `storage.buckets`:
+
+| Column | Default | What it does |
+|---|---|---|
+| `name` | required | Unique per database. Objects are addressed as `/{bucket}/{name}`. |
+| `public` | `false` | Objects are served without a key at their [public path](/using/storage/urls#public-urls). |
+| `file_size_limit` | none | The largest object, in bytes. Larger uploads, copies and moves into the bucket are refused with 413 `too_large`. |
+| `allowed_mime_types` | none | A list such as `["image/png", "image/*"]`. An upload must declare an allowed type, and its first bytes must be recognised as one too; otherwise 415 `mime_not_allowed`. |
+| `write_once` | `false` | See [Write-once buckets](#write-once-buckets). |
+
+Creating, changing and deleting a bucket runs as the caller like everything else, so it needs an `INSERT`, `UPDATE` or `DELETE` policy on `storage.buckets`. In practice that's a secret key on a server, or the owner in Studio. A bucket that still holds objects can't be deleted (409 `bucket_not_empty`).
+
+Every object route needs the caller to **see the bucket**: a `SELECT` policy on `storage.buckets` that shows it. Without one, the bucket is 404 `bucket_not_found` (missing and hidden look the same).
+
+## Objects
+
+An object name is 1 to 1024 bytes of UTF-8, with no control characters, no leading `/`, no empty segment (`a//b`) and no segment made only of dots. `/` separates folders: listing with `folders` groups names at the next `/`.
+
+Each upload makes a new **version** (`version_id`). An upload to a name that's taken is 409 `conflict` unless it asks to replace (`upsert`), which needs an `UPDATE` policy as well as `INSERT`. A move or rename changes only the metadata; a copy stores a new version at the destination.
+
+Every download is served with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, and as an attachment unless its type is a safe inline type: images (not SVG), video, audio, PDF and plain text. So no stored file can run script on the API's origin, whatever type it was uploaded as. `?download` (or `?download=<file name>`) always makes it an attachment.
+
+## Uploads and limits
+
+- **Single uploads** stream the body of any length (chunked included) in one request. Bytes are counted as they arrive, so `file_size_limit` holds whatever `Content-Length` says.
+- **Resumable uploads** go up in parts: start a session (`POST /storage/v1/upload/{bucket}/{name}`), send parts 1 to 10000 of **5 MiB to 100 MiB** each (the last may be smaller; a part sent again replaces it), then complete it. Completing checks the policies and the bucket's limits again and makes the object atomically; a refusal (403, 413, 415) aborts the upload. A session lasts 24 hours, then its parts answer 410 `upload_expired` and the sweep removes them. A session belongs to its caller: anyone else gets 404.
+- **Idle bodies.** An upload whose body sends nothing for 60 seconds fails with 408 `request_timeout` and frees its memory (`CHELABASE_STORAGE_BODY_IDLE_SECS`).
+- **In-flight cap.** Each storage process holds at most 1 GiB of upload buffers at once (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`). Past it, uploads are refused with 503 `busy`: retry them. The client retries for you.
+
+The client picks single or resumable uploads by size and resumes after a failure. See [Client and server](/using/storage/client#upload).
+
+## Write-once buckets
+
+A bucket with `write_once = true` keeps every object exactly as first uploaded:
+
+- an object can be uploaded once, then never overwritten, moved, renamed or deleted, by anyone. The database owner and Studio's owner mode are refused too (409 `write_once`). A resumable upload's completion refuses an existing name the same way;
+- `write_once` can be turned on at any time and never off again;
+- a write-once bucket holding objects can't be renamed or deleted.
+
+`public` stays switchable. That's the owner's takedown lever: turning it off takes every public URL in the bucket offline (404) without changing any object, and turning it on again brings them back. Use a public write-once bucket for links other sites keep, such as embedded images: the bytes behind a URL never change.
+
+## Errors
+
+Errors use the data API's envelope, `{"error": {"code", "message", …}}`. The client throws them as `StorageError`, with the server's code as `serverCode` beside its own stable `code` (see [Client and server](/using/storage/client#errors)).
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_request`, `invalid_parts` | A malformed body, name, `Content-Type` or TTL; a resumable upload with a gap or a short part that isn't the last |
+| 401 | `unauthorized`, `invalid_token`, `token_expired` | No or a bad key; a signed URL's token is malformed or expired |
+| 403 | `not_allowed`, `permission_denied` | No policy allows it |
+| 403 | `database_not_allowed`, `role_not_allowed`, `token_not_valid` | The key can't use the database, its role is owner-level, or a URL's token is for another object, used already, or its key was revoked |
+| 404 | `bucket_not_found`, `object_not_found`, `upload_not_found` | Missing or hidden (the same answer, so a hidden object isn't revealed) |
+| 408 | `request_timeout` | The body went idle |
+| 409 | `conflict` | The name is taken, or it changed meanwhile |
+| 409 | `write_once` | A write-once bucket refused the change |
+| 409 | `referenced`, `delete_refused`, `retry` | A delete refused by a table that references the object; see [Object references](/using/storage/refs#deleting-a-referenced-object) |
+| 409 | `bucket_not_empty` | A bucket holding objects can't be deleted |
+| 410 | `upload_expired` | The resumable upload's 24 hours are up |
+| 413 | `too_large` | Over the bucket's `file_size_limit`, or a part over 100 MiB |
+| 415 | `mime_not_allowed` | A type the bucket doesn't allow |
+| 416 | `range_not_satisfiable` | A `Range` outside the object |
+| 503 | `busy`, `unavailable`, `storage_unavailable` | Too many uploads in flight, or the database or storage isn't available right now; retry |

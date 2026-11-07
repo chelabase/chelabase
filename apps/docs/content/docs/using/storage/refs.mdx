@@ -1,0 +1,68 @@
+---
+title: Object references
+description: Point table rows at stored objects with storage_ref columns, get typed fields, and resolve them to URLs in one call.
+---
+
+Store a reference to an object in your tables, never its URL: URLs expire and name a host. Chelabase recognises three column shapes as object references. Generated types mark them, Studio's table editor shows and uploads them, and `client.storage.resolve` turns them into URLs.
+
+## The three forms
+
+| Form | Column | Generated type | Resolve it as |
+|---|---|---|---|
+| Composite | `storage.object_ref`: `(bucket_id uuid, name text)` | `StorageRef` | the value itself, `{ bucket_id, name }` |
+| Path in a known bucket | `text` (or `text[]`) with the comment `@storage_ref bucket=<bucket>` | `StoragePath<"bucket">` | `{ bucket, name }` |
+| Object id | a foreign key to `storage.objects(id)` | `StorageObjectId` | `{ id }` |
+
+```sql
+-- composite: any bucket
+CREATE TABLE documents (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, file storage.object_ref);
+INSERT INTO documents (file)
+  VALUES (storage.object_ref((SELECT id FROM storage.buckets WHERE name = 'docs'), 'reports/2026-11.pdf'));
+
+-- a path in one bucket
+CREATE TABLE profiles (user_id uuid PRIMARY KEY, avatar text);
+COMMENT ON COLUMN profiles.avatar IS '@storage_ref bucket=avatars';
+
+-- an object's id, kept consistent by Postgres
+CREATE TABLE attachments (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  object_id uuid REFERENCES storage.objects (id) ON DELETE SET NULL);
+```
+
+`StorageRef` applies only to the `storage.object_ref` type, not to another type that happens to be named `object_ref`. Through the data API, a composite is written and read as `{ "bucket_id": "…", "name": "…" }`.
+
+The database owner holds `REFERENCES (id)` on `storage.objects`, its only privilege on that table, so its tables can declare such a foreign key. A move or an overwrite keeps the object's id; a copy makes a new one.
+
+## Resolving to URLs
+
+```ts
+const rows = await db.from("documents").select("id", "file");
+const urls = await db.storage.resolve(rows.map((r) => r.file)); // one request, in input order
+
+const avatar = await db.storage.resolve({ bucket: "avatars", name: profile.avatar });
+const byId = await db.storage.resolve({ id: attachment.object_id }, { expiresIn: 600, download: true });
+```
+
+- An array resolves in one request (at most 1000 refs), in input order. An empty array, or only `null`s, sends nothing.
+- Each readable object becomes a [signed URL](/using/storage/urls#signed-urls), exactly as `createSignedUrl` makes it, or the public URL for a public bucket.
+- A ref the caller can't read, missing or hidden by row-level security, resolves to `null`, never an error. All refs are read in one statement, so a hidden ref can't be told from a missing one.
+
+Over HTTP: `POST /storage/v1/object/resolve` with `{"refs": [...], "expires_in": 3600}` answers `{"urls": [...]}`.
+
+## Generated types
+
+The [schema](/using/client/types) a secret key reads from `/data/v1/schema` carries one optional `storage_ref` hint per column: `ref`, `path` (with its bucket) or `id`. It's derived: the comment's text, foreign-key details and type names aren't exposed, and the hint never shows a column the caller's role can't already see. The route is secret-key only, as before. Generated types use the hint for `StorageRef`, `StoragePath<"bucket">` and `StorageObjectId`.
+
+## Deleting a referenced object
+
+Postgres keeps an id reference consistent; the other two forms are plain values, and a deleted object simply resolves to `null`.
+
+With a foreign key to `storage.objects(id)`, deleting the object runs the key's rule:
+
+- `ON DELETE NO ACTION` or `RESTRICT` (the default): the delete is refused with 409 `referenced` (SQLSTATE 23503). Remove or change the referencing rows first.
+- `ON DELETE SET NULL` or `CASCADE`: the delete goes through and Postgres updates or deletes the rows.
+- If something on the referencing table refuses (a `SET NULL` on a `NOT NULL` column, a trigger, a check), the delete is refused with 409 `delete_refused`.
+- A concurrent transaction or a held lock rolls it back with 409 `retry`: try again.
+
+In each case nothing is deleted (in a batch delete, none of the objects), and the message is fixed: it never names your table, column or row, nor quotes a constraint's or trigger's text. Studio explains a refused delete the same way.
+
+Cascades and `SET NULL` are your SQL. Chelabase never deletes rows of your tables on its own.

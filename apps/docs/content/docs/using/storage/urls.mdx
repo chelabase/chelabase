@@ -1,0 +1,73 @@
+---
+title: Signed and public URLs
+description: Links that serve an object without a key, how long they last, and the headers every download carries.
+---
+
+Three kinds of URL let a browser use an object without a key. All of them point at the gateway, never at the object store.
+
+| URL | Who makes it | What it does | Ends |
+|---|---|---|---|
+| Signed download | A caller who can read the object | Serves the version it was signed for | On expiry, or when its key is revoked; an overwrite, move or delete stops it (see below) |
+| One-time upload | A caller who can see the bucket | Takes one `PUT` of the object, as its maker | After one use, or on expiry |
+| Public | Nobody: it's the object's path | Serves the object while the bucket is public | When the object is deleted or the bucket made private |
+
+## Signed URLs
+
+```ts
+const { signedUrl, expiresAt } = await db.storage.from("docs").createSignedUrl("reports/2026-11.pdf", {
+  expiresIn: 3600,       // seconds, 1 to 604800 (7 days); default 3600
+  download: "report.pdf", // optional: serve as an attachment under this name
+});
+const many = await db.storage.from("docs").createSignedUrls(["a.png", "b.png"]);
+```
+
+Over HTTP, `POST /storage/v1/object/sign/{bucket}/{name}` with `{"expires_in": 3600}` answers `{"signed_url": "/storage/v1/object/sign/…?token=…"}`, a path on the gateway. A TTL over 7 days is 400.
+
+Signing runs as the caller: no URL is issued for an object its policies don't let it read. The token is bound to the database, branch, Postgres database, object and version and to the key that signed it, so it never opens another object or works on another branch (403 `token_not_valid`). A tampered or expired token is 401.
+
+**A signed URL serves only the version it was signed for.**
+
+- An overwrite or a delete stops it (404), and so does a move or rename (the URL names the old path). Re-creating the name doesn't bring it back: sign again to link to the new version.
+- A [branch reset or restore](/using/branches) puts the branch back where the URL was signed, so the URL serves again until it expires. That's true after an overwrite as well as after a delete.
+- Only revoking the key that signed it, or expiry, ends it for good. Revocation reaches every storage replica within a second (within 5 seconds if NATS is down). A URL minted for an app user stops when that user's session ends.
+
+For a link third parties keep, such as an image embedded on another site, use a [public bucket](#public-urls) instead, with unique names or a [write-once bucket](/using/storage#write-once-buckets).
+
+## One-time upload URLs
+
+```ts
+const { signedUrl, token } = await db.storage.from("user-files").createSignedUploadUrl(`${userId}/avatar.png`, {
+  expiresIn: 600,
+  upsert: true, // fixed now: the uploader can't change it
+});
+// in the browser, with no key:
+await fetch(signedUrl, { method: "PUT", body: file, headers: { "content-type": file.type } });
+```
+
+The URL takes exactly one `PUT`, as the caller who made it (its role and claims), so the policies decide at upload time. Whether it may replace an existing object is fixed when it's signed; `x-upsert` and `?upsert=` on the `PUT` are ignored. A malformed `Content-Type` is refused before the URL is spent; 413 and 415 spend it. The one-time check holds across every storage replica and restart.
+
+## Public URLs
+
+A bucket with `public = true` serves its objects with no key at
+
+```
+/storage/v1/object/public/{branch id}/{bucket}/{name}
+```
+
+`getPublicUrl(path)` builds it without a request; it needs the client's `storage.branch`. The URL is path-based and lasts while the object exists and the bucket stays public. It's served with `Cache-Control: public, max-age=3600`, and supports `Range` and `If-None-Match`.
+
+A private bucket's public path answers 404, the same as a missing object. Only a caller allowed to update the bucket (a policy on `storage.buckets`) can change `public`. Turning it off takes every URL in the bucket offline at once, without changing any object.
+
+## Download headers
+
+Every download, by key, signed URL or public path, carries:
+
+- `X-Content-Type-Options: nosniff`, so the browser never guesses another type;
+- `Content-Security-Policy: sandbox`, so even an HTML or SVG file opened directly can't run script on the API's origin;
+- `Content-Disposition: attachment`, unless the type is a safe inline type (images other than SVG, video, audio, PDF, plain text) and the request has no `?download`.
+
+The `Content-Type` served is the stored type's parsed `type/subtype` (with its parameters), never the raw stored text.
+
+## Studio's URLs
+
+Studio's **Copy signed URL** mints a URL valid for at most an hour, and only for members with Developer access or above. It works while the version is current and while you keep that access (Admin, for one made in owner mode). See [Studio](/using/storage/studio).

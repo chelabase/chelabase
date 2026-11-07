@@ -3,7 +3,7 @@ title: "API generation"
 description: "How the OpenAPI documents, the generated clients, the error shape and the API reference are produced."
 ---
 
-Chelabase's APIs describe themselves from the Rust code. Three OpenAPI documents are committed under `openapi/`, typed clients are generated from them, and this site renders them as the API reference. Nothing here is edited by hand.
+Chelabase's APIs describe themselves from the Rust code. Four OpenAPI documents are committed under `openapi/`, typed clients are generated from them, and this site renders them as the API reference. Nothing here is edited by hand.
 
 ## The documents
 
@@ -14,8 +14,9 @@ OpenAPI documents are generated from the Rust route handlers with utoipa 6 and u
 | `openapi/management.json` | The Management API: the orchestrator's `/v1` | `services/orchestrator/src/openapi.rs` |
 | `openapi/login.json` | The login API: auth's `/auth/v1`, Studio's sign-in pages and app users' sign-in flows (`/auth/v1/app/*`) | `services/auth/src/openapi.rs` |
 | `openapi/data.json` | The data API: `rest`'s `/data/v1` | `services/rest/src/openapi.rs` |
+| `openapi/storage.json` | Object storage: `storage`'s `/storage/v1` | `services/storage/src/openapi.rs` |
 
-The [management](/reference/management/databases/createDatabase) and [data](/reference/data/runQuery) references are published under `/reference/` and the [login API](/architecture/login-api/login/signIn) under `/architecture/login-api`; each page is generated from its document when the site is built.
+The [management](/reference/management/databases/createDatabase) and [data](/reference/data/runQuery) references are published under `/reference/` and the [login API](/architecture/login-api/login/signIn) under `/architecture/login-api`; each page is generated from its document when the site is built. The storage document isn't rendered here yet; the [Storage](/using/storage) guide links to it.
 
 ### Tests that keep them honest
 

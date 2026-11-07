@@ -11,6 +11,7 @@
     "login-roles",
     "data-api",
     "client",
+    "storage",
     "app-users",
     "sql-editor",
     "table-editor",
