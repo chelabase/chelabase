@@ -2186,6 +2186,142 @@ mod tests {
         }
     }
 
+    /// object-storage m19 (#152): the files the self-hosted `storage` service mounts from the
+    /// `secrets` volume (its block in docker-compose.yml), sorted.
+    fn selfhost_storage_mounts() -> Vec<String> {
+        let text = compose_file("docker-compose.yml");
+        let block = text
+            .split("\n  storage:\n")
+            .nth(1)
+            .expect("a storage service in the self-hosted compose file");
+        let mut subs: Vec<String> = block
+            .lines()
+            .take_while(|l| l.is_empty() || l.starts_with("    "))
+            .filter(|l| l.contains("source: secrets,"))
+            .filter_map(|l| l.split("subpath: ").nth(1))
+            .map(|rest| rest.split(['}', ',', ' ']).next().unwrap().to_string())
+            .collect();
+        subs.sort();
+        subs
+    }
+
+    /// The storage service mounts exactly its own files, each made by a fresh run (the layout's,
+    /// at the app user's owner-only or public mode; the S3 pair by init-secrets' script), and
+    /// NATS's auth file carries its user.
+    #[test]
+    fn storage_service_mounts_come_from_init() {
+        let mounts = selfhost_storage_mounts();
+        assert_eq!(
+            mounts,
+            [
+                "compute-ca/ca.crt",
+                "gateway/internal-verify.pem",
+                "nats/storage.password",
+                "storage-s3/access-key",
+                "storage-s3/secret-key",
+                "tokens/storage-internal.token",
+            ],
+            "storage mounts only its own secrets, the verify key and the CA certificate"
+        );
+        let t = tmp();
+        let o = opts();
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        let (uid, gid) = me();
+        for sub in mounts.iter().filter(|s| !s.starts_with("storage-s3/")) {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == sub)
+                .unwrap_or_else(|| panic!("{sub} is not in chelabase-init's layout"));
+            let want = if entry.spec == PUB { 0o644 } else { 0o600 };
+            assert!(
+                matches!(entry.spec.uid, Id::Writer),
+                "{sub}: the app user owns it"
+            );
+            let p = t.path().join(sub);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid(), mode(&p)),
+                (uid, gid, want),
+                "{sub}"
+            );
+            assert!(report.created.contains(&p), "{sub}");
+        }
+        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&auth);
+        let pw = std::fs::read_to_string(t.path().join("nats/storage.password")).unwrap();
+        assert!(
+            bcrypt::verify(&pw, &hashes["storage"]).unwrap(),
+            "storage's NATS user"
+        );
+    }
+
+    /// An install from before object storage (no storage secrets): the next run makes them and
+    /// re-renders NATS's users, and every other file stays byte for byte, the never-overwrite
+    /// ones included.
+    #[test]
+    fn upgrade_adds_storage_secrets_and_keeps_the_rest() {
+        const STORAGE: [&str; 2] = ["nats/storage.password", "tokens/storage-internal.token"];
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        for f in STORAGE {
+            std::fs::remove_file(t.path().join(f)).unwrap();
+        }
+        // NATS's users as such an install rendered them: no storage user.
+        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let before = snapshot(t.path());
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        let mut created = r.created.clone();
+        created.sort();
+        assert_eq!(created, STORAGE.map(|f| t.path().join(f)));
+        assert_eq!(r.rewritten, [t.path().join("nats/auth.conf")]);
+        assert!(r.auth_files.nats && !r.auth_files.valkey);
+        let after = snapshot(t.path());
+        for (p, v) in &before {
+            if p != Path::new("nats/auth.conf") {
+                assert_eq!(after.get(p), Some(v), "{} changed", p.display());
+            }
+        }
+        for kept in [
+            "secrets/secrets.key",
+            "gateway/internal-signing.pem",
+            "gateway/internal-verify.pem",
+            "auth/cookie.key",
+            "neon/compute-jwt.pem",
+            "neon/compute-jwt.pub",
+            "auth/member-jwt.key",
+            "auth/member-jwt.pub",
+            "identity/secret",
+            "identity/db.password",
+            "tokens/auth-identity.token",
+            "tokens/orchestrator-identity.token",
+            "tokens/worker-identity.token",
+            "tokens/bootstrap-identity.token",
+        ] {
+            assert_eq!(
+                after.get(Path::new(kept)),
+                before.get(Path::new(kept)),
+                "{kept}"
+            );
+            assert!(before.contains_key(Path::new(kept)), "{kept}");
+        }
+        // The other users keep their passwords; storage's new one verifies.
+        let new = String::from_utf8(after[Path::new("nats/auth.conf")].0.clone()).unwrap();
+        assert_ne!(new, auth);
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&new);
+        for u in crate::kinds::stack_secrets::NATS_USERS {
+            let pw = String::from_utf8(after[Path::new(&format!("nats/{u}.password"))].0.clone())
+                .unwrap();
+            assert!(bcrypt::verify(&pw, &hashes[u]).unwrap(), "{u}");
+        }
+        // A rerun changes nothing.
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(
+            again.created.is_empty() && again.rewritten.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(snapshot(t.path()), after);
+    }
+
     // m12 (#23): seeds from the compose .env.
 
     fn seeded(text: &str) -> InitSecrets {
