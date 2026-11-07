@@ -84,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         warn!("CHELABASE_STORAGE_BACKEND is unset: the storage sweep doesn't run");
     }
+    // Edge functions m7: scheduled runs and the bundle sweep, each only when configured.
+    let functions = worker::config::functions_settings(|name| std::env::var(name).ok())?;
     let worker = Arc::new(built);
     // Only with a store: without one, no consumer would take the jobs.
     if worker.blob_store.is_some() {
@@ -169,6 +171,29 @@ async fn main() -> anyhow::Result<()> {
         webhooks.clone(),
     ));
     tokio::spawn(serve_storage_webhook_test(worker.clone(), nats.clone(), webhooks));
+
+    match &functions.invoke {
+        Some((url, token)) => {
+            let invoker: Arc<dyn worker::fn_schedules::Invoker> =
+                Arc::new(worker::fn_schedules::HttpInvoker::new(url, token.clone())?);
+            tokio::spawn(worker::fn_schedules::schedule_loop(
+                worker.metadata.inner().clone(),
+                invoker,
+            ));
+        }
+        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules don't run"),
+    }
+    match &functions.bundles {
+        Some(config) => {
+            let store: Arc<dyn chelabase_storage::ObjectStore> =
+                Arc::new(chelabase_storage::S3Store::new(config).await);
+            tokio::spawn(worker::fn_bundle_sweep::bundle_sweep_loop(
+                store,
+                worker.metadata.inner().clone(),
+            ));
+        }
+        None => warn!("CHELABASE_FUNCTIONS_S3_BUCKET is unset: the function bundle sweep doesn't run"),
+    }
 
     if worker.blob_store.is_some() {
         tokio::spawn(storage_sweep_loop(worker.clone()));
