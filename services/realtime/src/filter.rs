@@ -91,10 +91,13 @@ pub struct FilterSettings {
     pub visibility_poll: Duration,
     pub window_deadline: Duration,
     pub max_keys: usize,
+    /// A bucket filter carries at most this many windows' worth of keys (× `max_keys`) per
+    /// group ([`CARRY_WINDOWS`]).
+    pub carry_windows: usize,
 }
 
 impl Default for FilterSettings {
-    /// 8, 2 s, 50 ms, 5 s, 1000.
+    /// 8, 2 s, 50 ms, 5 s, 1000, 10.
     fn default() -> Self {
         Self {
             concurrency: CONCURRENCY,
@@ -102,6 +105,7 @@ impl Default for FilterSettings {
             visibility_poll: VISIBILITY_POLL,
             window_deadline: WINDOW_DEADLINE,
             max_keys: MAX_KEYS,
+            carry_windows: CARRY_WINDOWS,
         }
     }
 }
@@ -723,7 +727,7 @@ impl TableFilter {
                 }
             }
             if !left.is_empty() && !viewers.is_empty() {
-                let dropped = left.trim(max * CARRY_WINDOWS);
+                let dropped = left.trim(max * self.settings.carry_windows.max(1));
                 if dropped > 0 {
                     tracing::warn!(
                         relation = self.relation.oid,

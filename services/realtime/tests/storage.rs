@@ -592,8 +592,70 @@ async fn storage_object_on_screen_moved_away_is_deleted_once() {
     );
 }
 
-// --- the invariant as a property: interleavings of bucket A/B changes, bulk windows and
-// permit starvation ------------------------------------------------------------------------------
+// --- a view check racing a window, a trimmed carry (#129's re-audit, B3 and B4) -----------------
+
+#[tokio::test(start_paused = true)]
+async fn storage_view_confirmed_before_a_move_lets_no_bucket_b_change_through() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    // Studio's view frame: asked under the filter, checked without it.
+    let ask = f.filter.ask_keys(2, &[ks(O1)], false).unwrap();
+    let seen = ask.run().await;
+    // Meanwhile O1 moves to bucket B, and that window is delivered.
+    f.checker.place(&[O1], BUCKET_B);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    assert_eq!(drain(&mut reader), vec![]);
+    // The pre-move answer lands.
+    f.filter.set_view(2, &ask, vec![ks(O1)], seen);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "bucket B's changes to O1 reached bucket A's viewer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_trimmed_move_out_lets_no_bucket_b_delete_through() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(
+        limiter.clone(),
+        FilterSettings {
+            max_keys: 1,
+            ..FilterSettings::default()
+        },
+    );
+    let ids: Vec<String> = (100..112).map(oid).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    f.checker.insert_rows(REL, &refs);
+    f.checker.place(&refs, BUCKET_A);
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.deliver(&window(&[O1], &[], &[])).await;
+    drain(&mut reader);
+    let held = limiter.try_permit().unwrap();
+    f.checker.place(&[O1], BUCKET_B);
+    // The move out is carried, then trimmed by later carried keys.
+    f.deliver(&window(&[], &[O1], &[])).await;
+    for k in &refs {
+        f.deliver(&window(&[k], &[], &[])).await;
+    }
+    drop(held);
+    f.deliver(&window(&[], &[], &[])).await;
+    drain(&mut reader);
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    f.deliver(&window(&[], &[], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a delete in bucket B reached bucket A's viewer"
+    );
+}
+
+// --- the invariant as a property: interleavings of bucket A/B changes, bulk windows, permit
+// starvation, a carry that overflows and trims, and view checks racing delivered windows ---------
 
 #[derive(Debug, Clone)]
 enum Step {
@@ -606,10 +668,19 @@ enum Step {
     Delete {
         i: usize,
     },
-    /// The viewer's screen: the objects of the mask (only those confirmed visible count).
+    /// The viewer's screen: the objects of the mask (only those confirmed visible count), asked,
+    /// checked and set under the filter in one go.
     View {
         mask: u8,
     },
+    /// A view frame as `replication.rs` runs it: asked under the filter (`Ask`), checked without
+    /// it (`Run`), and its answer set under the filter again (`Land`, which runs it first if
+    /// `Run` didn't); windows may be delivered in between. A new `Ask` drops an open one.
+    Ask {
+        mask: u8,
+    },
+    Run,
+    Land,
     /// The pending changes as one window: `bulk` the plugin's keyless `c` (keys lost), `starved`
     /// every check slot held by another filter for the whole delivery.
     Deliver {
@@ -625,6 +696,9 @@ fn step() -> impl Strategy<Value = Step> {
         3 => (0..OBJECTS, any::<bool>(), any::<bool>()).prop_map(|(i, in_a, hidden)| Step::Put { i, in_a, hidden }),
         1 => (0..OBJECTS).prop_map(|i| Step::Delete { i }),
         1 => any::<u8>().prop_map(|mask| Step::View { mask }),
+        1 => any::<u8>().prop_map(|mask| Step::Ask { mask }),
+        1 => Just(Step::Run),
+        1 => Just(Step::Land),
         3 => (any::<bool>(), any::<bool>()).prop_map(|(bulk, starved)| Step::Deliver { bulk, starved }),
     ]
 }
@@ -634,6 +708,17 @@ type Truth = Option<(bool, bool)>;
 
 fn shown_to_role(t: Truth) -> bool {
     matches!(t, Some((true, false)))
+}
+
+/// An open view frame (`Step::Ask`).
+struct OpenView {
+    ask: realtime::filter::KeyCheck,
+    keys: Vec<String>,
+    /// Its answer, once run.
+    seen: Option<Result<Vec<bool>, ()>>,
+    /// Keys a delivered window's check could have changed since it ran (`all`: a bulk window).
+    stale: HashSet<String>,
+    all: bool,
 }
 
 async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
@@ -647,8 +732,10 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
         checker.clone(),
         limiter.clone(),
         VisibilityCache::new(Duration::from_millis(100)),
+        // One key per check and a carry of two keys: chunks, and a carry that overflows.
         FilterSettings {
-            max_keys: 2,
+            max_keys: 1,
+            carry_windows: 2,
             ..FilterSettings::default()
         },
     );
@@ -661,14 +748,16 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
     let mut before: Vec<Truth> = truth.clone();
     let mut touched: Vec<usize> = vec![];
     // Since the last delivery the filter could check: touched objects, and whether a bulk
-    // window (keys lost) came.
+    // window (keys lost) came. Some may have been trimmed from the carry instead of checked.
     let mut unchecked: Vec<usize> = vec![];
     let mut bulk_unchecked = false;
-    // Keys the viewer was told exist (an insert or update frame, or a confirmed view) and not
-    // told gone since.
+    // Keys the viewer was told exist (an insert or update frame, or a view confirmed after
+    // every checked window that could have changed it) and not told gone since.
     let mut shown: HashSet<String> = HashSet::new();
-    // Keys a check found gone from the viewer since: no delete may follow until shown again.
+    // Keys found gone from the viewer since (checked, or trimmed unchecked): no delete may
+    // follow until shown again.
     let mut gone: HashSet<String> = HashSet::new();
+    let mut open: Option<OpenView> = None;
 
     for step in steps {
         match step {
@@ -708,6 +797,45 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                         shown.insert(k);
                     }
                 }
+            }
+            Step::Ask { mask } => {
+                let keys: Vec<String> = (0..OBJECTS)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| ks(&ids[i]))
+                    .collect();
+                let ask = filter.ask_keys(2, &keys, false).unwrap();
+                open = Some(OpenView {
+                    ask,
+                    keys,
+                    seen: None,
+                    stale: HashSet::new(),
+                    all: false,
+                });
+            }
+            Step::Run => {
+                if let Some(o) = open.as_mut().filter(|o| o.seen.is_none()) {
+                    o.seen = Some(o.ask.run().await);
+                }
+            }
+            Step::Land => {
+                let Some(mut o) = open.take() else {
+                    continue;
+                };
+                let seen = match o.seen.take() {
+                    Some(seen) => seen,
+                    None => o.ask.run().await,
+                };
+                // Confirmed by an answer no checked window has overtaken (`stale` stays empty
+                // when it ran just now): the viewer may hold these as on its screen.
+                if let Ok(answers) = &seen {
+                    for (k, visible) in o.keys.iter().zip(answers) {
+                        if *visible && !o.all && !o.stale.contains(k) {
+                            gone.remove(k);
+                            shown.insert(k.clone());
+                        }
+                    }
+                }
+                filter.set_view(2, &o.ask, o.keys.clone(), seen);
             }
             Step::Deliver { bulk, starved } => {
                 let mut w = RelWindow {
@@ -782,18 +910,24 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
                         }
                     }
                 }
-                // Everything carried so far was checked now: what the viewer was shown and no
-                // longer sees is gone (a bulk window re-checks everything it was shown).
+                // Everything carried so far was checked now, or trimmed from the carry: what the
+                // viewer was shown and no longer sees is gone (a bulk window re-checks everything
+                // it was shown).
                 let checked: Vec<String> = if bulk_unchecked {
                     shown.iter().cloned().collect()
                 } else {
                     unchecked.iter().map(|&i| ks(&ids[i])).collect()
                 };
-                for k in checked {
-                    if shown.contains(&k) && !visible(&k) {
-                        shown.remove(&k);
-                        gone.insert(k);
+                for k in &checked {
+                    if shown.contains(k) && !visible(k) {
+                        shown.remove(k);
+                        gone.insert(k.clone());
                     }
+                }
+                // An open view's answer no longer speaks for what these windows changed.
+                if let Some(o) = open.as_mut().filter(|o| o.seen.is_some()) {
+                    o.all |= bulk_unchecked;
+                    o.stale.extend(unchecked.iter().map(|&i| ks(&ids[i])));
                 }
                 unchecked.clear();
                 bulk_unchecked = false;
@@ -804,14 +938,17 @@ async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("STORAGE_MODEL_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(512),
+        ..ProptestConfig::default()
+    })]
 
     /// The invariant over interleavings: frames only for keys checked visible to the viewer in
     /// its bucket (inserts, updates), keyed deletes only for keys it was shown and that weren't
-    /// checked gone since, nothing keyless, nothing while starved.
+    /// found gone since, nothing keyless, nothing while starved.
     #[test]
     fn storage_frames_derive_only_from_keys_checked_visible_in_the_bucket(
-        steps in proptest::collection::vec(step(), 1..40),
+        steps in proptest::collection::vec(step(), 1..48),
     ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
