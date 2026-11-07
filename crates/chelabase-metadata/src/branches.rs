@@ -465,6 +465,16 @@ impl MetadataClient {
         // (they take only a key-share lock through the FK), so a concurrent add/remove may or
         // may not reach the child.
         copy_guard_exemptions(&mut tx, b.parent_branch_id.as_uuid(), b.id.as_uuid()).await?;
+        // Unlike the exemptions, an exact copy: every function write on the parent takes the
+        // database row `FOR SHARE`, which the lock above excludes. A failure (a parent secret
+        // that doesn't open, no secrets key) rolls the whole create back.
+        crate::functions::copy_branch_functions(
+            &mut tx,
+            self.secrets_key.as_deref(),
+            b.parent_branch_id.as_uuid(),
+            b.id.as_uuid(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(CreateBranchOutcome::Created)
     }
@@ -922,8 +932,10 @@ impl MetadataClient {
         })
     }
 
-    /// Clears owner_password_enc, sets deleted_at.
+    /// Clears owner_password_enc, sets deleted_at, and purges the branch's function state
+    /// (active deployments, secrets, schedules, triggers), in one transaction.
     pub async fn mark_branch_deleted(&self, id: BranchId) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE branches
              SET status = 'deleted', deleted_at = now(), updated_at = now(),
@@ -931,8 +943,10 @@ impl MetadataClient {
              WHERE id = $1",
         )
         .bind(id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        crate::functions::purge_branch_functions(&mut tx, &[id.as_uuid()]).await?;
+        tx.commit().await?;
         Ok(())
     }
 
