@@ -81,20 +81,28 @@ describe("LandingPage", () => {
     const section = screen.getByRole("region", { name: "Everything in one place." });
     const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace(/Coming soon|Soon/g, ""));
     expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
-    expect(names.slice(-2)).toEqual(["CLI", "Object storage"]);
+    expect(names.slice(-2)).toEqual(["Object storage", "CLI"]);
     const gateway = within(section).getByRole("link", { name: /^Gateway/ });
     expect(gateway.getAttribute("href")).toBe(`${DOCS}/architecture/gateway`);
-    expect(within(section).getAllByRole("link")).toHaveLength(names.length - 2);
+    expect(within(section).getAllByRole("link")).toHaveLength(names.length - 1);
   });
 
-  it("labels_the_cli_and_object_storage_coming_soon_without_links", () => {
+  it("labels_the_cli_coming_soon_without_a_link", () => {
     renderPage();
-    for (const name of ["CLI", "Object storage"]) {
-      const card = screen.getByRole("heading", { level: 3, name: new RegExp(`^${name}`) }).parentElement!;
-      expect(card.tagName).not.toBe("A");
-      expect(card).toHaveTextContent(/coming soon/i);
+    const card = screen.getByRole("heading", { level: 3, name: /^CLI/ }).parentElement!;
+    expect(card.tagName).not.toBe("A");
+    expect(card).toHaveTextContent(/coming soon/i);
+  });
+
+  it("links_object_storage_to_its_docs_and_says_what_shipped", () => {
+    renderPage();
+    const section = screen.getByRole("region", { name: "Everything in one place." });
+    const card = within(section).getByRole("link", { name: /^Object storage/ });
+    expect(card.getAttribute("href")).toBe(`${DOCS}/using/storage`);
+    expect(card).not.toHaveTextContent(/coming soon|not available/i);
+    for (const shipped of [/S3-compatible/, /row-level security/, /signed and public URLs/, /Studio/, /typed client/, /webhooks/]) {
+      expect(card).toHaveTextContent(shipped);
     }
-    expect(screen.getByRole("heading", { level: 3, name: /^Object storage/ }).parentElement).toHaveTextContent(/SeaweedFS/);
   });
 
   it("marks_the_comparison_as_a_preview_without_numbers", () => {
@@ -120,6 +128,8 @@ describe("LandingPage", () => {
     expect(table.textContent).not.toMatch(/to survey/i);
     const merge = rows.find((r) => within(r).getByRole("rowheader").textContent === "Schema merge between branches")!;
     expect(within(merge).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Partly", "No", "No", "No", "Yes"]);
+    const storage = rows.find((r) => within(r).getByRole("rowheader").textContent === "Object storage")!;
+    expect(within(storage).getAllByRole("cell")[0]).toHaveTextContent("Yes");
   });
 
   it("labels_the_branching_drawings_as_illustrations", () => {
