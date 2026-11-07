@@ -39,6 +39,8 @@ chelabase-secrets = { workspace = true }
 async-nats = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+# Storage webhooks (m18): their HMAC-SHA256 signatures.
+hmac = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
