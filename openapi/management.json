@@ -20657,6 +20657,17 @@
           "nullable": {
             "type": "boolean"
           },
+          "storage_ref": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StorageRefDesc",
+                "description": "When the column references a stored object (left out otherwise)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "type": {
             "type": "string"
           }
@@ -26464,6 +26475,60 @@
           }
         },
         "additionalProperties": false
+      },
+      "StorageRefDesc": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A `storage.object_ref`: the object's bucket id and name.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "ref"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An object's id: a single-column foreign key to `storage.objects(id)`.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "id"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An object's name in one bucket: a text column whose comment says\n`@storage_ref bucket=<bucket>`.",
+            "required": [
+              "bucket",
+              "kind"
+            ],
+            "properties": {
+              "bucket": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "path"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How a column references a stored object (object storage)."
       },
       "Table": {
         "type": "object",

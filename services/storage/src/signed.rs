@@ -290,24 +290,74 @@ pub fn public_url(branch: Uuid, database: &str, bucket: &str, name: &str) -> Str
     )
 }
 
-/// The refs' buckets and objects, as the caller (row level security on both tables decides):
-/// one row per ref the caller can read, numbered by its place (from 1) in the arrays. A ref
-/// whose bucket or object is missing or hidden has no row.
-const RESOLVE_SQL: &str = "SELECT r.ord, b.name, b.public, o.version_id, o.size, o.etag, o.content_type FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.uuid[]), pg_catalog.unnest($2::pg_catalog.text[])) WITH ORDINALITY AS r(bucket_id, name, ord) JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) r.bucket_id JOIN storage.objects o ON o.bucket_id OPERATOR(pg_catalog.=) r.bucket_id AND o.name OPERATOR(pg_catalog.=) r.name WHERE o.version_id IS NOT NULL AND o.size IS NOT NULL";
+/// The refs' buckets and objects, as the caller (row level security on both tables decides).
+/// `$1`..`$4` are the refs side by side (`bucket_id`, `bucket`, `name`, `id`; `NULL` where a
+/// ref's shape has no such field); one row per ref the caller can read, numbered by its place
+/// (from 1) in the arrays, with the object's own name. A ref whose bucket or object is missing
+/// or hidden has no row. Each shape is its own branch, so each joins on an index.
+const RESOLVE_SQL: &str = "WITH r AS (SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.uuid[]), pg_catalog.unnest($2::pg_catalog.text[]), pg_catalog.unnest($3::pg_catalog.text[]), pg_catalog.unnest($4::pg_catalog.uuid[])) WITH ORDINALITY AS r(bucket_id, bucket, name, id, ord)) \
+SELECT r.ord, b.name, b.public, o.name, o.version_id, o.size, o.etag, o.content_type FROM r JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) r.bucket_id JOIN storage.objects o ON o.bucket_id OPERATOR(pg_catalog.=) r.bucket_id AND o.name OPERATOR(pg_catalog.=) r.name WHERE o.version_id IS NOT NULL AND o.size IS NOT NULL \
+UNION ALL SELECT r.ord, b.name, b.public, o.name, o.version_id, o.size, o.etag, o.content_type FROM r JOIN storage.buckets b ON b.name OPERATOR(pg_catalog.=) r.bucket JOIN storage.objects o ON o.bucket_id OPERATOR(pg_catalog.=) b.id AND o.name OPERATOR(pg_catalog.=) r.name WHERE o.version_id IS NOT NULL AND o.size IS NOT NULL \
+UNION ALL SELECT r.ord, b.name, b.public, o.name, o.version_id, o.size, o.etag, o.content_type FROM r JOIN storage.objects o ON o.id OPERATOR(pg_catalog.=) r.id JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) o.bucket_id WHERE o.version_id IS NOT NULL AND o.size IS NOT NULL";
 
-/// One `storage.object_ref` value: an object by its bucket's id and its name.
+/// An object by its bucket's id and its name: a `storage.object_ref` value.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectRef {
+pub struct BucketIdRef {
     pub bucket_id: Uuid,
     pub name: String,
+}
+
+/// An object by its bucket's name and its name: a text column marked
+/// `@storage_ref bucket=<bucket>` holds the name.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BucketRef {
+    pub bucket: String,
+    pub name: String,
+}
+
+/// An object by its id: a column with a foreign key to `storage.objects(id)`.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdRef {
+    pub id: Uuid,
+}
+
+/// One object to resolve, named one of three ways.
+#[derive(Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ObjectRef {
+    BucketId(BucketIdRef),
+    Bucket(BucketRef),
+    Id(IdRef),
+}
+
+impl ObjectRef {
+    /// The ref's columns in [`RESOLVE_SQL`]'s arrays: `(bucket_id, bucket, name, id)`.
+    fn columns(&self) -> (Option<Uuid>, Option<String>, Option<String>, Option<Uuid>) {
+        match self {
+            ObjectRef::BucketId(r) => (Some(r.bucket_id), None, Some(r.name.clone()), None),
+            ObjectRef::Bucket(r) => (None, Some(r.bucket.clone()), Some(r.name.clone()), None),
+            ObjectRef::Id(r) => (None, None, None, Some(r.id)),
+        }
+    }
+
+    /// A name no object can have: the ref stays null without being asked about.
+    fn unservable(&self) -> bool {
+        match self {
+            ObjectRef::BucketId(BucketIdRef { name, .. })
+            | ObjectRef::Bucket(BucketRef { name, .. }) => check_object_name(name).is_err(),
+            ObjectRef::Id(_) => false,
+        }
+    }
 }
 
 /// The refs to resolve, and the signed URLs' lifetime.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveBody {
-    /// At most 1000.
+    /// At most 1000, each `{bucket_id, name}`, `{bucket, name}` or `{id}`.
     pub refs: Vec<ObjectRef>,
     /// A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600.
     #[serde(default)]
@@ -320,7 +370,7 @@ pub struct ResolveBody {
     operation_id = "resolveObjects",
     tag = "storage",
     summary = "Resolve object refs to URLs",
-    description = "For each `storage.object_ref` (`bucket_id`, `name`), in order: a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
+    description = "For each ref, in order (`{bucket_id, name}` as a `storage.object_ref` holds it, `{bucket, name}` for a text column marked `@storage_ref bucket=`, or `{id}` for a foreign key to `storage.objects(id)`): a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
     params(ObjectParams),
     request_body = ResolveBody,
     security(("bearer" = [])),
@@ -344,10 +394,7 @@ pub async fn resolve<S: ConnSource, M: ConnSource>(
     check_console_ttl(ttl)?;
     let exp = now() + ttl as u64;
     let mut urls: Vec<Option<String>> = vec![None; refs.len()];
-    // A name no object can have stays null without being asked about.
-    let sent: Vec<usize> = (0..refs.len())
-        .filter(|&i| check_object_name(&refs[i].name).is_ok())
-        .collect();
+    let sent: Vec<usize> = (0..refs.len()).filter(|&i| !refs[i].unservable()).collect();
     if sent.is_empty() {
         return Ok(Json(json!({ "urls": urls, "expires_at": exp })).into_response());
     }
@@ -355,13 +402,19 @@ pub async fn resolve<S: ConnSource, M: ConnSource>(
         .engine
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
-    let ids: Vec<Uuid> = sent.iter().map(|&i| refs[i].bucket_id).collect();
-    let names: Vec<String> = sent.iter().map(|&i| refs[i].name.clone()).collect();
+    let (mut bucket_ids, mut buckets, mut names, mut ids) = (vec![], vec![], vec![], vec![]);
+    for &i in &sent {
+        let (bucket_id, bucket, name, id) = refs[i].columns();
+        bucket_ids.push(bucket_id);
+        buckets.push(bucket);
+        names.push(name);
+        ids.push(id);
+    }
     // The OID in the same transaction as the rows: it decides the blobs' keys, as in `find`.
     let ((rows, oid), _) = state
         .caller(&data, &at, &rid, async |c, _| {
             let rows = c
-                .query(RESOLVE_SQL, &[&ids, &names])
+                .query(RESOLVE_SQL, &[&bucket_ids, &buckets, &names, &ids])
                 .await
                 .map_err(pg(&rid))?;
             let oid: i64 = c.query_one(DATOID_SQL, &[]).await.map_err(pg(&rid))?.get(0);
@@ -379,17 +432,21 @@ pub async fn resolve<S: ConnSource, M: ConnSource>(
             continue;
         };
         let bucket: String = row.get(1);
-        let name = refs[i].name.clone();
+        // The object's own name (an id ref names none): one no URL can carry stays null.
+        let name: String = row.get(3);
+        if check_object_name(&name).is_err() {
+            continue;
+        }
         let url = if row.get::<_, Option<bool>>(2).unwrap_or(false) {
             public_url(data.branch_id, &at.database, &bucket, &name)
         } else {
             let found = Found {
                 datoid,
-                version: row.get(3),
-                size: row.get(4),
-                etag: row.get::<_, Option<String>>(5).unwrap_or_default(),
+                version: row.get(4),
+                size: row.get(5),
+                etag: row.get::<_, Option<String>>(6).unwrap_or_default(),
                 content_type: row
-                    .get::<_, Option<String>>(6)
+                    .get::<_, Option<String>>(7)
                     .unwrap_or_else(|| "application/octet-stream".into()),
                 owner: None,
             };
@@ -799,6 +856,39 @@ mod tests {
             (err.0.status.as_u16(), err.0.code),
             (400, "invalid_request")
         );
+    }
+
+    /// #102: a ref names an object one way: `{bucket_id, name}` (a `storage.object_ref`),
+    /// `{bucket, name}` (a text column's bucket and name) or `{id}` (a foreign key to
+    /// `storage.objects(id)`); a mix, an unknown field or a partial ref is 400.
+    #[test]
+    fn a_ref_names_an_object_one_way() {
+        let b = "00000000-0000-0000-0000-0000000000b1";
+        let refs = |refs: Value| serde_json::from_value::<ResolveBody>(json!({ "refs": refs }));
+        let got = refs(json!([
+            { "bucket_id": b, "name": "a.png" },
+            { "bucket": "avatars", "name": "u1/me.png" },
+            { "id": b },
+        ]))
+        .unwrap()
+        .refs;
+        assert!(
+            matches!(&got[0], ObjectRef::BucketId(r) if r.bucket_id.to_string() == b && r.name == "a.png")
+        );
+        assert!(
+            matches!(&got[1], ObjectRef::Bucket(r) if r.bucket == "avatars" && r.name == "u1/me.png")
+        );
+        assert!(matches!(&got[2], ObjectRef::Id(r) if r.id.to_string() == b));
+        for bad in [
+            json!([{ "bucket_id": b, "name": "a", "id": b }]),
+            json!([{ "bucket": "x", "bucket_id": b, "name": "a" }]),
+            json!([{ "name": "a" }]),
+            json!([{ "bucket": "x" }]),
+            json!([{ "id": "nope" }]),
+            json!([{ "id": b, "extra": 1 }]),
+        ] {
+            assert!(refs(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     /// #102: a readable object in a public bucket resolves to its public URL on the branch,

@@ -153,6 +153,20 @@ pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFai
     }
 }
 
+/// A row delete's failure: a foreign key violation (23503) can only be a user table's key to
+/// `storage.objects(id)` (#102; nothing in the storage schema references an object), so it is
+/// 409 `referenced` ([`Failure::object_referenced`]). Anything else is left as it was.
+pub fn deleted_failure(f: QueryFailure) -> Failure {
+    if f.sqlstate.as_deref() == Some(FOREIGN_KEY_VIOLATION) {
+        Failure::object_referenced()
+    } else {
+        Failure(f)
+    }
+}
+
+/// Postgres's foreign key violation.
+const FOREIGN_KEY_VIOLATION: &str = "23503";
+
 /// The row an upload or copy writes.
 pub(crate) struct Row {
     pub bucket: Uuid,
@@ -855,7 +869,8 @@ pub async fn head<S: ConnSource, M: ConnSource>(
 
 impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     /// Deletes the rows `names` of `bucket` as the caller; the names deleted. The blobs stay
-    /// for the sweeper (m8).
+    /// for the sweeper (m8), which deletes only blobs no row references: a delete a foreign key
+    /// refuses (409 `referenced`) deletes no row, so it keeps every blob.
     async fn delete_rows(
         &self,
         data: &DataIdentity,
@@ -874,7 +889,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                 let rows = c
                     .query("DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name", &[&bucket_id, &names])
                     .await
-                    .map_err(pg(rid))?;
+                    .map_err(|e| deleted_failure(pg(rid)(e)).0)?;
                 Ok(rows.iter().map(|r| r.get(0)).collect::<Vec<String>>())
             })
             .await?;
@@ -890,7 +905,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     summary = "Delete an object",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     security(("bearer" = [])),
-    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it (nothing is deleted)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -923,7 +938,7 @@ pub struct DeleteObjects {
     params(("bucket" = String, Path), ObjectParams),
     request_body = DeleteObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; nothing is deleted", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them. Either way nothing is deleted", body = StorageErrorEnvelope)),
 )]
 pub async fn delete_many<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1269,6 +1284,35 @@ mod tests {
         let mut f = QueryFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "x");
         f.sqlstate = Some(sqlstate.into());
         Failure(f)
+    }
+
+    /// #102: a delete a user's foreign key to `storage.objects(id)` refuses (23503) is 409
+    /// `referenced`, with a fixed message (never Postgres's, which names the user's table and
+    /// constraint); every other failure is left as it was.
+    #[test]
+    fn a_delete_refused_by_a_foreign_key_is_referenced() {
+        let fk = db_failure(
+            "23503",
+            "update or delete on table \"objects\" violates foreign key constraint \"secret_photo_fkey\" on table \"secret\"",
+            "r",
+        );
+        assert!(
+            fk.message.contains("secret"),
+            "the data API's mapping keeps the message: {}",
+            fk.message
+        );
+        let got = deleted_failure(fk);
+        assert_eq!(
+            (got.0.status, got.0.code, got.0.sqlstate.as_deref()),
+            (StatusCode::CONFLICT, "referenced", Some("23503"))
+        );
+        assert!(!got.0.message.contains("secret"), "{}", got.0.message);
+        assert_eq!(got.0.detail, None);
+        let once = db_failure(WRITE_ONCE, "frozen", "r");
+        assert_eq!(deleted_failure(once.clone()), Failure(once));
+        for other in ["23505", "42501", "40001"] {
+            assert_eq!(deleted_failure(failure(other).0), failure(other), "{other}");
+        }
     }
 
     /// The trigger's `CB003` keeps its SQLSTATE (the data API's mapping has no row for it and

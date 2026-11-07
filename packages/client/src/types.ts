@@ -17,6 +17,28 @@ export type Int8 = { readonly __chelabase: "int8" };
  */
 export type StorageRef = { bucket_id: string; name: string };
 
+/**
+ * A text column whose comment says `@storage_ref bucket=<B>`: an object's name in bucket `B`.
+ * It is a plain string (written and filtered as one); resolve it as `{ bucket: "<B>", name }`.
+ */
+export type StoragePath<B extends string = string> = string & { readonly __storageBucket?: B };
+
+/**
+ * A column with a foreign key to `storage.objects(id)`: an object's id. It is a plain string;
+ * resolve it as `{ id }`.
+ */
+export type StorageObjectId = string & { readonly __storageObject?: true };
+
+/**
+ * What `client.storage.resolve` takes, each naming an object one way: a `StorageRef`
+ * (`{ bucket_id, name }`), a bucket's name and an object's name (`{ bucket, name }`, for a
+ * `StoragePath`), or an object's id (`{ id }`, for a `StorageObjectId`).
+ */
+export type StorageRefLike =
+  | (StorageRef & { bucket?: never; id?: never })
+  | { bucket: string; name: string; bucket_id?: never; id?: never }
+  | { id: string; bucket_id?: never; bucket?: never; name?: never };
+
 /** The Postgres types whose JSON numbers the client reads from their exact source text. */
 export type PgExact = "int8" | "numeric";
 

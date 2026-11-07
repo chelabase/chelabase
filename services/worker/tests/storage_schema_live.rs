@@ -3511,7 +3511,7 @@ async fn storage_write_once_live() {
         assert_eq!(check().await, "f");
         assert_eq!(fx.code(OWNER, "DELETE FROM storage.objects WHERE name = 'c.txt'").await, "ok", "version 6 has no guard");
         bootstrap(fx).await;
-        assert_eq!(fx.value(stamp).await, "chelabase storage schema 7");
+        assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
         assert_eq!(check().await, "t");
         assert_eq!(fx.value("SELECT name || ' ' || public || ' ' || file_size_limit || ' ' || write_once FROM storage.buckets WHERE name = 'frozen'").await, "frozen true 10 false", "a migrated bucket starts ordinary");
         fx.owner("UPDATE storage.buckets SET write_once = true WHERE name = 'frozen'").await.unwrap();
@@ -4096,6 +4096,250 @@ COMMIT;"
         let (status, body) = resolve_refs(&secret, json!(many)).await;
         assert_eq!((status, &body["error"]["code"]), (400, &json!("invalid_request")), "{body}");
         assert_eq!(resolve_refs(&secret, json!([{ "bucket_id": "nope", "name": "a" }])).await.0, 400);
+    }))
+    .await;
+}
+
+/// #102, the other two forms: a text column whose comment says `@storage_ref bucket=` and a
+/// column with a foreign key to `storage.objects(id)` are described in the schema (only that
+/// hint, never the comment's text) and typed `StoragePath<…>` and `StorageObjectId`; a type
+/// merely named `object_ref` isn't a ref. `{bucket, name}` and `{id}` refs resolve in one
+/// batch under the same rule: an object the caller can't read (or a bucket it can't see) is
+/// `null`.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_forms_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_forms_live() {
+    with_fx(|fx| Box::pin(async move {
+        // The table first: the data API reads the schema on its first request here.
+        fx.owner(
+            "CREATE TYPE object_ref AS (x int);
+             CREATE TABLE docs (id int PRIMARY KEY, path text, photo uuid REFERENCES storage.objects(id), look object_ref);
+             COMMENT ON COLUMN docs.path IS 'The file, internal. @storage_ref bucket=files';
+             COMMENT ON COLUMN docs.photo IS 'internal photo note';
+             GRANT SELECT, INSERT ON docs TO authenticated;",
+        )
+        .await
+        .expect("the docs table");
+        let secret = fx.secret_key("st-ref-forms", None).await;
+        let public = fx.public_key().await;
+        for b in ["files", "closed"] {
+            fx.bucket(b).await;
+        }
+        for (name, table, command, using, check) in [
+            ("b_select", "buckets", "SELECT", "'name <> ''closed'''", "NULL"),
+            ("o_select", "objects", "SELECT", "'name NOT LIKE ''hidden/%'''", "NULL"),
+            ("o_insert", "objects", "INSERT", "NULL", "'true'"),
+        ] {
+            fx.owner(&format!(
+                "SELECT storage.create_policy('{name}', '{table}', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for (path, body) in [("files/a.txt", "v1"), ("files/hidden/x.txt", "h")] {
+            let (status, _, b) = object("POST", &format!("/storage/v1/object/{path}"), &secret, Some(body.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
+            assert_eq!(status, 200, "{path}: {}", json_of(&b));
+        }
+        let closed = fx.value("SELECT id FROM storage.buckets WHERE name = 'closed'").await;
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage;
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role)
+  VALUES ('00000000-0000-0000-0000-0000000000f2', '{closed}', 'c.txt', 1, 'e', now() + interval '5 minutes', 'chelabase_storage');
+INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('{closed}', 'c.txt', 1, 'e', '00000000-0000-0000-0000-0000000000f2');
+COMMIT;"
+        ))
+        .await;
+        let by_name = "SELECT id FROM storage.objects WHERE name =";
+        let a = fx.value(&format!("{by_name} 'a.txt'")).await;
+        let hidden = fx.value(&format!("{by_name} 'hidden/x.txt'")).await;
+        let in_closed = fx.value(&format!("{by_name} 'c.txt'")).await;
+
+        // The schema names each form, and only the hint: no comment text.
+        let (status, _, schema) = object("GET", "/data/v1/schema", &secret, None, &[]).await;
+        let schema_text = String::from_utf8_lossy(&schema).to_string();
+        assert_eq!(status, 200, "{schema_text}");
+        let schema: Value = serde_json::from_str(&schema_text).unwrap();
+        let cols = &schema["schemas"]["public"]["tables"]["docs"]["columns"];
+        assert_eq!(cols["path"]["storage_ref"], json!({ "kind": "path", "bucket": "files" }), "{cols}");
+        assert_eq!(cols["photo"]["storage_ref"], json!({ "kind": "id" }), "{cols}");
+        assert!(cols["look"].get("storage_ref").is_none(), "{cols}");
+        assert!(cols["id"].get("storage_ref").is_none(), "{cols}");
+        assert!(!schema_text.contains("internal"), "{schema_text}");
+        // The public key's role can't reach docs: nothing of it is described.
+        let (status, _, anon) = object("GET", "/data/v1/schema", &public, None, &[]).await;
+        let anon: Value = serde_json::from_slice(&anon).unwrap();
+        assert_eq!(status, 200, "{anon}");
+        assert!(anon["schemas"]["public"]["tables"].get("docs").is_none(), "{anon}");
+
+        // The generated types.
+        let (status, _, ts) = object("GET", "/data/v1/types", &secret, None, &[]).await;
+        let ts = String::from_utf8_lossy(&ts);
+        assert_eq!(status, 200, "{ts}");
+        for line in ["path: StoragePath<\"files\"> | null;", "photo: StorageObjectId | null;", "look: string | null;"] {
+            assert!(ts.contains(line), "{line}\n{ts}");
+        }
+        assert!(ts.contains("import type { StorageObjectId, StoragePath, TypeMap } from \"@chelabase/client\";"), "{ts}");
+
+        // Both forms round-trip through the query API as plain strings.
+        let (status, body) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "insert", "into": "docs", "values": [{ "id": 1, "path": "a.txt", "photo": a }],
+        })))
+        .await;
+        assert!((200..300).contains(&status), "insert: {status} {body}");
+        let (status, rows) = storage("POST", "/data/v1/query", &secret, Some(json!({
+            "v": 1, "op": "select", "from": "docs", "select": ["path", "photo"],
+        })))
+        .await;
+        assert_eq!((status, rows), (200, json!([{ "path": "a.txt", "photo": a }])));
+
+        // One batch of id and bucket-name refs, in order; unreadable ones are null.
+        let refs = json!([
+            { "id": a },
+            { "id": hidden },
+            { "id": in_closed },
+            { "id": "00000000-0000-0000-0000-000000000000" },
+            { "bucket": "files", "name": "a.txt" },
+            { "bucket": "files", "name": "hidden/x.txt" },
+            { "bucket": "closed", "name": "c.txt" },
+            { "bucket": "nope", "name": "a.txt" },
+            { "bucket": "files", "name": "../a.txt" },
+        ]);
+        let (status, body) = resolve_refs(&secret, refs.clone()).await;
+        assert_eq!(status, 200, "{body}");
+        let urls = body["urls"].as_array().expect("urls").clone();
+        assert_eq!(urls.len(), 9, "{body}");
+        for i in [1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(urls[i], Value::Null, "slot {i}: {body}");
+        }
+        for i in [0, 4] {
+            let url = urls[i].as_str().unwrap_or_else(|| panic!("slot {i}: {body}"));
+            assert!(url.starts_with("/storage/v1/object/sign/files/a.txt?token="), "{url}");
+            let (status, _, got) = keyless("GET", url, None).await;
+            assert_eq!((status, &got[..]), (200, &b"v1"[..]), "slot {i}");
+        }
+        // The public key's role reads nothing: every slot null, not an error.
+        let (status, body) = resolve_refs(&public, refs).await;
+        assert_eq!((status, body["urls"].as_array().map(Vec::len)), (200, Some(9)), "{body}");
+        assert!(body["urls"].as_array().unwrap().iter().all(Value::is_null), "{body}");
+        // A ref naming an object two ways is 400; so is a 1001st id ref.
+        assert_eq!(resolve_refs(&secret, json!([{ "id": a, "bucket": "files", "name": "a.txt" }])).await.0, 400);
+        let many: Vec<Value> = (0..1001).map(|_| json!({ "id": a })).collect();
+        assert_eq!(resolve_refs(&secret, json!(many)).await.0, 400);
+    }))
+    .await;
+}
+
+/// #102: the database owner (no superuser) adds foreign keys to `storage.objects(id)`, its one
+/// privilege there (`REFERENCES (id)`, which the schema check knows and a reinstall keeps).
+/// A delete such a key refuses is 409 `referenced`, nothing deleted (the row, and so its blob,
+/// stays); `ON DELETE SET NULL` lets it through. A move or an overwrite keeps the object's id,
+/// so neither is refused. A version-7 schema (no grant) gets it from the bootstrap, and the
+/// foreign keys made before survive the reinstall.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_foreign_key_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_foreign_key_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        const TEXT: (&str, &str) = ("content-type", "text/plain");
+        let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
+        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+        let privileges = "SELECT has_column_privilege('postgres', 'storage.objects', 'id', 'REFERENCES')::text || ' '
+            || has_column_privilege('postgres', 'storage.objects', 'name', 'REFERENCES')::text || ' '
+            || has_column_privilege('postgres', 'storage.objects', 'bucket_id', 'REFERENCES')::text || ' '
+            || has_table_privilege('postgres', 'storage.buckets', 'REFERENCES')::text";
+        assert_eq!(fx.value(privileges).await, "true false false false", "only REFERENCES (id)");
+
+        // The owner's own tables, no superuser involved; the database stays healthy.
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        fx.owner("SELECT storage.create_policy('b_delete', 'buckets', 'DELETE', ARRAY['authenticated']::name[], 'true', NULL)")
+            .await
+            .unwrap();
+        fx.owner(
+            "CREATE TABLE pins (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id));
+             CREATE TABLE loose (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE SET NULL);",
+        )
+        .await
+        .expect("the owner's foreign keys to storage.objects(id)");
+        assert!(
+            fx.owner_err("CREATE TABLE by_name (b uuid, n text, FOREIGN KEY (b, n) REFERENCES storage.objects(bucket_id, name))").await.contains("permission denied"),
+            "no other column"
+        );
+        assert_eq!(check().await, "t", "the grant and the foreign keys are the install's to allow");
+
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        let call = async |method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]| {
+            let (status, b) = raw(&base, &token, method, path, body, headers).await;
+            (status, json_of(&b))
+        };
+        let up = |name: &str| format!("/storage/v1/object/files/{name}");
+        for (name, body) in [("a.txt", "one"), ("b.txt", "two")] {
+            let (status, b) = call("POST", &up(name), body.as_bytes().to_vec(), &[TEXT]).await;
+            assert_eq!(status, 200, "{name}: {b}");
+        }
+        let id_of = |name: &'static str| async move { fx.value(&format!("SELECT id FROM storage.objects WHERE name = '{name}'")).await };
+        let (a, b) = (id_of("a.txt").await, id_of("b.txt").await);
+        fx.owner(&format!("INSERT INTO pins VALUES (1, '{a}'); INSERT INTO loose VALUES (1, '{b}');")).await.unwrap();
+
+        // A referenced object isn't deleted: 409 `referenced`, no table name; row and blob stay.
+        let (status, got) = call("DELETE", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone(), got["error"]["sqlstate"].clone()), (409, json!("referenced"), json!("23503")), "{got}");
+        assert!(!got.to_string().contains("pins"), "{got}");
+        // Several at once: one referenced refuses them all.
+        let (status, got) = call("DELETE", "/storage/v1/object/files", json!({ "names": ["b.txt", "a.txt"] }).to_string().into_bytes(), &[JSON]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("referenced")), "{got}");
+        assert_eq!(fx.value("SELECT string_agg(name, ',' ORDER BY name) FROM storage.objects").await, "a.txt,b.txt");
+        let (status, got) = raw(&base, &token, "GET", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]), "the blob stays");
+
+        // ON DELETE SET NULL: deleted, the column nulled.
+        assert_eq!(call("DELETE", &up("b.txt"), vec![], &[]).await.0, 204);
+        assert_eq!(fx.value("SELECT coalesce(photo::text, 'null') FROM loose").await, "null");
+
+        // A move and an overwrite keep the id: neither is refused, the reference follows.
+        let (status, got) = call("POST", "/storage/v1/object/move", json!({ "bucket": "files", "from": "a.txt", "to": "a2.txt" }).to_string().into_bytes(), &[JSON]).await;
+        assert!((200..300).contains(&status), "move: {status} {got}");
+        let (status, got) = call("POST", &up("a2.txt"), b"one again".to_vec(), &[TEXT, ("x-upsert", "true")]).await;
+        assert_eq!(status, 200, "overwrite: {got}");
+        assert_eq!(id_of("a2.txt").await, a);
+        assert_eq!(fx.value("SELECT o.name FROM pins p JOIN storage.objects o ON o.id = p.photo").await, "a2.txt");
+        // A bucket holding it is not empty, as before.
+        let (status, got) = call("DELETE", "/storage/v1/bucket/files", vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("bucket_not_empty")), "{got}");
+
+        // A grant the install doesn't make shows as tampering, and the bootstrap heals it.
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_admin; GRANT REFERENCES (name) ON storage.objects TO postgres; COMMIT;").await;
+        assert_eq!(check().await, "f", "REFERENCES (name)");
+        bootstrap(fx).await;
+        assert_eq!((check().await, fx.value(privileges).await), ("t".to_string(), "true false false false".to_string()));
+
+        // Version 7 (no grant): the owner can't add one; the bootstrap brings the grant, and
+        // the foreign keys made before are still enforced after the reinstall.
+        fx.admin(
+            "BEGIN; SET LOCAL ROLE chelabase_admin; REVOKE REFERENCES (id) ON storage.objects FROM postgres;
+             COMMENT ON SCHEMA storage IS 'chelabase storage schema 7'; COMMIT;",
+        )
+        .await;
+        assert_eq!(fx.value(privileges).await, "false false false false");
+        assert!(fx.owner_err("CREATE TABLE later (photo uuid REFERENCES storage.objects(id))").await.contains("permission denied"));
+        assert_eq!(check().await, "f");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_ne!(storage_schema::STORAGE_SCHEMA_STAMP, "chelabase storage schema 7");
+        assert_eq!((check().await, fx.value(privileges).await), ("t".to_string(), "true false false false".to_string()));
+        fx.owner("CREATE TABLE later (photo uuid REFERENCES storage.objects(id))").await.expect("after the upgrade");
+        let (status, got) = call("DELETE", &up("a2.txt"), vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("referenced")), "the old foreign key survived: {got}");
+        fx.owner("DELETE FROM pins").await.unwrap();
+        assert_eq!(call("DELETE", &up("a2.txt"), vec![], &[]).await.0, 204);
     }))
     .await;
 }

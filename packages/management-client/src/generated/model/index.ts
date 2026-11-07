@@ -259,6 +259,7 @@ export * from './storageListObjectsParams.ts';
 export * from './storageListPartsParams.ts';
 export * from './storageMoveObjectParams.ts';
 export * from './storagePutObjectParams.ts';
+export * from './storageRefDesc.ts';
 export * from './storageSignObjectParams.ts';
 export * from './storageUpdateBucketParams.ts';
 export * from './storageUploadObjectParams.ts';

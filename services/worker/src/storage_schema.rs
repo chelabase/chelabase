@@ -16,6 +16,11 @@
 //!   visible or writable until the owner adds policies through `storage.create_policy` /
 //!   `storage.drop_policy` (`SECURITY DEFINER`, owned by `chelabase_admin`, executable by the
 //!   owner only).
+//! - The owner holds `REFERENCES (id)` on `storage.objects` (#102, version 8), its only table
+//!   privilege there, so its tables may declare a foreign key to an object. Such a key can
+//!   refuse a delete of the object (storage answers 409 `referenced`) unless it says
+//!   `ON DELETE SET NULL` or `CASCADE`; a move or an overwrite keeps the id. Postgres never
+//!   ties a constraint to the grant, so the reinstall's revoke-and-grant keeps the keys.
 //! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS) is the storage service's own login
 //!   (m5), locked down on every run like the data API's `chelabase_admin`: attributes (LOGIN,
 //!   [`STORAGE_CONNECTION_LIMIT`], no expiry), exactly the branch's password verifier
@@ -98,10 +103,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 7;
+pub const STORAGE_SCHEMA_VERSION: u32 = 8;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 7";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 8";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -398,6 +403,7 @@ GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, ve
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;
 GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;
+GRANT REFERENCES (id) ON storage.objects TO {owner};
 CREATE OR REPLACE FUNCTION storage.guard_tickets() RETURNS trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
 $f${GUARD_TICKETS_BODY}$f$;
@@ -673,7 +679,8 @@ UNION ALL SELECT pg_catalog.format('DROP POLICY IF EXISTS %I ON storage.upload_t
 
 /// Every ACL entry on `storage` and the objects in it, but the owners' own: `(target,
 /// grantor, grantee, is_grantable, allowed)`, `target` as `REVOKE ALL <target> FROM …` takes
-/// it, `allowed` the grantees the install grants there.
+/// it, `allowed` the grantees the install grants there (`REFERENCES` on `storage.objects(id)`:
+/// the database owner only, #102).
 fn acl_entries_sql() -> String {
     let ns = "pg_catalog.to_regnamespace('storage')";
     let tables = "CASE WHEN c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['upload_tickets', 'upload_sessions']::pg_catalog.name[]) THEN ARRAY['chelabase_storage'] ELSE ARRAY['anon', 'authenticated', 'chelabase_storage'] END";
@@ -682,7 +689,9 @@ fn acl_entries_sql() -> String {
     FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a WHERE n.oid OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) n.nspowner \
   UNION ALL SELECT 'ON TABLE ' OPERATOR(pg_catalog.||) c.oid::pg_catalog.regclass::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, {tables} \
     FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
-  UNION ALL SELECT pg_catalog.format('(%I) ON TABLE %s', t.attname, c.oid::pg_catalog.regclass), a.grantor, a.grantee, a.is_grantable, {tables} \
+  UNION ALL SELECT pg_catalog.format('(%I) ON TABLE %s', t.attname, c.oid::pg_catalog.regclass), a.grantor, a.grantee, a.is_grantable, \
+      CASE WHEN c.relname OPERATOR(pg_catalog.=) 'objects' AND t.attname OPERATOR(pg_catalog.=) 'id' AND a.privilege_type OPERATOR(pg_catalog.=) 'REFERENCES' \
+        THEN ARRAY['{{owner}}'] ELSE {tables} END \
     FROM pg_catalog.pg_attribute t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.attrelid, pg_catalog.aclexplode(t.attacl) a \
     WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
   UNION ALL SELECT 'ON ROUTINE ' OPERATOR(pg_catalog.||) p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, \
@@ -1184,9 +1193,15 @@ mod tests {
     /// schema; `SELECT` for `anon`; `authenticated` writes every object column a caller
     /// declares, the managed ones included (so RLS policies see them; the ticket trigger
     /// vouches for them); tickets only for the storage role. Nobody gets `TRUNCATE`,
-    /// `TRIGGER`, `REFERENCES`, a grant option or anything on the tickets but the storage role.
+    /// `TRIGGER`, a grant option or anything on the tickets but the storage role; `REFERENCES`
+    /// only the owner, only on `storage.objects(id)` (#102: a foreign key to an object).
     #[test]
     fn storage_schema_grants_let_callers_declare_managed_columns() {
+        // #102's grant came with version 8, so a version-7 schema is reinstalled.
+        assert_eq!(
+            (STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP),
+            (8, "chelabase storage schema 8")
+        );
         let sql = sql();
         assert!(
             sql.contains("REVOKE ALL ON SCHEMA storage FROM PUBLIC;"),
@@ -1204,10 +1219,14 @@ mod tests {
                 sql.find(grant).unwrap() > reset_at,
                 "granted before the reset: {grant}"
             );
+            // #102: the one REFERENCES, the owner's on objects' id (a user table's foreign key
+            // to storage.objects(id)).
+            let owner_references =
+                *grant == "GRANT REFERENCES (id) ON storage.objects TO \"postgres\";";
             assert!(
                 !grant.contains("TRUNCATE")
                     && !grant.contains("TRIGGER")
-                    && !grant.contains("REFERENCES")
+                    && (!grant.contains("REFERENCES") || owner_references)
                     && !grant.contains("GRANT OPTION")
                     && !grant.contains(" ALL "),
                 "{grant}"
@@ -1231,6 +1250,7 @@ mod tests {
                 "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;",
                 "GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;",
                 "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;",
+                "GRANT REFERENCES (id) ON storage.objects TO \"postgres\";",
             ]
         );
         for column in MANAGED_COLUMNS {
@@ -1589,6 +1609,10 @@ mod tests {
             assert!(objects.contains(part), "{part}: {objects}");
         }
         let acl = foreign_acl_sql("postgres");
+        assert!(
+            acl.contains("WHEN c.relname OPERATOR(pg_catalog.=) 'objects' AND t.attname OPERATOR(pg_catalog.=) 'id' AND a.privilege_type OPERATOR(pg_catalog.=) 'REFERENCES' THEN ARRAY['postgres']"),
+            "only the owner's REFERENCES (id) is allowed: {acl}"
+        );
         for part in [
             "x.is_grantable",
             "x.grantor OPERATOR(pg_catalog.<>) ALL",
@@ -2188,8 +2212,16 @@ mod tests {
     /// is), executable by nobody and firing always; checked and healed like the others.
     #[test]
     fn storage_schema_write_once_is_enforced_by_the_database() {
-        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (7, "chelabase storage schema 7"));
-        assert_eq!(stamp_version(STORAGE_SCHEMA_STAMP), Some(7));
+        const {
+            assert!(
+                STORAGE_SCHEMA_VERSION >= 7,
+                "write_once came with version 7"
+            )
+        };
+        assert_eq!(
+            stamp_version(STORAGE_SCHEMA_STAMP),
+            Some(STORAGE_SCHEMA_VERSION)
+        );
         let sql = sql();
         let buckets = between(&sql, "CREATE TABLE IF NOT EXISTS storage.buckets (", ");");
         assert!(buckets.contains("write_once boolean NOT NULL DEFAULT false"), "{buckets}");

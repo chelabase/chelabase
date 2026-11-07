@@ -1750,6 +1750,7 @@ mod tests {
             "SequencePrivilege",
             "SkipReason",
             "StatementResult",
+            "StorageRefDesc",
             "Table",
             "TableDesc",
             "TableGrant",

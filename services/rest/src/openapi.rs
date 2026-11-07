@@ -291,6 +291,7 @@ mod tests {
             "SchemaEntry",
             "SelectItem",
             "SelectRequest",
+            "StorageRefDesc",
             "TableDesc",
             "TableKind",
             "TableName",

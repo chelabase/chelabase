@@ -4,7 +4,7 @@ import { SESSION_GONE, USER_HEADER } from "./auth.ts";
 import { NO_REDIRECTS } from "./error.ts";
 import { StorageError, toStorageError } from "./storage-errors.ts";
 import { downloadParam, encodeName, queryOf, type StorageContext } from "./storage-lazy.ts";
-import type { StorageRef } from "./types.ts";
+import type { StorageRefLike } from "./types.ts";
 
 // --- public types ----------------------------------------------------------------------
 
@@ -263,13 +263,15 @@ export interface StorageClient {
   /** See `createBucket`. Only an empty bucket (409 `conflict` otherwise). */
   deleteBucket(name: string): Promise<void>;
   /**
-   * URLs for `storage.object_ref` values, in one request: a signed URL (as `createSignedUrl`)
-   * for each object the caller can read, a public bucket's public URL, and `null` for a ref
-   * the caller can't read (missing, or hidden by row level security) or a `null` ref. An
-   * array resolves in input order (at most 1000 refs); an empty one sends no request.
+   * URLs for stored-object references, in one request: a `StorageRef` (a `storage.object_ref`
+   * column), `{ bucket, name }` (a `StoragePath` column) or `{ id }` (a `StorageObjectId`
+   * column). A signed URL (as `createSignedUrl`) for each object the caller can read, a public
+   * bucket's public URL, and `null` for a ref the caller can't read (missing, or hidden by row
+   * level security) or a `null` ref. An array resolves in input order (at most 1000 refs); an
+   * empty one sends no request.
    */
-  resolve(ref: StorageRef | null | undefined, opts?: ResolveOptions): Promise<string | null>;
-  resolve(refs: readonly (StorageRef | null | undefined)[], opts?: ResolveOptions): Promise<(string | null)[]>;
+  resolve(ref: StorageRefLike | null | undefined, opts?: ResolveOptions): Promise<string | null>;
+  resolve(refs: readonly (StorageRefLike | null | undefined)[], opts?: ResolveOptions): Promise<(string | null)[]>;
 }
 
 // --- transport -------------------------------------------------------------------------
