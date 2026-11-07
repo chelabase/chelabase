@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
     let rt_events: Arc<dyn orchestrator::internal::realtime::RtEvents> = Arc::new(nats.clone());
     // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
-    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::WEBHOOKS_ENV, |name| std::env::var(name).ok())
         .map_err(anyhow::Error::msg)?;
     for entry in webhooks.allow_hosts_with_port() {
         warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
