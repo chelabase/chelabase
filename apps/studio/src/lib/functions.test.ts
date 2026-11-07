@@ -1,7 +1,6 @@
 import { ApiError } from "@chelabase/management-client";
 import { describe, expect, it } from "vitest";
 import {
-  NIL_UUID,
   curlFor,
   effectiveEnabled,
   functionErrorText,
@@ -123,7 +122,6 @@ describe("errors", () => {
     expect(isPlatformModeRefusal(new ApiError(403, "not_available_in_platform_mode", "no"))).toBe(true);
     expect(isPlatformModeRefusal(new ApiError(403, "forbidden", "no"))).toBe(false);
     expect(isPlatformModeRefusal(new Error("x"))).toBe(false);
-    expect(NIL_UUID).toBe("00000000-0000-0000-0000-000000000000");
   });
 
   it("explains_the_409_reasons", () => {

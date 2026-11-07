@@ -104,14 +104,21 @@ describe("canUseSql", () => {
 });
 
 describe("hiddenRailItems", () => {
-  it("hides_functions_in_platform_mode_only", () => {
-    expect(hiddenRailItems(meAs("developer") as never, { functionsUnavailable: false })).toEqual([]);
-    expect(hiddenRailItems(meAs("developer") as never, { functionsUnavailable: true })).toEqual(["functions"]);
+  const withFunctions = (me: object, functions_available: boolean | undefined) => ({ ...me, functions_available }) as never;
+
+  it("hides_functions_when_me_says_unavailable", () => {
+    expect(hiddenRailItems(withFunctions(meAs("developer"), true))).toEqual([]);
+    expect(hiddenRailItems(withFunctions(meAs("developer"), false))).toEqual(["functions"]);
+  });
+
+  it("keeps_functions_until_me_says_otherwise", () => {
+    // Not loaded yet, or a response from before the field: shown (the API still refuses in platform mode).
+    expect(hiddenRailItems(withFunctions(meAs("developer"), undefined))).toEqual([]);
+    expect(hiddenRailItems(undefined)).toEqual(["sql"]);
   });
 
   it("hides_sql_for_a_viewer_alongside", () => {
-    expect(hiddenRailItems(meAs("viewer") as never, { functionsUnavailable: false })).toEqual(["sql"]);
-    expect(hiddenRailItems(meAs("viewer") as never, { functionsUnavailable: true })).toEqual(["sql", "functions"]);
-    expect(hiddenRailItems(undefined, { functionsUnavailable: false })).toEqual(["sql"]);
+    expect(hiddenRailItems(withFunctions(meAs("viewer"), true))).toEqual(["sql"]);
+    expect(hiddenRailItems(withFunctions(meAs("viewer"), false))).toEqual(["sql", "functions"]);
   });
 });

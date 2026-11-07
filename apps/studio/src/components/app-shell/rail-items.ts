@@ -20,7 +20,7 @@ export const RAIL_ENTRIES: readonly RailEntry[] = [
   // Shown wherever the table editor is: Viewers browse buckets read-only.
   { kind: "link", id: "storage", label: "Storage", to: "/app/storage", icon: FolderArchive },
   { kind: "link", id: "data-api", label: "Data API", to: "/app/data-api", icon: KeyRound },
-  // Hidden in platform mode, where the functions API answers 403.
+  // Hidden in platform mode (`/v1/me` reports `functions_available: false`).
   { kind: "link", id: "functions", label: "Functions", to: "/app/functions", icon: Zap },
   { kind: "link", id: "api", label: "API reference", to: "/app/api", icon: BookOpenText },
   { kind: "link", id: "members", label: "Members", to: "/app/members", icon: Users },
@@ -50,10 +50,11 @@ export function canUseSql(me: MeResponse | undefined): boolean {
 
 /**
  * The rail items left out for this caller: the SQL editor for someone who isn't a Developer
- * anywhere, and Functions when the instance has none (platform mode).
+ * anywhere, and Functions when `/v1/me` says the instance has none (platform mode). Until `/v1/me`
+ * has loaded, Functions stays.
  */
-export function hiddenRailItems(me: MeResponse | undefined, opts: { functionsUnavailable: boolean }): RailLink["id"][] {
-  return [...(canUseSql(me) ? [] : (["sql"] as const)), ...(opts.functionsUnavailable ? (["functions"] as const) : [])];
+export function hiddenRailItems(me: MeResponse | undefined): RailLink["id"][] {
+  return [...(canUseSql(me) ? [] : (["sql"] as const)), ...(me?.functions_available === false ? (["functions"] as const) : [])];
 }
 
 /** Counts shown on rail items (Members: sign-up requests waiting for a tenant admin). */

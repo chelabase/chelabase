@@ -1,5 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
-import { ApiError, listFunctions, type FunctionAuth } from "@chelabase/management-client";
+import { ApiError, type FunctionAuth } from "@chelabase/management-client";
 import { errorText } from "./errors";
 import { actAsReserved } from "./role-rules";
 
@@ -90,31 +89,4 @@ export function functionErrorText(err: unknown): string {
     if (reason === "managed_key") return "That key is a function's run-as key: change it through the function's run-as role.";
   }
   return errorText(err);
-}
-
-export const NIL_UUID = "00000000-0000-0000-0000-000000000000";
-
-/**
- * Whether functions are off on this instance (platform mode). `/v1/me` doesn't say, so this asks
- * the functions API once: it checks availability before anything else, so a listing for the nil
- * database and branch answers 403 `not_available_in_platform_mode` in platform mode and a 403 or
- * 404 of another kind otherwise. Unknown (loading, or a network failure) counts as available.
- */
-export function useFunctionsUnavailable(enabled: boolean): boolean {
-  const probe = useQuery({
-    queryKey: ["studio", "functions-availability"],
-    queryFn: async () => {
-      try {
-        await listFunctions(NIL_UUID, NIL_UUID);
-        return false;
-      } catch (err) {
-        return isPlatformModeRefusal(err);
-      }
-    },
-    enabled,
-    staleTime: Infinity,
-    gcTime: Infinity,
-    retry: false,
-  });
-  return probe.data === true;
 }
