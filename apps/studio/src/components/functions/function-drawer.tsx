@@ -61,8 +61,8 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
   return (
     <DialogPrimitive.Root open onOpenChange={(open) => !open && onClose()}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Backdrop className="fixed inset-0 bg-black/40" />
-        <DialogPrimitive.Popup className="fixed top-0 right-0 h-full w-[34rem] max-w-full space-y-4 overflow-y-auto border-l border-line-strong bg-background p-6 text-foreground shadow-lg">
+        <DialogPrimitive.Backdrop className="fixed inset-0 z-40 bg-black/40" />
+        <DialogPrimitive.Popup className="fixed top-0 right-0 z-40 h-full w-[34rem] max-w-full space-y-4 overflow-y-auto border-l border-line-strong bg-background p-6 text-foreground shadow-lg">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 space-y-1">
               <DialogPrimitive.Title className="font-mono text-lg font-semibold break-all">{fn.name}</DialogPrimitive.Title>
