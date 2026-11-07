@@ -262,11 +262,13 @@ else
   bad "pin-images.sh refused a storage digests file"
 fi
 
-# Storage before its first pin (main after the object-storage epic): its compose default is the
-# tag `unpublished` and .env.example has no pin for it.
+# An image before its first pin (storage between the object-storage epic and its pin PR): its
+# compose default is the tag `unpublished`, .env.example has no pin for it, and
+# compose-image-pins.sh lists it in `unpublished`.
 unpublish() { # unpublish <image>
   sed -i -E "s#(/$1:\\\$\{CHELABASE_IMAGE_TAG:-)[^}]*\}#\1unpublished}#" infra/compose/docker-compose.yml
   sed -i "\#^\# ghcr.io/chelabase/$1:#d" infra/compose/.env.example
+  sed -i -E "s#^unpublished=\(.*\)\$#unpublished=($1)#" scripts/tests/compose-image-pins.sh
 }
 case_ unpublish storage
 grep -q '/storage:${CHELABASE_IMAGE_TAG:-unpublished}$' infra/compose/docker-compose.yml && ok "fixture: storage unpublished" ||
@@ -298,8 +300,9 @@ if scripts/pin-images.sh "$work/digests" >"$work/out" 2>&1; then
 else
   bad "pin-images.sh refused storage's first pin: $(cat "$work/out")"
 fi
-# Only an image that isn't published yet may be unpublished.
+# Only an image listed in `unpublished` may be unpublished: gateway isn't (storage is).
 case_ unpublish gateway
+sed -i -E 's#^unpublished=\(.*\)$#unpublished=(storage)#' scripts/tests/compose-image-pins.sh
 if scripts/tests/compose-image-pins.sh >"$work/out" 2>&1; then bad "compose-image-pins.sh accepted gateway unpublished"; else
   has "compose-image-pins.sh rejects a published image left unpublished" "gateway" "$(cat "$work/out")"
 fi
