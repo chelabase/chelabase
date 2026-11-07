@@ -711,7 +711,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     security(("bearer" = [])),
     responses(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
-        (status = 400, description = "`invalid_request`", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first; `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
@@ -740,7 +740,7 @@ pub async fn upload<S: ConnSource, M: ConnSource>(
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer" = [])),
-    responses((status = 200, description = "As POST", body = Value)),
+    responses((status = 200, description = "As POST", body = Value), (status = 400, description = "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope)),
 )]
 pub async fn put<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1043,7 +1043,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     summary = "Delete an object",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     security(("bearer" = [])),
-    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Deleted"), (status = 400, description = "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)", body = StorageErrorEnvelope), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1076,7 +1076,7 @@ pub struct DeleteObjects {
     params(("bucket" = String, Path), ObjectParams),
     request_body = DeleteObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 400, description = "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes), or `names` lists 0 or over 1000 objects", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete_many<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1105,6 +1105,18 @@ pub struct Relocate {
     pub to_bucket: Option<String>,
 }
 
+impl Relocate {
+    /// 400 unless every bucket this relocation writes has a name the API allows
+    /// ([`check_object_bucket`]). A copy writes only the destination, so an off-grammar source
+    /// (readable) is fine; a move writes the source too.
+    fn check_buckets(&self, writes_source: bool) -> Result<(), Failure> {
+        if writes_source {
+            check_object_bucket(&self.bucket)?;
+        }
+        check_object_bucket(self.to_bucket.as_deref().unwrap_or(&self.bucket))
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/storage/v1/object/copy",
@@ -1115,7 +1127,7 @@ pub struct Relocate {
     params(ObjectParams),
     request_body = Relocate,
     security(("bearer" = [])),
-    responses((status = 200, description = "`version_id` of the copy", body = Value), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing is written", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`version_id` of the copy", body = Value), (status = 400, description = "`invalid_request`: the destination bucket is outside the grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit); the source may be, since a copy only reads it", body = StorageErrorEnvelope), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing is written", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
 )]
 pub async fn copy<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1125,10 +1137,7 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     let r = body(json)?;
-    check_object_bucket(&r.bucket)?;
-    if let Some(to_bucket) = &r.to_bucket {
-        check_object_bucket(to_bucket)?;
-    }
+    r.check_buckets(false)?;
     check_object_name(&r.from)?;
     check_object_name(&r.to)?;
     let at = state
@@ -1193,7 +1202,7 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
     params(ObjectParams),
     request_body = Relocate,
     security(("bearer" = [])),
-    responses((status = 204, description = "Moved"), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "`conflict`: the destination exists; `write_once`: the source's bucket is write-once", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing changes", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Moved"), (status = 400, description = "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes) (the source or the destination)", body = StorageErrorEnvelope), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "`conflict`: the destination exists; `write_once`: the source's bucket is write-once", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing changes", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
 )]
 pub async fn r#move<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1203,10 +1212,7 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     let r = body(json)?;
-    check_object_bucket(&r.bucket)?;
-    if let Some(to_bucket) = &r.to_bucket {
-        check_object_bucket(to_bucket)?;
-    }
+    r.check_buckets(true)?;
     check_object_name(&r.from)?;
     check_object_name(&r.to)?;
     let at = state
@@ -1443,6 +1449,24 @@ pub async fn list<S: ConnSource, M: ConnSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m18 audit N9: a copy writes only its destination, so an off-grammar source bucket
+    /// (readable) is fine when the destination is valid; a move writes the source too.
+    #[test]
+    fn a_copy_checks_only_its_destination_and_a_move_both() {
+        let rel = |bucket: &str, to: Option<&str>| Relocate {
+            bucket: bucket.into(),
+            from: "a".into(),
+            to: "b".into(),
+            to_bucket: to.map(Into::into),
+        };
+        assert!(rel("Docs", Some("docs")).check_buckets(false).is_ok());
+        assert!(rel("Docs", Some("docs")).check_buckets(true).is_err());
+        assert!(rel("docs", Some("Docs")).check_buckets(false).is_err());
+        assert!(rel("Docs", None).check_buckets(false).is_err());
+        assert!(rel("Docs", None).check_buckets(true).is_err());
+        assert!(rel("docs", Some("more")).check_buckets(true).is_ok());
+    }
 
     fn failure(sqlstate: &str) -> Failure {
         let mut f = QueryFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "x");

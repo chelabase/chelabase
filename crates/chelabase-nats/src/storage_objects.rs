@@ -34,8 +34,9 @@ pub const MAX_NAME_BYTES: usize = 1024;
 pub const MAX_BUCKET_BYTES: usize = 63;
 
 /// The longest `Content-Type` an upload may declare (the storage service answers 400 above
-/// it). Its grammar is RFC 9110 tokens only, so JSON escapes nothing in it; an event carries a
-/// stored type longer than this (written with SQL) as absent.
+/// it). Its grammar is RFC 9110 tokens and spaces around `;` (never a tab), so JSON escapes
+/// nothing in it and the byte count is the JSON length; an event carries a stored type longer
+/// than this (written with SQL) as absent.
 pub const MAX_CONTENT_TYPE_BYTES: usize = 255;
 
 /// The longest `actor.sub` an event carries, counted as JSON writes it (escapes included): the

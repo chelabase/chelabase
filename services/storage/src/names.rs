@@ -137,9 +137,10 @@ pub fn parse_content_type(content_type: &str) -> Option<(String, Vec<(String, St
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
     };
-    // Optional whitespace around `;` only (space or tab).
+    // Optional whitespace around `;` is spaces only: a tab is two bytes in JSON, and the byte
+    // cap must equal the JSON length.
     fn ows(s: &str) -> &str {
-        s.trim_matches([' ', '\t'])
+        s.trim_matches(' ')
     }
     let mut parts = content_type.split(';');
     let (kind, sub) = ows(parts.next()?).split_once('/')?;
@@ -381,6 +382,20 @@ mod tests {
         let refused = check_content_type(&long).unwrap_err().0;
         assert_eq!((refused.status.as_u16(), refused.code), (400, "invalid_request"));
         assert!(check_content_type(&format!("image/png; x={}", "a".repeat(6000))).is_err());
+    }
+
+    /// m18 audit S3: optional whitespace around `;` is spaces only, so the byte cap equals the
+    /// JSON length (JSON writes a tab as two bytes) and an accepted type always fits its event.
+    #[test]
+    fn a_tab_padded_content_type_is_refused_and_a_space_padded_one_fits_the_event() {
+        let tabs = format!("image/png{};x=y", "\t".repeat(255 - "image/png;x=y".len()));
+        assert_eq!(tabs.len(), 255);
+        assert_eq!(check_content_type(&tabs).unwrap_err().0.status.as_u16(), 400);
+        assert!(check_content_type("image/png;\tx=y").is_err());
+        let spaces = format!("image/png{};x=y", " ".repeat(255 - "image/png;x=y".len()));
+        assert_eq!(spaces.len(), 255);
+        assert!(check_content_type(&spaces).is_ok());
+        assert_eq!(serde_json::to_string(&spaces).unwrap().len() - 2, 255);
     }
 
     #[test]

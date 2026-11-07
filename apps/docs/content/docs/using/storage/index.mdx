@@ -30,13 +30,19 @@ A bucket is a row of `storage.buckets`:
 
 | Column | Default | What it does |
 |---|---|---|
-| `name` | required | Unique per database. Objects are addressed as `/{bucket}/{name}`. |
+| `name` | required | Unique per database. Objects are addressed as `/{bucket}/{name}`. 1 to 63 characters from `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit ([bucket names](#bucket-names)). |
 | `public` | `false` | Objects are served without a key at their [public path](/using/storage/urls#public-urls). |
 | `file_size_limit` | none | The largest object, in bytes. Larger uploads, copies and moves into the bucket are refused with 413 `too_large`. |
 | `allowed_mime_types` | none | A list such as `["image/png", "image/*"]`. An upload must declare an allowed type, and its first bytes must be recognised as one too; otherwise 415 `mime_not_allowed`. |
 | `write_once` | `false` | See [Write-once buckets](#write-once-buckets). |
 
 Creating, changing and deleting a bucket runs as the caller like everything else, so it needs an `INSERT`, `UPDATE` or `DELETE` policy on `storage.buckets`. In practice that's a secret key on a server, or the owner in Studio. A bucket that still holds objects can't be deleted (409 `bucket_not_empty`).
+
+### Bucket names
+
+The API creates and renames buckets only under this grammar: 1 to 63 characters from `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit. `list`, `copy`, `move`, `sign`, `public`, `upload`, `resolve` and `session` are reserved.
+
+`storage.buckets.name` is plain text, so SQL can create a bucket outside the grammar (`Docs`, `user files`, a name over 63 bytes). Such a bucket can be read, listed and downloaded, but every object write or delete through the API answers 400 `invalid_request`: uploads, upload URLs, resumable uploads, deletes, moves, and copies into it. A copy out of it into a valid bucket is allowed, since a copy writes only its destination. Remove its objects with SQL, or create a bucket under a valid name and copy them across.
 
 Every object route needs the caller to **see the bucket**: a `SELECT` policy on `storage.buckets` that shows it. Without one, the bucket is 404 `bucket_not_found` (missing and hidden look the same).
 

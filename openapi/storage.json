@@ -396,6 +396,16 @@
               }
             }
           },
+          "400": {
+            "description": "`invalid_request`: the destination bucket is outside the grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit); the source may be, since a copy only reads it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "404": {
             "description": "The source is missing or hidden",
             "content": {
@@ -566,6 +576,16 @@
         "responses": {
           "204": {
             "description": "Moved"
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes) (the source or the destination)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
           },
           "404": {
             "description": "The source is missing or hidden",
@@ -1204,7 +1224,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`",
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1291,6 +1311,16 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes), or `names` lists 0 or over 1000 objects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
               }
             }
           },
@@ -1508,6 +1538,16 @@
                 "schema": {}
               }
             }
+          },
+          "400": {
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1594,7 +1634,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`",
+            "description": "`invalid_request`, or a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1734,6 +1774,16 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
           },
           "404": {
             "description": "`object_not_found`: missing, or hidden",
@@ -1994,7 +2044,7 @@
             }
           },
           "400": {
-            "description": "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last",
+            "description": "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last; `invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2260,6 +2310,16 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a bucket whose name is outside the API's grammar (1 to 63 of `a-z 0-9 . _ -`, starting with a letter or digit; made with SQL: readable, but takes no object writes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
               }
             }
           },
