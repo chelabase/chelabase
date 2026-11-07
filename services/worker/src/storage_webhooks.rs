@@ -19,7 +19,7 @@
 //! with the endpoint's secret (its UTF-8 bytes, `whsec_…`). The body is the event as JSON; every
 //! attempt of an event has the same `id` (also in `Chelabase-Event-Id`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,8 +47,9 @@ pub const EVENT_TYPE_HEADER: &str = "chelabase-event-type";
 /// Each request's whole time.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// An event is retried for this long after it happened, then dropped.
-pub const MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
-/// An endpoint failing for this long running is disabled.
+pub const MAX_AGE: chrono::TimeDelta = chelabase_metadata::STORAGE_WEBHOOK_RETRY_WINDOW;
+/// An endpoint failing for this long running is disabled (a run ends at a success, or after a
+/// quiet spell longer than [`MAX_AGE`]: see [`chelabase_metadata::FailureRun`]).
 pub const DISABLE_AFTER: chrono::TimeDelta = chrono::TimeDelta::hours(72);
 /// The first retry's delay; each next one doubles, up to [`BACKOFF_CAP`].
 pub const BACKOFF_BASE: Duration = Duration::from_secs(5);
@@ -246,7 +247,7 @@ pub async fn send(
     let request = match client.post(url) {
         Ok(request) => request,
         Err(refused) => {
-            warn!(webhook_url_host = %host_of(url), "webhook refused: {refused}");
+            warn!(webhook_url_host = %host_of(url), "webhook refused: {}", refused.log_detail());
             return Sent {
                 outcome: AttemptOutcome::Refused,
                 status: None,
@@ -277,7 +278,8 @@ pub async fn send(
             }
         }
         Err(e) => Sent {
-            outcome: if refused_by_guard(&e).is_some() {
+            outcome: if let Some(refused) = refused_by_guard(&e) {
+                warn!(webhook_url_host = %host_of(url), "webhook refused: {}", refused.log_detail());
                 AttemptOutcome::Refused
             } else if e.is_timeout() {
                 AttemptOutcome::Timeout
@@ -378,14 +380,15 @@ impl<S: AttemptStore> Delivery<S> {
     }
 }
 
-/// A test event for `webhook`: type `webhook.test`, now, as the database's own; no object.
+/// A test event for `webhook`: type `webhook.test`, now, as the database's own; no object and
+/// no branch (`branch_id` is the nil uuid).
 pub fn test_event(webhook: &StorageWebhook, now: DateTime<Utc>) -> ObjectEvent {
     ObjectEvent {
         id: Uuid::new_v4(),
         kind: ObjectEventType::Test,
         time: now,
         database_id: webhook.database_id,
-        branch_id: webhook.database_id,
+        branch_id: Uuid::nil(),
         pg_database: String::new(),
         bucket: webhook.bucket.clone().unwrap_or_default(),
         name: webhook.prefix.clone().unwrap_or_default(),
@@ -484,12 +487,14 @@ async fn reconcile(
     targets: Vec<DeliveryTarget>,
 ) {
     let mut wanted = HashMap::new();
+    let mut held = HashSet::new();
     for t in targets {
+        let name = storage_objects::endpoint_consumer_name(t.webhook.id, t.webhook.enabled_since);
         let Ok(secret) = open_webhook_secret(key, t.webhook.id, &t.secret_enc) else {
-            warn!(webhook = %t.webhook.id, "storage webhook skipped: its secret doesn't open");
+            warn!(webhook = %t.webhook.id, "storage webhook paused: its secret doesn't open (its consumer and pending retries are kept)");
+            held.insert(name);
             continue;
         };
-        let name = storage_objects::endpoint_consumer_name(t.webhook.id, t.webhook.enabled_since);
         wanted.insert(
             name,
             Arc::new(Live {
@@ -498,14 +503,12 @@ async fn reconcile(
             }),
         );
     }
-    let gone: Vec<String> = running
-        .keys()
-        .filter(|n| !wanted.contains_key(*n))
-        .cloned()
-        .collect();
-    for name in gone {
+    for (name, delete) in to_stop(running.keys(), &wanted, &held) {
         if let Some(r) = running.remove(&name) {
             r.task.abort();
+        }
+        if !delete {
+            continue;
         }
         if let Err(e) = js
             .delete_consumer_from_stream(&name, storage_objects::STREAM)
@@ -526,6 +529,22 @@ async fn reconcile(
             }
         }
     }
+}
+
+/// The running endpoints to stop: every one no longer wanted, each with whether its consumer
+/// is deleted too. A held endpoint (still enabled, its secret not opening) keeps its consumer,
+/// so its position and pending retries survive until the secret opens again.
+fn to_stop<'a, T>(
+    running: impl Iterator<Item = &'a String>,
+    wanted: &HashMap<String, T>,
+    held: &HashSet<String>,
+) -> Vec<(String, bool)> {
+    let mut stop: Vec<(String, bool)> = running
+        .filter(|n| !wanted.contains_key(*n))
+        .map(|n| (n.clone(), !held.contains(n)))
+        .collect();
+    stop.sort();
+    stop
 }
 
 /// One endpoint's consumer, consumed until the task is stopped (again after [`POLL`] when it
@@ -862,11 +881,43 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
+    /// The metadata's attempt bookkeeping, in memory: the same failure-run rule
+    /// ([`chelabase_metadata::FailureRun`]).
     struct FakeStore {
         attempts: Mutex<Vec<(Uuid, StorageWebhookAttempt)>>,
-        failing_since: Mutex<Option<DateTime<Utc>>>,
+        run: Mutex<(chelabase_metadata::FailureRun, Option<DateTime<Utc>>)>,
         disabled: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+    }
+
+    impl Default for FakeStore {
+        fn default() -> Self {
+            Self {
+                attempts: Mutex::default(),
+                run: Mutex::new((
+                    chelabase_metadata::FailureRun {
+                        failing_since: None,
+                        consecutive_failures: 0,
+                    },
+                    None,
+                )),
+                disabled: Mutex::default(),
+            }
+        }
+    }
+
+    impl FakeStore {
+        /// Failing since `since`, the last attempt at `last`.
+        fn failing(since: DateTime<Utc>, last: DateTime<Utc>) -> Arc<Self> {
+            let store = Self::default();
+            *store.run.lock().unwrap() = (
+                chelabase_metadata::FailureRun {
+                    failing_since: Some(since),
+                    consecutive_failures: 1,
+                },
+                Some(last),
+            );
+            Arc::new(store)
+        }
     }
 
     impl AttemptStore for Arc<FakeStore> {
@@ -875,17 +926,16 @@ mod tests {
             webhook: Uuid,
             attempt: &'a StorageWebhookAttempt,
         ) -> Fut<'a, Option<DateTime<Utc>>> {
-            let mut failing = self.failing_since.lock().unwrap();
-            if attempt.outcome == "delivered" {
-                *failing = None;
-            } else if failing.is_none() {
-                *failing = Some(attempt.attempted_at);
-            }
+            let mut run = self.run.lock().unwrap();
+            let next = run
+                .0
+                .after(run.1, attempt.outcome == "delivered", attempt.attempted_at);
+            *run = (next, Some(attempt.attempted_at));
             self.attempts
                 .lock()
                 .unwrap()
                 .push((webhook, attempt.clone()));
-            let out = *failing;
+            let out = next.failing_since;
             Box::pin(std::future::ready(Ok(out)))
         }
 
@@ -1060,9 +1110,8 @@ mod tests {
     #[tokio::test]
     async fn an_endpoint_failing_for_three_days_is_disabled() {
         let (port, _) = endpoint(&[503]).await;
-        let store = Arc::new(FakeStore::default());
         let now = Utc::now();
-        *store.failing_since.lock().unwrap() = Some(now - DISABLE_AFTER);
+        let store = FakeStore::failing(now - DISABLE_AFTER, now - BACKOFF_CAP);
         let d = local(store.clone());
         let mut w = webhook(&["object.created"], None, None);
         w.url = format!("http://127.0.0.1:{port}/hook");
@@ -1075,6 +1124,49 @@ mod tests {
             *store.disabled.lock().unwrap(),
             [(w.id, now - DISABLE_AFTER)]
         );
+    }
+
+    /// An endpoint that failed one event for a day (dropped), then had three quiet days, is
+    /// not disabled at its first failure back: that failure starts a new run.
+    #[tokio::test]
+    async fn a_failure_after_a_quiet_spell_starts_a_new_run_not_a_disable() {
+        let (port, _) = endpoint(&[502]).await;
+        let now = Utc::now();
+        let h = chrono::TimeDelta::hours;
+        let store = FakeStore::failing(now - h(96), now - h(72));
+        let d = local(store.clone());
+        let mut w = webhook(&["object.created"], None, None);
+        w.url = format!("http://127.0.0.1:{port}/hook");
+        let payload = serde_json::to_vec(&event(ObjectEventType::Created, "a", "b", now)).unwrap();
+        assert_eq!(
+            d.process(&w, SECRET, &payload, 1, now, 0.0).await,
+            Next::Retry(BACKOFF_BASE)
+        );
+        assert!(store.disabled.lock().unwrap().is_empty());
+        assert_eq!(store.run.lock().unwrap().0.failing_since, Some(now));
+    }
+
+    /// Reconciling stops what is no longer wanted; only a held endpoint (its secret not
+    /// opening) keeps its consumer and so its pending retries.
+    #[test]
+    fn a_held_endpoint_keeps_its_consumer() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let running = names(&["a", "b", "c"]);
+        let wanted: HashMap<String, ()> = [("a".to_string(), ())].into();
+        let held: HashSet<String> = ["b".to_string()].into();
+        assert_eq!(
+            to_stop(running.iter(), &wanted, &held),
+            [("b".to_string(), false), ("c".to_string(), true)]
+        );
+    }
+
+    /// A test event names its database and no branch (it comes from none).
+    #[test]
+    fn a_test_event_has_no_branch() {
+        let mut w = webhook(&["object.created"], None, None);
+        w.database_id = Uuid::new_v4();
+        let e = test_event(&w, at(0));
+        assert_eq!((e.database_id, e.branch_id), (w.database_id, Uuid::nil()));
     }
 
     /// AC 3 at delivery: a private target (registered before, or allowed then) is refused with

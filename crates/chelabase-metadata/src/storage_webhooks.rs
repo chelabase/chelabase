@@ -2,7 +2,7 @@
 //! delivery attempts. The sealed secret is read only by the worker ([`DeliveryTarget`]); no
 //! API type carries it.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
@@ -13,6 +13,45 @@ use crate::{MetadataClient, MetadataError};
 pub const STORAGE_WEBHOOK_CAP: i64 = 20;
 /// Attempts kept per endpoint (the newest).
 pub const STORAGE_WEBHOOK_ATTEMPTS_KEPT: i64 = 100;
+/// How long the worker retries an event before dropping it. While an endpoint keeps failing
+/// some event is always retrying, so attempts are never further apart than this: a longer
+/// quiet spell ends a run of failures.
+pub const STORAGE_WEBHOOK_RETRY_WINDOW: TimeDelta = TimeDelta::hours(24);
+
+/// An endpoint's run of failed attempts: when it started (`None`: not failing) and how many.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureRun {
+    pub failing_since: Option<DateTime<Utc>>,
+    pub consecutive_failures: i32,
+}
+
+impl FailureRun {
+    /// The run after an attempt at `at` (`delivered` or not), given this run and the time of
+    /// the endpoint's last attempt.
+    pub fn after(
+        self,
+        last_attempt_at: Option<DateTime<Utc>>,
+        delivered: bool,
+        at: DateTime<Utc>,
+    ) -> FailureRun {
+        if delivered {
+            return FailureRun {
+                failing_since: None,
+                consecutive_failures: 0,
+            };
+        }
+        if last_attempt_at.is_none_or(|last| at - last > STORAGE_WEBHOOK_RETRY_WINDOW) {
+            return FailureRun {
+                failing_since: Some(at),
+                consecutive_failures: 1,
+            };
+        }
+        FailureRun {
+            failing_since: Some(self.failing_since.unwrap_or(at)),
+            consecutive_failures: self.consecutive_failures.saturating_add(1),
+        }
+    }
+}
 
 macro_rules! columns {
     () => {
@@ -302,8 +341,9 @@ impl MetadataClient {
 
     /// Records an attempt and keeps only the newest [`STORAGE_WEBHOOK_ATTEMPTS_KEPT`]. `delivered`
     /// ends a run of failures; any other outcome starts one (`failing_since` set once) or
-    /// continues it. Returns the endpoint's `failing_since` after the attempt (`None`: the
-    /// endpoint is gone, or not failing).
+    /// continues it, unless the last attempt is older than the retry window: then it starts a
+    /// new one ([`FailureRun::after`]). Returns the endpoint's `failing_since` after the attempt
+    /// (`None`: the endpoint is gone, or not failing).
     pub async fn record_storage_webhook_attempt(
         &self,
         webhook: Uuid,
@@ -311,21 +351,33 @@ impl MetadataClient {
     ) -> Result<Option<DateTime<Utc>>, MetadataError> {
         let delivered = attempt.outcome == "delivered";
         let mut tx = self.pool.begin().await?;
-        let failing: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
-            "UPDATE storage_webhooks SET
-                failing_since = CASE WHEN $2 THEN NULL ELSE COALESCE(failing_since, $3) END,
-                consecutive_failures = CASE WHEN $2 THEN 0 ELSE consecutive_failures + 1 END,
-                last_attempt_at = $3
+        let Some(row) = sqlx::query(
+            "SELECT failing_since, consecutive_failures, last_attempt_at
+             FROM storage_webhooks WHERE id = $1 FOR UPDATE",
+        )
+        .bind(webhook)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let run = FailureRun {
+            failing_since: row.get("failing_since"),
+            consecutive_failures: row.get("consecutive_failures"),
+        }
+        .after(row.get("last_attempt_at"), delivered, attempt.attempted_at);
+        // As stored (microseconds): the value a later disable compares with.
+        let failing_since: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "UPDATE storage_webhooks
+             SET failing_since = $2, consecutive_failures = $3, last_attempt_at = $4
              WHERE id = $1 RETURNING failing_since",
         )
         .bind(webhook)
-        .bind(delivered)
+        .bind(run.failing_since)
+        .bind(run.consecutive_failures)
         .bind(attempt.attempted_at)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let Some(failing_since) = failing else {
-            return Ok(None);
-        };
         sqlx::query(
             "INSERT INTO storage_webhook_attempts
                 (webhook_id, event_id, event_type, attempt, outcome, status, duration_ms, attempted_at)
@@ -401,5 +453,62 @@ impl MetadataClient {
                 attempted_at: r.get("attempted_at"),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(hours: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap() + TimeDelta::hours(hours)
+    }
+
+    fn run(since: Option<i64>, n: i32) -> FailureRun {
+        FailureRun {
+            failing_since: since.map(at),
+            consecutive_failures: n,
+        }
+    }
+
+    /// A failure starts a run or continues it; a success ends it; a failure after a quiet
+    /// spell longer than the retry window starts a new run instead of continuing the old one
+    /// (which would disable a healthy endpoint at its first failure).
+    #[test]
+    fn a_quiet_spell_ends_a_failure_run() {
+        assert_eq!(run(None, 0).after(None, false, at(0)), run(Some(0), 1));
+        assert_eq!(
+            run(Some(0), 1).after(Some(at(0)), false, at(1)),
+            run(Some(0), 2)
+        );
+        assert_eq!(
+            run(Some(0), 2).after(Some(at(1)), true, at(2)),
+            run(None, 0)
+        );
+        // Failed for a day (its event dropped), then three quiet days: a new run.
+        assert_eq!(
+            run(Some(0), 30).after(Some(at(24)), false, at(96)),
+            run(Some(96), 1)
+        );
+        // Exactly the window apart still continues; a second more starts again.
+        let w = STORAGE_WEBHOOK_RETRY_WINDOW;
+        let last = at(10);
+        assert_eq!(
+            run(Some(0), 5).after(Some(last), false, last + w),
+            run(Some(0), 6)
+        );
+        let later = last + w + TimeDelta::seconds(1);
+        assert_eq!(
+            run(Some(0), 5).after(Some(last), false, later),
+            FailureRun {
+                failing_since: Some(later),
+                consecutive_failures: 1
+            }
+        );
+        // An attempt recorded out of order (concurrent deliveries) continues the run.
+        assert_eq!(
+            run(Some(0), 5).after(Some(at(10)), false, at(9)),
+            run(Some(0), 6)
+        );
     }
 }

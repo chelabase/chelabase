@@ -35,7 +35,9 @@ pub const ENV_ALLOW_HOSTS: &str = "CHELABASE_WEBHOOKS_ALLOW_HOSTS";
 pub const MAX_URL_LEN: usize = 2048;
 
 /// Why a URL or a connection was refused. Never carries the URL itself (its path or query may
-/// hold a token), only the host or address at fault.
+/// hold a token), only the host or address at fault. Its `Display` is what a user may see: it
+/// names the host as written, never an address the host resolved to (that would map the
+/// operator's internal DNS); [`Refused::log_detail`] adds the address, for logs only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     /// Not a valid absolute URL, or longer than [`MAX_URL_LEN`].
@@ -46,7 +48,8 @@ pub enum Refused {
     Credentials,
     /// The URL has no host.
     NoHost,
-    /// The host is, or resolves to, an address that isn't public.
+    /// The host is, or resolves to, an address that isn't public. `addr` is for logs only
+    /// ([`Refused::log_detail`]).
     NotPublic { host: String, addr: IpAddr },
     /// The host didn't resolve.
     Unresolved { host: String },
@@ -61,10 +64,24 @@ impl std::fmt::Display for Refused {
             Refused::Scheme => f.write_str("the URL must use https"),
             Refused::Credentials => f.write_str("the URL must not carry a user name or password"),
             Refused::NoHost => f.write_str("the URL has no host"),
-            Refused::NotPublic { host, addr } => {
-                write!(f, "{host} is not a public address ({addr})")
+            Refused::NotPublic { host, .. } if literal(host).is_some() => {
+                write!(f, "{host} is not a public address")
+            }
+            Refused::NotPublic { host, .. } => {
+                write!(f, "{host} resolves to a non-public address")
             }
             Refused::Unresolved { host } => write!(f, "{host} does not resolve"),
+        }
+    }
+}
+
+impl Refused {
+    /// The refusal with the address at fault, for the operator's logs only (never an API
+    /// answer).
+    pub fn log_detail(&self) -> String {
+        match self {
+            Refused::NotPublic { addr, .. } => format!("{self} ({addr})"),
+            _ => self.to_string(),
         }
     }
 }
@@ -97,6 +114,8 @@ impl HostLookup for SystemLookup {
 pub struct Outbound {
     allow_http: bool,
     allow_hosts: Arc<BTreeSet<String>>,
+    /// Allowlist entries with a port (kept only to warn about).
+    allow_hosts_ported: Arc<Vec<String>>,
     lookup: Arc<dyn HostLookup>,
 }
 
@@ -115,6 +134,7 @@ impl Outbound {
         Self {
             allow_http: false,
             allow_hosts: Arc::new(BTreeSet::new()),
+            allow_hosts_ported: Arc::new(Vec::new()),
             lookup: Arc::new(SystemLookup),
         }
     }
@@ -127,13 +147,13 @@ impl Outbound {
 
     /// Hosts (names or IP literals) that skip the address check.
     pub fn allow_hosts<I: IntoIterator<Item = S>, S: AsRef<str>>(mut self, hosts: I) -> Self {
-        self.allow_hosts = Arc::new(
-            hosts
-                .into_iter()
-                .map(|h| normalize_host(h.as_ref()))
-                .filter(|h| !h.is_empty())
-                .collect(),
-        );
+        let hosts: Vec<String> = hosts
+            .into_iter()
+            .map(|h| h.as_ref().trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self.allow_hosts_ported = Arc::new(hosts.iter().filter(|h| has_port(h)).cloned().collect());
+        self.allow_hosts = Arc::new(hosts.iter().map(|h| normalize_host(h)).collect());
         self
     }
 
@@ -157,6 +177,12 @@ impl Outbound {
             .allow_hosts(hosts.split(',').map(str::trim)))
     }
 
+    /// Allowlist entries that carry a port, as given: hosts are compared without one, so these
+    /// never match (the service warns at start).
+    pub fn allow_hosts_with_port(&self) -> Vec<&str> {
+        self.allow_hosts_ported.iter().map(String::as_str).collect()
+    }
+
     fn allowlisted(&self, host: &str) -> bool {
         self.allow_hosts.contains(&normalize_host(host))
     }
@@ -169,6 +195,10 @@ impl Outbound {
             return Err(Refused::Invalid);
         }
         let url = Url::parse(raw).map_err(|_| Refused::Invalid)?;
+        // Again as stored: percent-encoding and IDNA can make the normalized URL longer.
+        if url.as_str().len() > MAX_URL_LEN {
+            return Err(Refused::Invalid);
+        }
         match url.scheme() {
             "https" => {}
             "http" if self.allow_http => {}
@@ -237,6 +267,16 @@ impl Default for Outbound {
 /// The address a URL's host names, when it is an IP literal.
 fn literal(host: &str) -> Option<IpAddr> {
     normalize_host(host).parse().ok()
+}
+
+/// Whether an allowlist entry carries a port (`runner:8080`, `[::1]:80`); a bare IPv6 literal
+/// does not.
+fn has_port(entry: &str) -> bool {
+    let host = normalize_host(entry);
+    host.parse::<IpAddr>().is_err()
+        && host
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A host as compared with the allowlist: lower case, IPv6 brackets dropped.
@@ -379,12 +419,13 @@ impl PublicClient {
     }
 }
 
-/// Whether a send failed because the guard refused the host (as opposed to a network error).
-pub fn refused_by_guard(err: &reqwest::Error) -> Option<String> {
+/// Why the guard refused the host, when that is why a send failed (as opposed to a network
+/// error).
+pub fn refused_by_guard(err: &reqwest::Error) -> Option<Refused> {
     let mut source = std::error::Error::source(err);
     while let Some(e) = source {
         if let Some(refused) = e.downcast_ref::<Refused>() {
-            return Some(refused.to_string());
+            return Some(refused.clone());
         }
         source = e.source();
     }
@@ -780,6 +821,85 @@ mod tests {
         assert_eq!(resp.status(), 302);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(inner_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refusal the API shows names the host, never the address it resolved to (that would
+    /// map the operator's internal DNS); the address is only in the detail for logs. No other
+    /// refusal carries one either.
+    #[tokio::test]
+    async fn a_refusal_names_the_host_never_the_resolved_address() {
+        let fake = Fake::with(&[
+            ("db.internal", &[&["10.20.30.40"]]),
+            ("mixed.test", &[&["93.184.216.34", "fd00::7"]]),
+        ]);
+        let o = Outbound::new().with_lookup(fake);
+        let refused = o.check_resolved("https://db.internal/").await.unwrap_err();
+        let msg = refused.to_string();
+        assert!(!msg.contains("10.20.30.40"), "leaks: {msg}");
+        assert!(msg.contains("db.internal"), "{msg}");
+        assert!(
+            refused.log_detail().contains("10.20.30.40"),
+            "{}",
+            refused.log_detail()
+        );
+        let refused = o.check_resolved("https://mixed.test/x").await.unwrap_err();
+        assert!(!refused.to_string().contains("fd00"), "{refused}");
+        assert!(!refused.to_string().contains("93.184"), "{refused}");
+        // A literal names only what the user wrote (normalized), never anything resolved.
+        let literal = o.check_url("https://0x7f000001/").unwrap_err();
+        assert_eq!(literal.to_string(), "127.0.0.1 is not a public address");
+        for raw in [
+            "http://db.internal/",
+            "https://u:p@db.internal/",
+            "nope",
+            "https://nowhere.test/",
+        ] {
+            let r = match o.check_url(raw) {
+                Err(r) => r,
+                Ok(_) => o.check_resolved(raw).await.unwrap_err(),
+            };
+            assert!(!r.to_string().contains("10.20"), "{raw}: {r}");
+        }
+    }
+
+    /// The cap applies to the URL as it is stored (normalized), so an accepted URL always
+    /// fits: percent-encoding can triple its length.
+    #[test]
+    fn the_length_cap_applies_after_normalizing() {
+        let raw = format!("https://example.com/{}", "\u{e9}".repeat(1000));
+        assert!(raw.len() <= MAX_URL_LEN);
+        assert_eq!(Outbound::new().check_url(&raw), Err(Refused::Invalid));
+        let fits = format!("https://example.com/{}", "a".repeat(MAX_URL_LEN - 20));
+        assert_eq!(fits.len(), MAX_URL_LEN);
+        assert_eq!(
+            Outbound::new().check_url(&fits).unwrap().as_str().len(),
+            MAX_URL_LEN
+        );
+    }
+
+    /// An allowlist entry with a port can never match (hosts are compared without one): it is
+    /// reported so the service can warn at start. Bare IPv6 literals are not mistaken for one.
+    #[test]
+    fn allowlist_entries_with_a_port_are_reported() {
+        let o = Outbound::new().allow_hosts([
+            "runner:8080",
+            "10.0.0.5:9000",
+            "[::1]:80",
+            "::1",
+            "[fd00::1]",
+            "2001:db8::8080",
+            "runner",
+        ]);
+        assert_eq!(
+            o.allow_hosts_with_port(),
+            ["runner:8080", "10.0.0.5:9000", "[::1]:80"]
+        );
+        assert!(
+            Outbound::new()
+                .allow_hosts(["runner", "::1"])
+                .allow_hosts_with_port()
+                .is_empty()
+        );
     }
 
     #[test]
