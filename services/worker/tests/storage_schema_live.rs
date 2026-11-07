@@ -3511,7 +3511,7 @@ async fn storage_write_once_live() {
         assert_eq!(check().await, "f");
         assert_eq!(fx.code(OWNER, "DELETE FROM storage.objects WHERE name = 'c.txt'").await, "ok", "version 6 has no guard");
         bootstrap(fx).await;
-        assert_eq!(fx.value(stamp).await, "chelabase storage schema 7");
+        assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
         assert_eq!(check().await, "t");
         assert_eq!(fx.value("SELECT name || ' ' || public || ' ' || file_size_limit || ' ' || write_once FROM storage.buckets WHERE name = 'frozen'").await, "frozen true 10 false", "a migrated bucket starts ordinary");
         fx.owner("UPDATE storage.buckets SET write_once = true WHERE name = 'frozen'").await.unwrap();
@@ -4117,16 +4117,13 @@ async fn storage_ref_forms_live() {
         // The table first: the data API reads the schema on its first request here.
         fx.owner(
             "CREATE TYPE object_ref AS (x int);
-             CREATE TABLE docs (id int PRIMARY KEY, path text, photo uuid, look object_ref);
+             CREATE TABLE docs (id int PRIMARY KEY, path text, photo uuid REFERENCES storage.objects(id), look object_ref);
              COMMENT ON COLUMN docs.path IS 'The file, internal. @storage_ref bucket=files';
              COMMENT ON COLUMN docs.photo IS 'internal photo note';
              GRANT SELECT, INSERT ON docs TO authenticated;",
         )
         .await
         .expect("the docs table");
-        // The owner holds no REFERENCES on storage.objects (#102's open decision): the
-        // superuser adds the foreign key.
-        fx.admin("ALTER TABLE docs ADD FOREIGN KEY (photo) REFERENCES storage.objects(id)").await;
         let secret = fx.secret_key("st-ref-forms", None).await;
         let public = fx.public_key().await;
         for b in ["files", "closed"] {
@@ -4232,6 +4229,117 @@ COMMIT;"
         assert_eq!(resolve_refs(&secret, json!([{ "id": a, "bucket": "files", "name": "a.txt" }])).await.0, 400);
         let many: Vec<Value> = (0..1001).map(|_| json!({ "id": a })).collect();
         assert_eq!(resolve_refs(&secret, json!(many)).await.0, 400);
+    }))
+    .await;
+}
+
+/// #102: the database owner (no superuser) adds foreign keys to `storage.objects(id)`, its one
+/// privilege there (`REFERENCES (id)`, which the schema check knows and a reinstall keeps).
+/// A delete such a key refuses is 409 `referenced`, nothing deleted (the row, and so its blob,
+/// stays); `ON DELETE SET NULL` lets it through. A move or an overwrite keeps the object's id,
+/// so neither is refused. A version-7 schema (no grant) gets it from the bootstrap, and the
+/// foreign keys made before survive the reinstall.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_foreign_key_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_foreign_key_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        const TEXT: (&str, &str) = ("content-type", "text/plain");
+        let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
+        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+        let privileges = "SELECT has_column_privilege('postgres', 'storage.objects', 'id', 'REFERENCES')::text || ' '
+            || has_column_privilege('postgres', 'storage.objects', 'name', 'REFERENCES')::text || ' '
+            || has_column_privilege('postgres', 'storage.objects', 'bucket_id', 'REFERENCES')::text || ' '
+            || has_table_privilege('postgres', 'storage.buckets', 'REFERENCES')::text";
+        assert_eq!(fx.value(privileges).await, "true false false false", "only REFERENCES (id)");
+
+        // The owner's own tables, no superuser involved; the database stays healthy.
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        fx.owner("SELECT storage.create_policy('b_delete', 'buckets', 'DELETE', ARRAY['authenticated']::name[], 'true', NULL)")
+            .await
+            .unwrap();
+        fx.owner(
+            "CREATE TABLE pins (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id));
+             CREATE TABLE loose (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE SET NULL);",
+        )
+        .await
+        .expect("the owner's foreign keys to storage.objects(id)");
+        assert!(
+            fx.owner_err("CREATE TABLE by_name (b uuid, n text, FOREIGN KEY (b, n) REFERENCES storage.objects(bucket_id, name))").await.contains("permission denied"),
+            "no other column"
+        );
+        assert_eq!(check().await, "t", "the grant and the foreign keys are the install's to allow");
+
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        let call = async |method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]| {
+            let (status, b) = raw(&base, &token, method, path, body, headers).await;
+            (status, json_of(&b))
+        };
+        let up = |name: &str| format!("/storage/v1/object/files/{name}");
+        for (name, body) in [("a.txt", "one"), ("b.txt", "two")] {
+            let (status, b) = call("POST", &up(name), body.as_bytes().to_vec(), &[TEXT]).await;
+            assert_eq!(status, 200, "{name}: {b}");
+        }
+        let id_of = |name: &'static str| async move { fx.value(&format!("SELECT id FROM storage.objects WHERE name = '{name}'")).await };
+        let (a, b) = (id_of("a.txt").await, id_of("b.txt").await);
+        fx.owner(&format!("INSERT INTO pins VALUES (1, '{a}'); INSERT INTO loose VALUES (1, '{b}');")).await.unwrap();
+
+        // A referenced object isn't deleted: 409 `referenced`, no table name; row and blob stay.
+        let (status, got) = call("DELETE", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone(), got["error"]["sqlstate"].clone()), (409, json!("referenced"), json!("23503")), "{got}");
+        assert!(!got.to_string().contains("pins"), "{got}");
+        // Several at once: one referenced refuses them all.
+        let (status, got) = call("DELETE", "/storage/v1/object/files", json!({ "names": ["b.txt", "a.txt"] }).to_string().into_bytes(), &[JSON]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("referenced")), "{got}");
+        assert_eq!(fx.value("SELECT string_agg(name, ',' ORDER BY name) FROM storage.objects").await, "a.txt,b.txt");
+        let (status, got) = raw(&base, &token, "GET", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]), "the blob stays");
+
+        // ON DELETE SET NULL: deleted, the column nulled.
+        assert_eq!(call("DELETE", &up("b.txt"), vec![], &[]).await.0, 204);
+        assert_eq!(fx.value("SELECT coalesce(photo::text, 'null') FROM loose").await, "null");
+
+        // A move and an overwrite keep the id: neither is refused, the reference follows.
+        let (status, got) = call("POST", "/storage/v1/object/move", json!({ "bucket": "files", "from": "a.txt", "to": "a2.txt" }).to_string().into_bytes(), &[JSON]).await;
+        assert!((200..300).contains(&status), "move: {status} {got}");
+        let (status, got) = call("POST", &up("a2.txt"), b"one again".to_vec(), &[TEXT, ("x-upsert", "true")]).await;
+        assert_eq!(status, 200, "overwrite: {got}");
+        assert_eq!(id_of("a2.txt").await, a);
+        assert_eq!(fx.value("SELECT o.name FROM pins p JOIN storage.objects o ON o.id = p.photo").await, "a2.txt");
+        // A bucket holding it is not empty, as before.
+        let (status, got) = call("DELETE", "/storage/v1/bucket/files", vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("bucket_not_empty")), "{got}");
+
+        // A grant the install doesn't make shows as tampering, and the bootstrap heals it.
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_admin; GRANT REFERENCES (name) ON storage.objects TO postgres; COMMIT;").await;
+        assert_eq!(check().await, "f", "REFERENCES (name)");
+        bootstrap(fx).await;
+        assert_eq!((check().await, fx.value(privileges).await), ("t".to_string(), "true false false false".to_string()));
+
+        // Version 7 (no grant): the owner can't add one; the bootstrap brings the grant, and
+        // the foreign keys made before are still enforced after the reinstall.
+        fx.admin(
+            "BEGIN; SET LOCAL ROLE chelabase_admin; REVOKE REFERENCES (id) ON storage.objects FROM postgres;
+             COMMENT ON SCHEMA storage IS 'chelabase storage schema 7'; COMMIT;",
+        )
+        .await;
+        assert_eq!(fx.value(privileges).await, "false false false false");
+        assert!(fx.owner_err("CREATE TABLE later (photo uuid REFERENCES storage.objects(id))").await.contains("permission denied"));
+        assert_eq!(check().await, "f");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_ne!(storage_schema::STORAGE_SCHEMA_STAMP, "chelabase storage schema 7");
+        assert_eq!((check().await, fx.value(privileges).await), ("t".to_string(), "true false false false".to_string()));
+        fx.owner("CREATE TABLE later (photo uuid REFERENCES storage.objects(id))").await.expect("after the upgrade");
+        let (status, got) = call("DELETE", &up("a2.txt"), vec![], &[]).await;
+        assert_eq!((status, got["error"]["code"].clone()), (409, json!("referenced")), "the old foreign key survived: {got}");
+        fx.owner("DELETE FROM pins").await.unwrap();
+        assert_eq!(call("DELETE", &up("a2.txt"), vec![], &[]).await.0, 204);
     }))
     .await;
 }
