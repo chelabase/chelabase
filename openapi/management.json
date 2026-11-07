@@ -10067,7 +10067,7 @@
           "storage"
         ],
         "summary": "Upload one part of a resumable upload",
-        "description": "One part (5 MiB to 64 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.",
+        "description": "One part (5 MiB to 100 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.",
         "operationId": "storageUploadPart",
         "parameters": [
           {

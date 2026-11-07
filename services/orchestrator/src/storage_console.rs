@@ -739,7 +739,7 @@ storage_route!(
 );
 storage_route!(upload_part, put, "/v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/{part}", "storageUploadPart", ep::STORAGE_UPLOAD_PART,
     summary = "Upload one part of a resumable upload",
-    description = "One part (5 MiB to 64 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.",
+    description = "One part (5 MiB to 100 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.",
     params(("session" = Uuid, Path, description = "Upload session id"), ("part" = u32, Path, description = "Part number, 1 to 10000"),),
     body(content = Vec<u8>, content_type = "application/octet-stream"),
     ok = (200, "The part's `etag` and `size`"));
