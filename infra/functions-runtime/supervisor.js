@@ -13,7 +13,8 @@
 //
 // whose bytes, exactly as served, must hash (sha256, lowercase hex) to the requested sha256: the
 // producer (m2) serialises it canonically once and the store serves those bytes. Anything else
-// gets 502 and nothing is loaded.
+// gets 502 and nothing is loaded. A bundle that loads but can't start answers 502 `bundle failed
+// to start`; a handler that throws, 500. Every refusal names its reason in `x-chelabase-error`.
 //
 // A loaded worker is cached by the loader under `{database_id}/{sha256}:{sha256(env header)}`,
 // so two deployments sharing a bundle never share an env. User workers get only their own env,
@@ -22,6 +23,8 @@
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
+const ERROR_HEADER = "x-chelabase-error";
+const START_FAILED = "bundle failed to start";
 const BUNDLE_RE = /^([A-Za-z0-9_-]{1,64})\/([0-9a-f]{64})$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_MANIFEST_BYTES = 64 << 20;
@@ -167,9 +170,22 @@ export default {
       for (const [k, v] of request.headers) {
         if (!k.toLowerCase().startsWith(PRIVATE_PREFIX)) headers.append(k, v);
       }
-      return await worker.getEntrypoint().fetch(new Request(request, { headers }));
+      try {
+        return await worker.getEntrypoint().fetch(new Request(request, { headers }));
+      } catch (e) {
+        // An exception from the handler comes back marked `remote` and stays a 500. Anything
+        // else is the loader failing to start the worker (a syntax error, an unknown
+        // compatibility flag, a future compatibility date, a missing module, a top-level throw):
+        // 502, without workerd's message, which quotes the member's code.
+        if (e?.remote) throw e;
+        throw new Refused(502, START_FAILED);
+      }
     } catch (e) {
-      if (e instanceof Refused) return new Response(`${e.message}\n`, { status: e.status });
+      // `x-chelabase-error` carries the reason to the functions service (its `last_error`); it
+      // strips every x-chelabase-* header before the response reaches the caller.
+      if (e instanceof Refused) {
+        return new Response(`${e.message}\n`, { status: e.status, headers: { [ERROR_HEADER]: e.message } });
+      }
       throw e;
     }
   },
