@@ -48,7 +48,7 @@ pub use functions::{
     Advance, BranchFunction, ClaimedSchedule, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
-    TriggerRecord, TriggerSource, TriggerState, advance, valid_function_name, valid_secret_name,
+    TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance, valid_function_name, valid_secret_name,
 };
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,

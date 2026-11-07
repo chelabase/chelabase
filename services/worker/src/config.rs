@@ -400,6 +400,8 @@ pub fn build_with(
     attach: AttachSource,
     connect: impl FnOnce(ComputeSettings, DockerSettings) -> anyhow::Result<Backend>,
 ) -> anyhow::Result<RealWorker> {
+    // Edge functions m8: the child's run-as keys are sealed with the secrets key.
+    let metadata = metadata.with_secrets_key(key.clone());
     // First, so a missing key pair names its fix (`init-secrets` or `just workbench up`) before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
     let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {

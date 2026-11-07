@@ -6,8 +6,8 @@
 /// policies, ACLs, default privileges, comments (policies' included) and sequence ownership.
 ///
 /// - Same exclusions as the catalog reader (P6): `pg_catalog`, `information_schema`,
-///   `pg_toast`, temporary schemas, `chelabase`, `chelabase_merge`, `chelabase_guard` and
-///   extension members.
+///   `pg_toast`, temporary schemas, `chelabase`, `chelabase_merge`, `chelabase_guard`,
+///   `storage`, `chelabase_functions` and extension members.
 /// - Raw catalog columns and node trees, OIDs included, never `pg_get_*def`: the text doesn't
 ///   depend on `search_path` or the session's role, and any DDL on a 6g object changes it.
 ///   It's only ever compared on the same database.
@@ -24,7 +24,7 @@
 /// runs in the owner's session (E15) and needs no prelude.
 pub const TARGET_DIGEST_SQL: &str = "WITH nsp AS (\
 SELECT n.oid FROM pg_catalog.pg_namespace n \
-WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard', 'storage') \
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard', 'storage', 'chelabase_functions') \
 AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%' \
 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = n.oid AND d.deptype = 'e')\
 ), rel AS (\

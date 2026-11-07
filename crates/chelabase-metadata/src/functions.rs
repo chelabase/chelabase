@@ -21,6 +21,7 @@
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes) | branch create copies (insert), tombstone purge (delete) |
 //! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
+//! | 4b | `function_triggers` | `INSERT` (add); the worker's settle `UPDATE`, alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
 //! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync |
 //!
@@ -32,6 +33,8 @@
 //! wait on it in a cycle. `set_function_last_error` updates its state row alone, and the
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
 //! alone, skipping any another transaction holds, and takes nothing after them.
+//! The worker's trigger settle ([`MetadataClient::settle_trigger_installs`]) updates trigger rows (4b)
+//! alone and takes nothing after them.
 //! `function_writes_keep_the_lock_order` (`tests/functions_live.rs`) runs each function write
 //! against each existing writer, stalled on each row in turn, in both orders.
 //!
@@ -333,6 +336,18 @@ pub struct TriggerRecord {
     pub bucket: Option<String>,
     pub prefix: Option<String>,
     pub events: Vec<String>,
+    /// Why the worker couldn't install it (state `failed`), as the worker words it.
+    pub last_error: Option<String>,
+}
+
+/// One table trigger's install, as the worker reports it
+/// ([`MetadataClient::settle_trigger_installs`]): the row and the `enabled_since` it read (the
+/// generation it installed), and `None` when the trigger is in the database, or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerInstall {
+    pub id: Uuid,
+    pub enabled_since: DateTime<Utc>,
+    pub error: Option<String>,
 }
 
 /// A function's run-as role and the secret data key minted for it ([`MetadataClient::set_run_as`]).
@@ -596,7 +611,28 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         bucket: r.get("bucket"),
         prefix: r.get("prefix"),
         events: r.get("events"),
+        last_error: r.get("last_error"),
     })
+}
+
+/// In a reset's or restore's switch transaction (which holds the database and branch rows):
+/// every table trigger of `branch` goes back to `pending_install` with a new `enabled_since`
+/// and no error, so the worker truncates the outbox and reinstalls them on the new timeline
+/// before any is `installed` again (edge functions m8). Storage triggers don't live in the
+/// database and are left alone.
+pub(crate) async fn pend_table_triggers(
+    tx: &mut PgConnection,
+    branch: Uuid,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "UPDATE function_triggers
+         SET state = 'pending_install', enabled_since = clock_timestamp(), last_error = NULL
+         WHERE branch_id = $1 AND source = 'table'",
+    )
+    .bind(branch)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }
 
 /// Copies `parent`'s function state onto `child`, a branch row inserted in the same
@@ -1603,7 +1639,7 @@ impl MetadataClient {
     ) -> Result<Vec<TriggerRecord>, MetadataError> {
         sqlx::query(
             "SELECT id, branch_id, function_id, source, enabled, state, enabled_since,
-                    pg_database, schema_name, table_name, bucket, prefix, events
+                    pg_database, schema_name, table_name, bucket, prefix, events, last_error
              FROM function_triggers WHERE branch_id = $1 ORDER BY created_at, id",
         )
         .bind(branch.as_uuid())
@@ -1612,6 +1648,63 @@ impl MetadataClient {
         .iter()
         .map(trigger_from_row)
         .collect()
+    }
+
+    /// Settles the worker's table-trigger installs on `branch` (edge functions m8): each row
+    /// still `pending_install` at the `enabled_since` the worker read becomes `installed` (no
+    /// error) or `failed` (its error, cut to [`MAX_LAST_ERROR_CHARS`]). A row pended again
+    /// meanwhile (a new generation), already settled, or of another branch is left alone. The
+    /// number of rows settled.
+    ///
+    /// Lock order (module docs): one statement on trigger rows (4b) alone, taking nothing after.
+    pub async fn settle_trigger_installs(
+        &self,
+        branch: BranchId,
+        installs: &[TriggerInstall],
+    ) -> Result<u64, MetadataError> {
+        if installs.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = installs.iter().map(|i| i.id).collect();
+        let since: Vec<DateTime<Utc>> = installs.iter().map(|i| i.enabled_since).collect();
+        let errors: Vec<Option<String>> = installs
+            .iter()
+            .map(|i| i.error.as_ref().map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect()))
+            .collect();
+        Ok(sqlx::query(
+            "UPDATE function_triggers t
+             SET state = CASE WHEN i.error IS NULL THEN 'installed' ELSE 'failed' END,
+                 last_error = i.error
+             FROM unnest($2::uuid[], $3::timestamptz[], $4::text[]) AS i(id, since, error)
+             WHERE t.id = i.id AND t.branch_id = $1 AND t.source = 'table'
+               AND t.state = 'pending_install' AND t.enabled_since = i.since",
+        )
+        .bind(branch.as_uuid())
+        .bind(ids)
+        .bind(since)
+        .bind(errors)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// Up to `limit` ready branches (of live databases) with a table trigger
+    /// `pending_install`: the worker's sweep installs them (edge functions m8).
+    pub async fn pending_trigger_branches(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BranchId>, MetadataError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT b.id FROM branches b JOIN databases d ON d.id = b.database_id
+             WHERE b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
+               AND EXISTS (SELECT 1 FROM function_triggers t WHERE t.branch_id = b.id
+                           AND t.source = 'table' AND t.state = 'pending_install')
+             ORDER BY b.id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().map(BranchId).collect())
     }
 
     /// Bundle hashes any deployment of the database still names (for the bundle sweep, with
