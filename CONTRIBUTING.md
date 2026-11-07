@@ -274,7 +274,7 @@ These test the Compose install the way a self-hoster runs it. They need no workb
 
 | Recipe | What it runs |
 | --- | --- |
-| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim by the Acme example (`docker-compose.example.yml`) and a second seed run that skips, a project and a database through the API and the proxy, no secret in `docker inspect`, an invite mail through the identity service's SMTP, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender, refused by the identity service) |
+| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim by the Acme example (`docker-compose.example.yml`) and a second seed run that skips, a project and a database through the API and the proxy, object storage through the gateway (an app's data key: bucket, upload, download, 413 over a bucket's limit, a signed URL, refs; a console upload through the orchestrator; a signed webhook to an allowlisted receiver), no secret in `docker inspect`, an invite mail through the identity service's SMTP, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender, refused by the identity service) |
 | `selfhost-tls-e2e` | The install behind nginx terminating TLS with a throwaway CA and no port in the hosts: the claim and sign-in with a Secure session cookie, a token whose issuer is the https auth host, the gateway and realtime verifying tokens, and `down -v` leaving nothing |
 
 Images:
