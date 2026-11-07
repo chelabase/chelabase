@@ -29,11 +29,13 @@ const SECRET_FILES: &[&str] = &[
     "tokens/app-auth.token",
     "tokens/app-sessions.token",
     "tokens/storage-internal.token",
+    "tokens/orchestrator-functions.token",
+    "tokens/worker-functions.token",
     "tokens/proxy-api.token",
     "tokens/storcon-hook.token",
 ];
 
-const NATS_USERS: [&str; 5] = ["orchestrator", "worker", "realtime", "runner", "storage"];
+const NATS_USERS: [&str; 6] = ["orchestrator", "worker", "realtime", "runner", "storage", "functions"];
 const VALKEY_USERS: [&str; 5] = ["proxy", "control", "realtime", "runner", "health"];
 
 fn read_all(keys: &Path) -> BTreeMap<&'static str, Vec<u8>> {
