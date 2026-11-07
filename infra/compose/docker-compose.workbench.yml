@@ -649,16 +649,17 @@ services:
       metadata-db:
         condition: service_healthy
 
-  # Object storage (m5), 8089 behind the gateway. Only in this overlay until its first release
-  # image is published (the base file pins every image it runs). It dials computes on the compute
-  # network as `authenticator` (caller sessions) and as `chelabase_storage` (its own login), and
-  # SeaweedFS's S3 API as the `storage` identity (bucket chelabase-storage only).
+  # Object storage (m5), 8089 behind the gateway. It dials computes on the compute network as
+  # `authenticator` (caller sessions) and as `chelabase_storage` (its own login), and SeaweedFS's
+  # S3 API as the `storage` identity (bucket chelabase-storage only). The base file runs its
+  # release image (m19) on a read-only root; here, the host-built binary as any app.
   storage:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/storage"]
+    read_only: !reset null
     env_file:
       - *stack-env
-    environment:
+    environment: !override
       - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
       # m9: its own NATS user (subscribe-only: cache invalidation events).
       - CHELABASE_NATS_USER=storage
@@ -672,7 +673,7 @@ services:
     networks:
       default: {}
       compute: {}
-    volumes:
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
@@ -686,7 +687,7 @@ services:
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8089/health"]
-    depends_on:
+    depends_on: !override
       metadata-db:
         condition: service_healthy
       seaweedfs:

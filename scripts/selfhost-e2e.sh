@@ -19,6 +19,14 @@
 #                      name the published proxy (<ep>.localtest.me, CHELABASE_PROXY_PORT); with the
 #                      CA fetched as the docs say, psql on the host (verify-full) creates and reads
 #                      a row, and SQL over HTTP on the host answers
+#   7b. storage         the storage service through the gateway (#152): with bucket and object
+#                      policies made as the owner, an app's data key creates a bucket (limit 1000
+#                      bytes), uploads, downloads, signs a URL that downloads without a key and
+#                      resolves refs (a missing one to null); 2000 bytes get 413; a Studio
+#                      console upload through the orchestrator is readable by the app; a webhook
+#                      to a private host off the allowlist is refused, one to the allowlisted
+#                      receiver (`hooks`, over http: CHELABASE_WEBHOOKS_ALLOW_*) gets the upload's
+#                      object.created event, and its Chelabase-Signature verifies with the secret
 #   8. email            an invite by email reaches Mailpit through the identity service's SMTP
 #                      (the password file read at 10001:0600), with its code
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
@@ -72,7 +80,7 @@ tail_logs() { # tail_logs <project>
   echo "---- docker compose ps -a ($p)" >&2
   compose "$p" ps -a >&2 2>&1 || true
   # Whatever is not healthy, plus the app tier, whose logs usually say why a step failed.
-  for svc in init-secrets init-bootstrap identity orchestrator auth gateway example-seed; do
+  for svc in init-secrets init-bootstrap identity orchestrator auth gateway storage worker example-seed; do
     echo "---- logs $svc (tail 12)" >&2
     { compose "$p" logs --no-color --tail 12 "$svc" 2>&1 | cut -c1-300 >&2; } || true
   done
@@ -228,6 +236,28 @@ EOF
         condition: service_healthy
 EOF
   fi
+  if [[ -n "${WITH_HOOKS:-}" ]]; then
+    # A webhook receiver on the stack's network (the identity image's node): one JSON line per
+    # request on stdout, the Chelabase-Signature header and the body (base64, byte for byte).
+    local identity_image
+    identity_image="$(compose "$p" config --format json | jq -r '.services.identity.image')"
+    cat >>"$tmp/$p.override.yml" <<EOF
+  hooks:
+    image: $identity_image
+    pull_policy: never
+    read_only: true
+    command:
+      - node
+      - -e
+      - >-
+        require('http').createServer((q, r) => { const c = []; q.on('data', d => c.push(d));
+        q.on('end', () => { console.log(JSON.stringify({sig: q.headers['chelabase-signature'] || '',
+        body: Buffer.concat(c).toString('base64')})); r.writeHead(204); r.end(); }); }).listen(8080)
+    depends_on:
+      identity:
+        condition: service_started
+EOF
+  fi
 }
 
 # The base file's pinned Postgres image: a shell to make root-owned test files with.
@@ -342,8 +372,9 @@ docker run --rm --network none -v "$tmp:/w" --entrypoint sh "$FILE_HELPER" -c \
   'umask 077 && printf %s "$1" >/w/smtp.password && chown 10001:10001 /w/smtp.password && chmod 600 /w/smtp.password' sh "$SMTP_PASSWORD" ||
   die "writing the SMTP password file"
 [[ "$(stat -c %u:%a "$tmp/smtp.password")" == 10001:600 ]] || die "the SMTP password file is $(stat -c %u:%a "$tmp/smtp.password")"
-WITH_MAILPIT=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 CHELABASE_SMTP_TLS=none \
-  CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password"
+WITH_MAILPIT=1 WITH_HOOKS=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 CHELABASE_SMTP_TLS=none \
+  CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password" \
+  CHELABASE_WEBHOOKS_ALLOW_HOSTS=hooks CHELABASE_WEBHOOKS_ALLOW_HTTP=true
 PROXY_PORT="$(sed -n 's/^CHELABASE_PROXY_PORT=//p' "$tmp/$PROJECT.env")"
 PROXY_HTTP_PORT="$(sed -n 's/^CHELABASE_PROXY_HTTP_PORT=//p' "$tmp/$PROJECT.env")"
 STUDIO="http://studio.chelabase.localhost:$PORT"
@@ -537,6 +568,89 @@ out="$(curl -sS --max-time 30 --resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1" --
 [[ "${out##*$'\n'}" == 200 ]] && jq -e '.rows[0].v == 42' <<<"${out%$'\n'*}" >/dev/null ||
   die "SQL over HTTP at $http_url: ${out##*$'\n'} $(head -c 300 <<<"${out%$'\n'*}")"
 pass "from the host: psql (verify-full, the CA from docker compose cp) created and read a row; SQL over HTTP read it"
+
+# ---- 7b. object storage --------------------------------------------------------------------------
+
+step "object storage through the gateway: an app's data key, a console upload and a webhook"
+# Policies as the database owner: `authenticated` may see and create buckets and objects.
+psql_host -c "
+  select storage.create_policy('b_select', 'buckets', 'SELECT', array['authenticated']::name[], 'true', null);
+  select storage.create_policy('b_insert', 'buckets', 'INSERT', array['authenticated']::name[], null, 'true');
+  select storage.create_policy('o_select', 'objects', 'SELECT', array['authenticated']::name[], 'true', null);
+  select storage.create_policy('o_insert', 'objects', 'INSERT', array['authenticated']::name[], null, 'true');" >/dev/null ||
+  die "creating the storage policies as the owner"
+[[ "$(api GET "/v1/databases/$db_id/branches")" == 200 ]] || die "GET branches: $(cat "$tmp/body")"
+branch_id="$(jq -r '[.[] | select(.parent_branch_id == null)][0].id // empty' "$tmp/body")"
+[[ -n "$branch_id" ]] || die "no main branch in $(cat "$tmp/body")"
+status="$(api POST "/v1/databases/$db_id/branches/$branch_id/keys" '{"name":"e2e-storage","role":"authenticated"}')"
+[[ "$status" == 201 ]] || die "POST keys: $status $(cat "$tmp/body")"
+DATA_KEY="$(jq -r .key "$tmp/body")"
+# st <method> <path> [curl args…]: the storage API with the data key; status to stdout, body in $tmp/sbody.
+st() {
+  local m="$1" p="$2"
+  shift 2
+  printf 'Authorization: Bearer %s\n' "$DATA_KEY" |
+    curl -sS --max-time 60 -o "$tmp/sbody" -w '%{http_code}' -X "$m" "$API$p" -H @- "$@" || echo 000
+}
+# The webhook first (events from its registration on are delivered): a private host off the
+# allowlist is refused; the allowlisted receiver is taken.
+status="$(api POST "/v1/databases/$db_id/storage/webhooks" '{"url":"http://metadata-db:5432/x","events":["object.created"]}')"
+[[ "$status" == 4* ]] || die "a webhook to metadata-db (not allowlisted) was accepted: $status $(cat "$tmp/body")"
+status="$(api POST "/v1/databases/$db_id/storage/webhooks" '{"url":"http://hooks:8080/e2e","events":["object.created"],"bucket":"files"}')"
+[[ "$status" == 201 ]] || die "POST storage/webhooks: $status $(cat "$tmp/body")"
+HOOK_SECRET="$(jq -r .secret "$tmp/body")"
+[[ "$HOOK_SECRET" == whsec_* ]] || die "the webhook answer has no secret"
+status="$(st POST /storage/v1/bucket -H 'content-type: application/json' -d '{"name":"files","file_size_limit":1000}')"
+[[ "$status" == 201 ]] || die "create bucket files: $status $(cat "$tmp/sbody")"
+status="$(st POST /storage/v1/object/files/hello.txt -H 'content-type: text/plain' --data-binary 'hello storage')"
+[[ "$status" == 200 ]] || die "upload hello.txt: $status $(cat "$tmp/sbody")"
+status="$(st GET /storage/v1/object/files/hello.txt)"
+[[ "$status" == 200 && "$(cat "$tmp/sbody")" == 'hello storage' ]] || die "download hello.txt: $status $(head -c 300 "$tmp/sbody")"
+head -c 2000 /dev/zero >"$tmp/big.bin"
+status="$(st POST /storage/v1/object/files/big.bin -H 'content-type: application/octet-stream' --data-binary @"$tmp/big.bin")"
+[[ "$status" == 413 ]] || die "2000 bytes into a bucket of 1000: $status (wanted 413) $(head -c 300 "$tmp/sbody")"
+status="$(st POST /storage/v1/object/sign/files/hello.txt -H 'content-type: application/json' -d '{"expires_in":60}')"
+signed="$(jq -r '.signed_url // empty' "$tmp/sbody" 2>/dev/null || true)"
+[[ "$status" == 200 && "$signed" == "/storage/v1/object/sign/files/hello.txt?token="* ]] || die "sign hello.txt: $status $(cat "$tmp/sbody")"
+[[ "$(curl -sS --max-time 30 "$API$signed")" == 'hello storage' ]] || die "the signed URL doesn't download hello.txt without a key"
+status="$(st POST /storage/v1/object/resolve -H 'content-type: application/json' \
+  -d '{"refs":[{"bucket":"files","name":"hello.txt"},{"bucket":"files","name":"nope.txt"}]}')"
+[[ "$status" == 200 ]] && jq -e '(.urls | length) == 2 and (.urls[0] | type) == "string" and .urls[1] == null' "$tmp/sbody" >/dev/null ||
+  die "resolve refs: $status $(cat "$tmp/sbody")"
+[[ "$(curl -sS --max-time 30 "$API$(jq -r '.urls[0]' "$tmp/sbody")")" == 'hello storage' ]] || die "the resolved URL doesn't download hello.txt"
+# Studio's console upload (owner mode), through the orchestrator's storage routes to storage's
+# internal listener; the app reads it.
+status="$(printf 'Authorization: Bearer %s\n' "$(session_token "$ADMIN_JAR")" |
+  curl -sS --max-time 60 -o "$tmp/body" -w '%{http_code}' -X POST -H @- -H 'content-type: application/octet-stream' \
+    --data-binary 'from the console' "$API/v1/databases/$db_id/branches/$branch_id/storage/object/files/console.txt" || echo 000)"
+[[ "$status" == 200 ]] || die "console upload through the orchestrator: $status $(cat "$tmp/body")"
+status="$(st GET /storage/v1/object/files/console.txt)"
+[[ "$status" == 200 && "$(cat "$tmp/sbody")" == 'from the console' ]] || die "the app reading the console upload: $status $(head -c 300 "$tmp/sbody")"
+# The receiver got hello.txt's object.created event, signed with the endpoint's secret.
+event=""
+deadline=$((SECONDS + 90))
+while ((SECONDS < deadline)); do
+  while IFS= read -r line; do
+    [[ "$line" == '{"sig":"t='* ]] || continue
+    if jq -r .body <<<"$line" | base64 -d 2>/dev/null |
+      jq -e '.type == "object.created" and .bucket == "files" and .name == "hello.txt"' >/dev/null 2>&1; then
+      event="$line"
+      break
+    fi
+  done < <(compose "$PROJECT" logs --no-color --no-log-prefix hooks 2>/dev/null)
+  [[ -z "$event" ]] || break
+  sleep 2
+done
+[[ -n "$event" ]] || die "no object.created event for hello.txt at the receiver after 90 s: $(compose "$PROJECT" logs --no-color --tail 5 hooks 2>&1 | cut -c1-300)"
+sig="$(jq -r .sig <<<"$event")"
+t="${sig#t=}"
+t="${t%%,*}"
+v1="${sig#*v1=}"
+v1="${v1%%,*}"
+jq -r .body <<<"$event" | base64 -d >"$tmp/event.bin"
+want="$({ printf '%s.' "$t"; cat "$tmp/event.bin"; } | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)"
+[[ -n "$v1" && "$v1" == "$want" ]] || die "the event's Chelabase-Signature doesn't verify with the webhook's secret"
+pass "storage: bucket, upload, download, 413 over the limit, a signed URL, refs resolved, a console upload, and a signed object.created webhook delivered"
 
 # ---- 8. email through the identity service's SMTP ---------------------------------------------
 

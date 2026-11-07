@@ -25,6 +25,13 @@
 #      `docker run` of its own, checked in tools/cli). The workbench's runner, the test harness,
 #      sees the keys its live tests read and is left out of these checks, but never the
 #      bootstrap's token.
+#   5. the object-store keys (m2): see there. m19 (#152): the storage service's boundary, in both
+#      renders: `nats/storage.password` is storage's alone, `tokens/storage-internal.token` goes
+#      to storage and the orchestrator (the bearer both ways), `storage-s3/` to seaweedfs, storage
+#      and the worker (the blob sweep); storage runs its binary directly (no shell that could put
+#      a secret in argv or its environment), read-only, and names every secret by a `*_FILE`
+#      path. NATS restarts when init-secrets is updated, so an upgrade's new NATS users (storage's)
+#      reach it.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -131,6 +138,8 @@ worker	compute-ca	rw
 worker	orchestrator-tls	rw
 worker	realtime-tls	rw
 worker	db/metadata.password	ro
+worker	storage-s3/access-key	ro
+worker	storage-s3/secret-key	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
@@ -148,6 +157,12 @@ auth	tokens/app-auth.token	ro
 rest	gateway/internal-verify.pem	ro
 rest	compute-ca/ca.crt	ro
 rest	tokens/rest-internal.token	ro
+storage	gateway/internal-verify.pem	ro
+storage	compute-ca/ca.crt	ro
+storage	tokens/storage-internal.token	ro
+storage	nats/storage.password	ro
+storage	storage-s3/access-key	ro
+storage	storage-s3/secret-key	ro
 realtime	gateway/internal-verify.pem	ro
 realtime	compute-ca/ca.crt	ro
 realtime	nats/realtime.password	ro
@@ -255,15 +270,15 @@ leaks="$(jq -r '.services | to_entries[] | .key as $s
        | select(.source | test("storage-s3|grpc-tls|/s3/"))
        | "\($s): bind \(.source)")' "$tmp/base.json")"
 [[ -z "$leaks" ]] || err "an object-store key reaches a service through its environment or a bind:"$'\n'"$leaks"
-# init-secrets, which makes the files, is the one name besides seaweedfs.
-for dir in storage-s3 grpc-tls; do
+# init-secrets, which makes the files, is the one name besides their readers: grpc-tls/ is
+# seaweedfs's; storage-s3/ (the `storage` identity) is seaweedfs's, the storage service's and the
+# worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker "; do
+  dir="${want%%:*}"
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
-  [[ "$users" == "seaweedfs " ]] || err "services naming $dir/: got [$users], want [seaweedfs ]"
+  [[ "$users" == "${want#*:}" ]] || err "services naming $dir/: got [$users], want [${want#*:}]"
 done
-# m5: under the workbench the storage service mounts the `storage` identity too, and so does the
-# worker for the blob sweep (m8); nobody else does (the storage service is only in the overlay
-# until its first image is published).
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
 [[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
@@ -309,6 +324,37 @@ over="$(CHELABASE_NEON_S3_ENDPOINT=http://other.example:9000 compose chelabase-b
   err "seaweedfs: the healthcheck start_period must cover the bucket step's 8 minutes"
 grep -qF 'kill 1' <<<"$sw_cmd" && grep -qF 'last weed shell output' <<<"$sw_cmd" ||
   err "seaweedfs: the bucket step must log the last output and end the container when it gives up"
+
+# 6. The storage service (m19): its own secrets only, in both renders (the runner left out).
+for render in base wb; do
+  boundary nats/storage.password "storage" "$render" "$tmp/readers.$render"
+  boundary tokens/storage-internal.token "orchestrator storage" "$render" "$tmp/readers.$render"
+done
+jq -e '.services.storage' "$tmp/base.json" >/dev/null || err "the base file has no storage service"
+st="$(jq -c '.services.storage // {} | {entrypoint, command, read_only, user}' "$tmp/base.json")"
+[[ "$st" == '{"entrypoint":null,"command":null,"read_only":true,"user":null}' ]] ||
+  err "storage runs its image's binary as its user (10001), read-only, with no entrypoint or command: got $st"
+img="$(jq -r '.services.storage.image // ""' "$tmp/base.json")"
+[[ "$img" == ghcr.io/chelabase/storage:* ]] || err "storage runs the ghcr.io/chelabase/storage release image: got $img"
+# Every secret it mounts is named by a *_FILE setting (or the compute CA / verify key paths),
+# and no environment value holds a secret's contents (a path under /run/chelabase/secrets only).
+for sub in tokens/storage-internal.token nats/storage.password storage-s3/access-key storage-s3/secret-key; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services.storage.environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "storage reads $sub through a *_FILE setting"
+done
+bad="$(jq -r '.services.storage.environment // {} | to_entries[]
+  | select(.key | test("(TOKEN|PASSWORD|SECRET|_KEY)(_FILE)?$"))
+  | select((.value // "") | startswith("/run/chelabase/secrets/") | not) | .key' "$tmp/base.json")"
+[[ -z "$bad" ]] || err "storage gets a secret-named setting that isn't a mounted file's path: $bad"
+# The webhook allowlist defaults to nothing (public targets only, https only).
+for svc in orchestrator worker; do
+  got="$(jq -c --arg s "$svc" '.services[$s].environment | [.CHELABASE_WEBHOOKS_ALLOW_HOSTS, .CHELABASE_WEBHOOKS_ALLOW_HTTP]' "$tmp/base.json")"
+  [[ "$got" == '["",""]' ]] || err "$svc: the webhook allowlist defaults to empty and http to off; got $got"
+done
+# An upgrade re-renders nats/auth.conf with the new users; NATS reads it at start only.
+[[ "$(jq -r '.services.nats.depends_on["init-secrets"].restart' "$tmp/base.json")" == true ]] ||
+  err "nats restarts when init-secrets is updated (depends_on init-secrets: restart: true)"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

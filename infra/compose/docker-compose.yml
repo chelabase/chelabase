@@ -1,5 +1,5 @@
 # A self-hosted Chelabase: the infra, Neon storage and proxy, and the app tier (orchestrator,
-# worker, gateway, auth, identity, rest, realtime, Studio), with their wiring: images,
+# worker, gateway, auth, identity, rest, realtime, storage, Studio), with their wiring: images,
 # networks, volumes, secrets, healthchecks and dependencies.
 #
 #   cd infra/compose && cp .env.example .env && docker compose up -d
@@ -86,6 +86,10 @@ x-app-env: &app-env
   CHELABASE_AUTH_URL: http://auth:8084
   CHELABASE_REST_URL: http://rest:8085
   CHELABASE_REALTIME_URL: http://realtime:8087
+  # Object storage (m19): the gateway's upstream, and the orchestrator's way to its console
+  # listener (Studio's storage routes).
+  CHELABASE_STORAGE_URL: http://storage:8089
+  CHELABASE_STORAGE_INTERNAL_URL: http://storage:8090
   CHELABASE_STUDIO_UPSTREAM: http://studio:3000
   CHELABASE_ORCHESTRATOR_ADDR: 0.0.0.0:8081
   CHELABASE_WORKER_HEALTH_ADDR: 0.0.0.0:8082
@@ -95,6 +99,8 @@ x-app-env: &app-env
   CHELABASE_REST_INTERNAL_ADDR: 0.0.0.0:8086
   CHELABASE_REALTIME_ADDR: 0.0.0.0:8087
   CHELABASE_REALTIME_INTERNAL_ADDR: 0.0.0.0:8088
+  CHELABASE_STORAGE_ADDR: 0.0.0.0:8089
+  CHELABASE_STORAGE_INTERNAL_ADDR: 0.0.0.0:8090
   # Ruling (e): only the gateway's X-Forwarded-For counts (computes reach auth directly).
   CHELABASE_AUTH_TRUSTED_PROXY: gateway
   CHELABASE_CONTROL_PLANE_URI: http://orchestrator:8083
@@ -328,9 +334,13 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # NATS reads auth.conf at start only. An upgrade's init-secrets (a new image, so updated)
+    # can re-render it with a new service's user (storage's, m19): Compose restarts NATS then.
+    # A rerun of the same init-secrets restarts nothing.
     depends_on:
       init-secrets:
         condition: service_completed_successfully
+        restart: true
 
   # Valkey (BSD-3-Clause, speaks the Redis protocol). Neon's proxy uses it for query cancel and
   # for the cache-clearing messages the control plane publishes on a password change; realtime
@@ -972,6 +982,10 @@ services:
       # auth-replacement m5: its identity bearer.
       CHELABASE_IDENTITY_URL: http://identity:8080
       CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
+      # object-storage m18: where storage webhook URLs may point (checked at registration). Blank:
+      # https to public addresses only.
+      CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
+      CHELABASE_WEBHOOKS_ALLOW_HTTP: ${CHELABASE_WEBHOOKS_ALLOW_HTTP:-}
     # The default network for the apps, `control` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute` (P4): computes call its hooks listener
     # (8083) as `orchestrator`.
@@ -1045,6 +1059,20 @@ services:
       # auth-replacement m5: its identity bearer (pool lifecycle, the users sync).
       CHELABASE_IDENTITY_URL: http://identity:8080
       CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      # object-storage m8: the sweep reads and deletes unreferenced blobs as the `storage`
+      # identity (bucket chelabase-storage only).
+      CHELABASE_STORAGE_BACKEND: seaweedfs
+      CHELABASE_STORAGE_S3_ENDPOINT: http://seaweedfs:8333
+      CHELABASE_STORAGE_S3_BUCKET: chelabase-storage
+      CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/storage-s3/access-key
+      CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/storage-s3/secret-key
+      CHELABASE_STORAGE_SWEEP_GRACE_SECS: ${CHELABASE_STORAGE_SWEEP_GRACE_SECS:-}
+      CHELABASE_STORAGE_SWEEP_SECS: ${CHELABASE_STORAGE_SWEEP_SECS:-}
+      CHELABASE_STORAGE_SWEEP_DRY_RUN: ${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
+      # object-storage m18: where it delivers storage webhooks (checked again on each delivery).
+      # Blank: https to public addresses only.
+      CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
+      CHELABASE_WEBHOOKS_ALLOW_HTTP: ${CHELABASE_WEBHOOKS_ALLOW_HTTP:-}
     # P4: it dials computes (compute_ctl) on the compute network.
     networks:
       default: {}
@@ -1061,6 +1089,8 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, volume: {subpath: realtime-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
       - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
     healthcheck:
       <<: *app-health
@@ -1232,6 +1262,61 @@ services:
       init-bootstrap:
         condition: service_completed_successfully
 
+  # Object storage (m19; the service is m5's): files in buckets behind the gateway at /storage/v1
+  # (8089), and the console's listener for the orchestrator only (8090, behind its bearer, both
+  # ways as rest's). It verifies the gateway's identity, dials computes on the compute network
+  # (as `authenticator` for callers' sessions and as `chelabase_storage`, its own login, whose
+  # connection info it asks the orchestrator for), keeps blobs in SeaweedFS's bucket
+  # chelabase-storage as the `storage` identity, and listens on NATS as `storage` (cache events)
+  # and publishes object events there (webhooks, which the worker delivers). It runs its binary
+  # directly as the image's user (10001, the owner of its files), on a read-only root.
+  # The image isn't published or pinned yet: that happens from `main` once the object-storage
+  # epic merges, when the release scripts learn to publish and pin it like the others (and
+  # CHELABASE_STORAGE_IMAGE_TAG goes). Until then the default tag `unpublished` doesn't exist:
+  # build it from the clone with docker-compose.build.yml, or with `just images` (or
+  # `docker buildx bake -f infra/images/docker-bake.hcl storage`) and set CHELABASE_IMAGE_TAG,
+  # or CHELABASE_STORAGE_IMAGE_TAG for this image alone, to its tag.
+  storage:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_STORAGE_IMAGE_TAG:-${CHELABASE_IMAGE_TAG:-unpublished}}
+    restart: unless-stopped
+    read_only: true
+    environment:
+      <<: *app-env
+      CHELABASE_STORAGE_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/storage-internal.token
+      # m9: its own NATS user (cache events in; object events out, m18).
+      CHELABASE_NATS_USER: storage
+      CHELABASE_NATS_PASSWORD_FILE: /run/chelabase/secrets/nats/storage.password
+      CHELABASE_NATS_INBOX_PREFIX: _INBOX_storage
+      CHELABASE_STORAGE_BACKEND: seaweedfs
+      CHELABASE_STORAGE_S3_ENDPOINT: http://seaweedfs:8333
+      CHELABASE_STORAGE_S3_BUCKET: chelabase-storage
+      CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/storage-s3/access-key
+      CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/storage-s3/secret-key
+      # .env's tunables (blank = the service's default; m7).
+      CHELABASE_STORAGE_MAX_CONNECTIONS: ${CHELABASE_STORAGE_MAX_CONNECTIONS:-}
+      CHELABASE_STORAGE_MAX_INFLIGHT_BYTES: ${CHELABASE_STORAGE_MAX_INFLIGHT_BYTES:-}
+      CHELABASE_STORAGE_BODY_IDLE_SECS: ${CHELABASE_STORAGE_BODY_IDLE_SECS:-}
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storage-internal.token, read_only: true, volume: {subpath: tokens/storage-internal.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/nats/storage.password, read_only: true, volume: {subpath: nats/storage.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8089/health"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
@@ -1254,7 +1339,8 @@ networks:
           ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:-10.214.2.0/23}
   # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
   # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
-  # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime).
+  # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime,
+  # storage).
   # Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the storage broker or controller,
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).
