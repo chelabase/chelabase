@@ -197,6 +197,7 @@ export function objectActionError(err: unknown): string {
     const code = err.code as string;
     if (code === "write_once") return "The bucket is write-once: its files can't be overwritten, moved or deleted.";
     if (code === "referenced") return `A table row still references this file; clear the reference first. ${err.message}`.trim();
+    if (code === "delete_refused") return "A table that references this file refused the delete (a constraint or trigger on it); change that table first.";
   }
   return errorText(err);
 }

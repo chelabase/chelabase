@@ -118,6 +118,7 @@ describe("objectActionError", () => {
   it("explains_write_once_and_references_and_keeps_the_servers_conflict_message", () => {
     expect(objectActionError(new ApiError(409, "write_once" as never, "write-once"))).toMatch(/write-once/);
     expect(objectActionError(new ApiError(409, "referenced" as never, "x"))).toMatch(/references/);
+    expect(objectActionError(new ApiError(409, "delete_refused" as never, "x"))).toMatch(/table that references this file refused/);
     expect(objectActionError(new ApiError(409, "conflict" as never, "the object `a.png` already exists"))).toBe("the object `a.png` already exists");
     expect(objectActionError(new ApiError(400, "invalid_request" as never, "bad content type"))).toBe("bad content type");
   });
