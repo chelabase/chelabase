@@ -492,6 +492,25 @@ mod functions {
         }
     }
 
+    /// `/v1/me` says whether functions are available, so Studio hides the tab in platform mode
+    /// without asking the functions API.
+    #[tokio::test]
+    async fn functions_me_reports_availability() {
+        for (mode, available) in [(Mode::SelfHosted, true), (Mode::Platform, false)] {
+            let w = world_in(mode).await;
+            for sub in [DEFAULT_SUB, "dee"] {
+                let (status, text) = w.call(sub, "GET", "/v1/me", None).await;
+                assert_eq!(status, 200, "{mode:?} {sub}: {text}");
+                let me: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    me["functions_available"],
+                    json!(available),
+                    "{mode:?} {sub}: {text}"
+                );
+            }
+        }
+    }
+
     /// AC 8: a 13 MiB deploy body is 413 before it's parsed; the sink never sees it.
     #[tokio::test]
     async fn functions_oversize_413() {

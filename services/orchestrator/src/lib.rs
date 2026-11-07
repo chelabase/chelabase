@@ -2433,6 +2433,9 @@ struct MeResponse {
     /// Whether the caller may use instance routes (self-hosted: an active tenant admin;
     /// platform: a member of the operator tenant).
     instance_admin: bool,
+    /// Whether members may manage and run edge functions on this instance (false in platform
+    /// mode, where every functions route answers 403 `not_available_in_platform_mode`).
+    functions_available: bool,
     /// Each project the caller may use, with their platform role and the Postgres roles they
     /// may act as there. A tenant admin is Admin with every role on every project.
     projects: Vec<MeProject>,
@@ -2849,6 +2852,7 @@ where
         tenant_id,
         member: member.as_ref().map(|m| MeMember { id: m.id, status: m.status.into(), tenant_admin: m.tenant_admin }),
         instance_admin,
+        functions_available: state.policy.functions_available(),
         projects,
         user: MeUser { sub: caller.sub },
         tenant,
