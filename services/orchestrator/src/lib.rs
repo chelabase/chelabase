@@ -47,6 +47,7 @@ mod data_api_types;
 mod app_user_admin;
 mod app_users;
 mod data_keys;
+pub mod functions;
 pub mod internal;
 pub mod members;
 pub mod member_sessions;
@@ -127,7 +128,7 @@ pub(crate) fn proxy_host(endpoint_id: &str, domain: &str) -> String {
 /// Abstraction over tenant/database metadata lookups, so tests can inject an
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`. The member API's reads
 /// and writes are [`members::MembersPort`].
-pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
+pub trait MetadataPort: members::MembersPort + functions::FunctionsPort + Send + Sync + 'static {
     /// Whether the tenant exists (#119: a member token's `tid` names one that may be gone).
     fn tenant_exists(&self, tenant: TenantId) -> impl Future<Output = Result<bool, MetadataError>> + Send {
         async move {
@@ -1448,6 +1449,14 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         event: &chelabase_nats::StorageEvent,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
+    /// Edge functions m3: `chelabase.fn.changed.<branch>` after a function write committed
+    /// (core NATS, best effort).
+    fn publish_fn_changed(
+        &self,
+        branch: BranchId,
+        function: &str,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
     /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
     /// `authenticator`).
     fn check_data_role(
@@ -1694,6 +1703,12 @@ impl JobPort for NatsPorts {
 
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         chelabase_nats::publish_merge(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_fn_changed(&self, branch: BranchId, function: &str) -> Result<(), BoxError> {
+        chelabase_nats::fn_events::publish_changed(&self.client, branch.as_uuid(), function)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1953,6 +1968,8 @@ pub struct AppState<M, J> {
     /// `CHELABASE_WEBHOOKS_ALLOW_HOSTS`): checked at registration; the worker checks again at
     /// every connection.
     pub webhooks: chelabase_http::outbound::Outbound,
+    /// Edge functions m3: where deployments' bundles are stored (the functions service).
+    pub bundles: functions::Bundles,
 }
 
 /// The metadata client with the orchestrator's secrets key (edge functions m2/m3): function
@@ -2647,6 +2664,7 @@ where
         .merge(members::routes())
         .merge(personal_logins::routes())
         .merge(teams::routes())
+        .merge(functions::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.

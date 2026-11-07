@@ -80,6 +80,10 @@ fn forbidden(required: &str) -> Expect {
 fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
     use Expect::{Pass, Refuse, Skip};
     let access = e.policy.access;
+    // Edge functions m3: platform mode has no functions; every caller hears so first.
+    if mode == Mode::Platform && functions_route(e) {
+        return call(sub_of(PlatformRole::Admin), None, Refuse((403, "not_available_in_platform_mode", None)));
+    }
     match (caller, access) {
         // P14: a suspended member is refused everywhere, whatever the route needs, except
         // `/v1/me` (the one signed-in route), which tells them they're suspended.
@@ -165,6 +169,11 @@ fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
             call(sub_of(unprotected), Some("app"), Pass)
         }
     }
+}
+
+/// The functions management routes (`ModePolicy::functions_available`).
+fn functions_route(e: &Endpoint) -> bool {
+    e.path.contains("/functions")
 }
 
 fn sub_of(role: PlatformRole) -> &'static str {

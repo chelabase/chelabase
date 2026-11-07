@@ -6,14 +6,11 @@
 //! just functions-e2e
 //! ```
 //!
-//! It runs in the stack's runner (stack.env, the runner's NATS user and the orchestrator's
-//! functions bearer). Each run makes its own database rows (a pending database: no compute is
-//! needed, the gateway only resolves the key) and removes them at the end, pass or fail.
-//!
-//! TODO(#165): deploy, toggle and set auth through the management API once its functions
-//! endpoints land. Until then the test writes the metadata directly, uploads the bundle with
-//! the orchestrator's bearer as the orchestrator does, and publishes `chelabase.fn.changed`
-//! itself.
+//! It runs in the stack's runner (stack.env and `chelabase dev token`). Each run makes its own
+//! database rows (a pending database: no compute is needed, the gateway only resolves the key)
+//! and removes them at the end, pass or fail. Functions are created, deployed, toggled and
+//! given secrets and auth through the management API (#165) as the workbench's dev member, so
+//! the orchestrator uploads the bundle and publishes `chelabase.fn.changed` itself.
 
 // Test code: a plain client against the stack (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -23,8 +20,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chelabase_metadata::{
-    DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind, MetadataClient, MetadataConfig,
-    NewDataKey, NewDeployment,
+    DEMO_PROJECT_ID, DEMO_TENANT_ID, MetadataClient, MetadataConfig, NewDataKey,
 };
 use chelabase_secrets::SecretKey;
 use chelabase_types::data_key::{DataKeyKind, generate};
@@ -52,13 +48,89 @@ fn secrets_key() -> SecretKey {
 struct Stack {
     metadata: MetadataClient,
     http: reqwest::Client,
-    nats: chelabase_nats::NatsConfig,
+    /// The gateway's API base.
     api: String,
-    internal: String,
-    orchestrator_token: String,
+    /// The management API, as the dev member.
+    mgmt: Api,
     db: DatabaseId,
     branch: BranchId,
     key: String,
+}
+
+/// The management API as the workbench's dev member (`chelabase dev token`, per request: it is
+/// short-lived).
+pub(crate) struct Api {
+    pub(crate) http: reqwest::Client,
+    pub(crate) base: String,
+}
+
+impl Api {
+    pub(crate) fn new() -> Self {
+        Api {
+            http: reqwest::Client::new(),
+            base: env("CHELABASE_ENTRY_API_URL")
+                .trim_end_matches('/')
+                .to_owned(),
+        }
+    }
+
+    pub(crate) fn token() -> String {
+        let out = std::process::Command::new(env("CHELABASE_CLI"))
+            .args(["dev", "token"])
+            .output()
+            .expect("chelabase dev token");
+        assert!(
+            out.status.success(),
+            "chelabase dev token: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A call with `body` sent as it is (JSON); the status and the answer (JSON, else text).
+    pub(crate) async fn raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<String>,
+    ) -> (u16, Value) {
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}", self.base))
+            .bearer_auth(Self::token());
+        if let Some(b) = body {
+            req = req.header("content-type", "application/json").body(b);
+        }
+        let resp = req.send().await.expect("the gateway");
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+
+    pub(crate) async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        self.raw(method, path, body.map(|b| b.to_string())).await
+    }
+
+    /// [`Self::call`], asserting the status is one of `want`; the answer.
+    pub(crate) async fn ok(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        want: &[u16],
+    ) -> Value {
+        let (status, body) = self.call(method.clone(), path, body).await;
+        assert!(want.contains(&status), "{method} {path}: {status} {body}");
+        body
+    }
 }
 
 async fn metadata() -> MetadataClient {
@@ -120,105 +192,80 @@ impl Stack {
         Stack {
             metadata,
             http: reqwest::Client::new(),
-            nats: chelabase_nats::NatsConfig::from_env().expect("the runner's NATS settings"),
             api: env("CHELABASE_ENTRY_API_URL")
                 .trim_end_matches('/')
                 .to_owned(),
-            internal: env("CHELABASE_FUNCTIONS_INTERNAL_URL")
-                .trim_end_matches('/')
-                .to_owned(),
-            orchestrator_token: chelabase_types::secret_env::env_secret(
-                "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN",
-            )
-            .expect("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE")
-            .expect("the orchestrator's functions bearer"),
+            mgmt: Api::new(),
             db,
             branch,
             key,
         }
     }
 
-    /// Uploads `source` as a one-module bundle and makes it the function's active, enabled
-    /// deployment on the branch; returns the function's id.
-    async fn deploy(&self, name: &str, source: &str) -> Uuid {
-        let manifest = serde_json::to_vec(&json!({
+    /// The management API's path of the branch's functions, then `tail`.
+    fn functions(&self, tail: &str) -> String {
+        format!(
+            "/v1/databases/{}/branches/{}/functions{tail}",
+            self.db, self.branch
+        )
+    }
+
+    /// A PATCH of the function on the branch through the management API.
+    async fn patch(&self, name: &str, body: Value) -> Value {
+        self.mgmt
+            .ok(
+                reqwest::Method::PATCH,
+                &self.functions(&format!("/{name}")),
+                Some(body),
+                &[200],
+            )
+            .await
+    }
+
+    /// Sets a secret of the function on the branch through the management API.
+    async fn secret(&self, name: &str, secret: &str, value: &str) {
+        self.mgmt
+            .ok(
+                reqwest::Method::PUT,
+                &self.functions(&format!("/{name}/secrets/{secret}")),
+                Some(json!({ "value": value })),
+                &[204],
+            )
+            .await;
+    }
+
+    /// Creates the function if needed, deploys `source` as a one-module bundle (made active on
+    /// the branch) and enables it, all through the management API.
+    async fn deploy(&self, name: &str, source: &str) {
+        let manifest = serde_json::to_string(&json!({
             "compatibilityDate": "2026-10-01",
             "compatibilityFlags": [],
             "mainModule": "main.js",
             "modules": [{"name": "main.js", "type": "js", "base64": STANDARD.encode(source)}],
         }))
         .unwrap();
-        let sha = hex::encode(Sha256::digest(&manifest));
-        let resp = self
-            .http
-            .put(format!(
-                "{}/internal/bundles/{}/{sha}",
-                self.internal, self.db
-            ))
-            .bearer_auth(&self.orchestrator_token)
-            .body(manifest.clone())
-            .send()
-            .await
-            .expect("the functions service's internal listener");
-        assert_eq!(
-            resp.status(),
-            204,
-            "bundle upload: {}",
-            resp.text().await.unwrap_or_default()
-        );
-        let function = match self
-            .metadata
-            .list_functions(self.db)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|f| f.name == name)
-        {
-            Some(f) => f.id,
-            None => {
-                self.metadata
-                    .create_function(self.db, name, FunctionKind::Function)
-                    .await
-                    .unwrap()
-                    .id
-            }
-        };
-        let deployment = self
-            .metadata
-            .create_deployment(&NewDeployment {
-                id: Uuid::new_v4(),
-                function_id: function,
-                bundle_sha256: Some(&sha),
-                bundle_size: Some(manifest.len() as i64),
-                spec: &json!({}),
-                compatibility_date: sqlx::types::chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
-                    .unwrap(),
-                created_by: "functions-e2e",
-                note: None,
-            })
-            .await
-            .unwrap();
-        self.metadata
-            .set_active_deployment(self.branch, function, deployment.id)
-            .await
-            .unwrap();
-        assert!(
-            self.metadata
-                .set_enabled(self.branch, function, true)
-                .await
-                .unwrap()
-        );
-        self.changed(name).await;
-        function
-    }
-
-    /// What the management API publishes after each write (TODO(#165)).
-    async fn changed(&self, name: &str) {
-        let client = chelabase_nats::connect(&self.nats).await.expect("NATS");
-        chelabase_nats::fn_events::publish_changed(&client, self.branch.as_uuid(), name)
-            .await
-            .expect("publish");
-        client.flush().await.expect("flush");
+        let sha = hex::encode(Sha256::digest(manifest.as_bytes()));
+        self.mgmt
+            .ok(
+                reqwest::Method::PUT,
+                &self.functions(&format!("/{name}")),
+                Some(json!({})),
+                &[200, 201],
+            )
+            .await;
+        // The manifest's bytes as hashed: the orchestrator forwards them unchanged.
+        let (status, body) = self
+            .mgmt
+            .raw(
+                reqwest::Method::POST,
+                &self.functions(&format!("/{name}/deployments")),
+                Some(format!(
+                    "{{\"manifest\": {manifest}, \"sha256\": \"{sha}\"}}"
+                )),
+            )
+            .await;
+        assert_eq!(status, 201, "deploy {name}: {body}");
+        self.patch(name, json!({ "enabled": true })).await;
     }
 
     async fn call(&self, path: &str, key: bool) -> (u16, String) {
@@ -285,12 +332,8 @@ const HELLO: &str = r#"export default {
 
 async fn flow(s: &Stack) {
     // 1. Deployed and enabled: the branch's public key runs it, with its secret and branch id.
-    let hello = s.deploy("hello", &HELLO.replace("VERSION", "v1")).await;
-    s.metadata
-        .put_secret(s.branch, hello, "GREETING", "hi")
-        .await
-        .unwrap();
-    s.changed("hello").await;
+    s.deploy("hello", &HELLO.replace("VERSION", "v1")).await;
+    s.secret("hello", "GREETING", "hi").await;
     let (status, body) = s
         .within("/functions/v1/hello/sub", true, |st, b| {
             st == 200 && b.contains("\"hi\"")
@@ -306,11 +349,7 @@ async fn flow(s: &Stack) {
     assert_eq!(status, 401, "no key");
 
     // 2. Disabled: 404 within 2 s.
-    s.metadata
-        .set_enabled(s.branch, hello, false)
-        .await
-        .unwrap();
-    s.changed("hello").await;
+    s.patch("hello", json!({ "enabled": false })).await;
     let (status, body) = s
         .within("/functions/v1/hello", true, |st, _| st == 404)
         .await;
@@ -330,19 +369,12 @@ async fn flow(s: &Stack) {
     );
 
     // 4. A public function on the keyless form; a key-only one isn't reachable there.
-    let open = s
-        .deploy(
-            "open",
-            r#"export default { fetch() { return new Response("open") } }"#,
-        )
-        .await;
-    assert!(
-        s.metadata
-            .set_function_auth(s.branch, open, FunctionAuth::Public)
-            .await
-            .unwrap()
-    );
-    s.changed("open").await;
+    s.deploy(
+        "open",
+        r#"export default { fetch() { return new Response("open") } }"#,
+    )
+    .await;
+    s.patch("open", json!({ "auth": "public" })).await;
     let path = format!("/functions/v1/public/{}/open", s.branch);
     let (status, body) = s.within(&path, false, |st, _| st == 200).await;
     assert_eq!((status, body.as_str()), (200, "open"));

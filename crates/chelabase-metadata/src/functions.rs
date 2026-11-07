@@ -982,6 +982,24 @@ impl MetadataClient {
         Ok(deployment_from_row(&row))
     }
 
+    /// The function's deployments, newest first (none for an unknown function). Callers scope
+    /// the function to its database first ([`Self::list_functions`]).
+    pub async fn list_deployments(
+        &self,
+        function_id: Uuid,
+    ) -> Result<Vec<DeploymentRecord>, MetadataError> {
+        Ok(sqlx::query(
+            "SELECT * FROM function_deployments WHERE function_id = $1
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(function_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(deployment_from_row)
+        .collect())
+    }
+
     /// Makes `deployment_id` the function's active deployment on the branch (a new branch
     /// state starts disabled, auth `key`). A deployment of another function is
     /// [`MetadataError::InvalidFunction`].

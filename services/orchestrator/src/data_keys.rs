@@ -79,6 +79,10 @@ struct DataKey {
     /// The Postgres databases the key may reach; null is every served database.
     #[schema(required = true)]
     databases: Option<Vec<String>>,
+    /// The function whose run-as key this is (edge functions m3): it can't be rotated,
+    /// revoked or narrowed here. Absent for every other key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_by_function: Option<String>,
 }
 
 /// A key just made, with its plaintext.
@@ -127,6 +131,7 @@ fn summary(
         key,
         role_blocked,
         databases: record.databases,
+        managed_by_function: record.managed_by_function.map(|(_, name)| name),
     })
 }
 
@@ -321,36 +326,15 @@ where
     if role.is_empty() {
         return unprocessable("role must not be empty").into_response();
     }
-    // MH-12: a personal login never backs a key, whoever asks.
-    if let Err(err) = refuse_personal_login_key(&state, &record, &role).await {
-        return err.into_response();
-    }
-    if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &role).await {
-        return err.into_response();
-    }
     if let Some(names) = &request.databases
         && let Err(err) = validate_key_databases(&state, branch.id, names).await
     {
         return err.into_response();
     }
-    if branch.kind == BranchKind::Backup {
-        return conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL).into_response();
-    }
-    if branch.status != BranchStatus::Ready {
-        return conflict(ErrorCode::BranchNotReady, "branch is not ready").into_response();
-    }
-    let identity = match check_role(&state, branch.id, &role).await {
+    let identity = match checked_key_identity(&state, &authorized, &record, &branch, &role, &format!("a key for {role:?}")).await {
         Ok(identity) => identity,
         Err(err) => return err.into_response(),
     };
-    // EOS-H1: a key whose role is, or reaches, a role with the hub's "all rows" policy on the
-    // branch would hand every row of it to the data API (the policy's own check, MH-26, saw
-    // only the keys that existed then). The worker checks, as `cloud_admin`; any failure
-    // refuses (user ruling 2026-10-23: fail closed).
-    let starting: BTreeSet<String> = [role.clone()].into();
-    if let Err(err) = check_all_rows(&state, branch.id, starting, None, &format!("a key for {role:?}")).await {
-        return err.into_response();
-    }
     // Bound to the role's OID on the timeline the check read it on: a role dropped or
     // recreated after the check, or a timeline switch, leaves a dead key, never one of another
     // role (see `chelabase_metadata`'s data API docs).
@@ -383,7 +367,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready", body = ErrorEnvelope),
+        (status = 409, description = "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready; `conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)", body = ErrorEnvelope),
         (status = 422, description = "`role_refused`: the worker refused the secret key's role (it no longer exists or may not back a key; a rename is followed), or the role was dropped and created again since the key was made", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the branch's roles are being changed, retry after `Retry-After`; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope, headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
@@ -415,6 +399,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Some(err) = managed(&old) {
+        return err.into_response();
+    }
     if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &old.role).await {
         return err.into_response();
     }
@@ -487,6 +474,50 @@ where
     }
 }
 
+/// Every check a secret key's role passes before a key is made for it (a data key, or a
+/// function's run-as key: edge functions m3), in order: never a personal login (MH-12); a
+/// role the caller may use (T6); a ready, non-backup branch; the worker's check on the compute,
+/// which gives the role's identity; and the "all rows" check (EOS-H1: a key whose role is, or
+/// reaches, a role with the hub's "all rows" policy on the branch would hand every row of it to
+/// the data API; the worker checks, as `cloud_admin`, and any failure refuses, user ruling
+/// 2026-10-23: fail closed). `what` names the key in that check's message.
+pub(crate) async fn checked_key_identity<M, J>(
+    state: &AppState<M, J>,
+    authorized: &crate::access::Authorized,
+    record: &chelabase_metadata::DatabaseRecord,
+    branch: &BranchRecord,
+    role: &str,
+    what: &str,
+) -> Result<RoleIdentity, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    refuse_personal_login_key(state, record, role).await?;
+    authorize_key_role(state, authorized, branch.id.as_uuid(), role).await?;
+    if branch.kind == BranchKind::Backup {
+        return Err(conflict(ErrorCode::BackupBranch, BACKUP_REFUSAL));
+    }
+    if branch.status != BranchStatus::Ready {
+        return Err(conflict(ErrorCode::BranchNotReady, "branch is not ready"));
+    }
+    let identity = check_role(state, branch.id, role).await?;
+    let starting: BTreeSet<String> = [role.to_string()].into();
+    check_all_rows(state, branch.id, starting, None, what).await?;
+    Ok(identity)
+}
+
+/// A function's run-as key (edge functions m3): the keys routes never change it.
+fn managed(key: &DataKeyRecord) -> Option<ApiError> {
+    key.managed_by_function.as_ref().map(|(_, name)| {
+        conflict(
+            ErrorCode::Conflict,
+            format!("this key is function {name:?}'s run-as key; change the function's run-as role instead"),
+        )
+        .with_extra("reason", serde_json::Value::String("managed_key".into()))
+    })
+}
+
 /// A secret key's role identity from the worker's check: `(pg_roles.oid, the timeline it was
 /// read on, whether the role has BYPASSRLS)`; `None`s (and `false`) from a worker that
 /// predates them.
@@ -545,6 +576,8 @@ fn key_write_error(what: &str, err: MetadataError) -> ApiError {
                 "the role {role} was dropped and created again since this key was made; create a new key for it"
             ),
         ),
+        MetadataError::ManagedKey => conflict(ErrorCode::Conflict, "this key is a function's run-as key")
+            .with_extra("reason", serde_json::Value::String("managed_key".into())),
         MetadataError::EndpointLockTimeout(_) => ApiError::new(
             503,
             ErrorCode::Unavailable,
@@ -571,7 +604,7 @@ struct UpdateKeyRequest {
 }
 
 /// Distinguishes a missing field (outer `None`) from an explicit null (`Some(None)`).
-fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -594,6 +627,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: `databases` is missing or isn't null or a list of 1 to 20 distinct names of the branch's databases", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -632,6 +666,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Some(err) = managed(&old) {
+        return err.into_response();
+    }
     if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &old.role).await {
         return err.into_response();
     }
@@ -647,10 +684,7 @@ where
     {
         Ok(true) => {}
         Ok(false) => return ApiError::not_found("key not found").into_response(),
-        Err(err) => {
-            error!("set key databases: {err}");
-            return ApiError::internal().into_response();
-        }
+        Err(err) => return key_write_error("update", err).into_response(),
     }
     info!(request_id = %principal.request_id, branch_id = %branch.id, key_id = %old.id, "key databases changed");
     // Tokens already minted carry the old list; rest drops what it holds for the branch.
@@ -680,7 +714,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the key doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`public_key_not_revocable`: a public key can only be rotated", body = ErrorEnvelope),
+        (status = 409, description = "`public_key_not_revocable`: a public key can only be rotated; `conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -709,6 +743,9 @@ where
         Ok(None) => return ApiError::not_found("key not found").into_response(),
         Err(resp) => return resp.into_response(),
     };
+    if let Some(err) = managed(&key) {
+        return err.into_response();
+    }
     if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &key.role).await {
         return err.into_response();
     }
@@ -725,10 +762,7 @@ where
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => ApiError::not_found("key not found").into_response(),
-        Err(err) => {
-            error!("revoke data key: {err}");
-            ApiError::internal().into_response()
-        }
+        Err(err) => key_write_error("revoke", err).into_response(),
     }
 }
 

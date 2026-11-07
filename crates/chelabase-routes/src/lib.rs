@@ -1226,6 +1226,38 @@ pub mod orchestrator {
         Access::Project(Developer),
     );
 
+    /// Edge functions m3: a branch's functions. Reads need Viewer; every per-branch write is
+    /// `BRANCH` (Developer, Admin on a protected branch). A function's row is the database's,
+    /// so deleting it needs Admin (the handler also asks Admin to change its kind).
+    const FUNCTIONS: &str = "/v1/databases/{id}/branches/{branch_id}/functions";
+    const FUNCTION: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}";
+    const FUNCTION_DEPLOYMENTS: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments";
+    const FUNCTION_SECRETS: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets";
+    const FUNCTION_SECRET: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}";
+    pub const LIST_FUNCTIONS: Endpoint =
+        key_endpoint("orchestrator.list_functions", Method::Get, FUNCTIONS, Access::Project(Viewer));
+    pub const PUT_FUNCTION: Endpoint = key_endpoint("orchestrator.put_function", Method::Put, FUNCTION, BRANCH);
+    pub const UPDATE_FUNCTION: Endpoint =
+        key_endpoint("orchestrator.update_function", Method::Patch, FUNCTION, BRANCH);
+    pub const DELETE_FUNCTION: Endpoint =
+        key_endpoint("orchestrator.delete_function", Method::Delete, FUNCTION, Access::Project(Admin));
+    pub const CREATE_FUNCTION_DEPLOYMENT: Endpoint =
+        key_endpoint("orchestrator.create_function_deployment", Method::Post, FUNCTION_DEPLOYMENTS, BRANCH);
+    pub const LIST_FUNCTION_DEPLOYMENTS: Endpoint = key_endpoint(
+        "orchestrator.list_function_deployments",
+        Method::Get,
+        FUNCTION_DEPLOYMENTS,
+        Access::Project(Viewer),
+    );
+    pub const LIST_FUNCTION_SECRETS: Endpoint =
+        key_endpoint("orchestrator.list_function_secrets", Method::Get, FUNCTION_SECRETS, Access::Project(Viewer));
+    pub const PUT_FUNCTION_SECRET: Endpoint =
+        key_endpoint("orchestrator.put_function_secret", Method::Put, FUNCTION_SECRET, BRANCH);
+    pub const DELETE_FUNCTION_SECRET: Endpoint =
+        key_endpoint("orchestrator.delete_function_secret", Method::Delete, FUNCTION_SECRET, BRANCH);
+
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
@@ -1745,6 +1777,15 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::LIST_PARTS,
     storage::COMPLETE_UPLOAD,
     storage::ABORT_UPLOAD,
+    orchestrator::LIST_FUNCTIONS,
+    orchestrator::PUT_FUNCTION,
+    orchestrator::UPDATE_FUNCTION,
+    orchestrator::DELETE_FUNCTION,
+    orchestrator::CREATE_FUNCTION_DEPLOYMENT,
+    orchestrator::LIST_FUNCTION_DEPLOYMENTS,
+    orchestrator::LIST_FUNCTION_SECRETS,
+    orchestrator::PUT_FUNCTION_SECRET,
+    orchestrator::DELETE_FUNCTION_SECRET,
     functions::INVOKE,
     functions::INVOKE_PATH,
     functions::INVOKE_PUBLIC,
@@ -2716,6 +2757,16 @@ mod tests {
             ("storage.list_parts", Access::DataKey),
             ("storage.complete_upload", Access::DataKey),
             ("storage.abort_upload", Access::DataKey),
+            // Edge functions m3: the management API.
+            ("orchestrator.list_functions", Access::Project(Viewer)),
+            ("orchestrator.put_function", BRANCH),
+            ("orchestrator.update_function", BRANCH),
+            ("orchestrator.delete_function", Access::Project(Admin)),
+            ("orchestrator.create_function_deployment", BRANCH),
+            ("orchestrator.list_function_deployments", Access::Project(Viewer)),
+            ("orchestrator.list_function_secrets", Access::Project(Viewer)),
+            ("orchestrator.put_function_secret", BRANCH),
+            ("orchestrator.delete_function_secret", BRANCH),
             // Edge functions m3: invocations (served by m4).
             ("functions.invoke", Access::DataKey),
             ("functions.invoke_path", Access::DataKey),
@@ -3064,5 +3115,36 @@ mod tests {
 
         let declared = ties(ENDPOINTS);
         assert!(declared.is_empty(), "tied endpoints: {declared:?}");
+    }
+
+    /// Edge functions m3: the management routes, member token from Studio; reads at Viewer,
+    /// per-branch writes `Branch(Developer, Admin)`, a delete Admin.
+    #[test]
+    fn function_management_routes() {
+        use PlatformRole::{Admin, Developer, Viewer};
+        let branch = Access::Branch { unprotected: Developer, protected: Admin };
+        let base = "/v1/databases/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/branches/7a1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/functions";
+        for (method, tail, name, access) in [
+            ("GET", "", "orchestrator.list_functions", Access::Project(Viewer)),
+            ("PUT", "/hello", "orchestrator.put_function", branch),
+            ("PATCH", "/hello", "orchestrator.update_function", branch),
+            ("DELETE", "/hello", "orchestrator.delete_function", Access::Project(Admin)),
+            ("POST", "/hello/deployments", "orchestrator.create_function_deployment", branch),
+            ("GET", "/hello/deployments", "orchestrator.list_function_deployments", Access::Project(Viewer)),
+            ("GET", "/hello/secrets", "orchestrator.list_function_secrets", Access::Project(Viewer)),
+            ("PUT", "/hello/secrets/API_KEY", "orchestrator.put_function_secret", branch),
+            ("DELETE", "/hello/secrets/API_KEY", "orchestrator.delete_function_secret", branch),
+        ] {
+            let path = format!("{base}{tail}");
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy.access), (name, access), "{method} {tail}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio));
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "POST", &format!("{base}/hello")),
+            Match::MethodNotAllowed(vec![Method::Put, Method::Patch, Method::Delete])
+        );
     }
 }

@@ -122,6 +122,15 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/schema` | Member token | Project Viewer |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/types` | Member token | Project Developer |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/databases` | Member token | Project Viewer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions` | Member token | Project Viewer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}` | Member token | Project Admin |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}` | Member token | Branch: Developer unprotected, Admin protected |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/deployments` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/deployments` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets` | Member token | Project Viewer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets/\{secret\}` | Member token | Branch: Developer unprotected, Admin protected |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/functions/\{name\}/secrets/\{secret\}` | Member token | Branch: Developer unprotected, Admin protected |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions` | Member token | Project Developer |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Member token | Project Admin |
 | PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Member token | Project Admin |
