@@ -32,6 +32,9 @@
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
 #  10. secret reads     every running service reads its mounted secrets as its own uid and groups
 #  11. rerun            a second `up --wait` changes no secret, container or log line of the code
+#  11b. upgrade        an install from before object storage (no storage container, NATS user or
+#                      password): a recreated init-secrets adds only storage's password and NATS
+#                      user, Compose restarts NATS, and storage logs in and delivers an event
 #  12. uninstall        the documented uninstall (computes still running) leaves no container,
 #                      volume or network
 #  13. failing install  in a second project, an SMTP host with no sender fails `up --wait`: the
@@ -43,6 +46,8 @@
 # nothing is pulled for them). For a mixed release set, CHELABASE_IMAGE_TAG_<IMAGE> (e.g.
 # CHELABASE_IMAGE_TAG_STUDIO) tags one image; once any is set, the images with neither it nor
 # CHELABASE_IMAGE_TAG stay at their compose pins (pulled by digest when missing).
+# The default (build) mode runs storage from the all-in-one server image, like the other apps, so
+# the storage release image's read-only start is checked by scripts/tests/images-smoke.sh.
 #
 # Other switches: SELFHOST_E2E_SKIP_CODE=1 stubs the code check out (step 4 expects 200 instead of
 # 403, so the script must fail there: this shows its failure path). SELFHOST_E2E_KEEP=1 leaves the
@@ -276,13 +281,18 @@ if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]] && compgen -v CHELABASE_IMAGE_TAG_ 
   svc=""
   while IFS= read -r line; do
     [[ "$line" =~ ^\ \ ([a-z0-9-]+):$ ]] && svc="${BASH_REMATCH[1]}"
-    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
+    # Storage's tag nests its own variable until its first pin (#152):
+    # ${CHELABASE_STORAGE_IMAGE_TAG:-${CHELABASE_IMAGE_TAG:-unpublished}}.
+    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{(CHELABASE_[A-Z]+_IMAGE_TAG:-\$\{)?CHELABASE_IMAGE_TAG:-([^}]*)\}\}?$ ]] || continue
     img="${BASH_REMATCH[2]}"
     var="CHELABASE_IMAGE_TAG_${img^^}"
     if [[ -n "${!var:-}${CHELABASE_IMAGE_TAG:-}" ]]; then
       ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:${!var:-$CHELABASE_IMAGE_TAG}"
+    elif [[ "${BASH_REMATCH[4]}" == unpublished ]]; then
+      # No pin to fall back to yet: the image `just images` built.
+      ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:latest"
     else
-      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[3]}"
+      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[4]}"
       docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null
     fi
     printf '  %s:\n    image: %s\n' "$svc" "$ref" >>"$tmp/images.yml"
@@ -626,22 +636,26 @@ status="$(printf 'Authorization: Bearer %s\n' "$(session_token "$ADMIN_JAR")" |
 [[ "$status" == 200 ]] || die "console upload through the orchestrator: $status $(cat "$tmp/body")"
 status="$(st GET /storage/v1/object/files/console.txt)"
 [[ "$status" == 200 && "$(cat "$tmp/sbody")" == 'from the console' ]] || die "the app reading the console upload: $status $(head -c 300 "$tmp/sbody")"
+# hook_event <name>: waits up to 90 s for the receiver to log files/<name>'s object.created
+# event; sets $event to its line ({"sig": …, "body": base64}).
+hook_event() {
+  local name="$1" line deadline=$((SECONDS + 90))
+  event=""
+  while ((SECONDS < deadline)); do
+    while IFS= read -r line; do
+      [[ "$line" == '{"sig":"t='* ]] || continue
+      if jq -r .body <<<"$line" | base64 -d 2>/dev/null |
+        jq -e --arg n "$name" '.type == "object.created" and .bucket == "files" and .name == $n' >/dev/null 2>&1; then
+        event="$line"
+        return
+      fi
+    done < <(compose "$PROJECT" logs --no-color --no-log-prefix hooks 2>/dev/null)
+    sleep 2
+  done
+  die "no object.created event for $name at the receiver after 90 s: $(compose "$PROJECT" logs --no-color --tail 5 hooks 2>&1 | cut -c1-300)"
+}
 # The receiver got hello.txt's object.created event, signed with the endpoint's secret.
-event=""
-deadline=$((SECONDS + 90))
-while ((SECONDS < deadline)); do
-  while IFS= read -r line; do
-    [[ "$line" == '{"sig":"t='* ]] || continue
-    if jq -r .body <<<"$line" | base64 -d 2>/dev/null |
-      jq -e '.type == "object.created" and .bucket == "files" and .name == "hello.txt"' >/dev/null 2>&1; then
-      event="$line"
-      break
-    fi
-  done < <(compose "$PROJECT" logs --no-color --no-log-prefix hooks 2>/dev/null)
-  [[ -z "$event" ]] || break
-  sleep 2
-done
-[[ -n "$event" ]] || die "no object.created event for hello.txt at the receiver after 90 s: $(compose "$PROJECT" logs --no-color --tail 5 hooks 2>&1 | cut -c1-300)"
+hook_event hello.txt
 sig="$(jq -r .sig <<<"$event")"
 t="${sig#t=}"
 t="${t%%,*}"
@@ -773,6 +787,61 @@ diff -u "$tmp/before.containers" "$tmp/after.containers" >"$tmp/containers.diff"
 diff -u "$tmp/before.code" "$tmp/after.code" >/dev/null || die "a rerun of up printed the setup code again"
 [[ "$(api GET /v1/me)" == 200 ]] || die "the claimant lost access after the rerun: $(cat "$tmp/body")"
 pass "no secret file, container or setup-code line changed ($(wc -l <"$tmp/after.secrets") secret files)"
+
+# ---- 11b. an upgrade from before object storage --------------------------------------------------
+
+# An install from before object storage has no storage container, no storage NATS user and no
+# nats/storage.password, and its NATS runs on that auth.conf. The upgrade's new init image (here:
+# a label, which changes init-secrets' config the same way) makes the password and re-renders
+# auth.conf; Compose must restart NATS (depends_on restart: true) or storage can't log in.
+step "an upgrade from before object storage restarts NATS and storage logs in"
+compose "$PROJECT" rm -sf storage >/dev/null 2>&1 || die "removing the storage container"
+# shellcheck disable=SC2016
+docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s" --entrypoint sh "$HELPER" -c '
+  set -e
+  rm /s/nats/storage.password
+  awk "{ l[NR] = \$0 } END { for (i = 1; i <= NR; i++) {
+      if (!skip && l[i] == \"    {\" && l[i + 1] == \"      user: \\\"storage\\\"\") skip = 1
+      if (!skip) print l[i]; else if (l[i] == \"    }\") skip = 0 } }" /s/nats/auth.conf >/tmp/auth.conf
+  ! grep -q "user: \"storage\"" /tmp/auth.conf
+  [ "$(grep -c "user: " /tmp/auth.conf)" -ge 4 ]
+  cat /tmp/auth.conf >/s/nats/auth.conf' || die "making the secrets volume a pre-storage install's"
+compose "$PROJECT" restart nats >/dev/null 2>&1 || die "restarting NATS on the pre-storage users"
+snapshot pre-upgrade
+nats_started="$(docker inspect -f '{{.State.StartedAt}}' "$(compose "$PROJECT" ps -q nats)")"
+init_id="$(compose "$PROJECT" ps -aq init-secrets)"
+printf 'services:\n  init-secrets:\n    labels:\n      chelabase.e2e/upgrade: "1"\n' >"$tmp/upgrade.yml"
+COMPOSE_FILES+=(-f "$tmp/upgrade.yml")
+if ! compose_up "$PROJECT"; then tail -n 40 "$tmp/$PROJECT.up" >&2; die "the upgrade's up --wait failed"; fi
+snapshot upgraded
+[[ "$(compose "$PROJECT" ps -aq init-secrets)" != "$init_id" ]] || die "the upgrade didn't recreate init-secrets"
+# Only storage's password is new and only auth.conf changed: nothing else is overwritten.
+grep -v ' \./nats/auth\.conf$' "$tmp/pre-upgrade.secrets" >"$tmp/pre-upgrade.rest"
+grep -v ' \./nats/auth\.conf$' "$tmp/upgraded.secrets" | grep -v ' \./nats/storage\.password$' >"$tmp/upgraded.rest"
+diff -u "$tmp/pre-upgrade.rest" "$tmp/upgraded.rest" >"$tmp/upgrade.diff" ||
+  die "the upgrade changed other secret files: $(sed 's/^\([-+]\)[0-9a-f]\{64\}/\1<hash>/' "$tmp/upgrade.diff" | head -20)"
+grep -q ' \./nats/storage\.password$' "$tmp/upgraded.secrets" || die "the upgrade made no nats/storage.password"
+cmp -s <(grep ' \./nats/auth\.conf$' "$tmp/pre-upgrade.secrets") <(grep ' \./nats/auth\.conf$' "$tmp/upgraded.secrets") &&
+  die "the upgrade didn't re-render nats/auth.conf"
+vol_cat nats/auth.conf | grep -q 'user: "storage"' || die "the re-rendered auth.conf has no storage user"
+new_started="$(docker inspect -f '{{.State.StartedAt}}' "$(compose "$PROJECT" ps -q nats)")"
+[[ "$new_started" != "$nats_started" ]] || die "NATS didn't restart after the upgraded init-secrets (still started at $nats_started)"
+storage_id="$(compose "$PROJECT" ps -q storage)"
+[[ -n "$storage_id" && "$(docker inspect -f '{{.State.Health.Status}}' "$storage_id")" == healthy ]] || die "storage isn't healthy after the upgrade"
+# Storage logs in to NATS with its new user (its subscriptions start) …
+connected=""
+deadline=$((SECONDS + 60))
+while ((SECONDS < deadline)); do
+  if docker logs "$storage_id" 2>&1 | grep -qF 'listening for NATS cache events'; then connected=1; break; fi
+  sleep 2
+done
+[[ -n "$connected" ]] || die "storage didn't log in to NATS after the upgrade: $(docker logs --tail 5 "$storage_id" 2>&1 | cut -c1-300)"
+# … and publishes an object event through it: an upload reaches the webhook receiver.
+status="$(st POST /storage/v1/object/files/upgraded.txt -H 'content-type: text/plain' --data-binary 'after the upgrade')"
+[[ "$status" == 200 ]] || die "upload after the upgrade: $status $(cat "$tmp/sbody")"
+hook_event upgraded.txt
+[[ "$(api GET /v1/me)" == 200 ]] || die "the claimant lost access after the upgrade: $(cat "$tmp/body")"
+pass "the upgrade made storage's NATS user and password only, NATS restarted, and storage logged in and delivered an event"
 
 # ---- 12. teardown --------------------------------------------------------------------------------
 

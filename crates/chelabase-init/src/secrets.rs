@@ -2267,7 +2267,18 @@ mod tests {
             std::fs::remove_file(t.path().join(f)).unwrap();
         }
         // NATS's users as such an install rendered them: no storage user.
-        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let rendered = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let start = rendered
+            .find("    {\n      user: \"storage\"\n")
+            .expect("a storage user in auth.conf");
+        let end = start + rendered[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        let auth = format!("{}{}", &rendered[..start], &rendered[end..]);
+        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key("storage"));
+        assert_eq!(
+            crate::kinds::service_auth::previous_nats_hashes(&auth).len(),
+            crate::kinds::stack_secrets::NATS_USERS.len() - 1
+        );
+        std::fs::write(t.path().join("nats/auth.conf"), &auth).unwrap();
         let before = snapshot(t.path());
         let r = ensure_secrets(t.path(), &opts()).unwrap();
         let mut created = r.created.clone();

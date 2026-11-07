@@ -183,6 +183,26 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
       [[ "$got" != 101 && "$got" != 000 ]] && ok "realtime:8087 refuses a socket without a ticket ($got)" ||
         fail "realtime:8087: a socket without a ticket answers $got" ;;
     realtime:8088) health_only realtime:8088 "realtime:8088" ;;
+    # Object storage's public API (#153): every key route needs the gateway's identity token
+    # (X-Chelabase-Identity; a forged one is refused too); the keyless signed-URL routes need a
+    # valid URL token. Only /health answers without one.
+    storage:8089)
+      health_only storage:8089 "storage:8089"
+      refused GET http://storage:8089/storage/v1/bucket "storage's bucket list"
+      refused GET http://storage:8089/storage/v1/bucket "storage's bucket list (a forged identity)" -H 'X-Chelabase-Identity: eyJhbGciOiJFZERTQSJ9.e30.AAAA'
+      refused POST http://storage:8089/storage/v1/object/files/x.txt "storage's upload" -H 'Content-Type: text/plain' -d x
+      refused POST http://storage:8089/storage/v1/object/resolve "storage's ref resolve" -H 'Content-Type: application/json' -d '{"refs":[]}'
+      refused GET http://storage:8089/storage/v1/object/sign/files/x.txt "storage's signed download (no token)"
+      refused GET "http://storage:8089/storage/v1/object/sign/files/x.txt?token=bad" "storage's signed download (a bad token)"
+      refused PUT "http://storage:8089/storage/v1/object/upload/sign/files/x.txt?token=bad" "storage's signed upload (a bad token)" -H 'Content-Type: text/plain' -d x ;;
+    # Its console listener: the orchestrator's bearer (tokens/storage-internal.token) first, before
+    # the caller header is read, so a forged caller without the bearer is refused.
+    storage:8090)
+      local caller='X-Chelabase-Console: {"owner":true,"database":"x","branch_id":"'"$uuid"'"}'
+      refused GET http://storage:8090/storage/v1/bucket "storage's console bucket list"
+      refused GET http://storage:8090/storage/v1/bucket "storage's console bucket list (a forged caller)" -H "$caller"
+      refused POST http://storage:8090/storage/v1/object/files/x.txt "storage's console upload" -H "$caller" -H 'Content-Type: text/plain' -d x
+      refused POST http://storage:8090/storage/v1/object/sign/files/x.txt "storage's console signing" -H "$caller" -H 'Content-Type: application/json' -d '{"expires_in":60}' ;;
     compute:5432) ok "compute:5432 is public by design (password logins)" ;;
     # compute_ctl's external API answers 401 (with WWW-Authenticate: Bearer) to a request without
     # a bearer, on every route, /metrics and /autoscaling_metrics included (K3/K4). Its internal
