@@ -6,7 +6,7 @@ import { RealtimeContext } from "@/lib/realtime/context";
 import { KEYLESS_DEBOUNCE_MS, KEYLESS_MIN_MS } from "@/lib/realtime/live-rows";
 import type { StatusReason } from "@/lib/realtime/types";
 import { FakeRealtime } from "@/test/fake-realtime";
-import { objectKey, useLiveObjects, type LiveTarget } from "./live-objects";
+import { objectKey, useLiveObjects, viewIds, type LiveTarget } from "./live-objects";
 
 const TARGET: LiveTarget = { databaseId: "d1", branchId: "b1", pgDatabase: "app", bucketId: "bk-1", role: "authenticated" };
 const O1 = "00000000-0000-4000-8000-000000000001";
@@ -99,6 +99,13 @@ describe("useLiveObjects", () => {
     expect(rt.storage.views).toHaveLength(1);
     rerender({ target: TARGET, ids: [O1, O2] });
     expect(rt.storage.views.at(-1)).toEqual([objectKey(O1), objectKey(O2)]);
+  });
+
+  // S1: a folder row carries one object under it; its id is a view key too, so deleting the
+  // folder's last object (that one, necessarily) reaches this viewer and the row goes.
+  it("view_ids_are_the_files_and_each_folders_object", () => {
+    const row = (name: string, folder: boolean, id: string | null) => ({ name, folder, size: null, etag: null, contentType: null, updatedAt: null, id });
+    expect(viewIds([row("docs/", true, O2), row("a.png", false, O1), row("old/", true, null)])).toEqual([O2, O1]);
   });
 
   it("leaves_when_the_bucket_or_role_changes_and_on_unmount", () => {

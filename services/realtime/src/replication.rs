@@ -1406,18 +1406,27 @@ impl Holding<'_> {
                 e.insert(deps.checker.parents(&self.target, r.rel).await.ok()?);
             }
         }
-        for r in fan_out(w, parents, deps.settings.filter.max_keys) {
-            let msg = WindowMsg {
-                xids: w.xids.clone(),
-                changed: r.changed,
-                inserts: r.inserts,
-                updates: r.updates,
-                deletes: r.deletes,
+        let max_keys = deps.settings.filter.max_keys;
+        for whole in fan_out(w, parents, max_keys) {
+            // `storage.objects` is kept whole past the key limit: published in chunks (m17).
+            let chunks = if w.split.contains(&whole.rel) {
+                whole.chunks(max_keys)
+            } else {
+                vec![whole]
             };
-            out.push_back((
-                rows_subject(self.key, r.rel),
-                Bytes::from(serde_json::to_vec(&msg).expect("serializes")),
-            ));
+            for r in chunks {
+                let msg = WindowMsg {
+                    xids: w.xids.clone(),
+                    changed: r.changed,
+                    inserts: r.inserts,
+                    updates: r.updates,
+                    deletes: r.deletes,
+                };
+                out.push_back((
+                    rows_subject(self.key, r.rel),
+                    Bytes::from(serde_json::to_vec(&msg).expect("serializes")),
+                ));
+            }
         }
         Some(out)
     }

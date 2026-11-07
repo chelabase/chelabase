@@ -89,6 +89,8 @@ export interface FileObject {
   content_type: string | null;
   /** Seconds since the epoch. */
   updated_at: number | null;
+  /** A file's object id; for a folder, the id of one object under it (any one the caller can list). */
+  id: string | null;
 }
 
 /** A page of a listing: the objects, and the next page's cursor (`null` on the last page). */

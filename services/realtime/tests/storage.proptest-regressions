@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f641b90c840740ef29509726929a3904edc872f8808d7bfd8dba2571baa40c69 # shrinks to steps = [Deliver { bulk: true, starved: false }]
+cc f75a8d41745b38481452b88c48985843fe7fa8d963d6c213093295a1da670fe6 # shrinks to steps = [Put { i: 2, in_a: false, hidden: false }, Delete { i: 2 }, Deliver { bulk: false, starved: true }, Put { i: 2, in_a: true, hidden: false }, View { mask: 204 }, Deliver { bulk: true, starved: false }]
+cc 324c526b1eb9ec0b7bf6bfe3bd572ff2d60168f2b651b1c78fc8153e2d56733e # shrinks to steps = [Put { i: 2, in_a: true, hidden: false }, Deliver { bulk: false, starved: true }, View { mask: 4 }, Put { i: 2, in_a: false, hidden: false }, Deliver { bulk: false, starved: false }, Deliver { bulk: true, starved: false }]
+cc 80b94073dc38269f55cfa50547a5264e0ef841690dae434013cba70f47413a98 # shrinks to steps = [Put { i: 2, in_a: false, hidden: false }, Delete { i: 2 }, Deliver { bulk: false, starved: true }, Put { i: 2, in_a: true, hidden: false }, Deliver { bulk: true, starved: true }, View { mask: 52 }, Deliver { bulk: false, starved: false }]

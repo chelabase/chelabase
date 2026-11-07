@@ -3,6 +3,7 @@ import type { LiveStatus } from "@/components/table-editor/live-badge";
 import { useRealtime } from "@/lib/realtime/context";
 import { createRefetchGate } from "@/lib/realtime/live-rows";
 import type { Key, StorageSubscription } from "@/lib/realtime/types";
+import type { StorageItem } from "@/lib/storage-api";
 
 /** Where the browser is: the branch's main Postgres database, the bucket, the Act-as role (null: owner mode). */
 export interface LiveTarget {
@@ -19,12 +20,22 @@ export function objectKey(id: string): Key {
 }
 
 /**
+ * The listing's view keys: each file's id and each folder row's one object under it. Deleting a
+ * folder's last object deletes that object, so its keyed delete reaches the viewer and the row
+ * goes; other objects inside a folder change nothing on screen. Every id is one the role's own
+ * listing returned, and realtime confirms each before it counts.
+ */
+export function viewIds(items: StorageItem[]): string[] {
+  return items.flatMap((i) => (i.id ? [i.id] : []));
+}
+
+/**
  * Object storage m17: a bucket's live changes, as the role sees them. Realtime sends only keys of
  * objects the role can list in this bucket; the listing can't place an id in a folder, so any
  * change reads the listing again (its folder, search and sort), through the table editor's gate
  * (debounced, spaced, backing off). `joined`/`status` live reads it again at once (changes may have
- * happened while paused). `ids`: the files on screen, sent as view keys, so a delete of one of them
- * reaches this viewer. Returns the live state for the badge; null without realtime or before the
+ * happened while paused). `ids`: the rows on screen ({@link viewIds}), sent as view keys, so a delete of
+ * one of them reaches this viewer. Returns the live state for the badge; null without realtime or before the
  * first answer.
  */
 export function useLiveObjects(target: LiveTarget, ids: string[], refetch: () => void): LiveStatus | null {
