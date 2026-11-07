@@ -171,6 +171,9 @@ pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFai
 /// - a transient failure stays one, with a fixed text (m11 re-audit S2): class 40 and 55P03
 ///   are 409 `retry` ([`Failure::delete_retry`]), 57014 and 25P04 are 504 `timeout`
 ///   ([`Failure::delete_timeout`]);
+/// - a server-side failure the data API calls 503 (`classify`: shutdown, connection loss,
+///   insufficient resources) stays a retryable 503 `unavailable` with a fixed text, from a
+///   statement, nested or at COMMIT (m11 re-audit S3);
 /// - any other nested error is 409 `delete_refused` (a user's trigger picks its own SQLSTATE
 ///   and text; an RLS policy function's error lands here too);
 /// - what's left was raised by the `DELETE` on `storage.objects` itself (RLS, privileges),
@@ -191,6 +194,11 @@ pub fn deleted_failure(code: Option<&str>, nested: bool, f: QueryFailure) -> Fai
             Failure::delete_retry(c)
         }
         Some(c @ (QUERY_CANCELED | TRANSACTION_TIMEOUT)) => Failure::delete_timeout(c),
+        // The codes the data API calls 503 `unavailable` (shutdown, lost connection,
+        // insufficient resources): not a user's refusal, so retryable, with a fixed text.
+        Some(c) if chelabase_query::error::classify(c) == Some((503, "unavailable")) => {
+            Failure::delete_unavailable()
+        }
         Some(_) if nested => Failure::delete_refused(),
         Some(_) => Failure(f),
     }
@@ -1033,7 +1041,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     summary = "Delete an object",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     security(("bearer" = [])),
-    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted); `retry`: a concurrent transaction or a held lock rolled it back (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1066,7 +1074,7 @@ pub struct DeleteObjects {
     params(("bucket" = String, Path), ObjectParams),
     request_body = DeleteObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message); `retry`: a concurrent transaction or a held lock rolled it back (try again). Either way nothing is deleted", body = StorageErrorEnvelope), (status = 503, description = "`unavailable`: the database was shut down, lost or out of resources (nothing is deleted; try again)", body = StorageErrorEnvelope), (status = 504, description = "`timeout`: the delete ran past the timeout (nothing is deleted; try again)", body = StorageErrorEnvelope)),
 )]
 pub async fn delete_many<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1474,6 +1482,7 @@ mod tests {
         const SECRET: &str = "secret_table";
         let class_23 = ["23000", "23001", "23502", "23503", "23505", "23514", "23P01"];
         let transient = ["40000", "40001", "40002", "40003", "40P01", "55P03", "57014", "25P04"];
+        let unavailable = ["08006", "28P01", "53100", "53200", "53300", "57P01", "57P02", "57P03"];
         let raised = [WRITE_ONCE, TICKET_MISSING, "P0001", "42501", "22023", "XX000", "ZZ999"];
         let from_user = |code: &str| {
             let mut f = QueryFailure::new(StatusCode::BAD_REQUEST, "raised", format!("{SECRET} row 1 ({code})"));
@@ -1483,13 +1492,14 @@ mod tests {
             f
         };
         let mut checked = 0;
-        for code in class_23.iter().chain(&transient).chain(&raised) {
+        for code in class_23.iter().chain(&transient).chain(&unavailable).chain(&raised) {
             // (context line, at COMMIT): a statement's error without and with one, and the
             // COMMIT's (whatever its context).
             for (context, at_commit) in [(false, false), (true, false), (false, true), (true, true)] {
                 let case = format!("{code} context={context} at_commit={at_commit}");
                 let user_reachable = code.starts_with("23")
                     || transient.contains(code)
+                    || unavailable.contains(code)
                     || context
                     || at_commit
                     || *code == WRITE_ONCE;
@@ -1504,10 +1514,15 @@ mod tests {
                     "23503" => Failure::object_referenced(),
                     WRITE_ONCE => Failure::write_once_delete(),
                     "57014" | "25P04" => Failure::delete_timeout(code),
+                    c if unavailable.contains(&c) => Failure::delete_unavailable(),
                     c if transient.contains(&c) => Failure::delete_retry(c),
                     _ => Failure::delete_refused(),
                 };
-                let status = if matches!(*code, "57014" | "25P04") { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::CONFLICT };
+                let status = match *code {
+                    "57014" | "25P04" => StatusCode::GATEWAY_TIMEOUT,
+                    c if unavailable.contains(&c) => StatusCode::SERVICE_UNAVAILABLE,
+                    _ => StatusCode::CONFLICT,
+                };
                 assert_eq!(got.status, status, "{case}");
                 assert_eq!(Failure(got), want, "{case}");
                 checked += 1;
@@ -1516,7 +1531,7 @@ mod tests {
         // Not reachable: a non-transient, non-class-23 code other than write-once, raised by
         // the DELETE itself (no context line, not at COMMIT): left as it was, above.
         let unreachable = raised.len() - 1;
-        let all = (class_23.len() + transient.len() + raised.len()) * 4;
+        let all = (class_23.len() + transient.len() + unavailable.len() + raised.len()) * 4;
         assert_eq!(checked, all - unreachable, "every reachable case");
     }
 
