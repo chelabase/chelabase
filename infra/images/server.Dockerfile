@@ -1,6 +1,6 @@
 # Release images for the Rust services (self-host). One builder stage runs one `cargo build`
 # for every binary; each runtime target copies what it needs:
-#   --target gateway|orchestrator|worker|rest|auth|realtime|storage|init   one binary, /usr/local/bin/<app>
+#   --target gateway|orchestrator|worker|rest|auth|realtime|storage|functions|init   one binary, /usr/local/bin/<app>
 #   --target all                                                   every binary (chelabase/server)
 # `init` is the `chelabase-init` binary and keeps that name. The `chelabase` CLI is in none of them.
 # The workbench does not use this file: it runs host-built debug binaries (infra/workbench).
@@ -18,9 +18,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-      -p gateway -p orchestrator -p worker -p rest -p auth -p realtime -p chelabase-storage-service -p init \
+      -p gateway -p orchestrator -p worker -p rest -p auth -p realtime -p chelabase-storage-service \
+      -p chelabase-functions -p init \
  && mkdir /out \
- && for b in gateway orchestrator worker rest auth realtime storage chelabase-init; do \
+ && for b in gateway orchestrator worker rest auth realtime storage functions chelabase-init; do \
       install -m 0755 "target/release/${b}" "/out/${b}"; \
     done
 
@@ -73,6 +74,11 @@ FROM base-http AS storage
 COPY --from=builder /out/storage /usr/local/bin/storage
 USER 10001:10001
 CMD ["storage"]
+
+FROM base-http AS functions
+COPY --from=builder /out/functions /usr/local/bin/functions
+USER 10001:10001
+CMD ["functions"]
 
 FROM base AS init
 COPY --from=builder /out/chelabase-init /usr/local/bin/chelabase-init

@@ -1234,6 +1234,8 @@ mod tests {
                 "${CHELABASE_STACK_DIR}/s3/secret-key",
                 "${CHELABASE_STACK_DIR}/storage-s3/access-key",
                 "${CHELABASE_STACK_DIR}/storage-s3/secret-key",
+                "${CHELABASE_STACK_DIR}/functions-s3/access-key",
+                "${CHELABASE_STACK_DIR}/functions-s3/secret-key",
                 "${CHELABASE_STACK_DIR}/grpc-tls/ca.crt",
                 "${CHELABASE_STACK_DIR}/grpc-tls/server.crt",
                 "${CHELABASE_STACK_DIR}/grpc-tls/server.key",
@@ -2201,11 +2203,16 @@ mod tests {
     /// object-storage m19 (#152): the files the self-hosted `storage` service mounts from the
     /// `secrets` volume (its block in docker-compose.yml), sorted.
     fn selfhost_storage_mounts() -> Vec<String> {
+        selfhost_mounts("storage")
+    }
+
+    /// The files the self-hosted service `name` mounts from the `secrets` volume, sorted.
+    fn selfhost_mounts(name: &str) -> Vec<String> {
         let text = compose_file("docker-compose.yml");
         let block = text
-            .split("\n  storage:\n")
+            .split(&format!("\n  {name}:\n"))
             .nth(1)
-            .expect("a storage service in the self-hosted compose file");
+            .unwrap_or_else(|| panic!("a {name} service in the self-hosted compose file"));
         let mut subs: Vec<String> = block
             .lines()
             .take_while(|l| l.is_empty() || l.starts_with("    "))
@@ -2265,6 +2272,53 @@ mod tests {
             bcrypt::verify(&pw, &hashes["storage"]).unwrap(),
             "storage's NATS user"
         );
+    }
+
+    /// Edge functions m4b: the functions service mounts exactly its own files, each made by a
+    /// fresh run (the layout's; the S3 pair by init-secrets' script), and NATS's auth file
+    /// carries its user. The orchestrator and the worker each mount their bearer.
+    #[test]
+    fn functions_service_mounts_come_from_init() {
+        let mounts = selfhost_mounts("functions");
+        assert_eq!(
+            mounts,
+            [
+                "db/metadata.password",
+                "functions-s3/access-key",
+                "functions-s3/secret-key",
+                "gateway/internal-verify.pem",
+                "nats/functions.password",
+                "secrets/secrets.key",
+                "tokens/orchestrator-functions.token",
+                "tokens/worker-functions.token",
+            ],
+            "functions mounts only its own secrets"
+        );
+        assert!(selfhost_mounts("orchestrator").contains(&"tokens/orchestrator-functions.token".to_string()));
+        assert!(selfhost_mounts("worker").contains(&"tokens/worker-functions.token".to_string()));
+        let t = tmp();
+        let report = ensure_secrets(t.path(), &opts()).unwrap();
+        let (uid, gid) = me();
+        for sub in mounts.iter().filter(|s| !s.starts_with("functions-s3/")) {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == sub)
+                .unwrap_or_else(|| panic!("{sub} is not in chelabase-init's layout"));
+            let p = t.path().join(sub);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert!(matches!(entry.spec.uid, Id::Writer), "{sub}: the app user owns it");
+            assert_eq!(meta.uid(), uid, "{sub}");
+            // Owner-only, except the metadata password (also its database's group).
+            if sub != "db/metadata.password" {
+                let want = if entry.spec == PUB { 0o644 } else { 0o600 };
+                assert_eq!((meta.gid(), mode(&p)), (gid, want), "{sub}");
+            }
+            assert!(report.created.contains(&p), "{sub}");
+        }
+        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&auth);
+        let pw = std::fs::read_to_string(t.path().join("nats/functions.password")).unwrap();
+        assert!(bcrypt::verify(&pw, &hashes["functions"]).unwrap(), "functions' NATS user");
     }
 
     /// An install from before object storage (no storage secrets): the next run makes them and

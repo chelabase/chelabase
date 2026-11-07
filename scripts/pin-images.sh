@@ -21,7 +21,7 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 [[ $# -eq 1 && -f "$1" ]] || { echo "usage: $0 <digests-file>" >&2; exit 2; }
-images=(gateway orchestrator worker rest auth realtime storage init studio identity)
+images=(gateway orchestrator worker rest auth realtime storage functions init studio identity functions-runtime)
 declare -A ref
 pin_re='^[0-9a-f]{12}$'
 digest_re='^sha256:[0-9a-f]{64}$'
@@ -40,7 +40,7 @@ done <"$1"
 # The current .env.example pins, so the block keeps the images that aren't being repinned.
 declare -A old
 while read -r line; do
-  [[ "$line" =~ ^#\ ghcr\.io/chelabase/([a-z]+):(.*)$ ]] && old[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+  [[ "$line" =~ ^#\ ghcr\.io/chelabase/([a-z-]+):(.*)$ ]] && old[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
 done < <(sed -n '/^# BEGIN image pins/,/^# END image pins/p' "$envex")
 unpublished() { grep -qE "^\s*image: \\\$\{CHELABASE_IMAGE_REPO:-[^}]*\}/$1:\\\$\{CHELABASE_IMAGE_TAG:-unpublished\}\$" "$compose"; }
 for i in "${images[@]}"; do
