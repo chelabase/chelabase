@@ -55,8 +55,9 @@ async function renderRail(initial: RailBehaviour, path = "/app", badges?: { memb
   });
   const members = createRoute({ getParentRoute: () => root, path: "/app/members", component: () => <p>members</p> });
   const dataApi = createRoute({ getParentRoute: () => root, path: "/app/data-api", component: () => <p>data api</p> });
+  const storage = createRoute({ getParentRoute: () => root, path: "/app/storage/$", component: () => <p>storage</p> });
   const router = createRouter({
-    routeTree: root.addChildren([dashboard, api, project, members, dataApi]),
+    routeTree: root.addChildren([dashboard, api, project, members, dataApi, storage]),
     history: createMemoryHistory({ initialEntries: [path] }),
   });
   render(<RouterProvider router={router} />);
@@ -328,10 +329,23 @@ describe("AppRail", () => {
     expect(screen.getByRole("link", { name: "Table editor" })).toBeInTheDocument();
   });
 
-  it("data_api_item_links_between_sql_editor_and_api_reference", async () => {
+  // #103 AC1: Storage follows the SQL editor, links bare (the page opens at the last storage place) and is current there.
+  it("storage_item_follows_sql_editor_and_is_current_on_storage_routes", async () => {
     const { nav } = await renderRail("expanded");
     const names = [...nav.querySelectorAll("a")].map((a) => a.textContent);
-    expect(names.indexOf("Data API")).toBe(names.indexOf("SQL editor") + 1);
+    expect(names.indexOf("Storage")).toBe(names.indexOf("SQL editor") + 1);
+    expect(screen.getByRole("link", { name: "Storage" })).toHaveAttribute("href", "/app/storage");
+    expect(screen.getByRole("link", { name: "Storage" })).not.toHaveAttribute("aria-current");
+    cleanup();
+    await renderRail("expanded", "/app/storage/p1/d1/b1");
+    expect(screen.getByRole("link", { name: "Storage" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("link", { name: "SQL editor" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("data_api_item_links_between_storage_and_api_reference", async () => {
+    const { nav } = await renderRail("expanded");
+    const names = [...nav.querySelectorAll("a")].map((a) => a.textContent);
+    expect(names.indexOf("Data API")).toBe(names.indexOf("Storage") + 1);
     expect(names.indexOf("API reference")).toBe(names.indexOf("Data API") + 1);
     expect(screen.getByRole("link", { name: "Data API" })).toHaveAttribute("href", "/app/data-api");
   });

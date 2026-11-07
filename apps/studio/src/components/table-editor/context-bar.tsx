@@ -36,6 +36,8 @@ export interface ContextBarProps {
   onBranchesOpen?: () => void;
   /** A branch was created from the picker's form. */
   onBranchCreated?: (branch: Branch) => void;
+  /** False: the place stops at the branch (Storage runs in the branch's main database), so no Postgres db picker. */
+  pgLevel?: boolean;
 }
 
 function Waiting({ label }: { label: string }) {
@@ -53,7 +55,7 @@ const slash = (
 );
 
 /** The header's context bar: one labelled picker per level, and the role to act as. */
-export function ContextBar({ params, navigate, projects, branches, pgDatabases, actAs, onActAs, rolesError = null, historyWindow, onBranchesOpen, onBranchCreated }: ContextBarProps) {
+export function ContextBar({ params, navigate, projects, branches, pgDatabases, actAs, onActAs, rolesError = null, historyWindow, onBranchesOpen, onBranchCreated, pgLevel = true }: ContextBarProps) {
   const [newBranch, setNewBranch] = useState(false);
   const barRef = useRef<HTMLDivElement>(null);
   const [fade, setFade] = useState<ScrollFade>({ start: false, end: false });
@@ -148,7 +150,7 @@ export function ContextBar({ params, navigate, projects, branches, pgDatabases, 
           )}
         </Fragment>
       )}
-      {branch && (
+      {branch && pgLevel && (
         <Fragment>
           {slash}
           {pgDatabases ? (

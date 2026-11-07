@@ -1,7 +1,7 @@
 import { Tooltip } from "@base-ui/react/tooltip";
 import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
-import { DATA_API_ROUTE, isRailItemActive, SQL_ROUTE, TABLES_ROUTE, type RailEntry } from "./rail-items";
+import { DATA_API_ROUTE, isRailItemActive, SQL_ROUTE, STORAGE_ROUTE, TABLES_ROUTE, type RailEntry, type RailLink } from "./rail-items";
 
 export interface RailItemProps {
   entry: RailEntry;
@@ -20,6 +20,14 @@ export interface RailItemProps {
 function badgeName(label: string, n: number): string {
   return `${label}, ${n} ${n === 1 ? "request" : "requests"} waiting`;
 }
+
+/** The section routes with optional levels are linked bare: the page fills the levels from the last place. */
+const BARE: Partial<Record<RailLink["to"], string>> = {
+  "/app/tables": TABLES_ROUTE,
+  "/app/sql": SQL_ROUTE,
+  "/app/storage": STORAGE_ROUTE,
+  "/app/data-api": DATA_API_ROUTE,
+};
 
 /** Row geometry shared by links and placeholders: the 18px icon sits centred in the 56px rail. */
 const row = "relative flex h-9 items-center gap-3 whitespace-nowrap text-sm";
@@ -59,7 +67,7 @@ export function RailItem({ entry, pathname, expanded, tooltip, badge = 0, onNavi
   const active = isRailItemActive(entry.id, pathname);
   const link = (
     <Link
-      to={entry.to === "/app/tables" ? TABLES_ROUTE : entry.to === "/app/sql" ? SQL_ROUTE : entry.to === "/app/data-api" ? DATA_API_ROUTE : entry.to}
+      to={BARE[entry.to] ?? entry.to}
       aria-label={counted ? badgeName(entry.label, badge) : undefined}
       aria-current={active ? "page" : undefined}
       onClick={onNavigate}
