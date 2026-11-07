@@ -1312,7 +1312,8 @@ pub struct ListObjects {
 
 /// The list statement for a sort column and order (both from fixed lists); the parameters:
 /// bucket, prefix, delimiter (empty: none), search, cursor value, cursor key, limit. The last
-/// column is a file's object id (m17: Studio's live view keys), NULL for a folder.
+/// column is a file's object id, or for a folder the id of one object under it (any one the
+/// caller sees; m17: Studio's live view keys, so deleting a folder's last object is seen).
 pub fn list_sql(sort_by: &str, desc: bool) -> Option<String> {
     let (value, cast) = match sort_by {
         "name" => ("key", "text"),
@@ -1335,7 +1336,7 @@ pub fn list_sql(sort_by: &str, desc: bool) -> Option<String> {
   SELECT key, bool_or(key <> name) AS folder, max(size) FILTER (WHERE key = name) AS size,
          max(etag) FILTER (WHERE key = name) AS etag, max(content_type) FILTER (WHERE key = name) AS content_type,
          max(updated_at) FILTER (WHERE key = name) AS updated_at,
-         (array_agg(id) FILTER (WHERE key = name))[1] AS id
+         coalesce((array_agg(id) FILTER (WHERE key = name))[1], (array_agg(id))[1]) AS id
   FROM e GROUP BY key
 )
 SELECT key, folder, size, etag, content_type, updated_at, ({value})::text, id FROM g
@@ -1354,7 +1355,7 @@ ORDER BY {value} {dir}, key {dir} LIMIT $7"
     params(("bucket" = String, Path), ObjectParams),
     request_body = ListObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`) and `next_cursor`", body = Value)),
+    responses((status = 200, description = "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`, `id`: a file's object id, or for a folder the id of one object under it) and `next_cursor`", body = Value)),
 )]
 pub async fn list<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1632,12 +1633,18 @@ mod tests {
         );
     }
 
-    /// m17: a file's row carries its object id last (Studio's live view keys); a folder's is
-    /// NULL (it is no object).
+    /// m17: a file's row carries its object id last (Studio's live view keys); a folder's
+    /// carries one object under it (#129 S1: deleting a folder's last object deletes that one,
+    /// so Studio learns the folder went).
     #[test]
     fn the_list_statement_returns_a_files_id_last() {
         let sql = list_sql("name", false).unwrap();
-        assert!(sql.contains("(array_agg(id) FILTER (WHERE key = name))[1] AS id"), "{sql}");
+        assert!(
+            sql.contains(
+                "coalesce((array_agg(id) FILTER (WHERE key = name))[1], (array_agg(id))[1]) AS id"
+            ),
+            "{sql}"
+        );
         assert!(sql.contains("({value})::text, id FROM g".replace("{value}", "key").as_str()), "{sql}");
     }
 

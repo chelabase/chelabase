@@ -501,7 +501,7 @@
         },
         "responses": {
           "200": {
-            "description": "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`) and `next_cursor`",
+            "description": "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`, `id`: a file's object id, or for a folder the id of one object under it) and `next_cursor`",
             "content": {
               "application/json": {
                 "schema": {}
