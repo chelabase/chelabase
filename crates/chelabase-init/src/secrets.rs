@@ -1244,11 +1244,11 @@ mod tests {
 
     /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
     /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
-    /// makes after it (the bootstrap's outputs, and the object store's `storage` keys and gRPC
-    /// TLS set).
+    /// makes after it (the bootstrap's outputs, and the object store's `storage` and `functions`
+    /// keys and gRPC TLS set).
     fn selfhost_secret_paths() -> Vec<String> {
         const SCRIPT_DIRS: [&str; 1] = ["bootstrap"];
-        const SCRIPT_FILES: [&str; 2] = ["storage-s3", "grpc-tls"];
+        const SCRIPT_FILES: [&str; 3] = ["storage-s3", "functions-s3", "grpc-tls"];
         let text = compose_file("docker-compose.yml");
         let mut paths = Vec::new();
         let mut others = Vec::new();
@@ -1272,6 +1272,8 @@ mod tests {
             others,
             [
                 "bootstrap",
+                "functions-s3/access-key",
+                "functions-s3/secret-key",
                 "grpc-tls/ca.crt",
                 "grpc-tls/client.crt",
                 "grpc-tls/client.key",
@@ -1287,7 +1289,13 @@ mod tests {
             script.contains(&format!("for d in {}; do", SCRIPT_DIRS.join(" "))),
             "init-secrets makes {SCRIPT_DIRS:?}"
         );
-        for made in ["new_key storage-s3/access-key 20", "new_key storage-s3/secret-key 40", "T=\"$$S/grpc-tls\""] {
+        for made in [
+            "new_key storage-s3/access-key 20",
+            "new_key storage-s3/secret-key 40",
+            "new_key functions-s3/access-key 20",
+            "new_key functions-s3/secret-key 40",
+            "T=\"$$S/grpc-tls\"",
+        ] {
             assert!(script.contains(made), "init-secrets runs {made}");
         }
         assert!(paths.len() > 30, "{paths:?}");

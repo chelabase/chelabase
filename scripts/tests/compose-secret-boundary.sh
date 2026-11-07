@@ -67,6 +67,8 @@ seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
 seaweedfs	storage-s3/access-key	ro
 seaweedfs	storage-s3/secret-key	ro
+seaweedfs	functions-s3/access-key	ro
+seaweedfs	functions-s3/secret-key	ro
 seaweedfs	grpc-tls/ca.crt	ro
 seaweedfs	grpc-tls/server.crt	ro
 seaweedfs	grpc-tls/server.key	ro
@@ -204,7 +206,7 @@ jq -r --arg k "$keys/" --arg st "$state" '.services | to_entries[] | .key as $s
   | if (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|storage-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|storage-s3/|functions-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true
@@ -267,13 +269,15 @@ leaks="$(jq -r '.services | to_entries[] | .key as $s
        | select(.key | test("^(AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)|CHELABASE_STORAGE_S3_(ACCESS|SECRET)_KEY)$"))
        | "\($s): environment \(.key) is set in the base file"),
     ((.value.volumes // [])[] | select(.type == "bind")
-       | select(.source | test("storage-s3|grpc-tls|/s3/"))
+       | select(.source | test("storage-s3|functions-s3|grpc-tls|/s3/"))
        | "\($s): bind \(.source)")' "$tmp/base.json")"
 [[ -z "$leaks" ]] || err "an object-store key reaches a service through its environment or a bind:"$'\n'"$leaks"
 # init-secrets, which makes the files, is the one name besides their readers: grpc-tls/ is
 # seaweedfs's; storage-s3/ (the `storage` identity) is seaweedfs's, the storage service's and the
 # worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
-for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker "; do
+# functions-s3/ (the `functions` identity, edge-functions m1) is seaweedfs's alone until the
+# functions service (m4) and the worker's bundle sweep (m7) mount it; never the runtime's.
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:seaweedfs "; do
   dir="${want%%:*}"
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
@@ -290,6 +294,8 @@ users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.targe
 sw_cmd="$(jq -r '.services.seaweedfs.command | join("\n")' "$tmp/base.json")"
 for want in '"Read:neon", "Write:neon", "List:neon", "Tagging:neon"' \
   '"Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"' \
+  '"Read:chelabase-functions", "Write:chelabase-functions", "List:chelabase-functions"' \
+  's3.bucket.create -name chelabase-functions' \
   '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.ip.bind=0.0.0.0' '-s3.iam=false' 'exec weed server' \
   '/etc/seaweedfs/security.toml' '[grpc.%s]' 'for c in master volume filer s3' '[grpc.client]' \
   's3.bucket.create -name neon' 's3.bucket.create -name chelabase-storage' '/tmp/buckets-ready'; do

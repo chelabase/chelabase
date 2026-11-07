@@ -188,7 +188,8 @@ services:
   # SeaweedFS runs the base file's command: its identities and its gRPC TLS files come from key
   # files, here Compose secrets from the stack's state dir (the CLI writes the fixed dev values of
   # `storage` and a per-stack CA with server and client certificates there, beside Neon's `s3/`
-  # pair), so none of them is in `docker inspect`. create-bucket is the base file's one-shot.
+  # pair), so none of them is in `docker inspect`. The `functions` identity's fixed dev values
+  # are Compose configs below (edge-functions m1). create-bucket is the base file's one-shot.
   seaweedfs:
     volumes: !override
       - neon_seaweedfs_data:/data
@@ -202,7 +203,16 @@ services:
       - {source: grpc-tls-server-key, target: /run/chelabase/secrets/grpc-tls/server.key}
       - {source: grpc-tls-client-crt, target: /run/chelabase/secrets/grpc-tls/client.crt}
       - {source: grpc-tls-client-key, target: /run/chelabase/secrets/grpc-tls/client.key}
+    configs:
+      - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
+      - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
     depends_on: !reset {}
+
+  # Edge functions (m1): the image `docker buildx bake -f infra/images/docker-bake.hcl
+  # functions-runtime` builds locally (profile `functions`, as in the base file).
+  functions-runtime:
+    image: chelabase/functions-runtime:${CHELABASE_FUNCTIONS_RUNTIME_TAG:-latest}
+    pull_policy: never
 
   safekeeper1:
     user: "0"
@@ -885,6 +895,14 @@ networks:
       config:
         - subnet: ${CHELABASE_CONTROL_SUBNET:?set by chelabase workbench (stack.env)}
           ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
+
+# The `functions` S3 identity's fixed dev pair (edge-functions m1), like the CLI's fixed `storage`
+# pair: dev values, not secrets.
+configs:
+  s3-functions-access-key:
+    content: chelabase-functions-dev
+  s3-functions-secret-key:
+    content: chelabase-functions-dev-secret
 
 # The self-hosted install's secrets volume: unused here (the keys dir and the state dir hold
 # them, as Compose secrets below).
