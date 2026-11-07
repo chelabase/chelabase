@@ -188,6 +188,7 @@ fn base(w: &MemberWorld) -> String {
 const ROUTES: &[(&str, &str, bool)] = &[
     ("GET", "/bucket", true),
     ("POST", "/object/list/b", true),
+    ("POST", "/object/resolve", true),
     ("GET", "/object/b/dir/a.txt", true),
     ("POST", "/bucket", false),
     ("PATCH", "/bucket/b", false),

@@ -1087,7 +1087,7 @@ pub mod orchestrator {
 
     /// m9: Studio's storage on a branch, proxied to the storage service's console listener, as
     /// an Act-as role or, with no role (or `owner`), in owner mode, which needs Admin on the
-    /// database. Reads and listing act as a role held at Viewer; writes, a signed URL and a
+    /// database. Reads, listing and resolve act as a role held at Viewer; writes, a signed URL and a
     /// resumable upload's steps need the role at Developer. They stream
     /// ([`super::Transfer::Stream`]).
     pub const STORAGE_PREFIX: &str = "orchestrator.storage_";
@@ -1141,6 +1141,14 @@ pub mod orchestrator {
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{*name}",
         Access::ActAs(Developer),
+    );
+    /// Object refs to URLs, as the role (row level security decides; `null` for what it can't
+    /// read). Its signed URLs live at most an hour, while the member keeps Developer access.
+    pub const STORAGE_RESOLVE_OBJECTS: Endpoint = key_endpoint(
+        "orchestrator.storage_resolve_objects",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/resolve",
+        Access::ActAs(Viewer),
     );
     pub const STORAGE_CREATE_UPLOAD: Endpoint = key_endpoint(
         "orchestrator.storage_create_upload",
@@ -1523,6 +1531,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::STORAGE_COPY_OBJECT,
     orchestrator::STORAGE_MOVE_OBJECT,
     orchestrator::STORAGE_SIGN_OBJECT,
+    orchestrator::STORAGE_RESOLVE_OBJECTS,
     orchestrator::STORAGE_CREATE_UPLOAD,
     orchestrator::STORAGE_UPLOAD_PART,
     orchestrator::STORAGE_LIST_PARTS,
@@ -1881,7 +1890,7 @@ mod tests {
     }
 
     /// m9: Studio's storage routes on a branch take a member token and stream (no body cap at
-    /// the gateway, long timeouts). Reads and listing act as a role held at Viewer; every write,
+    /// the gateway, long timeouts). Reads, listing and resolve act as a role held at Viewer; every write,
     /// a signed URL and a resumable upload's steps need the role at Developer.
     #[test]
     fn console_storage_routes() {
@@ -1902,6 +1911,7 @@ mod tests {
             ("POST", "/object/copy", "orchestrator.storage_copy_object", developer),
             ("POST", "/object/move", "orchestrator.storage_move_object", developer),
             ("POST", "/object/sign/avatars/a.png", "orchestrator.storage_sign_object", developer),
+            ("POST", "/object/resolve", "orchestrator.storage_resolve_objects", viewer),
             ("POST", "/upload/avatars/big.bin", "orchestrator.storage_create_upload", developer),
             ("PUT", "/upload/session/s1/3", "orchestrator.storage_upload_part", developer),
             ("GET", "/upload/session/s1", "orchestrator.storage_list_parts", developer),
@@ -2470,6 +2480,7 @@ mod tests {
             ("orchestrator.storage_copy_object", Access::ActAs(Developer)),
             ("orchestrator.storage_move_object", Access::ActAs(Developer)),
             ("orchestrator.storage_sign_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_resolve_objects", Access::ActAs(Viewer)),
             ("orchestrator.storage_create_upload", Access::ActAs(Developer)),
             ("orchestrator.storage_upload_part", Access::ActAs(Developer)),
             ("orchestrator.storage_list_parts", Access::ActAs(Developer)),

@@ -940,6 +940,31 @@ mod tests {
         );
     }
 
+    /// The URLs sign and resolve mint carry owner mode's marker only in an owner-mode console
+    /// request: such a URL lives only while its member is still an Admin.
+    #[tokio::test]
+    async fn only_an_owner_mode_url_is_marked() {
+        let branch = Uuid::new_v4();
+        let at = Located { database: "app".into(), database_id: Uuid::new_v4() };
+        let found = || Found {
+            datoid: 5,
+            version: Uuid::new_v4(),
+            size: 1,
+            etag: "e".into(),
+            content_type: "text/plain".into(),
+            owner: None,
+        };
+        let owner = crate::internal::test_owner_caller(branch, "app");
+        let claims = |data: &DataIdentity| download_claims(data, &at, "b".into(), "a".into(), found(), 1);
+        let marked = crate::internal::in_console(owner.clone(), async { claims(&owner.data) }).await;
+        assert_eq!(marked.role.as_deref(), Some(crate::internal::STORAGE_ROLE));
+        assert_eq!(claims(&owner.data).role, None, "outside a console request");
+        let mut role = owner.clone();
+        role.mode = crate::internal::Mode::Role;
+        let unmarked = crate::internal::in_console(role.clone(), async { claims(&role.data) }).await;
+        assert_eq!(unmarked.role, None, "a role caller");
+    }
+
     /// An app user's request names its session (`sid`); a key's doesn't; an unreadable one
     /// mints nothing.
     #[test]
