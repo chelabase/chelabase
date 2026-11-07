@@ -157,6 +157,7 @@ fn a_row_moving_between_partitions_is_an_update_of_the_root() {
         ],
         xids: vec![1],
         end_lsn: Some(PgLsn::from(1)),
+        split: vec![],
     };
     let out = fan_out(&w, &parents, MAX_KEYS);
     let root = out.iter().find(|r| r.rel == 10).unwrap();

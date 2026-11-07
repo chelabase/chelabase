@@ -9,11 +9,13 @@
 mod common;
 mod fakes;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chelabase_query::realtime::Relation;
 use fakes::*;
+use proptest::prelude::*;
 use realtime::channel::{JoinTarget, TableChannel, parse_join};
 use realtime::check::{Limiter, VisibilityCache};
 use realtime::filter::{FilterSettings, TableFilter};
@@ -288,6 +290,536 @@ async fn storage_object_moved_out_of_the_bucket_is_a_keyed_delete_on_screen() {
         drain(&mut reader),
         vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &[O1])])]
     );
+}
+
+// --- never across buckets or visibility (#129's white-room audit, B1 and B2) ------------------
+//
+// The invariant (`realtime::filter`'s module docs): a storage channel's frames are derived only
+// from keys checked visible to that viewer, in that bucket, except a TRUNCATE.
+
+/// A bucket-A filter on its own limiter and settings.
+fn fx_with(limiter: Arc<Limiter>, settings: FilterSettings) -> Fx {
+    let checker = FakeChecker::new();
+    checker.insert_rows(REL, &[O1, O2, O3]);
+    checker.place(&[O1, O3], BUCKET_A);
+    checker.place(&[O2], BUCKET_B);
+    let mut filter = TableFilter::new(
+        target(),
+        objects(),
+        checker.clone(),
+        limiter,
+        VisibilityCache::new(Duration::from_millis(100)),
+        settings,
+    );
+    filter.set_bucket(Some(BUCKET_A));
+    Fx { checker, filter }
+}
+
+/// Every key of a viewer's events, per op; panics on anything keyless.
+fn keys_by_op(events: &[ChannelEvent]) -> Vec<(ChangeOp, String)> {
+    let mut out = vec![];
+    for e in events {
+        let ChannelEvent::Rows(changes) = e else {
+            panic!("only rows reach a storage viewer: {e:?}");
+        };
+        for c in changes {
+            let keys = c
+                .keys
+                .as_ref()
+                .unwrap_or_else(|| panic!("a keyless frame reached a storage viewer: {c:?}"));
+            for k in keys {
+                out.push((c.op, k.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// An object id from a number (bucket placement is the test's).
+fn oid(n: usize) -> String {
+    format!("00000000-0000-4000-8000-{n:012}")
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_bulk_change_in_another_bucket_reaches_nobody() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.filter.view(2, vec![ks(O1)]).await;
+    // A keyless window (the plugin's `c`: past its key limit, or a TRUNCATE) of bucket B.
+    f.checker.delete_rows(REL, &[O2]);
+    let w = RelWindow {
+        rel: REL,
+        changed: true,
+        inserts: vec![],
+        updates: vec![],
+        deletes: vec![],
+    };
+    f.deliver(&w).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a bulk change in bucket B reached bucket A's viewer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_truncate_is_a_keyed_delete_of_what_is_on_screen() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.filter.view(2, vec![ks(O1)]).await;
+    f.deliver(&window(&[O3], &[], &[])).await;
+    drain(&mut reader);
+    f.checker.delete_rows(REL, &[O1, O2, O3]);
+    let w = RelWindow {
+        rel: REL,
+        changed: true,
+        inserts: vec![],
+        updates: vec![],
+        deletes: vec![],
+    };
+    f.deliver(&w).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &[O1])])],
+        "the objects on screen are re-checked; nothing keyless"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_window_over_the_key_limit_is_checked_in_chunks() {
+    let mut f = fx_with(
+        Limiter::new(8),
+        FilterSettings {
+            max_keys: 2,
+            ..FilterSettings::default()
+        },
+    );
+    let ids: Vec<String> = (10..15).map(oid).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    f.checker.insert_rows(REL, &refs);
+    f.checker.place(&[refs[0], refs[2], refs[4]], BUCKET_A);
+    f.checker.place(&[refs[1], refs[3]], BUCKET_B);
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.deliver(&window(&refs, &[], &[])).await;
+    let got = keys_by_op(&drain(&mut reader));
+    let want: Vec<(ChangeOp, String)> = [refs[0], refs[2], refs[4]]
+        .iter()
+        .map(|k| (ChangeOp::Insert, ks(k)))
+        .collect();
+    assert_eq!(got, want);
+    for c in f.checker.checks() {
+        let fakes::Call::Check { keys, .. } = c else {
+            unreachable!()
+        };
+        assert!(
+            keys.is_none_or(|k| k.len() <= 2),
+            "a chunk holds at most max_keys keys"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_saturated_limiter_waits_and_carries_instead_of_changed() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(limiter.clone(), FilterSettings::default());
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    let held = limiter.try_permit().unwrap(); // another bucket's filter is checking
+    f.deliver(&window(&[O1], &[O2], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "bucket B's change reached bucket A's viewer"
+    );
+    drop(held);
+    // The next window checks what was carried: O1 (bucket A) arrives, O2 (bucket B) never.
+    f.deliver(&window(&[O3], &[], &[])).await;
+    assert_eq!(
+        keys_by_op(&drain(&mut reader)),
+        vec![(ChangeOp::Insert, ks(O1)), (ChangeOp::Insert, ks(O3))]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_nine_groups_exhausting_check_slots_get_no_changed() {
+    let mut f = fx();
+    f.checker.hold();
+    let mut sinks = vec![];
+    for i in 0..9u64 {
+        sinks.push(f.viewer(i + 1, role(&format!("role{i}")), false));
+    }
+    let checker = f.checker.clone();
+    let mut filter = f.filter;
+    let task = tokio::spawn(async move {
+        filter
+            .deliver(&window(&[O1], &[O2], &[]), &[10], Instant::now())
+            .await;
+        filter
+    });
+    for _ in 0..1000 {
+        if checker.in_flight() == 8 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(checker.in_flight(), 8, "eight groups hold every check slot");
+    checker.release();
+    let _filter = task.await.unwrap();
+    for (i, rx) in sinks.iter_mut().enumerate() {
+        assert_eq!(
+            drain(rx),
+            vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &[O1])])],
+            "viewer {i}: O1 only, never `changed`"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_failed_check_carries_instead_of_changed() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.checker.fail_checks(
+        Some("authenticated"),
+        Some(realtime::check::CheckError::Timeout),
+    );
+    f.deliver(&window(&[O1, O2], &[], &[])).await;
+    assert_eq!(drain(&mut reader), vec![]);
+    f.checker.fail_checks(Some("authenticated"), None);
+    f.checker.fail_probe(Some("authenticated"), true);
+    f.deliver(&window(&[O3], &[], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a failed probe sends nothing either"
+    );
+    f.checker.fail_probe(Some("authenticated"), false);
+    f.deliver(&window(&[], &[], &[])).await;
+    assert_eq!(
+        keys_by_op(&drain(&mut reader)),
+        vec![(ChangeOp::Insert, ks(O1)), (ChangeOp::Insert, ks(O3))]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_carried_keys_are_bounded_newest_kept() {
+    let limiter = Limiter::new(1);
+    let mut f = fx_with(
+        limiter.clone(),
+        FilterSettings {
+            max_keys: 1,
+            ..FilterSettings::default()
+        },
+    );
+    let ids: Vec<String> = (100..112).map(oid).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    f.checker.insert_rows(REL, &refs);
+    f.checker.place(&refs, BUCKET_A);
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    let held = limiter.try_permit().unwrap();
+    for k in &refs {
+        f.deliver(&window(&[k], &[], &[])).await;
+    }
+    drop(held);
+    f.deliver(&window(&[], &[], &[])).await;
+    let got = keys_by_op(&drain(&mut reader));
+    // At most ten windows' worth of keys (10 × max_keys) wait; the oldest beyond that go.
+    let want: Vec<(ChangeOp, String)> = refs[2..]
+        .iter()
+        .map(|k| (ChangeOp::Insert, ks(k)))
+        .collect();
+    assert_eq!(got, want);
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_delete_after_move_to_another_bucket_reaches_nobody() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.deliver(&window(&[O1], &[], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &[O1])])]
+    );
+    f.checker.place(&[O1], BUCKET_B);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "the move out sends nothing off screen"
+    );
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a delete in bucket B reached bucket A's viewer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_delete_of_an_object_hidden_since_delivery_reaches_nobody() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.deliver(&window(&[O1], &[], &[])).await;
+    drain(&mut reader);
+    f.checker.hide(Some("authenticated"), &[O1]);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    assert_eq!(drain(&mut reader), vec![]);
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "a hidden object's delete reached the viewer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn storage_object_on_screen_moved_away_is_deleted_once() {
+    let mut f = fx();
+    let mut reader = f.viewer(2, role("authenticated"), false);
+    f.filter.view(2, vec![ks(O1)]).await;
+    f.checker.place(&[O1], BUCKET_B);
+    f.deliver(&window(&[], &[O1], &[])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &[O1])])]
+    );
+    f.checker.delete_rows(REL, &[O1]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(
+        drain(&mut reader),
+        vec![],
+        "its later delete in bucket B is bucket B's"
+    );
+}
+
+// --- the invariant as a property: interleavings of bucket A/B changes, bulk windows and
+// permit starvation ------------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Step {
+    /// Create or change object `i`: its bucket (A when true) and whether the role's policy hides it.
+    Put {
+        i: usize,
+        in_a: bool,
+        hidden: bool,
+    },
+    Delete {
+        i: usize,
+    },
+    /// The viewer's screen: the objects of the mask (only those confirmed visible count).
+    View {
+        mask: u8,
+    },
+    /// The pending changes as one window: `bulk` the plugin's keyless `c` (keys lost), `starved`
+    /// every check slot held by another filter for the whole delivery.
+    Deliver {
+        bulk: bool,
+        starved: bool,
+    },
+}
+
+const OBJECTS: usize = 4;
+
+fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        3 => (0..OBJECTS, any::<bool>(), any::<bool>()).prop_map(|(i, in_a, hidden)| Step::Put { i, in_a, hidden }),
+        1 => (0..OBJECTS).prop_map(|i| Step::Delete { i }),
+        1 => any::<u8>().prop_map(|mask| Step::View { mask }),
+        3 => (any::<bool>(), any::<bool>()).prop_map(|(bulk, starved)| Step::Deliver { bulk, starved }),
+    ]
+}
+
+/// One object's truth: `None` absent, else (in bucket A, hidden from the role).
+type Truth = Option<(bool, bool)>;
+
+fn shown_to_role(t: Truth) -> bool {
+    matches!(t, Some((true, false)))
+}
+
+async fn run_storage_model(steps: Vec<Step>) -> Result<(), TestCaseError> {
+    let ids: Vec<String> = (0..OBJECTS).map(|i| oid(200 + i)).collect();
+    let limiter = Limiter::new(1);
+    let checker = FakeChecker::new();
+    checker.set_bypass(Some("authenticated"), false);
+    let mut filter = TableFilter::new(
+        target(),
+        objects(),
+        checker.clone(),
+        limiter.clone(),
+        VisibilityCache::new(Duration::from_millis(100)),
+        FilterSettings {
+            max_keys: 2,
+            ..FilterSettings::default()
+        },
+    );
+    filter.set_bucket(Some(BUCKET_A));
+    let (tx, mut rx) = mpsc::channel(1024);
+    filter.add(2, role("authenticated"), false, tx);
+
+    let mut truth: Vec<Truth> = vec![None; OBJECTS];
+    // Truth when the open window started.
+    let mut before: Vec<Truth> = truth.clone();
+    let mut touched: Vec<usize> = vec![];
+    // Since the last delivery the filter could check: touched objects, and whether a bulk
+    // window (keys lost) came.
+    let mut unchecked: Vec<usize> = vec![];
+    let mut bulk_unchecked = false;
+    // Keys the viewer was told exist (an insert or update frame, or a confirmed view) and not
+    // told gone since.
+    let mut shown: HashSet<String> = HashSet::new();
+    // Keys a check found gone from the viewer since: no delete may follow until shown again.
+    let mut gone: HashSet<String> = HashSet::new();
+
+    for step in steps {
+        match step {
+            Step::Put { i, in_a, hidden } => {
+                let k = ids[i].as_str();
+                checker.insert_rows(REL, &[k]);
+                checker.place(&[k], if in_a { BUCKET_A } else { BUCKET_B });
+                if hidden {
+                    checker.hide(Some("authenticated"), &[k]);
+                } else {
+                    checker.unhide(Some("authenticated"), &[k]);
+                }
+                truth[i] = Some((in_a, hidden));
+                if !touched.contains(&i) {
+                    touched.push(i);
+                }
+            }
+            Step::Delete { i } => {
+                if truth[i].is_none() {
+                    continue;
+                }
+                checker.delete_rows(REL, &[ids[i].as_str()]);
+                truth[i] = None;
+                if !touched.contains(&i) {
+                    touched.push(i);
+                }
+            }
+            Step::View { mask } => {
+                let keys: Vec<String> = (0..OBJECTS)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| ks(&ids[i]))
+                    .collect();
+                filter.view(2, keys.clone()).await;
+                for (i, k) in (0..OBJECTS).filter(|i| mask & (1 << i) != 0).zip(keys) {
+                    if shown_to_role(truth[i]) {
+                        gone.remove(&k);
+                        shown.insert(k);
+                    }
+                }
+            }
+            Step::Deliver { bulk, starved } => {
+                let mut w = RelWindow {
+                    rel: REL,
+                    changed: bulk,
+                    ..RelWindow::default()
+                };
+                if !bulk {
+                    for &i in &touched {
+                        let t = vec![ids[i].clone()];
+                        match (before[i].is_some(), truth[i].is_some()) {
+                            (false, true) => w.inserts.push(t),
+                            (true, true) => w.updates.push(t),
+                            _ => w.deletes.push(t),
+                        }
+                    }
+                }
+                unchecked.append(&mut touched);
+                bulk_unchecked |= bulk;
+                before = truth.clone();
+                let held = starved.then(|| limiter.try_permit().unwrap());
+                filter.deliver(&w, &[10], Instant::now()).await;
+                drop(held);
+                let events = drain(&mut rx);
+                if starved {
+                    prop_assert_eq!(
+                        events,
+                        vec![],
+                        "a starved delivery carries, it sends nothing"
+                    );
+                    continue;
+                }
+                let visible = |k: &str| {
+                    (0..OBJECTS).any(|i| ids[i] == k[2..k.len() - 2] && shown_to_role(truth[i]))
+                };
+                for e in &events {
+                    let ChannelEvent::Rows(changes) = e else {
+                        return Err(TestCaseError::fail(format!("not rows: {e:?}")));
+                    };
+                    for c in changes {
+                        let Some(keys) = &c.keys else {
+                            return Err(TestCaseError::fail(format!("keyless: {c:?}")));
+                        };
+                        for k in keys {
+                            match c.op {
+                                ChangeOp::Insert | ChangeOp::Update => {
+                                    prop_assert!(
+                                        visible(k),
+                                        "{:?} of {} the role can't list in bucket A",
+                                        c.op,
+                                        k
+                                    );
+                                    gone.remove(k);
+                                    shown.insert(k.clone());
+                                }
+                                ChangeOp::Delete => {
+                                    prop_assert!(!visible(k), "a delete of {} it still sees", k);
+                                    prop_assert!(
+                                        shown.contains(k),
+                                        "a delete of {} it was never shown",
+                                        k
+                                    );
+                                    prop_assert!(
+                                        !gone.contains(k),
+                                        "a delete of {} checked gone before",
+                                        k
+                                    );
+                                    shown.remove(k);
+                                }
+                                other => return Err(TestCaseError::fail(format!("{other:?}"))),
+                            }
+                        }
+                    }
+                }
+                // Everything carried so far was checked now: what the viewer was shown and no
+                // longer sees is gone (a bulk window re-checks everything it was shown).
+                let checked: Vec<String> = if bulk_unchecked {
+                    shown.iter().cloned().collect()
+                } else {
+                    unchecked.iter().map(|&i| ks(&ids[i])).collect()
+                };
+                for k in checked {
+                    if shown.contains(&k) && !visible(&k) {
+                        shown.remove(&k);
+                        gone.insert(k);
+                    }
+                }
+                unchecked.clear();
+                bulk_unchecked = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// The invariant over interleavings: frames only for keys checked visible to the viewer in
+    /// its bucket (inserts, updates), keyed deletes only for keys it was shown and that weren't
+    /// checked gone since, nothing keyless, nothing while starved.
+    #[test]
+    fn storage_frames_derive_only_from_keys_checked_visible_in_the_bucket(
+        steps in proptest::collection::vec(step(), 1..40),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(run_storage_model(steps))?;
+    }
 }
 
 // --- the socket (AC 4) -----------------------------------------------------------------------

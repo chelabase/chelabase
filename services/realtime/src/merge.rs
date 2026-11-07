@@ -14,6 +14,14 @@
 //!
 //! Keys keep their first-seen order. The window carries every transaction's xid (in decode
 //! order) and the highest end LSN.
+//!
+//! Object storage m17: `storage.objects` (by the plugin's schema and table names) is never
+//! collapsed: it keeps every key of the window past [`MAX_KEYS`], and a `c` marks it `changed`
+//! without dropping the other transactions' keys. Its storage channels must never get a keyless
+//! `changed` for another bucket's changes; the source publishes its window in chunks of at most
+//! [`MAX_KEYS`] keys ([`RelWindow::chunks`]) and each bucket's filter checks them. Its memory is
+//! that of one 100 ms window of decoded changes (each transaction already capped at the plugin's
+//! `max_keys_per_table`, past which it is a `c`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -42,6 +50,43 @@ impl RelWindow {
     pub fn key_count(&self) -> usize {
         self.inserts.len() + self.updates.len() + self.deletes.len()
     }
+    /// The window as chunks of at most `max` keys (inserts, then updates, then deletes), the
+    /// first one carrying `changed`; one chunk (itself) when it fits.
+    pub fn chunks(&self, max: usize) -> Vec<RelWindow> {
+        let max = max.max(1);
+        if self.key_count() <= max {
+            return vec![self.clone()];
+        }
+        let mut out: Vec<RelWindow> = Vec::new();
+        let mut cur = RelWindow {
+            rel: self.rel,
+            changed: self.changed,
+            ..RelWindow::default()
+        };
+        for (keys, op) in [(&self.inserts, 0u8), (&self.updates, 1), (&self.deletes, 2)] {
+            for k in keys {
+                if cur.key_count() == max {
+                    let next = RelWindow {
+                        rel: self.rel,
+                        ..RelWindow::default()
+                    };
+                    out.push(std::mem::replace(&mut cur, next));
+                }
+                match op {
+                    0 => cur.inserts.push(k.clone()),
+                    1 => cur.updates.push(k.clone()),
+                    _ => cur.deletes.push(k.clone()),
+                }
+            }
+        }
+        out.push(cur);
+        out
+    }
+}
+
+/// `storage.objects`: never collapsed by the window (see the module docs).
+pub fn is_storage_objects(schema: &str, table: &str) -> bool {
+    schema == "storage" && table == "objects"
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +99,9 @@ pub struct Window {
     pub xids: Vec<u64>,
     /// The highest end LSN in the window (what is acknowledged once it's published).
     pub end_lsn: Option<PgLsn>,
+    /// Relations kept whole past the key limit (`storage.objects`): published in chunks, never
+    /// fanned out.
+    pub split: Vec<u32>,
 }
 
 impl Window {
@@ -73,6 +121,8 @@ enum KeyOp {
 /// One relation's keys in the open window: each key's op, keys in first-seen order.
 #[derive(Default)]
 struct RelState {
+    /// Never collapsed (`storage.objects`): no key limit, a `c` keeps the keys.
+    whole: bool,
     changed: bool,
     order: Vec<Vec<String>>,
     ops: HashMap<Vec<String>, KeyOp>,
@@ -81,7 +131,7 @@ struct RelState {
 impl RelState {
     /// One transaction's ops of `key` (`i`, `u`, `d` seen in it) folded into its window op.
     fn apply(&mut self, key: &[String], ins: bool, del: bool, max_keys: usize) {
-        if self.changed {
+        if self.changed && !self.whole {
             return;
         }
         let txn_op = match (ins, del) {
@@ -99,7 +149,7 @@ impl RelState {
             (Some(_), _) => KeyOp::Update,
         };
         if !self.ops.contains_key(key) {
-            if self.order.len() >= max_keys {
+            if self.order.len() >= max_keys && !self.whole {
                 self.changed = true;
                 self.order.clear();
                 self.ops.clear();
@@ -115,7 +165,7 @@ impl RelState {
             changed: self.changed,
             ..RelWindow::default()
         };
-        if self.changed {
+        if self.changed && !self.whole {
             return w;
         }
         for key in self.order {
@@ -180,7 +230,13 @@ impl Merger {
         for c in changes {
             if !self.rels.contains_key(&c.rel) {
                 self.order.push(c.rel);
-                self.rels.insert(c.rel, RelState::default());
+                self.rels.insert(
+                    c.rel,
+                    RelState {
+                        whole: is_storage_objects(&c.schema, &c.table),
+                        ..RelState::default()
+                    },
+                );
             }
             let idx = match per_rel.iter().position(|(r, _)| *r == c.rel) {
                 Some(i) => i,
@@ -192,8 +248,10 @@ impl Merger {
             if c.op == Op::Changed {
                 let state = self.rels.get_mut(&c.rel).expect("inserted above");
                 state.changed = true;
-                state.order.clear();
-                state.ops.clear();
+                if !state.whole {
+                    state.order.clear();
+                    state.ops.clear();
+                }
                 continue;
             }
             let keys = &mut per_rel[idx].1;
@@ -230,6 +288,12 @@ impl Merger {
     pub fn take(&mut self) -> Option<Window> {
         self.opened.take()?;
         let mut rels = std::mem::take(&mut self.rels);
+        let split: Vec<u32> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|r| rels.get(r).is_some_and(|s| s.whole))
+            .collect();
         let window = Window {
             all: std::mem::take(&mut self.all),
             rels: std::mem::take(&mut self.order)
@@ -242,6 +306,7 @@ impl Merger {
                 .collect(),
             xids: std::mem::take(&mut self.xids),
             end_lsn: self.end_lsn.take(),
+            split,
         };
         Some(window)
     }

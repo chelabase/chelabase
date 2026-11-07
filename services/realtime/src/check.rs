@@ -22,7 +22,9 @@
 //!   snapshot; polled every [`VISIBILITY_POLL`] up to [`VISIBILITY_WAIT`], the [`Limiter`]
 //!   permit released between polls; still not visible → `changed`.
 //! - [`Limiter`]: at most [`CONCURRENCY`] checks in flight per (branch, database); a group that
-//!   finds no free permit gets `changed` at once (R15).
+//!   finds no free permit gets `changed` at once (R15). A storage channel's group waits for one
+//!   instead, and never gets `changed` (object storage m17, [`crate::filter`]'s storage
+//!   invariant).
 //! - [`VisibilityCache`] (R12): (group, relation, key) → visible, for presence; it lives at most
 //!   one merge window and is flushed for the whole database on every window of that database.
 
@@ -185,6 +187,16 @@ impl Limiter {
         self.permits
             .clone()
             .try_acquire_owned()
+            .ok()
+            .map(|p| CheckPermit { _permit: p })
+    }
+    /// A permit once one is free (object storage m17: a bucket filter waits rather than send
+    /// `changed`); `None` only if the bound were closed, which it never is.
+    pub async fn permit(&self) -> Option<CheckPermit> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
             .ok()
             .map(|p| CheckPermit { _permit: p })
     }
