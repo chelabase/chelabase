@@ -1420,6 +1420,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-service-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bollard",
+ "bytes",
+ "chelabase-http",
+ "chelabase-metadata",
+ "chelabase-secrets",
+ "chelabase-types",
+ "chrono",
+ "dotenvy",
+ "futures-util",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "chelabase-storage"
 version = "0.1.0"
 dependencies = [
