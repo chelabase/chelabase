@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks that each release image's (the ones named, default all nine) top-level OCI index carries the
+# Checks that each release image's (the ones named, default all ten) top-level OCI index carries the
 # org.opencontainers.image.{source,revision,licenses} annotations (GHCR links a package to its
 # repo from them; a label alone is ignored when the tag is an index), and that revision == HEAD.
 # Run after `scripts/publish-images.sh` (build mode), on the images it built. Not part of
@@ -32,7 +32,7 @@ cd "$(git rev-parse --show-toplevel)"
 REPO="${REPO:-ghcr.io/chelabase}"
 TAG="${TAG:-$(git rev-parse --short=12 HEAD)}"
 head_full="$(git rev-parse HEAD)"
-images=(gateway orchestrator worker rest auth realtime init studio identity)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity)
 [[ $# -eq 0 ]] || images=("$@")
 want_source="https://github.com/chelabase/chelabase"
 fail=0

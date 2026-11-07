@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Offline tests of the image release tooling on a scratch git repo: a small cargo and pnpm
-# workspace with all nine images pinned at its first commit, and a stub `docker` that only logs.
+# workspace with all ten images pinned at its first commit, and a stub `docker` that only logs.
 #   - scripts/image-inputs.sh changed: which images changed since their pins
 #   - scripts/publish-images.sh: --service / --all / no flag, and --push-only on the selection
-#   - scripts/pin-images.sh + scripts/tests/compose-image-pins.sh: a partial digests file
+#   - scripts/pin-images.sh + scripts/tests/compose-image-pins.sh: a partial digests file, and
+#     the first pin of an image that isn't published yet (default tag `unpublished`)
 #   - scripts/image-inputs.sh copies: a Dockerfile COPY outside the image's inputs
 # Part of `just check`.
 set -euo pipefail
@@ -46,6 +47,9 @@ crate services/rest rest bin '[dev-dependencies]' 'meta = { path = "../../crates
 crate services/auth auth bin
 crate services/realtime realtime bin
 crate services/init init bin
+# storage's package isn't named after its image (the image and binary are `storage`).
+crate crates/objstore objstore lib
+crate services/storage chelabase-storage-service bin 'http = { path = "../../crates/http" }' 'objstore = { path = "../../crates/objstore" }'
 crate tools/cli cli bin 'meta = { path = "../../crates/meta" }'
 cargo generate-lockfile --offline -q
 
@@ -72,7 +76,7 @@ cp "$src"/infra/images/{docker-bake.hcl,server.Dockerfile,studio.Dockerfile,stud
 cp "$src/.dockerignore" .
 cp "$src"/scripts/{image-inputs.sh,publish-images.sh,pin-images.sh} scripts/ 2>/dev/null || true
 cp "$src/scripts/tests/compose-image-pins.sh" scripts/tests/
-images=(gateway orchestrator worker rest auth realtime init studio identity)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity)
 digest() { printf 'sha256:%064d' "$1"; }
 write_pins() { # write_pins <sha12>: every image pinned at <sha12>
   local i n=0
@@ -132,16 +136,20 @@ expect "apps/studio only -> studio" "studio" "$(changed)"
 case_ edit crates/meta/src/lib.rs
 expect "crates/meta -> its dependents, not rest (dev only)" "orchestrator worker" "$(changed)"
 case_ edit crates/http/src/lib.rs
-expect "crates/http -> direct and transitive dependents" "gateway orchestrator worker" "$(changed)"
+expect "crates/http -> direct and transitive dependents" "gateway orchestrator worker storage" "$(changed)"
 case_ edit services/auth/src/main.rs
 expect "a service's own crate -> that service" "auth" "$(changed)"
+case_ edit services/storage/src/main.rs
+expect "storage's own crate (package chelabase-storage-service) -> storage" "storage" "$(changed)"
+case_ edit crates/objstore/src/lib.rs
+expect "a crate only storage uses -> storage" "storage" "$(changed)"
 case_ edit tools/cli/src/main.rs
 expect "a crate no image builds -> nothing" "" "$(changed)"
 case_ edit crates/meta/Cargo.toml
-expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime init" "$(changed)"
+expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage init" "$(changed)"
 for f in Cargo.lock Cargo.toml rust-toolchain.toml; do
   case_ edit "$f"
-  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime init" "$(changed)"
+  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage init" "$(changed)"
 done
 case_ edit packages/ui/index.ts
 expect "a workspace package studio uses -> studio" "studio" "$(changed)"
@@ -163,7 +171,7 @@ for f in services/identity/src.ts infra/images/identity.Dockerfile; do
 done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
-all="gateway orchestrator worker rest auth realtime init studio identity"
+all="gateway orchestrator worker rest auth realtime storage init studio identity"
 for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"
@@ -242,6 +250,65 @@ if scripts/pin-images.sh "$work/digests" >/dev/null; then
 else
   bad "pin-images.sh refused an identity digests file"
 fi
+case_ true
+printf 'pin storage %s %s\n' "$sha" "$(digest 96)" >"$work/digests"
+if scripts/pin-images.sh "$work/digests" >/dev/null; then
+  expect "storage digests -> only storage's lines change" \
+    "$(printf '%s\n' "+# ghcr.io/chelabase/storage:$sha@$(digest 96)" "+    image: \${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:\${CHELABASE_IMAGE_TAG:-$sha@$(digest 96)}")" \
+    "$(g diff -U0 | grep '^+[^+]')"
+  scripts/tests/compose-image-pins.sh "$work/digests" >/dev/null && ok "compose-image-pins.sh passes on the storage digests" ||
+    bad "compose-image-pins.sh fails on the storage digests"
+else
+  bad "pin-images.sh refused a storage digests file"
+fi
+
+# Storage before its first pin (main after the object-storage epic): its compose default is the
+# tag `unpublished` and .env.example has no pin for it.
+unpublish() { # unpublish <image>
+  sed -i -E "s#(/$1:\\\$\{CHELABASE_IMAGE_TAG:-)[^}]*\}#\1unpublished}#" infra/compose/docker-compose.yml
+  sed -i "\#^\# ghcr.io/chelabase/$1:#d" infra/compose/.env.example
+}
+case_ unpublish storage
+grep -q '/storage:${CHELABASE_IMAGE_TAG:-unpublished}$' infra/compose/docker-compose.yml && ok "fixture: storage unpublished" ||
+  bad "fixture: storage's compose line wasn't unpublished"
+scripts/tests/compose-image-pins.sh >"$work/out" 2>&1 && ok "compose-image-pins.sh passes with storage unpublished" ||
+  bad "compose-image-pins.sh fails with storage unpublished: $(cat "$work/out")"
+expect "an unpublished image counts as changed" "storage" "$(changed)"
+printf 'pin studio %s %s\n' "$sha" "$(digest 99)" >"$work/digests"
+if scripts/pin-images.sh "$work/digests" >"$work/out" 2>&1; then
+  expect "pinning studio leaves storage unpublished, only studio's lines change" \
+    "$(printf '%s\n' "+# ghcr.io/chelabase/studio:$sha@$(digest 99)" "+    image: \${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:\${CHELABASE_IMAGE_TAG:-$sha@$(digest 99)}")" \
+    "$(g diff -U0 | grep '^+[^+]')"
+  scripts/tests/compose-image-pins.sh "$work/digests" >/dev/null && ok "compose-image-pins.sh passes on studio's pin with storage unpublished" ||
+    bad "compose-image-pins.sh fails on studio's pin with storage unpublished"
+else
+  bad "pin-images.sh refused to pin studio while storage is unpublished: $(cat "$work/out")"
+fi
+g checkout -q -- .
+printf 'pin storage %s %s\n' "$sha" "$(digest 96)" >"$work/digests"
+if scripts/pin-images.sh "$work/digests" >"$work/out" 2>&1; then
+  expect "storage's first pin -> its compose default and a new .env.example pin" \
+    "$(printf '%s\n' "+# ghcr.io/chelabase/storage:$sha@$(digest 96)" "+    image: \${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:\${CHELABASE_IMAGE_TAG:-$sha@$(digest 96)}")" \
+    "$(g diff -U0 | grep '^+[^+]')"
+  expect "... and removes only its unpublished line" \
+    "-    image: \${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:\${CHELABASE_IMAGE_TAG:-unpublished}" \
+    "$(g diff -U0 | grep '^-[^-]')"
+  scripts/tests/compose-image-pins.sh "$work/digests" >/dev/null && ok "compose-image-pins.sh passes on storage's first pin" ||
+    bad "compose-image-pins.sh fails on storage's first pin"
+else
+  bad "pin-images.sh refused storage's first pin: $(cat "$work/out")"
+fi
+# Only an image that isn't published yet may be unpublished.
+case_ unpublish gateway
+if scripts/tests/compose-image-pins.sh >"$work/out" 2>&1; then bad "compose-image-pins.sh accepted gateway unpublished"; else
+  has "compose-image-pins.sh rejects a published image left unpublished" "gateway" "$(cat "$work/out")"
+fi
+# An unpublished compose default with a .env.example pin is a half-done pin.
+case_ sed -i -E 's#(/storage:\$\{CHELABASE_IMAGE_TAG:-)[^}]*\}#\1unpublished}#' infra/compose/docker-compose.yml
+if scripts/tests/compose-image-pins.sh >"$work/out" 2>&1; then bad "compose-image-pins.sh accepted storage unpublished in compose but pinned in .env.example"; else
+  has "compose-image-pins.sh rejects compose unpublished with a .env.example pin" "storage" "$(cat "$work/out")"
+fi
+
 case_ true
 printf 'pin studio %s %s\npin nosuch %s %s\n' "$sha" "$(digest 99)" "$sha" "$(digest 98)" >"$work/digests"
 if scripts/pin-images.sh "$work/digests" >"$work/out" 2>&1; then bad "pin-images.sh accepted an unknown image"; else

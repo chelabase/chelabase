@@ -7,6 +7,10 @@
 # it names must equal the pushed tag and digest; images it doesn't name keep their pins. A line
 # for an unknown image fails.
 #
+# An image in `unpublished` below (one added before its first release) may instead have the
+# default tag `unpublished` and no .env.example pin, never one without the other; its first
+# `pin-images.sh` run pins it like the rest, and that pin PR drops it from the list.
+#
 #   scripts/tests/compose-image-pins.sh [digests-file]
 #
 # It also renders the base file with docker-compose.build.yml (the self-hosted build from a
@@ -24,7 +28,8 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime init studio identity)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity)
+unpublished=(storage)
 re='^ghcr\.io/chelabase/([a-z]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }
@@ -37,7 +42,11 @@ while IFS= read -r line; do
     ref="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
     name="${BASH_REMATCH[2]}"
     seen_compose[$name]="$ref"
-    [[ "$ref" =~ $re ]] || err "docker-compose.yml: $name default is not pinned: $ref"
+    if [[ "${BASH_REMATCH[3]}" == unpublished && " ${unpublished[*]} " == *" $name "* ]]; then
+      seen_compose[$name]=unpublished
+    else
+      [[ "$ref" =~ $re ]] || err "docker-compose.yml: $name default is not pinned: $ref"
+    fi
   fi
 done <"$compose"
 
@@ -68,6 +77,10 @@ done
 
 for i in "${images[@]}"; do
   [[ -n "${seen_compose[$i]:-}" ]] || err "docker-compose.yml: no image line for $i"
+  if [[ "${seen_compose[$i]:-}" == unpublished ]]; then
+    [[ -z "${seen_env[$i]:-}" ]] || err "$i: compose has no pin (unpublished) but .env.example pins ${seen_env[$i]}"
+    continue
+  fi
   [[ -n "${seen_env[$i]:-}" ]] || err ".env.example: no pin for $i"
   if [[ -n "${seen_compose[$i]:-}" && -n "${seen_env[$i]:-}" && "${seen_compose[$i]}" != "${seen_env[$i]}" ]]; then
     err "$i: compose and .env.example differ (${seen_compose[$i]} vs ${seen_env[$i]})"

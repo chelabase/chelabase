@@ -19,7 +19,6 @@ A blank value counts as unset. Durations marked *(duration)* take a number with 
 | `CHELABASE_STORAGE_MAX_CONNECTIONS` | storage | `200` | Connections storage opens to computes, across every branch. Each database also has its own budget, `storage_max_connections`, in Studio's database settings |
 | `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES` | storage | `1073741824` (1 GiB) | Upload buffers one storage process holds at once; past it, uploads get 503 `busy` |
 | `CHELABASE_STORAGE_BODY_IDLE_SECS` | storage | `60` (at least 1) | An upload whose body sends nothing for this many seconds fails with 408 `request_timeout` |
-| `CHELABASE_STORAGE_IMAGE_TAG` | Compose | `CHELABASE_IMAGE_TAG` | The storage image's tag alone, while it isn't published (see `.env.example`) |
 
 ## The object store
 
