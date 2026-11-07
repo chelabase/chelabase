@@ -137,6 +137,28 @@ impl Tw {
         self.w.app.rt_events.clear();
         self.w.app.cache.clear();
     }
+
+    /// Waits until no spawned publish has landed for 300 ms (10 s at most).
+    async fn quiesce(&self) {
+        let seen = || {
+            (
+                self.w.jobs.member_role_enqueues.lock().unwrap().len(),
+                self.w.app.rt_events.all().len(),
+                self.w.app.cache.sent().len(),
+            )
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = seen();
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let now = seen();
+            if now == last {
+                return;
+            }
+            last = now;
+        }
+        panic!("spawned publishes never stopped: {last:?}");
+    }
 }
 
 fn team_path(team: uuid::Uuid) -> String {
@@ -899,9 +921,13 @@ async fn every_team_write_fires_realtime_cache_and_reconcile() {
         "the login was revoked once the team gave only Viewer"
     );
 
-    // Unchanged writes fire nothing.
+    // Unchanged writes fire nothing. The steps above and the new team (which gives the member
+    // their access back) publish from spawned tasks, so wait until they've all landed: one that's
+    // late on a busy machine would be counted against an unchanged write.
+    t.clear_effects();
     let team = api_team(&t.w.app, "Quiet", p, "developer", &["plain"], &[m]).await;
     let tp = team_path(team);
+    t.quiesce().await;
     for (what, method, path, body) in [
         (
             "same grant",
