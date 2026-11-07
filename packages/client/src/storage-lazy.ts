@@ -1,6 +1,7 @@
 // `client.storage` as every client carries it: a thin front that loads `storage.ts` on first
-// use (a dynamic import, so a bundler splits it out of a query-only app). Only
-// `getPublicUrl` (no network) lives here. Nothing here may import `storage.ts` statically.
+// use (a dynamic import, so a bundler splits it out of a query-only app), and `storage-ref.ts`
+// for `resolve` the same way. Only `getPublicUrl` (no network) lives here. Nothing here may
+// import `storage.ts` or `storage-ref.ts` statically.
 import type { AuthCore } from "./auth.ts";
 import type { PublicUrlOptions, StorageBucket, StorageClient, StorageOptions } from "./storage.ts";
 import type { DatabaseShape } from "./types.ts";
@@ -90,6 +91,8 @@ export function resumeStore(key: string, opts: StorageOptions | undefined): Resu
 
 let loading: Promise<typeof import("./storage.ts")> | undefined;
 const load = () => (loading ??= import("./storage.ts"));
+let loadingRefs: Promise<typeof import("./storage-ref.ts")> | undefined;
+const loadRefs = () => (loadingRefs ??= import("./storage-ref.ts"));
 
 const BUCKET_METHODS = [
   "upload",
@@ -123,7 +126,11 @@ export function lazyStorage(ctx: StorageContext): StorageClient {
     }
     return api as unknown as StorageBucket;
   };
-  const client: Record<string, unknown> = { from };
+  const client: Record<string, unknown> = {
+    from,
+    resolve: (refs: unknown, opts?: unknown) =>
+      loadRefs().then((r) => r.resolveRefs(ctx, refs as Parameters<typeof r.resolveRefs>[1], opts as Parameters<typeof r.resolveRefs>[2])),
+  };
   for (const m of ADMIN_METHODS) {
     client[m] = (...args: unknown[]) => load().then((s) => (s.adminApi(ctx)[m] as AnyFn)(...args));
   }

@@ -1400,6 +1400,10 @@ pub mod storage {
         data("storage.list_objects", Method::Post, "/storage/v1/object/list/{bucket}");
     pub const COPY_OBJECT: Endpoint = data("storage.copy_object", Method::Post, "/storage/v1/object/copy");
     pub const MOVE_OBJECT: Endpoint = data("storage.move_object", Method::Post, "/storage/v1/object/move");
+    /// #102: signed (or public) URLs for `storage.object_ref` values, each checked by row level
+    /// security as the caller.
+    pub const RESOLVE_OBJECTS: Endpoint =
+        data("storage.resolve_objects", Method::Post, "/storage/v1/object/resolve");
 
     /// m6: no key at the gateway; the URL's token (or a public bucket) is the credential,
     /// checked by storage.
@@ -1623,6 +1627,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::LIST_OBJECTS,
     storage::COPY_OBJECT,
     storage::MOVE_OBJECT,
+    storage::RESOLVE_OBJECTS,
     storage::SIGN_OBJECT,
     storage::SIGNED_DOWNLOAD,
     storage::SIGN_UPLOAD,
@@ -1726,6 +1731,7 @@ mod tests {
             ("POST", "/storage/v1/object/list/avatars", "storage.list_objects"),
             ("POST", "/storage/v1/object/copy", "storage.copy_object"),
             ("POST", "/storage/v1/object/move", "storage.move_object"),
+            ("POST", "/storage/v1/object/resolve", "storage.resolve_objects"),
         ] {
             let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
                 panic!("{method} {path} isn't routed");
@@ -2578,6 +2584,7 @@ mod tests {
             ("storage.list_objects", Access::DataKey),
             ("storage.copy_object", Access::DataKey),
             ("storage.move_object", Access::DataKey),
+            ("storage.resolve_objects", Access::DataKey),
             ("storage.sign_object", Access::DataKey),
             ("storage.signed_download", Access::Public),
             ("storage.sign_upload", Access::DataKey),

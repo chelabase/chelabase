@@ -707,6 +707,90 @@
         }
       }
     },
+    "/storage/v1/object/resolve": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Resolve object refs to URLs",
+        "description": "For each `storage.object_ref` (`bucket_id`, `name`), in order: a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
+        "operationId": "resolveObjects",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`urls`: one per ref, in order, each a path on the API host or `null`; `expires_at`: the signed URLs' expiry (seconds since the epoch)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: over 1000 refs, a malformed ref, or `expires_in` outside 1 to 604800",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`, `database_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/storage/v1/object/sign/{bucket}/{*name}": {
       "get": {
         "tags": [
@@ -2353,6 +2437,24 @@
         },
         "additionalProperties": false
       },
+      "ObjectRef": {
+        "type": "object",
+        "description": "One `storage.object_ref` value: an object by its bucket's id and its name.",
+        "required": [
+          "bucket_id",
+          "name"
+        ],
+        "properties": {
+          "bucket_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "Relocate": {
         "type": "object",
         "description": "A copy or a move.",
@@ -2377,6 +2479,31 @@
               "null"
             ],
             "description": "The destination bucket (default: the same)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResolveBody": {
+        "type": "object",
+        "description": "The refs to resolve, and the signed URLs' lifetime.",
+        "required": [
+          "refs"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600."
+          },
+          "refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectRef"
+            },
+            "description": "At most 1000."
           }
         },
         "additionalProperties": false

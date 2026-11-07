@@ -30,6 +30,18 @@
             "ship-to": { "type": "text", "array": false, "nullable": true, "has_default": false, "generated": false }
           }
         },
+        "profiles": {
+          "kind": "table",
+          "rls": true,
+          "security_invoker": false,
+          "privileges": null,
+          "columns": {
+            "id": { "type": "uuid", "array": false, "nullable": false, "has_default": true, "generated": false },
+            "avatar": { "type": "object_ref", "array": false, "nullable": true, "has_default": false, "generated": false },
+            "banner": { "type": "object_ref", "array": false, "nullable": false, "has_default": false, "generated": false },
+            "gallery": { "type": "object_ref", "array": true, "nullable": true, "has_default": false, "generated": false }
+          }
+        },
         "order_stats": {
           "kind": "materialized_view",
           "rls": false,

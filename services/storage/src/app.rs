@@ -55,6 +55,7 @@ pub fn api_router<S: ConnSource, M: ConnSource>() -> OpenApiRouter<Arc<AppState<
         .routes(routes!(objects::copy))
         .routes(routes!(objects::r#move))
         .routes(routes!(signed::sign, signed::signed_download))
+        .routes(routes!(signed::resolve))
         .routes(routes!(signed::sign_upload, signed::signed_upload))
         .routes(routes!(public::public_download))
         .routes(routes!(multipart::create))

@@ -6,7 +6,7 @@ import { expect, test } from "vitest";
 
 const dir = fileURLToPath(new URL(".", import.meta.url));
 // Strings only the storage implementation holds.
-const MARKERS = ["/storage/v1/upload/", "multipartThreshold", "StorageError"];
+const MARKERS = ["/storage/v1/upload/", "multipartThreshold", "StorageError", "/storage/v1/object/resolve"];
 
 async function bundle(contents: string) {
   const out = await build({

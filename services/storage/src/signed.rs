@@ -47,10 +47,10 @@ use serde_json::Value;
 use crate::app::{AppState, identity};
 use crate::buckets::body;
 use crate::control::LiveKey;
-use crate::engine::datoid_of;
+use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
 use crate::names::{self, check_object_name};
-use crate::objects::{Found, ObjectParams, serve, upload_as};
+use crate::objects::{Found, ObjectParams, pg, serve, upload_as};
 use crate::openapi::StorageErrorEnvelope;
 use crate::token::{self, Claims, Purpose, TokenError};
 
@@ -212,11 +212,7 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
     let (data, rid) = identity(&state, &headers)?;
     check_object_name(&name)?;
     let ttl = ttl_of(body(json)?.expires_in)?;
-    if crate::internal::console().is_some() && ttl > crate::internal::MAX_CONSOLE_TTL {
-        return Err(Failure::invalid_request(
-            "a URL minted from the console lives at most 3600 seconds (an hour)",
-        ));
-    }
+    check_console_ttl(ttl)?;
     let at = state
         .engine
         .locate(&data, q.database.as_deref(), &rid)
@@ -224,11 +220,37 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
     let (_, found) = state.find(&data, &at, &bucket, &name, &rid).await?;
     let key = state.urls.key(&rid).await?;
     let exp = now() + ttl as u64;
-    let claims = Claims {
+    let claims = download_claims(&data, &at, bucket, name, found, exp);
+    let token = token::sign(key, &claims);
+    let url = signed_url("sign", &claims.bucket, &claims.name, &token);
+    Ok(Json(json!({ "signed_url": url, "expires_at": exp })).into_response())
+}
+
+/// A URL minted from the console lives at most [`crate::internal::MAX_CONSOLE_TTL`] (else 400).
+fn check_console_ttl(ttl: i64) -> Result<(), Failure> {
+    if crate::internal::console().is_some() && ttl > crate::internal::MAX_CONSOLE_TTL {
+        return Err(Failure::invalid_request(
+            "a URL minted from the console lives at most 3600 seconds (an hour)",
+        ));
+    }
+    Ok(())
+}
+
+/// A download token's claims for the version `found` of `bucket`/`name` in `at`, which `data`
+/// was just shown it can read, expiring at `exp`.
+fn download_claims(
+    data: &DataIdentity,
+    at: &Located,
+    bucket: String,
+    name: String,
+    found: Found,
+    exp: u64,
+) -> Claims {
+    Claims {
         purpose: Purpose::Download,
         database_id: at.database_id,
         branch_id: data.branch_id,
-        database: at.database,
+        database: at.database.clone(),
         datoid: Some(found.datoid),
         key_id: data.key_id,
         bucket,
@@ -244,10 +266,144 @@ pub async fn sign<S: ConnSource, M: ConnSource>(
         upsert: false,
         token_id: Uuid::new_v4(),
         exp,
-    };
-    let token = token::sign(key, &claims);
-    let url = signed_url("sign", &claims.bucket, &claims.name, &token);
-    Ok(Json(json!({ "signed_url": url, "expires_at": exp })).into_response())
+    }
+}
+
+/// The most refs one resolve takes.
+pub const MAX_REFS: usize = 1000;
+
+/// A resolve's refs: 0 to [`MAX_REFS`] (else 400).
+pub fn check_refs(count: usize) -> Result<(), Failure> {
+    if count > MAX_REFS {
+        return Err(Failure::invalid_request("refs lists at most 1000 objects"));
+    }
+    Ok(())
+}
+
+/// A public bucket's object's URL on `branch`, naming the database.
+pub fn public_url(branch: Uuid, database: &str, bucket: &str, name: &str) -> String {
+    format!(
+        "/storage/v1/object/public/{branch}/{}/{}?database={}",
+        names::encode_path(bucket),
+        names::encode_path(name),
+        names::encode_path(database)
+    )
+}
+
+/// The refs' buckets and objects, as the caller (row level security on both tables decides):
+/// one row per ref the caller can read, numbered by its place (from 1) in the arrays. A ref
+/// whose bucket or object is missing or hidden has no row.
+const RESOLVE_SQL: &str = "SELECT r.ord, b.name, b.public, o.version_id, o.size, o.etag, o.content_type FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.uuid[]), pg_catalog.unnest($2::pg_catalog.text[])) WITH ORDINALITY AS r(bucket_id, name, ord) JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) r.bucket_id JOIN storage.objects o ON o.bucket_id OPERATOR(pg_catalog.=) r.bucket_id AND o.name OPERATOR(pg_catalog.=) r.name WHERE o.version_id IS NOT NULL AND o.size IS NOT NULL";
+
+/// One `storage.object_ref` value: an object by its bucket's id and its name.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectRef {
+    pub bucket_id: Uuid,
+    pub name: String,
+}
+
+/// The refs to resolve, and the signed URLs' lifetime.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveBody {
+    /// At most 1000.
+    pub refs: Vec<ObjectRef>,
+    /// A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/storage/v1/object/resolve",
+    operation_id = "resolveObjects",
+    tag = "storage",
+    summary = "Resolve object refs to URLs",
+    description = "For each `storage.object_ref` (`bucket_id`, `name`), in order: a signed download URL (exactly as `signObject` mints it) when the caller can read the bucket and the object (row level security on both, as the caller), the public URL instead when the bucket is public, and `null` when the caller can't read it (missing or hidden alike) or the name isn't a valid object name. All refs are read in one statement.",
+    params(ObjectParams),
+    request_body = ResolveBody,
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "`urls`: one per ref, in order, each a path on the API host or `null`; `expires_at`: the signed URLs' expiry (seconds since the epoch)", body = Value),
+        (status = 400, description = "`invalid_request`: over 1000 refs, a malformed ref, or `expires_in` outside 1 to 604800", body = StorageErrorEnvelope),
+        (status = 403, description = "`not_allowed`, `database_not_allowed`", body = StorageErrorEnvelope),
+    ),
+)]
+pub async fn resolve<S: ConnSource, M: ConnSource>(
+    State(state): State<Arc<AppState<S, M>>>,
+    headers: HeaderMap,
+    Query(q): Query<ObjectParams>,
+    json: Result<Json<ResolveBody>, JsonRejection>,
+) -> Result<Response, Failure> {
+    let (data, rid) = identity(&state, &headers)?;
+    let asked = body(json)?;
+    let refs = asked.refs;
+    check_refs(refs.len())?;
+    let ttl = ttl_of(asked.expires_in)?;
+    check_console_ttl(ttl)?;
+    let exp = now() + ttl as u64;
+    let mut urls: Vec<Option<String>> = vec![None; refs.len()];
+    // A name no object can have stays null without being asked about.
+    let sent: Vec<usize> = (0..refs.len())
+        .filter(|&i| check_object_name(&refs[i].name).is_ok())
+        .collect();
+    if sent.is_empty() {
+        return Ok(Json(json!({ "urls": urls, "expires_at": exp })).into_response());
+    }
+    let at = state
+        .engine
+        .locate(&data, q.database.as_deref(), &rid)
+        .await?;
+    let ids: Vec<Uuid> = sent.iter().map(|&i| refs[i].bucket_id).collect();
+    let names: Vec<String> = sent.iter().map(|&i| refs[i].name.clone()).collect();
+    // The OID in the same transaction as the rows: it decides the blobs' keys, as in `find`.
+    let ((rows, oid), _) = state
+        .caller(&data, &at, &rid, async |c, _| {
+            let rows = c
+                .query(RESOLVE_SQL, &[&ids, &names])
+                .await
+                .map_err(pg(&rid))?;
+            let oid: i64 = c.query_one(DATOID_SQL, &[]).await.map_err(pg(&rid))?.get(0);
+            Ok((rows, oid))
+        })
+        .await?;
+    if rows.is_empty() {
+        return Ok(Json(json!({ "urls": urls, "expires_at": exp })).into_response());
+    }
+    let datoid = datoid_of(Some(oid)).ok_or_else(Failure::storage_unavailable)?;
+    let key = state.urls.key(&rid).await?;
+    for row in rows {
+        let ord: i64 = row.get(0);
+        let Some(&i) = usize::try_from(ord - 1).ok().and_then(|k| sent.get(k)) else {
+            continue;
+        };
+        let bucket: String = row.get(1);
+        let name = refs[i].name.clone();
+        let url = if row.get::<_, Option<bool>>(2).unwrap_or(false) {
+            public_url(data.branch_id, &at.database, &bucket, &name)
+        } else {
+            let found = Found {
+                datoid,
+                version: row.get(3),
+                size: row.get(4),
+                etag: row.get::<_, Option<String>>(5).unwrap_or_default(),
+                content_type: row
+                    .get::<_, Option<String>>(6)
+                    .unwrap_or_else(|| "application/octet-stream".into()),
+                owner: None,
+            };
+            let claims = download_claims(&data, &at, bucket, name, found, exp);
+            signed_url(
+                "sign",
+                &claims.bucket,
+                &claims.name,
+                &token::sign(key, &claims),
+            )
+        };
+        urls[i] = Some(url);
+    }
+    Ok(Json(json!({ "urls": urls, "expires_at": exp })).into_response())
 }
 
 impl<S: ConnSource, M: ConnSource> AppState<S, M> {
@@ -629,6 +785,31 @@ mod tests {
         let lifted = Claims { session_id: None, ..claims.clone() };
         assert!(upload_identity(key.clone(), json!({}), &lifted).is_none());
         assert!(upload_identity(key, json!({}), &Claims { role: None, ..own }).is_none());
+    }
+
+    /// #102: a resolve takes 0 to 1000 refs (more is 400, before anything is read).
+    #[test]
+    fn a_resolve_takes_at_most_a_thousand_refs() {
+        assert_eq!(MAX_REFS, 1000);
+        for ok in [0, 1, 1000] {
+            assert!(check_refs(ok).is_ok(), "{ok}");
+        }
+        let err = check_refs(1001).unwrap_err();
+        assert_eq!(
+            (err.0.status.as_u16(), err.0.code),
+            (400, "invalid_request")
+        );
+    }
+
+    /// #102: a readable object in a public bucket resolves to its public URL on the branch,
+    /// naming the database; the path's segments are encoded as a signed URL's are.
+    #[test]
+    fn a_public_object_resolves_to_its_public_url() {
+        let branch = Uuid::parse_str("6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10").unwrap();
+        assert_eq!(
+            public_url(branch, "my db", "pub", "logos/a b.png"),
+            "/storage/v1/object/public/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/pub/logos/a%20b.png?database=my%20db"
+        );
     }
 
     /// An app user's request names its session (`sid`); a key's doesn't; an unreadable one
