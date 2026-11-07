@@ -113,6 +113,31 @@ impl Failure {
         Failure(f)
     }
 
+    /// 409: something on a table that references the object refused the delete (m11 audit
+    /// B1): a referential action that breaks a constraint (`ON DELETE SET NULL` on a
+    /// `NOT NULL` column, a `CHECK`, a unique key), or a trigger or function the delete set
+    /// off. A fixed message with no SQLSTATE: Postgres's text and the trigger's own name the
+    /// user's tables, columns and rows, which the caller may not be allowed to see.
+    pub fn delete_refused() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "delete_refused",
+            "a constraint, trigger or function on a table that references the object refused the delete; nothing was deleted",
+        )
+    }
+
+    /// 409: a delete in a write-once bucket (m7). The schema's own message, fixed here so a
+    /// user's trigger raising the same SQLSTATE can't pass its text through.
+    pub fn write_once_delete() -> Self {
+        let mut f = QueryFailure::new(
+            StatusCode::CONFLICT,
+            "write_once",
+            "storage.objects: the bucket is write-once; its objects are never overwritten, moved, renamed or deleted",
+        );
+        f.sqlstate = Some("CB005".into());
+        Failure(f)
+    }
+
     /// 413: the body is over the bucket's file size limit.
     pub fn too_large(limit: i64) -> Self {
         Self::new(

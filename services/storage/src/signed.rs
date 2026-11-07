@@ -280,6 +280,29 @@ pub fn check_refs(count: usize) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `refs`, refused while it parses at the first ref over [`MAX_REFS`] (m11 audit N2): a body
+/// up to the JSON limit isn't parsed whole before the count is checked.
+fn capped_refs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ObjectRef>, D::Error> {
+    struct Capped;
+    impl<'de> serde::de::Visitor<'de> for Capped {
+        type Value = Vec<ObjectRef>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a list of at most {MAX_REFS} refs")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut refs = Vec::new();
+            while let Some(r) = seq.next_element()? {
+                if refs.len() == MAX_REFS {
+                    return Err(serde::de::Error::custom("refs lists at most 1000 objects"));
+                }
+                refs.push(r);
+            }
+            Ok(refs)
+        }
+    }
+    d.deserialize_seq(Capped)
+}
+
 /// A public bucket's object's URL on `branch`, naming the database.
 pub fn public_url(branch: Uuid, database: &str, bucket: &str, name: &str) -> String {
     format!(
@@ -358,6 +381,7 @@ impl ObjectRef {
 #[serde(deny_unknown_fields)]
 pub struct ResolveBody {
     /// At most 1000, each `{bucket_id, name}`, `{bucket, name}` or `{id}`.
+    #[serde(deserialize_with = "capped_refs")]
     pub refs: Vec<ObjectRef>,
     /// A signed URL's lifetime: seconds, 1 to 604800 (7 days); default 3600.
     #[serde(default)]
@@ -393,15 +417,17 @@ pub async fn resolve<S: ConnSource, M: ConnSource>(
     let ttl = ttl_of(asked.expires_in)?;
     check_console_ttl(ttl)?;
     let exp = now() + ttl as u64;
+    // The database first, even for a batch with nothing to ask (m11 audit N1): one the key
+    // may not use is 403 whatever the refs are.
+    let at = state
+        .engine
+        .locate(&data, q.database.as_deref(), &rid)
+        .await?;
     let mut urls: Vec<Option<String>> = vec![None; refs.len()];
     let sent: Vec<usize> = (0..refs.len()).filter(|&i| !refs[i].unservable()).collect();
     if sent.is_empty() {
         return Ok(Json(json!({ "urls": urls, "expires_at": exp })).into_response());
     }
-    let at = state
-        .engine
-        .locate(&data, q.database.as_deref(), &rid)
-        .await?;
     let (mut bucket_ids, mut buckets, mut names, mut ids) = (vec![], vec![], vec![], vec![]);
     for &i in &sent {
         let (bucket_id, bucket, name, id) = refs[i].columns();
@@ -856,6 +882,18 @@ mod tests {
             (err.0.status.as_u16(), err.0.code),
             (400, "invalid_request")
         );
+    }
+
+    /// m11 audit N2: the cap holds while the body parses. A 1001st ref fails there, before
+    /// the rest of the body (here, not even JSON) is read.
+    #[test]
+    fn the_ref_cap_holds_while_parsing() {
+        let one = r#"{"id":"00000000-0000-0000-0000-0000000000a1"}"#;
+        let at_cap = format!(r#"{{"refs":[{}]}}"#, vec![one; MAX_REFS].join(","));
+        assert_eq!(serde_json::from_str::<ResolveBody>(&at_cap).unwrap().refs.len(), MAX_REFS);
+        let over = format!(r#"{{"refs":[{},{one},{one}, this is not JSON"#, vec![one; MAX_REFS].join(","));
+        let err = serde_json::from_str::<ResolveBody>(&over).err().expect("over the cap");
+        assert!(err.to_string().contains("at most 1000"), "{err}");
     }
 
     /// #102: a ref names an object one way: `{bucket_id, name}` (a `storage.object_ref`),
