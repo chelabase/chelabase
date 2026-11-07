@@ -28,9 +28,9 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime)
+images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner)
 # Edge functions (m4b): the functions service and its runtime, until their first pin.
-unpublished=(functions functions-runtime)
+unpublished=(functions functions-runtime service-runner)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }
@@ -94,7 +94,7 @@ build="$root/infra/compose/docker-compose.build.yml"
 render_images() { # render_images <-f args…>: "service image built" per line
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE -u CHELABASE_IMAGE_REPO -u CHELABASE_IMAGE_TAG \
     docker compose -p chelabase-image-pins \
-    --project-directory "$root/infra/compose" "$@" --env-file "$envex" config --format json |
+    --project-directory "$root/infra/compose" "$@" --profile services --env-file "$envex" config --format json |
     jq -r '.services | to_entries[]
       | "\(.key) \(.value.image // "-") \(.value.build != null and .value.pull_policy == "build")"'
 }

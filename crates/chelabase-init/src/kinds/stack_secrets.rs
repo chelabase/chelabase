@@ -48,6 +48,8 @@ pub const SECRET_FILES: &[(&str, Kind)] = &[
     ("tokens/storage-internal.token", Kind::Text),
     ("tokens/orchestrator-functions.token", Kind::Text),
     ("tokens/worker-functions.token", Kind::Text),
+    ("tokens/functions-service-runner.token", Kind::Text),
+    ("tokens/worker-service-runner.token", Kind::Text),
     ("tokens/proxy-api.token", Kind::Text),
     ("tokens/storcon-hook.token", Kind::Text),
 ];

@@ -21,7 +21,7 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 [[ $# -eq 1 && -f "$1" ]] || { echo "usage: $0 <digests-file>" >&2; exit 2; }
-images=(gateway orchestrator worker rest auth realtime storage functions init studio identity functions-runtime)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
 declare -A ref
 pin_re='^[0-9a-f]{12}$'
 digest_re='^sha256:[0-9a-f]{64}$'

@@ -216,6 +216,9 @@ pub const LAYOUT: &[Entry] = &[
     // Edge functions m4b: the functions service's internal listener, one bearer per caller.
     e("tokens/orchestrator-functions.token", M, Gen::Text32, P),
     e("tokens/worker-functions.token", M, Gen::Text32, P),
+    // Edge functions m10: the service runner's internal API, one bearer per caller.
+    e("tokens/functions-service-runner.token", M, Gen::Text32, P),
+    e("tokens/worker-service-runner.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
     e("tokens/auth-identity.token", M, Gen::Token32, P),
@@ -2289,6 +2292,7 @@ mod tests {
                 "gateway/internal-verify.pem",
                 "nats/functions.password",
                 "secrets/secrets.key",
+                "tokens/functions-service-runner.token",
                 "tokens/orchestrator-functions.token",
                 "tokens/worker-functions.token",
             ],
@@ -2353,6 +2357,65 @@ mod tests {
         assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
         assert_eq!(read("tokens/orchestrator-functions.token"), orch);
         assert_eq!(read("tokens/worker-functions.token"), worker);
+    }
+
+    /// Edge functions m10: the service runner's bearers (the functions service's, the
+    /// worker's) are made by a fresh run, at least 32 characters and different, and kept.
+    #[test]
+    fn service_runner_bearers_are_made_once_and_differ() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let read = |f: &str| std::fs::read(t.path().join(f)).unwrap();
+        let files = ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"];
+        let (functions, worker) = (read(files[0]), read(files[1]));
+        assert!(functions.len() >= 32 && worker.len() >= 32);
+        assert_ne!(functions, worker);
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
+        assert_eq!(read(files[0]), functions);
+        assert_eq!(read(files[1]), worker);
+    }
+
+    /// An install from before the service runner: the next run makes its two bearers and
+    /// leaves every other file byte for byte (no NATS or Valkey user changes).
+    #[test]
+    fn upgrade_adds_service_runner_bearers_and_keeps_the_rest() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let files = ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"];
+        for f in files {
+            std::fs::remove_file(t.path().join(f)).unwrap();
+        }
+        let before = snapshot(t.path());
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        let mut created = r.created.clone();
+        created.sort();
+        assert_eq!(created, files.map(|f| t.path().join(f)));
+        assert!(r.rewritten.is_empty(), "{:?}", r.rewritten);
+        let after = snapshot(t.path());
+        for (path, v) in &before {
+            assert_eq!(after.get(path), Some(v), "{}", path.display());
+        }
+    }
+
+    /// The self-hosted service-runner mounts exactly its two caller bearers and the metadata
+    /// password; the functions service and the worker each mount their own bearer.
+    #[test]
+    fn service_runner_mounts_come_from_init() {
+        assert_eq!(
+            selfhost_mounts("service-runner"),
+            [
+                "db/metadata.password",
+                "tokens/functions-service-runner.token",
+                "tokens/worker-service-runner.token",
+            ]
+        );
+        assert!(selfhost_mounts("functions").contains(&"tokens/functions-service-runner.token".to_string()));
+        assert!(selfhost_mounts("worker").contains(&"tokens/worker-service-runner.token".to_string()));
+        for f in ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"] {
+            let entry = LAYOUT.iter().find(|e| e.path == f).unwrap_or_else(|| panic!("{f} in the layout"));
+            assert!(matches!(entry.spec.uid, Id::Writer), "{f}");
+        }
     }
 
     fn assert_upgrade_adds(files: &[&str], user: &str) {

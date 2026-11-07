@@ -39,7 +39,7 @@ awk -v want="^# --- ($sections)( .*)? ---\$" '
 mv "$tmp/env.all" "$tmp/env"
 
 docker compose -p chelabase-env-tunables --project-directory "$dir" -f "$dir/docker-compose.yml" \
-  --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
+  --profile services --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
   { cat "$tmp/config.err" >&2; err "docker compose config failed"; exit 1; }
 
 checked=0

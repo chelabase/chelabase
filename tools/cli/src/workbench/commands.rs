@@ -42,6 +42,10 @@ impl Site {
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
 pub(super) const RUST_APPS: [&str; 8] =
     ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage", "functions"];
+/// Rust binaries `up` builds for a compose profile that is off by default (edge functions m10:
+/// the service runner, profile `services`): built with the apps, never started, recorded or
+/// restarted with them; `docker compose --profile services up -d service-runner` runs it.
+pub(super) const PROFILE_RUST_APPS: [&str; 1] = ["service-runner"];
 /// Every app container (the Rust apps, Studio and the identity service; the sites are added by
 /// `--with`).
 pub(super) const APPS: [&str; 10] = [
@@ -1223,14 +1227,21 @@ fn neon_images(stack: &Stack) -> anyhow::Result<Vec<(String, String)>> {
 fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.arg("build").current_dir(&stack.checkout);
-    for app in apps {
-        cmd.args(["-p", package_of(app)]);
-    }
+    cmd.args(build_packages(apps, cli));
     if cli {
         // `chelabase-init` too: the bootstrap runs it.
         cmd.args(["-p", "chelabase", "-p", "init"]);
     }
     run(cmd)
+}
+
+/// `-p <package>` for each app, and for [`PROFILE_RUST_APPS`] too on a full build (`cli`: `up`).
+pub(super) fn build_packages(apps: &[&str], cli: bool) -> Vec<String> {
+    let extra: &[&str] = if cli { &PROFILE_RUST_APPS } else { &[] };
+    apps.iter()
+        .chain(extra)
+        .flat_map(|app| ["-p".to_string(), package_of(app).to_string()])
+        .collect()
 }
 
 /// The cargo package that builds `app`'s binary (the storage service's crate name differs from
@@ -1239,6 +1250,7 @@ fn package_of(app: &str) -> &str {
     match app {
         "storage" => "chelabase-storage-service",
         "functions" => "chelabase-functions",
+        "service-runner" => "chelabase-service-runner",
         other => other,
     }
 }

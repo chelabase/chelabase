@@ -46,6 +46,9 @@ services:
   functions:
     <<: *server
     command: ["functions"]
+  service-runner:
+    <<: *server
+    command: ["service-runner"]
   functions-runtime:
     image: chelabase/functions-runtime:local
     pull_policy: build

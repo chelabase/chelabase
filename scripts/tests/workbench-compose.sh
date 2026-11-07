@@ -14,7 +14,7 @@ fail() {
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
   -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
   --env-file "$fixture" \
-  --profile sites --profile runner config --no-env-resolution --format json |
+  --profile sites --profile runner --profile services config --no-env-resolution --format json |
   jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" || fail "compose config failed"
 # (The rewrite lists each service's file secrets, which Docker binds read-only, among its volumes.)
 q() { jq -r "$1" <<<"$config"; }
@@ -94,11 +94,11 @@ for s in orchestrator worker gateway auth rest realtime studio; do
     | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/(storage|functions)-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
-for s in mailpit identity orchestrator worker gateway auth rest functions; do
+for s in mailpit identity orchestrator worker gateway auth rest functions service-runner; do
   [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
 done
 
-for s in orchestrator worker gateway auth rest functions runner; do
+for s in orchestrator worker gateway auth rest functions service-runner runner; do
   q ".services[\"$s\"].env_file[]? | if type == \"object\" then .path else . end" | gq -x /m/.chelabase/stacks/feat-x/env/stack.env ||
     fail "$s reads the stack env"
 done
@@ -130,7 +130,7 @@ done
 [[ "$(q '.services.orchestrator.networks.control.ipv4_address')" == 10.213.4.10 ]] || fail "the orchestrator's static control address"
 [[ "$(q '.services.runner.networks.control.ipv4_address')" == 10.213.4.11 ]] || fail "the runner's static control address"
 [[ "$(q '.services.orchestrator.networks | keys | sort | join(" ")')" == "compute control default functions-control" ]] || fail "the orchestrator is on the default, control, compute and functions-control networks"
-[[ "$(q '.services.worker.networks | keys | sort | join(" ")')" == "compute default functions-control" ]] || fail "the worker isn't on the control network (it is on compute, default and functions-control)"
+[[ "$(q '.services.worker.networks | keys | sort | join(" ")')" == "compute default functions-control services-control" ]] || fail "the worker isn't on the control network (it is on compute, default, functions-control and services-control)"
 ca_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/compute-ca")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/compute-ca" and .read_only == true))"] | sort | join(" ")')"
 [[ "$ca_mounts" == "runner:true worker:false" ]] || fail "compute-ca: rw for the worker, ro for the runner (R-T9a), nobody else; got: $ca_mounts"
 tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/orchestrator-tls")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/orchestrator-tls" and .read_only == true))"] | sort | join(" ")')"
@@ -427,6 +427,15 @@ others="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; (.source 
   fail "functions runs the checkout's debug binary"
 [[ "$(q '.services["functions-runtime"].image')" == chelabase/functions-runtime:* && "$(q '.services["functions-runtime"].pull_policy')" == never ]] ||
   fail "functions-runtime runs the locally built image, never pulled"
+# Edge functions (m10): the service runner, in profile services (off by default), runs the
+# checkout's debug binary in the Docker group, with the socket and its two caller bearers only.
+[[ "$(q '.services["service-runner"].profiles | join(" ")')" == services ]] || fail "service-runner is in the services profile only"
+[[ "$(q '.services["service-runner"].command | join(" ")')" == "$(sed -n 's/^CHELABASE_CHECKOUT=//p' "$fixture")/target/debug/service-runner" ]] ||
+  fail "service-runner runs the checkout's debug binary"
+[[ "$(q '.services["service-runner"].group_add | join(" ")')" == "$(sed -n 's/^CHELABASE_DOCKER_GID=//p' "$fixture")" ]] ||
+  fail "service-runner joins the Docker group"
+[[ "$(q '[.services["service-runner"].volumes[] | select(.type == "bind" and (.source | test("docker.sock|service-runner.token$"))) | .source | split("/") | last] | sort | join(" ")')" == "docker.sock functions-service-runner.token worker-service-runner.token" ]] ||
+  fail "service-runner mounts the Docker socket and its two caller bearers"
 
 # Neon's S3 endpoint is the base file's one setting, default http://seaweedfs:8333, for the
 # safekeepers and the pageserver under the workbench too.

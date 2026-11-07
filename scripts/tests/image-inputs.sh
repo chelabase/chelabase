@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline tests of the image release tooling on a scratch git repo: a small cargo and pnpm
-# workspace with all twelve images pinned at its first commit, and a stub `docker` that only logs.
+# workspace with all thirteen images pinned at its first commit, and a stub `docker` that only logs.
 #   - scripts/image-inputs.sh changed: which images changed since their pins
 #   - scripts/publish-images.sh: --service / --all / no flag, and --push-only on the selection
 #   - scripts/pin-images.sh + scripts/tests/compose-image-pins.sh: a partial digests file, and
@@ -52,6 +52,7 @@ crate crates/objstore objstore lib
 crate services/storage chelabase-storage-service bin 'http = { path = "../../crates/http" }' 'objstore = { path = "../../crates/objstore" }'
 # functions' package isn't named after its image either (edge functions m4b).
 crate services/functions chelabase-functions bin
+crate services/service-runner chelabase-service-runner bin
 crate tools/cli cli bin 'meta = { path = "../../crates/meta" }'
 cargo generate-lockfile --offline -q
 
@@ -80,7 +81,7 @@ for f in config.capnp supervisor.js watchdog.sh; do echo "// $f" >"infra/functio
 cp "$src/.dockerignore" .
 cp "$src"/scripts/{image-inputs.sh,publish-images.sh,pin-images.sh} scripts/ 2>/dev/null || true
 cp "$src/scripts/tests/compose-image-pins.sh" scripts/tests/
-images=(gateway orchestrator worker rest auth realtime storage functions init studio identity functions-runtime)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
 digest() { printf 'sha256:%064d' "$1"; }
 write_pins() { # write_pins <sha12>: every image pinned at <sha12>
   local i n=0
@@ -149,6 +150,8 @@ case_ edit crates/objstore/src/lib.rs
 expect "a crate only storage uses -> storage" "storage" "$(changed)"
 case_ edit services/functions/src/main.rs
 expect "functions' own crate (package chelabase-functions) -> functions" "functions" "$(changed)"
+case_ edit services/service-runner/src/main.rs
+expect "service-runner's own crate (package chelabase-service-runner) -> service-runner" "service-runner" "$(changed)"
 for f in infra/functions-runtime/supervisor.js infra/images/functions-runtime.Dockerfile; do
   case_ edit "$f"
   expect "$f -> functions-runtime" "functions-runtime" "$(changed)"
@@ -156,10 +159,10 @@ done
 case_ edit tools/cli/src/main.rs
 expect "a crate no image builds -> nothing" "" "$(changed)"
 case_ edit crates/meta/Cargo.toml
-expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions init" "$(changed)"
+expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init" "$(changed)"
 for f in Cargo.lock Cargo.toml rust-toolchain.toml; do
   case_ edit "$f"
-  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions init" "$(changed)"
+  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init" "$(changed)"
 done
 case_ edit packages/ui/index.ts
 expect "a workspace package studio uses -> studio" "studio" "$(changed)"
@@ -181,7 +184,7 @@ for f in services/identity/src.ts infra/images/identity.Dockerfile; do
 done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
-all="gateway orchestrator worker rest auth realtime storage functions init studio identity functions-runtime"
+all="gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime"
 for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"

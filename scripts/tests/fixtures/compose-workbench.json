@@ -33,6 +33,15 @@
     "functions-egress": {
       "ipam": {},
       "name": "chelabase-feat-x_functions-egress"
+    },
+    "services": {
+      "ipam": {},
+      "name": "chelabase-feat-x_services"
+    },
+    "services-control": {
+      "internal": true,
+      "ipam": {},
+      "name": "chelabase-feat-x_services-control"
     }
   },
   "secrets": {
@@ -216,6 +225,10 @@
       "file": "/m/.chelabase/tokens/data-keys.token",
       "name": "chelabase-feat-x_token-data-keys"
     },
+    "token-functions-service-runner": {
+      "file": "/m/.chelabase/tokens/functions-service-runner.token",
+      "name": "chelabase-feat-x_token-functions-service-runner"
+    },
     "token-orchestrator-functions": {
       "file": "/m/.chelabase/tokens/orchestrator-functions.token",
       "name": "chelabase-feat-x_token-orchestrator-functions"
@@ -247,6 +260,10 @@
     "token-worker-identity": {
       "file": "/m/.chelabase/tokens/worker-identity.token",
       "name": "chelabase-feat-x_token-worker-identity"
+    },
+    "token-worker-service-runner": {
+      "file": "/m/.chelabase/tokens/worker-service-runner.token",
+      "name": "chelabase-feat-x_token-worker-service-runner"
     },
     "valkey-control": {
       "file": "/m/.chelabase/valkey/control.password",
@@ -460,10 +477,11 @@
         }
       ],
       "environment": {
-        "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,127.0.0.1:8091",
+        "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,functions-services:8091,127.0.0.1:8091",
         "CHELABASE_FUNCTIONS_CONTROL_ADDR": "functions-control:8080",
         "CHELABASE_FUNCTIONS_INTERNAL_ADDR": "functions-internal:8080",
         "CHELABASE_FUNCTIONS_RUNTIME_URL": "http://functions-runtime:8080",
+        "CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/functions-service-runner.token",
         "CHELABASE_FUNCTIONS_TIMEOUT_MS": "",
         "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_functions",
         "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/functions.password",
@@ -506,7 +524,13 @@
           "aliases": [
             "functions-control"
           ]
-        }
+        },
+        "services": {
+          "aliases": [
+            "functions-services"
+          ]
+        },
+        "services-control": {}
       },
       "restart": "unless-stopped",
       "secrets": [
@@ -529,6 +553,10 @@
         {
           "source": "token-worker-functions",
           "target": "/m/.chelabase/tokens/worker-functions.token"
+        },
+        {
+          "source": "token-functions-service-runner",
+          "target": "/m/.chelabase/tokens/functions-service-runner.token"
         },
         {
           "source": "s3-functions-access-key",
@@ -2105,6 +2133,90 @@
         }
       ]
     },
+    "service-runner": {
+      "command": [
+        "/w/feat-x/target/debug/service-runner"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/functions-service-runner.token",
+        "CHELABASE_SERVICES_NETWORK": "chelabase-feat-x_services",
+        "CHELABASE_SERVICE_RUNNER_ADDR": "service-runner-control:8094,127.0.0.1:8094",
+        "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token"
+      },
+      "group_add": [
+        "973"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8094/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "default": {},
+        "services-control": {
+          "aliases": [
+            "service-runner-control"
+          ]
+        }
+      },
+      "profiles": [
+        "services"
+      ],
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "token-functions-service-runner",
+          "target": "/m/.chelabase/tokens/functions-service-runner.token"
+        },
+        {
+          "source": "token-worker-service-runner",
+          "target": "/m/.chelabase/tokens/worker-service-runner.token"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        },
+        {
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        }
+      ],
+      "working_dir": "/w/feat-x"
+    },
     "storage": {
       "command": [
         "/w/feat-x/target/debug/storage"
@@ -2490,7 +2602,8 @@
         "CHELABASE_VALKEY_USER": "control",
         "CHELABASE_WEBHOOKS_ALLOW_HOSTS": "runner",
         "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true",
-        "CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/worker-functions.token"
+        "CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/worker-functions.token",
+        "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token"
       },
       "group_add": [
         "973"
@@ -2511,7 +2624,8 @@
       "networks": {
         "compute": {},
         "default": {},
-        "functions-control": {}
+        "functions-control": {},
+        "services-control": {}
       },
       "restart": "unless-stopped",
       "secrets": [
@@ -2558,6 +2672,10 @@
         {
           "source": "token-worker-identity",
           "target": "/m/.chelabase/tokens/worker-identity.token"
+        },
+        {
+          "source": "token-worker-service-runner",
+          "target": "/m/.chelabase/tokens/worker-service-runner.token"
         },
         {
           "source": "token-worker-functions",
