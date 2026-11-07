@@ -849,7 +849,6 @@ impl JobPort for Doc {
 }
 
 #[allow(unused_variables)]
-#[allow(unused_variables)]
 impl functions::FunctionsPort for Doc {
     async fn create_function(&self, database: DatabaseId, name: &str, kind: chelabase_metadata::FunctionKind) -> Result<chelabase_metadata::FunctionRecord, MetadataError> {
         match *self {}

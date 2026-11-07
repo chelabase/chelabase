@@ -861,4 +861,136 @@ mod functions {
                 .any(|(k, _)| k.managed_by_function.is_some() && k.revoked_at.is_none());
         assert!(!live, "the managed key is revoked");
     }
+
+    /// Audit S1: a deploy that doesn't activate still publishes (CLI and Studio list it).
+    #[tokio::test]
+    async fn functions_deploy_without_activate_publishes() {
+        let w = world().await;
+        w.json("dee", "PUT", &w.path(w.w.dev, "/hello"), Some(json!({})))
+            .await;
+        let before = w.published().len();
+        let m = manifest("djE=");
+        let body = format!(
+            "{{\"manifest\": {m}, \"sha256\": \"{}\", \"activate\": false}}",
+            sha(&m)
+        );
+        let (status, text) = w
+            .call(
+                "dee",
+                "POST",
+                &w.path(w.w.dev, "/hello/deployments"),
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, 201, "{text}");
+        assert_eq!(w.published()[before..], [(w.w.dev, "hello".to_string())]);
+        let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, ""), None).await;
+        assert_eq!(list[0]["deployment_id"], Value::Null, "not activated");
+    }
+
+    /// Audit S2: protection is checked again after the upload: a Developer's deploy to a branch
+    /// an Admin protected meanwhile is 403, and nothing is recorded or activated.
+    #[tokio::test]
+    async fn functions_deploy_rechecks_protection_after_upload() {
+        let w = world().await;
+        w.json("dee", "PUT", &w.path(w.main, "/hello"), Some(json!({})))
+            .await;
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *w.w.app.bundles.gate.lock().unwrap() = Some((started.clone(), release.clone()));
+        let base = w.w.app.base.clone();
+        let token = w.w.app.token_for("dee", "org-1");
+        let path = w.path(w.main, "/hello/deployments");
+        let deploy = tokio::spawn(async move {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}{path}"))
+                .header(IDENTITY_HEADER, token)
+                .header("content-type", "application/json")
+                .body(deploy_body("djE="))
+                .send()
+                .await
+                .unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        });
+        started.notified().await;
+        w.protect_main();
+        release.notify_one();
+        let (status, text) = deploy.await.unwrap();
+        assert_eq!(status, 403, "{text}");
+        let (_, deployments) = w
+            .json("ada", "GET", &w.path(w.main, "/hello/deployments"), None)
+            .await;
+        assert_eq!(deployments, json!([]), "no row recorded");
+        let (_, list) = w.json("ada", "GET", &w.path(w.main, ""), None).await;
+        assert_eq!(list[0]["deployment_id"], Value::Null, "nothing activated");
+    }
+
+    /// N1: the manifest is a JSON object.
+    #[tokio::test]
+    async fn functions_manifest_must_be_an_object() {
+        let w = world().await;
+        w.json("dee", "PUT", &w.path(w.w.dev, "/hello"), Some(json!({})))
+            .await;
+        for m in ["\"just a string\"", "[1, 2]", "42"] {
+            let body = format!(
+                "{{\"manifest\": {m}, \"sha256\": \"{}\", \"compatibility_date\": \"2026-10-01\"}}",
+                sha(m)
+            );
+            let (status, text) = w
+                .call(
+                    "dee",
+                    "POST",
+                    &w.path(w.w.dev, "/hello/deployments"),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, 422, "{m}: {text}");
+        }
+        assert!(w.w.app.bundles.puts.lock().unwrap().is_empty());
+    }
+
+    /// N2: an empty or blank run-as role is refused here, before the worker is asked.
+    #[tokio::test]
+    async fn functions_blank_run_as_role_422() {
+        let w = world().await;
+        w.deployed("dee", w.w.dev, "hello", "djE=").await;
+        for role in ["", "   "] {
+            let (status, body) = w
+                .json(
+                    "dee",
+                    "PATCH",
+                    &w.path(w.w.dev, "/hello"),
+                    Some(json!({"run_as_role": role})),
+                )
+                .await;
+            assert_eq!(status, 422, "{role:?}: {body}");
+        }
+        assert!(
+            w.w.jobs.role_checks.lock().unwrap().is_empty(),
+            "the worker wasn't asked"
+        );
+    }
+
+    /// N8: a body that breaks off (shorter than its Content-Length) is 400, not 413.
+    #[tokio::test]
+    async fn functions_broken_body_400() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let w = world().await;
+        w.json("dee", "PUT", &w.path(w.w.dev, "/hello"), Some(json!({})))
+            .await;
+        let addr = w.w.app.base.trim_start_matches("http://").to_string();
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let request = format!(
+            "POST {} HTTP/1.1\r\nhost: {addr}\r\n{IDENTITY_HEADER}: {}\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"manifest\":",
+            w.path(w.w.dev, "/hello/deployments"),
+            w.w.app.token_for("dee", "org-1"),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    }
 }

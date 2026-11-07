@@ -236,7 +236,7 @@ impl Stack {
 
     /// Creates the function if needed, deploys `source` as a one-module bundle (made active on
     /// the branch) and enables it, all through the management API.
-    async fn deploy(&self, name: &str, source: &str) {
+    async fn deploy(&self, name: &str, source: &str) -> String {
         let manifest = serde_json::to_string(&json!({
             "compatibilityDate": "2026-10-01",
             "compatibilityFlags": [],
@@ -266,6 +266,19 @@ impl Stack {
             .await;
         assert_eq!(status, 201, "deploy {name}: {body}");
         self.patch(name, json!({ "enabled": true })).await;
+        body["id"].as_str().expect("the deployment's id").to_owned()
+    }
+
+    /// The function as the management API lists it on the branch.
+    async fn listed(&self, name: &str) -> Value {
+        let list = self
+            .mgmt
+            .ok(reqwest::Method::GET, &self.functions(""), None, &[200])
+            .await;
+        list.as_array()
+            .and_then(|fs| fs.iter().find(|f| f["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} isn't listed: {list}"))
     }
 
     async fn call(&self, path: &str, key: bool) -> (u16, String) {
@@ -332,7 +345,13 @@ const HELLO: &str = r#"export default {
 
 async fn flow(s: &Stack) {
     // 1. Deployed and enabled: the branch's public key runs it, with its secret and branch id.
-    s.deploy("hello", &HELLO.replace("VERSION", "v1")).await;
+    let v1 = s.deploy("hello", &HELLO.replace("VERSION", "v1")).await;
+    let listed = s.listed("hello").await;
+    assert_eq!(
+        (&listed["enabled"], &listed["deployment_id"]),
+        (&json!(true), &json!(v1)),
+        "after deploy and enable: {listed}"
+    );
     s.secret("hello", "GREETING", "hi").await;
     let (status, body) = s
         .within("/functions/v1/hello/sub", true, |st, b| {
@@ -350,6 +369,9 @@ async fn flow(s: &Stack) {
 
     // 2. Disabled: 404 within 2 s.
     s.patch("hello", json!({ "enabled": false })).await;
+    let listed = s.listed("hello").await;
+    assert_eq!(listed["enabled"], json!(false), "after disable: {listed}");
+    assert_eq!(listed["deployment_id"], json!(v1), "{listed}");
     let (status, body) = s
         .within("/functions/v1/hello", true, |st, _| st == 404)
         .await;
