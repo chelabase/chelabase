@@ -22,6 +22,8 @@
 
 use std::time::Duration;
 
+pub mod outbound;
+
 pub use reqwest::{IntoUrl, Method, RequestBuilder};
 
 /// A `reqwest` client that never follows a redirect: a 3xx comes back to the caller as the
