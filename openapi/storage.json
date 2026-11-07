@@ -998,7 +998,7 @@
           "storage"
         ],
         "summary": "Upload through a one-time URL",
-        "description": "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters.",
+        "description": "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters, at most 255 bytes.",
         "operationId": "signedUpload",
         "parameters": [
           {
@@ -1061,7 +1061,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters (refused before the URL is spent, so it takes the corrected upload)",
+            "description": "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters, or is over 255 bytes (refused before the URL is spent, so it takes the corrected upload)",
             "content": {
               "application/json": {
                 "schema": {

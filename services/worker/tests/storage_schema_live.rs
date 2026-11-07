@@ -2871,14 +2871,17 @@ async fn storage_urls_child_branch_live() {
 }
 
 /// B3: a Content-Type a browser would read as another type (a comma list) is refused at
-/// every upload: a direct upload, a resumable upload and an upload URL.
+/// every upload: a direct upload, a resumable upload and an upload URL. m18 re-audit B4: so is
+/// one over 255 bytes (its event wouldn't fit the stream), while 255 bytes uploads.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
 async fn storage_urls_content_type_live() {
     with_fx(|fx| Box::pin(async move {
         let fx = &*fx;
         let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
-        for ct in ["text/plain;a=b,text/html", "image/png;x=1, text/html", "text/plain; charset=\"utf-8\""] {
+        let of_len = |n: usize| format!("image/png; x={}", "a".repeat(n - "image/png; x=".len()));
+        let too_long = of_len(storage::names::MAX_CONTENT_TYPE_BYTES + 1);
+        for ct in ["text/plain;a=b,text/html", "image/png;x=1, text/html", "text/plain; charset=\"utf-8\"", too_long.as_str()] {
             let (status, _, b) = object("POST", "/storage/v1/object/files/c.txt", &secret, Some(b"<script>1</script>".to_vec().into()), &[("content-type", ct)]).await;
             assert_eq!(status, 400, "{ct}: {}", json_of(&b));
             assert_eq!(open_upload(&secret, "files", "c.txt", ct, &[]).await.0, 400, "{ct}");
@@ -2887,6 +2890,9 @@ async fn storage_urls_content_type_live() {
             assert_eq!(keyless_with("PUT", &up, b"<script>1</script>".to_vec(), &[("content-type", ct)]).await.0, 400, "{ct}");
         }
         assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        let longest = of_len(storage::names::MAX_CONTENT_TYPE_BYTES);
+        let (status, _, b) = object("POST", "/storage/v1/object/files/long.png", &secret, Some(b"png".to_vec().into()), &[("content-type", longest.as_str())]).await;
+        assert_eq!(status, 200, "255 bytes: {}", json_of(&b));
         // A plain type with a charset still uploads and serves inline as its essence.
         let (status, _, b) = object("POST", "/storage/v1/object/files/ok.txt", &secret, Some(b"ok".to_vec().into()), &[("content-type", "Text/Plain; Charset=UTF-8; x=y")]).await;
         assert_eq!(status, 200, "{}", json_of(&b));
@@ -2896,6 +2902,30 @@ async fn storage_urls_content_type_live() {
         assert_eq!(status, 200);
         assert_eq!(h["content-type"], "text/plain; charset=utf-8");
         assert_eq!(h["content-disposition"], "inline");
+    }))
+    .await;
+}
+
+/// m18 re-audit B4: a bucket the API couldn't have created (a 64-byte name, made with SQL)
+/// takes no object write, so no write's event outgrows the stream's limit: an upload, a
+/// resumable upload, an upload URL and a copy into it are 400 `invalid_request`.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sql_bucket_takes_no_writes_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let long = "b".repeat(chelabase_nats::storage_objects::MAX_BUCKET_BYTES + 1);
+        fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{long}'); COMMIT;")).await;
+        let (status, _, b) = object("POST", &format!("/storage/v1/object/{long}/a.txt"), &secret, Some(b"a".to_vec().into()), &[]).await;
+        assert_eq!((status, json_of(&b)["error"]["code"].clone()), (400, json!("invalid_request")), "{}", json_of(&b));
+        assert_eq!(open_upload(&secret, &long, "a.txt", "text/plain", &[]).await.0, 400);
+        assert_eq!(mint("upload/sign", &format!("{long}/a.txt"), &secret, 60).await.0, 400);
+        let (status, _, b) = object("POST", "/storage/v1/object/files/src.txt", &secret, Some(b"src".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (status, b) = storage("POST", "/storage/v1/object/copy", &secret, Some(json!({ "bucket": "files", "from": "src.txt", "to": "a.txt", "to_bucket": long }))).await;
+        assert_eq!((status, b["error"]["code"].clone()), (400, json!("invalid_request")), "{b}");
+        assert_eq!(fx.value(&format!("SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = '{long}'")).await, "0");
     }))
     .await;
 }

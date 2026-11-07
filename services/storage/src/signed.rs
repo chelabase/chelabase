@@ -631,6 +631,7 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
     json: Result<Json<SignUploadBody>, JsonRejection>,
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
+    crate::buckets::check_object_bucket(&bucket)?;
     check_object_name(&name)?;
     let asked = body(json)?;
     let ttl = ttl_of(asked.expires_in)?;
@@ -683,12 +684,12 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
     operation_id = "signedUpload",
     tag = "storage",
     summary = "Upload through a one-time URL",
-    description = "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters.",
+    description = "No key: the token is the credential, once. Streams the body as an upload by the URL's minter; whether it may replace an existing object is the URL's (`x-upsert` and `?upsert=` are ignored here). `Content-Type` must be one `type/subtype` with unquoted parameters, at most 255 bytes.",
     params(("bucket" = String, Path), ("name" = String, Path), SignedParams),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
-        (status = 400, description = "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters (refused before the URL is spent, so it takes the corrected upload)", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_request`: a `Content-Type` that isn't one `type/subtype` with unquoted parameters, or is over 255 bytes (refused before the URL is spent, so it takes the corrected upload)", body = StorageErrorEnvelope),
         (status = 401, description = "`invalid_token`, `token_expired`", body = StorageErrorEnvelope),
         (status = 403, description = "`token_not_valid`: used already, another object's, its key was revoked or its role changed, or the app user's session ended; `not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`", body = StorageErrorEnvelope),

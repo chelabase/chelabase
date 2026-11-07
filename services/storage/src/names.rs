@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::error::Failure;
 
-/// The longest object name, in bytes of UTF-8.
-pub const MAX_NAME_BYTES: usize = 1024;
+/// The longest object name, in bytes of UTF-8 (the object event's bound, so every accepted
+/// write's event fits the stream).
+pub const MAX_NAME_BYTES: usize = chelabase_nats::storage_objects::MAX_NAME_BYTES;
 
 /// 1 to [`MAX_NAME_BYTES`] bytes, no control character, no leading `/`, no empty segment and
 /// none made only of dots (`.`, `..`, and their full-width `．`): clients normalise those away,
@@ -121,6 +122,10 @@ pub fn inline_safe(content_type: &str) -> bool {
     }
 }
 
+/// The longest `Content-Type` an upload may declare, in bytes (the object event's bound, so
+/// every accepted write's event fits the stream).
+pub const MAX_CONTENT_TYPE_BYTES: usize = chelabase_nats::storage_objects::MAX_CONTENT_TYPE_BYTES;
+
 /// A stored or declared Content-Type under a strict grammar: `type/subtype` then any
 /// `; name=value` parameters, every part an RFC 9110 token (no quoted strings, no `,`, no
 /// whitespace inside a part). Its lower-case essence and its parameters (names lower case),
@@ -167,8 +172,14 @@ pub fn served_content_type(stored: &str) -> String {
     }
 }
 
-/// 400 unless an upload's declared Content-Type parses ([`parse_content_type`]).
+/// 400 unless an upload's declared Content-Type parses ([`parse_content_type`]) and is at most
+/// [`MAX_CONTENT_TYPE_BYTES`].
 pub fn check_content_type(content_type: &str) -> Result<(), Failure> {
+    if content_type.len() > MAX_CONTENT_TYPE_BYTES {
+        return Err(Failure::invalid_request(format!(
+            "Content-Type must be at most {MAX_CONTENT_TYPE_BYTES} bytes"
+        )));
+    }
     match parse_content_type(content_type) {
         Some(_) => Ok(()),
         None => Err(Failure::invalid_request(
@@ -355,6 +366,21 @@ mod tests {
             assert_eq!(served_content_type(good), served, "{good}");
         }
         assert!(parse_content_type("text/plain; charset=utf-8").is_some());
+    }
+
+    /// Re-audit B4 (round 3): an upload's `Content-Type` is at most [`MAX_CONTENT_TYPE_BYTES`]
+    /// (255) bytes, so its event fits the stream; one byte more is 400 `invalid_request`.
+    #[test]
+    fn a_content_type_is_at_most_255_bytes() {
+        assert_eq!(MAX_CONTENT_TYPE_BYTES, 255);
+        let of_len = |n: usize| format!("image/png; x={}", "a".repeat(n - "image/png; x=".len()));
+        assert!(check_content_type(&of_len(MAX_CONTENT_TYPE_BYTES)).is_ok());
+        let long = of_len(MAX_CONTENT_TYPE_BYTES + 1);
+        assert_eq!(long.len(), 256);
+        assert!(parse_content_type(&long).is_some(), "only the length is wrong");
+        let refused = check_content_type(&long).unwrap_err().0;
+        assert_eq!((refused.status.as_u16(), refused.code), (400, "invalid_request"));
+        assert!(check_content_type(&format!("image/png; x={}", "a".repeat(6000))).is_err());
     }
 
     #[test]

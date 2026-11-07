@@ -50,7 +50,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::app::{AppState, identity};
-use crate::buckets::body;
+use crate::buckets::{body, check_object_bucket};
 use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
 use crate::events::ObjectChange;
@@ -624,6 +624,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     request: Body,
 ) -> Result<Response, Failure> {
     let (data, rid, headers) = (data.clone(), rid.to_owned(), headers.clone());
+    check_object_bucket(&bucket)?;
     check_object_name(&name)?;
     let upsert = q.upsert.unwrap_or(false) || header(&headers, "x-upsert") == Some("true");
     let at = state
@@ -986,6 +987,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         names: &[String],
         rid: &str,
     ) -> Result<Vec<String>, Failure> {
+        check_object_bucket(bucket)?;
         for name in names {
             check_object_name(name)?;
         }
@@ -1123,6 +1125,10 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     let r = body(json)?;
+    check_object_bucket(&r.bucket)?;
+    if let Some(to_bucket) = &r.to_bucket {
+        check_object_bucket(to_bucket)?;
+    }
     check_object_name(&r.from)?;
     check_object_name(&r.to)?;
     let at = state
@@ -1197,6 +1203,10 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     let r = body(json)?;
+    check_object_bucket(&r.bucket)?;
+    if let Some(to_bucket) = &r.to_bucket {
+        check_object_bucket(to_bucket)?;
+    }
     check_object_name(&r.from)?;
     check_object_name(&r.to)?;
     let at = state

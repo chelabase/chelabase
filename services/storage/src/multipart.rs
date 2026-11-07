@@ -436,6 +436,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
     Query(q): Query<ObjectParams>,
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
+    crate::buckets::check_object_bucket(&bucket)?;
     check_object_name(&name)?;
     let upsert = q.upsert.unwrap_or(false)
         || headers.get("x-upsert").and_then(|v| v.to_str().ok()) == Some("true");
@@ -693,6 +694,8 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
     let s = state.session(&data, &at, &id, &rid).await?;
+    // The bucket renamed with SQL since the session opened takes no write either.
+    crate::buckets::check_object_bucket(&s.bucket)?;
     state.admit(&s, &rid).await?;
     // A refusal that no retry of this session can change ends it.
     let checked = s

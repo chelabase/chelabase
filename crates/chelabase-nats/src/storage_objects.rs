@@ -26,20 +26,37 @@ const SUBJECT_PREFIX: &str = "chelabase.storage.events";
 /// How long the stream keeps an event: the 24 h retry window plus an hour's margin.
 pub const RETENTION: std::time::Duration = std::time::Duration::from_secs(25 * 3600);
 
+/// The longest object name, in bytes of UTF-8 (the storage service refuses a longer one). JSON
+/// can double it (`"` and `\` are escaped; control characters are refused).
+pub const MAX_NAME_BYTES: usize = 1024;
+
+/// The longest bucket name: `[a-z0-9._-]`, nothing JSON escapes.
+pub const MAX_BUCKET_BYTES: usize = 63;
+
+/// The longest `Content-Type` an upload may declare (the storage service answers 400 above
+/// it). Its grammar is RFC 9110 tokens only, so JSON escapes nothing in it; an event carries a
+/// stored type longer than this (written with SQL) as absent.
+pub const MAX_CONTENT_TYPE_BYTES: usize = 255;
+
+/// The longest `actor.sub` an event carries, counted as JSON writes it (escapes included): the
+/// claim comes from the caller's token, so a longer one is left out rather than cut, since a
+/// cut `sub` would name someone else.
+pub const MAX_SUB_BYTES: usize = 255;
+
+/// A Postgres name's longest (`NAMEDATALEN` − 1): the role and the Postgres database. Such a
+/// name may hold any character but NUL, so JSON can write each byte as six (`\u0001`).
+pub const PG_NAME_BYTES: usize = 63;
+
 /// Events the stream keeps for one database (one subject). Past this, the database's own
 /// oldest events are dropped, pending or not: about 1.1 events a second sustained over
 /// [`RETENTION`] while an endpoint is down. Nothing counts those drops yet; counting them
 /// (e.g. a consumer noticing a gap in its stream sequence) is a follow-up.
 pub const MAX_EVENTS_PER_DATABASE: i64 = 100_000;
 
-/// Events the whole stream keeps: ten databases at their cap.
-pub const MAX_EVENTS: i64 = 10 * MAX_EVENTS_PER_DATABASE;
-
 /// The largest event the stream stores, JSON payload and `Nats-Msg-Id` header together. The
-/// stream refuses a bigger one (`max_message_size`), which storage logs and counts as missed.
-/// A worst-case event made of the bounded fields (a 1024-byte name of `"`, which JSON
-/// doubles, twice in a move) is about 5 KiB; the rest leaves room for a long `sub` or
-/// content type.
+/// stream refuses a bigger one (`max_message_size`). The worst case the field bounds allow (a
+/// [`MAX_NAME_BYTES`] name of `"`, which JSON doubles, twice in a move; every other field at
+/// its bound) is under 6 KiB, so every write the API accepts is stored.
 pub const MAX_EVENT_BYTES: i64 = 6 * 1024;
 
 /// What JetStream's file store keeps for each message beside its payload and headers: the
@@ -51,9 +68,9 @@ pub const STORED_OVERHEAD_BYTES: i64 = 22 + 4 + 8 + (SUBJECT_PREFIX.len() + 1 + 
 pub const DATABASE_BYTES_AT_CAP: i64 =
     (MAX_EVENT_BYTES + STORED_OVERHEAD_BYTES) * MAX_EVENTS_PER_DATABASE;
 
-/// Room left for every other database's traffic while one is fully backed up: the rest of
-/// [`MAX_EVENTS`] at ordinary sizes needs well under a gigabyte, and this also holds about
-/// six more databases backed up with worst-case events.
+/// Room left for every other database's traffic while one is fully backed up: about 6.8
+/// million ordinary events (about 630 bytes stored each), or about six more databases backed
+/// up with worst-case events.
 pub const OTHER_TRAFFIC_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
 /// The stream's byte limit (about 4.6 GiB): one database at its cap plus everyone else's
@@ -61,6 +78,15 @@ pub const OTHER_TRAFFIC_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 /// this much of the NATS server's file store when the stream is created; the disk fills only
 /// as events arrive.
 pub const STREAM_MAX_BYTES: i64 = DATABASE_BYTES_AT_CAP + OTHER_TRAFFIC_BYTES;
+
+/// The smallest event the stream can hold, JSON payload and `Nats-Msg-Id` header together:
+/// one-byte names, nothing optional.
+pub const MIN_EVENT_BYTES: i64 = 380;
+
+/// Events the whole stream keeps: what [`STREAM_MAX_BYTES`] holds of the smallest events
+/// (about 10.4 million), so the count never binds before the bytes and the byte budget is what
+/// every database shares. It costs no disk: JetStream reserves by bytes.
+pub const MAX_EVENTS: i64 = STREAM_MAX_BYTES / (MIN_EVENT_BYTES + STORED_OVERHEAD_BYTES);
 
 /// How long a consumer nobody pulls from lives on (an endpoint deleted while no worker ran).
 pub const CONSUMER_INACTIVE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -150,8 +176,8 @@ pub struct ObjectEvent {
 }
 
 /// The stream: limits retention (each endpoint's consumer reads independently; nothing is
-/// consumed away), [`RETENTION`], bounded in count ([`MAX_EVENTS`]) and bytes
-/// ([`STREAM_MAX_BYTES`]) with the oldest dropped first, each database also bounded on its own
+/// consumed away), [`RETENTION`], bounded in bytes ([`STREAM_MAX_BYTES`]) with the oldest
+/// dropped first (and in count, [`MAX_EVENTS`], which never binds before the bytes), each database also bounded on its own
 /// ([`MAX_EVENTS_PER_DATABASE`]: beyond it that database's oldest events drop, uncounted),
 /// each event bounded ([`MAX_EVENT_BYTES`]), and a duplicate window so a retried publish (same
 /// `Nats-Msg-Id`, the event id) is stored once.
@@ -387,6 +413,12 @@ mod tests {
             "a stream with the old byte limit is updated"
         );
         let mut have = want.clone();
+        have.max_messages = 1_000_000;
+        assert!(
+            drifted(&have, &want),
+            "a stream with the old event count limit is updated"
+        );
+        let mut have = want.clone();
         have.max_message_size = 64 * 1024;
         assert!(
             drifted(&have, &want),
@@ -394,44 +426,117 @@ mod tests {
         );
     }
 
-    /// The stream's bytes hold one database at its cap with worst-case events (a 1024-byte
-    /// name of `"`, which JSON doubles, twice in a move; every other field at its longest)
-    /// and still leave room for every other database's ordinary traffic.
-    #[test]
-    fn one_database_at_its_cap_fits_the_stream_with_room_for_the_rest() {
-        let c = stream_config();
-        let quotes = "\"".repeat(1024);
-        let worst = ObjectEvent {
+    /// The worst-case event, built from the field bounds: a [`MAX_NAME_BYTES`] name of `"`
+    /// (JSON doubles it) twice in a move, [`MAX_BUCKET_BYTES`] buckets, a
+    /// [`MAX_CONTENT_TYPE_BYTES`] type, a `sub` of [`MAX_SUB_BYTES`] as written, Postgres names
+    /// of [`PG_NAME_BYTES`] control characters (six bytes each in JSON), the longest time and
+    /// size. Growing any bound grows this event.
+    fn worst_event() -> ObjectEvent {
+        let quotes = "\"".repeat(MAX_NAME_BYTES);
+        ObjectEvent {
             id: Uuid::max(),
             kind: ObjectEventType::Moved,
             time: DateTime::from_timestamp(253_402_300_799, 999_999_999).unwrap(),
             database_id: Uuid::max(),
             branch_id: Uuid::max(),
-            pg_database: "\"".repeat(63),
-            bucket: "b".repeat(63),
+            pg_database: "\u{1}".repeat(PG_NAME_BYTES),
+            bucket: "b".repeat(MAX_BUCKET_BYTES),
             name: quotes.clone(),
             version_id: Some(Uuid::max()),
             size: Some(i64::MIN),
-            content_type: Some("t".repeat(64)),
+            content_type: Some("t".repeat(MAX_CONTENT_TYPE_BYTES)),
             actor: ObjectActor {
-                role: "\"".repeat(63),
-                sub: Some(Uuid::max().to_string()),
+                role: "\u{1}".repeat(PG_NAME_BYTES),
+                sub: Some("s".repeat(MAX_SUB_BYTES)),
             },
             from: Some(ObjectFrom {
-                bucket: "b".repeat(63),
+                bucket: "b".repeat(MAX_BUCKET_BYTES),
                 name: quotes,
             }),
-        };
-        // The payload and the `Nats-Msg-Id` header block.
-        let header = format!("NATS/1.0\r\nNats-Msg-Id: {}\r\n\r\n", Uuid::max()).len();
-        let worst_bytes = (serde_json::to_vec(&worst).unwrap().len() + header) as i64;
-        let stored = |bytes: i64| bytes + 22 + 4 + 8 + subject(Uuid::max()).len() as i64;
-        assert_eq!(stored(0), STORED_OVERHEAD_BYTES);
-        let at_cap = stored(worst_bytes) * MAX_EVENTS_PER_DATABASE;
+        }
+    }
+
+    /// The smallest event: one-byte names, a delete with nothing optional, a whole-second
+    /// time.
+    fn least_event() -> ObjectEvent {
+        ObjectEvent {
+            id: Uuid::nil(),
+            kind: ObjectEventType::Moved,
+            time: DateTime::from_timestamp(0, 0).unwrap(),
+            database_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            pg_database: "a".into(),
+            bucket: "b".into(),
+            name: "c".into(),
+            version_id: None,
+            size: None,
+            content_type: None,
+            actor: ObjectActor {
+                role: "r".into(),
+                sub: None,
+            },
+            from: None,
+        }
+    }
+
+    /// What the stream counts of `e`: its JSON and the `Nats-Msg-Id` header block.
+    fn wire_bytes(e: &ObjectEvent) -> i64 {
+        let header = format!("NATS/1.0\r\nNats-Msg-Id: {}\r\n\r\n", e.id).len();
+        (serde_json::to_vec(e).unwrap().len() + header) as i64
+    }
+
+    /// Re-audit B4 (round 3): the worst-case event the bounds allow is stored.
+    #[test]
+    fn the_worst_case_event_fits_the_event_size_limit() {
+        let worst = wire_bytes(&worst_event());
+        assert!(
+            worst <= stream_config().max_message_size as i64,
+            "the worst-case event ({worst} B) is stored"
+        );
+    }
+
+    /// Re-audit S2 (round 3): the stream's event count never binds before its bytes, even
+    /// with every event as small as an event can be, so the byte budget is what everyone
+    /// shares.
+    #[test]
+    fn the_event_count_never_binds_before_the_bytes() {
+        let c = stream_config();
+        let least = ObjectEventType::ALL
+            .map(|kind| {
+                wire_bytes(&ObjectEvent {
+                    kind,
+                    ..least_event()
+                })
+            })
+            .into_iter()
+            .min()
+            .unwrap();
+        assert!(MIN_EVENT_BYTES <= least, "the smallest event is {least} B");
+        let stored = least + STORED_OVERHEAD_BYTES;
+        assert!(
+            c.max_messages.saturating_mul(stored) >= c.max_bytes,
+            "{} events of {stored} B fill only {} of {} B",
+            c.max_messages,
+            c.max_messages * stored,
+            c.max_bytes
+        );
+    }
+
+    /// The stream's bytes hold one database at its cap with worst-case events and still leave
+    /// room for every other database's ordinary traffic.
+    #[test]
+    fn one_database_at_its_cap_fits_the_stream_with_room_for_the_rest() {
+        let c = stream_config();
+        let worst = worst_event();
+        let stored =
+            |e: &ObjectEvent| wire_bytes(e) + 22 + 4 + 8 + subject(e.database_id).len() as i64;
+        assert_eq!(stored(&worst) - wire_bytes(&worst), STORED_OVERHEAD_BYTES);
+        let at_cap = stored(&worst) * MAX_EVENTS_PER_DATABASE;
         assert!(at_cap <= DATABASE_BYTES_AT_CAP);
         let ordinary = ObjectEvent {
             name: "avatars/user-1/photo.png".into(),
             pg_database: "app".into(),
+            bucket: "avatars".into(),
             actor: ObjectActor {
                 role: "authenticated".into(),
                 sub: Some(Uuid::max().to_string()),
@@ -439,19 +544,18 @@ mod tests {
             content_type: Some("image/png".into()),
             from: None,
             kind: ObjectEventType::Created,
-            ..worst.clone()
+            ..worst
         };
-        let ordinary_bytes = (serde_json::to_vec(&ordinary).unwrap().len() + header) as i64;
-        let others = stored(ordinary_bytes) * (c.max_messages - MAX_EVENTS_PER_DATABASE);
+        // About 6.8 million ordinary events: over sixty databases' worth at their cap.
+        let others = OTHER_TRAFFIC_BYTES / stored(&ordinary);
         assert!(
-            worst_bytes <= c.max_message_size as i64,
-            "the worst-case event ({worst_bytes} B) is stored"
+            others >= 60 * MAX_EVENTS_PER_DATABASE,
+            "room for {others} ordinary events"
         );
-        assert!(others <= OTHER_TRAFFIC_BYTES);
         assert!(
-            at_cap + others <= c.max_bytes,
-            "one database at its cap ({at_cap} B) plus everyone else's ordinary events \
-             ({others} B) fit in max_bytes ({} B)",
+            at_cap + OTHER_TRAFFIC_BYTES <= c.max_bytes,
+            "one database at its cap ({at_cap} B) plus everyone else's traffic fit in \
+             max_bytes ({} B)",
             c.max_bytes
         );
     }
