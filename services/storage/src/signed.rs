@@ -275,7 +275,7 @@ pub const MAX_REFS: usize = 1000;
 /// A resolve's refs: 0 to [`MAX_REFS`] (else 400).
 pub fn check_refs(count: usize) -> Result<(), Failure> {
     if count > MAX_REFS {
-        return Err(Failure::invalid_request("refs lists at most 1000 objects"));
+        return Err(Failure::invalid_request(format!("refs lists at most {MAX_REFS} objects")));
     }
     Ok(())
 }
@@ -293,7 +293,7 @@ fn capped_refs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ObjectRef>,
             let mut refs = Vec::new();
             while let Some(r) = seq.next_element()? {
                 if refs.len() == MAX_REFS {
-                    return Err(serde::de::Error::custom("refs lists at most 1000 objects"));
+                    return Err(serde::de::Error::custom(format!("refs lists at most {MAX_REFS} objects")));
                 }
                 refs.push(r);
             }
