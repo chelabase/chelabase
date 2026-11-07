@@ -1161,7 +1161,8 @@ pub struct ListObjects {
 }
 
 /// The list statement for a sort column and order (both from fixed lists); the parameters:
-/// bucket, prefix, delimiter (empty: none), search, cursor value, cursor key, limit.
+/// bucket, prefix, delimiter (empty: none), search, cursor value, cursor key, limit. The last
+/// column is a file's object id (m17: Studio's live view keys), NULL for a folder.
 pub fn list_sql(sort_by: &str, desc: bool) -> Option<String> {
     let (value, cast) = match sort_by {
         "name" => ("key", "text"),
@@ -1177,16 +1178,17 @@ pub fn list_sql(sort_by: &str, desc: bool) -> Option<String> {
         "WITH e AS (
   SELECT CASE WHEN $3 <> '' AND strpos(substr(name, length($2) + 1), $3) > 0
               THEN $2 || split_part(substr(name, length($2) + 1), $3, 1) || $3 ELSE name END AS key,
-         name, size, etag, content_type, updated_at
+         name, id, size, etag, content_type, updated_at
   FROM storage.objects
   WHERE bucket_id = $1 AND starts_with(name, $2) AND ($4::text IS NULL OR strpos(lower(name), lower($4)) > 0)
 ), g AS (
   SELECT key, bool_or(key <> name) AS folder, max(size) FILTER (WHERE key = name) AS size,
          max(etag) FILTER (WHERE key = name) AS etag, max(content_type) FILTER (WHERE key = name) AS content_type,
-         max(updated_at) FILTER (WHERE key = name) AS updated_at
+         max(updated_at) FILTER (WHERE key = name) AS updated_at,
+         (array_agg(id) FILTER (WHERE key = name))[1] AS id
   FROM e GROUP BY key
 )
-SELECT key, folder, size, etag, content_type, updated_at, ({value})::text FROM g
+SELECT key, folder, size, etag, content_type, updated_at, ({value})::text, id FROM g
 WHERE $6::text IS NULL OR ({value}, key) {cmp} ($5::text::{cast}, $6)
 ORDER BY {value} {dir}, key {dir} LIMIT $7"
     ))
@@ -1264,6 +1266,7 @@ pub async fn list<S: ConnSource, M: ConnSource>(
                 "name": r.get::<_, String>(0), "folder": r.get::<_, bool>(1), "size": r.get::<_, Option<i64>>(2),
                 "etag": r.get::<_, Option<String>>(3), "content_type": r.get::<_, Option<String>>(4),
                 "updated_at": updated.map(|t| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                "id": r.get::<_, Option<Uuid>>(7),
             })
         })
         .collect();
@@ -1410,6 +1413,15 @@ mod tests {
                 .unwrap()
                 .contains("(key, key) > ($5::text::text, $6)")
         );
+    }
+
+    /// m17: a file's row carries its object id last (Studio's live view keys); a folder's is
+    /// NULL (it is no object).
+    #[test]
+    fn the_list_statement_returns_a_files_id_last() {
+        let sql = list_sql("name", false).unwrap();
+        assert!(sql.contains("(array_agg(id) FILTER (WHERE key = name))[1] AS id"), "{sql}");
+        assert!(sql.contains("({value})::text, id FROM g".replace("{value}", "key").as_str()), "{sql}");
     }
 
     /// m6: no stored object runs script on the API origin: every answer is sandboxed and
