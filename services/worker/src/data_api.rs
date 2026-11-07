@@ -1177,7 +1177,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// The name rules, the check query on `ep`, then the grant.
-    async fn check_and_grant(
+    pub(crate) async fn check_and_grant(
         &self,
         branch: BranchId,
         ep: &str,
