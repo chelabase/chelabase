@@ -2,3 +2,4 @@
 require("./runtime.test.mjs");
 require("./busy-loop.test.mjs");
 require("./start-failure.test.mjs");
+require("./binding.test.mjs");

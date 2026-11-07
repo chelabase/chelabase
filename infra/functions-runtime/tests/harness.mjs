@@ -17,7 +17,7 @@ export const IMAGE = process.env.FUNCTIONS_RUNTIME_IMAGE ?? "chelabase/functions
 export const FIXTURES = new URL("../fixtures/", import.meta.url).pathname;
 export const COMPAT_DATE = "2026-10-01";
 // Names user code must not reach; each resolves to the host running the stub store.
-export const INTERNAL_NAMES = ["functions", "functions-internal", "functions-control", "metadata-db", "nats", "orchestrator"];
+export const INTERNAL_NAMES = ["functions", "functions-internal", "functions-control", "gateway-functions", "metadata-db", "nats", "orchestrator"];
 
 const TYPES = { ".js": "js", ".wasm": "wasm", ".txt": "text", ".bin": "data" };
 
@@ -83,18 +83,20 @@ async function docker(...args) {
   return stdout.trim();
 }
 
-// Starts the runtime pointed at the stub store. Returns its base URL and helpers.
-export async function startRuntime(store, { restart = "no" } = {}) {
+// Starts the runtime pointed at the stub store and, with `gateway` (a port on the host), the
+// gateway binding at that stub as the API host `apiHost`. Returns its base URL and helpers.
+export async function startRuntime(store, { restart = "no", gateway, apiHost = "api.chelabase.test:8000" } = {}) {
   const hosts = INTERNAL_NAMES.flatMap((n) => ["--add-host", `${n}:host-gateway`]);
   const id = await docker(
     "run", "-d", "--restart", restart,
     "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
     "--memory", "512m", "--pids-limit", "256",
-    ...hosts, "-p", "127.0.0.1::8080",
+    ...hosts, "-p", "127.0.0.1::8080", "-e", `CHELABASE_API_HOST=${apiHost}`,
     IMAGE,
-    // The image's command, with the bundle store moved to the stub's port.
+    // The image's command, with the bundle store moved to the stub's port (and the gateway too).
     "/usr/local/bin/workerd", "serve", "--experimental",
     "--external-addr", `bundles=functions:${store.port}`,
+    ...(gateway ? ["--external-addr", `chelabase-api=gateway-functions:${gateway}`] : []),
     "/etc/functions-runtime/config.capnp",
   );
   const hostPort = async () => (await docker("port", id, "8080/tcp")).split("\n")[0].split(":").pop();
