@@ -343,6 +343,28 @@ pub fn check_purge(slug: &str, named: Option<&str>, yes: bool) -> anyhow::Result
     Ok(())
 }
 
+/// A purge that names no stack (`--stack`) takes the current checkout's own, but only when the
+/// registry says that checkout owns it. A stack registered to another checkout (a task worktree
+/// borrowing its epic's, or a slug that collides) is not this one's to purge: the message says
+/// so and the purge is skipped. `None` means go ahead.
+pub fn borrowed_stack_message(
+    slug: &str,
+    named: Option<&str>,
+    here: &Path,
+    entry: Option<&Entry>,
+) -> Option<String> {
+    let entry = entry?;
+    if named.is_some() || entry.checkout == here {
+        return None;
+    }
+    Some(format!(
+        "stack {slug} belongs to another checkout ({}), not {}: not purged \
+         (`just workbench purge --stack {slug}` if you mean it)",
+        entry.checkout.display(),
+        here.display()
+    ))
+}
+
 /// A `docker <args…>` command with every `KEY=VALUE` of the stack's env file set in its
 /// environment, so a variable the calling shell exports can't override the stack's own in
 /// Compose's interpolation (T5 review I5).
@@ -1663,6 +1685,10 @@ pub fn purge(slug: Option<&str>, yes: bool) -> anyhow::Result<()> {
     let here = current_stack()?;
     let (stack, entry) = chosen_stack(&here, slug)?;
     check_purge(&stack.slug, slug, yes)?;
+    if let Some(msg) = borrowed_stack_message(&stack.slug, slug, &here.checkout, entry.as_ref()) {
+        eprintln!("[workbench] {msg}");
+        return Ok(());
+    }
     if entry.is_none() && !stack.state.exists() {
         let known = read_registry(&here.stacks_dir)?;
         bail!(
