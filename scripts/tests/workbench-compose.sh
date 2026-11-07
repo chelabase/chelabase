@@ -86,11 +86,12 @@ done
   fail "runner mounts the state dir read-write at its own path"
 
 # The exceptions: the orchestrator reads the stack's setup code (#126), checked below, and the
-# worker the `storage` identity's two S3 key files for the blob sweep (object-storage m8).
+# worker the `storage` identity's two S3 key files for the blob sweep (object-storage m8) and
+# the `functions` identity's for the bundle sweep (edge-functions m7).
 for s in orchestrator worker gateway auth rest realtime studio; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\"))
     | select(\"$s:\" + .source != \"orchestrator:/m/.chelabase/stacks/feat-x/setup/setup.code\")
-    | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/storage-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
+    | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/(storage|functions)-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
 for s in mailpit identity orchestrator worker gateway auth rest functions; do
@@ -407,18 +408,19 @@ done
 [[ "$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "neon_seaweedfs_data")) | .key] | join(" ")')" == seaweedfs ]] ||
   fail "only seaweedfs mounts its data volume (S3 is reached by URL only)"
 # Edge functions (m4b): the `functions` identity's pair, generated per stack in its state dir
-# (never a fixed value), mounted read-only by seaweedfs and the functions service only.
+# (never a fixed value), mounted read-only by seaweedfs, the functions service and the worker
+# (the bundle sweep, m7) only.
 fn_binds() { # fn_binds <service>: its functions-s3 binds, "target<-source", sorted
   q "[.services[\"$1\"].volumes[]? | select(.type == \"bind\" and (.source | test(\"/functions-s3/\")))
     | \"\\(.target)<-\\(.source)\\(if (.read_only // false) then \"\" else \":rw\" end)\"] | sort | join(\" \")"
 }
 fn_want="/run/chelabase/secrets/functions-s3/access-key<-/m/.chelabase/stacks/feat-x/functions-s3/access-key"
 fn_want+=" /run/chelabase/secrets/functions-s3/secret-key<-/m/.chelabase/stacks/feat-x/functions-s3/secret-key"
-for s in seaweedfs functions; do
+for s in seaweedfs functions worker; do
   [[ "$(fn_binds "$s")" == "$fn_want" ]] || fail "$s mounts the stack's functions S3 pair read-only; got: $(fn_binds "$s")"
 done
 others="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; (.source // "") | test("/functions-s3/"))) | .key] | sort | join(" ")')"
-[[ "$others" == "functions seaweedfs" ]] || fail "only seaweedfs and functions mount the functions S3 keys; got: $others"
+[[ "$others" == "functions seaweedfs worker" ]] || fail "only seaweedfs, functions and the worker mount the functions S3 keys; got: $others"
 ! grep -qE 'chelabase-functions-dev' <<<"$config" || fail "no fixed dev key of the functions identity is in the rendered config"
 [[ "$(q '.configs // {} | keys | join(" ")')" == "" ]] || fail "the overlay holds no fixed-value configs"
 [[ "$(q '.services.functions.command | join(" ")')" == "$(sed -n 's/^CHELABASE_CHECKOUT=//p' "$fixture")/target/debug/functions" ]] ||

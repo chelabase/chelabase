@@ -524,6 +524,10 @@ services:
       - CHELABASE_STORAGE_SWEEP_GRACE_SECS=${CHELABASE_STORAGE_SWEEP_GRACE_SECS:-}
       - CHELABASE_STORAGE_SWEEP_SECS=${CHELABASE_STORAGE_SWEEP_SECS:-}
       - CHELABASE_STORAGE_SWEEP_DRY_RUN=${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
+      # Edge functions m7: the bundle sweep as the `functions` identity, the stack's generated pair.
+      - CHELABASE_FUNCTIONS_S3_BUCKET=chelabase-functions
+      - CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE=/run/chelabase/secrets/functions-s3/access-key
+      - CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE=/run/chelabase/secrets/functions-s3/secret-key
       - CHELABASE_IDENTITY_URL=http://identity:8080
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
       # Edge functions (m4b): its bearer for the functions service's invocations.
@@ -551,6 +555,8 @@ services:
       - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
       - {source: s3-storage-access-key, target: /run/chelabase/secrets/storage-s3/access-key}
       - {source: s3-storage-secret-key, target: /run/chelabase/secrets/storage-s3/secret-key}
+      - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
+      - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
       - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
       - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
     depends_on: !override
