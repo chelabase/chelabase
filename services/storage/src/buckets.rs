@@ -25,7 +25,7 @@ pub fn valid_bucket_name(name: &str) -> bool {
     let b = name.as_bytes();
     let ok = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
     matches!(b.first(), Some(c) if ok(c))
-        && b.len() <= 63
+        && b.len() <= chelabase_nats::storage_objects::MAX_BUCKET_BYTES
         && b.iter().all(|c| ok(c) || matches!(c, b'.' | b'_' | b'-'))
 }
 

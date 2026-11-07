@@ -24,7 +24,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chelabase_auth::internal::DataIdentity;
-use chelabase_nats::storage_objects::{ObjectActor, ObjectEvent, ObjectEventType, ObjectFrom};
+use chelabase_nats::storage_objects::{
+    MAX_CONTENT_TYPE_BYTES, MAX_SUB_BYTES, ObjectActor, ObjectEvent, ObjectEventType, ObjectFrom,
+};
 
 use chelabase_nats::rt::{ACCESS, PROJECT, ProjectEvent};
 use chelabase_nats::{NatsConfig, SUBJECT_STORAGE_EVENTS, StorageEvent};
@@ -112,7 +114,14 @@ pub struct ObjectChange {
     pub from: Option<ObjectFrom>,
 }
 
-/// The event of `change`, made by `data` in `at`, now.
+/// The event of `change`, made by `data` in `at`, now. Every field stays within its bound
+/// (`chelabase_nats::storage_objects`), so the stream stores the event: the API refuses a
+/// longer name, bucket or declared type, and Postgres bounds the role and database names.
+/// The two strings that can still be longer are left out, not cut, since a cut value would
+/// name a different user or type: a `sub` claim past [`MAX_SUB_BYTES`] as JSON writes it (it
+/// comes from the caller's token), and a stored type past [`MAX_CONTENT_TYPE_BYTES`] (one
+/// written with SQL, then copied, moved or deleted through the API). Bucket names come from
+/// the API's grammar; a bucket made with SQL outside it is SQL's change, like any other.
 pub fn event_of(data: &DataIdentity, at: &crate::engine::Located, change: ObjectChange) -> ObjectEvent {
     ObjectEvent {
         id: Uuid::new_v4(),
@@ -125,13 +134,23 @@ pub fn event_of(data: &DataIdentity, at: &crate::engine::Located, change: Object
         name: change.name,
         version_id: change.version_id,
         size: change.size,
-        content_type: change.content_type,
+        content_type: change.content_type.filter(|t| json_len(t) <= MAX_CONTENT_TYPE_BYTES),
         actor: ObjectActor {
             role: data.role.clone(),
-            sub: data.claims.get("sub").and_then(|s| s.as_str()).map(str::to_string),
+            sub: data
+                .claims
+                .get("sub")
+                .and_then(|s| s.as_str())
+                .filter(|s| json_len(s) <= MAX_SUB_BYTES)
+                .map(str::to_string),
         },
         from: change.from,
     }
+}
+
+/// `s`'s bytes as JSON writes it, escapes included, without the quotes.
+fn json_len(s: &str) -> usize {
+    serde_json::to_string(s).map_or(usize::MAX, |j| j.len() - 2)
 }
 
 impl<S: ConnSource, M: ConnSource> AppState<S, M> {
@@ -338,6 +357,61 @@ mod tests {
         let anon = event_of(&data(json!({ "sub": 7 })), &located(), change(ObjectEventType::Deleted));
         assert_eq!(anon.actor.sub, None);
         assert_ne!(anon.id, e.id);
+    }
+
+    /// What the stream stores of `e`: its JSON and the `Nats-Msg-Id` header block.
+    fn wire_bytes(e: &ObjectEvent) -> usize {
+        let header = format!("NATS/1.0\r\nNats-Msg-Id: {}\r\n\r\n", e.id).len();
+        serde_json::to_vec(e).unwrap().len() + header
+    }
+
+    /// Re-audit B4 (round 3): every write the API accepts makes an event the stream stores.
+    /// The audit's case (a 255-byte type, a worst-case name moved, a long `sub`) fits
+    /// `max_message_size`; a `sub` or stored type past its bound is left out, never cut.
+    #[test]
+    fn an_accepted_write_makes_an_event_the_stream_stores() {
+        use chelabase_nats::storage_objects::{MAX_EVENT_BYTES, MAX_SUB_BYTES, PG_NAME_BYTES};
+        use crate::names::{MAX_CONTENT_TYPE_BYTES, MAX_NAME_BYTES, check_content_type, check_object_name};
+        let ct = format!("image/png; x={}", "a".repeat(MAX_CONTENT_TYPE_BYTES - "image/png; x=".len()));
+        check_content_type(&ct).expect("storage accepts the type");
+        let name = "\"".repeat(MAX_NAME_BYTES);
+        check_object_name(&name).expect("storage accepts the name");
+        let worst_change = || ObjectChange {
+            kind: ObjectEventType::Moved,
+            bucket: "b".repeat(63),
+            name: name.clone(),
+            version_id: Some(Uuid::max()),
+            size: Some(i64::MIN),
+            content_type: Some(ct.clone()),
+            from: Some(ObjectFrom { bucket: "b".repeat(63), name: name.clone() }),
+        };
+        let worst_at = crate::engine::Located { database: "\u{1}".repeat(PG_NAME_BYTES), database_id: Uuid::max() };
+        let worst_data = |sub: &str| {
+            let mut d = data(json!({ "sub": sub }));
+            d.role = "\u{1}".repeat(PG_NAME_BYTES);
+            d
+        };
+        for (sub, kept) in [
+            ("a".repeat(MAX_SUB_BYTES), true),
+            ("\"".repeat(MAX_SUB_BYTES / 2), true),
+            ("\"".repeat(MAX_SUB_BYTES), false),
+            ("\u{1}".repeat(MAX_SUB_BYTES), false),
+            ("a".repeat(MAX_SUB_BYTES + 1), false),
+            ("a".repeat(6000), false),
+        ] {
+            let e = event_of(&worst_data(&sub), &worst_at, worst_change());
+            let n = wire_bytes(&e);
+            assert!(n as i64 <= MAX_EVENT_BYTES, "event {n} B > max_message_size {MAX_EVENT_BYTES} B: refused, never delivered");
+            assert_eq!(e.actor.sub.as_deref(), kept.then_some(sub.as_str()), "{} bytes of sub", sub.len());
+            assert_eq!(e.content_type.as_deref(), Some(ct.as_str()));
+        }
+        // A stored type past the bound (written with SQL, then copied, moved or deleted
+        // through the API) is left out.
+        let mut sql_typed = worst_change();
+        sql_typed.content_type = Some(format!("image/png; x={}", "a".repeat(6000)));
+        let e = event_of(&worst_data("u"), &worst_at, sql_typed);
+        assert!(wire_bytes(&e) as i64 <= MAX_EVENT_BYTES);
+        assert_eq!(e.content_type, None);
     }
 
     /// A publish that fails is tried again; one that keeps failing is counted and never

@@ -2871,14 +2871,17 @@ async fn storage_urls_child_branch_live() {
 }
 
 /// B3: a Content-Type a browser would read as another type (a comma list) is refused at
-/// every upload: a direct upload, a resumable upload and an upload URL.
+/// every upload: a direct upload, a resumable upload and an upload URL. m18 re-audit B4: so is
+/// one over 255 bytes (its event wouldn't fit the stream), while 255 bytes uploads.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
 async fn storage_urls_content_type_live() {
     with_fx(|fx| Box::pin(async move {
         let fx = &*fx;
         let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
-        for ct in ["text/plain;a=b,text/html", "image/png;x=1, text/html", "text/plain; charset=\"utf-8\""] {
+        let of_len = |n: usize| format!("image/png; x={}", "a".repeat(n - "image/png; x=".len()));
+        let too_long = of_len(storage::names::MAX_CONTENT_TYPE_BYTES + 1);
+        for ct in ["text/plain;a=b,text/html", "image/png;x=1, text/html", "text/plain; charset=\"utf-8\"", too_long.as_str()] {
             let (status, _, b) = object("POST", "/storage/v1/object/files/c.txt", &secret, Some(b"<script>1</script>".to_vec().into()), &[("content-type", ct)]).await;
             assert_eq!(status, 400, "{ct}: {}", json_of(&b));
             assert_eq!(open_upload(&secret, "files", "c.txt", ct, &[]).await.0, 400, "{ct}");
@@ -2887,6 +2890,9 @@ async fn storage_urls_content_type_live() {
             assert_eq!(keyless_with("PUT", &up, b"<script>1</script>".to_vec(), &[("content-type", ct)]).await.0, 400, "{ct}");
         }
         assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        let longest = of_len(storage::names::MAX_CONTENT_TYPE_BYTES);
+        let (status, _, b) = object("POST", "/storage/v1/object/files/long.png", &secret, Some(b"png".to_vec().into()), &[("content-type", longest.as_str())]).await;
+        assert_eq!(status, 200, "255 bytes: {}", json_of(&b));
         // A plain type with a charset still uploads and serves inline as its essence.
         let (status, _, b) = object("POST", "/storage/v1/object/files/ok.txt", &secret, Some(b"ok".to_vec().into()), &[("content-type", "Text/Plain; Charset=UTF-8; x=y")]).await;
         assert_eq!(status, 200, "{}", json_of(&b));
