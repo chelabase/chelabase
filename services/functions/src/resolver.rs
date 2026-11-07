@@ -184,6 +184,7 @@ mod tests {
                 enabled,
                 secrets: Vec::new(),
                 service_key: None,
+                service: None,
             }))
         }
         async fn record_error(&self, _: Uuid, _: Uuid, _: &str) -> anyhow::Result<()> {
@@ -282,6 +283,7 @@ mod tests {
                 enabled,
                 secrets: Vec::new(),
                 service_key: None,
+                service: None,
             }))
         }
         async fn record_error(&self, _: Uuid, _: Uuid, _: &str) -> anyhow::Result<()> {

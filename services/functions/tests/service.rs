@@ -146,6 +146,7 @@ impl Directory for Fake {
             enabled,
             secrets: vec![("API_KEY".into(), Zeroizing::new("s3cret".into()))],
             service_key: None,
+            service: None,
         }))
     }
     async fn record_error(&self, branch: Uuid, function: Uuid, error: &str) -> anyhow::Result<()> {

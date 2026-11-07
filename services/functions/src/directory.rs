@@ -6,8 +6,9 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use chelabase_http::outbound::Url;
 use chelabase_metadata::{
-    FunctionAuth, FunctionKind, MetadataClient, MetadataError, ResolvedFunction,
+    FunctionAuth, FunctionKind, MetadataClient, MetadataError, ResolvedFunction, ServiceTarget,
 };
 use chelabase_types::{BranchId, DatabaseId};
 use uuid::Uuid;
@@ -27,6 +28,31 @@ pub struct Resolution {
     pub enabled: bool,
     /// `x-chelabase-env`: base64 of the env's JSON object.
     pub env_header: Zeroizing<String>,
+    /// m9: an external service's target; `None` for a function.
+    pub service: Option<External>,
+}
+
+/// m9: where an external service is (`spec = {backend: "external", url, health_path}`) and its
+/// signing secret (wiped on drop; `None` when it has none, and every call answers 503).
+pub struct External {
+    pub deployment_id: Uuid,
+    pub url: Url,
+    pub secret: Option<Zeroizing<String>>,
+}
+
+impl External {
+    /// The external target a resolved service's deployment names, when it is one.
+    pub fn from_spec(deployment_id: Uuid, spec: &serde_json::Value) -> Option<Self> {
+        if spec.get("backend")?.as_str()? != "external" {
+            return None;
+        }
+        let url = Url::parse(spec.get("url")?.as_str()?).ok()?;
+        Some(External {
+            deployment_id,
+            url,
+            secret: None,
+        })
+    }
 }
 
 impl fmt::Debug for Resolution {
@@ -38,6 +64,7 @@ impl fmt::Debug for Resolution {
             .field("auth", &self.auth)
             .field("enabled", &self.enabled)
             .field("env_header", &"<redacted>")
+            .field("service", &self.service.as_ref().map(|e| (e.deployment_id, e.url.as_str())))
             .finish()
     }
 }
@@ -51,6 +78,7 @@ pub struct Parts {
     pub enabled: bool,
     pub secrets: Vec<(String, Zeroizing<String>)>,
     pub service_key: Option<Zeroizing<String>>,
+    pub service: Option<External>,
 }
 
 impl Resolution {
@@ -76,6 +104,7 @@ impl Resolution {
             auth: parts.auth,
             enabled: parts.enabled,
             env_header: Zeroizing::new(STANDARD.encode(&*json)),
+            service: parts.service,
         }
     }
 }
@@ -89,6 +118,14 @@ pub trait Directory: Send + Sync + 'static {
     async fn record_error(&self, branch: Uuid, function: Uuid, error: &str) -> anyhow::Result<()>;
     /// The database exists and isn't deleting or deleted.
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool>;
+    /// m9: the external services' deployments to health-check.
+    async fn service_targets(&self) -> anyhow::Result<Vec<ServiceTarget>> {
+        Ok(Vec::new())
+    }
+    /// m9: records a deployment's health.
+    async fn record_health(&self, _deployment: Uuid, _healthy: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// What [`Metadata`] needs from the metadata database: [`MetadataClient`]'s calls, behind a
@@ -120,6 +157,16 @@ pub trait MetadataPort: Send + Sync + 'static {
         error: Option<&str>,
     ) -> Result<(), MetadataError>;
     async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError>;
+    /// m9: a service's signing secret, opened.
+    async fn service_signing_secret(&self, _function: Uuid) -> Result<Option<String>, MetadataError> {
+        Ok(None)
+    }
+    async fn list_service_targets(&self) -> Result<Vec<ServiceTarget>, MetadataError> {
+        Ok(Vec::new())
+    }
+    async fn set_service_health(&self, _deployment: Uuid, _healthy: bool) -> Result<(), MetadataError> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -159,6 +206,15 @@ impl MetadataPort for MetadataClient {
     async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError> {
         MetadataClient::live_database(self, database).await
     }
+    async fn service_signing_secret(&self, function: Uuid) -> Result<Option<String>, MetadataError> {
+        MetadataClient::service_signing_secret(self, function).await
+    }
+    async fn list_service_targets(&self) -> Result<Vec<ServiceTarget>, MetadataError> {
+        MetadataClient::list_service_targets(self).await
+    }
+    async fn set_service_health(&self, deployment: Uuid, healthy: bool) -> Result<(), MetadataError> {
+        MetadataClient::set_service_health(self, deployment, healthy).await
+    }
 }
 
 /// The metadata database. Its client carries the secrets key (`with_secrets_key`): function
@@ -173,10 +229,32 @@ impl<P: MetadataPort> Directory for Metadata<P> {
         let Some(f) = self.client.resolve(BranchId(branch), name).await? else {
             return Ok(None);
         };
-        let (FunctionKind::Function, Some(sha)) = (f.kind, f.bundle_sha256) else {
+        let Some(database) = self.client.branch_database(BranchId(branch)).await? else {
             return Ok(None);
         };
-        let Some(database) = self.client.branch_database(BranchId(branch)).await? else {
+        if f.kind == FunctionKind::Service {
+            let Some(mut external) = External::from_spec(f.deployment_id, &f.spec) else {
+                return Ok(None);
+            };
+            if f.enabled {
+                external.secret = self
+                    .client
+                    .service_signing_secret(f.function_id)
+                    .await?
+                    .map(Zeroizing::new);
+            }
+            return Ok(Some(Parts {
+                database_id: database.as_uuid(),
+                function_id: f.function_id,
+                bundle_sha256: String::new(),
+                auth: f.auth,
+                enabled: f.enabled,
+                secrets: Vec::new(),
+                service_key: None,
+                service: Some(external),
+            }));
+        }
+        let Some(sha) = f.bundle_sha256 else {
             return Ok(None);
         };
         // A disabled function is never run: its secrets stay sealed.
@@ -204,6 +282,7 @@ impl<P: MetadataPort> Directory for Metadata<P> {
             enabled: f.enabled,
             secrets,
             service_key,
+            service: None,
         }))
     }
 
@@ -217,6 +296,14 @@ impl<P: MetadataPort> Directory for Metadata<P> {
 
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool> {
         Ok(self.client.live_database(DatabaseId(database)).await?)
+    }
+
+    async fn service_targets(&self) -> anyhow::Result<Vec<ServiceTarget>> {
+        Ok(self.client.list_service_targets().await?)
+    }
+
+    async fn record_health(&self, deployment: Uuid, healthy: bool) -> anyhow::Result<()> {
+        Ok(self.client.set_service_health(deployment, healthy).await?)
     }
 }
 
@@ -252,6 +339,7 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), Zeroizing::new(v.to_string())))
                 .collect(),
             service_key: service_key.map(|k| Zeroizing::new(k.to_string())),
+            service: None,
         }
     }
 

@@ -2,8 +2,9 @@
 //!
 //! Public (behind the gateway): `ANY /functions/v1/{name}[/{*rest}]` with the gateway's
 //! identity token (a data key, maybe with a user token), `ANY
-//! /functions/v1/public/{branch_id}/{name}[/{*rest}]` with none, and `GET /health`. Nothing
-//! else, `/internal/*` included.
+//! /functions/v1/public/{branch_id}/{name}[/{*rest}]` with none, `ANY
+//! /services/v1/{name}[/{*rest}]` with a data key (m9, [`crate::services`]) and `GET /health`.
+//! Nothing else, `/internal/*` included.
 //!
 //! Internal, in two sides on two networks (#181, audit S1): the runtime's side serves only
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
@@ -55,6 +56,8 @@ pub struct AppState {
     pub bundles: Bundles,
     pub orchestrator_token: String,
     pub worker_token: String,
+    /// m9: the external services' proxy; `None` answers 503 there.
+    pub services: Option<crate::services::Services>,
     recent_errors: Cache<(Uuid, Uuid), String>,
 }
 
@@ -74,11 +77,18 @@ impl AppState {
             bundles,
             orchestrator_token,
             worker_token,
+            services: None,
             recent_errors: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(LAST_ERROR_QUIET)
                 .build(),
         }
+    }
+
+    /// Serves `/services/v1` through `services`.
+    pub fn with_services(mut self, services: crate::services::Services) -> Self {
+        self.services = Some(services);
+        self
     }
 }
 
@@ -97,6 +107,8 @@ pub fn public_router(state: Shared) -> Router {
         )
         .route("/functions/v1/{name}", any(invoke_key))
         .route("/functions/v1/{name}/{*rest}", any(invoke_key_rest))
+        .route("/services/v1/{name}", any(call_service))
+        .route("/services/v1/{name}/{*rest}", any(call_service_rest))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
         .with_state(state)
 }
@@ -122,7 +134,7 @@ pub fn control_router(state: Shared) -> Router {
         .with_state(state)
 }
 
-fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
+pub(crate) fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     (
         status,
         axum::Json(json!({"error": {"code": code, "message": message}})),
@@ -139,14 +151,14 @@ fn not_found() -> Response<Body> {
 }
 
 /// The request as it came, for an invocation.
-struct Incoming {
-    method: Method,
-    /// What the function sees as its path: `/{name}[/{rest}]`, exactly as the client sent it
-    /// (still percent-encoded, dot segments kept).
-    path: String,
-    headers: HeaderMap,
-    query: Option<String>,
-    body: Body,
+pub(crate) struct Incoming {
+    pub(crate) method: Method,
+    /// What the function sees as its path: `/{name}[/{rest}]` (a service: `[/{rest}]`), exactly
+    /// as the client sent it (still percent-encoded, dot segments kept).
+    pub(crate) path: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) query: Option<String>,
+    pub(crate) body: Body,
 }
 
 /// The request path without its first `skip` segments, exactly as sent: the route's own
@@ -165,6 +177,8 @@ fn raw_tail(path: &str, skip: usize) -> String {
 const KEY_PREFIX: usize = 2;
 /// `/functions/v1/public/{branch_id}/{name}…`: four.
 const PUBLIC_PREFIX: usize = 4;
+/// `/services/v1/{name}…`: three (a service sees only the rest).
+const SERVICE_PREFIX: usize = 3;
 /// `/internal/invoke/{branch_id}/{name}`: three.
 const INTERNAL_PREFIX: usize = 3;
 
@@ -259,23 +273,64 @@ async fn invoke_public_rest(
     .await
 }
 
-/// The branch is the key's, never anything in the request.
-async fn key_form(s: Shared, name: String, req: Incoming) -> Response<Body> {
-    let claims = req
-        .headers
+/// The caller and branch of the gateway's identity token: a data key's.
+fn key_caller(s: &AppState, headers: &HeaderMap) -> Result<(Caller, Uuid), Box<Response<Body>>> {
+    let claims = headers
         .get(IDENTITY_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|token| s.verifier.verify(token, AUDIENCE).ok());
-    let Some((caller, branch)) =
-        claims.and_then(|c| Some((Caller::from_claims(&c)?, c.data?.branch_id)))
-    else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "a data API key is required",
-        );
+    claims
+        .and_then(|c| Some((Caller::from_claims(&c)?, c.data?.branch_id)))
+        .ok_or_else(|| {
+            Box::new(error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "a data API key is required",
+            ))
+        })
+}
+
+/// The branch is the key's, never anything in the request.
+async fn key_form(s: Shared, name: String, req: Incoming) -> Response<Body> {
+    match key_caller(&s, &req.headers) {
+        Ok((caller, branch)) => invoke(&s, branch, &name, Form::Key, caller, req).await,
+        Err(resp) => *resp,
+    }
+}
+
+async fn call_service(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response<Body> {
+    let (caller, branch) = match key_caller(&s, &headers) {
+        Ok(found) => found,
+        Err(resp) => return *resp,
     };
-    invoke(&s, branch, &name, Form::Key, caller, req).await
+    let req = Incoming {
+        method,
+        path: raw_tail(uri.path(), SERVICE_PREFIX),
+        headers,
+        query,
+        body,
+    };
+    crate::services::call(&s, branch, &name, caller, req).await
+}
+
+async fn call_service_rest(
+    State(s): State<Shared>,
+    Path((name, _rest)): Path<(String, String)>,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response<Body> {
+    call_service(State(s), Path(name), uri, RawQuery(query), method, headers, body).await
 }
 
 async fn public_form(s: Shared, branch: String, name: String, req: Incoming) -> Response<Body> {
@@ -317,7 +372,8 @@ async fn invoke(
     req: Incoming,
 ) -> Response<Body> {
     let resolution = match s.resolver.resolve(branch, name).await {
-        Ok(Some(r)) if r.enabled => r,
+        // A service is called on /services/v1 only.
+        Ok(Some(r)) if r.enabled && r.service.is_none() => r,
         Ok(_) => return not_found(),
         Err(e) => {
             tracing::warn!("{e}");
@@ -418,7 +474,7 @@ fn is_scheduled(body: &[u8]) -> bool {
 /// Drops the headers that are ours or the hop's: every `x-chelabase-*` and `chelabase-*` (the
 /// gateway's identity and forwarded headers, a client's forgeries, the runtime's own), the
 /// hop-by-hop ones, and on a request also `host`, `authorization` and `content-length`.
-fn strip(headers: &mut HeaderMap, request: bool) {
+pub(crate) fn strip(headers: &mut HeaderMap, request: bool) {
     let ours = |name: &HeaderName| {
         let n = name.as_str();
         n.starts_with("x-chelabase-")

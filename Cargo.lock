@@ -1175,6 +1175,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
+ "hmac",
  "moka",
  "reqwest",
  "serde",
