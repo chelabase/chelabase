@@ -1156,6 +1156,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-functions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chelabase-auth",
+ "chelabase-http",
+ "chelabase-metadata",
+ "chelabase-nats",
+ "chelabase-secrets",
+ "chelabase-storage",
+ "chelabase-types",
+ "dotenvy",
+ "futures-util",
+ "hex",
+ "moka",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "chelabase-http"
 version = "0.1.0"
 dependencies = [

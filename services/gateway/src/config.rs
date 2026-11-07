@@ -93,6 +93,7 @@ impl GatewayConfig {
         .and_then(|u| u.with_rest(&or("CHELABASE_REST_URL", "http://127.0.0.1:8085")))
         .and_then(|u| u.with_realtime(&or("CHELABASE_REALTIME_URL", "http://127.0.0.1:8087")))
         .and_then(|u| u.with_storage(&or("CHELABASE_STORAGE_URL", "http://127.0.0.1:8089")))
+        .and_then(|u| u.with_functions(&or("CHELABASE_FUNCTIONS_URL", "http://127.0.0.1:8091")))
         .map_err(anyhow::Error::msg)?;
         for (site, var, default, enabled) in sites {
             if enabled {

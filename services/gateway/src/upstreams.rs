@@ -7,7 +7,6 @@ use std::collections::HashMap;
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 const DEFAULT_REALTIME: &str = "127.0.0.1:8087";
 const DEFAULT_STORAGE: &str = "127.0.0.1:8089";
-/// Edge functions m3 declares `Service::Functions`; m4 adds the service and its URL setting.
 const DEFAULT_FUNCTIONS: &str = "127.0.0.1:8091";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +49,12 @@ impl Upstreams {
     /// Where `storage` (object storage) lives.
     pub fn with_storage(mut self, storage_url: &str) -> Result<Self, String> {
         self.storage = authority_from_url(storage_url)?;
+        Ok(self)
+    }
+
+    /// Where `functions` (edge function invocations) lives.
+    pub fn with_functions(mut self, functions_url: &str) -> Result<Self, String> {
+        self.functions = authority_from_url(functions_url)?;
         Ok(self)
     }
 
@@ -168,6 +173,17 @@ mod tests {
         assert_eq!(set.addr(Service::Rest), "127.0.0.1:8085");
         for bad in ["https://realtime:9000", "http://realtime", "http://realtime:9000/x"] {
             assert!(upstreams.clone().with_realtime(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn functions_has_its_own_upstream_checked_like_the_others() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(Service::Functions), "127.0.0.1:8091");
+        let set = upstreams.clone().with_functions("http://functions:8091/").unwrap();
+        assert_eq!(set.addr(Service::Functions), "functions:8091");
+        for bad in ["https://functions:8091", "http://functions", "http://functions:8091/x"] {
+            assert!(upstreams.clone().with_functions(bad).is_err(), "{bad}");
         }
     }
 }
