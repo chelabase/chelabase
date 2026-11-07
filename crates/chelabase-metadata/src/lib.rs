@@ -20,6 +20,7 @@ mod projects;
 mod saved_queries;
 mod schema_bases;
 mod storage_tokens;
+mod storage_webhooks;
 pub mod teams;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
@@ -35,6 +36,10 @@ pub use branches::{
 };
 pub use saved_queries::{
     SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
+};
+pub use storage_webhooks::{
+    DeliveryTarget, NewStorageWebhook, STORAGE_WEBHOOK_ATTEMPTS_KEPT, STORAGE_WEBHOOK_CAP, StorageWebhook,
+    StorageWebhookAttempt, StorageWebhookPatch,
 };
 pub use ddl::DdlTx;
 pub use merges::{
@@ -436,7 +441,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261103000002).
+        // this file when adding one (last: 20261107000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
