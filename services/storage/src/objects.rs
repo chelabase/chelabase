@@ -53,6 +53,8 @@ use crate::app::{AppState, identity};
 use crate::buckets::body;
 use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
+use crate::events::ObjectChange;
+use chelabase_nats::storage_objects::{ObjectEventType, ObjectFrom};
 use crate::limits::{Limits, SNIFF_BYTES, peek, until_idle};
 use crate::names::{self, Staged, check_object_name};
 use crate::openapi::StorageErrorEnvelope;
@@ -182,6 +184,27 @@ pub(crate) struct Row {
 
 const INSERT: &str = "INSERT INTO storage.objects (bucket_id, name, owner, size, content_type, etag, version_id) VALUES ($1, $2, $3, $4, $5, $6, $7)";
 const UPSERT: &str = "INSERT INTO storage.objects (bucket_id, name, owner, size, content_type, etag, version_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (bucket_id, name) DO UPDATE SET owner = EXCLUDED.owner, size = EXCLUDED.size, content_type = EXCLUDED.content_type, etag = EXCLUDED.etag, version_id = EXCLUDED.version_id WHERE storage.objects.version_id IS NOT DISTINCT FROM $8";
+
+/// An upload's event: an upsert that replaced the version the pre-check saw is an update;
+/// anything else wrote a new object (`final_write`'s INSERT).
+pub(crate) fn written_kind(upsert: bool, expected: Option<Uuid>) -> ObjectEventType {
+    if upsert && expected.is_some() { ObjectEventType::Updated } else { ObjectEventType::Created }
+}
+
+impl Row {
+    /// The change this written row made, in `bucket` (by name).
+    pub(crate) fn change(&self, kind: ObjectEventType, bucket: &str) -> ObjectChange {
+        ObjectChange {
+            kind,
+            bucket: bucket.to_owned(),
+            name: self.name.clone(),
+            version_id: Some(self.version),
+            size: self.size,
+            content_type: Some(self.content_type.clone()),
+            from: None,
+        }
+    }
+}
 
 /// The caller's `sub` claim as a uuid (an app user), else no owner.
 pub(crate) fn owner_of(data: &DataIdentity) -> Option<Uuid> {
@@ -585,6 +608,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         state.write(&data, &at, &row, expected, upsert, &rid).await
     })
     .await?;
+    state.emit(&data, &at, row.change(written_kind(upsert, expected), &bucket));
     Ok(Json(json!({
         "bucket": bucket, "name": row.name, "version_id": row.version, "size": row.size, "etag": row.etag,
     }))
@@ -887,13 +911,33 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         let (deleted, _) = self
             .caller(data, &at, rid, async |c, _| {
                 let rows = c
-                    .query("DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name", &[&bucket_id, &names])
+                    .query("DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name, version_id, size, content_type", &[&bucket_id, &names])
                     .await
                     .map_err(|e| deleted_failure(pg(rid)(e)).0)?;
-                Ok(rows.iter().map(|r| r.get(0)).collect::<Vec<String>>())
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get::<_, String>(0), r.get(1), r.get(2), r.get(3)))
+                    .collect::<Vec<(String, Option<Uuid>, Option<i64>, Option<String>)>>())
             })
             .await?;
-        Ok(deleted)
+        let mut names = Vec::with_capacity(deleted.len());
+        for (name, version_id, size, content_type) in deleted {
+            self.emit(
+                data,
+                &at,
+                ObjectChange {
+                    kind: ObjectEventType::Deleted,
+                    bucket: bucket.to_owned(),
+                    name: name.clone(),
+                    version_id,
+                    size,
+                    content_type,
+                    from: None,
+                },
+            );
+            names.push(name);
+        }
+        Ok(names)
     }
 }
 
@@ -1034,6 +1078,7 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
         state.write(&data, &at, &row, expected, false, &rid).await
     })
     .await?;
+    state.emit(&data, &at, row.change(ObjectEventType::Created, to_bucket));
     Ok(
         Json(json!({ "bucket": to_bucket, "name": row.name, "version_id": row.version }))
             .into_response(),
@@ -1137,6 +1182,19 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
         state.unticket(&data, &at, row, &rid).await;
     }
     moved?;
+    state.emit(
+        &data,
+        &at,
+        ObjectChange {
+            kind: ObjectEventType::Moved,
+            bucket: r.to_bucket.clone().unwrap_or_else(|| r.bucket.clone()),
+            name: r.to.clone(),
+            version_id: Some(src.version),
+            size: Some(src.size),
+            content_type: Some(src.content_type.clone()),
+            from: Some(ObjectFrom { bucket: r.bucket.clone(), name: r.from.clone() }),
+        },
+    );
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

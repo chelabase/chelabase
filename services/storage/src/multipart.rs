@@ -759,6 +759,7 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
     })
     .await;
     written?;
+    state.emit(&data, &at, row.change(crate::objects::written_kind(s.upsert, expected), &s.bucket));
     Ok(Json(json!({
         "bucket": s.bucket, "name": row.name, "version_id": row.version, "size": row.size, "etag": row.etag,
     }))
@@ -971,6 +972,7 @@ mod tests {
                 "t",
             ))),
             inflight: crate::limits::InFlight::new(1 << 20),
+            events: crate::events::ObjectEvents::none(),
         };
         let data = identity("authenticated", Some(Uuid::new_v4()), Uuid::new_v4());
         let at = Located {

@@ -36,6 +36,8 @@ pub struct AppState<S, M> {
     pub urls: Urls,
     /// The cap on upload buffers in this process (m7).
     pub inflight: crate::limits::InFlight,
+    /// Object events after each committed write (m18).
+    pub events: Arc<crate::events::ObjectEvents>,
 }
 
 /// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
@@ -152,6 +154,7 @@ mod tests {
             store: Arc::new(chelabase_storage::MemoryStore::default()),
             urls: Urls::new(Arc::new(crate::control::Orchestrator::new("http://127.0.0.1:9", "t"))),
             inflight: crate::limits::InFlight::new(1 << 30),
+            events: crate::events::ObjectEvents::none(),
         };
         let headers = |token: &str| {
             let mut h = HeaderMap::new();
@@ -254,6 +257,7 @@ mod tests {
             store: Arc::new(chelabase_storage::MemoryStore::default()),
             urls: Urls::new(control),
             inflight: crate::limits::InFlight::new(1 << 30),
+            events: crate::events::ObjectEvents::none(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -584,6 +588,7 @@ mod tests {
             store: store.clone(),
             urls: Urls::new(Arc::new(FakeControl::default())),
             inflight: crate::limits::InFlight::new(1 << 20),
+            events: crate::events::ObjectEvents::none(),
         };
         let claims = download_claims(&data(), crate::signed::now() + 60);
         let (datoid, version) = (claims.datoid.unwrap(), claims.version_id.unwrap());

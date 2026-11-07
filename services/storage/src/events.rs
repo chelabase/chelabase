@@ -11,9 +11,20 @@
 //!   budget changed (as a branch event above);
 //! - `chelabase.rt.access.*`: a member's access changed (removed, suspended, a grant): every
 //!   cached key liveness goes, since a console URL lives on its member's access.
+//!
+//! m18: after each object write commits, storage publishes an object event
+//! ([`ObjectEvents::emit`], `chelabase_nats::storage_objects`) on the same connection, in the
+//! background and retried; one that still fails is logged and counted, never failing the
+//! request. Changes made with SQL directly on `storage.objects` publish nothing.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use chelabase_auth::internal::DataIdentity;
+use chelabase_nats::storage_objects::{ObjectActor, ObjectEvent, ObjectEventType, ObjectFrom};
 
 use chelabase_nats::rt::{ACCESS, PROJECT, ProjectEvent};
 use chelabase_nats::{NatsConfig, SUBJECT_STORAGE_EVENTS, StorageEvent};
@@ -68,6 +79,147 @@ pub async fn apply<S: ConnSource, M: ConnSource>(state: &AppState<S, M>, drop: D
     }
 }
 
+/// Where object events go: the stream (through NATS), or a fake in tests.
+pub trait EventSink: Send + Sync + 'static {
+    fn publish<'a>(&'a self, event: &'a ObjectEvent) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// The stream, on storage's latest NATS connection (until there is one every publish fails:
+/// the event is missed and counted).
+#[derive(Default)]
+pub struct NatsSink {
+    js: RwLock<Option<chelabase_nats::JetStreamContext>>,
+}
+
+impl EventSink for NatsSink {
+    fn publish<'a>(&'a self, event: &'a ObjectEvent) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let js = self.js.read().ok().and_then(|js| js.clone()).ok_or("NATS isn't connected")?;
+            chelabase_nats::storage_objects::publish(&js, event).await.map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// What a committed write changed, for its event.
+#[derive(Debug, Clone)]
+pub struct ObjectChange {
+    pub kind: ObjectEventType,
+    pub bucket: String,
+    pub name: String,
+    pub version_id: Option<Uuid>,
+    pub size: Option<i64>,
+    pub content_type: Option<String>,
+    pub from: Option<ObjectFrom>,
+}
+
+/// The event of `change`, made by `data` in `at`, now.
+pub fn event_of(data: &DataIdentity, at: &crate::engine::Located, change: ObjectChange) -> ObjectEvent {
+    ObjectEvent {
+        id: Uuid::new_v4(),
+        kind: change.kind,
+        time: chrono::Utc::now(),
+        database_id: at.database_id,
+        branch_id: data.branch_id,
+        pg_database: at.database.clone(),
+        bucket: change.bucket,
+        name: change.name,
+        version_id: change.version_id,
+        size: change.size,
+        content_type: change.content_type,
+        actor: ObjectActor {
+            role: data.role.clone(),
+            sub: data.claims.get("sub").and_then(|s| s.as_str()).map(str::to_string),
+        },
+        from: change.from,
+    }
+}
+
+impl<S: ConnSource, M: ConnSource> AppState<S, M> {
+    /// Publishes the event of a write that committed (in the background).
+    pub(crate) fn emit(&self, data: &DataIdentity, at: &crate::engine::Located, change: ObjectChange) {
+        self.events.emit(event_of(data, at, change));
+    }
+}
+
+/// Publishes object events after their writes commit (see the module docs).
+pub struct ObjectEvents {
+    sink: Option<Arc<dyn EventSink>>,
+    nats: Option<Arc<NatsSink>>,
+    /// The pauses between tries: one try more than pauses.
+    retries: Vec<Duration>,
+    /// Events that couldn't be published.
+    pub missed: AtomicU64,
+}
+
+impl ObjectEvents {
+    /// Through NATS, once [`spawn`] connects.
+    pub fn nats() -> Arc<Self> {
+        let nats = Arc::new(NatsSink::default());
+        Arc::new(Self {
+            sink: Some(nats.clone()),
+            nats: Some(nats),
+            retries: vec![Duration::from_millis(100), Duration::from_millis(500), Duration::from_secs(2)],
+            missed: AtomicU64::new(0),
+        })
+    }
+
+    /// To `sink`, pausing `retries` between tries.
+    pub fn with_sink(sink: Arc<dyn EventSink>, retries: Vec<Duration>) -> Arc<Self> {
+        Arc::new(Self { sink: Some(sink), nats: None, retries, missed: AtomicU64::new(0) })
+    }
+
+    /// Nowhere (unit tests that don't look at events).
+    pub fn none() -> Arc<Self> {
+        Arc::new(Self { sink: None, nats: None, retries: Vec::new(), missed: AtomicU64::new(0) })
+    }
+
+    fn connected(&self, js: chelabase_nats::JetStreamContext) {
+        if let Some(nats) = &self.nats
+            && let Ok(mut slot) = nats.js.write()
+        {
+            *slot = Some(js);
+        }
+    }
+
+    /// Publishes `event` in the background (the request never waits for it).
+    pub fn emit(self: &Arc<Self>, event: ObjectEvent) {
+        if self.sink.is_none() {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.send(&event).await;
+        });
+    }
+
+    /// Publishes `event`, trying again after each pause; false (logged and counted) when every
+    /// try failed.
+    pub async fn send(&self, event: &ObjectEvent) -> bool {
+        let Some(sink) = &self.sink else {
+            return true;
+        };
+        let mut pauses = self.retries.iter();
+        loop {
+            match sink.publish(event).await {
+                Ok(()) => return true,
+                Err(e) => match pauses.next() {
+                    Some(pause) => tokio::time::sleep(*pause).await,
+                    None => {
+                        let missed = self.missed.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::warn!(
+                            event = %event.id,
+                            database = %event.database_id,
+                            missed_total = missed,
+                            "an object event was not published (no webhook gets it): {e}"
+                        );
+                        return false;
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// How long to wait before connecting again after NATS refused or couldn't be reached.
 const RETRY: Duration = Duration::from_secs(5);
 
@@ -93,6 +245,7 @@ async fn listen<S: ConnSource, M: ConnSource>(
     config: &NatsConfig,
 ) -> anyhow::Result<()> {
     let client = chelabase_nats::connect(config).await?;
+    state.events.connected(chelabase_nats::storage_objects::jetstream(client.clone()));
     let subjects = [
         format!("{PROJECT}.*"),
         format!("{ACCESS}.*"),
@@ -117,6 +270,105 @@ async fn listen<S: ConnSource, M: ConnSource>(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    /// A sink that fails its first `fail` publishes, keeping what it published.
+    struct Flaky {
+        fail: Mutex<usize>,
+        tries: AtomicU64,
+        published: Mutex<Vec<ObjectEvent>>,
+    }
+
+    impl Flaky {
+        fn new(fail: usize) -> Arc<Self> {
+            Arc::new(Self { fail: Mutex::new(fail), tries: AtomicU64::new(0), published: Mutex::new(Vec::new()) })
+        }
+    }
+
+    impl EventSink for Flaky {
+        fn publish<'a>(&'a self, event: &'a ObjectEvent) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.tries.fetch_add(1, Ordering::SeqCst);
+            let mut fail = self.fail.lock().unwrap();
+            let out = if *fail > 0 {
+                *fail -= 1;
+                Err("nats down".to_string())
+            } else {
+                self.published.lock().unwrap().push(event.clone());
+                Ok(())
+            };
+            Box::pin(std::future::ready(out))
+        }
+    }
+
+    fn data(claims: serde_json::Value) -> DataIdentity {
+        serde_json::from_value(json!({
+            "branch_id": Uuid::from_u128(2), "key_id": Uuid::from_u128(3), "kind": "secret",
+            "role": "app_writer", "claims": claims
+        }))
+        .unwrap()
+    }
+
+    fn located() -> crate::engine::Located {
+        crate::engine::Located { database: "app".into(), database_id: Uuid::from_u128(1) }
+    }
+
+    fn change(kind: ObjectEventType) -> ObjectChange {
+        ObjectChange {
+            kind,
+            bucket: "avatars".into(),
+            name: "a.png".into(),
+            version_id: Some(Uuid::from_u128(9)),
+            size: Some(3),
+            content_type: Some("image/png".into()),
+            from: None,
+        }
+    }
+
+    /// An event names its database, branch, Postgres database, object and actor (role and a
+    /// string `sub`, nothing else of the claims).
+    #[test]
+    fn an_event_carries_the_write_and_its_actor() {
+        let e = event_of(&data(json!({ "sub": "user-1", "email": "a@b.c" })), &located(), change(ObjectEventType::Created));
+        assert_eq!((e.database_id, e.branch_id), (Uuid::from_u128(1), Uuid::from_u128(2)));
+        assert_eq!((e.pg_database.as_str(), e.bucket.as_str(), e.name.as_str()), ("app", "avatars", "a.png"));
+        assert_eq!((e.version_id, e.size, e.content_type.as_deref()), (Some(Uuid::from_u128(9)), Some(3), Some("image/png")));
+        assert_eq!(e.actor, ObjectActor { role: "app_writer".into(), sub: Some("user-1".into()) });
+        assert!(!serde_json::to_string(&e).unwrap().contains("a@b.c"));
+        assert!((chrono::Utc::now() - e.time).num_seconds().abs() < 5);
+        let anon = event_of(&data(json!({ "sub": 7 })), &located(), change(ObjectEventType::Deleted));
+        assert_eq!(anon.actor.sub, None);
+        assert_ne!(anon.id, e.id);
+    }
+
+    /// A publish that fails is tried again; one that keeps failing is counted and never
+    /// panics or errors; the next event publishes once NATS is back (AC 6).
+    #[tokio::test]
+    async fn a_failed_publish_is_retried_then_counted_and_later_events_resume() {
+        let sink = Flaky::new(2);
+        let events = ObjectEvents::with_sink(sink.clone(), vec![Duration::ZERO; 3]);
+        let first = event_of(&data(json!({})), &located(), change(ObjectEventType::Created));
+        assert!(events.send(&first).await);
+        assert_eq!(sink.tries.load(Ordering::SeqCst), 3);
+        assert_eq!(*sink.published.lock().unwrap(), std::slice::from_ref(&first));
+        assert_eq!(events.missed.load(Ordering::SeqCst), 0);
+
+        let down = Flaky::new(usize::MAX);
+        let events = ObjectEvents::with_sink(down.clone(), vec![Duration::ZERO; 3]);
+        assert!(!events.send(&first).await);
+        assert_eq!(down.tries.load(Ordering::SeqCst), 4, "one try more than pauses");
+        assert_eq!(events.missed.load(Ordering::SeqCst), 1);
+        *down.fail.lock().unwrap() = 0;
+        let later = event_of(&data(json!({})), &located(), change(ObjectEventType::Updated));
+        assert!(events.send(&later).await);
+        assert_eq!(*down.published.lock().unwrap(), [later]);
+        assert_eq!(events.missed.load(Ordering::SeqCst), 1);
+
+        // Without a connection (NATS never reached), an event is missed and counted.
+        let unconnected = ObjectEvents::nats();
+        let unconnected = ObjectEvents { retries: vec![Duration::ZERO], ..Arc::into_inner(unconnected).unwrap() };
+        assert!(!unconnected.send(&first).await);
+        assert_eq!(unconnected.missed.load(Ordering::SeqCst), 1);
+    }
 
     /// Each subject and event maps to what it drops; anything else drops nothing.
     #[test]
