@@ -31,7 +31,9 @@ const NOTES: &str = r#"export default {
       const token = request.headers.get("chelabase-caller-token");
       if (token) headers["chelabase-user"] = token;
     }
-    const res = await env.CHELABASE.fetch("/data/v1/query", {
+    // A binding takes an absolute URL (as a Cloudflare service binding does); its host is replaced
+    // with the API host, so CHELABASE_URL is just a convenient base.
+    const res = await env.CHELABASE.fetch(new URL("/data/v1/query", env.CHELABASE_URL), {
       method: "POST",
       headers,
       body: JSON.stringify({ v: 1, op: "select", from: "notes", select: ["body"] }),
