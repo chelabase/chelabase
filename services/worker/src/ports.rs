@@ -411,6 +411,14 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         branch: BranchId,
         sealed: &str,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Stores the `chelabase_storage` password (sealed) and its SCRAM salt only when the
+    /// branch has none. A no-op on a deleting, deleted or unknown branch.
+    fn set_storage_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     /// The branch's Postgres databases with their data API state: main first, then by name.
     fn branch_databases(
         &self,
@@ -1151,6 +1159,15 @@ impl WorkerMetadata for MetadataClient {
         sealed: &str,
     ) -> Result<(), MetadataError> {
         MetadataClient::set_authenticator_password(self, branch, sealed).await
+    }
+
+    async fn set_storage_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_storage_password(self, branch, sealed, salt).await
     }
 
     async fn branch_databases(

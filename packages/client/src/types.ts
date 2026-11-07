@@ -1,5 +1,6 @@
 // The type layer: the `Database` shape `chelabase gen types` emits, the runtime type map,
 // and the typed builder interfaces. No runtime code lives here.
+import type { StorageClient } from "./storage.ts";
 
 /** A JSON value (`json` and `jsonb` columns). */
 export type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
@@ -9,6 +10,34 @@ export type Json = string | number | boolean | null | Json[] | { [k: string]: Js
  * `number` by default, `bigint` with `createClient({ bigint: true })`. Never both.
  */
 export type Int8 = { readonly __chelabase: "int8" };
+
+/**
+ * A `storage.object_ref` column's value: an object by its bucket's id and its name. Insert it
+ * as `{ bucket_id, name }`; `client.storage.resolve` turns refs into URLs.
+ */
+export type StorageRef = { bucket_id: string; name: string };
+
+/**
+ * A text column whose comment says `@storage_ref bucket=<B>`: an object's name in bucket `B`.
+ * It is a plain string (written and filtered as one); resolve it as `{ bucket: "<B>", name }`.
+ */
+export type StoragePath<B extends string = string> = string & { readonly __storageBucket?: B };
+
+/**
+ * A column with a foreign key to `storage.objects(id)`: an object's id. It is a plain string;
+ * resolve it as `{ id }`.
+ */
+export type StorageObjectId = string & { readonly __storageObject?: true };
+
+/**
+ * What `client.storage.resolve` takes, each naming an object one way: a `StorageRef`
+ * (`{ bucket_id, name }`), a bucket's name and an object's name (`{ bucket, name }`, for a
+ * `StoragePath`), or an object's id (`{ id }`, for a `StorageObjectId`).
+ */
+export type StorageRefLike =
+  | (StorageRef & { bucket?: never; id?: never })
+  | { bucket: string; name: string; bucket_id?: never; id?: never }
+  | { id: string; bucket_id?: never; bucket?: never; name?: never };
 
 /** The Postgres types whose JSON numbers the client reads from their exact source text. */
 export type PgExact = "int8" | "numeric";
@@ -356,6 +385,12 @@ export interface Auth<DB extends DatabaseShape, S = Session> {
 export interface Client<DB extends DatabaseShape, B extends boolean, S = Session> extends Tx<DB, B> {
   /** App user sign-up, sign-in and session handling. Shared by `database()` siblings. */
   readonly auth: Auth<DB, S>;
+  /**
+   * Storage: buckets and their objects, as this client's key (and app user). Loaded on first
+   * use, so an app that never touches it never bundles it. A `database()` sibling's storage
+   * works on that database.
+   */
+  readonly storage: StorageClient;
   /**
    * Runs the operations in order in one transaction, all or nothing (at most 50), and
    * resolves to each one's result.

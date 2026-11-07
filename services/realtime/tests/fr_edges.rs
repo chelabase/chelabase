@@ -179,6 +179,7 @@ async fn join(inst: &Inst) -> Viewer {
         pg_database: "app".into(),
         schema: "public".into(),
         table: "items".into(),
+        bucket: None,
     };
     let (handle, info) = inst
         .src

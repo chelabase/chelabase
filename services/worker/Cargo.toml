@@ -39,13 +39,20 @@ chelabase-secrets = { workspace = true }
 async-nats = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+# Storage webhooks (m18): their HMAC-SHA256 signatures.
+hmac = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# The storage sweep (object-storage m8): user blobs.
+chelabase-storage = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 worker = { path = ".", features = ["test-support"] }
-chelabase-auth = { workspace = true }
+chelabase-auth = { workspace = true, features = ["keygen"] }
+# The managed pool's login check, asked as `chelabase_storage` in the storage login live test.
+chelabase-pgsession = { workspace = true }
 bollard = { workspace = true }
 tempfile = { workspace = true }
 sqlx = { workspace = true }
@@ -54,3 +61,14 @@ proptest = { workspace = true }
 chelabase-neon = { workspace = true, features = ["fake"] }
 chelabase-identity = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }
+# The storage API live tests: the object store's blobs, and streamed (throttled, failing,
+# stalled) upload bodies.
+chelabase-storage = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+# The storage service in-process (its failure paths, against a real compute): its router, the
+# compute TLS, and an object store that fails on demand.
+chelabase-storage-service = { path = "../storage" }
+chelabase-query = { workspace = true }
+async-trait = { workspace = true }

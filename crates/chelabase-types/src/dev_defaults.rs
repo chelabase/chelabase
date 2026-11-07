@@ -11,7 +11,7 @@ use crate::mode_policy::ModePolicy;
 /// Every public development bearer, by its variable: what a service uses when the variable
 /// (and its `_FILE`) is unset. The values are in this repository, so each is refused outside
 /// an explicit `CHELABASE_DEV_DEFAULTS=1` ([`DevDefaults::check_bearers`]).
-pub const DEV_BEARERS: [(&str, &str); 7] = [
+pub const DEV_BEARERS: [(&str, &str); 8] = [
     ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
     ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
     ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
@@ -19,6 +19,7 @@ pub const DEV_BEARERS: [(&str, &str); 7] = [
     ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
     ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", crate::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
     ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
+    ("CHELABASE_STORAGE_INTERNAL_TOKEN", "chelabase-dev-storage-internal"),
 ];
 
 /// `var`'s development default.

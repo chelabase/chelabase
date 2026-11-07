@@ -11,6 +11,8 @@ pub enum Method {
     Put,
     Patch,
     Delete,
+    /// Only object storage's metadata read (`storage.head_object`).
+    Head,
 }
 
 impl Method {
@@ -21,6 +23,7 @@ impl Method {
             Method::Put => "PUT",
             Method::Patch => "PATCH",
             Method::Delete => "DELETE",
+            Method::Head => "HEAD",
         }
     }
 
@@ -33,6 +36,7 @@ impl Method {
             "PUT" => Some(Method::Put),
             "PATCH" => Some(Method::Patch),
             "DELETE" => Some(Method::Delete),
+            "HEAD" => Some(Method::Head),
             _ => None,
         }
     }
@@ -44,6 +48,8 @@ pub enum Service {
     Auth,
     Rest,
     Realtime,
+    /// Object storage (buckets and objects).
+    Storage,
 }
 
 impl Service {
@@ -54,8 +60,20 @@ impl Service {
             Service::Auth => "auth",
             Service::Rest => "rest",
             Service::Realtime => "realtime",
+            Service::Storage => "storage",
         }
     }
+}
+
+/// How a route's bodies move through the gateway. Neither kind has a body cap at the gateway
+/// (the service enforces its own limits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// The gateway's configured upstream read timeout and the default client idle timeout.
+    Standard,
+    /// A body that may take long to send or answer (object uploads and downloads): long
+    /// upstream read and client idle timeouts.
+    Stream,
 }
 
 /// Which family of hostnames an endpoint is served on.
@@ -113,6 +131,37 @@ pub struct Endpoint {
     /// The route takes a websocket upgrade (a GET). Every other API route answers an
     /// `Upgrade` request with 400 at the gateway.
     pub websocket: bool,
+}
+
+impl Endpoint {
+    /// Every storage route streams ([`Transfer::Stream`]), and Studio's storage routes on the
+    /// orchestrator; every other route is standard.
+    pub const fn transfer(&self) -> Transfer {
+        match self.service {
+            Service::Storage => Transfer::Stream,
+            // m9: Studio's storage routes stream through the orchestrator.
+            Service::Orchestrator if starts_with(self.name, orchestrator::STORAGE_PREFIX) => {
+                Transfer::Stream
+            }
+            _ => Transfer::Standard,
+        }
+    }
+}
+
+/// Whether `s` starts with `prefix` (const).
+const fn starts_with(s: &str, prefix: &str) -> bool {
+    let (s, p) = (s.as_bytes(), prefix.as_bytes());
+    if s.len() < p.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < p.len() {
+        if s[i] != p[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 pub mod orchestrator {
@@ -1036,6 +1085,127 @@ pub mod orchestrator {
         Access::ActAs(Viewer),
     );
 
+    /// m9: Studio's storage on a branch, proxied to the storage service's console listener, as
+    /// an Act-as role or, with no role (or `owner`), in owner mode, which needs Admin on the
+    /// database. Reads, listing and resolve act as a role held at Viewer; writes, a signed URL and a
+    /// resumable upload's steps need the role at Developer. They stream
+    /// ([`super::Transfer::Stream`]).
+    pub const STORAGE_PREFIX: &str = "orchestrator.storage_";
+    const ST_BUCKETS: &str = "/v1/databases/{id}/branches/{branch_id}/storage/bucket";
+    const ST_BUCKET: &str = "/v1/databases/{id}/branches/{branch_id}/storage/bucket/{name}";
+    const ST_OBJECT: &str = "/v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}/{*name}";
+    const ST_SESSION: &str = "/v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}";
+    pub const STORAGE_LIST_BUCKETS: Endpoint =
+        key_endpoint("orchestrator.storage_list_buckets", Method::Get, ST_BUCKETS, Access::ActAs(Viewer));
+    pub const STORAGE_CREATE_BUCKET: Endpoint =
+        key_endpoint("orchestrator.storage_create_bucket", Method::Post, ST_BUCKETS, Access::ActAs(Developer));
+    pub const STORAGE_UPDATE_BUCKET: Endpoint =
+        key_endpoint("orchestrator.storage_update_bucket", Method::Patch, ST_BUCKET, Access::ActAs(Developer));
+    pub const STORAGE_DELETE_BUCKET: Endpoint =
+        key_endpoint("orchestrator.storage_delete_bucket", Method::Delete, ST_BUCKET, Access::ActAs(Developer));
+    pub const STORAGE_LIST_OBJECTS: Endpoint = key_endpoint(
+        "orchestrator.storage_list_objects",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/list/{bucket}",
+        Access::ActAs(Viewer),
+    );
+    pub const STORAGE_DOWNLOAD_OBJECT: Endpoint =
+        key_endpoint("orchestrator.storage_download_object", Method::Get, ST_OBJECT, Access::ActAs(Viewer));
+    pub const STORAGE_UPLOAD_OBJECT: Endpoint =
+        key_endpoint("orchestrator.storage_upload_object", Method::Post, ST_OBJECT, Access::ActAs(Developer));
+    pub const STORAGE_PUT_OBJECT: Endpoint =
+        key_endpoint("orchestrator.storage_put_object", Method::Put, ST_OBJECT, Access::ActAs(Developer));
+    pub const STORAGE_DELETE_OBJECT: Endpoint =
+        key_endpoint("orchestrator.storage_delete_object", Method::Delete, ST_OBJECT, Access::ActAs(Developer));
+    pub const STORAGE_DELETE_OBJECTS: Endpoint = key_endpoint(
+        "orchestrator.storage_delete_objects",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/{bucket}",
+        Access::ActAs(Developer),
+    );
+    pub const STORAGE_COPY_OBJECT: Endpoint = key_endpoint(
+        "orchestrator.storage_copy_object",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/copy",
+        Access::ActAs(Developer),
+    );
+    pub const STORAGE_MOVE_OBJECT: Endpoint = key_endpoint(
+        "orchestrator.storage_move_object",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/move",
+        Access::ActAs(Developer),
+    );
+    /// A download URL that lives at most an hour, while the member holds the role at Developer.
+    pub const STORAGE_SIGN_OBJECT: Endpoint = key_endpoint(
+        "orchestrator.storage_sign_object",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/sign/{bucket}/{*name}",
+        Access::ActAs(Developer),
+    );
+    /// Object refs to URLs, as the role (row level security decides; `null` for what it can't
+    /// read). Its signed URLs live at most an hour, while the member holds the role at Developer.
+    pub const STORAGE_RESOLVE_OBJECTS: Endpoint = key_endpoint(
+        "orchestrator.storage_resolve_objects",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/object/resolve",
+        Access::ActAs(Viewer),
+    );
+    pub const STORAGE_CREATE_UPLOAD: Endpoint = key_endpoint(
+        "orchestrator.storage_create_upload",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/upload/{bucket}/{*name}",
+        Access::ActAs(Developer),
+    );
+    pub const STORAGE_UPLOAD_PART: Endpoint = key_endpoint(
+        "orchestrator.storage_upload_part",
+        Method::Put,
+        "/v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/{part}",
+        Access::ActAs(Developer),
+    );
+    pub const STORAGE_LIST_PARTS: Endpoint =
+        key_endpoint("orchestrator.storage_list_parts", Method::Get, ST_SESSION, Access::ActAs(Developer));
+    pub const STORAGE_COMPLETE_UPLOAD: Endpoint = key_endpoint(
+        "orchestrator.storage_complete_upload",
+        Method::Post,
+        "/v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/complete",
+        Access::ActAs(Developer),
+    );
+    pub const STORAGE_ABORT_UPLOAD: Endpoint =
+        key_endpoint("orchestrator.storage_abort_upload", Method::Delete, ST_SESSION, Access::ActAs(Developer));
+
+    /// m18: a database's webhook endpoints for storage object events (every branch's), and
+    /// their test events, secret rotation and recent attempts: Developer on the database.
+    const WEBHOOKS: &str = "/v1/databases/{id}/storage/webhooks";
+    const WEBHOOK: &str = "/v1/databases/{id}/storage/webhooks/{webhook_id}";
+    pub const LIST_STORAGE_WEBHOOKS: Endpoint =
+        key_endpoint("orchestrator.list_storage_webhooks", Method::Get, WEBHOOKS, Access::Project(Developer));
+    pub const CREATE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.create_storage_webhook", Method::Post, WEBHOOKS, Access::Project(Developer));
+    pub const GET_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.get_storage_webhook", Method::Get, WEBHOOK, Access::Project(Developer));
+    pub const UPDATE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.update_storage_webhook", Method::Patch, WEBHOOK, Access::Project(Developer));
+    pub const DELETE_STORAGE_WEBHOOK: Endpoint =
+        key_endpoint("orchestrator.delete_storage_webhook", Method::Delete, WEBHOOK, Access::Project(Developer));
+    pub const ROTATE_STORAGE_WEBHOOK_SECRET: Endpoint = key_endpoint(
+        "orchestrator.rotate_storage_webhook_secret",
+        Method::Post,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/rotate-secret",
+        Access::Project(Developer),
+    );
+    pub const TEST_STORAGE_WEBHOOK: Endpoint = key_endpoint(
+        "orchestrator.test_storage_webhook",
+        Method::Post,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/test",
+        Access::Project(Developer),
+    );
+    pub const LIST_STORAGE_WEBHOOK_ATTEMPTS: Endpoint = key_endpoint(
+        "orchestrator.list_storage_webhook_attempts",
+        Method::Get,
+        "/v1/databases/{id}/storage/webhooks/{webhook_id}/attempts",
+        Access::Project(Developer),
+    );
+
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
@@ -1228,6 +1398,88 @@ pub mod realtime {
     };
 }
 
+/// Object storage, served by `storage`: any data key; what the caller may do is decided by row
+/// level security on `storage.buckets` and `storage.objects`.
+pub mod storage {
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    const fn data(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method,
+            path,
+            scope: Scope::Api,
+            service: Service::Storage,
+            policy: Policy {
+                auth: Auth::DataKey,
+                cors: Cors::Any,
+                access: Access::DataKey,
+            },
+            websocket: false,
+        }
+    }
+
+    pub const LIST_BUCKETS: Endpoint = data("storage.list_buckets", Method::Get, "/storage/v1/bucket");
+    pub const CREATE_BUCKET: Endpoint = data("storage.create_bucket", Method::Post, "/storage/v1/bucket");
+    pub const UPDATE_BUCKET: Endpoint =
+        data("storage.update_bucket", Method::Patch, "/storage/v1/bucket/{name}");
+    /// Only an empty bucket.
+    pub const DELETE_BUCKET: Endpoint =
+        data("storage.delete_bucket", Method::Delete, "/storage/v1/bucket/{name}");
+
+    const OBJECT: &str = "/storage/v1/object/{bucket}/{*name}";
+    /// A streamed upload (POST, or PUT: the same route).
+    pub const UPLOAD_OBJECT: Endpoint = data("storage.upload_object", Method::Post, OBJECT);
+    pub const PUT_OBJECT: Endpoint = data("storage.put_object", Method::Put, OBJECT);
+    pub const DOWNLOAD_OBJECT: Endpoint = data("storage.download_object", Method::Get, OBJECT);
+    pub const HEAD_OBJECT: Endpoint = data("storage.head_object", Method::Head, OBJECT);
+    pub const DELETE_OBJECT: Endpoint = data("storage.delete_object", Method::Delete, OBJECT);
+    /// Several objects of a bucket, named in the body.
+    pub const DELETE_OBJECTS: Endpoint =
+        data("storage.delete_objects", Method::Delete, "/storage/v1/object/{bucket}");
+    pub const LIST_OBJECTS: Endpoint =
+        data("storage.list_objects", Method::Post, "/storage/v1/object/list/{bucket}");
+    pub const COPY_OBJECT: Endpoint = data("storage.copy_object", Method::Post, "/storage/v1/object/copy");
+    pub const MOVE_OBJECT: Endpoint = data("storage.move_object", Method::Post, "/storage/v1/object/move");
+    /// #102: signed (or public) URLs for `storage.object_ref` values, each checked by row level
+    /// security as the caller.
+    pub const RESOLVE_OBJECTS: Endpoint =
+        data("storage.resolve_objects", Method::Post, "/storage/v1/object/resolve");
+
+    /// m6: no key at the gateway; the URL's token (or a public bucket) is the credential,
+    /// checked by storage.
+    const fn open(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            policy: Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public },
+            ..data(name, method, path)
+        }
+    }
+
+    const SIGNED: &str = "/storage/v1/object/sign/{bucket}/{*name}";
+    const UPLOAD_SIGNED: &str = "/storage/v1/object/upload/sign/{bucket}/{*name}";
+    /// Mints a signed download URL (the caller must be able to read the object).
+    pub const SIGN_OBJECT: Endpoint = data("storage.sign_object", Method::Post, SIGNED);
+    pub const SIGNED_DOWNLOAD: Endpoint = open("storage.signed_download", Method::Get, SIGNED);
+    /// Mints a one-time upload URL.
+    pub const SIGN_UPLOAD: Endpoint = data("storage.sign_upload", Method::Post, UPLOAD_SIGNED);
+    pub const SIGNED_UPLOAD: Endpoint = open("storage.signed_upload", Method::Put, UPLOAD_SIGNED);
+    /// A public bucket's object, on its branch.
+    pub const PUBLIC_DOWNLOAD: Endpoint =
+        open("storage.public_download", Method::Get, "/storage/v1/object/public/{branch}/{bucket}/{*name}");
+
+    /// m7: resumable uploads. A session is opened for a bucket and name, then addressed by its
+    /// id alone (the caller's own: storage answers another's as missing).
+    pub const CREATE_UPLOAD: Endpoint =
+        data("storage.create_upload", Method::Post, "/storage/v1/upload/{bucket}/{*name}");
+    const SESSION: &str = "/storage/v1/upload/session/{session}";
+    pub const UPLOAD_PART: Endpoint =
+        data("storage.upload_part", Method::Put, "/storage/v1/upload/session/{session}/{part}");
+    pub const LIST_PARTS: Endpoint = data("storage.list_parts", Method::Get, SESSION);
+    pub const COMPLETE_UPLOAD: Endpoint =
+        data("storage.complete_upload", Method::Post, "/storage/v1/upload/session/{session}/complete");
+    pub const ABORT_UPLOAD: Endpoint = data("storage.abort_upload", Method::Delete, SESSION);
+}
+
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
@@ -1266,6 +1518,25 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_KEY,
     orchestrator::CONSOLE_QUERY,
     orchestrator::CONSOLE_SCHEMA,
+    orchestrator::STORAGE_LIST_BUCKETS,
+    orchestrator::STORAGE_CREATE_BUCKET,
+    orchestrator::STORAGE_UPDATE_BUCKET,
+    orchestrator::STORAGE_DELETE_BUCKET,
+    orchestrator::STORAGE_LIST_OBJECTS,
+    orchestrator::STORAGE_DOWNLOAD_OBJECT,
+    orchestrator::STORAGE_UPLOAD_OBJECT,
+    orchestrator::STORAGE_PUT_OBJECT,
+    orchestrator::STORAGE_DELETE_OBJECT,
+    orchestrator::STORAGE_DELETE_OBJECTS,
+    orchestrator::STORAGE_COPY_OBJECT,
+    orchestrator::STORAGE_MOVE_OBJECT,
+    orchestrator::STORAGE_SIGN_OBJECT,
+    orchestrator::STORAGE_RESOLVE_OBJECTS,
+    orchestrator::STORAGE_CREATE_UPLOAD,
+    orchestrator::STORAGE_UPLOAD_PART,
+    orchestrator::STORAGE_LIST_PARTS,
+    orchestrator::STORAGE_COMPLETE_UPLOAD,
+    orchestrator::STORAGE_ABORT_UPLOAD,
     orchestrator::CREATE_MERGE,
     orchestrator::LIST_MERGES,
     orchestrator::GET_MERGE,
@@ -1283,6 +1554,14 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::GET_SAVED_QUERY,
     orchestrator::UPDATE_SAVED_QUERY,
     orchestrator::DELETE_SAVED_QUERY,
+    orchestrator::LIST_STORAGE_WEBHOOKS,
+    orchestrator::CREATE_STORAGE_WEBHOOK,
+    orchestrator::GET_STORAGE_WEBHOOK,
+    orchestrator::UPDATE_STORAGE_WEBHOOK,
+    orchestrator::DELETE_STORAGE_WEBHOOK,
+    orchestrator::ROTATE_STORAGE_WEBHOOK_SECRET,
+    orchestrator::TEST_STORAGE_WEBHOOK,
+    orchestrator::LIST_STORAGE_WEBHOOK_ATTEMPTS,
     orchestrator::RUN_SQL,
     orchestrator::CANCEL_SQL_RUN,
     orchestrator::GET_SQL_SCHEMA,
@@ -1385,6 +1664,30 @@ pub const ENDPOINTS: &[Endpoint] = &[
     auth::APP_JWKS,
     realtime::TICKET,
     realtime::SOCKET,
+    storage::LIST_BUCKETS,
+    storage::CREATE_BUCKET,
+    storage::UPDATE_BUCKET,
+    storage::DELETE_BUCKET,
+    storage::UPLOAD_OBJECT,
+    storage::PUT_OBJECT,
+    storage::DOWNLOAD_OBJECT,
+    storage::HEAD_OBJECT,
+    storage::DELETE_OBJECT,
+    storage::DELETE_OBJECTS,
+    storage::LIST_OBJECTS,
+    storage::COPY_OBJECT,
+    storage::MOVE_OBJECT,
+    storage::RESOLVE_OBJECTS,
+    storage::SIGN_OBJECT,
+    storage::SIGNED_DOWNLOAD,
+    storage::SIGN_UPLOAD,
+    storage::SIGNED_UPLOAD,
+    storage::PUBLIC_DOWNLOAD,
+    storage::CREATE_UPLOAD,
+    storage::UPLOAD_PART,
+    storage::LIST_PARTS,
+    storage::COMPLETE_UPLOAD,
+    storage::ABORT_UPLOAD,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1429,12 +1732,22 @@ fn match_in(endpoints: &'static [Endpoint], scope: Scope, method: &str, path: &s
 }
 
 /// If `template` matches `path`, return one flag per segment (`true` = literal
-/// segment), so literal matches compare greater than param matches.
+/// segment), so literal matches compare greater than param matches. A last `{*tail}` segment
+/// takes one or more non-empty segments.
 fn path_specificity(template: &str, path: &str) -> Option<Vec<bool>> {
     let template = template.strip_prefix('/')?;
     let path = path.strip_prefix('/')?;
     let template_segments: Vec<&str> = template.split('/').collect();
-    let path_segments: Vec<&str> = path.split('/').collect();
+    let mut path_segments: Vec<&str> = path.split('/').collect();
+    if let Some(last) = template_segments.last()
+        && last.starts_with("{*")
+    {
+        let fixed = template_segments.len() - 1;
+        if path_segments.len() <= fixed || path_segments[fixed..].iter().any(|p| p.is_empty()) {
+            return None;
+        }
+        path_segments.truncate(template_segments.len());
+    }
     if template_segments.len() != path_segments.len() {
         return None;
     }
@@ -1454,6 +1767,167 @@ fn path_specificity(template: &str, path: &str) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m5 phase B: the object routes; a `{*name}` tail takes one or more segments, and a
+    /// literal segment still wins over it (`list`, `copy`, `move`).
+    #[test]
+    fn object_routes_take_a_multi_segment_name() {
+        for (method, path, name) in [
+            ("POST", "/storage/v1/object/avatars/a.png", "storage.upload_object"),
+            ("PUT", "/storage/v1/object/avatars/u1/2026/a.png", "storage.put_object"),
+            ("GET", "/storage/v1/object/avatars/u1/a.png", "storage.download_object"),
+            ("DELETE", "/storage/v1/object/avatars/u1/a.png", "storage.delete_object"),
+            ("DELETE", "/storage/v1/object/avatars", "storage.delete_objects"),
+            ("POST", "/storage/v1/object/list/avatars", "storage.list_objects"),
+            ("POST", "/storage/v1/object/copy", "storage.copy_object"),
+            ("POST", "/storage/v1/object/move", "storage.move_object"),
+            ("POST", "/storage/v1/object/resolve", "storage.resolve_objects"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!(ep.name, name, "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
+        }
+        for path in ["/storage/v1/object/avatars/", "/storage/v1/object/avatars//a"] {
+            assert_ne!(
+                match_endpoint(Scope::Api, "GET", path),
+                Match::Found(&storage::DOWNLOAD_OBJECT),
+                "{path}"
+            );
+        }
+        // A tail matches only as the last segment of a template.
+        assert_eq!(path_specificity("/a/{*rest}", "/a"), None);
+        assert_eq!(path_specificity("/a/{*rest}", "/a/b/c"), Some(vec![true, false]));
+    }
+
+    /// m6: minting a signed URL takes a data key; serving one (the token is the credential) and
+    /// a public bucket's objects take none. The literal `sign`, `upload` and `public` segments
+    /// win over a bucket of that name (reserved, so never one).
+    #[test]
+    fn storage_url_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        let open = Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public };
+        for (method, path, name, policy) in [
+            ("POST", "/storage/v1/object/sign/avatars/u1/a.png", "storage.sign_object", key),
+            ("GET", "/storage/v1/object/sign/avatars/u1/a.png", "storage.signed_download", open),
+            ("POST", "/storage/v1/object/upload/sign/avatars/a.png", "storage.sign_upload", key),
+            ("PUT", "/storage/v1/object/upload/sign/avatars/a.png", "storage.signed_upload", open),
+            (
+                "GET",
+                "/storage/v1/object/public/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/avatars/a.png",
+                "storage.public_download",
+                open,
+            ),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy), (name, policy), "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
+        }
+        // Nothing else is public on these paths: no HEAD, DELETE or a POST that uploads.
+        for (method, path) in [
+            ("DELETE", "/storage/v1/object/sign/avatars/a.png"),
+            ("POST", "/storage/v1/object/public/b/avatars/a.png"),
+        ] {
+            if let Match::Found(ep) = match_endpoint(Scope::Api, method, path) {
+                assert_ne!(ep.policy.auth, Auth::Public, "{method} {path}");
+            }
+        }
+    }
+
+    /// m7: resumable uploads take a data key and stream; the literal `session` wins over a
+    /// bucket of that name (reserved, so never one), and a part's PUT is its own route.
+    #[test]
+    fn storage_resumable_upload_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        let id = "6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10";
+        for (method, path, name) in [
+            ("POST", "/storage/v1/upload/avatars/u1/big.bin".to_owned(), "storage.create_upload"),
+            ("PUT", format!("/storage/v1/upload/session/{id}/3"), "storage.upload_part"),
+            ("GET", format!("/storage/v1/upload/session/{id}"), "storage.list_parts"),
+            ("POST", format!("/storage/v1/upload/session/{id}/complete"), "storage.complete_upload"),
+            ("DELETE", format!("/storage/v1/upload/session/{id}"), "storage.abort_upload"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy), (name, key), "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
+        }
+    }
+
+    /// m5: the storage service's bucket routes take any data key and stream (long timeouts,
+    /// no body cap); every other route is a standard one.
+    #[test]
+    fn storage_routes_are_data_key_transfer_routes() {
+        for (method, path, name) in [
+            ("GET", "/storage/v1/bucket", "storage.list_buckets"),
+            ("POST", "/storage/v1/bucket", "storage.create_bucket"),
+            ("PATCH", "/storage/v1/bucket/avatars", "storage.update_bucket"),
+            ("DELETE", "/storage/v1/bucket/avatars", "storage.delete_bucket"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!(ep.name, name);
+            assert_eq!(ep.service, Service::Storage);
+            assert_eq!(ep.service.name(), "storage");
+            assert_eq!(
+                ep.policy,
+                Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey }
+            );
+            assert_eq!(ep.transfer(), Transfer::Stream, "{name}");
+            assert!(!ep.websocket);
+        }
+        for ep in ENDPOINTS
+            .iter()
+            .filter(|e| e.service != Service::Storage && !e.name.starts_with(orchestrator::STORAGE_PREFIX))
+        {
+            assert_eq!(ep.transfer(), Transfer::Standard, "{}", ep.name);
+        }
+    }
+
+    /// m9: Studio's storage routes on a branch take a member token and stream (no body cap at
+    /// the gateway, long timeouts). Reads, listing and resolve act as a role held at Viewer; every write,
+    /// a signed URL and a resumable upload's steps need the role at Developer.
+    #[test]
+    fn console_storage_routes() {
+        let base = "/v1/databases/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/branches/7a1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/storage";
+        let viewer = Access::ActAs(PlatformRole::Viewer);
+        let developer = Access::ActAs(PlatformRole::Developer);
+        for (method, tail, name, access) in [
+            ("GET", "/bucket", "orchestrator.storage_list_buckets", viewer),
+            ("POST", "/bucket", "orchestrator.storage_create_bucket", developer),
+            ("PATCH", "/bucket/avatars", "orchestrator.storage_update_bucket", developer),
+            ("DELETE", "/bucket/avatars", "orchestrator.storage_delete_bucket", developer),
+            ("POST", "/object/list/avatars", "orchestrator.storage_list_objects", viewer),
+            ("GET", "/object/avatars/u1/a.png", "orchestrator.storage_download_object", viewer),
+            ("POST", "/object/avatars/u1/a.png", "orchestrator.storage_upload_object", developer),
+            ("PUT", "/object/avatars/u1/a.png", "orchestrator.storage_put_object", developer),
+            ("DELETE", "/object/avatars/u1/a.png", "orchestrator.storage_delete_object", developer),
+            ("DELETE", "/object/avatars", "orchestrator.storage_delete_objects", developer),
+            ("POST", "/object/copy", "orchestrator.storage_copy_object", developer),
+            ("POST", "/object/move", "orchestrator.storage_move_object", developer),
+            ("POST", "/object/sign/avatars/a.png", "orchestrator.storage_sign_object", developer),
+            ("POST", "/object/resolve", "orchestrator.storage_resolve_objects", viewer),
+            ("POST", "/upload/avatars/big.bin", "orchestrator.storage_create_upload", developer),
+            ("PUT", "/upload/session/s1/3", "orchestrator.storage_upload_part", developer),
+            ("GET", "/upload/session/s1", "orchestrator.storage_list_parts", developer),
+            ("POST", "/upload/session/s1/complete", "orchestrator.storage_complete_upload", developer),
+            ("DELETE", "/upload/session/s1", "orchestrator.storage_abort_upload", developer),
+        ] {
+            let path = format!("{base}{tail}");
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!(ep.name, name, "{method} {tail}");
+            assert_eq!(ep.service, Service::Orchestrator);
+            assert_eq!(ep.policy, Policy { auth: Auth::Management, cors: Cors::Studio, access }, "{name}");
+            assert_eq!(ep.transfer(), Transfer::Stream, "{name}");
+        }
+    }
 
     #[test]
     fn api_docs_paths_are_unrouted() {
@@ -1983,6 +2457,35 @@ mod tests {
             ("orchestrator.me", Access::SignedIn),
             // Console.
             ("orchestrator.console_query", Access::ActAs(Viewer)),
+            // m18: storage webhooks, Developer on the database.
+            ("orchestrator.list_storage_webhooks", Access::Project(Developer)),
+            ("orchestrator.create_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.get_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.update_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.delete_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.rotate_storage_webhook_secret", Access::Project(Developer)),
+            ("orchestrator.test_storage_webhook", Access::Project(Developer)),
+            ("orchestrator.list_storage_webhook_attempts", Access::Project(Developer)),
+            // m9: Studio's storage, as an Act-as role.
+            ("orchestrator.storage_list_buckets", Access::ActAs(Viewer)),
+            ("orchestrator.storage_create_bucket", Access::ActAs(Developer)),
+            ("orchestrator.storage_update_bucket", Access::ActAs(Developer)),
+            ("orchestrator.storage_delete_bucket", Access::ActAs(Developer)),
+            ("orchestrator.storage_list_objects", Access::ActAs(Viewer)),
+            ("orchestrator.storage_download_object", Access::ActAs(Viewer)),
+            ("orchestrator.storage_upload_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_put_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_delete_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_delete_objects", Access::ActAs(Developer)),
+            ("orchestrator.storage_copy_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_move_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_sign_object", Access::ActAs(Developer)),
+            ("orchestrator.storage_resolve_objects", Access::ActAs(Viewer)),
+            ("orchestrator.storage_create_upload", Access::ActAs(Developer)),
+            ("orchestrator.storage_upload_part", Access::ActAs(Developer)),
+            ("orchestrator.storage_list_parts", Access::ActAs(Developer)),
+            ("orchestrator.storage_complete_upload", Access::ActAs(Developer)),
+            ("orchestrator.storage_abort_upload", Access::ActAs(Developer)),
             ("orchestrator.console_schema", Access::ActAs(Viewer)),
             // SQL editor (cancel: the starter or Admin, refined in the handler).
             ("orchestrator.run_sql", Access::ActAs(Developer)),
@@ -2129,6 +2632,30 @@ mod tests {
             ("orchestrator.list_project_team_grants", Access::Project(Admin)),
             // Data API.
             ("rest.query", Access::DataKey),
+            ("storage.list_buckets", Access::DataKey),
+            ("storage.create_bucket", Access::DataKey),
+            ("storage.update_bucket", Access::DataKey),
+            ("storage.delete_bucket", Access::DataKey),
+            ("storage.upload_object", Access::DataKey),
+            ("storage.put_object", Access::DataKey),
+            ("storage.download_object", Access::DataKey),
+            ("storage.head_object", Access::DataKey),
+            ("storage.delete_object", Access::DataKey),
+            ("storage.delete_objects", Access::DataKey),
+            ("storage.list_objects", Access::DataKey),
+            ("storage.copy_object", Access::DataKey),
+            ("storage.move_object", Access::DataKey),
+            ("storage.resolve_objects", Access::DataKey),
+            ("storage.sign_object", Access::DataKey),
+            ("storage.signed_download", Access::Public),
+            ("storage.sign_upload", Access::DataKey),
+            ("storage.signed_upload", Access::Public),
+            ("storage.public_download", Access::Public),
+            ("storage.create_upload", Access::DataKey),
+            ("storage.upload_part", Access::DataKey),
+            ("storage.list_parts", Access::DataKey),
+            ("storage.complete_upload", Access::DataKey),
+            ("storage.abort_upload", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.

@@ -1,0 +1,87 @@
+---
+title: Storage
+description: How the storage service stores objects, where their bytes live, how the sweep reclaims them, and who can reach the object store.
+---
+
+Object storage is the `storage` service (`services/storage`) behind the gateway at `/storage/v1`, plus the worker's sweep and webhook delivery. The user guide is [Storage](/using/storage); this page is how it works.
+
+## The pieces
+
+| Piece | Role |
+|---|---|
+| Gateway | Checks the data key (or app-user token) and forwards `/storage/v1/*` with an identity token it mints for `storage`. Signed-URL downloads, one-time upload `PUT`s and public paths are routed with no credential. |
+| `storage` service | The public listener (`CHELABASE_STORAGE_ADDR`, behind the gateway) and the console listener (`CHELABASE_STORAGE_INTERNAL_ADDR`, for the orchestrator only, behind a bearer). Runs metadata statements in the branch's database and streams bytes to and from the object store. |
+| Branch databases | The `storage` schema: `buckets`, `objects`, `upload_tickets`, `upload_sessions`, the policy helpers and the triggers that guard them. Installed and kept current by the worker's data API bootstrap. |
+| Object store | One S3 bucket holding every database's blobs: SeaweedFS's `chelabase-storage` in the self-hosted install, or [Amazon S3](/self-hosting/amazon-s3). |
+| Orchestrator | Studio's storage routes (proxied to the console listener), webhook management, and the control-plane checks signed URLs need. |
+| Worker | The [sweep](#the-sweep) of unreferenced blobs, and [webhook](/using/storage/webhooks) delivery from NATS. |
+
+## A request
+
+An upload, for example:
+
+1. The gateway authenticates the key and forwards the request with its identity token: database, branch, role and claims.
+2. Storage finds the branch's compute through the orchestrator's internal listener (cached; NATS events for settings changes, branch deletes, resets and restores drop the cache at once) and checks the database's `storage` schema is Chelabase's own, at a current version. Otherwise every route answers 503 `storage_unavailable`, so a `storage` schema a user made is never served.
+3. **As the caller:** in one transaction on a role session (`authenticator`, then the key's role and claims), storage reads the bucket and checks the caller's `INSERT` policy, before any byte is stored.
+4. The body streams to the object store at the version's key, counted against the bucket's `file_size_limit` as it arrives, with its type sniffed against `allowed_mime_types`. Upload buffers are capped per process (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`; 503 `busy` past it), and an idle body fails after `CHELABASE_STORAGE_BODY_IDLE_SECS`.
+5. **As storage:** on its own login, storage writes an upload ticket vouching for the new version's bucket, name, size, etag, owner and role.
+6. **As the caller again:** the object row is inserted or upserted. Row-level security decides a second time, and the `protect_objects` trigger lets the row in only by consuming the matching ticket.
+7. After the commit, storage publishes an object event to NATS for webhooks. A failed publish is logged and counted; it never fails the request.
+
+A download reads the row as the caller (row-level security decides), then streams the version from the object store with the [download headers](/using/storage/urls#download-headers). Storage's connections to a branch, both kinds, share the database's `storage_max_connections` budget (Studio's database settings) and the process-wide `CHELABASE_STORAGE_MAX_CONNECTIONS`. Every compute's TLS is verified against the platform CA.
+
+## Blob keys
+
+```
+{database_id}/{datoid}/{version_id}      a version's bytes
+_sweep/{database_id}/…                    the sweep's marks and the timelines it has seen
+_sweep/purge/{database_id}                a deleted database whose blobs are still to go
+```
+
+`database_id` is the Chelabase database, shared by all of its branches; `datoid` is the Postgres database's OID on the branch; `version_id` is new for every upload and copy. A blob is never overwritten: an overwrite writes a new version and repoints the row, and a move changes only the row. That's what lets branches share blobs, signed URLs pin a version, and the sweep decide by reference alone.
+
+## Tickets and the owner
+
+Only storage's login (`chelabase_storage`) can write `storage.upload_tickets`, and a ticket lives five minutes on one Neon timeline. Inserting an object row, or changing its `bucket_id`, `version_id`, `size` or `etag`, consumes a matching ticket, whatever the role: the database owner, a `BYPASSRLS` role or `pg_write_all_data` can't make a row name bytes storage didn't store for that request. A branch copies unconsumed tickets but never its parent's timeline, so they can't be spent there.
+
+Write-once buckets are enforced in the same schema by triggers (`guard_buckets`, `freeze_objects`), so no role is exempt, storage's own included.
+
+## Signed URLs
+
+A token is `v1.{kid}.{payload}.{mac}`: the payload is the claims (database, branch, Postgres database, purpose, bucket, name, version, the minting key, expiry), and the MAC is HMAC-SHA256 under a URL-signing key derived by the orchestrator from the platform secrets key. It's verified in constant time before anything in it is read.
+
+Serving a signed URL also checks, each time, that the minting key is still live (cached up to 5 seconds; a key revocation, a member removal or a key rotation is broadcast over NATS so every replica drops it within a second) and that the signed version is still the row's current version on that branch. A one-time upload token is consumed in the control plane's metadata database, so it's spent once across every replica and restart. The public path reads `buckets.public` through storage's own login, never the caller's role.
+
+## The sweep
+
+The worker sweeps each database every `CHELABASE_STORAGE_SWEEP_SECS` (6 hours), and after a branch delete, reset or restore. A pass:
+
+1. reads the object store's own clock, from a probe object, and checks it against every compute's clock;
+2. reads every live branch's references (every Postgres database, `storage.objects` and `storage.upload_tickets`), backups included. A branch that isn't ready, has a reset or restore in flight, or can't be read stops the pass: it fails closed and deletes nothing;
+3. lists the blobs, marks and open multipart uploads, then reads the branches again. A branch made, reset or restored meanwhile stops the pass;
+4. marks each blob nobody references that's older than the grace period, and deletes it only once its mark is older than the grace period plus the longest history a branch can be restored from.
+
+The grace period (`CHELABASE_STORAGE_SWEEP_GRACE_SECS`) is at least 8 days: longer than the longest signed URL (7 days) plus a day, longer than Neon's default history, and far longer than any upload. Marks matter because a restore or a branch at a past point can bring back rows a pass never saw. The sweep records the timelines it has seen; a timeline it hasn't voids the marks made after its branch point (all of them for a restore, which detaches its timeline). So a database restored more often than the wait never reclaims anything, and that's logged.
+
+A deleted database first writes its purge marker, then its delete removes every blob, upload and mark under its prefix; the periodic pass retries any purge still pending. `CHELABASE_STORAGE_SWEEP_DRY_RUN=true` counts what it would delete and deletes nothing.
+
+## The credential barrier
+
+The object store holds every database's files, so as few things as possible can reach it:
+
+- **Two identities, two buckets.** Neon's pageservers and safekeepers use identity `neon`, which may use only bucket `neon`; storage and the worker use identity `storage`, which may use only `chelabase-storage`. There's no admin identity, and SeaweedFS's master, volume and filer ports listen on loopback only (`just storage-iam-e2e` checks it live).
+- **Only storage and the worker hold the `storage` keys**, as key files (re-read every five minutes, so rotating them needs no restart), never in environment values or command lines.
+- **Computes never see an S3 credential**, and the object store's endpoint is never exposed. There are no S3 presigned URLs: signed and public URLs are served by storage through the gateway.
+- **Storage's database login** bypasses row-level security but has rights only on the `storage` schema, runs only storage's fixed statements, and is locked down by the worker on every bootstrap: a compromise of the storage service can't read your other tables.
+- **The console listener** takes requests only with the orchestrator's bearer (`CHELABASE_STORAGE_INTERNAL_TOKEN`), after the orchestrator has checked the member's access; owner mode needs Admin.
+
+## Webhooks
+
+Storage publishes each committed change to the NATS JetStream stream `CHELABASE_STORAGE_EVENTS` (subject `chelabase.storage.events.<database_id>`), with each database capped at 100,000 pending events. The worker consumes it with durable per-endpoint state, signs each delivery with the endpoint's secret (sealed in the metadata database under its own purpose), and sends it through an outbound client that refuses non-public addresses at connect time. See [Webhooks](/using/storage/webhooks).
+
+## Tests
+
+- `cargo nextest run -p chelabase-storage-service` and `-p chelabase-storage` (with a conformance suite every backend passes);
+- the live tests in `services/worker/tests/storage_schema_live.rs` and `storage_sweep_live.rs`;
+- `just storage-e2e`: the whole story through the gateway, from a policy to the sweep's purge; `just storage-e2e --backend s3` runs it again with storage and the worker switched to backend `s3` on a second S3 endpoint, changing only their environment;
+- `just storage-iam-e2e`: the bucket boundary between the two identities.

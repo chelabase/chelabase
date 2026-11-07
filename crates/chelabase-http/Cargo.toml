@@ -7,6 +7,8 @@ description = "The one reqwest client builder services and tools use: it never f
 
 [dependencies]
 reqwest = { workspace = true }
+# `outbound`: the system resolver its guarded client checks (m18 webhooks).
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

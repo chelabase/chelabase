@@ -32,11 +32,11 @@ mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrat
 for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verify.pem auth/cookie.key \
   auth/app-jwt.key auth/app-jwt.pub neon/compute-jwt.pem neon/compute-jwt.pub compute-ca/ca.crt \
   compute-ca/ca.key orchestrator-tls/v1/client.crt orchestrator-tls/v1/client.key orchestrator-tls/v1/ca.crt \
-  nats/orchestrator.password nats/worker.password nats/realtime.password nats/runner.password \
+  nats/orchestrator.password nats/worker.password nats/realtime.password nats/runner.password nats/storage.password \
   valkey/proxy.password valkey/control.password valkey/realtime.password valkey/runner.password valkey/health.password \
   realtime/pg.password realtime/ticket.key realtime/internal.token \
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token \
-  tokens/proxy-api.token tokens/storcon-hook.token \
+  tokens/storage-internal.token tokens/proxy-api.token tokens/storcon-hook.token \
   auth/member-jwt.key auth/member-jwt.pub identity/secret identity/db.password \
   tokens/auth-identity.token tokens/orchestrator-identity.token tokens/worker-identity.token \
   tokens/bootstrap-identity.token \
@@ -74,14 +74,14 @@ readable=(secrets/secrets.key gateway/internal-verify.pem neon/compute-jwt.pem n
   orchestrator-tls/current/client.crt orchestrator-tls/current/client.key orchestrator-tls/current/ca.crt
   nats/orchestrator.password valkey/control.password realtime/internal.token
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token
-  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub
+  tokens/storage-internal.token tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub
   stacks/x/setup/setup.code)
 expected="$(printf '%s\n' "$keys/secrets/secrets.key" "$keys/gateway/internal-verify.pem" \
   "$keys/neon/compute-jwt.pem" "$keys/neon/compute-jwt.pub" "$keys/orchestrator-tls/current" \
   "$keys/orchestrator-tls/v1/client.crt" "$keys/orchestrator-tls/v1/client.key" "$keys/orchestrator-tls/v1/ca.crt" \
   "$keys/nats/orchestrator.password" "$keys/valkey/control.password" "$keys/realtime/internal.token" \
   "$keys/tokens/rest-internal.token" "$keys/tokens/data-keys.token" "$keys/tokens/app-auth.token" \
-  "$keys/tokens/app-sessions.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
+  "$keys/tokens/app-sessions.token" "$keys/tokens/storage-internal.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
   "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" "$state/setup/setup.code" | sort)"
 
 script='set -e

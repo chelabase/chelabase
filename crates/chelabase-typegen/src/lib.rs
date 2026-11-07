@@ -118,6 +118,24 @@ struct Column {
     generated: bool,
     #[serde(rename = "enum")]
     enum_ref: Option<String>,
+    /// How the column references a stored object (newer servers only).
+    #[serde(default)]
+    storage_ref: Option<StorageRefHint>,
+}
+
+/// A column's `storage_ref`: `ref` (a `storage.object_ref`), `id` (a foreign key to
+/// `storage.objects(id)`) or `path` (a text column naming an object in `bucket`). A kind this
+/// generator doesn't know is typed as the column's own type.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StorageRefHint {
+    Ref,
+    Id,
+    Path {
+        bucket: String,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,9 +218,37 @@ struct Ctx<'a> {
     schema: &'a Schema,
     uses_int8: bool,
     uses_json: bool,
+    uses: StorageUses,
+}
+
+/// Which storage types a module uses (each imported only then).
+#[derive(Default, Clone, Copy)]
+struct StorageUses {
+    object_id: bool,
+    path: bool,
+    r#ref: bool,
 }
 
 impl Ctx<'_> {
+    /// The TS type of a column's stored-object reference (no array, no null), if it has one.
+    fn storage(&mut self, hint: Option<&StorageRefHint>) -> Option<String> {
+        match hint? {
+            StorageRefHint::Ref => {
+                self.uses.r#ref = true;
+                Some("StorageRef".into())
+            }
+            StorageRefHint::Id => {
+                self.uses.object_id = true;
+                Some("StorageObjectId".into())
+            }
+            StorageRefHint::Path { bucket } => {
+                self.uses.path = true;
+                Some(format!("StoragePath<{}>", quote(bucket)))
+            }
+            StorageRefHint::Unknown => None,
+        }
+    }
+
     /// The TS type of a base type (no array, no null).
     fn scalar(&mut self, ty: &str, enum_labels: Option<&[String]>) -> String {
         if let Some(labels) = enum_labels {
@@ -265,8 +311,14 @@ impl Ctx<'_> {
     }
 
     fn column(&mut self, c: &Column) -> String {
-        let labels = self.column_enum(c).map(<[String]>::to_vec);
-        let t = self.typed(&c.ty, c.array, labels.as_deref());
+        let t = match self.storage(c.storage_ref.as_ref()) {
+            Some(base) if c.array => format!("{base}[]"),
+            Some(base) => base,
+            None => {
+                let labels = self.column_enum(c).map(<[String]>::to_vec);
+                self.typed(&c.ty, c.array, labels.as_deref())
+            }
+        };
         if c.nullable { format!("{t} | null") } else { t }
     }
 
@@ -464,6 +516,7 @@ struct Rendered {
     version: String,
     uses_int8: bool,
     uses_json: bool,
+    uses: StorageUses,
 }
 
 impl Rendered {
@@ -497,6 +550,15 @@ fn header(parts: &[&Rendered], versions: &str) -> String {
     }
     if parts.iter().any(|r| r.uses_json) {
         imports.push("Json");
+    }
+    for (name, used) in [
+        ("StorageObjectId", parts.iter().any(|r| r.uses.object_id)),
+        ("StoragePath", parts.iter().any(|r| r.uses.path)),
+        ("StorageRef", parts.iter().any(|r| r.uses.r#ref)),
+    ] {
+        if used {
+            imports.push(name);
+        }
     }
     imports.push("TypeMap");
     format!(
@@ -605,6 +667,7 @@ fn render_one(schema: &Schema) -> Result<Rendered> {
         schema,
         uses_int8: false,
         uses_json: false,
+        uses: StorageUses::default(),
     };
 
     let mut db = String::new();
@@ -724,6 +787,7 @@ fn render_one(schema: &Schema) -> Result<Rendered> {
         version: schema.version.clone(),
         uses_int8: cx.uses_int8,
         uses_json: cx.uses_json,
+        uses: cx.uses,
     })
 }
 
@@ -1046,6 +1110,79 @@ mod tests {
             runtime.contains(r#"["__proto__"]: { returns: "int8" },"#),
             "{runtime}"
         );
+    }
+
+    /// #102 AC 1: the schema's `storage_ref` types a column: `ref` (a `storage.object_ref`) is a
+    /// `StorageRef`, `path` (a text column's `@storage_ref bucket=`) a `StoragePath<bucket>`,
+    /// `id` (a foreign key to `storage.objects(id)`) a `StorageObjectId`; `| null` when
+    /// nullable, arrays of them when arrays. A type merely named `object_ref` (no
+    /// `storage_ref`) is not a ref. The module imports only what it uses, and the runtime map
+    /// doesn't list them.
+    #[test]
+    fn storage_ref_columns_are_typed() {
+        let with = |ty: &str, hint: &str, nullable: bool, array: bool| {
+            let mut c: serde_json::Value = serde_json::from_str(&col(ty)).unwrap();
+            c["nullable"] = nullable.into();
+            c["array"] = array.into();
+            if !hint.is_empty() {
+                c["storage_ref"] = serde_json::from_str(hint).unwrap();
+            }
+            c.to_string()
+        };
+        let json = tiny(
+            "v1",
+            "public",
+            &format!(
+                r#"{{"profiles":{{"columns":{{"avatar":{},"banner":{},"gallery":{},"lookalike":{},"path":{},"paths":{},"photo":{}}}}}}}"#,
+                with("object_ref", r#"{"kind":"ref"}"#, true, false),
+                with("object_ref", r#"{"kind":"ref"}"#, false, false),
+                with("object_ref", r#"{"kind":"ref"}"#, false, true),
+                with("object_ref", "", false, false),
+                with(
+                    "text",
+                    r#"{"kind":"path","bucket":"ava\"tars"}"#,
+                    true,
+                    false
+                ),
+                with("text", r#"{"kind":"path","bucket":"docs"}"#, false, true),
+                with("uuid", r#"{"kind":"id"}"#, false, false),
+            ),
+            "{}",
+        );
+        let out = generate(&serde_json::from_str(&json).unwrap()).unwrap();
+        assert!(
+            out.contains("import type { StorageObjectId, StoragePath, StorageRef, TypeMap } from \"@chelabase/client\";"),
+            "{out}"
+        );
+        let row = &out[out.find("Row: {").unwrap()..out.find("Insert: {").unwrap()];
+        for line in [
+            "avatar: StorageRef | null;",
+            "banner: StorageRef;",
+            "gallery: StorageRef[];",
+            "lookalike: string;",
+            r#"path: StoragePath<"ava\"tars"> | null;"#,
+            r#"paths: StoragePath<"docs">[];"#,
+            "photo: StorageObjectId;",
+        ] {
+            assert!(row.contains(line), "{line}\n{row}");
+        }
+        let insert = &out[out.find("Insert: {").unwrap()..out.find("Update: {").unwrap()];
+        assert!(insert.contains("avatar?: StorageRef | null;"), "{insert}");
+        assert!(insert.contains("banner: StorageRef;"), "{insert}");
+        assert!(
+            out.contains("profiles: {},"),
+            "not in the runtime map: {out}"
+        );
+        // Only what is used is imported; a type named object_ref alone imports nothing.
+        let lookalike = tiny(
+            "v1",
+            "public",
+            &format!(r#"{{"t":{{"columns":{{"c":{}}}}}}}"#, col("object_ref")),
+            "{}",
+        );
+        let lookalike = generate(&serde_json::from_str(&lookalike).unwrap()).unwrap();
+        assert!(!lookalike.contains("Storage"), "{lookalike}");
+        assert!(lookalike.contains("c: string;"), "{lookalike}");
     }
 
     /// A schema name with a dot can't be addressed (names are "schema.name"): refused.

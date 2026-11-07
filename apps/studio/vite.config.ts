@@ -58,7 +58,13 @@ export default defineConfig(({ mode }) => {
     // The pgls worker (src/lib/pgls) is an ES module worker; its package loads pgls.wasm via
     // `new URL(..., import.meta.url)`, which pre-bundling would break.
     worker: { format: "es" },
-    optimizeDeps: { exclude: ["@postgres-language-server/wasm"] },
+    //
+    // The workspace packages are source (`main` is a .ts file): excluded, so Vite serves and
+    // watches them as app modules instead of freezing a pre-bundled copy that misses exports a
+    // merge adds until the dev server restarts.
+    optimizeDeps: {
+      exclude: ["@postgres-language-server/wasm", "@chelabase/management-client", "@chelabase/design"],
+    },
     server: {
       // Bound to loopback on 3000 (or CHELABASE_STUDIO_PORT): only the gateway reaches it, at
       // Studio's host. Never drift to another port. Inside a workbench stack the gateway is

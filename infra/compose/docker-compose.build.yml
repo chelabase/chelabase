@@ -39,6 +39,9 @@ services:
   realtime:
     <<: *server
     command: ["realtime"]
+  storage:
+    <<: *server
+    command: ["storage"]
   studio:
     image: chelabase/studio:local
     pull_policy: build

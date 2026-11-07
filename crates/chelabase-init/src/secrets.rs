@@ -192,6 +192,7 @@ pub const LAYOUT: &[Entry] = &[
     e("nats/worker.password", M, Gen::Text32, P),
     e("nats/realtime.password", M, Gen::Text32, P),
     e("nats/runner.password", M, Gen::Text32, P),
+    e("nats/storage.password", M, Gen::Text32, P),
     e("valkey/proxy.password", M, Gen::Text32, P),
     e("valkey/control.password", M, Gen::Text32, P),
     e("valkey/realtime.password", M, Gen::Text32, P),
@@ -210,6 +211,7 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/data-keys.token", M, Gen::Text32, P),
     e("tokens/app-auth.token", M, Gen::Text32, P),
     e("tokens/app-sessions.token", M, Gen::Text32, P),
+    e("tokens/storage-internal.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
     e("tokens/auth-identity.token", M, Gen::Token32, P),
@@ -1188,8 +1190,10 @@ mod tests {
     }
 
     /// The workbench: the files the overlay's top-level `secrets:` block reads from
-    /// `${CHELABASE_KEYS_DIR}`, all of which chelabase-init makes. The one other file it may
-    /// read is the stack's setup code, which chelabase-init writes into the stack dir (#126).
+    /// `${CHELABASE_KEYS_DIR}`, all of which chelabase-init makes; the others are the object
+    /// store's dev keys and gRPC TLS set in the stack dir, which `chelabase workbench up` writes
+    /// (`ensure_object_store_dev_files`). The one other file it may read is the stack's setup
+    /// code, which chelabase-init writes into the stack dir (#126).
     fn workbench_secret_files() -> Vec<String> {
         const STACK_SETUP_CODE: &str = "setup/setup.code";
         assert!(
@@ -1219,9 +1223,20 @@ mod tests {
                 others.push(file.to_string());
             }
         }
-        assert!(
-            others.is_empty(),
-            "a workbench secret outside the keys dir that chelabase-init doesn't make: {others:?}"
+        assert_eq!(
+            others,
+            [
+                "${CHELABASE_STACK_DIR}/s3/access-key",
+                "${CHELABASE_STACK_DIR}/s3/secret-key",
+                "${CHELABASE_STACK_DIR}/storage-s3/access-key",
+                "${CHELABASE_STACK_DIR}/storage-s3/secret-key",
+                "${CHELABASE_STACK_DIR}/grpc-tls/ca.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/server.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/server.key",
+                "${CHELABASE_STACK_DIR}/grpc-tls/client.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/client.key",
+            ],
+            "a workbench secret outside the keys dir that neither chelabase-init nor the workbench makes"
         );
         assert!(keys.len() > 30, "{keys:?}");
         keys
@@ -1229,9 +1244,11 @@ mod tests {
 
     /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
     /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
-    /// makes after it (the bootstrap's outputs).
+    /// makes after it (the bootstrap's outputs, and the object store's `storage` keys and gRPC
+    /// TLS set).
     fn selfhost_secret_paths() -> Vec<String> {
         const SCRIPT_DIRS: [&str; 1] = ["bootstrap"];
+        const SCRIPT_FILES: [&str; 2] = ["storage-s3", "grpc-tls"];
         let text = compose_file("docker-compose.yml");
         let mut paths = Vec::new();
         let mut others = Vec::new();
@@ -1241,7 +1258,7 @@ mod tests {
             };
             let sub = rest.split(['}', ',', ' ']).next().unwrap().to_string();
             let top = sub.split('/').next().unwrap();
-            let list = if SCRIPT_DIRS.contains(&top) {
+            let list = if SCRIPT_DIRS.contains(&top) || SCRIPT_FILES.contains(&top) {
                 &mut others
             } else {
                 &mut paths
@@ -1253,7 +1270,16 @@ mod tests {
         others.sort();
         assert_eq!(
             others,
-            ["bootstrap"],
+            [
+                "bootstrap",
+                "grpc-tls/ca.crt",
+                "grpc-tls/client.crt",
+                "grpc-tls/client.key",
+                "grpc-tls/server.crt",
+                "grpc-tls/server.key",
+                "storage-s3/access-key",
+                "storage-s3/secret-key",
+            ],
             "a self-hosted mount outside chelabase-init's layout that init-secrets doesn't make"
         );
         let script = text.split("\n  init-secrets:\n").nth(1).unwrap();
@@ -1261,6 +1287,9 @@ mod tests {
             script.contains(&format!("for d in {}; do", SCRIPT_DIRS.join(" "))),
             "init-secrets makes {SCRIPT_DIRS:?}"
         );
+        for made in ["new_key storage-s3/access-key 20", "new_key storage-s3/secret-key 40", "T=\"$$S/grpc-tls\""] {
+            assert!(script.contains(made), "init-secrets runs {made}");
+        }
         assert!(paths.len() > 30, "{paths:?}");
         paths
     }
@@ -2155,6 +2184,153 @@ mod tests {
             assert_eq!(snapshot(t.path()), before, "{file}");
             std::fs::write(t.path().join(file), keep).unwrap();
         }
+    }
+
+    /// object-storage m19 (#152): the files the self-hosted `storage` service mounts from the
+    /// `secrets` volume (its block in docker-compose.yml), sorted.
+    fn selfhost_storage_mounts() -> Vec<String> {
+        let text = compose_file("docker-compose.yml");
+        let block = text
+            .split("\n  storage:\n")
+            .nth(1)
+            .expect("a storage service in the self-hosted compose file");
+        let mut subs: Vec<String> = block
+            .lines()
+            .take_while(|l| l.is_empty() || l.starts_with("    "))
+            .filter(|l| l.contains("source: secrets,"))
+            .filter_map(|l| l.split("subpath: ").nth(1))
+            .map(|rest| rest.split(['}', ',', ' ']).next().unwrap().to_string())
+            .collect();
+        subs.sort();
+        subs
+    }
+
+    /// The storage service mounts exactly its own files, each made by a fresh run (the layout's,
+    /// at the app user's owner-only or public mode; the S3 pair by init-secrets' script), and
+    /// NATS's auth file carries its user.
+    #[test]
+    fn storage_service_mounts_come_from_init() {
+        let mounts = selfhost_storage_mounts();
+        assert_eq!(
+            mounts,
+            [
+                "compute-ca/ca.crt",
+                "gateway/internal-verify.pem",
+                "nats/storage.password",
+                "storage-s3/access-key",
+                "storage-s3/secret-key",
+                "tokens/storage-internal.token",
+            ],
+            "storage mounts only its own secrets, the verify key and the CA certificate"
+        );
+        let t = tmp();
+        let o = opts();
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        let (uid, gid) = me();
+        for sub in mounts.iter().filter(|s| !s.starts_with("storage-s3/")) {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == sub)
+                .unwrap_or_else(|| panic!("{sub} is not in chelabase-init's layout"));
+            let want = if entry.spec == PUB { 0o644 } else { 0o600 };
+            assert!(
+                matches!(entry.spec.uid, Id::Writer),
+                "{sub}: the app user owns it"
+            );
+            let p = t.path().join(sub);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid(), mode(&p)),
+                (uid, gid, want),
+                "{sub}"
+            );
+            assert!(report.created.contains(&p), "{sub}");
+        }
+        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&auth);
+        let pw = std::fs::read_to_string(t.path().join("nats/storage.password")).unwrap();
+        assert!(
+            bcrypt::verify(&pw, &hashes["storage"]).unwrap(),
+            "storage's NATS user"
+        );
+    }
+
+    /// An install from before object storage (no storage secrets): the next run makes them and
+    /// re-renders NATS's users, and every other file stays byte for byte, the never-overwrite
+    /// ones included.
+    #[test]
+    fn upgrade_adds_storage_secrets_and_keeps_the_rest() {
+        const STORAGE: [&str; 2] = ["nats/storage.password", "tokens/storage-internal.token"];
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        for f in STORAGE {
+            std::fs::remove_file(t.path().join(f)).unwrap();
+        }
+        // NATS's users as such an install rendered them: no storage user.
+        let rendered = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let start = rendered
+            .find("    {\n      user: \"storage\"\n")
+            .expect("a storage user in auth.conf");
+        let end = start + rendered[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
+        let auth = format!("{}{}", &rendered[..start], &rendered[end..]);
+        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key("storage"));
+        assert_eq!(
+            crate::kinds::service_auth::previous_nats_hashes(&auth).len(),
+            crate::kinds::stack_secrets::NATS_USERS.len() - 1
+        );
+        std::fs::write(t.path().join("nats/auth.conf"), &auth).unwrap();
+        let before = snapshot(t.path());
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        let mut created = r.created.clone();
+        created.sort();
+        assert_eq!(created, STORAGE.map(|f| t.path().join(f)));
+        assert_eq!(r.rewritten, [t.path().join("nats/auth.conf")]);
+        assert!(r.auth_files.nats && !r.auth_files.valkey);
+        let after = snapshot(t.path());
+        for (p, v) in &before {
+            if p != Path::new("nats/auth.conf") {
+                assert_eq!(after.get(p), Some(v), "{} changed", p.display());
+            }
+        }
+        for kept in [
+            "secrets/secrets.key",
+            "gateway/internal-signing.pem",
+            "gateway/internal-verify.pem",
+            "auth/cookie.key",
+            "neon/compute-jwt.pem",
+            "neon/compute-jwt.pub",
+            "auth/member-jwt.key",
+            "auth/member-jwt.pub",
+            "identity/secret",
+            "identity/db.password",
+            "tokens/auth-identity.token",
+            "tokens/orchestrator-identity.token",
+            "tokens/worker-identity.token",
+            "tokens/bootstrap-identity.token",
+        ] {
+            assert_eq!(
+                after.get(Path::new(kept)),
+                before.get(Path::new(kept)),
+                "{kept}"
+            );
+            assert!(before.contains_key(Path::new(kept)), "{kept}");
+        }
+        // The other users keep their passwords; storage's new one verifies.
+        let new = String::from_utf8(after[Path::new("nats/auth.conf")].0.clone()).unwrap();
+        assert_ne!(new, auth);
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&new);
+        for u in crate::kinds::stack_secrets::NATS_USERS {
+            let pw = String::from_utf8(after[Path::new(&format!("nats/{u}.password"))].0.clone())
+                .unwrap();
+            assert!(bcrypt::verify(&pw, &hashes[u]).unwrap(), "{u}");
+        }
+        // A rerun changes nothing.
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(
+            again.created.is_empty() && again.rewritten.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(snapshot(t.path()), after);
     }
 
     // m12 (#23): seeds from the compose .env.

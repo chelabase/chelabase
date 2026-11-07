@@ -319,6 +319,8 @@ struct TableChan {
     status: StatusCell,
     reauth: ReauthState,
     task: TaskGuard,
+    /// Object storage m17: a storage channel (no presence state of its own).
+    storage: bool,
 }
 
 struct ProjectChan {
@@ -400,7 +402,7 @@ enum Done {
     Table {
         id: String,
         r#ref: String,
-        channel: TableChannel,
+        channel: Box<TableChannel>,
         role: Option<String>,
         token: Arc<str>,
         target: AuthTarget,
@@ -991,7 +993,7 @@ impl Session {
                     let _ = done.send(Done::Table {
                         id,
                         r#ref,
-                        channel,
+                        channel: Box::new(channel),
                         role,
                         token,
                         target,
@@ -1084,7 +1086,7 @@ impl Session {
                 }
                 match result {
                     Ok(joined) => {
-                        self.join_table(&r#ref, id, channel, role, token, target, joined)
+                        self.join_table(&r#ref, id, *channel, role, token, target, joined)
                             .await
                     }
                     Err((code, message)) => self.error(Some(&r#ref), Some(&id), code, &message),
@@ -1135,6 +1137,7 @@ impl Session {
         {
             self.shared.source.renew(&handle, current).await;
         }
+        let storage = channel.bucket.is_some();
         let scope = Scope::Table {
             branch_id: channel.branch_id,
             db_oid: info.db_oid,
@@ -1213,6 +1216,7 @@ impl Session {
                 status,
                 reauth: ReauthState::new(),
                 task,
+                storage,
             }),
         );
     }
@@ -1279,6 +1283,14 @@ impl Session {
                 "not a joined table",
             );
         };
+        if t.storage {
+            return self.error(
+                None,
+                Some(channel),
+                ErrorCode::Invalid,
+                "a storage channel has no presence state",
+            );
+        }
         match parse_table_state(state) {
             Ok(s) => {
                 t.presence.send_replace(Some(s));

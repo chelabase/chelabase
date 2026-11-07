@@ -13,7 +13,7 @@ use chelabase_nats::{
     SUBJECT_ROLE_DELETE_PREVIEW, SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
     run_app_users_consumer, run_app_users_sync_consumer, run_branch_consumer,
     run_delete_consumer, run_merge_consumer, run_project_delete_consumer,
-    run_provision_consumer, run_settings_consumer,
+    run_provision_consumer, run_settings_consumer, run_storage_sweep_consumer,
 };
 use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
 use futures_util::StreamExt;
@@ -54,6 +54,12 @@ async fn main() -> anyhow::Result<()> {
     let config = WorkerConfig::from_env()?;
     let metadata_config = worker::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
+    // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    for entry in webhooks.allow_hosts_with_port() {
+        warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
+    }
 
     let metadata = MetadataClient::connect(&metadata_config).await?;
     metadata.migrate().await?;
@@ -68,7 +74,21 @@ async fn main() -> anyhow::Result<()> {
     // Provisions wait for the orchestrator's tenant-attached events (carried gaps T4), read
     // with the worker's own NATS rights (filtered consumers only; no stream lookups).
     let attach = worker::ports::AttachSource::Nats(js.clone());
-    let worker = Arc::new(build(&config, metadata, key, publisher, attach)?);
+    let mut built = build(&config, metadata, key, publisher, attach)?;
+    built.storage_sweep = worker::storage_sweep::SweepSettings::from_lookup(|name| std::env::var(name).ok())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // object-storage m8: the sweep needs the user-blob store; without one it doesn't run.
+    if std::env::var(chelabase_storage::config::ENV_BACKEND).is_ok_and(|v| !v.trim().is_empty()) {
+        let store_config = chelabase_storage::StorageConfig::from_env()?;
+        built.blob_store = Some(Arc::new(chelabase_storage::S3Store::new(&store_config).await));
+    } else {
+        warn!("CHELABASE_STORAGE_BACKEND is unset: the storage sweep doesn't run");
+    }
+    let worker = Arc::new(built);
+    // Only with a store: without one, no consumer would take the jobs.
+    if worker.blob_store.is_some() {
+        worker.sweep_requests.connect(js.clone());
+    }
     worker.resync_requests.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.
@@ -139,6 +159,36 @@ async fn main() -> anyhow::Result<()> {
             warn!("project delete consumer exited: {err}");
         }
     });
+
+    // object-storage m18: storage webhooks, one consumer per enabled endpoint, and their test
+    // events on request.
+    tokio::spawn(worker::storage_webhooks::run(
+        worker.metadata.inner().clone(),
+        worker.key.clone(),
+        js.clone(),
+        webhooks.clone(),
+    ));
+    tokio::spawn(serve_storage_webhook_test(worker.clone(), nats.clone(), webhooks));
+
+    if worker.blob_store.is_some() {
+        tokio::spawn(storage_sweep_loop(worker.clone()));
+        let sweep_worker = worker.clone();
+        let sweep_js = js.clone();
+        tokio::spawn(async move {
+            let result = run_storage_sweep_consumer(sweep_js, move |job, attempt| {
+                let worker = sweep_worker.clone();
+                async move {
+                    worker
+                        .handle_storage_sweep_attempt(job.payload.database_id, attempt)
+                        .await
+                }
+            })
+            .await;
+            if let Err(err) = result {
+                warn!("storage sweep consumer exited: {err}");
+            }
+        });
+    }
 
     let app_users_worker = worker.clone();
     let app_users_js = js.clone();
@@ -687,6 +737,48 @@ async fn serve_review(worker: Arc<RealWorker>, client: async_nats::Client) {
     }
 }
 
+/// object-storage m18: sends one test event to a storage webhook endpoint on the orchestrator's
+/// request (`chelabase.rpc.storage_webhooks.test`) and answers how the attempt went.
+async fn serve_storage_webhook_test(
+    worker: Arc<RealWorker>,
+    client: async_nats::Client,
+    outbound: chelabase_http::outbound::Outbound,
+) {
+    use chelabase_nats::storage_objects::{SUBJECT_TEST, TestReply, TestRequest};
+    let http = match outbound.client(worker::storage_webhooks::TIMEOUT) {
+        Ok(http) => http,
+        Err(err) => {
+            warn!("storage webhook tests unavailable: {err}");
+            return;
+        }
+    };
+    let mut requests = match client.queue_subscribe(SUBJECT_TEST, RESET_QUEUE_GROUP.to_string()).await {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("storage webhook test subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_TEST, "serving storage webhook tests");
+    while let Some(message) = requests.next().await {
+        let (worker, client, http) = (worker.clone(), client.clone(), http.clone());
+        tokio::spawn(async move {
+            let reply = match serde_json::from_slice::<TestRequest>(&message.payload) {
+                Ok(request) => {
+                    worker::storage_webhooks::test_reply(worker.metadata.inner(), &worker.key, &http, &request).await
+                }
+                Err(err) => TestReply::Failed { message: format!("bad request: {err}") },
+            };
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("storage webhook test reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
 /// EOS-H1: serves the all-rows check (request/reply with an [`AllRowsCheckReply`]); a reply
 /// that can't be sent leaves the orchestrator to time out and refuse.
 async fn serve_all_rows_check(worker: Arc<RealWorker>, client: async_nats::Client) {
@@ -744,6 +836,25 @@ async fn member_roles_sweep_loop(worker: Arc<RealWorker>) {
         let (done, failed) = worker.sweep_member_roles_once().await;
         if failed > 0 {
             warn!(done, failed, "member-role sweep: some branches failed; the next sweep retries");
+        }
+    }
+}
+
+/// How soon after start the first storage sweep is queued (audit N4): a worker restarted more
+/// often than the period still sweeps.
+const STORAGE_SWEEP_FIRST: Duration = Duration::from_secs(600);
+
+/// object-storage m8: every `CHELABASE_STORAGE_SWEEP_SECS`, a sweep of every ready database is
+/// queued (one job per database; the consumer runs them one at a time).
+async fn storage_sweep_loop(worker: Arc<RealWorker>) {
+    let every = worker.storage_sweep.every;
+    let first = every.min(STORAGE_SWEEP_FIRST);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + first, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        if let Err(err) = worker.queue_storage_sweeps().await {
+            warn!("queueing storage sweeps: {err}");
         }
     }
 }

@@ -143,10 +143,13 @@ pub enum DdlErrorKind {
 
 /// T4-5: the schemas the hub never shows and whose privileges its ops never change: Postgres's
 /// own (`pg_…`: `pg_catalog`, `pg_toast`, `pg_temp_<n>`, …; Postgres reserves the prefix),
-/// `information_schema`, and Chelabase's (`chelabase…`). Extension schemas need the catalog
-/// (the orchestrator checks them).
+/// `information_schema`, and Chelabase's (`chelabase…`, and `storage`: object metadata).
+/// Extension schemas need the catalog (the orchestrator checks them).
 pub fn hidden_schema(schema: &str) -> bool {
-    schema.starts_with("pg_") || schema == "information_schema" || schema.starts_with("chelabase")
+    schema.starts_with("pg_")
+        || schema == "information_schema"
+        || schema.starts_with("chelabase")
+        || schema == "storage"
 }
 
 /// The privilege ops' grantee allow-list (MH-28, S5): never `owner` (the database owner in an

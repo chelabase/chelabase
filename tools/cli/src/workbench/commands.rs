@@ -40,17 +40,18 @@ impl Site {
 }
 
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
-pub(super) const RUST_APPS: [&str; 6] =
-    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
+pub(super) const RUST_APPS: [&str; 7] =
+    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage"];
 /// Every app container (the Rust apps, Studio and the identity service; the sites are added by
 /// `--with`).
-pub(super) const APPS: [&str; 8] = [
+pub(super) const APPS: [&str; 9] = [
     "orchestrator",
     "worker",
     "gateway",
     "auth",
     "rest",
     "realtime",
+    "storage",
     "studio",
     "identity",
 ];
@@ -78,7 +79,7 @@ pub(super) const FRONT: &[&str] = &["mailpit", "gateway", "identity"];
 /// Started before the bootstrap, which waits on the orchestrator and (the dev member's sign-up)
 /// auth.
 pub(super) const LATE_APPS: &[&str] =
-    &["orchestrator", "worker", "auth", "rest", "realtime", "studio"];
+    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -342,6 +343,28 @@ pub fn check_purge(slug: &str, named: Option<&str>, yes: bool) -> anyhow::Result
     Ok(())
 }
 
+/// A purge that names no stack (`--stack`) takes the current checkout's own, but only when the
+/// registry says that checkout owns it. A stack registered to another checkout (a task worktree
+/// borrowing its epic's, or a slug that collides) is not this one's to purge: the message says
+/// so and the purge is skipped. `None` means go ahead.
+pub fn borrowed_stack_message(
+    slug: &str,
+    named: Option<&str>,
+    here: &Path,
+    entry: Option<&Entry>,
+) -> Option<String> {
+    let entry = entry?;
+    if named.is_some() || entry.checkout == here {
+        return None;
+    }
+    Some(format!(
+        "stack {slug} belongs to another checkout ({}), not {}: not purged \
+         (`just workbench purge --stack {slug}` if you mean it)",
+        entry.checkout.display(),
+        here.display()
+    ))
+}
+
 /// A `docker <args…>` command with every `KEY=VALUE` of the stack's env file set in its
 /// environment, so a variable the calling shell exports can't override the stack's own in
 /// Compose's interpolation (T5 review I5).
@@ -380,6 +403,7 @@ pub fn ensure_stack_secrets(
         &main.join(".chelabase"),
         &chelabase_init::InitSecrets::workbench(state),
     )?;
+    ensure_object_store_dev_files(state).context("writing the object store's dev keys")?;
     if report.setup_code.is_some() {
         eprintln!(
             "[workbench] the stack's setup code is in {}",
@@ -387,6 +411,128 @@ pub fn ensure_stack_secrets(
         );
     }
     Ok(report.auth_files)
+}
+
+/// The fixed dev S3 keys of SeaweedFS's `storage` identity (bucket `chelabase-storage`), as files
+/// in the stack's state dir beside Neon's `s3/` pair. There is no admin identity: SeaweedFS makes
+/// its buckets over loopback.
+const OBJECT_STORE_DEV_KEYS: [(&str, &str); 2] = [
+    ("storage-s3/access-key", "chelabase-storage-dev"),
+    ("storage-s3/secret-key", "chelabase-storage-dev-secret"),
+];
+
+/// SeaweedFS's gRPC mutual TLS files under `<state>/grpc-tls/`: a CA (`ca.crt`, and `ca.key`,
+/// which no service mounts) and a server and a client certificate with their keys, all valid for
+/// a century (a dev stack has no renewal). The base file's init-secrets makes the same files
+/// with openssl. Mode 0600; the dir 0700. Only the tests list them.
+#[cfg(test)]
+const GRPC_TLS_FILES: [&str; 6] = ["ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"];
+
+/// The compose overlay mounts these as secrets (`scripts/tests/workbench-compose.sh` pins the
+/// mounts), so they are not in `docker inspect`. Writes what is missing under `state`; a file that
+/// is fine is never touched, so a stack made before these files gains them and nothing else.
+/// The gRPC set is repaired as a whole: an empty file counts as missing; a CA that isn't a valid
+/// pair is made again (and then both leaves); a leaf is made again, certificate and key together,
+/// when either is missing or the pair isn't signed by the CA on disk. Every write is a temp file
+/// renamed into place, so an interrupted `up` leaves no half-written file.
+fn ensure_object_store_dev_files(state: &Path) -> anyhow::Result<()> {
+    use chelabase_neon::compute_tls::{key_matches_cert, signed_by};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
+    };
+    // An earlier build of this milestone had an admin identity; its dev keys are not used.
+    match std::fs::remove_dir_all(state.join("s3-admin")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).context("removing the stale s3-admin dir");
+        }
+        _ => {}
+    }
+    for (rel, value) in OBJECT_STORE_DEV_KEYS {
+        write_private_file_if_missing(&state.join(rel), value.as_bytes())?;
+    }
+    let dir = state.join("grpc-tls");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().filter(|t| !t.is_empty());
+    let params = |cn: &str| {
+        let mut p = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        p.distinguished_name = dn;
+        p.not_before = date_time_ymd(2025, 1, 1);
+        p.not_after = date_time_ymd(2125, 1, 1);
+        p
+    };
+    // The CA on disk, if it is a valid pair; else a new one (both files written).
+    let existing = match (read("ca.crt"), read("ca.key")) {
+        (Some(crt), Some(key)) if key_matches_cert(&crt, &key) => KeyPair::from_pem(&key)
+            .ok()
+            .and_then(|k| Issuer::from_ca_cert_pem(&crt, k).ok())
+            .map(|issuer| (crt, issuer)),
+        _ => None,
+    };
+    let (ca_pem, issuer) = match existing {
+        Some(found) => found,
+        None => {
+            let key = KeyPair::generate().context("generating the gRPC CA key")?;
+            let mut p = params("chelabase-seaweedfs-grpc-ca");
+            p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let cert = p.self_signed(&key).context("signing the gRPC CA")?;
+            // Key first: a crash between the two leaves a CA that doesn't pass the check above.
+            write_private_file(&dir.join("ca.key"), key.serialize_pem().as_bytes())?;
+            write_private_file(&dir.join("ca.crt"), cert.pem().as_bytes())?;
+            (cert.pem(), Issuer::new(p, key))
+        }
+    };
+    for (name, eku) in [("server", ExtendedKeyUsagePurpose::ServerAuth), ("client", ExtendedKeyUsagePurpose::ClientAuth)] {
+        let (crt, key) = (read(&format!("{name}.crt")), read(&format!("{name}.key")));
+        if matches!((&crt, &key), (Some(c), Some(k)) if signed_by(c, &ca_pem) && key_matches_cert(c, k)) {
+            continue;
+        }
+        let key = KeyPair::generate().with_context(|| format!("generating the gRPC {name} key"))?;
+        let mut p = params(&format!("seaweedfs-{name}"));
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![eku];
+        p.subject_alt_names = vec![
+            SanType::DnsName("seaweedfs".try_into()?),
+            SanType::DnsName("localhost".try_into()?),
+            SanType::IpAddress([127, 0, 0, 1].into()),
+        ];
+        let cert = p.signed_by(&key, &issuer).with_context(|| format!("signing the gRPC {name} certificate"))?;
+        write_private_file(&dir.join(format!("{name}.key")), key.serialize_pem().as_bytes())?;
+        write_private_file(&dir.join(format!("{name}.crt")), cert.pem().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// [`write_private_file`] unless `path` exists and isn't empty.
+fn write_private_file_if_missing(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
+        return Ok(());
+    }
+    write_private_file(path, bytes)
+}
+
+/// Writes `bytes` to `path` (dirs 0700, file 0600) through a temp file renamed into place.
+fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let dir = path.parent().expect("a file below the state dir");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(".{}.tmp", path.file_name().expect("a file name").to_string_lossy()));
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", path.display()))
 }
 
 /// `CHELABASE_NEXTEST_BIN` in `stack.env`: the host's cargo-nextest, else `/dev/null`, so the
@@ -1020,13 +1166,22 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.arg("build").current_dir(&stack.checkout);
     for app in apps {
-        cmd.args(["-p", app]);
+        cmd.args(["-p", package_of(app)]);
     }
     if cli {
         // `chelabase-init` too: the bootstrap runs it.
         cmd.args(["-p", "chelabase", "-p", "init"]);
     }
     run(cmd)
+}
+
+/// The cargo package that builds `app`'s binary (the storage service's crate name differs from
+/// its binary's, beside the `chelabase-storage` library).
+fn package_of(app: &str) -> &str {
+    match app {
+        "storage" => "chelabase-storage-service",
+        other => other,
+    }
 }
 
 /// How long any `compose up --wait` in `up` waits for its services to be healthy.
@@ -1530,6 +1685,10 @@ pub fn purge(slug: Option<&str>, yes: bool) -> anyhow::Result<()> {
     let here = current_stack()?;
     let (stack, entry) = chosen_stack(&here, slug)?;
     check_purge(&stack.slug, slug, yes)?;
+    if let Some(msg) = borrowed_stack_message(&stack.slug, slug, &here.checkout, entry.as_ref()) {
+        eprintln!("[workbench] {msg}");
+        return Ok(());
+    }
     if entry.is_none() && !stack.state.exists() {
         let known = read_registry(&here.stacks_dir)?;
         bail!(
@@ -1794,7 +1953,9 @@ pub(crate) fn runner_command(
         ));
     }
     pairs.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
-    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps"];
+    // `--use-aliases`: the runner is `runner` on the stack's networks (object-storage m18: the
+    // worker's webhooks reach the live test's receiver by that name, the one host it allows).
+    let mut args: Vec<&str> = vec!["--profile", "runner", "run", "--rm", "--no-deps", "--use-aliases"];
     for p in &pairs {
         args.extend(["-e", p.as_str()]);
     }
@@ -2174,6 +2335,106 @@ mod key_phase_tests {
             }
         }
         out
+    }
+
+    // m2 of epic object-storage: the `storage` S3 dev keys and SeaweedFS's gRPC mTLS files appear
+    // on `up` for a stack made without them (no admin key), and an existing file is never changed.
+    #[test]
+    fn the_object_store_dev_files_are_added_and_never_overwritten() {
+        use chelabase_neon::compute_tls::{key_matches_cert, signed_by};
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        super::ensure_object_store_dev_files(&state).unwrap();
+        let read = |p: &str| std::fs::read_to_string(state.join(p)).unwrap();
+        assert_eq!(read("storage-s3/access-key"), "chelabase-storage-dev");
+        assert_eq!(read("storage-s3/secret-key"), "chelabase-storage-dev-secret");
+        assert!(!state.join("s3-admin").exists(), "no admin identity");
+        let ca = read("grpc-tls/ca.crt");
+        for f in ["server", "client"] {
+            let (crt, key) = (read(&format!("grpc-tls/{f}.crt")), read(&format!("grpc-tls/{f}.key")));
+            assert!(signed_by(&crt, &ca), "{f}.crt is signed by the CA");
+            assert!(key_matches_cert(&crt, &key), "{f}.key is {f}.crt's");
+        }
+        assert!(!read("grpc-tls/server.crt").is_empty() && read("grpc-tls/server.crt") != read("grpc-tls/client.crt"));
+        for p in ["storage-s3/access-key", "grpc-tls/ca.key", "grpc-tls/server.key"] {
+            let mode = std::fs::metadata(state.join(p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{p}");
+        }
+        let dir_mode = std::fs::metadata(state.join("grpc-tls")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let before: Vec<String> = ["ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"]
+            .iter()
+            .map(|f| read(&format!("grpc-tls/{f}")))
+            .collect();
+        std::fs::write(state.join("storage-s3/access-key"), "kept").unwrap();
+        super::ensure_object_store_dev_files(&state).unwrap();
+        assert_eq!(read("storage-s3/access-key"), "kept", "an existing key is left alone");
+        let after: Vec<String> = ["ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"]
+            .iter()
+            .map(|f| read(&format!("grpc-tls/{f}")))
+            .collect();
+        assert_eq!(before, after, "a second run changes no certificate");
+    }
+
+    /// After `damage` runs on a complete grpc-tls dir, a second `ensure` leaves a set in which
+    /// both leaves are signed by `ca.crt` and each key is its certificate's (white-room audit of
+    /// m2, B1); `kept` files must come through byte for byte.
+    fn repairs(damage: impl Fn(&Path), kept: &[&str]) {
+        use chelabase_neon::compute_tls::{key_matches_cert, signed_by};
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        super::ensure_object_store_dev_files(&state).unwrap();
+        let dir = state.join("grpc-tls");
+        let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+        let before: Vec<String> = kept.iter().map(|f| read(f)).collect();
+        damage(&dir);
+        super::ensure_object_store_dev_files(&state).unwrap();
+        for f in ["server", "client"] {
+            let (crt, key) = (read(&format!("{f}.crt")), read(&format!("{f}.key")));
+            assert!(signed_by(&crt, &read("ca.crt")), "{f}.crt is not signed by ca.crt");
+            assert!(key_matches_cert(&crt, &key), "{f}.key does not match {f}.crt");
+        }
+        let after: Vec<String> = kept.iter().map(|f| read(f)).collect();
+        assert_eq!(before, after, "files that were fine are not remade");
+        for f in super::GRPC_TLS_FILES {
+            let mode = std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 6, "no temp file is left: {leftovers:?}");
+    }
+
+    #[test]
+    fn audit_missing_server_key() {
+        repairs(|d| std::fs::remove_file(d.join("server.key")).unwrap(), &["ca.crt", "ca.key", "client.crt", "client.key"]);
+    }
+
+    #[test]
+    fn audit_missing_client_crt() {
+        repairs(|d| std::fs::remove_file(d.join("client.crt")).unwrap(), &["ca.crt", "ca.key", "server.crt", "server.key"]);
+    }
+
+    #[test]
+    fn audit_missing_ca_key() {
+        repairs(|d| std::fs::remove_file(d.join("ca.key")).unwrap(), &[]);
+    }
+
+    #[test]
+    fn an_empty_or_truncated_file_counts_as_missing() {
+        repairs(|d| std::fs::write(d.join("client.key"), "").unwrap(), &["ca.crt", "ca.key", "server.crt", "server.key"]);
+        repairs(|d| std::fs::write(d.join("ca.crt"), "garbage").unwrap(), &[]);
+        repairs(|d| std::fs::write(d.join("server.crt"), "").unwrap(), &["ca.crt", "ca.key", "client.crt", "client.key"]);
+    }
+
+    // N3: the dev admin keys of an earlier build of this milestone are removed on `up`.
+    #[test]
+    fn a_stale_admin_key_dir_is_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        std::fs::create_dir_all(state.join("s3-admin")).unwrap();
+        std::fs::write(state.join("s3-admin/access-key"), "chelabase-admin-dev").unwrap();
+        super::ensure_object_store_dev_files(&state).unwrap();
+        assert!(!state.join("s3-admin").exists());
     }
 
     // AC 7: a stack whose keys the old key phase made (under umask 002, like the real shared keys

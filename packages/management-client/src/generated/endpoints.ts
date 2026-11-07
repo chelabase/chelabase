@@ -51,6 +51,7 @@ import type {
   CreateProjectRequest,
   CreateRoleRequest,
   CreateSavedQueryRequest,
+  CreateStorageWebhookRequest,
   CreateTeamRequest,
   CreatedDataKey,
   DataApiSchema,
@@ -122,6 +123,29 @@ import type {
   SavedQuerySummary,
   SchemaChangeRequest,
   SchemaChangeResponse,
+  StorageAbortUploadParams,
+  StorageCompleteUploadParams,
+  StorageCopyObjectParams,
+  StorageCreateBucketParams,
+  StorageCreateUploadParams,
+  StorageDeleteBucketParams,
+  StorageDeleteObjectParams,
+  StorageDeleteObjectsParams,
+  StorageDownloadObjectParams,
+  StorageListBucketsParams,
+  StorageListObjectsParams,
+  StorageListPartsParams,
+  StorageMoveObjectParams,
+  StoragePutObjectParams,
+  StorageResolveObjectsParams,
+  StorageSignObjectParams,
+  StorageUpdateBucketParams,
+  StorageUploadObjectParams,
+  StorageUploadPartParams,
+  StorageWebhook,
+  StorageWebhookAttempt,
+  StorageWebhookTestResult,
+  StorageWebhookWithSecret,
   Team,
   TeamGrantRequest,
   TenantName,
@@ -137,6 +161,7 @@ import type {
   UpdateProjectRequest,
   UpdateRoleRequest,
   UpdateSavedQueryRequest,
+  UpdateStorageWebhookRequest,
   UpdateTeamRequest,
   UpdateTenantRequest
 } from './model';
@@ -4656,6 +4681,2012 @@ export function useGetSqlSchema<TData = Awaited<ReturnType<typeof getSqlSchema>>
 
 
 
+export const getStorageListBucketsUrl = (id: string,
+    branchId: string,
+    params?: StorageListBucketsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket`
+}
+
+/**
+ * The buckets the role's policies show, by name (storage's `GET /storage/v1/bucket`). Needs the role held at Viewer.
+ * @summary List the buckets a role sees
+ */
+export const storageListBuckets = async (id: string,
+    branchId: string,
+    params?: StorageListBucketsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+  return customFetch<unknown>(getStorageListBucketsUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageListBucketsQueryKey = (id: string,
+    branchId: string,
+    params?: StorageListBucketsParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/storage/bucket`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getStorageListBucketsQueryOptions = <TData = Awaited<ReturnType<typeof storageListBuckets>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: StorageListBucketsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStorageListBucketsQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof storageListBuckets>>> = ({ signal }) => storageListBuckets(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type StorageListBucketsQueryResult = NonNullable<Awaited<ReturnType<typeof storageListBuckets>>>
+export type StorageListBucketsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useStorageListBuckets<TData = Awaited<ReturnType<typeof storageListBuckets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  StorageListBucketsParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageListBuckets>>,
+          TError,
+          Awaited<ReturnType<typeof storageListBuckets>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageListBuckets<TData = Awaited<ReturnType<typeof storageListBuckets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: StorageListBucketsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageListBuckets>>,
+          TError,
+          Awaited<ReturnType<typeof storageListBuckets>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageListBuckets<TData = Awaited<ReturnType<typeof storageListBuckets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: StorageListBucketsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List the buckets a role sees
+ */
+
+export function useStorageListBuckets<TData = Awaited<ReturnType<typeof storageListBuckets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: StorageListBucketsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListBuckets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getStorageListBucketsQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getStorageCreateBucketUrl = (id: string,
+    branchId: string,
+    params?: StorageCreateBucketParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket`
+}
+
+/**
+ * Storage's `POST /storage/v1/bucket` as the role: an insert policy on `storage.buckets` decides. Needs the role held at Developer.
+ * @summary Create a bucket as a role
+ */
+export const storageCreateBucket = async (id: string,
+    branchId: string,
+    storageCreateBucketBody: unknown,
+    params?: StorageCreateBucketParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageCreateBucketUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageCreateBucketBody)
+  }
+);}
+
+
+
+
+
+export const getStorageCreateBucketMutationKey = () => ['storageCreateBucket'] as const;
+
+export const getStorageCreateBucketMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCreateBucket>>, TError,StorageCreateBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageCreateBucket>>, TError,StorageCreateBucketMutationVariables, TContext> => {
+
+const mutationKey = getStorageCreateBucketMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageCreateBucket>>, StorageCreateBucketMutationVariables> = (props) => {
+          const {id,branchId,data,params} = props ?? {};
+
+          return  storageCreateBucket(id,branchId,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageCreateBucketMutationResult = NonNullable<Awaited<ReturnType<typeof storageCreateBucket>>>
+    export type StorageCreateBucketMutationBody = unknown
+    export type StorageCreateBucketMutationError = ErrorType<ErrorEnvelope>
+    export type StorageCreateBucketMutationVariables = {id: string;branchId: string;data: unknown;params?: StorageCreateBucketParams}
+
+    /**
+ * @summary Create a bucket as a role
+ */
+export const useStorageCreateBucket = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCreateBucket>>, TError,StorageCreateBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageCreateBucket>>,
+        TError,
+        StorageCreateBucketMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageCreateBucketMutationOptions(options), queryClient);
+    }
+
+export const getStorageDeleteBucketUrl = (id: string,
+    branchId: string,
+    name: string,
+    params?: StorageDeleteBucketParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's `DELETE /storage/v1/bucket/{name}` as the role. Needs the role held at Developer.
+ * @summary Delete an empty bucket as a role
+ */
+export const storageDeleteBucket = async (id: string,
+    branchId: string,
+    name: string,
+    params?: StorageDeleteBucketParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+  return customFetch<unknown>(getStorageDeleteBucketUrl(id,branchId,name,params),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageDeleteBucketMutationKey = () => ['storageDeleteBucket'] as const;
+
+export const getStorageDeleteBucketMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteBucket>>, TError,StorageDeleteBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageDeleteBucket>>, TError,StorageDeleteBucketMutationVariables, TContext> => {
+
+const mutationKey = getStorageDeleteBucketMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageDeleteBucket>>, StorageDeleteBucketMutationVariables> = (props) => {
+          const {id,branchId,name,params} = props ?? {};
+
+          return  storageDeleteBucket(id,branchId,name,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageDeleteBucketMutationResult = NonNullable<Awaited<ReturnType<typeof storageDeleteBucket>>>
+
+    export type StorageDeleteBucketMutationError = ErrorType<ErrorEnvelope>
+    export type StorageDeleteBucketMutationVariables = {id: string;branchId: string;name: string;params?: StorageDeleteBucketParams}
+
+    /**
+ * @summary Delete an empty bucket as a role
+ */
+export const useStorageDeleteBucket = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteBucket>>, TError,StorageDeleteBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageDeleteBucket>>,
+        TError,
+        StorageDeleteBucketMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageDeleteBucketMutationOptions(options), queryClient);
+    }
+
+export const getStorageUpdateBucketUrl = (id: string,
+    branchId: string,
+    name: string,
+    params?: StorageUpdateBucketParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/bucket/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's `PATCH /storage/v1/bucket/{name}` as the role. Needs the role held at Developer.
+ * @summary Update a bucket as a role
+ */
+export const storageUpdateBucket = async (id: string,
+    branchId: string,
+    name: string,
+    storageUpdateBucketBody: unknown,
+    params?: StorageUpdateBucketParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageUpdateBucketUrl(id,branchId,name,params),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageUpdateBucketBody)
+  }
+);}
+
+
+
+
+
+export const getStorageUpdateBucketMutationKey = () => ['storageUpdateBucket'] as const;
+
+export const getStorageUpdateBucketMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUpdateBucket>>, TError,StorageUpdateBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageUpdateBucket>>, TError,StorageUpdateBucketMutationVariables, TContext> => {
+
+const mutationKey = getStorageUpdateBucketMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageUpdateBucket>>, StorageUpdateBucketMutationVariables> = (props) => {
+          const {id,branchId,name,data,params} = props ?? {};
+
+          return  storageUpdateBucket(id,branchId,name,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageUpdateBucketMutationResult = NonNullable<Awaited<ReturnType<typeof storageUpdateBucket>>>
+    export type StorageUpdateBucketMutationBody = unknown
+    export type StorageUpdateBucketMutationError = ErrorType<ErrorEnvelope>
+    export type StorageUpdateBucketMutationVariables = {id: string;branchId: string;name: string;data: unknown;params?: StorageUpdateBucketParams}
+
+    /**
+ * @summary Update a bucket as a role
+ */
+export const useStorageUpdateBucket = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUpdateBucket>>, TError,StorageUpdateBucketMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageUpdateBucket>>,
+        TError,
+        StorageUpdateBucketMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageUpdateBucketMutationOptions(options), queryClient);
+    }
+
+export const getStorageCopyObjectUrl = (id: string,
+    branchId: string,
+    params?: StorageCopyObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/copy?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/copy`
+}
+
+/**
+ * Storage's copy as the role. Needs the role held at Developer.
+ * @summary Copy an object as a role
+ */
+export const storageCopyObject = async (id: string,
+    branchId: string,
+    storageCopyObjectBody: unknown,
+    params?: StorageCopyObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageCopyObjectUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageCopyObjectBody)
+  }
+);}
+
+
+
+
+
+export const getStorageCopyObjectMutationKey = () => ['storageCopyObject'] as const;
+
+export const getStorageCopyObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCopyObject>>, TError,StorageCopyObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageCopyObject>>, TError,StorageCopyObjectMutationVariables, TContext> => {
+
+const mutationKey = getStorageCopyObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageCopyObject>>, StorageCopyObjectMutationVariables> = (props) => {
+          const {id,branchId,data,params} = props ?? {};
+
+          return  storageCopyObject(id,branchId,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageCopyObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storageCopyObject>>>
+    export type StorageCopyObjectMutationBody = unknown
+    export type StorageCopyObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StorageCopyObjectMutationVariables = {id: string;branchId: string;data: unknown;params?: StorageCopyObjectParams}
+
+    /**
+ * @summary Copy an object as a role
+ */
+export const useStorageCopyObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCopyObject>>, TError,StorageCopyObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageCopyObject>>,
+        TError,
+        StorageCopyObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageCopyObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageListObjectsUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    params?: StorageListObjectsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/list/${encodeURIComponent(String(bucket))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/list/${encodeURIComponent(String(bucket))}`
+}
+
+/**
+ * Storage's `POST /storage/v1/object/list/{bucket}` as the role: only the objects its policies show. Needs the role held at Viewer.
+ * @summary List objects as a role
+ */
+export const storageListObjects = async (id: string,
+    branchId: string,
+    bucket: string,
+    storageListObjectsBody: unknown,
+    params?: StorageListObjectsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageListObjectsUrl(id,branchId,bucket,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageListObjectsBody)
+  }
+);}
+
+
+
+
+
+export const getStorageListObjectsMutationKey = () => ['storageListObjects'] as const;
+
+export const getStorageListObjectsMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageListObjects>>, TError,StorageListObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageListObjects>>, TError,StorageListObjectsMutationVariables, TContext> => {
+
+const mutationKey = getStorageListObjectsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageListObjects>>, StorageListObjectsMutationVariables> = (props) => {
+          const {id,branchId,bucket,data,params} = props ?? {};
+
+          return  storageListObjects(id,branchId,bucket,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageListObjectsMutationResult = NonNullable<Awaited<ReturnType<typeof storageListObjects>>>
+    export type StorageListObjectsMutationBody = unknown
+    export type StorageListObjectsMutationError = ErrorType<ErrorEnvelope>
+    export type StorageListObjectsMutationVariables = {id: string;branchId: string;bucket: string;data: unknown;params?: StorageListObjectsParams}
+
+    /**
+ * @summary List objects as a role
+ */
+export const useStorageListObjects = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageListObjects>>, TError,StorageListObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageListObjects>>,
+        TError,
+        StorageListObjectsMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageListObjectsMutationOptions(options), queryClient);
+    }
+
+export const getStorageMoveObjectUrl = (id: string,
+    branchId: string,
+    params?: StorageMoveObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/move?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/move`
+}
+
+/**
+ * Storage's move as the role. Needs the role held at Developer.
+ * @summary Move an object as a role
+ */
+export const storageMoveObject = async (id: string,
+    branchId: string,
+    storageMoveObjectBody: unknown,
+    params?: StorageMoveObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageMoveObjectUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageMoveObjectBody)
+  }
+);}
+
+
+
+
+
+export const getStorageMoveObjectMutationKey = () => ['storageMoveObject'] as const;
+
+export const getStorageMoveObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageMoveObject>>, TError,StorageMoveObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageMoveObject>>, TError,StorageMoveObjectMutationVariables, TContext> => {
+
+const mutationKey = getStorageMoveObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageMoveObject>>, StorageMoveObjectMutationVariables> = (props) => {
+          const {id,branchId,data,params} = props ?? {};
+
+          return  storageMoveObject(id,branchId,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageMoveObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storageMoveObject>>>
+    export type StorageMoveObjectMutationBody = unknown
+    export type StorageMoveObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StorageMoveObjectMutationVariables = {id: string;branchId: string;data: unknown;params?: StorageMoveObjectParams}
+
+    /**
+ * @summary Move an object as a role
+ */
+export const useStorageMoveObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageMoveObject>>, TError,StorageMoveObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageMoveObject>>,
+        TError,
+        StorageMoveObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageMoveObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageResolveObjectsUrl = (id: string,
+    branchId: string,
+    params?: StorageResolveObjectsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/resolve?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/resolve`
+}
+
+/**
+ * Storage's `POST /storage/v1/object/resolve` as the role: `{"refs": [...], "expires_in"?}`, at most 1000 refs, each `{bucket_id, name}`, `{bucket, name}` or `{id}`. For each ref, in order: a signed download URL when the role can read the bucket and the object (row level security), the public URL when the bucket is public, and `null` when it can't read it (missing or hidden alike). `expires_in` is 1 to 3600 seconds (default 3600). A signed URL works while it is the object's current version and while you hold the role at Developer on the database (Admin for one resolved in owner mode): one resolved as a role you hold only at Viewer is refused when opened. Needs the role held at Viewer.
+ * @summary Resolve object refs to URLs as a role
+ */
+export const storageResolveObjects = async (id: string,
+    branchId: string,
+    storageResolveObjectsBody: unknown,
+    params?: StorageResolveObjectsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageResolveObjectsUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageResolveObjectsBody)
+  }
+);}
+
+
+
+
+
+export const getStorageResolveObjectsMutationKey = () => ['storageResolveObjects'] as const;
+
+export const getStorageResolveObjectsMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext> => {
+
+const mutationKey = getStorageResolveObjectsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageResolveObjects>>, StorageResolveObjectsMutationVariables> = (props) => {
+          const {id,branchId,data,params} = props ?? {};
+
+          return  storageResolveObjects(id,branchId,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageResolveObjectsMutationResult = NonNullable<Awaited<ReturnType<typeof storageResolveObjects>>>
+    export type StorageResolveObjectsMutationBody = unknown
+    export type StorageResolveObjectsMutationError = ErrorType<ErrorEnvelope>
+    export type StorageResolveObjectsMutationVariables = {id: string;branchId: string;data: unknown;params?: StorageResolveObjectsParams}
+
+    /**
+ * @summary Resolve object refs to URLs as a role
+ */
+export const useStorageResolveObjects = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageResolveObjects>>, TError,StorageResolveObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageResolveObjects>>,
+        TError,
+        StorageResolveObjectsMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageResolveObjectsMutationOptions(options), queryClient);
+    }
+
+export const getStorageSignObjectUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageSignObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/sign/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/sign/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's signed download URL, minted as the role (it must be able to read the object). `expires_in` is 1 to 3600 seconds (default 3600). The URL works while it is the object's current version and while you still hold the role at Developer on the database; it stops when you are removed or the role's level drops below Developer. Needs the role held at Developer.
+ * @summary Create a signed download URL as a role
+ */
+export const storageSignObject = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    storageSignObjectBody: unknown,
+    params?: StorageSignObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageSignObjectUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageSignObjectBody)
+  }
+);}
+
+
+
+
+
+export const getStorageSignObjectMutationKey = () => ['storageSignObject'] as const;
+
+export const getStorageSignObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageSignObject>>, TError,StorageSignObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageSignObject>>, TError,StorageSignObjectMutationVariables, TContext> => {
+
+const mutationKey = getStorageSignObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageSignObject>>, StorageSignObjectMutationVariables> = (props) => {
+          const {id,branchId,bucket,name,data,params} = props ?? {};
+
+          return  storageSignObject(id,branchId,bucket,name,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageSignObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storageSignObject>>>
+    export type StorageSignObjectMutationBody = unknown
+    export type StorageSignObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StorageSignObjectMutationVariables = {id: string;branchId: string;bucket: string;name: string;data: unknown;params?: StorageSignObjectParams}
+
+    /**
+ * @summary Create a signed download URL as a role
+ */
+export const useStorageSignObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageSignObject>>, TError,StorageSignObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageSignObject>>,
+        TError,
+        StorageSignObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageSignObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageDeleteObjectsUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    params?: StorageDeleteObjectsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}`
+}
+
+/**
+ * Storage's delete-many (`{"names": [...]}`) as the role. Needs the role held at Developer.
+ * @summary Delete several objects as a role
+ */
+export const storageDeleteObjects = async (id: string,
+    branchId: string,
+    bucket: string,
+    storageDeleteObjectsBody: unknown,
+    params?: StorageDeleteObjectsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageDeleteObjectsUrl(id,branchId,bucket,params),
+  {
+    ...options,
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageDeleteObjectsBody)
+  }
+);}
+
+
+
+
+
+export const getStorageDeleteObjectsMutationKey = () => ['storageDeleteObjects'] as const;
+
+export const getStorageDeleteObjectsMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObjects>>, TError,StorageDeleteObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObjects>>, TError,StorageDeleteObjectsMutationVariables, TContext> => {
+
+const mutationKey = getStorageDeleteObjectsMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageDeleteObjects>>, StorageDeleteObjectsMutationVariables> = (props) => {
+          const {id,branchId,bucket,data,params} = props ?? {};
+
+          return  storageDeleteObjects(id,branchId,bucket,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageDeleteObjectsMutationResult = NonNullable<Awaited<ReturnType<typeof storageDeleteObjects>>>
+    export type StorageDeleteObjectsMutationBody = unknown
+    export type StorageDeleteObjectsMutationError = ErrorType<ErrorEnvelope>
+    export type StorageDeleteObjectsMutationVariables = {id: string;branchId: string;bucket: string;data: unknown;params?: StorageDeleteObjectsParams}
+
+    /**
+ * @summary Delete several objects as a role
+ */
+export const useStorageDeleteObjects = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObjects>>, TError,StorageDeleteObjectsMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageDeleteObjects>>,
+        TError,
+        StorageDeleteObjectsMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageDeleteObjectsMutationOptions(options), queryClient);
+    }
+
+export const getStorageDownloadObjectUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's download as the role, streamed (`Range` and `If-None-Match` pass through). Needs the role held at Viewer.
+ * @summary Download an object as a role
+ */
+export const storageDownloadObject = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<Blob> => {
+
+  return customFetch<Blob>(getStorageDownloadObjectUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageDownloadObjectQueryKey = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/storage/object/${bucket}/${name}`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getStorageDownloadObjectQueryOptions = <TData = Awaited<ReturnType<typeof storageDownloadObject>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStorageDownloadObjectQueryKey(id,branchId,bucket,name,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof storageDownloadObject>>> = ({ signal }) => storageDownloadObject(id,branchId,bucket,name,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && bucket !== null && bucket !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type StorageDownloadObjectQueryResult = NonNullable<Awaited<ReturnType<typeof storageDownloadObject>>>
+export type StorageDownloadObjectQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useStorageDownloadObject<TData = Awaited<ReturnType<typeof storageDownloadObject>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params: undefined |  StorageDownloadObjectParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageDownloadObject>>,
+          TError,
+          Awaited<ReturnType<typeof storageDownloadObject>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageDownloadObject<TData = Awaited<ReturnType<typeof storageDownloadObject>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageDownloadObject>>,
+          TError,
+          Awaited<ReturnType<typeof storageDownloadObject>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageDownloadObject<TData = Awaited<ReturnType<typeof storageDownloadObject>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Download an object as a role
+ */
+
+export function useStorageDownloadObject<TData = Awaited<ReturnType<typeof storageDownloadObject>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDownloadObjectParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageDownloadObject>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getStorageDownloadObjectQueryOptions(id,branchId,bucket,name,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getStoragePutObjectUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StoragePutObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * As the POST upload. Needs the role held at Developer.
+ * @summary Upload an object as a role (PUT)
+ */
+export const storagePutObject = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    storagePutObjectBody: Blob,
+    params?: StoragePutObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStoragePutObjectUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/octet-stream', ...getHeaders(options?.headers) },
+    body: storagePutObjectBody
+  }
+);}
+
+
+
+
+
+export const getStoragePutObjectMutationKey = () => ['storagePutObject'] as const;
+
+export const getStoragePutObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storagePutObject>>, TError,StoragePutObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storagePutObject>>, TError,StoragePutObjectMutationVariables, TContext> => {
+
+const mutationKey = getStoragePutObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storagePutObject>>, StoragePutObjectMutationVariables> = (props) => {
+          const {id,branchId,bucket,name,data,params} = props ?? {};
+
+          return  storagePutObject(id,branchId,bucket,name,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StoragePutObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storagePutObject>>>
+    export type StoragePutObjectMutationBody = Blob
+    export type StoragePutObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StoragePutObjectMutationVariables = {id: string;branchId: string;bucket: string;name: string;data: Blob;params?: StoragePutObjectParams}
+
+    /**
+ * @summary Upload an object as a role (PUT)
+ */
+export const useStoragePutObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storagePutObject>>, TError,StoragePutObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storagePutObject>>,
+        TError,
+        StoragePutObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStoragePutObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageUploadObjectUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageUploadObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's streamed upload as the role, with no body cap here (the bucket's limits apply). `x-upsert: true` or `?upsert=true` replaces an existing object. Needs the role held at Developer.
+ * @summary Upload an object as a role
+ */
+export const storageUploadObject = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    storageUploadObjectBody: Blob,
+    params?: StorageUploadObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageUploadObjectUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', ...getHeaders(options?.headers) },
+    body: storageUploadObjectBody
+  }
+);}
+
+
+
+
+
+export const getStorageUploadObjectMutationKey = () => ['storageUploadObject'] as const;
+
+export const getStorageUploadObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUploadObject>>, TError,StorageUploadObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageUploadObject>>, TError,StorageUploadObjectMutationVariables, TContext> => {
+
+const mutationKey = getStorageUploadObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageUploadObject>>, StorageUploadObjectMutationVariables> = (props) => {
+          const {id,branchId,bucket,name,data,params} = props ?? {};
+
+          return  storageUploadObject(id,branchId,bucket,name,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageUploadObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storageUploadObject>>>
+    export type StorageUploadObjectMutationBody = Blob
+    export type StorageUploadObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StorageUploadObjectMutationVariables = {id: string;branchId: string;bucket: string;name: string;data: Blob;params?: StorageUploadObjectParams}
+
+    /**
+ * @summary Upload an object as a role
+ */
+export const useStorageUploadObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUploadObject>>, TError,StorageUploadObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageUploadObject>>,
+        TError,
+        StorageUploadObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageUploadObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageDeleteObjectUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDeleteObjectParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/object/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's delete as the role. Needs the role held at Developer.
+ * @summary Delete an object as a role
+ */
+export const storageDeleteObject = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageDeleteObjectParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+  return customFetch<unknown>(getStorageDeleteObjectUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageDeleteObjectMutationKey = () => ['storageDeleteObject'] as const;
+
+export const getStorageDeleteObjectMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObject>>, TError,StorageDeleteObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObject>>, TError,StorageDeleteObjectMutationVariables, TContext> => {
+
+const mutationKey = getStorageDeleteObjectMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageDeleteObject>>, StorageDeleteObjectMutationVariables> = (props) => {
+          const {id,branchId,bucket,name,params} = props ?? {};
+
+          return  storageDeleteObject(id,branchId,bucket,name,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageDeleteObjectMutationResult = NonNullable<Awaited<ReturnType<typeof storageDeleteObject>>>
+
+    export type StorageDeleteObjectMutationError = ErrorType<ErrorEnvelope>
+    export type StorageDeleteObjectMutationVariables = {id: string;branchId: string;bucket: string;name: string;params?: StorageDeleteObjectParams}
+
+    /**
+ * @summary Delete an object as a role
+ */
+export const useStorageDeleteObject = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageDeleteObject>>, TError,StorageDeleteObjectMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageDeleteObject>>,
+        TError,
+        StorageDeleteObjectMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageDeleteObjectMutationOptions(options), queryClient);
+    }
+
+export const getStorageListPartsUrl = (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}`
+}
+
+/**
+ * Needs the role held at Developer.
+ * @summary List a resumable upload's parts
+ */
+export const storageListParts = async (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+  return customFetch<unknown>(getStorageListPartsUrl(id,branchId,session,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageListPartsQueryKey = (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/storage/upload/session/${session}`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getStorageListPartsQueryOptions = <TData = Awaited<ReturnType<typeof storageListParts>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getStorageListPartsQueryKey(id,branchId,session,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof storageListParts>>> = ({ signal }) => storageListParts(id,branchId,session,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && session !== null && session !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type StorageListPartsQueryResult = NonNullable<Awaited<ReturnType<typeof storageListParts>>>
+export type StorageListPartsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useStorageListParts<TData = Awaited<ReturnType<typeof storageListParts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    session: string,
+    params: undefined |  StorageListPartsParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageListParts>>,
+          TError,
+          Awaited<ReturnType<typeof storageListParts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageListParts<TData = Awaited<ReturnType<typeof storageListParts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof storageListParts>>,
+          TError,
+          Awaited<ReturnType<typeof storageListParts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useStorageListParts<TData = Awaited<ReturnType<typeof storageListParts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a resumable upload's parts
+ */
+
+export function useStorageListParts<TData = Awaited<ReturnType<typeof storageListParts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    session: string,
+    params?: StorageListPartsParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof storageListParts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getStorageListPartsQueryOptions(id,branchId,session,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getStorageAbortUploadUrl = (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageAbortUploadParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}`
+}
+
+/**
+ * Needs the role held at Developer.
+ * @summary Abort a resumable upload
+ */
+export const storageAbortUpload = async (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageAbortUploadParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+  return customFetch<unknown>(getStorageAbortUploadUrl(id,branchId,session,params),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getStorageAbortUploadMutationKey = () => ['storageAbortUpload'] as const;
+
+export const getStorageAbortUploadMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageAbortUpload>>, TError,StorageAbortUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageAbortUpload>>, TError,StorageAbortUploadMutationVariables, TContext> => {
+
+const mutationKey = getStorageAbortUploadMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageAbortUpload>>, StorageAbortUploadMutationVariables> = (props) => {
+          const {id,branchId,session,params} = props ?? {};
+
+          return  storageAbortUpload(id,branchId,session,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageAbortUploadMutationResult = NonNullable<Awaited<ReturnType<typeof storageAbortUpload>>>
+
+    export type StorageAbortUploadMutationError = ErrorType<ErrorEnvelope>
+    export type StorageAbortUploadMutationVariables = {id: string;branchId: string;session: string;params?: StorageAbortUploadParams}
+
+    /**
+ * @summary Abort a resumable upload
+ */
+export const useStorageAbortUpload = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageAbortUpload>>, TError,StorageAbortUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageAbortUpload>>,
+        TError,
+        StorageAbortUploadMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageAbortUploadMutationOptions(options), queryClient);
+    }
+
+export const getStorageCompleteUploadUrl = (id: string,
+    branchId: string,
+    session: string,
+    params?: StorageCompleteUploadParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}/complete?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}/complete`
+}
+
+/**
+ * Writes the object as the role (row level security decides). Needs the role held at Developer.
+ * @summary Complete a resumable upload
+ */
+export const storageCompleteUpload = async (id: string,
+    branchId: string,
+    session: string,
+    storageCompleteUploadBody: unknown,
+    params?: StorageCompleteUploadParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageCompleteUploadUrl(id,branchId,session,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageCompleteUploadBody)
+  }
+);}
+
+
+
+
+
+export const getStorageCompleteUploadMutationKey = () => ['storageCompleteUpload'] as const;
+
+export const getStorageCompleteUploadMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCompleteUpload>>, TError,StorageCompleteUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageCompleteUpload>>, TError,StorageCompleteUploadMutationVariables, TContext> => {
+
+const mutationKey = getStorageCompleteUploadMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageCompleteUpload>>, StorageCompleteUploadMutationVariables> = (props) => {
+          const {id,branchId,session,data,params} = props ?? {};
+
+          return  storageCompleteUpload(id,branchId,session,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageCompleteUploadMutationResult = NonNullable<Awaited<ReturnType<typeof storageCompleteUpload>>>
+    export type StorageCompleteUploadMutationBody = unknown
+    export type StorageCompleteUploadMutationError = ErrorType<ErrorEnvelope>
+    export type StorageCompleteUploadMutationVariables = {id: string;branchId: string;session: string;data: unknown;params?: StorageCompleteUploadParams}
+
+    /**
+ * @summary Complete a resumable upload
+ */
+export const useStorageCompleteUpload = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCompleteUpload>>, TError,StorageCompleteUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageCompleteUpload>>,
+        TError,
+        StorageCompleteUploadMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageCompleteUploadMutationOptions(options), queryClient);
+    }
+
+export const getStorageUploadPartUrl = (id: string,
+    branchId: string,
+    session: string,
+    part: number,
+    params?: StorageUploadPartParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}/${encodeURIComponent(String(part))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/session/${encodeURIComponent(String(session))}/${encodeURIComponent(String(part))}`
+}
+
+/**
+ * One part (5 MiB to 100 MiB, the last may be smaller), streamed with no body cap here. Needs the role held at Developer.
+ * @summary Upload one part of a resumable upload
+ */
+export const storageUploadPart = async (id: string,
+    branchId: string,
+    session: string,
+    part: number,
+    storageUploadPartBody: Blob,
+    params?: StorageUploadPartParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageUploadPartUrl(id,branchId,session,part,params),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/octet-stream', ...getHeaders(options?.headers) },
+    body: storageUploadPartBody
+  }
+);}
+
+
+
+
+
+export const getStorageUploadPartMutationKey = () => ['storageUploadPart'] as const;
+
+export const getStorageUploadPartMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUploadPart>>, TError,StorageUploadPartMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageUploadPart>>, TError,StorageUploadPartMutationVariables, TContext> => {
+
+const mutationKey = getStorageUploadPartMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageUploadPart>>, StorageUploadPartMutationVariables> = (props) => {
+          const {id,branchId,session,part,data,params} = props ?? {};
+
+          return  storageUploadPart(id,branchId,session,part,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageUploadPartMutationResult = NonNullable<Awaited<ReturnType<typeof storageUploadPart>>>
+    export type StorageUploadPartMutationBody = Blob
+    export type StorageUploadPartMutationError = ErrorType<ErrorEnvelope>
+    export type StorageUploadPartMutationVariables = {id: string;branchId: string;session: string;part: number;data: Blob;params?: StorageUploadPartParams}
+
+    /**
+ * @summary Upload one part of a resumable upload
+ */
+export const useStorageUploadPart = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageUploadPart>>, TError,StorageUploadPartMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageUploadPart>>,
+        TError,
+        StorageUploadPartMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageUploadPartMutationOptions(options), queryClient);
+    }
+
+export const getStorageCreateUploadUrl = (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    params?: StorageCreateUploadParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/upload/${encodeURIComponent(String(bucket))}/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Storage's resumable upload session, yours alone. Needs the role held at Developer.
+ * @summary Start a resumable upload as a role
+ */
+export const storageCreateUpload = async (id: string,
+    branchId: string,
+    bucket: string,
+    name: string,
+    storageCreateUploadBody: unknown,
+    params?: StorageCreateUploadParams, options?: Parameters<typeof customFetch>[1]): Promise<unknown> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<unknown>(getStorageCreateUploadUrl(id,branchId,bucket,name,params),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(storageCreateUploadBody)
+  }
+);}
+
+
+
+
+
+export const getStorageCreateUploadMutationKey = () => ['storageCreateUpload'] as const;
+
+export const getStorageCreateUploadMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCreateUpload>>, TError,StorageCreateUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof storageCreateUpload>>, TError,StorageCreateUploadMutationVariables, TContext> => {
+
+const mutationKey = getStorageCreateUploadMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof storageCreateUpload>>, StorageCreateUploadMutationVariables> = (props) => {
+          const {id,branchId,bucket,name,data,params} = props ?? {};
+
+          return  storageCreateUpload(id,branchId,bucket,name,data,params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type StorageCreateUploadMutationResult = NonNullable<Awaited<ReturnType<typeof storageCreateUpload>>>
+    export type StorageCreateUploadMutationBody = unknown
+    export type StorageCreateUploadMutationError = ErrorType<ErrorEnvelope>
+    export type StorageCreateUploadMutationVariables = {id: string;branchId: string;bucket: string;name: string;data: unknown;params?: StorageCreateUploadParams}
+
+    /**
+ * @summary Start a resumable upload as a role
+ */
+export const useStorageCreateUpload = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof storageCreateUpload>>, TError,StorageCreateUploadMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof storageCreateUpload>>,
+        TError,
+        StorageCreateUploadMutationVariables,
+        TContext
+      > => {
+      return useMutation(getStorageCreateUploadMutationOptions(options), queryClient);
+    }
+
 export const getGetTableUrl = (id: string,
     branchId: string,
     schema: string,
@@ -7130,6 +9161,741 @@ export const useUpdateSavedQuery = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getUpdateSavedQueryMutationOptions(options), queryClient);
+    }
+
+export const getListStorageWebhooksUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks`
+}
+
+/**
+ * The database's webhook endpoints for storage object events (never their secrets).
+ * @summary List storage webhooks
+ */
+export const listStorageWebhooks = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook[]> => {
+
+  return customFetch<StorageWebhook[]>(getListStorageWebhooksUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListStorageWebhooksQueryKey = (id: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks`
+    ] as const;
+    }
+
+
+export const getListStorageWebhooksQueryOptions = <TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListStorageWebhooksQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listStorageWebhooks>>> = ({ signal }) => listStorageWebhooks(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListStorageWebhooksQueryResult = NonNullable<Awaited<ReturnType<typeof listStorageWebhooks>>>
+export type ListStorageWebhooksQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhooks>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhooks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhooks>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhooks>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List storage webhooks
+ */
+
+export function useListStorageWebhooks<TData = Awaited<ReturnType<typeof listStorageWebhooks>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhooks>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListStorageWebhooksQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateStorageWebhookUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks`
+}
+
+/**
+ * Registers an endpoint for the database's storage object events (every branch's, made through the storage API; changes made with SQL directly on `storage.objects` send none). Each event is POSTed as JSON, signed with `Chelabase-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, at least once, retried with backoff for up to 24 hours. A database keeps at most 100,000 undelivered events: past that its oldest events are dropped unsent. The secret is in this response only. A database has at most 20 endpoints.
+ * @summary Create a storage webhook
+ */
+export const createStorageWebhook = async (id: string,
+    createStorageWebhookRequest: CreateStorageWebhookRequest, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookWithSecret> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<StorageWebhookWithSecret>(getCreateStorageWebhookUrl(id),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createStorageWebhookRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateStorageWebhookMutationKey = () => ['createStorageWebhook'] as const;
+
+export const getCreateStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getCreateStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createStorageWebhook>>, CreateStorageWebhookMutationVariables> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  createStorageWebhook(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof createStorageWebhook>>>
+    export type CreateStorageWebhookMutationBody = CreateStorageWebhookRequest
+    export type CreateStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type CreateStorageWebhookMutationVariables = {id: string;data: CreateStorageWebhookRequest}
+
+    /**
+ * @summary Create a storage webhook
+ */
+export const useCreateStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createStorageWebhook>>, TError,CreateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createStorageWebhook>>,
+        TError,
+        CreateStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getGetStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * One endpoint, with its failure state (never its secret).
+ * @summary Get a storage webhook
+ */
+export const getStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook> => {
+
+  return customFetch<StorageWebhook>(getGetStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetStorageWebhookQueryKey = (id: string,
+    webhookId: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks/${webhookId}`
+    ] as const;
+    }
+
+
+export const getGetStorageWebhookQueryOptions = <TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetStorageWebhookQueryKey(id,webhookId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getStorageWebhook>>> = ({ signal }) => getStorageWebhook(id,webhookId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && webhookId !== null && webhookId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetStorageWebhookQueryResult = NonNullable<Awaited<ReturnType<typeof getStorageWebhook>>>
+export type GetStorageWebhookQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStorageWebhook>>,
+          TError,
+          Awaited<ReturnType<typeof getStorageWebhook>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStorageWebhook>>,
+          TError,
+          Awaited<ReturnType<typeof getStorageWebhook>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Get a storage webhook
+ */
+
+export function useGetStorageWebhook<TData = Awaited<ReturnType<typeof getStorageWebhook>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStorageWebhook>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetStorageWebhookQueryOptions(id,webhookId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getDeleteStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * Deletes the endpoint and its attempts; deliveries in flight stop within seconds.
+ * @summary Delete a storage webhook
+ */
+export const deleteStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteStorageWebhookMutationKey = () => ['deleteStorageWebhook'] as const;
+
+export const getDeleteStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getDeleteStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteStorageWebhook>>, DeleteStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  deleteStorageWebhook(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof deleteStorageWebhook>>>
+
+    export type DeleteStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteStorageWebhookMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Delete a storage webhook
+ */
+export const useDeleteStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteStorageWebhook>>, TError,DeleteStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteStorageWebhook>>,
+        TError,
+        DeleteStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getUpdateStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}`
+}
+
+/**
+ * Changes the given fields. `bucket` and `prefix` accept `null` to clear them. Enabling a disabled endpoint restarts delivery from now and clears its failure state.
+ * @summary Update a storage webhook
+ */
+export const updateStorageWebhook = async (id: string,
+    webhookId: string,
+    updateStorageWebhookRequest: UpdateStorageWebhookRequest, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhook> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<StorageWebhook>(getUpdateStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateStorageWebhookRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateStorageWebhookMutationKey = () => ['updateStorageWebhook'] as const;
+
+export const getUpdateStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getUpdateStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateStorageWebhook>>, UpdateStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId,data} = props ?? {};
+
+          return  updateStorageWebhook(id,webhookId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof updateStorageWebhook>>>
+    export type UpdateStorageWebhookMutationBody = UpdateStorageWebhookRequest
+    export type UpdateStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateStorageWebhookMutationVariables = {id: string;webhookId: string;data: UpdateStorageWebhookRequest}
+
+    /**
+ * @summary Update a storage webhook
+ */
+export const useUpdateStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateStorageWebhook>>, TError,UpdateStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateStorageWebhook>>,
+        TError,
+        UpdateStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateStorageWebhookMutationOptions(options), queryClient);
+    }
+
+export const getListStorageWebhookAttemptsUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/attempts`
+}
+
+/**
+ * The endpoint's newest delivery attempts (at most 100), newest first: status and duration only.
+ * @summary List a storage webhook's recent attempts
+ */
+export const listStorageWebhookAttempts = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookAttempt[]> => {
+
+  return customFetch<StorageWebhookAttempt[]>(getListStorageWebhookAttemptsUrl(id,webhookId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListStorageWebhookAttemptsQueryKey = (id: string,
+    webhookId: string,) => {
+    return [
+    `/v1/databases/${id}/storage/webhooks/${webhookId}/attempts`
+    ] as const;
+    }
+
+
+export const getListStorageWebhookAttemptsQueryOptions = <TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListStorageWebhookAttemptsQueryKey(id,webhookId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listStorageWebhookAttempts>>> = ({ signal }) => listStorageWebhookAttempts(id,webhookId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && webhookId !== null && webhookId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListStorageWebhookAttemptsQueryResult = NonNullable<Awaited<ReturnType<typeof listStorageWebhookAttempts>>>
+export type ListStorageWebhookAttemptsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>,
+          TError,
+          Awaited<ReturnType<typeof listStorageWebhookAttempts>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a storage webhook's recent attempts
+ */
+
+export function useListStorageWebhookAttempts<TData = Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    webhookId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listStorageWebhookAttempts>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListStorageWebhookAttemptsQueryOptions(id,webhookId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getRotateStorageWebhookSecretUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/rotate-secret`
+}
+
+/**
+ * Replaces the signing secret; deliveries are signed with the new one within seconds. The new secret is in this response only.
+ * @summary Rotate a storage webhook's secret
+ */
+export const rotateStorageWebhookSecret = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookWithSecret> => {
+
+  return customFetch<StorageWebhookWithSecret>(getRotateStorageWebhookSecretUrl(id,webhookId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getRotateStorageWebhookSecretMutationKey = () => ['rotateStorageWebhookSecret'] as const;
+
+export const getRotateStorageWebhookSecretMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext> => {
+
+const mutationKey = getRotateStorageWebhookSecretMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, RotateStorageWebhookSecretMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  rotateStorageWebhookSecret(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RotateStorageWebhookSecretMutationResult = NonNullable<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>>
+
+    export type RotateStorageWebhookSecretMutationError = ErrorType<ErrorEnvelope>
+    export type RotateStorageWebhookSecretMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Rotate a storage webhook's secret
+ */
+export const useRotateStorageWebhookSecret = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof rotateStorageWebhookSecret>>, TError,RotateStorageWebhookSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof rotateStorageWebhookSecret>>,
+        TError,
+        RotateStorageWebhookSecretMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRotateStorageWebhookSecretMutationOptions(options), queryClient);
+    }
+
+export const getTestStorageWebhookUrl = (id: string,
+    webhookId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/storage/webhooks/${encodeURIComponent(String(webhookId))}/test`
+}
+
+/**
+ * Sends one signed `webhook.test` event now (enabled or not), without retries and without counting toward the endpoint's failures, and answers how it went.
+ * @summary Send a test event to a storage webhook
+ */
+export const testStorageWebhook = async (id: string,
+    webhookId: string, options?: Parameters<typeof customFetch>[1]): Promise<StorageWebhookTestResult> => {
+
+  return customFetch<StorageWebhookTestResult>(getTestStorageWebhookUrl(id,webhookId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getTestStorageWebhookMutationKey = () => ['testStorageWebhook'] as const;
+
+export const getTestStorageWebhookMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext> => {
+
+const mutationKey = getTestStorageWebhookMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof testStorageWebhook>>, TestStorageWebhookMutationVariables> = (props) => {
+          const {id,webhookId} = props ?? {};
+
+          return  testStorageWebhook(id,webhookId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type TestStorageWebhookMutationResult = NonNullable<Awaited<ReturnType<typeof testStorageWebhook>>>
+
+    export type TestStorageWebhookMutationError = ErrorType<ErrorEnvelope>
+    export type TestStorageWebhookMutationVariables = {id: string;webhookId: string}
+
+    /**
+ * @summary Send a test event to a storage webhook
+ */
+export const useTestStorageWebhook = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof testStorageWebhook>>, TError,TestStorageWebhookMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof testStorageWebhook>>,
+        TError,
+        TestStorageWebhookMutationVariables,
+        TContext
+      > => {
+      return useMutation(getTestStorageWebhookMutationOptions(options), queryClient);
     }
 
 export const getGetInstanceSettingsUrl = () => {

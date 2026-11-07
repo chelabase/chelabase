@@ -16,6 +16,9 @@ pub struct InternalConfig {
     /// `CHELABASE_REALTIME_INTERNAL_TOKEN[_FILE]`: realtime's bearer (its `/internal/realtime/*`
     /// routes, and connection info and key lookups here).
     pub realtime_token: String,
+    /// `CHELABASE_STORAGE_INTERNAL_TOKEN[_FILE]`: the storage service's bearer (its login's
+    /// connection info, and the data connection info its role sessions use).
+    pub storage_token: String,
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
     pub compute_network: String,
@@ -53,7 +56,7 @@ pub struct InternalConfig {
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
 /// instance refuses each, [`InternalConfig::check_mode`]).
-pub const DEV_BEARERS: [(&str, &str); 7] = chelabase_types::dev_defaults::DEV_BEARERS;
+pub const DEV_BEARERS: [(&str, &str); 8] = chelabase_types::dev_defaults::DEV_BEARERS;
 
 /// A session never lasts longer than this after it was created (and so neither can a refresh).
 pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -113,6 +116,7 @@ impl InternalConfig {
             valkey_url: or("CHELABASE_VALKEY_URL", "redis://127.0.0.1:6379"),
             app_auth_token: secret(DEV_BEARERS[5].0, DEV_BEARERS[5].1)?,
             app_sessions_token: secret(DEV_BEARERS[6].0, DEV_BEARERS[6].1)?,
+            storage_token: secret(DEV_BEARERS[7].0, DEV_BEARERS[7].1)?,
             app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
             dev_defaults: chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
                 .map_err(|e| anyhow!(e))?,
@@ -134,7 +138,7 @@ impl InternalConfig {
     }
 
     /// Every bearer the internal listener checks, with its variable, in [`DEV_BEARERS`]' order.
-    fn bearers(&self) -> [(&'static str, &str); 7] {
+    fn bearers(&self) -> [(&'static str, &str); 8] {
         let values = [
             self.proxy_token.as_str(),
             self.storcon_token.as_str(),
@@ -143,6 +147,7 @@ impl InternalConfig {
             self.realtime_token.as_str(),
             self.app_auth_token.as_str(),
             self.app_sessions_token.as_str(),
+            self.storage_token.as_str(),
         ];
         std::array::from_fn(|i| (DEV_BEARERS[i].0, values[i]))
     }
@@ -220,6 +225,7 @@ impl std::fmt::Debug for InternalConfig {
             .field("data_keys_token", &"<redacted>")
             .field("rest_token", &"<redacted>")
             .field("realtime_token", &"<redacted>")
+            .field("storage_token", &"<redacted>")
             .field("storcon_url", &self.storcon_url)
             .field("compute_jwt_dir", &self.compute_jwt_dir)
             .field("compute_network", &self.compute_network)

@@ -12,7 +12,10 @@ const DEFAULTS = {
   max_rows: 1000,
   statement_timeout_ms: 8000,
   max_connections: 5,
+  storage_max_connections: 2,
 };
+// What a save sends: every setting the form edits, storage's connection budget included (#103).
+const SENT = DEFAULTS;
 
 const PATCH = "PATCH /v1/databases/db";
 
@@ -53,7 +56,7 @@ describe("DatabaseSettings", () => {
     await userEvent.type(cap, "3");
     await userEvent.click(save());
     await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, history_window: 43200, max_branches: 3 }));
-    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, history_window: 43200, max_branches: 3 }]);
+    expect(await patches(fetch)).toEqual([{ ...SENT, history_window: 43200, max_branches: 3 }]);
     expect(await screen.findByRole("status")).toHaveTextContent("Saved.");
   });
 
@@ -115,7 +118,21 @@ describe("DatabaseSettings", () => {
     await userEvent.type(rows, "50");
     await userEvent.click(save());
     await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50 }));
-    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, max_rows: 50 }]);
+    expect(await patches(fetch)).toEqual([{ ...SENT, max_rows: 50 }]);
+  });
+
+  // #103 AC7: storage's connection budget sits next to the data API's max connections.
+  it("shows_and_saves_storage_connections", async () => {
+    const { fetch, onSaved } = setup(() => jsonResponse({ ...DEFAULTS, storage_max_connections: 7 }));
+    const storage = screen.getByLabelText("Storage connections");
+    expect(storage).toHaveValue(2);
+    expect(storage).toHaveAttribute("min", "1");
+    expect(storage).toHaveAttribute("max", "20");
+    await userEvent.clear(storage);
+    await userEvent.type(storage, "7");
+    await userEvent.click(save());
+    await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, storage_max_connections: 7 }));
+    expect(await patches(fetch)).toEqual([{ ...SENT, storage_max_connections: 7 }]);
   });
 
   it("refuses data API settings outside their bounds", async () => {
@@ -124,6 +141,7 @@ describe("DatabaseSettings", () => {
       ["Max rows", "100001", /Max rows must be a whole number between 1 and 100000/],
       ["Statement timeout (ms)", "99", /Statement timeout must be a whole number between 100 and 120000/],
       ["Max connections", "51", /Max connections must be a whole number between 1 and 50/],
+      ["Storage connections", "21", /Storage connections must be a whole number between 1 and 20/],
     ];
     for (const [label, value, message] of cases) {
       const input = screen.getByLabelText(label);

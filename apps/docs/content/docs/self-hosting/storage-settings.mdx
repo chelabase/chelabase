@@ -1,0 +1,57 @@
+---
+title: Storage settings
+description: Every CHELABASE_STORAGE_* and webhook setting, which service reads it, and its default.
+---
+
+The self-hosted install runs storage with working defaults; the [install page](/self-hosting/install) covers starting it, its secrets and the space its webhook events need. The settings that are `.env` tunables there are listed in `infra/compose/.env.example` under "Object storage". The object store settings are fixed in `docker-compose.yml` to the bundled SeaweedFS: to use another store, override them for both `storage` and `worker`, as [Using Amazon S3](/self-hosting/amazon-s3) shows.
+
+A blank value counts as unset. Durations marked *(duration)* take a number with a unit, such as `5s`, `90s` or `2m`.
+
+## The storage service
+
+| Variable | Read by | Default | What it does |
+|---|---|---|---|
+| `CHELABASE_STORAGE_ADDR` | storage | `127.0.0.1:8089` (`0.0.0.0:8089` in Compose) | The public listener, behind the gateway |
+| `CHELABASE_STORAGE_INTERNAL_ADDR` | storage | `127.0.0.1:8090` (`0.0.0.0:8090` in Compose) | The console listener, for the orchestrator only (Studio's storage routes) |
+| `CHELABASE_STORAGE_URL` | gateway | `http://127.0.0.1:8089` (`http://storage:8089` in Compose) | Where the gateway sends `/storage/v1` |
+| `CHELABASE_STORAGE_INTERNAL_URL` | orchestrator | `http://127.0.0.1:8090` (`http://storage:8090` in Compose) | Storage's console listener: `http(s)://host[:port]`, no path |
+| `CHELABASE_STORAGE_INTERNAL_TOKEN`, `CHELABASE_STORAGE_INTERNAL_TOKEN_FILE` | storage, orchestrator | the generated `tokens/storage-internal.token` | The bearer between them, both ways. Use the `_FILE` form. A public development value is refused unless `CHELABASE_DEV_DEFAULTS=1` |
+| `CHELABASE_STORAGE_MAX_CONNECTIONS` | storage | `200` | Connections storage opens to computes, across every branch. Each database also has its own budget, `storage_max_connections`, in Studio's database settings |
+| `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES` | storage | `1073741824` (1 GiB) | Upload buffers one storage process holds at once; past it, uploads get 503 `busy` |
+| `CHELABASE_STORAGE_BODY_IDLE_SECS` | storage | `60` (at least 1) | An upload whose body sends nothing for this many seconds fails with 408 `request_timeout` |
+| `CHELABASE_STORAGE_IMAGE_TAG` | Compose | `CHELABASE_IMAGE_TAG` | The storage image's tag alone, while it isn't published (see `.env.example`) |
+
+## The object store
+
+Read by **storage** and by the **worker** (its sweep). Set them the same on both.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CHELABASE_STORAGE_BACKEND` | `seaweedfs` | `seaweedfs` or `s3`. The two differ only in their defaults and in where credentials may come from |
+| `CHELABASE_STORAGE_S3_ENDPOINT` | `seaweedfs`: required (`http://seaweedfs:8333` in Compose); `s3`: AWS's own | The S3 endpoint URL |
+| `CHELABASE_STORAGE_S3_REGION` | `seaweedfs`: `us-east-1`; `s3`: required | The region requests are signed for |
+| `CHELABASE_STORAGE_S3_BUCKET` | required (`chelabase-storage` in Compose) | The one bucket every database's blobs go in |
+| `CHELABASE_STORAGE_S3_PATH_STYLE` | `seaweedfs`: `true`; `s3`: `false` | `true` for path-style addressing (`endpoint/bucket/key`), `false` for virtual-hosted (`bucket.endpoint/key`) |
+| `CHELABASE_STORAGE_S3_ACCESS_KEY_FILE`, `CHELABASE_STORAGE_S3_SECRET_KEY_FILE` | `seaweedfs`: required; `s3`: optional | Files holding the access key and secret key, read at start and again every five minutes, so a rotated file needs no restart. With `s3` and neither set, the AWS default chain is used: environment, web identity (IRSA), EKS Pod Identity, ECS, instance profile. Set both or neither |
+| `CHELABASE_STORAGE_S3_CONNECT_TIMEOUT` | `5s` *(duration)* | Connecting to the store |
+| `CHELABASE_STORAGE_S3_REQUEST_TIMEOUT` | `60s` *(duration)* | One attempt, up to the response's headers; it doesn't bound a body being streamed |
+| `CHELABASE_STORAGE_S3_STREAM_IDLE_TIMEOUT` | `30s` *(duration)* | The longest gap between two chunks of a streamed download |
+| `CHELABASE_STORAGE_S3_MAX_ATTEMPTS` | `3` (at least 1) | Attempts per request, retries included |
+
+A connection failure or a timeout is a transient error: requests are retried up to the attempt limit, then answer 502 `storage_error` or 503.
+
+## The sweep and webhooks
+
+| Variable | Read by | Default | What it does |
+|---|---|---|---|
+| `CHELABASE_STORAGE_SWEEP_SECS` | worker | `21600` (6 hours; 60 to 604800) | How often each database is swept |
+| `CHELABASE_STORAGE_SWEEP_GRACE_SECS` | worker | `691200` (8 days; the least allowed, at most 60 days) | How long a blob stays after nothing references it, before the restore window is added. See [the sweep](/architecture/storage#the-sweep) |
+| `CHELABASE_STORAGE_SWEEP_DRY_RUN` | worker | `false` | `true` counts and logs what a pass would delete, and deletes nothing |
+| `CHELABASE_WEBHOOKS_ALLOW_HOSTS` | orchestrator, worker | empty | Host names or IP literals, comma separated, no port, that webhooks may reach although they resolve to private addresses |
+| `CHELABASE_WEBHOOKS_ALLOW_HTTP` | orchestrator, worker | `false` | `true` also accepts `http` webhook URLs |
+
+## A name that isn't object storage
+
+`CHELABASE_STORAGE_TOKEN_REFRESH_SECS` (worker, default `3600`, 1 to 43200) is about Neon's storage, not object storage: how often each running compute gets a fresh token for the pageserver and safekeepers. See [Security](/architecture/security#compute-and-storage-tokens).
+
+`CHELABASE_STORAGE_EVENTS` isn't a setting: it's the name of the NATS stream that holds webhook events.

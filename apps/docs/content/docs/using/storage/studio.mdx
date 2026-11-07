@@ -1,0 +1,36 @@
+---
+title: Storage in Studio
+description: The Storage tab, acting as a role or as the owner, uploads, object references in the table editor, and live updates.
+---
+
+Each branch has a **Storage** tab in Studio. It works on the branch's main Postgres database and needs the [data API](/using/data-api) on there ("Storage needs the data API" otherwise).
+
+## Buckets and objects
+
+- **Buckets.** Create, change and delete buckets: public or private, a size limit, allowed types, write-once.
+- **The object browser.** Browse a bucket by folder, search, sort and page through it; preview images, video, audio, PDF and text; download, rename, move, copy and delete; copy a signed URL.
+- **Uploads.** Drag files or whole folders onto the browser, or pick them. Large files go up in parts (5 to 100 MiB each) through a resumable queue: a failed or interrupted upload resumes, and a name that's taken asks before replacing.
+- **The table editor.** [Object reference](/using/storage/refs) columns show the object, open a preview, and take an upload straight into the cell.
+
+## Who you act as
+
+Like the table editor and the SQL editor, the Storage tab runs every request as a role you pick in **Act as**, with optional claims, so you see the bucket exactly as that role does and your policies decide:
+
+- **A role.** A role your [grant](/using/roles-and-schema-isolation) names (or one its chain reaches); any other role is 403 before storage is called. Reading, listing and resolving need the role held at Viewer; uploads, changes, deletes and signed URLs need it at Developer.
+- **Owner** (no role). Admins of the database (tenant admins included) can act as the owner. Owner mode can do everything (list, download, upload, delete, move, copy, sign) past row-level security.
+
+Owner mode runs on storage's own database login, not on the owner's credentials, which never leave the orchestrator. That login bypasses row-level security but has rights only on the `storage` schema, and it's reachable only through Studio's routes, after the orchestrator has checked you're an Admin; it runs only storage's fixed statements, never your SQL. Objects uploaded in owner mode have no `owner`. Write-once buckets still refuse to overwrite or delete.
+
+Studio's routes check your access on every request, the same as the API: see the storage rows of the [access table](/reference/access).
+
+## Signed URLs from Studio
+
+**Copy signed URL** needs the role you act as held at Developer (Admin in owner mode). The URL lasts at most an hour, and works while the object's version is current and while you can still act as that role at Developer, or are still an Admin, for one made in owner mode: it stops when you're removed, when the granted role you reach it through drops to Viewer or leaves your grant, or when the role becomes Admin-only (owner-level, LOGIN or ADMIN).
+
+The table editor resolves object references through a route that needs only Viewer access, so a Viewer can see which references exist and are visible to their role, and preview through Studio's own download route. The signed URLs that route returns open only while you can act as that role at Developer, the same as **Copy signed URL**.
+
+## Live updates
+
+While the browser is open on a bucket, other people's uploads, overwrites, renames, moves and deletes in it appear within about a second, without a reload. They come over [realtime](/architecture/realtime)'s `storage:` channel, as keys only, checked against your acting role: an object your role can't list never appears, and never causes any signal, not even a "something changed" refresh. Changes in other buckets never reach you.
+
+When live updates can't run (no free replication slot, NATS down, the compute stopping), the browser says **Live updates paused** with the reason, and reloads when they come back.

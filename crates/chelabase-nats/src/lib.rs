@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub mod rt;
+pub mod storage_objects;
 
 #[cfg(test)]
 mod t4_tests;
@@ -61,6 +62,27 @@ pub const CONSUMER_APP_USERS: &str = "chelabase-worker-app-users";
 pub const SUBJECT_APP_USERS_SYNC: &str = "chelabase.app_users_sync";
 pub const CONSUMER_APP_USERS_SYNC: &str = "chelabase-worker-app-users-sync";
 
+/// Durable storage sweep jobs: one Chelabase database's orphaned blobs (object-storage m8).
+/// One token under `chelabase.`, like every control job: the services' publish right is
+/// `chelabase.*`.
+pub const SUBJECT_STORAGE_SWEEP: &str = "chelabase.storage_sweep";
+pub const CONSUMER_STORAGE_SWEEP: &str = "chelabase-worker-storage-sweep";
+
+/// Object storage's cache events (m9), core NATS (not JetStream), published by the
+/// orchestrator and heard by every storage replica (`chelabase.storage.>`): a data key revoked,
+/// rotated or its database list changed ([`StorageEvent::Key`]: its signed URLs' cached
+/// liveness goes), and a branch's settings changed ([`StorageEvent::Branch`]: its connection
+/// info and pools go). Lost events are covered by storage's own short cache lifetimes.
+pub const SUBJECT_STORAGE_EVENTS: &str = "chelabase.storage.events";
+
+/// What [`SUBJECT_STORAGE_EVENTS`] carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum StorageEvent {
+    Key { key_id: Uuid },
+    Branch { branch_id: Uuid },
+}
+
 /// Core request/reply (not JetStream): check a table can hold the app-users location.
 pub const SUBJECT_APP_USERS_CHECK: &str = "chelabase.rpc.app_users.check";
 
@@ -79,6 +101,19 @@ pub struct ProvisionDatabaseJob {
     pub project_id: ProjectId,
     pub tenant_id: TenantId,
     pub name: String,
+}
+
+/// Sweep one Chelabase database's blobs (or, once it is deleted, its whole prefix).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSweepJob {
+    pub database_id: DatabaseId,
+}
+
+/// The JetStream message id of a database's sweep job, `storage-sweep-{db}-{tag}`: the stream
+/// drops a second one with the same tag inside its duplicate window. The tag is the period
+/// (the periodic job), an event's id, or `purge`, so one kind never swallows another.
+pub fn storage_sweep_msg_id(database: DatabaseId, tag: &str) -> String {
+    format!("storage-sweep-{database}-{tag}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -992,6 +1027,7 @@ pub fn control_subjects() -> Vec<String> {
         SUBJECT_APP_USERS.to_string(),
         SUBJECT_APP_USERS_SYNC.to_string(),
         SUBJECT_MERGE.to_string(),
+        SUBJECT_STORAGE_SWEEP.to_string(),
     ]
 }
 
@@ -1561,6 +1597,46 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     run_consumer(js, CONSUMER_PROJECT_DELETE, SUBJECT_PROJECT_DELETE, handler).await
+}
+
+/// Queue a storage sweep of `job`'s database; one already queued inside the stream's duplicate
+/// window ([`storage_sweep_msg_id`]) makes this a no-op.
+pub async fn publish_storage_sweep(
+    js: &async_nats::jetstream::Context,
+    job: &StorageSweepJob,
+    tag: &str,
+) -> Result<(), NatsError> {
+    let envelope = JobEnvelope {
+        job_id: Uuid::new_v4(),
+        payload: job.clone(),
+    };
+    let payload = serde_json::to_vec(&envelope)?;
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Nats-Msg-Id", storage_sweep_msg_id(job.database_id, tag).as_str());
+    js.publish_with_headers(SUBJECT_STORAGE_SWEEP.to_string(), headers, payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the storage sweep consumer loop, calling `handler` for each job (one at a time) with
+/// its delivery attempt (1-based), so the handler can give up on a job that keeps failing.
+pub async fn run_storage_sweep_consumer<F, Fut>(
+    js: async_nats::jetstream::Context,
+    handler: F,
+) -> Result<(), NatsError>
+where
+    F: FnMut(JobEnvelope<StorageSweepJob>, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    consume(
+        js,
+        ConsumerSpec::control(CONSUMER_STORAGE_SWEEP, SUBJECT_STORAGE_SWEEP),
+        handler,
+    )
+    .await
 }
 
 /// Run the app users consumer loop, calling `handler` for each job.
@@ -2376,6 +2452,7 @@ mod tests {
                 SUBJECT_APP_USERS.to_string(),
                 SUBJECT_APP_USERS_SYNC.to_string(),
                 SUBJECT_MERGE.to_string(),
+                SUBJECT_STORAGE_SWEEP.to_string(),
             ]
         );
         assert!(missing_subjects(&control_subjects()).is_empty());
@@ -2404,8 +2481,31 @@ mod tests {
                 SUBJECT_APP_USERS.to_string(),
                 SUBJECT_APP_USERS_SYNC.to_string(),
                 SUBJECT_MERGE.to_string(),
+                SUBJECT_STORAGE_SWEEP.to_string(),
             ]
         );
+    }
+
+    // object-storage m8: one token under `chelabase.` (the services' `chelabase.*` publish
+    // right), on the control stream; one message id per database, so a burst of events for
+    // one database is one job.
+    #[test]
+    fn storage_sweep_jobs_are_control_jobs_deduplicated_per_database() {
+        assert_eq!(SUBJECT_STORAGE_SWEEP, "chelabase.storage_sweep");
+        assert_eq!(SUBJECT_STORAGE_SWEEP.matches('.').count(), 1);
+        assert_eq!(CONSUMER_STORAGE_SWEEP, "chelabase-worker-storage-sweep");
+        assert!(control_subjects().contains(&SUBJECT_STORAGE_SWEEP.to_string()));
+        let (a, b) = (DatabaseId::new(), DatabaseId::new());
+        assert_eq!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "7"));
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(b, "7"));
+        // Audit B2: a period's, an event's and a purge's ids never collide.
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "8"));
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "purge"));
+        assert_eq!(storage_sweep_msg_id(a, "purge"), format!("storage-sweep-{a}-purge"));
+        let job = StorageSweepJob { database_id: a };
+        let json = serde_json::to_value(&job).unwrap();
+        assert_eq!(json, serde_json::json!({ "database_id": a }));
+        assert_eq!(serde_json::from_value::<StorageSweepJob>(json).unwrap(), job);
     }
 
     #[test]

@@ -204,6 +204,7 @@ describe("parseSettings", () => {
     maxRows: "1000",
     statementTimeoutMs: "8000",
     maxConnections: "5",
+    storageMaxConnections: "2",
   };
   const parse = (over: Partial<typeof base> = {}) => parseSettings({ ...base, ...over });
 
@@ -216,6 +217,7 @@ describe("parseSettings", () => {
         max_rows: 1000,
         statement_timeout_ms: 8000,
         max_connections: 5,
+        storage_max_connections: 2,
       },
     });
     expect(parse({ window: "30", maxBranches: "0" })).toMatchObject({
@@ -241,6 +243,11 @@ describe("parseSettings", () => {
     expect(parse({ statementTimeoutMs: "100" })).toMatchObject({ ok: true });
     expect(parse({ statementTimeoutMs: "120000" })).toMatchObject({ ok: true });
     for (const v of ["99", "120001", "", "abc"]) expect(parse({ statementTimeoutMs: v })).toMatchObject({ ok: false, statementTimeoutMs: expect.any(String) });
+  });
+  it("enforces_storage_max_connections_1_to_20", () => {
+    expect(parse({ storageMaxConnections: "1" })).toMatchObject({ ok: true, settings: { storage_max_connections: 1 } });
+    expect(parse({ storageMaxConnections: "20" })).toMatchObject({ ok: true });
+    for (const v of ["0", "21", "", "2.5"]) expect(parse({ storageMaxConnections: v })).toMatchObject({ ok: false, storageMaxConnections: expect.any(String) });
   });
   it("enforces max_connections 1 to 50", () => {
     expect(parse({ maxConnections: "1" })).toMatchObject({ ok: true });

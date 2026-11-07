@@ -30,6 +30,7 @@ pub const SECRET_FILES: &[(&str, Kind)] = &[
     ("nats/worker.password", Kind::Text),
     ("nats/realtime.password", Kind::Text),
     ("nats/runner.password", Kind::Text),
+    ("nats/storage.password", Kind::Text),
     ("valkey/proxy.password", Kind::Text),
     ("valkey/control.password", Kind::Text),
     ("valkey/realtime.password", Kind::Text),
@@ -43,12 +44,13 @@ pub const SECRET_FILES: &[(&str, Kind)] = &[
     ("tokens/data-keys.token", Kind::Text),
     ("tokens/app-auth.token", Kind::Text),
     ("tokens/app-sessions.token", Kind::Text),
+    ("tokens/storage-internal.token", Kind::Text),
     ("tokens/proxy-api.token", Kind::Text),
     ("tokens/storcon-hook.token", Kind::Text),
 ];
 
-/// The NATS users, one per service plus the test runner.
-pub const NATS_USERS: [&str; 4] = ["orchestrator", "worker", "realtime", "runner"];
+/// The NATS users, one per service plus the test runner (`storage`: object storage m9).
+pub const NATS_USERS: [&str; 5] = ["orchestrator", "worker", "realtime", "runner", "storage"];
 /// The Valkey ACL users: the proxy, the control plane (orchestrator and worker), realtime, the
 /// test runner and the healthcheck.
 pub const VALKEY_USERS: [&str; 5] = ["proxy", "control", "realtime", "runner", "health"];

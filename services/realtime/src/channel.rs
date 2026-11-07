@@ -6,6 +6,12 @@
 //! - A project join is `{"channel":"project:<uuid>"}`; its id is `project:` + the canonical
 //!   (hyphenated lowercase) UUID.
 //! - `app:<name>` is RT2's: parsed, so a Studio ticket gets `forbidden` for it (R9).
+//! - Object storage m17: a storage join is `{"channel":"storage","params":{database_id,
+//!   branch_id, pg_database, bucket_id, role}}`: a watch of `storage.objects` scoped to one
+//!   bucket ([`TableChannel::bucket`]), checked and authorized as a table join of that role. Its
+//!   channel id is `storage:` + the compact JSON array `[database_id,branch_id,pg_database,
+//!   bucket_id]`. A `table` join of the `storage` schema is refused: only a storage channel
+//!   carries those keys, and only for its bucket.
 //! - R4: `channel_hash = hex(sha256(scope ‖ channel id))`, scope `branch_id ‖ db_oid` for tables
 //!   and `project_id` for projects; every presence and fan-out message carries its scope.
 
@@ -18,6 +24,11 @@ use uuid::Uuid;
 /// table under one id and check it under another, so it is refused.
 pub const MAX_NAME_BYTES: usize = 63;
 
+/// The schema a `table` join may not name (object metadata: storage channels only).
+pub const STORAGE_SCHEMA: &str = "storage";
+/// The table a storage channel watches, in [`STORAGE_SCHEMA`].
+pub const OBJECTS_TABLE: &str = "objects";
+
 /// A table, without the role it is watched as.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableChannel {
@@ -26,11 +37,28 @@ pub struct TableChannel {
     pub pg_database: String,
     pub schema: String,
     pub table: String,
+    /// Object storage m17: a storage channel's bucket (`storage.objects` only): every check of
+    /// the watch is scoped to it, and its deletes are never a bypass group's. `None` for a
+    /// table channel.
+    pub bucket: Option<Uuid>,
 }
 
 impl TableChannel {
-    /// `table:` + compact JSON `[database_id,branch_id,pg_database,schema,table]`.
+    /// `table:` + compact JSON `[database_id,branch_id,pg_database,schema,table]`; a storage
+    /// channel's `storage:` + compact JSON `[database_id,branch_id,pg_database,bucket_id]`.
     pub fn id(&self) -> String {
+        if let Some(bucket) = self.bucket {
+            let parts = [
+                self.database_id.hyphenated().to_string(),
+                self.branch_id.hyphenated().to_string(),
+                self.pg_database.clone(),
+                bucket.hyphenated().to_string(),
+            ];
+            return format!(
+                "storage:{}",
+                serde_json::to_string(&parts).expect("strings serialize")
+            );
+        }
         let parts = [
             self.database_id.hyphenated().to_string(),
             self.branch_id.hyphenated().to_string(),
@@ -127,14 +155,11 @@ fn parse_table(params: Option<&Value>) -> Result<JoinTarget, String> {
     let branch_id = uuid_of("branch_id")?;
     let pg_database = parse_name(p.get("pg_database"), "pg_database")?;
     let schema = parse_name(p.get("schema"), "schema")?;
+    if schema == STORAGE_SCHEMA {
+        return Err("the storage schema is watched through a storage channel".into());
+    }
     let table = parse_name(p.get("table"), "table")?;
-    // `role` is required: `null` (the owner) must be said, never implied by a missing field.
-    let role = match p.get("role") {
-        Some(Value::Null) => None,
-        Some(v @ Value::String(_)) => Some(parse_name(Some(v), "role")?),
-        Some(_) => return Err("role must be a string or null".into()),
-        None => return Err("role is required (null for the owner)".into()),
-    };
+    let role = parse_role(p.get("role"))?;
     Ok(JoinTarget::Table {
         channel: TableChannel {
             database_id,
@@ -142,6 +167,52 @@ fn parse_table(params: Option<&Value>) -> Result<JoinTarget, String> {
             pg_database,
             schema,
             table,
+            bucket: None,
+        },
+        role,
+    })
+}
+
+/// `role` is required: `null` (the owner) must be said, never implied by a missing field.
+fn parse_role(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        Some(Value::Null) => Ok(None),
+        Some(v @ Value::String(_)) => Ok(Some(parse_name(Some(v), "role")?)),
+        Some(_) => Err("role must be a string or null".into()),
+        None => Err("role is required (null for the owner)".into()),
+    }
+}
+
+const STORAGE_FIELDS: [&str; 5] = ["database_id", "branch_id", "pg_database", "bucket_id", "role"];
+
+/// A storage join (object storage m17): `storage.objects` of one bucket, as `role`.
+fn parse_storage(params: Option<&Value>) -> Result<JoinTarget, String> {
+    let Some(Value::Object(p)) = params else {
+        return Err(
+            "a storage join takes params {database_id, branch_id, pg_database, bucket_id, role}"
+                .into(),
+        );
+    };
+    if let Some(unknown) = p.keys().find(|k| !STORAGE_FIELDS.contains(&k.as_str())) {
+        return Err(format!("unknown join param {unknown:?}"));
+    }
+    let uuid_of = |field: &str| match p.get(field) {
+        Some(Value::String(s)) => parse_uuid(s, field),
+        _ => Err(format!("{field} must be a hyphenated UUID")),
+    };
+    let database_id = uuid_of("database_id")?;
+    let branch_id = uuid_of("branch_id")?;
+    let pg_database = parse_name(p.get("pg_database"), "pg_database")?;
+    let bucket = uuid_of("bucket_id")?;
+    let role = parse_role(p.get("role"))?;
+    Ok(JoinTarget::Table {
+        channel: TableChannel {
+            database_id,
+            branch_id,
+            pg_database,
+            schema: STORAGE_SCHEMA.into(),
+            table: OBJECTS_TABLE.into(),
+            bucket: Some(bucket),
         },
         role,
     })
@@ -154,6 +225,9 @@ pub fn parse_join(channel: &str, params: Option<&Value>) -> Result<JoinTarget, S
     let params = params.filter(|p| !p.is_null());
     if channel == "table" {
         return parse_table(params);
+    }
+    if channel == "storage" {
+        return parse_storage(params);
     }
     if let Some(id) = channel.strip_prefix("project:") {
         if params.is_some() {
@@ -170,7 +244,7 @@ pub fn parse_join(channel: &str, params: Option<&Value>) -> Result<JoinTarget, S
         }
         return Ok(JoinTarget::App(channel.to_string()));
     }
-    Err("unknown channel: table, project:<uuid> or app:<name>".into())
+    Err("unknown channel: table, storage, project:<uuid> or app:<name>".into())
 }
 
 /// A channel's R4 scope.

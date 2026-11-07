@@ -1,5 +1,5 @@
 {
   "title": "Self-hosting",
   "root": true,
-  "pages": ["install", "hosts", "example"]
+  "pages": ["install", "hosts", "storage-settings", "amazon-s3", "example"]
 }

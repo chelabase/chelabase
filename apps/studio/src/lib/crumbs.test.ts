@@ -42,6 +42,7 @@ describe("buildCrumbs: shapes", () => {
 
   it("the Data API page is a single Data API crumb at any place", () => {
     expect(summary(buildCrumbs("/app/data-api", {}, labels()))).toEqual([{ label: "Data API", link: false, loading: false }]);
+    expect(summary(buildCrumbs("/app/storage/p1/d1/b1/avatars", { projectId: "p1", bucket: "avatars" }, labels()))).toEqual([{ label: "Storage", link: false, loading: false }]);
     expect(summary(buildCrumbs("/app/data-api/p1/d1/b1/app", { projectId: "p1", databaseId: "d1" }, labels()))).toEqual([{ label: "Data API", link: false, loading: false }]);
   });
 

@@ -1,0 +1,11 @@
+error: no rules expected `request`
+ --> tests/ui/statement_from_leaked_text.rs:4:67
+  |
+4 |     let _ = chelabase_pgsession::named_statement!("from request", request.leak(), &[]);
+  |                                                                   ^^^^^^^ no rules expected this token in macro call
+  |
+note: while trying to match meta-variable `$sql:literal`
+ --> src/service.rs
+  |
+  |     ($name:literal, $sql:literal, $types:expr $(,)?) => {{
+  |                     ^^^^^^^^^^^^

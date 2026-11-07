@@ -46,7 +46,8 @@ pg_query = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
-reqwest = { workspace = true }
+# `stream`: Studio's storage routes stream bodies to and from the storage service (m9).
+reqwest = { workspace = true, features = ["stream"] }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
 deadpool-postgres = { workspace = true }

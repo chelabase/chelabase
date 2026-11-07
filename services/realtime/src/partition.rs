@@ -34,7 +34,8 @@ pub const PARENTS_SQL: &str = "SELECT a.relid::pg_catalog.oid, true \
 /// The window's relations fanned out to their parents (`parents[rel]`, absent = none): each
 /// relation keeps its own window and every parent gets the union of its descendants' keys
 /// (keyed parents) or `changed` (inheritance parents). A target over `max_keys` distinct keys
-/// after the union is `changed`.
+/// after the union is `changed`. A relation of `window.split` (`storage.objects`, object storage
+/// m17) passes through whole: it has no parents and is never collapsed.
 pub fn fan_out(
     window: &Window,
     parents: &HashMap<u32, Vec<Parent>>,
@@ -46,7 +47,13 @@ pub fn fan_out(
     // Targets in first-reached order: each relation's own window, then its parents.
     let mut order: Vec<u32> = Vec::new();
     let mut targets: HashMap<u32, Target> = HashMap::new();
+    let mut whole: HashMap<u32, RelWindow> = HashMap::new();
     for r in &window.rels {
+        if window.split.contains(&r.rel) {
+            order.push(r.rel);
+            whole.insert(r.rel, r.clone());
+            continue;
+        }
         reach(&mut targets, &mut order, r.rel).add(r, true);
         for p in parents.get(&r.rel).into_iter().flatten() {
             reach(&mut targets, &mut order, p.oid).add(r, p.keyed);
@@ -54,7 +61,11 @@ pub fn fan_out(
     }
     order
         .into_iter()
-        .map(|oid| targets.remove(&oid).expect("reached").into_window(oid, max_keys))
+        .filter_map(|oid| match whole.remove(&oid) {
+            Some(w) => Some(w),
+            // A split relation also reached as another's parent was emitted whole already.
+            None => targets.remove(&oid).map(|t| t.into_window(oid, max_keys)),
+        })
         .collect()
 }
 

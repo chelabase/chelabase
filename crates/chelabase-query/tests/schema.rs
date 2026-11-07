@@ -42,8 +42,34 @@ fn ty(
     )
 }
 
-fn col(name: &str, typid: u32, formatted: &str) -> (String, u32, String, bool, bool, bool) {
-    (name.into(), typid, formatted.into(), true, false, false)
+#[allow(clippy::type_complexity)]
+fn col(
+    name: &str,
+    typid: u32,
+    formatted: &str,
+) -> (String, u32, String, bool, bool, bool, Option<String>, bool) {
+    col_with(name, typid, formatted, None, false)
+}
+
+/// A nullable column with its comment and whether a foreign key makes it `storage.objects(id)`.
+#[allow(clippy::type_complexity)]
+fn col_with(
+    name: &str,
+    typid: u32,
+    formatted: &str,
+    comment: Option<&str>,
+    storage_object: bool,
+) -> (String, u32, String, bool, bool, bool, Option<String>, bool) {
+    (
+        name.into(),
+        typid,
+        formatted.into(),
+        true,
+        false,
+        false,
+        comment.map(Into::into),
+        storage_object,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -154,7 +180,16 @@ fn raw() -> Raw {
                 false,
                 false,
                 vec![
-                    ("id".into(), 23, "integer".into(), false, true, true),
+                    (
+                        "id".into(),
+                        23,
+                        "integer".into(),
+                        false,
+                        true,
+                        true,
+                        None,
+                        false,
+                    ),
                     col("select", 25, "text"),
                     col("total", 1700, "numeric(10,2)"),
                     col("mood", 90001, "mood"),
@@ -616,4 +651,225 @@ fn schema_reports_app_users_table() {
     )
     .unwrap();
     assert_eq!(parsed.app_users, None);
+}
+
+/// #102: the three storage_ref forms are described on their columns (`storage_ref`), and
+/// nothing else of a comment or a foreign key is: a `storage.object_ref` (by its schema, not
+/// any type named `object_ref`) is `ref`; a column a single-column foreign key makes
+/// `storage.objects(id)` is `id`; a text column whose comment says `@storage_ref bucket=…` is
+/// `path` with that bucket. Every other column's JSON is as before (no new field).
+#[test]
+fn storage_ref_columns_are_described() {
+    const PROFILES: u32 = 40010;
+    let mut raw = raw();
+    raw.types.push(ty(
+        91001,
+        "storage",
+        "object_ref",
+        "c",
+        0,
+        0,
+        "C",
+        -1,
+        "storage.object_ref",
+    ));
+    raw.types.push(ty(
+        91002,
+        "storage",
+        "_object_ref",
+        "b",
+        91001,
+        0,
+        "A",
+        -1,
+        "storage.object_ref[]",
+    ));
+    raw.types.push(ty(
+        91003,
+        "public",
+        "object_ref",
+        "c",
+        0,
+        0,
+        "C",
+        -1,
+        "object_ref",
+    ));
+    raw.types.push(ty(
+        1009,
+        "pg_catalog",
+        "_text",
+        "b",
+        25,
+        0,
+        "A",
+        -1,
+        "text[]",
+    ));
+    raw.relations.push((
+        PROFILES,
+        "public".into(),
+        "profiles".into(),
+        "r".into(),
+        false,
+        false,
+        vec![
+            col("avatar", 91001, "storage.object_ref"),
+            col("gallery", 91002, "storage.object_ref[]"),
+            col("lookalike", 91003, "object_ref"),
+            col_with(
+                "avatar_path",
+                25,
+                "text",
+                Some("The avatar.\n@storage_ref  bucket=avatars (resized)"),
+                false,
+            ),
+            col_with(
+                "paths",
+                1009,
+                "text[]",
+                Some("@storage_ref bucket=docs"),
+                false,
+            ),
+            col_with(
+                "email",
+                90003,
+                "email",
+                Some("@storage_ref bucket=mail"),
+                false,
+            ),
+            col_with("no_bucket", 25, "text", Some("@storage_ref"), false),
+            col_with(
+                "empty_bucket",
+                25,
+                "text",
+                Some("@storage_ref bucket="),
+                false,
+            ),
+            col_with(
+                "other_word",
+                25,
+                "text",
+                Some("@storage_ref bucket_id=x"),
+                false,
+            ),
+            col_with(
+                "not_text",
+                23,
+                "integer",
+                Some("@storage_ref bucket=x"),
+                false,
+            ),
+            col_with("photo_id", 2950, "uuid", Some("internal: photo"), true),
+            col_with(
+                "secret_note",
+                25,
+                "text",
+                Some("internal note, do not share"),
+                false,
+            ),
+        ],
+        vec![],
+    ));
+    let s = Schema::build("v1".into(), raw);
+    let reader = Visibility {
+        schemas: HashSet::from([PUBLIC]),
+        tables: HashMap::from([(
+            PROFILES,
+            Privileges {
+                select: true,
+                ..Default::default()
+            },
+        )]),
+        functions: HashSet::new(),
+    };
+    let json = s.to_json("public", &[("anon", &reader)], false);
+    let cols = &json["schemas"]["public"]["tables"]["profiles"]["columns"];
+    assert_eq!(
+        cols["avatar"],
+        json!({"type":"object_ref","array":false,"nullable":true,"has_default":false,"generated":false,"storage_ref":{"kind":"ref"}})
+    );
+    assert_eq!(cols["gallery"]["storage_ref"], json!({"kind":"ref"}));
+    assert_eq!(cols["gallery"]["array"], true);
+    assert_eq!(
+        cols["avatar_path"]["storage_ref"],
+        json!({"kind":"path","bucket":"avatars"})
+    );
+    assert_eq!(
+        cols["paths"]["storage_ref"],
+        json!({"kind":"path","bucket":"docs"})
+    );
+    // A domain over text is text.
+    assert_eq!(
+        cols["email"]["storage_ref"],
+        json!({"kind":"path","bucket":"mail"})
+    );
+    assert_eq!(cols["photo_id"]["storage_ref"], json!({"kind":"id"}));
+    for plain in [
+        "lookalike",
+        "no_bucket",
+        "empty_bucket",
+        "other_word",
+        "not_text",
+        "secret_note",
+    ] {
+        assert!(
+            cols[plain].get("storage_ref").is_none(),
+            "{plain}: {}",
+            cols[plain]
+        );
+    }
+    assert_eq!(
+        cols["secret_note"],
+        json!({"type":"text","array":false,"nullable":true,"has_default":false,"generated":false})
+    );
+    // No comment text reaches the document.
+    let text = json.to_string();
+    for leaked in ["internal", "The avatar", "resized"] {
+        assert!(!text.contains(leaked), "{leaked}: {text}");
+    }
+    // A role that can't reach the table sees none of it.
+    let other = Visibility {
+        schemas: HashSet::from([PUBLIC]),
+        tables: HashMap::from([(
+            ORDERS,
+            Privileges {
+                select: true,
+                ..Default::default()
+            },
+        )]),
+        functions: HashSet::new(),
+    };
+    let json = s.to_json("public", &[("anon", &other)], false);
+    assert!(
+        json["schemas"]["public"]["tables"]
+            .get("profiles")
+            .is_none(),
+        "{json}"
+    );
+    assert!(!json.to_string().contains("avatars"), "{json}");
+}
+
+/// #102: the introspection reads each column's comment and whether a single-column foreign
+/// key points it at `storage.objects(id)` (found by name, so a database without storage
+/// still introspects). It runs as the request's role, so the table is found through the
+/// catalog alone: a qualified name (`to_regclass('storage.objects')`, a `::regclass` cast)
+/// checks USAGE on `storage` and fails for a role without it (every custom role: a 500).
+#[test]
+fn introspection_reads_storage_ref_hints() {
+    assert!(
+        INTROSPECT_SQL.contains("pg_catalog.col_description(c.oid, a.attnum)"),
+        "{INTROSPECT_SQL}"
+    );
+    assert!(
+        INTROSPECT_SQL.contains("s.nspname = 'storage' AND o.relname = 'objects'"),
+        "{INTROSPECT_SQL}"
+    );
+    for qualified in ["to_regclass", "to_regtype", "'storage."] {
+        assert!(!INTROSPECT_SQL.contains(qualified), "{qualified}: {INTROSPECT_SQL}");
+    }
+    assert!(
+        INTROSPECT_SQL.contains("f.contype = 'f'"),
+        "{INTROSPECT_SQL}"
+    );
 }

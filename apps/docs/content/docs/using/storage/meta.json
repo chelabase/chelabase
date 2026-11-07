@@ -1,0 +1,4 @@
+{
+  "title": "Storage",
+  "pages": ["index", "policies", "client", "urls", "refs", "branches", "studio", "webhooks"]
+}

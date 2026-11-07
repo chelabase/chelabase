@@ -1813,3 +1813,96 @@ async fn realtime_refuses_suspended_and_offboarded_members() {
         .await;
     assert_eq!(status, 403, "an offboarded member's projects");
 }
+
+// --- Object storage m17: the storage channel ----------------------------------------------------
+
+/// AC 4: a `storage:` join is authorized by `/authorize` with the storage console's own rules
+/// (m9's `authorize`: `ActAs(Viewer)`, owner mode Admin-only, then the branch and database
+/// gates and the worker's role check). One row per (member, Act-as role): a Viewer holding the
+/// role watches it; one without it, a Developer asking for another role, any non-Admin asking
+/// for owner mode and a non-member are refused.
+#[tokio::test]
+async fn storage_realtime_join_matrix_matches_the_console_list_route() {
+    let t = rt().await;
+    t.metadata.add_granted(t.tenant, "viewer2", t.project, PlatformRole::Viewer, &["app"]);
+    let rows: [(&str, Option<&str>, bool); 9] = [
+        (DEFAULT_SUB, None, true),
+        (DEFAULT_SUB, Some("app"), true),
+        ("dev1", Some("app"), true),
+        ("viewer2", Some("app"), true),
+        ("dev1", None, false),
+        ("dev1", Some("other"), false),
+        ("viewer1", None, false),
+        ("viewer1", Some("app"), false),
+        ("stranger", Some("app"), false),
+    ];
+    for (sub, role, allowed) in rows {
+        let body = t.authorize(sub, t.target(t.main(), "web1", role)).await;
+        if allowed {
+            assert_allowed(&body, t.tenant, sub);
+        } else {
+            assert_refused(&body, "forbidden");
+        }
+    }
+    // The gates: a backup branch, a database the data API doesn't serve.
+    assert_refused(&t.authorize(DEFAULT_SUB, t.target(t.backup, "web1", None)).await, "forbidden");
+    assert_refused(&t.authorize(DEFAULT_SUB, t.target(t.main(), "analytics", None)).await, "forbidden");
+}
+
+/// `/visible`'s `bucket` goes with a check: never with the convert mode, and it is a UUID.
+#[tokio::test]
+async fn storage_realtime_visible_bucket_goes_with_a_check() {
+    let t = rt().await;
+    let mut body = t.visible_body(t.main(), "web1", 16_384, None, Some(json!([["x"]])));
+    body["convert"] = json!(true);
+    body["bucket"] = json!(uuid::Uuid::new_v4());
+    assert_eq!(t.visible(DEFAULT_SUB, body).await.0, 400, "bucket with the convert mode");
+    let mut body = t.visible_body(t.main(), "web1", 16_384, None, None);
+    body["bucket"] = json!("images");
+    assert_eq!(t.visible(DEFAULT_SUB, body).await.0, 400, "a bucket is a UUID");
+}
+
+/// AC 5 (owner mode): with `bucket`, the owner's check returns only the objects of that bucket
+/// it sees, and only while the bucket exists; `bucket` on another relation is a 400.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn storage_realtime_visible_scopes_the_owners_check_to_a_bucket() {
+    let password = "storage-visible-pass";
+    let scratch = ScratchCompute::new(password).await;
+    let t = rt_live(&scratch, password).await;
+    let db = scratch.database.clone();
+    let owner = scratch.owner.clone();
+    let (a, b, gone) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (o1, o2, o3) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    scratch
+        .exec_in(&format!(
+            "CREATE SCHEMA storage AUTHORIZATION {owner};
+             CREATE TABLE storage.buckets (id uuid PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE storage.objects (id uuid PRIMARY KEY, bucket_id uuid NOT NULL, name text NOT NULL);
+             ALTER TABLE storage.buckets OWNER TO {owner};
+             ALTER TABLE storage.objects OWNER TO {owner};
+             INSERT INTO storage.buckets VALUES ('{a}', 'a'), ('{b}', 'b');
+             INSERT INTO storage.objects VALUES ('{o1}', '{a}', 'x'), ('{o2}', '{b}', 'y'), ('{o3}', '{gone}', 'z');"
+        ))
+        .await;
+    let objects = scratch.oid("storage.objects").await;
+    let keys = json!([[o1.to_string()], [o2.to_string()], [o3.to_string()]]);
+    let scoped = |bucket: uuid::Uuid, rel: u32, keys: Value| {
+        let mut body = t.visible_body(t.main(), &db, rel, None, Some(keys));
+        body["bucket"] = json!(bucket);
+        body
+    };
+    let (status, body) = t.visible(DEFAULT_SUB, scoped(a, objects, keys.clone())).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["keys"], json!([serde_json::to_string(&[o1.to_string()]).unwrap()]), "{body}");
+    let (_, body) = t.visible(DEFAULT_SUB, scoped(b, objects, keys.clone())).await;
+    assert_eq!(body["keys"], json!([serde_json::to_string(&[o2.to_string()]).unwrap()]), "{body}");
+    let (_, body) = t.visible(DEFAULT_SUB, scoped(gone, objects, keys.clone())).await;
+    assert_eq!(body["keys"], json!([]), "a bucket that doesn't exist shows nothing: {body}");
+    let weird = scratch.oid(r#"public."we""ird""#).await;
+    let (status, body) = t
+        .visible(DEFAULT_SUB, scoped(a, weird, json!([["1", "a"]])))
+        .await;
+    assert_eq!(status, 400, "a bucket on another relation: {body}");
+    scratch.drop().await;
+}

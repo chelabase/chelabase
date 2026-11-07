@@ -18,6 +18,8 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
 chelabase-http = { workspace = true }
+# The branch's pools and the role session (`conn` re-exports it).
+chelabase-pgsession = { workspace = true }
 chelabase-query = { workspace = true, features = ["openapi"] }
 # The full-cell read's shared code (`cell`, `catalog`, P40).
 chelabase-schema = { workspace = true }
@@ -48,6 +50,7 @@ utoipa-axum = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+chelabase-pgsession = { workspace = true, features = ["test-support"] }
 chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-metadata = { workspace = true }
 chelabase-nats = { workspace = true }

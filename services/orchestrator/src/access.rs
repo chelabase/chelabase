@@ -226,7 +226,8 @@ pub(crate) fn member_facts(member: Option<&MemberRecord>) -> MemberFacts {
 /// 1. the target, in the caller's tenant;
 /// 2. the target branch's protection (`Branch` routes);
 /// 3. the effective grant (no cache), and `decide`;
-/// 4. R16: acting as an owner-level role needs Admin.
+/// 4. an act-as: [`act_as_allowed`], the console's act-as rule (chains, R21; personal logins,
+///    MH-21; owner-level, LOGIN and ADMIN roles need Admin, R16, R22, R23).
 pub async fn authorize<M: MetadataPort, J: JobPort>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
@@ -362,54 +363,32 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
         owner_role,
         access,
     );
-    let act_as_role = match (access, target.requested()) {
-        (Access::ActAs(_) | Access::ActAsBranch { .. }, Some(Requested::Role(name))) => Some(name),
-        _ => None,
-    };
     // The roles of the branch, read once for the checks that need them.
     let mut graph: Option<RoleGraph> = None;
     let mut graph_loaded = false;
-    if let Err(deny) = decided {
-        // R21: a role reachable through a granted role's chain counts as granted, at that
-        // granted role's own level (D1): only roles held at the route's minimum lead on.
-        let min = act_as_minimum(access, branch_protected);
-        let allowed_by_chain = match (&deny, act_as_role, grant.as_ref(), record.as_ref(), min) {
-            (Deny::Forbidden { required }, Some(name), Some(g), Some(r), Some(min))
-                if required.starts_with("role:") && !act_as_reserved(name) =>
+    match (act_as_minimum(access, branch_protected), record.as_ref()) {
+        // An act-as: `decide` answered admission and the target; its act-as refusals (all
+        // `Forbidden` here) are the shared rule's to give, with the branch's facts.
+        (Some(min), Some(r)) => {
+            if let Err(deny) = decided
+                && !matches!(deny, Deny::Forbidden { .. })
             {
+                return Err(answer(deny));
+            }
+            let requested = target.requested().unwrap_or(Requested::Owner);
+            let owner = roles::owner_name(r);
+            if act_as_reads_graph(member, grant.as_ref(), min, requested, owner) {
                 graph = RoleGraph::load(state, r, target.branch()).await?;
                 graph_loaded = true;
-                graph.as_ref().is_some_and(|gr| gr.chain_grants(&g.roles_at_least(min), name))
             }
-            _ => false,
-        };
-        if !allowed_by_chain {
-            return Err(answer(deny));
+            let personal_login = match Requested::from_name(requested_name(requested), owner) {
+                Requested::Role(name) => is_personal_login(state, r, name).await?,
+                Requested::Owner => false,
+            };
+            act_as_allowed(member, grant.as_ref(), min, requested, owner, graph.as_ref(), personal_login)
+                .map_err(answer)?;
         }
-    }
-
-    // MH-21: a personal login is one member's own identity: nobody acts as it, its member and
-    // tenant admins included.
-    if let (Some(name), Some(r)) = (act_as_role, record.as_ref())
-        && is_personal_login(state, r, name).await?
-    {
-        return Err(answer(Deny::Forbidden { required: format!("role:{name}") }));
-    }
-
-    // 4. R16, R22, R23 (the single rule, `RoleGraph::refusal`): a role that is, or reaches,
-    // an owner-level, LOGIN or reserved role is Admin-only, even when the grant lists it.
-    if let (Some(name), Some(r), Some(g)) = (act_as_role, record.as_ref(), grant.as_ref())
-        && g.platform_role < PlatformRole::Admin
-    {
-        if !graph_loaded {
-            graph = RoleGraph::load(state, r, target.branch()).await?;
-            graph_loaded = true;
-        }
-        if graph.as_ref().is_some_and(|gr| gr.refusal(name).is_some()) {
-            return Err(answer(Deny::Forbidden {
-                required: PlatformRole::Admin.as_str().to_string(),
-            }));
-        }
+        _ => decided.map_err(answer)?,
     }
     let roles = match (graph_loaded, target.branch()) {
         (true, Some(branch)) => Some(LoadedRoles { branch, graph: graph.map(Arc::new) }),
@@ -424,6 +403,112 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
         branch_protected,
         roles,
     })
+}
+
+/// The name a request carries (`owner` for owner mode), for [`Requested::from_name`].
+fn requested_name<'a>(requested: Requested<'a>) -> &'a str {
+    match requested {
+        Requested::Owner => PgRole::OWNER,
+        Requested::Role(name) => name,
+    }
+}
+
+/// The member's access as act-as judges it: a tenant admin's is always
+/// [`tenant_admin_effective`]; an active member's is `grant`; anyone else has none.
+fn act_as_effective(member: MemberFacts, grant: Option<&Effective>) -> Result<std::borrow::Cow<'_, Effective>, Deny> {
+    match member {
+        MemberFacts::Active { tenant_admin: true, .. } => Ok(std::borrow::Cow::Owned(tenant_admin_effective())),
+        MemberFacts::Active { .. } => grant.map(std::borrow::Cow::Borrowed).ok_or(Deny::NotFound),
+        MemberFacts::Removed => Err(Deny::NotFound),
+        MemberFacts::Suspended => Err(Deny::Suspended),
+        MemberFacts::Offboarded => Err(Deny::Offboarded),
+        MemberFacts::Pending => Err(Deny::PendingApproval),
+        MemberFacts::NotMember | MemberFacts::Invited => Err(Deny::NoAccessYet),
+    }
+}
+
+/// Whether the role is held directly at `min` or above (D1: its own level).
+fn held_at(grant: &Effective, name: &str, min: PlatformRole) -> bool {
+    grant.roles.may_act_as(name) && grant.level_of(name).is_some_and(|l| l >= min)
+}
+
+/// Whether [`act_as_allowed`] needs the branch's role graph for this request: a named role
+/// that isn't reserved, unless an Admin holds it directly (no chain, no R16 refusal then).
+/// Callers that skip the read when this is false get the same answer as with it.
+pub(crate) fn act_as_reads_graph(
+    member: MemberFacts,
+    grant: Option<&Effective>,
+    min: PlatformRole,
+    requested: Requested<'_>,
+    owner_role: &str,
+) -> bool {
+    let Ok(grant) = act_as_effective(member, grant) else {
+        return false;
+    };
+    match Requested::from_name(requested_name(requested), owner_role) {
+        Requested::Owner => false,
+        Requested::Role(name) => {
+            !act_as_reserved(name)
+                && (grant.platform_role < PlatformRole::Admin || !held_at(&grant, name, min))
+        }
+    }
+}
+
+/// The console's act-as rule: whether `member` (with `grant`, their effective access on the
+/// database) may act as `requested` on a branch at `min`, the route's minimum.
+///
+/// **Invariant (#100): a console URL is live exactly when console `sign` by its member, as
+/// its role, on its branch, would be authorized now.** [`authorize`] decides every act-as
+/// (console `sign` included) with this predicate, and console URL liveness
+/// ([`crate::internal::console_url_live`]) asks it with `min = Developer` (`sign`'s level),
+/// so the two can't drift; `tests/storage_console.rs::sign_and_url_liveness_agree` checks
+/// them side by side on every case.
+///
+/// In order, the first refusal answers:
+/// - only an active member, a tenant admin always with [`tenant_admin_effective`];
+/// - the member's platform level reaches `min`;
+/// - owner mode (no role, `owner`, or `owner_role`) needs Admin (R7);
+/// - a named role is held directly at `min` (D1: its own level; R18: the data API's roles
+///   only when a source names them), or reached through the chain of a role held at `min`
+///   (R21, [`RoleGraph::chain_grants`]); never a reserved name;
+/// - never a personal login (MH-21: `personal_login`), whoever asks;
+/// - below Admin, never a role that is or reaches an owner-level, LOGIN, ADMIN-holding or
+///   reserved role (R16, R22, R23: [`RoleGraph::refusal`]).
+///
+/// `graph` is the branch's roles (`None`: no endpoint, so no chain and nothing to refuse);
+/// [`act_as_reads_graph`] says when it matters.
+pub(crate) fn act_as_allowed(
+    member: MemberFacts,
+    grant: Option<&Effective>,
+    min: PlatformRole,
+    requested: Requested<'_>,
+    owner_role: &str,
+    graph: Option<&RoleGraph>,
+    personal_login: bool,
+) -> Result<(), Deny> {
+    let forbidden = |required: &str| Err(Deny::Forbidden { required: required.to_string() });
+    let grant = act_as_effective(member, grant)?;
+    if grant.platform_role < min {
+        return forbidden(min.as_str());
+    }
+    let name = match Requested::from_name(requested_name(requested), owner_role) {
+        Requested::Owner if grant.platform_role == PlatformRole::Admin => return Ok(()),
+        Requested::Owner => return forbidden(PgRole::OWNER),
+        Requested::Role(name) => name,
+    };
+    let by_chain = || {
+        !act_as_reserved(name) && graph.is_some_and(|g| g.chain_grants(&grant.roles_at_least(min), name))
+    };
+    if !held_at(&grant, name, min) && !by_chain() {
+        return forbidden(&format!("role:{name}"));
+    }
+    if personal_login {
+        return forbidden(&format!("role:{name}"));
+    }
+    if grant.platform_role < PlatformRole::Admin && graph.is_some_and(|g| g.refusal(name).is_some()) {
+        return forbidden(PlatformRole::Admin.as_str());
+    }
+    Ok(())
 }
 
 /// Roles that make whoever reaches them owner-level, besides the database's owner.

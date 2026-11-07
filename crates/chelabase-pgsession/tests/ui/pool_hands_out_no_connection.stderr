@@ -1,0 +1,11 @@
+error[E0599]: no method named `acquire` found for reference `&ServicePool<InternalSource>` in the current scope
+ --> tests/ui/pool_hands_out_no_connection.rs:4:18
+  |
+4 |     let _ = pool.acquire(uuid::Uuid::nil(), "main").await;
+  |                  ^^^^^^^ method not found in `&ServicePool<InternalSource>`
+
+error[E0616]: field `pools` of struct `ServicePool` is private
+ --> tests/ui/pool_hands_out_no_connection.rs:8:18
+  |
+8 |     let _ = pool.pools.acquire(uuid::Uuid::nil(), "main").await;
+  |                  ^^^^^ private field

@@ -46,6 +46,26 @@
       "file": "/m/.chelabase/auth/cookie.key",
       "name": "chelabase-feat-x_cookie"
     },
+    "grpc-tls-ca": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/ca.crt",
+      "name": "chelabase-feat-x_grpc-tls-ca"
+    },
+    "grpc-tls-client-crt": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/client.crt",
+      "name": "chelabase-feat-x_grpc-tls-client-crt"
+    },
+    "grpc-tls-client-key": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/client.key",
+      "name": "chelabase-feat-x_grpc-tls-client-key"
+    },
+    "grpc-tls-server-crt": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/server.crt",
+      "name": "chelabase-feat-x_grpc-tls-server-crt"
+    },
+    "grpc-tls-server-key": {
+      "file": "/m/.chelabase/stacks/feat-x/grpc-tls/server.key",
+      "name": "chelabase-feat-x_grpc-tls-server-key"
+    },
     "identity-db-password": {
       "file": "/m/.chelabase/identity/db.password",
       "name": "chelabase-feat-x_identity-db-password"
@@ -82,6 +102,10 @@
       "file": "/m/.chelabase/nats/runner.password",
       "name": "chelabase-feat-x_nats-runner"
     },
+    "nats-storage": {
+      "file": "/m/.chelabase/nats/storage.password",
+      "name": "chelabase-feat-x_nats-storage"
+    },
     "nats-worker": {
       "file": "/m/.chelabase/nats/worker.password",
       "name": "chelabase-feat-x_nats-worker"
@@ -97,6 +121,22 @@
     "realtime-ticket": {
       "file": "/m/.chelabase/realtime/ticket.key",
       "name": "chelabase-feat-x_realtime-ticket"
+    },
+    "s3-neon-access-key": {
+      "file": "/m/.chelabase/stacks/feat-x/s3/access-key",
+      "name": "chelabase-feat-x_s3-neon-access-key"
+    },
+    "s3-neon-secret-key": {
+      "file": "/m/.chelabase/stacks/feat-x/s3/secret-key",
+      "name": "chelabase-feat-x_s3-neon-secret-key"
+    },
+    "s3-storage-access-key": {
+      "file": "/m/.chelabase/stacks/feat-x/storage-s3/access-key",
+      "name": "chelabase-feat-x_s3-storage-access-key"
+    },
+    "s3-storage-secret-key": {
+      "file": "/m/.chelabase/stacks/feat-x/storage-s3/secret-key",
+      "name": "chelabase-feat-x_s3-storage-secret-key"
     },
     "secrets-key": {
       "file": "/m/.chelabase/secrets/secrets.key",
@@ -161,6 +201,10 @@
     "token-rest-internal": {
       "file": "/m/.chelabase/tokens/rest-internal.token",
       "name": "chelabase-feat-x_token-rest-internal"
+    },
+    "token-storage-internal": {
+      "file": "/m/.chelabase/tokens/storage-internal.token",
+      "name": "chelabase-feat-x_token-storage-internal"
     },
     "token-storcon-hook": {
       "file": "/m/.chelabase/tokens/storcon-hook.token",
@@ -287,9 +331,7 @@
       "working_dir": "/w/feat-x"
     },
     "create-bucket": {
-      "command": [
-        "for i in $$(seq 60); do\n  aws --endpoint-url http://seaweedfs:8333 s3 mb s3://neon 2>/dev/null ||\n    aws --endpoint-url http://seaweedfs:8333 s3 ls s3://neon >/dev/null && exit 0\n  sleep 2\ndone\nexit 1\n"
-      ],
+      "command": null,
       "depends_on": {
         "seaweedfs": {
           "condition": "service_healthy",
@@ -297,14 +339,8 @@
         }
       },
       "entrypoint": [
-        "/bin/sh",
-        "-c"
+        "/bin/true"
       ],
-      "environment": {
-        "AWS_ACCESS_KEY_ID": "chelabase-dev",
-        "AWS_DEFAULT_REGION": "us-east-1",
-        "AWS_SECRET_ACCESS_KEY": "chelabase-dev-secret"
-      },
       "image": "neon-storage:placeholder",
       "networks": {
         "default": null
@@ -776,6 +812,7 @@
         "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
         "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token",
         "CHELABASE_SETUP_CODE_FILE": "/m/.chelabase/stacks/feat-x/setup/setup.code",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
         "CHELABASE_STORCON_HOOK_TOKEN_FILE": "/m/.chelabase/tokens/storcon-hook.token",
         "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/control.password",
         "CHELABASE_VALKEY_USER": "control"
@@ -846,6 +883,10 @@
         {
           "source": "token-app-sessions",
           "target": "/m/.chelabase/tokens/app-sessions.token"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
         },
         {
           "source": "token-proxy-api",
@@ -1320,6 +1361,7 @@
         "CHELABASE_REALTIME_TICKET_KEY_FILE": "/m/.chelabase/realtime/ticket.key",
         "CHELABASE_REALTIME_TLS_DIR": "/m/.chelabase/realtime-tls",
         "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
         "CHELABASE_STORCON_HOOK_TOKEN_FILE": "/m/.chelabase/tokens/storcon-hook.token",
         "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/runner.password",
         "CHELABASE_VALKEY_USER": "runner"
@@ -1431,6 +1473,10 @@
         {
           "source": "token-storcon-hook",
           "target": "/m/.chelabase/tokens/storcon-hook.token"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
         },
         {
           "source": "storage-pem",
@@ -1764,7 +1810,7 @@
     },
     "seaweedfs": {
       "command": [
-        "cat > /tmp/s3.json <<EOT\n{\"identities\": [{\"name\": \"neon\",\n  \"credentials\": [{\"accessKey\": \"chelabase-dev\", \"secretKey\": \"chelabase-dev-secret\"}],\n  \"actions\": [\"Admin\", \"Read\", \"Write\", \"List\", \"Tagging\"]}]}\nEOT\nexec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
+        "set -e\numask 077\n# The S3 identities' keys go from their files into s3.json through stdin and stdout only\n# (tr drops the newline), so no key is ever a program argument or a shell variable.\nkey() { tr -d '\\n' < \"/run/chelabase/secrets/$$1\"; }\n{\n  printf '{\"identities\": [\\n  {\"name\": \"neon\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key s3/access-key; printf '\", \"secretKey\": \"'; key s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:neon\", \"Write:neon\", \"List:neon\", \"Tagging:neon\"]},\\n'\n  printf '  {\"name\": \"storage\",\\n   \"credentials\": [{\"accessKey\": \"'\n  key storage-s3/access-key; printf '\", \"secretKey\": \"'; key storage-s3/secret-key\n  printf '\"}],\\n   \"actions\": [\"Read:chelabase-storage\", \"Write:chelabase-storage\", \"List:chelabase-storage\", \"Tagging:chelabase-storage\"]}]}\\n'\n} > /tmp/s3.json\nD=/run/chelabase/secrets/grpc-tls\nmkdir -p /etc/seaweedfs\n{\n  echo '[grpc]'; echo \"ca = \\\"$$D/ca.crt\\\"\"\n  for c in master volume filer s3; do\n    printf '[grpc.%s]\\ncert = \"%s/server.crt\"\\nkey = \"%s/server.key\"\\nclient_cert = \"%s/client.crt\"\\nclient_key = \"%s/client.key\"\\n' \"$$c\" \"$$D\" \"$$D\" \"$$D\" \"$$D\"\n  done\n  printf '[grpc.client]\\ncert = \"%s/client.crt\"\\nkey = \"%s/client.key\"\\n' \"$$D\" \"$$D\"\n} > /etc/seaweedfs/security.toml\n# The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's\n# start_period covers it). On exhaustion it logs the last output and ends the container\n# (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.\n# On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.\n(\n  i=0; out=\n  while [ \"$$i\" -lt 40 ]; do\n    out=\"$$(printf 's3.bucket.create -name neon\\ns3.bucket.create -name chelabase-storage\\ns3.bucket.list\\n' |\n      timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)\"\n    if printf '%s' \"$$out\" | grep -qw neon && printf '%s' \"$$out\" | grep -qw chelabase-storage; then\n      touch /tmp/buckets-ready; exec sleep 2147483647\n    fi\n    i=$$((i + 1)); sleep 2\n  done\n  echo \"seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:\" >&2\n  printf '%s\\n' \"$$out\" >&2\n  kill 1\n) &\nexec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024\n"
       ],
       "entrypoint": [
         "/bin/sh",
@@ -1773,12 +1819,10 @@
       "healthcheck": {
         "interval": "2s",
         "retries": 60,
+        "start_period": "8m0s",
         "test": [
-          "CMD",
-          "nc",
-          "-z",
-          "127.0.0.1",
-          "8333"
+          "CMD-SHELL",
+          "[ -e /tmp/buckets-ready ] && printf 'GET / HTTP/1.0\\r\\n\\r\\n' | nc -w 3 127.0.0.1 8333 | grep -q '<Code>AccessDenied</Code>'\n"
         ]
       },
       "image": "chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882",
@@ -1786,6 +1830,44 @@
         "default": null
       },
       "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "s3-neon-access-key",
+          "target": "/run/chelabase/secrets/s3/access-key"
+        },
+        {
+          "source": "s3-neon-secret-key",
+          "target": "/run/chelabase/secrets/s3/secret-key"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        },
+        {
+          "source": "grpc-tls-ca",
+          "target": "/run/chelabase/secrets/grpc-tls/ca.crt"
+        },
+        {
+          "source": "grpc-tls-server-crt",
+          "target": "/run/chelabase/secrets/grpc-tls/server.crt"
+        },
+        {
+          "source": "grpc-tls-server-key",
+          "target": "/run/chelabase/secrets/grpc-tls/server.key"
+        },
+        {
+          "source": "grpc-tls-client-crt",
+          "target": "/run/chelabase/secrets/grpc-tls/client.crt"
+        },
+        {
+          "source": "grpc-tls-client-key",
+          "target": "/run/chelabase/secrets/grpc-tls/client.key"
+        }
+      ],
       "volumes": [
         {
           "source": "neon_seaweedfs_data",
@@ -1794,6 +1876,100 @@
           "volume": {}
         }
       ]
+    },
+    "storage": {
+      "command": [
+        "/w/feat-x/target/debug/storage"
+      ],
+      "depends_on": {
+        "metadata-db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "seaweedfs": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
+      "entrypoint": null,
+      "env_file": [
+        {
+          "path": "/m/.chelabase/stacks/feat-x/env/stack.env",
+          "required": false
+        }
+      ],
+      "environment": {
+        "CHELABASE_NATS_INBOX_PREFIX": "_INBOX_storage",
+        "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/storage.password",
+        "CHELABASE_NATS_USER": "storage",
+        "CHELABASE_STORAGE_BACKEND": "seaweedfs",
+        "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
+        "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/storage-s3/access-key",
+        "CHELABASE_STORAGE_S3_BUCKET": "chelabase-storage",
+        "CHELABASE_STORAGE_S3_ENDPOINT": "http://seaweedfs:8333",
+        "CHELABASE_STORAGE_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/storage-s3/secret-key"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8089/health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "networks": {
+        "compute": {},
+        "default": {}
+      },
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "internal-verify",
+          "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
+        },
+        {
+          "source": "token-storage-internal",
+          "target": "/m/.chelabase/tokens/storage-internal.token"
+        },
+        {
+          "source": "nats-storage",
+          "target": "/m/.chelabase/nats/storage.password"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
+        }
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "/w/feat-x",
+          "target": "/w/feat-x",
+          "type": "bind"
+        },
+        {
+          "read_only": true,
+          "target": "/m/.chelabase",
+          "type": "tmpfs"
+        }
+      ],
+      "working_dir": "/w/feat-x"
     },
     "storage-broker": {
       "command": [
@@ -2070,9 +2246,19 @@
         "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
         "CHELABASE_REALTIME_PG_PASSWORD_FILE": "/m/.chelabase/realtime/pg.password",
         "CHELABASE_REALTIME_TLS_DIR": "/m/.chelabase/realtime-tls",
+        "CHELABASE_STORAGE_BACKEND": "seaweedfs",
+        "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/storage-s3/access-key",
+        "CHELABASE_STORAGE_S3_BUCKET": "chelabase-storage",
+        "CHELABASE_STORAGE_S3_ENDPOINT": "http://seaweedfs:8333",
+        "CHELABASE_STORAGE_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/storage-s3/secret-key",
+        "CHELABASE_STORAGE_SWEEP_DRY_RUN": "",
+        "CHELABASE_STORAGE_SWEEP_GRACE_SECS": "",
+        "CHELABASE_STORAGE_SWEEP_SECS": "",
         "CHELABASE_STORAGE_TOKEN_REFRESH_SECS": "3600",
         "CHELABASE_VALKEY_PASSWORD_FILE": "/m/.chelabase/valkey/control.password",
-        "CHELABASE_VALKEY_USER": "control"
+        "CHELABASE_VALKEY_USER": "control",
+        "CHELABASE_WEBHOOKS_ALLOW_HOSTS": "runner",
+        "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true"
       },
       "group_add": [
         "973"
@@ -2119,6 +2305,14 @@
         {
           "source": "realtime-pg",
           "target": "/m/.chelabase/realtime/pg.password"
+        },
+        {
+          "source": "s3-storage-access-key",
+          "target": "/run/chelabase/secrets/storage-s3/access-key"
+        },
+        {
+          "source": "s3-storage-secret-key",
+          "target": "/run/chelabase/secrets/storage-s3/secret-key"
         },
         {
           "source": "token-worker-identity",

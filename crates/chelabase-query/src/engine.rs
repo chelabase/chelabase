@@ -374,10 +374,29 @@ pub fn begin_sql(reset_sql: &str, status: TransactionStatus) -> String {
 /// ends the transaction. For any other client, the `ROLLBACK` that opens the next
 /// transaction on it (sent whenever its status isn't idle) is the guard, so stale work is
 /// never committed with a later request's.
+///
+/// A failed `COMMIT` (a deferred key or constraint trigger) goes through
+/// [`QueryFailure::from_pg`]; [`with_transaction_mapped`] picks another mapping for it.
 pub async fn with_transaction<C: QueryClient + ?Sized, T>(
     client: &C,
     reset_sql: &str,
     request_id: &str,
+    f: impl AsyncFnOnce(&Client) -> Result<T, QueryFailure>,
+) -> Result<T, QueryFailure> {
+    let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+    with_transaction_mapped(client, reset_sql, request_id, on_commit, f).await
+}
+
+/// [`with_transaction`], with `on_commit` mapping the failure of a `COMMIT` that follows an
+/// `f` that succeeded: what deferred work (a deferred key, a deferred constraint trigger,
+/// whatever those queue) raised once every statement had passed. It sees the Postgres error
+/// itself, so a caller that must never show the text of what fired at COMMIT (storage's
+/// object delete) can tell it from `f`'s own failures, which pass through untouched.
+pub async fn with_transaction_mapped<C: QueryClient + ?Sized, T>(
+    client: &C,
+    reset_sql: &str,
+    request_id: &str,
+    on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
     f: impl AsyncFnOnce(&Client) -> Result<T, QueryFailure>,
 ) -> Result<T, QueryFailure> {
     let c = client.client();
@@ -402,7 +421,7 @@ pub async fn with_transaction<C: QueryClient + ?Sized, T>(
     let ended = results.pop().expect("the COMMIT or ROLLBACK step");
     match out {
         Ok(out) => {
-            ended.map_err(|e| QueryFailure::from_pg(&e, request_id))?;
+            ended.map_err(|e| on_commit(&e))?;
             Ok(out)
         }
         Err(failure) => {
@@ -429,7 +448,22 @@ pub async fn console_session<C: QueryClient + ?Sized, T>(
     request_id: &str,
     f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
 ) -> Result<T, QueryFailure> {
-    with_transaction(client, settings.reset_sql, request_id, async |c| {
+    let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+    console_session_mapped(client, database, run_as, settings, request_id, on_commit, f).await
+}
+
+/// [`console_session`], with a failed `COMMIT` mapped by `on_commit`
+/// ([`with_transaction_mapped`]).
+pub async fn console_session_mapped<C: QueryClient + ?Sized, T>(
+    client: &C,
+    database: &str,
+    run_as: RunAs<'_>,
+    settings: &RunSettings,
+    request_id: &str,
+    on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+    f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+) -> Result<T, QueryFailure> {
+    with_transaction_mapped(client, settings.reset_sql, request_id, on_commit, async |c| {
         let pre = preamble(c, run_as, settings.statement_timeout_ms, request_id)
             .await
             .map_err(|f| in_database(f, database))?;

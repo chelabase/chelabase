@@ -1,0 +1,43 @@
+---
+title: Branches and files
+description: What a branch, a reset, a restore and a delete do to stored objects, and when their bytes are reclaimed.
+---
+
+An object's metadata is a row in the branch's Postgres database, and its bytes are an immutable blob in the object store, one per version. Branching copies rows, never bytes.
+
+## A new branch
+
+A branch made from main, at its present or at a point in its history, has main's `storage.buckets` and `storage.objects` rows as they were at that point, and so every object, at no cost. Its blobs are shared with main.
+
+From then on the two are independent, like any other table:
+
+- an upload on the branch makes a new version only the branch sees;
+- an overwrite, move or delete on the branch changes only the branch's rows; main still serves its own version;
+- the branch's policies are its own, copied with the schema.
+
+Keys belong to one branch, so use the branch's own key (or Studio on that branch) to work with its objects. Public URLs name the branch: `/storage/v1/object/public/{branch id}/…`.
+
+## Reset and restore
+
+A [reset to parent or a restore](/using/branches) puts the branch's rows back where they were, and with them its objects. The blobs those rows name are still in the store, because the sweep keeps every blob any live branch, backup branches included, could still bring back.
+
+A signed URL follows its version: if a reset or restore makes the version it was signed for current again, the URL serves again until it expires. See [Signed URLs](/using/storage/urls#signed-urls).
+
+## When bytes are reclaimed
+
+Deleting an object, or a branch, removes rows; the worker's **sweep** removes the blobs no row names any more:
+
+- it runs every 6 hours for each database (`CHELABASE_STORAGE_SWEEP_SECS`), and after a branch is deleted, reset or restored;
+- a blob is kept while any live branch of the database, in any of its Postgres databases, names it, in `storage.objects` or in an upload still in flight;
+- an unreferenced blob is first marked, then deleted only once it has been unreferenced for the grace period (8 days by default and at least, `CHELABASE_STORAGE_SWEEP_GRACE_SECS`) plus the longest history a branch can be restored from. So a restore anywhere in the history window, or a signed URL of up to 7 days, never finds its blob gone;
+- if any branch can't be read, or a branch is made, reset or restored while it runs, the pass deletes nothing;
+- deleting the whole database removes its blobs at once.
+
+Abandoned resumable uploads are aborted the same way once their session has expired.
+
+## Changes made in SQL
+
+The storage API keeps rows and blobs together. Direct SQL changes to `storage.objects` don't:
+
+- inserting an object row, or changing its `bucket_id`, `version_id`, `size` or `etag`, needs a ticket only storage mints, so SQL can't create objects or point a row at other bytes, the owner included. Renames and metadata changes in SQL do work, but aren't evented either;
+- deleting rows in SQL (or with a `CASCADE` from your own table) works, and the sweep later reclaims the bytes, but no [webhook](/using/storage/webhooks) event is sent: only changes made through the storage API are evented.

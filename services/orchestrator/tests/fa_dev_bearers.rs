@@ -14,7 +14,7 @@ use chelabase_types::mode_policy::ModePolicy;
 use orchestrator::internal::config::InternalConfig;
 
 /// Every bearer the internal listener accepts, with its development default.
-const BEARERS: [(&str, &str); 7] = [
+const BEARERS: [(&str, &str); 8] = [
     ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
     ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
     ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
@@ -33,6 +33,10 @@ const BEARERS: [(&str, &str); 7] = [
     (
         "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
         "chelabase-dev-app-sessions",
+    ),
+    (
+        "CHELABASE_STORAGE_INTERNAL_TOKEN",
+        "chelabase-dev-storage-internal",
     ),
 ];
 

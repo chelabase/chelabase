@@ -9,9 +9,35 @@ import { createAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
 import { type CookieOptions, checkCookieOptions, cookieNames, parseCookies, readSession, serializeCookie, sessionCookies } from "./cookies.ts";
 import { toError } from "./error.ts";
+import type { StorageOptions } from "./storage.ts";
 import type { BrowserSession, Client, DatabaseShape, TypeMap } from "./types.ts";
 
 export type { BrowserSession } from "./types.ts";
+// `StorageError` itself comes from `@chelabase/client`.
+export type { StorageErrorCode } from "./storage-errors.ts";
+export type {
+  Bucket,
+  CreateBucket,
+  DownloadOptions,
+  FileList,
+  FileObject,
+  ListOptions,
+  ObjectInfo,
+  PublicUrlOptions,
+  RelocateOptions,
+  SignedUploadUrl,
+  SignedUploadUrlOptions,
+  SignedUrl,
+  SignedUrlOptions,
+  StorageBucket,
+  StorageClient,
+  StorageOptions,
+  UpdateBucket,
+  UploadBody,
+  UploadOptions,
+  UploadProgress,
+  UploadResult,
+} from "./storage.ts";
 
 export interface BrowserClientOptions {
   /** The gateway's base URL. */
@@ -26,6 +52,11 @@ export interface BrowserClientOptions {
   authPath?: string;
   /** The same `cookieOptions` the server side uses (`secure` and `domain` pick the cookie names). */
   cookieOptions?: CookieOptions;
+  /**
+   * Storage options: the branch id for `getPublicUrl`, and `resume: "localStorage"` to resume a
+   * multipart upload after a reload.
+   */
+  storage?: StorageOptions;
 }
 
 /**

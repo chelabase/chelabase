@@ -12,6 +12,8 @@ mod proxy;
 pub mod realtime;
 mod signup;
 mod spec;
+mod storage;
+pub use storage::{ConsoleMinter, console_url_live};
 
 pub use signup::{SETUP_NONCE_TTL, SetupCode, load_setup_code};
 
@@ -49,8 +51,43 @@ pub(crate) const DDL_BODY_LIMIT: usize = 64 * 1024;
 /// `(tenant, token_hash)` of each accepted invite of one identity user, newest first.
 pub type AcceptedInvites = Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>;
 
+/// What console URL liveness reads (#100, [`console_url_live`]): the same facts console
+/// act-as ([`crate::access::authorize`]) reads, each the [`MetadataClient`] method of the same
+/// name. A trait of its own so a test can answer it from the console's fake and run both
+/// sides on one world.
+pub trait ConsoleUrlFacts: Send + Sync {
+    fn get_branch(
+        &self,
+        id: BranchId,
+    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
+    /// The database (any status).
+    fn get_database(
+        &self,
+        db: DatabaseId,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError>> + Send;
+    /// A member by id (any status) and their access sources on `project`, with `database`'s
+    /// override.
+    fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> impl Future<Output = Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError>> + Send;
+    /// An endpoint's roles as 6a records them (the role graph).
+    fn list_roles(
+        &self,
+        endpoint_id: &str,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::RoleRow>, MetadataError>> + Send;
+    /// Whether `name` is a personal login of the database (any status).
+    fn is_personal_login_name(
+        &self,
+        database: DatabaseId,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+}
+
 /// The metadata the internal routes read. Abstracted so tests can use an in-memory fake.
-pub trait NeonMetadataPort: Send + Sync + 'static {
+pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
     /// The DDL receiver's transaction.
     type Ddl: DdlPort;
 
@@ -114,6 +151,27 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         key_id: Uuid,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
 
+    /// Object storage (m6): the key with this id while it is live.
+    fn live_data_key(
+        &self,
+        key_id: Uuid,
+    ) -> impl Future<Output = Result<Option<DataKeyLookup>, MetadataError>> + Send;
+
+    /// Records a minted one-time upload token; false when the id is taken or the key is dead.
+    fn insert_upload_token(
+        &self,
+        token_id: Uuid,
+        key_id: Uuid,
+        claims: &serde_json::Value,
+        expires_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Spends an upload token once, before its expiry, while its key is live.
+    fn consume_upload_token(
+        &self,
+        token_id: Uuid,
+    ) -> impl Future<Output = Result<Option<(DataKeyLookup, serde_json::Value)>, MetadataError>> + Send;
+
     /// What the REST service needs to connect to a branch, whatever its status.
     fn branch_connection(
         &self,
@@ -130,10 +188,6 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         project: ProjectId,
     ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
-    fn get_branch(
-        &self,
-        id: BranchId,
-    ) -> impl Future<Output = Result<Option<BranchRecord>, MetadataError>> + Send;
     /// The project the database belongs to, deleted or not.
     fn database_project(
         &self,
@@ -279,6 +333,33 @@ pub struct SignUpFacts {
 
 // As for `MetadataPort`: each method must call `MetadataClient`'s inherent method by its full
 // path, or a rename would make it call itself.
+impl ConsoleUrlFacts for MetadataClient {
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        MetadataClient::get_branch(self, id).await
+    }
+    async fn get_database(&self, db: DatabaseId) -> Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError> {
+        MetadataClient::get_database(self, db).await
+    }
+    async fn member_access(
+        &self,
+        member: Uuid,
+        project: ProjectId,
+        database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        let Some(record) = MetadataClient::member(self, member).await? else {
+            return Ok(None);
+        };
+        let sources = MetadataClient::grant_sources(self, member, project.as_uuid(), Some(database.as_uuid())).await?;
+        Ok(Some((record, sources)))
+    }
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<chelabase_metadata::RoleRow>, MetadataError> {
+        MetadataClient::list_roles(self, endpoint_id).await
+    }
+    async fn is_personal_login_name(&self, database: DatabaseId, name: &str) -> Result<bool, MetadataError> {
+        MetadataClient::is_personal_login_name(self, database.as_uuid(), name).await
+    }
+}
+
 impl NeonMetadataPort for MetadataClient {
     type Ddl = chelabase_metadata::DdlTx;
 
@@ -338,6 +419,24 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<DataKeyLookup>, MetadataError> {
         MetadataClient::lookup_data_key(self, sha256).await
     }
+    async fn live_data_key(&self, key_id: Uuid) -> Result<Option<DataKeyLookup>, MetadataError> {
+        MetadataClient::live_data_key(self, key_id).await
+    }
+    async fn insert_upload_token(
+        &self,
+        token_id: Uuid,
+        key_id: Uuid,
+        claims: &serde_json::Value,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::insert_upload_token(self, token_id, key_id, claims, expires_at).await
+    }
+    async fn consume_upload_token(
+        &self,
+        token_id: Uuid,
+    ) -> Result<Option<(DataKeyLookup, serde_json::Value)>, MetadataError> {
+        MetadataClient::consume_upload_token(self, token_id).await
+    }
     async fn touch_data_key(&self, key_id: Uuid) -> Result<(), MetadataError> {
         MetadataClient::touch_data_key(self, key_id).await
     }
@@ -352,9 +451,6 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         MetadataClient::project_auth(self, project).await
-    }
-    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
-        MetadataClient::get_branch(self, id).await
     }
     async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
         Ok(MetadataClient::get_database(self, db)
@@ -528,6 +624,8 @@ pub struct InternalState<M, L> {
     pub rest_token: String,
     /// Realtime's token: connection info and key lookups too (`require_any_bearer`, R10).
     pub realtime_token: String,
+    /// The storage service's token: its login's connection info, and the data connection info.
+    pub storage_token: String,
     /// Publishes realtime's events (the DDL hook's `pg_database.*`).
     pub rt_events: Arc<dyn realtime::RtEvents>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
@@ -621,14 +719,26 @@ where
         .route("/internal/invites/open", post(invite::open::<M, L>))
         .route("/internal/invites/accept", post(invite::accept::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
-    let rest_tokens: Arc<[Arc<str>]> =
-        Arc::new([state.rest_token.as_str().into(), realtime_token]);
+    // Storage's role sessions connect as `authenticator` too.
+    let storage_token: Arc<str> = state.storage_token.as_str().into();
+    let rest_tokens: Arc<[Arc<str>]> = Arc::new([
+        state.rest_token.as_str().into(),
+        realtime_token,
+        storage_token.clone(),
+    ]);
     let rest = Router::new()
         .route(
             "/internal/data/branches/{id}/connection",
             get(data::branch_connection::<M, L>),
         )
         .route_layer(middleware::from_fn_with_state(rest_tokens, require_any_bearer));
+    // The `chelabase_storage` login's password and object URLs' state: storage's bearer only.
+    let storage = storage::routes::<M, L>()
+        .route(
+            "/internal/storage/branches/{id}/connection",
+            get(data::storage_connection::<M, L>),
+        )
+        .route_layer(middleware::from_fn_with_state(storage_token, require_bearer));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -645,6 +755,7 @@ where
         .merge(storcon)
         .merge(data_keys)
         .merge(rest)
+        .merge(storage)
         .merge(signup)
         .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())

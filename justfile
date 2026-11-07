@@ -81,7 +81,7 @@ sweep-dbs-test:
 
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
-    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest document_is_current
+    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest -p chelabase-storage-service document_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
 
@@ -119,6 +119,7 @@ check-scripts:
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
     scripts/tests/ci-affected.sh
+    scripts/tests/storage-docs-vars.sh
 
 # cargo-deny, check, clippy, nextest and doctests: the whole workspace, or only the given packages
 # (`just check-rust gateway chelabase-routes`)
@@ -310,6 +311,18 @@ app-users-e2e:
 # on the compute network needs a credential or is public by design
 compute-network-e2e:
     cargo run -q -p chelabase -- workbench run scripts/compute-network-e2e.sh
+
+# Live check of SeaweedFS's bucket boundary (object-storage m2): neon and storage identities each
+# reach only their own bucket (list, write, copy), no unauthenticated port is reachable, no key in inspect
+storage-iam-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/storage-iam-e2e.sh
+
+# Live object storage story through the gateway (#107): bucket, policies, upload, resumable upload,
+# download, signed and public URLs, a branch, delete, and the sweep's purge. `--backend s3` runs it
+# with storage and the worker switched to backend s3 on a second, throwaway S3 endpoint (it
+# recreates the stack's storage and worker, then restores them); `--restore` only restores
+storage-e2e *args:
+    cargo run -q -p chelabase -- workbench run scripts/storage-e2e.sh "$@"
 
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:

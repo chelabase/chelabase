@@ -98,6 +98,11 @@ fn access_table() -> String {
             ep.path.replace('{', "\\{").replace('}', "\\}"),
             auth_text(ep.policy.auth),
             access_text(ep.policy.access)
+                + if ep.name.starts_with(chelabase_routes::orchestrator::STORAGE_PREFIX) {
+                    "; no role (owner mode): Admin"
+                } else {
+                    ""
+                }
         );
     }
     out

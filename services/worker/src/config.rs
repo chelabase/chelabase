@@ -507,6 +507,11 @@ pub fn build_with(
         storage_token_refresh_every: config.storage_token_refresh_every,
         storage_token_failures: Default::default(),
         realtime_password,
+        blob_store: None,
+        storage_sweep: Default::default(),
+        sweep_requests: Default::default(),
+        storage_sweep_refusals: Default::default(),
+        storage_sweep_restore_voids: Default::default(),
     })
 }
 

@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chelabase_types::data_api_schema::{
-    AppUsersTable, ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc, SchemaEntry, TableDesc,
-    TableKind,
+    AppUsersTable, ArgDesc, ColumnDesc, DataApiSchema, FunctionDesc, Privilege, ReturnDesc,
+    SchemaEntry, StorageRefDesc, TableDesc, TableKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,11 +29,14 @@ use crate::query::Name;
 use crate::sql::{Catalog, ColumnInfo, FnLookupError, FunctionInfo, TableInfo, quote_ident};
 
 /// Schemas never exposed, whatever the grants: Chelabase's own machinery, Postgres's and
-/// Neon's own. `pg_temp_*` and `pg_toast_temp_*` are hidden too ([`is_reserved`]).
+/// Neon's own. `pg_temp_*`, `pg_toast_temp_*` and every `chelabase…` schema are hidden too
+/// ([`is_reserved`]).
 pub const RESERVED_SCHEMAS: &[&str] = &[
     "chelabase",
     // The protected-branch DDL guard (worker `schema_guard`).
     "chelabase_guard",
+    // Object metadata (worker `storage_schema`): served by the storage service only.
+    "storage",
     "pg_catalog",
     "information_schema",
     "pg_toast",
@@ -54,6 +57,7 @@ const ROLE_VIEWS: u64 = 64;
 
 pub fn is_reserved(schema: &str) -> bool {
     RESERVED_SCHEMAS.contains(&schema)
+        || schema.starts_with("chelabase")
         || schema.starts_with("pg_temp_")
         || schema.starts_with("pg_toast_temp_")
 }
@@ -62,7 +66,7 @@ pub fn is_reserved(schema: &str) -> bool {
 /// as `int8`, since `to_json` writes an `oid` as a string).
 pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
   'namespaces', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(n.oid::int8, n.nspname)), '[]')
-    FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_')),
+    FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')),
   'types', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(t.oid::int8, n.nspname, t.typname, t.typtype,
       t.typelem::int8, t.typbasetype::int8, t.typcategory, t.typlen, pg_catalog.format_type(t.oid, NULL))), '[]')
     FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace),
@@ -74,7 +78,13 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
         FROM pg_catalog.unnest(c.reloptions) o WHERE o LIKE 'security_invoker=%'), false),
       (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(a.attname, a.atttypid::int8,
           pg_catalog.format_type(a.atttypid, a.atttypmod), NOT a.attnotnull,
-          a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a') ORDER BY a.attnum), '[]')
+          a.atthasdef OR a.attidentity <> '', a.attgenerated <> '' OR a.attidentity = 'a',
+          pg_catalog.col_description(c.oid, a.attnum),
+          EXISTS (SELECT FROM pg_catalog.pg_constraint f WHERE f.conrelid = c.oid AND f.contype = 'f'
+            AND f.conkey = ARRAY[a.attnum] AND f.confrelid = (SELECT o.oid FROM pg_catalog.pg_class o JOIN pg_catalog.pg_namespace s ON s.oid = o.relnamespace
+              WHERE s.nspname = 'storage' AND o.relname = 'objects')
+            AND f.confkey = ARRAY[(SELECT x.attnum FROM pg_catalog.pg_attribute x
+              WHERE x.attrelid = f.confrelid AND x.attname = 'id')])) ORDER BY a.attnum), '[]')
         FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped),
       (SELECT coalesce(pg_catalog.json_agg(a.attname ORDER BY k.ord), '[]')
         FROM pg_catalog.pg_constraint con
@@ -82,21 +92,21 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
         WHERE con.conrelid = c.oid AND con.contype = 'p'))), '[]')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_')),
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')),
   'functions', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(p.oid::int8, n.nspname, p.proname, p.prokind,
       p.proretset, p.prorettype::int8, p.proargtypes::oid[]::int8[], p.proallargtypes::int8[], p.proargmodes::text[], p.proargnames,
       p.pronargdefaults, p.provariadic <> 0,
       EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
         AND d.objid = p.oid AND d.deptype = 'e'))), '[]')
     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_'))
+    WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'))
 )::text";
 
 /// `$1` = the role (`text`), `$2` = [`RESERVED_SCHEMAS`] (`text[]`). One row, one `text` column: the JSON
 /// [`Visibility`] reads.
 pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
   'schemas', (SELECT coalesce(pg_catalog.json_agg(n.oid::int8), '[]') FROM pg_catalog.pg_namespace n
-    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')),
   'tables', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(c.oid::int8,
       pg_catalog.has_any_column_privilege($1::name, c.oid, 'SELECT'),
@@ -104,11 +114,11 @@ pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
       pg_catalog.has_any_column_privilege($1::name, c.oid, 'UPDATE'),
       pg_catalog.has_table_privilege($1::name, c.oid, 'DELETE'))), '[]')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')),
   'functions', (SELECT coalesce(pg_catalog.json_agg(p.oid::int8), '[]')
     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')
       AND pg_catalog.has_function_privilege($1::name, p.oid, 'EXECUTE'))
 )::text";
@@ -123,8 +133,10 @@ pub enum IntrospectError {
 
 /// `(oid, schema, name, typtype, typelem, typbasetype, typcategory, typlen, format_type)`.
 type RawType = (u32, String, String, String, u32, u32, String, i16, String);
-/// `(name, type oid, format_type with typmod, nullable, has_default, generated)`.
-type RawColumn = (String, u32, String, bool, bool, bool);
+/// `(name, type oid, format_type with typmod, nullable, has_default, generated, comment,
+/// a single-column foreign key to `storage.objects(id)`)`. The comment is read only for the
+/// `@storage_ref` hint ([`storage_bucket_of`]); its text never reaches the API.
+type RawColumn = (String, u32, String, bool, bool, bool, Option<String>, bool);
 /// `(oid, schema, name, relkind, rls, security_invoker, columns, primary key columns)`.
 /// `security_invoker` is true only for a view whose options set it (any spelling Postgres
 /// reads as true: the value is cast to `boolean`). The primary key's columns come in the
@@ -186,6 +198,24 @@ pub struct Column {
     pub ty: TypeDesc,
     pub nullable: bool,
     pub has_default: bool,
+    /// How the column references a stored object, if it does.
+    pub storage_ref: Option<StorageRefDesc>,
+}
+
+/// The bucket a column comment's `@storage_ref bucket=<name>` names: the word right after
+/// `@storage_ref` (words split at whitespace), when it is `bucket=` and a non-empty name.
+pub fn storage_bucket_of(comment: &str) -> Option<String> {
+    let mut words = comment.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "@storage_ref" {
+            return words
+                .next()?
+                .strip_prefix("bucket=")
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +422,34 @@ impl Types {
         Some(format!("{}.{}", quote_ident(&t.1), quote_ident(&t.2)))
     }
 
+    /// How a column of type `oid` (with `comment`, and `storage_object` when a single-column
+    /// foreign key makes it `storage.objects(id)`) references a stored object: the foreign
+    /// key first, then the type `storage.object_ref` (by its schema, never another type of
+    /// that name), then a text column's (or text array's) `@storage_ref bucket=` comment.
+    fn storage_ref(
+        &self,
+        oid: u32,
+        comment: Option<&str>,
+        storage_object: bool,
+    ) -> Option<StorageRefDesc> {
+        if storage_object {
+            return Some(StorageRefDesc::Id);
+        }
+        let mut t = self.base(oid)?;
+        if Self::is_array(t) {
+            t = self.base(t.4)?;
+        }
+        if t.1 == "storage" && t.2 == "object_ref" {
+            return Some(StorageRefDesc::Ref);
+        }
+        if t.6 == "S" {
+            return comment
+                .and_then(storage_bucket_of)
+                .map(|bucket| StorageRefDesc::Path { bucket });
+        }
+        None
+    }
+
     /// The type by its own schema and name, each quoted, without modifiers (an array is its
     /// `_` type, a domain itself): never resolved through the search path.
     fn qualified(&self, oid: u32) -> Option<String> {
@@ -433,7 +491,16 @@ impl Schema {
                     columns: columns
                         .into_iter()
                         .map(
-                            |(name, typid, formatted, nullable, has_default, generated)| {
+                            |(
+                                name,
+                                typid,
+                                formatted,
+                                nullable,
+                                has_default,
+                                generated,
+                                comment,
+                                storage_object,
+                            )| {
                                 let ty = types.desc(typid).unwrap_or(TypeDesc {
                                     name: formatted.clone(),
                                     array: false,
@@ -441,6 +508,8 @@ impl Schema {
                                 });
                                 let text_like =
                                     !ty.array && types.base(typid).is_some_and(|b| b.6 == "S");
+                                let storage_ref =
+                                    types.storage_ref(typid, comment.as_deref(), storage_object);
                                 let type_qualified =
                                     types.qualified(typid).unwrap_or_else(|| formatted.clone());
                                 Column {
@@ -457,6 +526,7 @@ impl Schema {
                                     ty,
                                     nullable,
                                     has_default,
+                                    storage_ref,
                                 }
                             },
                         )
@@ -568,6 +638,7 @@ impl Schema {
                         has_default: c.has_default,
                         generated: c.info.generated,
                         r#enum: c.ty.enum_ref.clone(),
+                        storage_ref: c.storage_ref.clone(),
                     },
                 );
             }
@@ -834,6 +905,33 @@ mod tests {
         assert!(is_reserved("chelabase_guard"));
     }
 
+    /// Object storage m3: `/data/v1` never serves `storage` (the storage service does) or any
+    /// `chelabase…` schema (the merge's marker, a quarantined bootstrap schema, …).
+    #[test]
+    fn the_storage_and_chelabase_schemas_are_reserved() {
+        for schema in ["storage", "chelabase", "chelabase_merge", "chelabase_quarantine_1"] {
+            assert!(is_reserved(schema), "{schema}");
+        }
+        for schema in ["public", "storage_app", "app_chelabase"] {
+            assert!(!is_reserved(schema), "{schema}");
+        }
+        assert!(RESERVED_SCHEMAS.contains(&"storage"));
+        // The SQL hides them too, by the same list and prefix.
+        assert!(INTROSPECT_SQL.contains("n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'"), "{INTROSPECT_SQL}");
+        assert!(!INTROSPECT_SQL.contains("n.nspname ~ '^pg_(toast_)?temp_'"));
+        assert!(!VISIBILITY_SQL.contains("n.nspname ~ '^pg_(toast_)?temp_'"));
+        assert!(VISIBILITY_SQL.contains("n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'"));
+        // A relation the SQL returned anyway never reaches the planner's catalog.
+        let relation = |oid: u32, schema: &str, name: &str| (oid, schema.to_string(), name.to_string(), "r".to_string(), true, false, vec![], vec![]);
+        let raw = Raw {
+            relations: vec![relation(1, "storage", "objects"), relation(2, "chelabase_merge", "marker"), relation(3, "public", "t")],
+            ..Raw::default()
+        };
+        let schema = Schema::build("v".into(), raw);
+        let names: Vec<(&str, &str)> = schema.tables.iter().map(|t| (t.schema.as_str(), t.name.as_str())).collect();
+        assert_eq!(names, [("public", "t")]);
+    }
+
     fn td(name: &str, array: bool, enum_ref: Option<&str>) -> TypeDesc {
         TypeDesc {
             name: name.into(),
@@ -855,6 +953,7 @@ mod tests {
             ty,
             nullable,
             has_default,
+            storage_ref: None,
         }
     }
 

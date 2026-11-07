@@ -24,7 +24,7 @@
 /// runs in the owner's session (E15) and needs no prelude.
 pub const TARGET_DIGEST_SQL: &str = "WITH nsp AS (\
 SELECT n.oid FROM pg_catalog.pg_namespace n \
-WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard') \
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard', 'storage') \
 AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%' \
 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = n.oid AND d.deptype = 'e')\
 ), rel AS (\

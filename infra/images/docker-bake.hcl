@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio", "identity"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "init", "server", "studio", "identity"]
 }
 
 target "_app" {
@@ -68,6 +68,14 @@ target "realtime" {
   inherits = ["_app"]
   target   = "realtime"
   tags     = ["${REPO}/realtime:${TAG}"]
+}
+# Object storage: in the default group (`just images`) since the base compose file runs it (m19);
+# not in the release scripts yet (publish, pin, image-inputs): its first publish and pin are from
+# `main` once the object-storage epic merges.
+target "storage" {
+  inherits = ["_app"]
+  target   = "storage"
+  tags     = ["${REPO}/storage:${TAG}"]
 }
 target "init" {
   inherits = ["_app"]

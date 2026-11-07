@@ -43,6 +43,10 @@
 //!   every watcher converges to it; a database channel made on the holder's own instance
 //!   starts from it. A fenced holder tells only its own instance's watchers `waiting`.
 //! - On any window of a database, that database's R12 cache is flushed (every relation's).
+//!
+//! Object storage m17: a storage channel ([`TableChannel::bucket`]) has a filter of its own per
+//! (relation, bucket) on the database, with a visibility cache of its own (its answers are
+//! per bucket, never another filter's), and gets every window of `storage.objects`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -210,6 +214,10 @@ enum TableWork {
     Schema,
 }
 
+/// A watched relation of a database, and a storage channel's bucket (object storage m17): one
+/// filter each.
+type TableKey = (u32, Option<Uuid>);
+
 /// One watched relation of a database on this instance.
 struct Table {
     filter: Arc<tokio::sync::Mutex<TableFilter>>,
@@ -222,7 +230,7 @@ struct Table {
 struct Db {
     target: CheckTarget,
     status: Status,
-    tables: HashMap<u32, Table>,
+    tables: HashMap<TableKey, Table>,
     limiter: Arc<Limiter>,
     cache: Arc<VisibilityCache>,
     tasks: Vec<AbortHandle>,
@@ -451,6 +459,7 @@ impl Inner {
         &self,
         key: DbKey,
         resolved: &Resolved,
+        bucket: Option<Uuid>,
     ) -> Option<(
         Arc<tokio::sync::Mutex<TableFilter>>,
         mpsc::UnboundedSender<TableWork>,
@@ -458,17 +467,23 @@ impl Inner {
         let mut state = self.state.lock().unwrap();
         let db = state.dbs.get_mut(&key)?;
         let oid = resolved.relation.oid;
-        if let Some(t) = db.tables.get(&oid) {
+        if let Some(t) = db.tables.get(&(oid, bucket)) {
             return Some((t.filter.clone(), t.queue.clone()));
         }
+        // A bucket's answers are its own: never cached where another filter reads them.
+        let cache = match bucket {
+            None => db.cache.clone(),
+            Some(_) => VisibilityCache::new(WINDOW),
+        };
         let mut filter = TableFilter::new(
             db.target.clone(),
             resolved.relation.clone(),
             self.deps.checker.clone(),
             db.limiter.clone(),
-            db.cache.clone(),
+            cache,
             self.deps.settings.filter.clone(),
         );
+        filter.set_bucket(bucket);
         filter.set_changed_only(
             join_kind(resolved.relkind, resolved.inheritance_parent) == JoinKind::Changed,
         );
@@ -480,7 +495,7 @@ impl Inner {
             self.spawn(async move { me.table_worker(key, filter, rx).await })
         };
         db.tables.insert(
-            oid,
+            (oid, bucket),
             Table {
                 filter: filter.clone(),
                 queue: queue.clone(),
@@ -504,10 +519,11 @@ impl Inner {
         let Some(db) = state.dbs.get_mut(&key) else {
             return;
         };
-        if let Some(table) = db.tables.get_mut(&rec.rel) {
+        let tkey = (rec.rel, rec.channel.bucket);
+        if let Some(table) = db.tables.get_mut(&tkey) {
             table.viewers.remove(&id);
             if table.viewers.is_empty() {
-                let table = db.tables.remove(&rec.rel).expect("present");
+                let table = db.tables.remove(&tkey).expect("present");
                 table.worker.abort();
             } else {
                 let filter = table.filter.clone();
@@ -592,25 +608,33 @@ impl Inner {
             let Ok(w) = serde_json::from_slice::<WindowMsg>(&m.payload) else {
                 continue;
             };
-            let queue = self
+            // The relation's table channel and every bucket's storage channel of it.
+            let queues: Vec<mpsc::UnboundedSender<TableWork>> = self
                 .state
                 .lock()
                 .unwrap()
                 .dbs
                 .get(&key)
-                .and_then(|d| d.tables.get(&rel))
-                .map(|t| t.queue.clone());
-            if let Some(q) = queue {
+                .map(|d| {
+                    d.tables
+                        .iter()
+                        .filter(|((oid, _), _)| *oid == rel)
+                        .map(|(_, t)| t.queue.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let at = Instant::now();
+            for q in queues {
                 let _ = q.send(TableWork::Window {
                     window: RelWindow {
                         rel,
                         changed: w.changed,
-                        inserts: w.inserts,
-                        updates: w.updates,
-                        deletes: w.deletes,
+                        inserts: w.inserts.clone(),
+                        updates: w.updates.clone(),
+                        deletes: w.deletes.clone(),
                     },
-                    xids: w.xids,
-                    at: Instant::now(),
+                    xids: w.xids.clone(),
+                    at,
                 });
             }
         }
@@ -623,14 +647,27 @@ impl Inner {
         filter: Arc<tokio::sync::Mutex<TableFilter>>,
         mut rx: mpsc::UnboundedReceiver<TableWork>,
     ) {
-        while let Some(work) = rx.recv().await {
+        loop {
+            // A storage channel's carried keys are retried on their own clock (#129, S2): never
+            // when some other window happens to arrive.
+            let due = filter.lock().await.retry_at();
+            let work = tokio::select! {
+                work = rx.recv() => match work {
+                    Some(work) => work,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                    filter.lock().await.retry().await;
+                    continue;
+                }
+            };
             let mut f = filter.lock().await;
             match work {
                 TableWork::Window { window, xids, at } => {
                     f.deliver(&window, &xids, at).await;
                 }
                 TableWork::Schema => {
-                    let old = f.relation().oid;
+                    let old = (f.relation().oid, f.bucket());
                     drop(f);
                     self.rebind(key, old).await;
                     let mut f = filter.lock().await;
@@ -649,7 +686,7 @@ impl Inner {
     /// Re-resolves the table now keyed `old` on `key` as one of its viewers (W10, S16): a new
     /// OID (a recreated or renamed table) moves the table and its watches to it. `Some` with
     /// the resolution (`None` inside: the table is gone), `None` when it couldn't be asked.
-    async fn rebind(&self, key: DbKey, old: u32) -> Option<Option<Resolved>> {
+    async fn rebind(&self, key: DbKey, old: TableKey) -> Option<Option<Resolved>> {
         let (target, channel, identity) = {
             let state = self.state.lock().unwrap();
             let db = state.dbs.get(&key)?;
@@ -671,8 +708,8 @@ impl Inner {
     }
 
     /// The table keyed `old` follows `resolved` (its OID and key).
-    async fn move_table(&self, key: DbKey, old: u32, resolved: &Resolved) {
-        let new = resolved.relation.oid;
+    async fn move_table(&self, key: DbKey, old: TableKey, resolved: &Resolved) {
+        let new = (resolved.relation.oid, old.1);
         let filter = {
             let mut state = self.state.lock().unwrap();
             let State { watches, dbs, .. } = &mut *state;
@@ -689,7 +726,7 @@ impl Inner {
                 };
                 for id in &table.viewers {
                     if let Some(w) = watches.get_mut(id) {
-                        w.rel = new;
+                        w.rel = new.0;
                     }
                 }
                 let filter = table.filter.clone();
@@ -1382,18 +1419,27 @@ impl Holding<'_> {
                 e.insert(deps.checker.parents(&self.target, r.rel).await.ok()?);
             }
         }
-        for r in fan_out(w, parents, deps.settings.filter.max_keys) {
-            let msg = WindowMsg {
-                xids: w.xids.clone(),
-                changed: r.changed,
-                inserts: r.inserts,
-                updates: r.updates,
-                deletes: r.deletes,
+        let max_keys = deps.settings.filter.max_keys;
+        for whole in fan_out(w, parents, max_keys) {
+            // `storage.objects` is kept whole past the key limit: published in chunks (m17).
+            let chunks = if w.split.contains(&whole.rel) {
+                whole.chunks(max_keys)
+            } else {
+                vec![whole]
             };
-            out.push_back((
-                rows_subject(self.key, r.rel),
-                Bytes::from(serde_json::to_vec(&msg).expect("serializes")),
-            ));
+            for r in chunks {
+                let msg = WindowMsg {
+                    xids: w.xids.clone(),
+                    changed: r.changed,
+                    inserts: r.inserts,
+                    updates: r.updates,
+                    deletes: r.deletes,
+                };
+                out.push_back((
+                    rows_subject(self.key, r.rel),
+                    Bytes::from(serde_json::to_vec(&msg).expect("serializes")),
+                ));
+            }
         }
         Some(out)
     }
@@ -1459,6 +1505,7 @@ impl Inner {
                     xids: Vec::new(),
                     keys: None,
                     convert: Vec::new(),
+                    bucket: ch.bucket,
                 },
             )
             .await
@@ -1477,7 +1524,7 @@ impl Inner {
         state
             .dbs
             .get(&key)
-            .and_then(|d| d.tables.get(&w.rel))
+            .and_then(|d| d.tables.get(&(w.rel, w.channel.bucket)))
             .map(|t| t.filter.clone())
     }
 
@@ -1550,7 +1597,7 @@ impl ChangeSource for ReplicationSource {
             ));
         }
         inner.ensure_db(key, &target);
-        let Some((filter, _queue)) = inner.ensure_table(key, &resolved) else {
+        let Some((filter, _queue)) = inner.ensure_table(key, &resolved, ch.bucket) else {
             return Err(JoinRefusal::Unavailable);
         };
         {
@@ -1560,7 +1607,11 @@ impl ChangeSource for ReplicationSource {
                 .get(&watch_id)
                 .map(|w| w.rel)
                 .unwrap_or(rel_oid);
-            if let Some(t) = state.dbs.get_mut(&key).and_then(|d| d.tables.get_mut(&rel)) {
+            if let Some(t) = state
+                .dbs
+                .get_mut(&key)
+                .and_then(|d| d.tables.get_mut(&(rel, ch.bucket)))
+            {
                 t.viewers.insert(watch_id);
             }
         }
@@ -1625,7 +1676,7 @@ impl ChangeSource for ReplicationSource {
             state
                 .dbs
                 .get(&key)
-                .and_then(|d| d.tables.get(&w.rel))
+                .and_then(|d| d.tables.get(&(w.rel, w.channel.bucket)))
                 .map(|t| t.filter.clone())
                 .ok_or(())?
         };
@@ -1660,7 +1711,7 @@ impl ChangeSource for ReplicationSource {
         };
         // A renamed or recreated table: the channel follows the new OID.
         // The group's classification is the next window's own probe's (R2): nothing to keep.
-        inner.move_table(key, old_rel, &resolved).await;
+        inner.move_table(key, (old_rel, channel.bucket), &resolved).await;
         let (live, reason) = inner.status_of(key);
         Ok(JoinInfo {
             pk,

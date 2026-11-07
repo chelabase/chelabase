@@ -42,6 +42,7 @@ Two one-shot containers do the setup, and both must exit 0:
 | `auth` | The login API: sign-in, sign-up, invites, password reset, and member and app-user tokens |
 | `identity` | Every account (Studio's members and each project's app users) and the emails with codes; internal only, see [Identity service](/architecture/identity) |
 | `rest`, `realtime` | The data API and live rows |
+| `storage` | Object storage: files in buckets at `/storage/v1`, signed URLs and storage webhooks. Its files live in SeaweedFS's `chelabase-storage` bucket |
 | `metadata-db`, `nats`, `valkey` | The control plane's database (the identity service's schemas live there too), jobs, and caches |
 | `storage-*`, `pageserver`, `safekeeper*`, `proxy`, `seaweedfs` | Neon's storage and the Postgres proxy |
 
@@ -99,6 +100,9 @@ Everything `init-secrets` makes lives in the `secrets` volume, each file mounted
 | `identity/db.password` | `identity`, `init-bootstrap` | The identity service's database password |
 | `tokens/auth-identity.token`, `tokens/orchestrator-identity.token`, `tokens/worker-identity.token`, `tokens/bootstrap-identity.token` | `identity` and each caller | One bearer per caller of the identity service |
 | `setup/setup.code` | `init-secrets`, the orchestrator | The setup code |
+| `tokens/storage-internal.token` | `storage`, the orchestrator | The bearer between them, both ways (Studio's storage routes, and storage's own database login) |
+| `nats/storage.password` | `storage` | Its NATS login |
+| `storage-s3/access-key`, `storage-s3/secret-key` | `storage`, the worker (its sweep of unreferenced files), SeaweedFS | The object store identity that may use the `chelabase-storage` bucket only |
 
 None of them is ever rewritten once it exists.
 
@@ -123,8 +127,11 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the images come from. The compose file pins each release image by digest. Setting either variable replaces every pin: one tag for all images, with no digest check. For testing or images you built only (see [Upgrade](#upgrade)) |
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
 | `CHELABASE_SMTP_*` | unset | The identity service's email (below) |
+| `CHELABASE_WEBHOOKS_ALLOW_HOSTS`, `CHELABASE_WEBHOOKS_ALLOW_HTTP` | empty, `false` | Where storage webhooks may be delivered. By default only `https` URLs whose host resolves to public addresses. List host names (no port) that may resolve to private addresses, such as a receiver on your own network, and set `true` to also accept `http` URLs |
 | `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | How long a member access token lives, 60 to 900 seconds |
 | `CHELABASE_MEMBER_SESSION_CHECK_SECS` | `15` | How long the orchestrator reuses the identity service's answer that a member token's session is live, 0 to 30 seconds (0 asks every time). A token stops working at most this long after logout or a password reset |
+
+Storage webhook events wait in a NATS stream until they're delivered. The NATS volume (`nats_data`) needs about 6.2 GiB free (NATS reserves about 4.6 GiB and only uses 75% of free disk by default) when the stream is created, and the orchestrator doesn't start without it. A database keeps at most 100,000 undelivered events; past that, its oldest events are dropped unsent.
 
 Compose cannot split a host into its name and port, so when you change the hosts, `.env` has to repeat what Compose can't derive: the three `*_HOST_NAME` values, `CHELABASE_PUBLIC_PORT` and `CHELABASE_PUBLIC_SECURE`. `init-secrets` checks that they match the hosts and, if not, fails and names the exact line to fix. For example, `http` on port 9000:
 
@@ -232,7 +239,7 @@ docker compose pull
 docker compose up -d --wait
 ```
 
-`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. `up` recreates the containers, not the volumes: `init-secrets` creates only the secrets that are missing and never replaces one, the orchestrator applies any new metadata migrations when it starts, and `init-bootstrap` can safely run again. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. `up` recreates the containers, not the volumes: `init-secrets` creates only the secrets that are missing and never replaces one (an upgrade that adds a service, such as `storage`, adds that service's secrets and NATS login; Compose restarts `nats` after an updated `init-secrets` so the new login works), the orchestrator applies any new metadata migrations when it starts, and `init-bootstrap` can safely run again. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
 
 `CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
 

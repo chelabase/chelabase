@@ -1,0 +1,11 @@
+error[E0599]: no associated function or constant named `new` found for struct `NamedStatement` in the current scope
+ --> tests/ui/statement_new_from_leaked_text.rs:4:59
+  |
+4 |     let _ = chelabase_pgsession::service::NamedStatement::new("from request", request.leak(), &[]);
+  |                                                           ^^^ associated function or constant not found in `NamedStatement`
+  |
+note: if you're trying to build a new `NamedStatement`, consider using `NamedStatement::of` which returns `NamedStatement`
+ --> src/service.rs
+  |
+  |     pub const fn of<T: StatementText>() -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -29,7 +29,7 @@ use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 use chelabase_types::mode::Mode;
 use chelabase_types::role_settings::RoleSettings;
 use orchestrator::internal::{
-    BoxFuture, CachePort, DdlPort, InternalState, NeonMetadataPort, ResyncPort,
+    BoxFuture, CachePort, ConsoleUrlFacts, DdlPort, InternalState, NeonMetadataPort, ResyncPort,
     build_internal_router,
 };
 use std::collections::BTreeMap;
@@ -46,6 +46,7 @@ const STORCON_TOKEN: &str = "storcon-token";
 const COMPUTE_TOKEN: &str = "compute-token";
 const DATA_KEYS_TOKEN: &str = "data-keys-token";
 const REST_TOKEN: &str = "rest-token";
+const STORAGE_TOKEN: &str = "storage-token";
 const CONTROL_PLANE_URI: &str = "http://orchestrator:8083";
 const APP_AUTH_TOKEN: &str = "app-auth-token";
 const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
@@ -57,6 +58,8 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
+/// Upload tokens by id: (key id, claims, spent).
+type UploadTokens = HashMap<uuid::Uuid, (uuid::Uuid, Value, bool)>;
 
 /// An invite's stored expiry and whether the database clock calls it open.
 type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
@@ -99,6 +102,15 @@ struct FakeNeon {
     clears: Arc<Mutex<Vec<(TenantId, String)>>>,
     fail_clear: Arc<Mutex<bool>>,
     fail_tenant_lookup: Arc<Mutex<bool>>,
+    /// Object storage m6: upload tokens by id (key id, claims, spent); the SQL's own rules are
+    /// tested live (`live_db::storage_upload_tokens_*`).
+    upload_tokens: Arc<Mutex<UploadTokens>>,
+    /// Object storage m9: members by id with their access sources (one project each here).
+    members: Arc<Mutex<Vec<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>>>,
+    /// #100: each endpoint's role rows (the role graph console act-as reads), and the
+    /// personal-login names of each database.
+    role_rows: Arc<Mutex<HashMap<String, Vec<chelabase_metadata::RoleRow>>>>,
+    personal_login_names: Arc<Mutex<std::collections::HashSet<(DatabaseId, String)>>>,
 }
 
 /// The fake's fresh-install claim rows: a model of `claim_setup`'s rules (the real ones are
@@ -450,6 +462,23 @@ impl FakeNeon {
         e.static_lsn = static_lsn.map(str::to_string);
     }
 
+    /// #100: a NOLOGIN group role on an endpoint that is a member of `member_of`.
+    fn add_group_role(&self, endpoint: &str, name: &str, member_of: &[&str]) {
+        self.role_rows.lock().unwrap().entry(endpoint.into()).or_default().push(chelabase_metadata::RoleRow {
+            name: name.into(),
+            origin: RoleOrigin::Sql,
+            level: RoleLevel::Plain,
+            login: false,
+            password: chelabase_metadata::PasswordState::Generated,
+            created_at: chrono::Utc::now(),
+            pending: false,
+            attributes: chelabase_metadata::RoleAttributes {
+                member_of: member_of.iter().map(|r| r.to_string()).collect(),
+                ..Default::default()
+            },
+        });
+    }
+
     fn break_it(&self) {
         *self.fail.lock().unwrap() = true;
     }
@@ -464,6 +493,62 @@ impl FakeNeon {
             return Err(MetadataError::Config("metadata is down".into()));
         }
         Ok(())
+    }
+}
+
+impl ConsoleUrlFacts for FakeNeon {
+    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
+        self.check()?;
+        Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
+    }
+
+    /// A `Ready` database of its `db_projects` project, owned by `postgres`.
+    async fn get_database(&self, db: DatabaseId) -> Result<Option<chelabase_metadata::DatabaseRecord>, MetadataError> {
+        self.check()?;
+        let rows = self.app.lock().unwrap();
+        let Some(project) = rows.db_projects.get(&db).copied() else {
+            return Ok(None);
+        };
+        let Some(tenant_id) = rows.projects.iter().find(|p| p.id == project).map(|p| p.tenant_id) else {
+            return Ok(None);
+        };
+        Ok(Some(chelabase_metadata::DatabaseRecord {
+            database_id: db,
+            project_id: project,
+            tenant_id,
+            name: "web".into(),
+            status: chelabase_metadata::DatabaseStatus::Ready,
+            database_name: Some("web".into()),
+            owner_role: Some("postgres".into()),
+            error: None,
+            neon_tenant_id: None,
+            history_window: std::time::Duration::from_secs(86_400),
+            max_branches: 10,
+            max_rows: 1000,
+            statement_timeout_ms: 8000,
+            max_connections: 10,
+            storage_max_connections: 10,
+        }))
+    }
+
+    async fn member_access(
+        &self,
+        member: uuid::Uuid,
+        _project: ProjectId,
+        _database: DatabaseId,
+    ) -> Result<Option<(chelabase_metadata::members::MemberRecord, chelabase_types::access::GrantSources)>, MetadataError> {
+        self.check()?;
+        Ok(self.members.lock().unwrap().iter().find(|(m, _)| m.id == member).cloned())
+    }
+
+    async fn list_roles(&self, endpoint_id: &str) -> Result<Vec<chelabase_metadata::RoleRow>, MetadataError> {
+        self.check()?;
+        Ok(self.role_rows.lock().unwrap().get(endpoint_id).cloned().unwrap_or_default())
+    }
+
+    async fn is_personal_login_name(&self, database: DatabaseId, name: &str) -> Result<bool, MetadataError> {
+        self.check()?;
+        Ok(self.personal_login_names.lock().unwrap().contains(&(database, name.to_string())))
     }
 }
 
@@ -494,6 +579,44 @@ impl NeonMetadataPort for FakeNeon {
             .iter()
             .find(|(h, _)| h == sha256)
             .map(|(_, l)| l.clone()))
+    }
+
+    async fn live_data_key(&self, key_id: uuid::Uuid) -> Result<Option<DataKeyLookup>, MetadataError> {
+        self.check()?;
+        Ok(self.data_keys.lock().unwrap().iter().find(|(_, l)| l.key_id == key_id).map(|(_, l)| l.clone()))
+    }
+
+    async fn insert_upload_token(
+        &self,
+        token_id: uuid::Uuid,
+        key_id: uuid::Uuid,
+        claims: &Value,
+        _expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetadataError> {
+        if self.live_data_key(key_id).await?.is_none() {
+            return Ok(false);
+        }
+        let mut tokens = self.upload_tokens.lock().unwrap();
+        if tokens.contains_key(&token_id) {
+            return Ok(false);
+        }
+        tokens.insert(token_id, (key_id, claims.clone(), false));
+        Ok(true)
+    }
+
+    async fn consume_upload_token(
+        &self,
+        token_id: uuid::Uuid,
+    ) -> Result<Option<(DataKeyLookup, Value)>, MetadataError> {
+        let entry = self.upload_tokens.lock().unwrap().get(&token_id).cloned();
+        let Some((key_id, claims, false)) = entry else {
+            return Ok(None);
+        };
+        let Some(key) = self.live_data_key(key_id).await? else {
+            return Ok(None);
+        };
+        self.upload_tokens.lock().unwrap().insert(token_id, (key_id, claims.clone(), true));
+        Ok(Some((key, claims)))
     }
 
     async fn touch_data_key(&self, key_id: uuid::Uuid) -> Result<(), MetadataError> {
@@ -774,11 +897,6 @@ impl NeonMetadataPort for FakeNeon {
         }
         self.clears.lock().unwrap().push((tenant, identity_user_id.to_string()));
         Ok(true)
-    }
-
-    async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
-        self.check()?;
-        Ok(self.app.lock().unwrap().branches.iter().find(|b| b.id == id).cloned())
     }
 
     async fn database_project(&self, db: DatabaseId) -> Result<Option<ProjectId>, MetadataError> {
@@ -1405,6 +1523,7 @@ async fn spawn_with_app(
         data_keys_token: DATA_KEYS_TOKEN.into(),
         rest_token: REST_TOKEN.into(),
         realtime_token: REALTIME_TOKEN.into(),
+        storage_token: STORAGE_TOKEN.into(),
         rt_events: Arc::new(app.rt_events),
         secrets: key.clone(),
         roles,
@@ -2200,14 +2319,18 @@ async fn key_lookup_404_for_unknown_or_bad_hex() {
 fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option<String>) -> BranchConnectionRow {
     BranchConnectionRow {
         branch_id: BranchId::new(),
+        database_id: chelabase_types::DatabaseId(uuid::Uuid::from_u128(0xdb)),
         status,
         endpoint_id: endpoint.map(str::to_string),
         database_name: Some("web1".into()),
         authenticator_password_enc: password,
+        storage_password_enc: None,
+        storage_password_salt: None,
         settings: DataApiSettings {
             max_rows: 500,
             statement_timeout_ms: 4000,
             max_connections: 7,
+            storage_max_connections: 3,
         },
         databases: vec![ServedDatabase { name: "web1".into(), default_schema: "app".into() }],
     }
@@ -2222,8 +2345,508 @@ async fn connection_requires_the_rest_bearer() {
     assert_eq!(app.get(&path, Some("wrong")).await.0, 401);
     assert_eq!(app.get(&path, Some(DATA_KEYS_TOKEN)).await.0, 401);
     assert_eq!(app.get(&path, Some(PROXY_TOKEN)).await.0, 401);
-    // With the right token an unknown branch is a plain 404.
+    // With the right token an unknown branch is a plain 404; storage reads it too (its role
+    // sessions connect as `authenticator`).
     assert_eq!(app.get(&path, Some(REST_TOKEN)).await.0, 404);
+    assert_eq!(app.get(&path, Some(STORAGE_TOKEN)).await.0, 404);
+}
+
+/// The storage login's route takes storage's bearer only: never rest's, realtime's or the
+/// gateway's, so no other service learns the `chelabase_storage` password.
+#[tokio::test]
+async fn storage_connection_requires_the_storage_bearer() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/storage/branches/{}/connection", BranchId::new().as_uuid());
+    for token in [None, Some("wrong"), Some(REST_TOKEN), Some(REALTIME_TOKEN), Some(DATA_KEYS_TOKEN), Some(PROXY_TOKEN)] {
+        assert_eq!(app.get(&path, token).await.0, 401, "{token:?}");
+    }
+    assert_eq!(app.get(&path, Some(STORAGE_TOKEN)).await.0, 404);
+}
+
+/// Object storage m6: the URL routes take storage's bearer only. The URL key is the secrets
+/// key's `storage_url` derivation (generation 1); a key's liveness is the gateway's lookup by
+/// id; an upload token is recorded for a live key only and spent once.
+#[tokio::test]
+async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
+    use base64::Engine;
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let key_id = uuid::Uuid::new_v4();
+    let lookup = DataKeyLookup {
+        key_id,
+        branch_id: BranchId::new(),
+        project_id: ProjectId::new(),
+        kind: DataKeyKind::Secret,
+        role: "authenticated".into(),
+        databases: None,
+        role_oid: Some(16384),
+    };
+    neon.data_keys.lock().unwrap().push(([9; 32], lookup.clone()));
+    let token = uuid::Uuid::new_v4();
+    let consume = format!("/internal/storage/upload-tokens/{token}/consume");
+    let new_token = |key: uuid::Uuid| {
+        json!({ "token_id": token, "key_id": key, "claims": { "sub": "u1" }, "expires_at": "2030-01-01T00:00:00Z" })
+    };
+    for bearer in [None, Some("wrong"), Some(REST_TOKEN), Some(REALTIME_TOKEN), Some(DATA_KEYS_TOKEN)] {
+        assert_eq!(app.get("/internal/storage/url-key", bearer).await.0, 401, "{bearer:?}");
+        assert_eq!(app.get(&format!("/internal/storage/keys/{key_id}"), bearer).await.0, 401);
+        assert_eq!(app.post_json("/internal/storage/upload-tokens", bearer, new_token(key_id)).await.0, 401);
+        assert_eq!(app.post_json(&consume, bearer, json!({})).await.0, 401);
+    }
+    let (code, body) = app.get("/internal/storage/url-key", Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    let derived = chelabase_secrets::derive_key(&app.key, Purpose::StorageUrl, 1);
+    assert_eq!(body, json!({ "kid": 1, "key": base64::engine::general_purpose::STANDARD.encode(derived) }));
+
+    let (code, body) = app.get(&format!("/internal/storage/keys/{key_id}"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["branch_id"], json!(lookup.branch_id));
+    assert_eq!(body["role"], "authenticated");
+    let unknown = format!("/internal/storage/keys/{}", uuid::Uuid::new_v4());
+    assert_eq!(app.get(&unknown, Some(STORAGE_TOKEN)).await.0, 404);
+
+    // A dead key's token isn't recorded; a live key's is, once; it is spent once.
+    let dead = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(uuid::Uuid::new_v4()));
+    assert_eq!(dead.await.0, 409);
+    assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+    let made = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
+    assert_eq!(made, (200, json!({ "expires_at": 1_893_456_000 })));
+    let again = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
+    assert_eq!(again.0, 409);
+    let (code, body) = app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["key"]["key_id"], json!(key_id));
+    assert_eq!(body["claims"], json!({ "sub": "u1" }));
+    assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+}
+
+/// Object storage m9: a URL minted from the console names the member as its key and the role
+/// it was minted as (#100). It is live, for the branch the URL was signed on, while the member
+/// is active in the database's tenant holding that role at Developer (own grant or tenant
+/// admin) and the branch is a normal one not being deleted; a Viewer, a suspended, removed or
+/// offboarded member, another tenant's, a deleted branch or no branch at all is 404.
+#[tokio::test]
+async fn a_console_url_lives_while_its_member_has_developer_access() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    let gone = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+        rows.branches.push(branch_record(gone, db, None, BranchKind::Normal, BranchStatus::Deleting, Some("ep-2")));
+    }
+    let member = |tenant: TenantId, status: MemberStatus, admin: bool, offboarded: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status,
+        accepted_at: None,
+        offboarded,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let grant = |role: PlatformRole| {
+        let roles = RoleSet::Only([chelabase_types::access::PgRole::Named("writer".into())].into());
+        GrantSources::new(Some(Grant { platform_role: role, roles }), Vec::new(), None)
+    };
+    let none = GrantSources::new(None, Vec::new(), None);
+    let cases = [
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Developer), true),
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Admin), true),
+        (member(tenant, MemberStatus::Active, true, false), none.clone(), true),
+        (member(tenant, MemberStatus::Active, false, false), grant(PlatformRole::Viewer), false),
+        (member(tenant, MemberStatus::Active, false, false), none.clone(), false),
+        (member(tenant, MemberStatus::Suspended, false, false), grant(PlatformRole::Developer), false),
+        (member(tenant, MemberStatus::Removed, true, false), grant(PlatformRole::Admin), false),
+        (member(tenant, MemberStatus::Active, true, true), grant(PlatformRole::Admin), false),
+        (member(TenantId::new(), MemberStatus::Active, true, false), grant(PlatformRole::Admin), false),
+    ];
+    for (i, (m, sources, live)) in cases.into_iter().enumerate() {
+        let id = m.id;
+        neon.members.lock().unwrap().push((m, sources));
+        let path = format!("/internal/storage/keys/{id}?branch={}&role=writer", branch.as_uuid());
+        let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+        if live {
+            assert_eq!(code, 200, "case {i}: {body}");
+            assert_eq!(body["key_id"], json!(id));
+            assert_eq!(body["branch_id"], json!(branch.as_uuid()));
+            assert_eq!(body["databases"], Value::Null);
+            // Not on a branch being deleted, nor without a branch.
+            let on_gone = format!("/internal/storage/keys/{id}?branch={}&role=writer", gone.as_uuid());
+            assert_eq!(app.get(&on_gone, Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
+            assert_eq!(app.get(&format!("/internal/storage/keys/{id}?role=writer"), Some(STORAGE_TOKEN)).await.0, 404, "case {i}");
+            for bearer in [None, Some(REST_TOKEN)] {
+                assert_eq!(app.get(&path, bearer).await.0, 401, "case {i}");
+            }
+        } else {
+            assert_eq!(code, 404, "case {i}: {body}");
+        }
+    }
+}
+
+/// Object storage m9: a URL minted in owner mode (`&owner=true`) lives only while its member
+/// is still an Admin of the database (or a tenant admin): a Developer's is 404.
+#[tokio::test]
+async fn an_owner_mode_url_lives_while_its_member_is_admin() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = |admin: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let grant = |role: PlatformRole| {
+        let roles = RoleSet::Only([chelabase_types::access::PgRole::Named("writer".into())].into());
+        GrantSources::new(Some(Grant { platform_role: role, roles }), Vec::new(), None)
+    };
+    for (m, sources, owner_live) in [
+        (member(false), grant(PlatformRole::Developer), false),
+        (member(false), grant(PlatformRole::Admin), true),
+        (member(true), GrantSources::new(None, Vec::new(), None), true),
+    ] {
+        let id = m.id;
+        neon.members.lock().unwrap().push((m, sources));
+        let base = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        assert_eq!(app.get(&format!("{base}&role=writer"), Some(STORAGE_TOKEN)).await.0, 200, "a role URL of a Developer or above");
+        let (code, body) = app.get(&format!("{base}&owner=true"), Some(STORAGE_TOKEN)).await;
+        assert_eq!(code, if owner_live { 200 } else { 404 }, "{body}");
+    }
+}
+
+/// #100 (the resolve route's audit, B1): a console URL minted as a role lives on that role's
+/// own level, not the member's best level on the database. A member who is a Developer
+/// through their own grant (`writer`) and holds `reader` only at Viewer through a team grant:
+/// a URL minted as `reader` is 404, as `writer` 200. Once `writer` drops to Viewer too (the
+/// own grant lowered), its URLs are 404 as well.
+#[tokio::test]
+async fn a_console_url_needs_its_role_at_developer() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: false,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let id = member.id;
+    let only = |role: PlatformRole, names: &[&str]| Grant {
+        platform_role: role,
+        roles: RoleSet::Only(names.iter().map(|n| PgRole::Named((*n).into())).collect()),
+    };
+    let team = only(PlatformRole::Viewer, &["reader"]);
+    neon.members.lock().unwrap().push((
+        member.clone(),
+        GrantSources::new(Some(only(PlatformRole::Developer, &["writer"])), vec![team.clone()], None),
+    ));
+    let url = |role: &str| format!("/internal/storage/keys/{id}?branch={}&role={role}", branch.as_uuid());
+    let (code, body) = app.get(&url("reader"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 404, "a URL minted as a role held only at Viewer is live: {body}");
+    let (code, body) = app.get(&url("writer"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    // `writer` lowered to Viewer while the member stays a Developer elsewhere: its URL ends.
+    {
+        let mut members = neon.members.lock().unwrap();
+        members.retain(|(m, _)| m.id != id);
+        members.push((
+            member,
+            GrantSources::new(
+                Some(only(PlatformRole::Developer, &["other"])),
+                vec![team, only(PlatformRole::Viewer, &["writer"])],
+                None,
+            ),
+        ));
+    }
+    let (code, body) = app.get(&url("writer"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 404, "a URL whose role was lowered to Viewer is live: {body}");
+    assert_eq!(app.get(&url("other"), Some(STORAGE_TOKEN)).await.0, 200);
+}
+
+/// #100: a console URL lives only on a role its member holds, named exactly once. No role (a
+/// URL from before #100), an empty one, a role not held, owner mode and a role both, a
+/// reserved role, and a data API role an Admin's grant doesn't name are all 404, for an Admin
+/// of the database and for a tenant admin.
+#[tokio::test]
+async fn a_console_url_without_a_held_role_is_not_live() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    let member = |admin: bool| MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: admin,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let developer = GrantSources::new(
+        Some(Grant {
+            platform_role: PlatformRole::Developer,
+            roles: RoleSet::Only([PgRole::Named("writer".into())].into()),
+        }),
+        Vec::new(),
+        None,
+    );
+    let admin = GrantSources::new(Some(Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() }), Vec::new(), None);
+    for (m, sources) in [
+        (member(false), developer),
+        (member(false), admin),
+        (member(true), GrantSources::new(None, Vec::new(), None)),
+    ] {
+        let id = m.id;
+        let admin_level = m.tenant_admin || sources.effective().is_some_and(|e| e.platform_role == PlatformRole::Admin);
+        neon.members.lock().unwrap().push((m, sources));
+        let base = format!("/internal/storage/keys/{id}?branch={}", branch.as_uuid());
+        assert_eq!(app.get(&format!("{base}&role=writer"), Some(STORAGE_TOKEN)).await.0, 200, "the held role");
+        let mut refused = vec![
+            base.clone(),
+            format!("{base}&role="),
+            format!("{base}&role=writer&owner=true"),
+            format!("{base}&role=chelabase_storage"),
+            format!("{base}&role=authenticated"),
+        ];
+        if !admin_level {
+            refused.push(format!("{base}&role=other"));
+        }
+        for path in refused {
+            let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+            assert_eq!(code, 404, "{path}: {body}");
+        }
+    }
+}
+
+/// #100 B2 (regression): a console URL minted as a role reached through a granted role's
+/// chain (R21) is live, as console `sign` as that role is authorized.
+#[tokio::test]
+async fn adv_a_console_url_of_a_chain_reached_role_is_live() {
+    use chelabase_metadata::members::{MemberRecord, MemberStatus};
+    use chelabase_types::access::{Grant, GrantSources, PgRole, PlatformRole, RoleSet};
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (project, db) = (ProjectId::new(), DatabaseId::new());
+    let record = project_record(project);
+    let tenant = record.tenant_id;
+    let branch = BranchId::new();
+    {
+        let mut rows = neon.app.lock().unwrap();
+        rows.projects.push(record);
+        rows.db_projects.insert(db, project);
+        rows.branches.push(branch_record(branch, db, None, BranchKind::Normal, BranchStatus::Ready, Some("ep-1")));
+    }
+    neon.add_group_role("ep-1", "billing", &[]);
+    neon.add_group_role("ep-1", "billing_admin", &["billing"]);
+    let member = MemberRecord {
+        id: uuid::Uuid::new_v4(),
+        tenant_id: tenant,
+        identity_user_id: "u".into(),
+        email: None,
+        display_name: "u".into(),
+        tenant_admin: false,
+        status: MemberStatus::Active,
+        accepted_at: None,
+        offboarded: false,
+        suspended_at: None,
+        suspended_by: None,
+    };
+    let id = member.id;
+    let grant = Grant { platform_role: PlatformRole::Developer, roles: RoleSet::Only([PgRole::Named("billing_admin".into())].into()) };
+    neon.members.lock().unwrap().push((member, GrantSources::new(Some(grant), Vec::new(), None)));
+    let url = |role: &str| format!("/internal/storage/keys/{id}?branch={}&role={role}", branch.as_uuid());
+    assert_eq!(app.get(&url("billing_admin"), Some(STORAGE_TOKEN)).await.0, 200);
+    let (code, body) = app.get(&url("billing"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "a URL signed as a chain-reached role (R21) is dead on arrival: {body}");
+}
+
+/// Object storage m6 fix (B1, S3): an app user's upload token (its claims carry the session's
+/// `sid`) is recorded only while that session of the key's project is live, never past the
+/// session's expiry, and is spent only while the session is still live.
+#[tokio::test]
+async fn storage_upload_tokens_follow_the_app_session() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let project = ProjectId::new();
+    let key_id = uuid::Uuid::new_v4();
+    let lookup = DataKeyLookup {
+        key_id,
+        branch_id: BranchId::new(),
+        project_id: project,
+        kind: DataKeyKind::Public,
+        role: "anon".into(),
+        databases: None,
+        role_oid: None,
+    };
+    neon.data_keys.lock().unwrap().push(([9; 32], lookup));
+    let session = |project: ProjectId, life: chrono::Duration| {
+        let neon = neon.clone();
+        async move {
+            let id = uuid::Uuid::new_v4();
+            neon.insert_app_session(&NewAppSession {
+                id,
+                project_id: project,
+                user_id: uuid::Uuid::new_v4(),
+                identity_session_id: "z",
+                refresh_hash: [1; 32],
+                expires_at: chrono::Utc::now() + life,
+            })
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let record = |token: uuid::Uuid, sid: Value| {
+        let body = json!({ "token_id": token, "key_id": key_id, "claims": { "sub": "u1", "sid": sid },
+            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1) });
+        app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), body)
+    };
+    let app = &app;
+    let consume = |token: uuid::Uuid| async move {
+        app.post_json(&format!("/internal/storage/upload-tokens/{token}/consume"), Some(STORAGE_TOKEN), json!({})).await
+    };
+
+    // Clamped to the session's 10 minutes, and spent while it is live.
+    let live = session(project, chrono::Duration::minutes(10)).await;
+    let t1 = uuid::Uuid::new_v4();
+    let (code, body) = record(t1, json!(live)).await;
+    assert_eq!(code, 200, "{body}");
+    let exp = body["expires_at"].as_i64().unwrap();
+    let cap = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
+    assert!(exp <= cap && exp > cap - 30, "{body}");
+    assert_eq!(consume(t1).await.0, 200);
+
+    // Revoked after minting: the token isn't spent into an upload.
+    let t2 = uuid::Uuid::new_v4();
+    assert_eq!(record(t2, json!(live)).await.0, 200);
+    assert!(neon.revoke_app_session(live, project).await.unwrap().is_some());
+    assert_eq!(consume(t2).await.0, 404);
+
+    // A revoked, expired, unknown, another project's or unreadable session mints nothing.
+    let expired = session(project, chrono::Duration::seconds(-1)).await;
+    let foreign = session(ProjectId::new(), chrono::Duration::minutes(10)).await;
+    for sid in [json!(live), json!(expired), json!(uuid::Uuid::new_v4()), json!(foreign), json!("nope"), json!(7)] {
+        assert_eq!(record(uuid::Uuid::new_v4(), sid.clone()).await.0, 409, "{sid}");
+    }
+}
+
+/// The storage route answers as `chelabase_storage` with its own password (sealed for the
+/// branch, `Purpose::Storage`) and the same address, databases and settings; 409 until the
+/// worker stored a password, and the data route never carries it.
+#[tokio::test]
+async fn storage_connection_opens_the_storage_password() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    let branch = row.branch_id.to_string();
+    row.authenticator_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "auth-pw"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let path = format!("/internal/storage/branches/{}/connection", row.branch_id.as_uuid());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!((code, &body), (409, &json!({ "status": "ready" })));
+
+    row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Storage, "storage-pw"));
+    row.storage_password_salt = Some(vec![1; 16]);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
+            "port": 55432,
+            "database": "web1",
+            "database_id": "00000000-0000-0000-0000-0000000000db",
+            "server_name": "ep-1.compute.chelabase.internal",
+            "user": "chelabase_storage",
+            "password": "storage-pw",
+            "status": "ready",
+            "settings": {
+                "max_rows": 500,
+                "statement_timeout_ms": 4000,
+                "max_connections": 7,
+                "storage_max_connections": 3,
+            },
+            "databases": [{ "name": "web1", "default_schema": "app" }],
+        })
+    );
+    let (code, data) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(STORAGE_TOKEN))
+        .await;
+    assert_eq!((code, &data["user"], &data["password"]), (200, &json!("authenticator"), &json!("auth-pw")));
+    assert!(!data.to_string().contains("storage-pw"), "{data}");
+
+    // A storage password sealed as another purpose (the authenticator's) doesn't open.
+    row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "swapped"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 500);
+    assert!(!body.to_string().contains("swapped"));
 }
 
 #[tokio::test]
@@ -2313,6 +2936,7 @@ async fn connection_opens_the_authenticator_password() {
             "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
             "port": 55432,
             "database": "web1",
+            "database_id": "00000000-0000-0000-0000-0000000000db",
             "server_name": "ep-1.compute.chelabase.internal",
             "user": "authenticator",
             "password": "auth-pw",
@@ -2321,6 +2945,7 @@ async fn connection_opens_the_authenticator_password() {
                 "max_rows": 500,
                 "statement_timeout_ms": 4000,
                 "max_connections": 7,
+                "storage_max_connections": 3,
             },
             "databases": [{ "name": "web1", "default_schema": "app" }],
             // C4 (SP11): no control-network address found, so null; the rest is unchanged.
