@@ -252,6 +252,7 @@ describe("errors", () => {
     [409, "conflict", "conflict"],
     [409, "write_once", "write_once"],
     [409, "referenced", "referenced"],
+    [409, "delete_refused", "delete_refused"],
     [400, "invalid_request", "invalid_request"],
     [408, "request_timeout", "timeout"],
     [401, "token_expired", "unauthorized"],

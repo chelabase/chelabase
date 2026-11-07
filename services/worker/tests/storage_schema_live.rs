@@ -4341,3 +4341,95 @@ async fn storage_ref_foreign_key_live() {
     }))
     .await;
 }
+
+/// #102 (m11 audit B1): a delete the owner's tables refuse gives a fixed answer, never
+/// Postgres's text about them (the invariant in `objects::deleted_failure`). A deferred
+/// foreign key fails at the statement, not at COMMIT, and is 409 `referenced`; a referential
+/// action that breaks a constraint (`ON DELETE SET NULL` on a `NOT NULL` column), a trigger
+/// the cascade fires, and a trigger that defers the keys again are 409 `delete_refused`. Single
+/// and batch delete alike; nothing is deleted.
+///
+/// ```text
+/// just workbench test -p worker --test storage_schema_live -- --run-ignored only storage_ref_delete_refusal_live
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_ref_delete_refusal_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        const TEXT: (&str, &str) = ("content-type", "text/plain");
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        fx.owner(
+            "-- First: its cascade trigger is older, so it fires (and defers the keys) before
+             -- secret_pins's check does.
+             CREATE TABLE secret_redefer (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE CASCADE);
+             CREATE FUNCTION secret_redefer() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN SET CONSTRAINTS ALL DEFERRED; RETURN OLD; END $$;
+             CREATE TRIGGER secret_redefer BEFORE DELETE ON secret_redefer FOR EACH ROW EXECUTE FUNCTION secret_redefer();
+             CREATE TABLE secret_pins (id int PRIMARY KEY, photo uuid
+                 CONSTRAINT secret_pins_photo_fkey REFERENCES storage.objects(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TABLE secret_notnull (id int PRIMARY KEY,
+                 photo uuid NOT NULL REFERENCES storage.objects(id) ON DELETE SET NULL);
+             CREATE TABLE secret_cascade (id int PRIMARY KEY, photo uuid REFERENCES storage.objects(id) ON DELETE CASCADE);
+             CREATE FUNCTION secret_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'secret_guard refused row %', OLD.id USING DETAIL = 'secret detail', HINT = 'secret hint'; END $$;
+             CREATE TRIGGER secret_guard BEFORE DELETE ON secret_cascade FOR EACH ROW EXECUTE FUNCTION secret_guard();",
+        )
+        .await
+        .expect("the owner's tables");
+
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        let call = async |method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]| {
+            let (status, b) = raw(&base, &token, method, path, body, headers).await;
+            (status, json_of(&b))
+        };
+        let up = |name: &str| format!("/storage/v1/object/files/{name}");
+        for name in ["deferred.txt", "notnull.txt", "trigger.txt", "redefer.txt", "free.txt"] {
+            let (status, b) = call("POST", &up(name), b"x".to_vec(), &[TEXT]).await;
+            assert_eq!(status, 200, "{name}: {b}");
+        }
+        let id_of = |name: &'static str| async move { fx.value(&format!("SELECT id FROM storage.objects WHERE name = '{name}'")).await };
+        let (deferred, notnull, trigger, redefer) =
+            (id_of("deferred.txt").await, id_of("notnull.txt").await, id_of("trigger.txt").await, id_of("redefer.txt").await);
+        fx.owner(&format!(
+            "INSERT INTO secret_pins VALUES (1, '{deferred}'); INSERT INTO secret_notnull VALUES (1, '{notnull}');
+             INSERT INTO secret_cascade VALUES (1, '{trigger}'); INSERT INTO secret_pins VALUES (2, '{redefer}');
+             INSERT INTO secret_redefer VALUES (1, '{redefer}');"
+        ))
+        .await
+        .unwrap();
+
+        // Every case runs, and the failures are reported together.
+        let mut failures = Vec::new();
+        let mut check = |case: String, code: &str, status: u16, got: &Value| {
+            let text = got.to_string();
+            let leaked = ["secret", "Failing row", "photo", "constraint \"", "relation \""].into_iter().find(|s| text.contains(s));
+            let extra = got["error"].get("detail").is_some() || got["error"].get("hint").is_some();
+            if leaked.is_some() || extra || (status, &got["error"]["code"]) != (409, &json!(code)) {
+                failures.push(format!("{case}: want 409 {code} with no owner text, got {status} {got}"));
+            }
+        };
+        for (name, code) in [
+            ("deferred.txt", "referenced"),
+            ("notnull.txt", "delete_refused"),
+            ("trigger.txt", "delete_refused"),
+            ("redefer.txt", "referenced"),
+        ] {
+            let (status, got) = call("DELETE", &up(name), vec![], &[]).await;
+            check(name.to_owned(), code, status, &got);
+            let batch = json!({ "names": ["free.txt", name] }).to_string().into_bytes();
+            let (status, got) = call("DELETE", "/storage/v1/object/files", batch, &[JSON]).await;
+            check(format!("batch {name}"), code, status, &got);
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(
+            fx.value("SELECT string_agg(name, ',' ORDER BY name) FROM storage.objects").await,
+            "deferred.txt,free.txt,notnull.txt,redefer.txt,trigger.txt",
+            "nothing deleted"
+        );
+        assert_eq!(fx.owner("SELECT count(*) FROM secret_notnull").await.unwrap().trim(), "1");
+        assert_eq!(call("DELETE", &up("free.txt"), vec![], &[]).await.0, 204, "an unreferenced object still goes");
+    }))
+    .await;
+}

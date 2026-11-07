@@ -14,6 +14,9 @@
  * - `referenced` (409): a row's foreign key to `storage.objects(id)` still references the object, so
  *   it isn't deleted (nothing is, for a batch); delete or change that row first, or declare the key
  *   `ON DELETE SET NULL` or `CASCADE`;
+ * - `delete_refused` (409): a constraint, trigger or function on a table that references the
+ *   object refused the delete (for example `ON DELETE SET NULL` on a `NOT NULL` column); nothing
+ *   is deleted. The message is fixed: it never names the referencing table, column or row;
  * - `expired` (410): a resumable upload's session ended;
  * - `too_large` (413): over the bucket's file size limit;
  * - `unsupported_type` (415): a type the bucket's `allowed_mime_types` doesn't list;
@@ -31,6 +34,7 @@ export type StorageErrorCode =
   | "conflict"
   | "write_once"
   | "referenced"
+  | "delete_refused"
   | "expired"
   | "too_large"
   | "unsupported_type"
@@ -104,6 +108,8 @@ export function toStorageError(res: Response, text: string): StorageError {
     message = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${snippet ? `: ${snippet}` : ""}`;
   }
   const code =
-    serverCode === "write_once" || serverCode === "referenced" ? serverCode : (BY_STATUS[res.status] ?? "internal");
+    serverCode === "write_once" || serverCode === "referenced" || serverCode === "delete_refused"
+      ? serverCode
+      : (BY_STATUS[res.status] ?? "internal");
   return new StorageError({ status: res.status, code, message, serverCode, sqlstate });
 }

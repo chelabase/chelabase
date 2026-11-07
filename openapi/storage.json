@@ -1295,7 +1295,7 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them. Either way nothing is deleted",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references one of them; `delete_refused`: a constraint, trigger or function on a table that references one of them refused the delete (both with a fixed message). Either way nothing is deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1726,7 +1726,7 @@
             }
           },
           "409": {
-            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it (nothing is deleted)",
+            "description": "`write_once`: the bucket is write-once; `referenced`: a foreign key to storage.objects(id) still references it; `delete_refused`: a constraint, trigger or function on a table that references it refused the delete (both with a fixed message; nothing is deleted)",
             "content": {
               "application/json": {
                 "schema": {
