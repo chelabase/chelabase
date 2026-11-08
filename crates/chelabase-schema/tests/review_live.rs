@@ -230,6 +230,54 @@ async fn the_scan_follows_operators_domains_ranges_and_definer_callers() {
     meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
 }
 
+// Edge functions (#170), same rule as #185: `chelabase_functions` is skipped only when
+// `chelabase_functions_owner` owns it.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_user_owned_chelabase_functions_schema_is_reviewed() {
+    // Edge functions (#170): `chelabase_functions` and its `chelabase_fn_*` triggers are skipped
+    // only when `chelabase_functions_owner` owns the schema; one the owner made is reviewed, and
+    // a trigger named like ours that runs a function in it is still listed.
+    let meta = connect(&url()).await;
+    let mut random = [0u8; 6];
+    getrandom::fill(&mut random).unwrap();
+    let name = format!("rv_{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let (owner, dev) = (format!("{name}_owner"), format!("{name}_dev"));
+    meta.batch_execute(&format!("CREATE ROLE {owner} LOGIN; CREATE ROLE {dev};")).await.unwrap();
+    meta.batch_execute(&format!("CREATE DATABASE {name} OWNER {owner}")).await.unwrap();
+    let db = connect(&url_for(&name)).await;
+    db.batch_execute(&format!(
+        "SET ROLE {owner};
+         CREATE SCHEMA chelabase_functions;
+         GRANT USAGE, CREATE ON SCHEMA chelabase_functions TO {dev};
+         RESET ROLE;
+         SET ROLE {dev};
+         CREATE FUNCTION chelabase_functions.f_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         CREATE FUNCTION chelabase_functions.f_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE chelabase_functions.t (a int);
+         CREATE TRIGGER chelabase_fn_00000000000000000000000000000000 BEFORE INSERT ON chelabase_functions.t
+           FOR EACH ROW EXECUTE FUNCTION chelabase_functions.f_trg();
+         RESET ROLE;"
+    ))
+    .await
+    .unwrap();
+
+    let keys: Vec<String> = scan(&db, &owner).await.into_iter().map(|i| i.key).collect();
+    assert_eq!(
+        keys,
+        [
+            "app/function/chelabase_functions.f_planted()",
+            "app/function/chelabase_functions.f_trg()",
+            "app/trigger/chelabase_functions.chelabase_fn_00000000000000000000000000000000(chelabase_functions.t)",
+        ],
+        "a chelabase_functions schema that isn't chelabase_functions_owner's is reviewed"
+    );
+
+    drop(db);
+    meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
+    meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
+}
+
 // #185 audit B1: `storage` is skipped only when it is object storage's (owned by
 // `chelabase_admin`). A `storage` schema the owner made, where another role can create, is
 // reviewed like any other: a planted SECURITY DEFINER function and a trigger are listed.
