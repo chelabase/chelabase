@@ -10,7 +10,8 @@
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
 //! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
 //! /internal/invoke/{branch_id}/{name}` (the worker's bearer; a `{"type": "scheduled"}` body
-//! reaches the runtime marked `x-chelabase-event: scheduled`, m7).
+//! reaches the runtime marked `x-chelabase-event: scheduled`, m7; a call with `chelabase-event:
+//! db` reaches the function's `fetch` marked `chelabase-event: db`, m13).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,9 @@ use crate::caller::{self, Caller, Form, Refusal};
 use crate::directory::Resolution;
 use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
 use crate::resolver::Resolver;
+
+/// m13: marks a database event, from the worker on the internal invoke to the function.
+pub const DB_EVENT_HEADER: &str = "chelabase-event";
 
 /// A request body may be at most 6 MiB.
 pub const MAX_BODY_BYTES: usize = 6 * 1024 * 1024;
@@ -420,6 +424,12 @@ async fn invoke(
     let mut headers = function_headers(&req.headers, &caller);
     if form == Form::Internal && is_scheduled(&body) {
         headers.insert(EVENT_HEADER, HeaderValue::from_static("scheduled"));
+    } else if form == Form::Internal
+        && req.headers.get(DB_EVENT_HEADER).is_some_and(|v| v == "db")
+    {
+        // m13: the worker's database event goes to `fetch`, marked (any client's copy of the
+        // header was stripped above).
+        headers.insert(DB_EVENT_HEADER, HeaderValue::from_static("db"));
     }
     let inv = Invocation {
         method: req.method,
