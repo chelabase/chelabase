@@ -326,15 +326,17 @@ where
     if role.is_empty() {
         return unprocessable("role must not be empty").into_response();
     }
+    // The role's checks first (a personal login, the caller's right to key the role), as before
+    // the run-as refactor: a bad databases list never hides their refusal.
+    let identity = match checked_key_identity(&state, &authorized, &record, &branch, &role, &format!("a key for {role:?}")).await {
+        Ok(identity) => identity,
+        Err(err) => return err.into_response(),
+    };
     if let Some(names) = &request.databases
         && let Err(err) = validate_key_databases(&state, branch.id, names).await
     {
         return err.into_response();
     }
-    let identity = match checked_key_identity(&state, &authorized, &record, &branch, &role, &format!("a key for {role:?}")).await {
-        Ok(identity) => identity,
-        Err(err) => return err.into_response(),
-    };
     // Bound to the role's OID on the timeline the check read it on: a role dropped or
     // recreated after the check, or a timeline switch, leaves a dead key, never one of another
     // role (see `chelabase_metadata`'s data API docs).

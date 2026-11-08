@@ -271,7 +271,7 @@ mod functions_triggers {
 
     /// m13b (B2): a table trigger on Chelabase's or Postgres's own schemas is 422 (a trigger on
     /// `chelabase_functions.outbox` would recurse into `enqueue()`); (S4) so is a table trigger
-    /// on a service, which is never delivered events.
+    /// on a service, which is never delivered events (review fix: nor is a storage trigger).
     #[tokio::test]
     async fn functions_triggers_reserved_schemas_and_services_422() {
         let w = world().await;
@@ -303,9 +303,14 @@ mod functions_triggers {
             .await;
         assert!(status == 201 || status == 200, "{status} {body}");
         let svc = w.path(w.w.dev, "/svc/triggers");
-        let (status, err) = w.call("dee", "POST", &svc, Some(table().to_string())).await;
-        assert_eq!(status, 422, "{err}");
-        assert!(err["error"]["message"].as_str().unwrap_or("").contains("service"), "{err}");
+        // Review fix: a storage trigger too: a service is never invoked by any trigger.
+        for body in [table(), storage()] {
+            let (status, err) = w.call("dee", "POST", &svc, Some(body.to_string())).await;
+            assert_eq!(status, 422, "{body}: {err}");
+            assert!(err["error"]["message"].as_str().unwrap_or("").contains("service"), "{err}");
+        }
+        let (_, list) = w.call("vic", "GET", &svc, None).await;
+        assert!(list.as_array().unwrap().is_empty(), "nothing was added to the service");
         let (status, _) = w.call("dee", "POST", &base, Some(table().to_string())).await;
         assert_eq!(status, 201, "a user schema is fine");
     }

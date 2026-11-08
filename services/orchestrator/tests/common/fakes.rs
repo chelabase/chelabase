@@ -235,6 +235,8 @@ struct FakeFunctions {
     schedules: Vec<chelabase_metadata::ScheduleRecord>,
     /// Edge functions m13: every branch's triggers, oldest first.
     triggers: Vec<chelabase_metadata::TriggerRecord>,
+    /// Review fix: each branch state's `deployment_generation` (missing: 0).
+    generations: HashMap<(BranchId, uuid::Uuid), i64>,
 }
 
 /// Members hub step 2 (T23): one team as the fake keeps it.
@@ -2281,12 +2283,15 @@ enum FakeReset {
     Unavailable,
 }
 
+/// A test's look at the metadata at a `chelabase.fn.changed` publish.
+type OnFnChanged = Arc<dyn Fn(BranchId, &str) + Send + Sync>;
+
 #[derive(Clone, Default)]
 struct FakeJobs {
     /// Edge functions m3: each `chelabase.fn.changed` publish, as (branch, function).
     fn_changed: Arc<Mutex<Vec<(BranchId, String)>>>,
     /// Called at each `chelabase.fn.changed` publish (to look at the metadata then).
-    on_fn_changed: Arc<Mutex<Option<Arc<dyn Fn(BranchId, &str) + Send + Sync>>>>,
+    on_fn_changed: Arc<Mutex<Option<OnFnChanged>>>,
     /// Object storage m9: the storage cache events published.
     storage_events: Arc<Mutex<Vec<chelabase_nats::StorageEvent>>>,
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
@@ -2862,18 +2867,28 @@ struct TestApp {
     bundles: FakeBundles,
 }
 
+/// A test's hold on a call: the call signals the first and waits for the second.
+type Gate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+/// A bundle upload as (database, sha256, the bytes sent).
+type BundlePut = (DatabaseId, String, Vec<u8>);
+/// A container rollout as (branch, function, deployment).
+type RolloutCall = (BranchId, uuid::Uuid, uuid::Uuid);
+
 /// Edge functions m3: the functions service's bundle store, as the orchestrator sees it.
 #[derive(Clone, Default)]
 struct FakeBundles {
     /// Each upload as (database, sha256, the bytes sent).
-    puts: Arc<Mutex<Vec<(DatabaseId, String, Vec<u8>)>>>,
+    puts: Arc<Mutex<Vec<BundlePut>>>,
     /// Answer every upload with this status (2xx when unset).
     status: Arc<Mutex<Option<u16>>>,
     /// While set, an upload signals the first and waits for the second before it answers.
-    gate: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    gate: Gate,
+    /// Review fix: while set, a rollout signals the first and waits for the second before it
+    /// answers.
+    pub rollout_gate: Gate,
     /// m11: the control side's container-service calls: each rollout as (branch, function,
     /// deployment), and the error every call answers with while set.
-    pub rollouts: Arc<Mutex<Vec<(BranchId, uuid::Uuid, uuid::Uuid)>>>,
+    pub rollouts: Arc<Mutex<Vec<RolloutCall>>>,
     pub control_error: Arc<Mutex<Option<orchestrator::functions::ControlError>>>,
 }
 
@@ -2921,7 +2936,14 @@ impl orchestrator::functions::BundleSink for FakeBundles {
     fn rollout(&self, branch: BranchId, function: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, ()> {
         self.rollouts.lock().unwrap().push((branch, function, deployment));
         let err = self.control_error.lock().unwrap().clone();
-        Box::pin(async move { err.map_or(Ok(()), Err) })
+        let gate = self.rollout_gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            err.map_or(Ok(()), Err)
+        })
     }
 
     fn service_logs(&self, _: BranchId, _: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, String> {
@@ -5502,6 +5524,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
                 st.deployment_id = deployment;
                 st.last_error = None;
                 st.updated_at = chrono::Utc::now();
+                *fs.generations.entry((branch, function)).or_default() += 1;
             }
             None => fs.states.push((
                 branch,
@@ -5523,6 +5546,41 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             )),
         }
         Ok(())
+    }
+
+    async fn active_deployment_generation(&self, branch: BranchId, function: uuid::Uuid) -> Result<Option<(uuid::Uuid, i64)>, MetadataError> {
+        let fs = self.functions.lock().unwrap();
+        Ok(fs
+            .states
+            .iter()
+            .find(|(b, st)| *b == branch && st.function_id == function)
+            .map(|(_, st)| (st.deployment_id, fs.generations.get(&(branch, function)).copied().unwrap_or_default())))
+    }
+
+    async fn switch_active_deployment(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        generation: i64,
+        deployment: uuid::Uuid,
+    ) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        if !fs.deployments.iter().any(|d| d.id == deployment && d.function_id == function) {
+            return Err(MetadataError::InvalidFunction("the deployment belongs to another function".into()));
+        }
+        let current = fs.generations.get(&(branch, function)).copied().unwrap_or_default();
+        let Some((_, st)) = fs.states.iter_mut().find(|(b, st)| *b == branch && st.function_id == function) else {
+            return Ok(false);
+        };
+        if current != generation {
+            return Ok(false);
+        }
+        st.deployment_id = deployment;
+        st.last_error = None;
+        st.updated_at = chrono::Utc::now();
+        fs.generations.insert((branch, function), current + 1);
+        Ok(true)
     }
 
     async fn set_enabled(&self, branch: BranchId, function: uuid::Uuid, enabled: bool) -> Result<bool, MetadataError> {
@@ -5599,7 +5657,21 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             return Err(MetadataError::InvalidFunction("a secret is at most 65536 bytes".into()));
         }
         self.fn_scope(branch, function)?;
-        self.functions.lock().unwrap().secrets.insert((branch.as_uuid(), function, name.to_string()), value.to_string());
+        let mut fs = self.functions.lock().unwrap();
+        let total = chelabase_metadata::secrets_env_bytes(
+            fs.secrets
+                .iter()
+                .filter(|((b, f, n), _)| *b == branch.as_uuid() && *f == function && n != name)
+                .map(|((_, _, n), v)| (n.as_str(), v.as_str()))
+                .chain([(name, value)]),
+        );
+        if total > chelabase_metadata::MAX_SECRETS_ENV_BYTES {
+            return Err(MetadataError::InvalidFunction(format!(
+                "a function's secrets on a branch are at most {} bytes together",
+                chelabase_metadata::MAX_SECRETS_ENV_BYTES
+            )));
+        }
+        fs.secrets.insert((branch.as_uuid(), function, name.to_string()), value.to_string());
         Ok(())
     }
 

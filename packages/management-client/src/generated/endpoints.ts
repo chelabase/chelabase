@@ -2946,7 +2946,7 @@ export const getPutFunctionSecretUrl = (id: string,
 }
 
 /**
- * The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB. The value is never returned, logged or echoed in an error.
+ * The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.
  * @summary Set a function's secret on the branch
  */
 export const putFunctionSecret = async (id: string,

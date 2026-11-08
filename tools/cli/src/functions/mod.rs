@@ -80,18 +80,13 @@ pub(crate) struct Api {
     base: String,
 }
 
-/// What a failed management call says: the API's message, and for a rollover refused as
-/// unhealthy (409 `unhealthy`) the new deployment's id and that the previous one stays live.
+/// What a failed management call says: the method, path and status, and the API's message.
+/// (A rollover's failure isn't one: rollovers run in the background, see [`rollout_outcome`].)
 pub(crate) fn error_message(method: &str, path: &str, status: u16, body: &Value) -> String {
-    let error = &body["error"];
-    let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| body.to_string());
-    if status == 409 && error["reason"] == "unhealthy" {
-        let id = error["deployment_id"].as_str().unwrap_or("(unknown)");
-        return format!(
-            "the new deployment {id} never passed its health check, so the previous deployment \
-             stays live: {message}"
-        );
-    }
+    let message = body["error"]["message"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| body.to_string());
     format!("{method} {path}: {status} {message}")
 }
 
@@ -104,7 +99,9 @@ pub(crate) fn rollout_outcome(service: &Value, deployment: &str) -> Option<Resul
         return Some(if service["deployment_id"] == deployment {
             Ok(())
         } else {
-            Err(format!("deployment {deployment} isn't active; another change replaced it"))
+            Err(format!(
+                "deployment {deployment} isn't active; another change replaced it"
+            ))
         });
     }
     if rollout["deployment_id"] != deployment {
@@ -142,7 +139,10 @@ impl Api {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(why)) => bail!("{why}"),
                 None if start.elapsed() > ROLLOUT_WAIT => {
-                    bail!("{name}: the rollover to {deployment} is still pending after {} s", ROLLOUT_WAIT.as_secs())
+                    bail!(
+                        "{name}: the rollover to {deployment} is still pending after {} s",
+                        ROLLOUT_WAIT.as_secs()
+                    )
                 }
                 None => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
             }
@@ -198,8 +198,12 @@ impl Api {
 
     /// Turns a function or service on or off on the branch.
     pub(crate) async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
-        self.json(reqwest::Method::PATCH, &format!("/{name}"), json!({ "enabled": enabled }))
-            .await?;
+        self.json(
+            reqwest::Method::PATCH,
+            &format!("/{name}"),
+            json!({ "enabled": enabled }),
+        )
+        .await?;
         eprintln!("{name}: {}", if enabled { "enabled" } else { "disabled" });
         Ok(())
     }
@@ -207,7 +211,9 @@ impl Api {
     /// Makes an earlier deployment the active one (a service rolls over to it).
     pub(crate) async fn rollback(&self, name: &str, deployment: &str) -> Result<()> {
         let body = json!({ "active_deployment_id": deployment });
-        let answer = self.json(reqwest::Method::PATCH, &format!("/{name}"), body).await?;
+        let answer = self
+            .json(reqwest::Method::PATCH, &format!("/{name}"), body)
+            .await?;
         if answer["rollout"]["state"] == "pending" {
             self.await_rollout(name, deployment).await?;
         }
@@ -215,7 +221,12 @@ impl Api {
         Ok(())
     }
 
-    pub(crate) async fn json(&self, method: reqwest::Method, tail: &str, body: Value) -> Result<Value> {
+    pub(crate) async fn json(
+        &self,
+        method: reqwest::Method,
+        tail: &str,
+        body: Value,
+    ) -> Result<Value> {
         self.send(method, tail, Some(body.to_string().into_bytes()))
             .await
     }

@@ -2207,7 +2207,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden` (`required` names what's missing): Developer on the branch (Admin when it's protected), Admin to change the kind, a tenant admin to make a service or turn a function into one; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -2247,7 +2247,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: a bad or reserved name, or a kind change for a function with deployments",
+            "description": "`invalid_request`: a bad or reserved name, a kind change for a function with deployments, or to a service for a function with schedules or triggers",
             "content": {
               "application/json": {
                 "schema": {
@@ -3192,7 +3192,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: a bad cron or time zone (`field` names it), or an unknown field",
+            "description": "`invalid_request`: a bad cron or time zone (`field` names it), an unknown field, or a schedule for a service",
             "content": {
               "application/json": {
                 "schema": {
@@ -3591,7 +3591,7 @@
           "functions"
         ],
         "summary": "Set a function's secret on the branch",
-        "description": "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB. The value is never returned, logged or echoed in an error.",
+        "description": "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.",
         "operationId": "putFunctionSecret",
         "parameters": [
           {
@@ -3698,7 +3698,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: a bad name, or a value over 64 KiB",
+            "description": "`invalid_request`: a bad name, a value over 64 KiB, or the function's secrets on the branch over 128 KiB together (as the JSON env they travel in)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4051,7 +4051,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`) or on a service",
+            "description": "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`), or any trigger on a service",
             "content": {
               "application/json": {
                 "schema": {

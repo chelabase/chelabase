@@ -98,7 +98,7 @@ fn s(v: &Value) -> String {
 }
 
 /// One line per trigger: id, source and target, events, state, enabled, dead, dropped, last
-/// delivered, last error.
+/// delivered, last (install) error, and the last delivery error when there is one.
 pub fn trigger_line(t: &Value) -> String {
     let target = if t["source"] == "table" {
         format!("table {}.{}", s(&t["schema"]), s(&t["table"]))
@@ -111,8 +111,12 @@ pub fn trigger_line(t: &Value) -> String {
         .flatten()
         .map(s)
         .collect();
+    let delivery = t["last_delivery_error"]
+        .as_str()
+        .map(|e| format!("\tdelivery: {e}"))
+        .unwrap_or_default();
     format!(
-        "{}\t{target}\t{}\t{}\t{}\tdead={}\tdropped={}\tdelivered={}\t{}",
+        "{}\t{target}\t{}\t{}\t{}\tdead={}\tdropped={}\tdelivered={}\t{}{delivery}",
         s(&t["id"]),
         events.join(","),
         s(&t["state"]),
@@ -382,11 +386,11 @@ mod tests {
             "id": "t1", "source": "table", "schema": "public", "table": "orders",
             "events": ["insert", "update"], "state": "failed", "enabled": true,
             "dead_count": 3, "dropped_count": 7, "last_delivered_at": null,
-            "last_error": "relation does not exist",
+            "last_error": "relation does not exist", "last_delivery_error": "500 from the function",
         });
         assert_eq!(
             trigger_line(&t),
-            "t1\ttable public.orders\tinsert,update\tfailed\tenabled\tdead=3\tdropped=7\tdelivered=-\trelation does not exist"
+            "t1\ttable public.orders\tinsert,update\tfailed\tenabled\tdead=3\tdropped=7\tdelivered=-\trelation does not exist\tdelivery: 500 from the function"
         );
         let t = json!({
             "id": "t2", "source": "storage", "bucket": null, "prefix": "in/", "events": ["object.created"],

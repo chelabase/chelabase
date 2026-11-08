@@ -1345,6 +1345,54 @@ mod functions {
         assert_eq!(body["error"]["code"], "runner_unavailable");
     }
 
+    /// Review fix: a rollover switches with a compare-and-set on the generation it read when it
+    /// started, so a rollback to the serving deployment, made while the new container was being
+    /// checked, isn't overwritten when the check passes.
+    #[tokio::test]
+    async fn functions_container_rollover_never_overwrites_a_later_change() {
+        let w = echo_world().await;
+        let (_, first) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"enabled": true}))).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *w.w.app.bundles.rollout_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+        let (status, second) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:2"))).await;
+        assert_eq!(status, 202, "{second}");
+        started.notified().await;
+        // Meanwhile: keep the serving deployment (nothing to roll over, so it applies at once).
+        let (status, body) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"active_deployment_id": first["id"]}))).await;
+        assert_eq!(status, 200, "{body}");
+        release.notify_one();
+        let st = w.settled().await;
+        assert_eq!(st["deployment_id"], first["id"], "the later decision stands: {st}");
+        assert_eq!(st["rollout"]["state"], "failed", "{st}");
+        assert!(st["rollout"]["error"].as_str().unwrap().contains("changed"), "{st}");
+    }
+
+    /// Review fix: a function's secrets on a branch travel in one header, so together they're
+    /// capped (422 with why, nothing written).
+    #[tokio::test]
+    async fn functions_secrets_total_capped_422() {
+        let w = world().await;
+        w.deployed("dee", w.w.dev, "hello", "djE=").await;
+        let put = |name: &'static str, len: usize| {
+            let w = &w;
+            async move {
+                w.call("dee", "PUT", &w.path(w.w.dev, &format!("/hello/secrets/{name}")), Some(json!({"value": "x".repeat(len)}).to_string()))
+                    .await
+            }
+        };
+        assert_eq!(put("A", 63 * 1024).await.0, 204);
+        assert_eq!(put("B", 63 * 1024).await.0, 204);
+        let (status, body) = put("C", 4096).await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("together"), "{body}");
+        let (_, names) = w.call("dee", "GET", &w.path(w.w.dev, "/hello/secrets"), None).await;
+        assert_eq!(names, r#"["A","B"]"#);
+        assert_eq!(put("A", 10).await.0, 204, "a smaller value fits");
+        assert_eq!(put("C", 4096).await.0, 204);
+    }
+
     /// A container service's rollback rolls over too: the older deployment's container must be
     /// healthy before it's active again.
     #[tokio::test]

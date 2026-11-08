@@ -269,6 +269,44 @@ mod functions_schedules {
         assert_eq!(list.as_array().unwrap().len(), 1, "nothing was added");
     }
 
+    /// Review fix: a service is never run on a schedule (only a function's bundle is), so a
+    /// schedule for one is 422 with why, and nothing is added.
+    #[tokio::test]
+    async fn functions_schedules_on_a_service_422() {
+        let w = world().await;
+        // A service is a tenant admin's to make (m9).
+        w.w.metadata
+            .add_member(w.w.tenant, "tom", MemberStatus::Active, true);
+        let (status, body) = w
+            .call(
+                "tom",
+                "PUT",
+                &w.path(w.w.dev, "/svc"),
+                Some(json!({"kind": "service"}).to_string()),
+            )
+            .await;
+        assert!(status == 201 || status == 200, "{status} {body}");
+        let base = w.path(w.w.dev, "/svc/schedules");
+        let (status, err) = w
+            .call(
+                "dee",
+                "POST",
+                &base,
+                Some(json!({"cron": "* * * * *"}).to_string()),
+            )
+            .await;
+        assert_eq!(status, 422, "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("service"),
+            "{err}"
+        );
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert!(list.as_array().unwrap().is_empty(), "nothing was added");
+    }
+
     /// A Viewer reads and is 403 on every write; another project's Developer, and a path
     /// naming another database's branch, are 404 everywhere.
     #[tokio::test]

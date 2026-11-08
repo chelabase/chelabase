@@ -14510,6 +14510,11 @@ async fn a_key_cannot_be_bound_to_a_personal_login() {
     let keys = format!("/v1/databases/{}/branches/{}/keys", p.db(), p.main());
     let err = error_of(p.send(DEFAULT_SUB, Method::POST, &keys, Some(json!({ "name": "k", "role": "alice_login" }))).await, 403).await;
     assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("role:alice_login")));
+    // Edge functions review: the role's checks come before the databases list's, so a bad list
+    // doesn't hide the refusal (nor does the list's check run for a role the caller can't key).
+    let body = json!({ "name": "k", "role": "alice_login", "databases": [] });
+    let err = error_of(p.send(DEFAULT_SUB, Method::POST, &keys, Some(body)).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden");
     assert!(p.t.w.metadata.keys.lock().unwrap().is_empty(), "no key stored");
     assert!(p.t.w.jobs.role_checks.lock().unwrap().is_empty(), "the worker isn't asked about it");
 }
