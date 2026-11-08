@@ -90,6 +90,7 @@ enum WorkbenchCommands {
     },
     Test {
         stack: Option<String>,
+        env: Vec<String>,
         archive: Vec<String>,
         run: Vec<String>,
     },
@@ -118,10 +119,12 @@ impl From<WorkbenchCli> for WorkbenchCommands {
             WorkbenchCli::Exec { service, cmd } => Self::Exec { service, cmd },
             WorkbenchCli::Test {
                 stack,
+                env,
                 archive,
                 run,
             } => Self::Test {
                 stack,
+                env,
                 archive,
                 run,
             },
@@ -226,6 +229,9 @@ enum WorkbenchCli {
         /// Run on this registered stack instead of this checkout's (before the selection)
         #[arg(long)]
         stack: Option<String>,
+        /// Extra variables for the runner (KEY=VALUE, repeatable; before the selection)
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
         /// What to archive (cargo nextest archive's package and target selection)
         #[arg(allow_hyphen_values = true, value_terminator = "--")]
         archive: Vec<String>,
@@ -387,9 +393,10 @@ async fn main() -> anyhow::Result<()> {
                 WorkbenchCommands::Exec { service, cmd } => wb::exec(&service, &cmd),
                 WorkbenchCommands::Test {
                     stack,
+                    env,
                     archive,
                     run,
-                } => wb::test(stack.as_deref(), &archive, &run),
+                } => wb::test(stack.as_deref(), &env, &archive, &run),
                 WorkbenchCommands::Run {
                     stack,
                     env,
@@ -506,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_and_run_take_a_stack() {
-        let WorkbenchCommands::Test { stack, archive, run } =
+        let WorkbenchCommands::Test { stack, archive, run, .. } =
             workbench(&["test", "--stack", "feat", "-p", "rest", "--", "--run-ignored", "only"])
         else {
             panic!()
@@ -527,6 +534,20 @@ mod tests {
         assert_eq!(env, ["A=1"]);
         assert_eq!(script, "s.sh");
         assert_eq!(args, ["--stack", "x"], "after the script, everything is the script's");
+    }
+
+    #[test]
+    fn test_takes_env_before_the_selection() {
+        let WorkbenchCommands::Test { env, archive, run, .. } = workbench(&[
+            "test", "--env", "A=1", "--env", "B=x=y", "-p", "chelabase-functions", "--", "--run-ignored", "only",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(env, ["A=1", "B=x=y"]);
+        assert_eq!(archive, ["-p", "chelabase-functions"]);
+        assert_eq!(run, ["--run-ignored", "only"]);
+        let WorkbenchCommands::Test { env, .. } = workbench(&["test", "-p", "rest"]) else { panic!() };
+        assert!(env.is_empty());
     }
 
     #[test]

@@ -670,7 +670,7 @@ fn parse_image_lines(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `K=V` pairs of `run --env`; a pair without `=` or with an empty key is an error.
+/// `K=V` pairs of `run --env` and `test --env`; a pair without `=` or with an empty key is an error.
 fn parse_env_pairs(pairs: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     pairs
         .iter()
@@ -1884,11 +1884,18 @@ pub fn exec(service: &str, cmd: &[String]) -> anyhow::Result<()> {
 
 // --- test, run ---
 
-/// `workbench test [--stack <slug>] [selection…] [-- run-args…]`: archive on the host (the runner
-/// has no cargo), run the archive in the runner on the stack's network. On another checkout's
-/// stack (`--stack`, or the one `wt-add` recorded) the stack is never started, rebuilt or
-/// recreated; this checkout's files are what runs.
-pub fn test(stack: Option<&str>, selection: &[String], run_args: &[String]) -> anyhow::Result<()> {
+/// `workbench test [--stack <slug>] [--env K=V]… [selection…] [-- run-args…]`: archive on the
+/// host (the runner has no cargo), run the archive in the runner on the stack's network, with
+/// the extra variables (as `run --env`). On another checkout's stack (`--stack`, or the one
+/// `wt-add` recorded) the stack is never started, rebuilt or recreated; this checkout's files
+/// are what runs.
+pub fn test(
+    stack: Option<&str>,
+    env: &[String],
+    selection: &[String],
+    run_args: &[String],
+) -> anyhow::Result<()> {
+    let pairs = parse_env_pairs(env)?;
     let here = current_stack()?;
     let (target, entry) = stack_for_run(&here, stack)?;
     let archive = archive_path(&target.state, &target.slug, &here.slug);
@@ -1901,7 +1908,7 @@ pub fn test(stack: Option<&str>, selection: &[String], run_args: &[String]) -> a
     })?;
     let mut cmd = vec!["cargo-nextest".to_string()];
     cmd.extend(nextest_run_args(run_args, &archive, &here.checkout));
-    in_runner(&target, &here.checkout, &entry, &[], &cmd)
+    in_runner(&target, &here.checkout, &entry, &pairs, &cmd)
 }
 
 /// `workbench run [--stack <slug>] [--env K=V]… <script> [args…]`: a repo script in the runner.
