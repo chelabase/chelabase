@@ -20,6 +20,8 @@ axum = { workspace = true }
 # The Docker Engine API, over the socket (the only new socket holder; edge functions m10).
 bollard = { workspace = true }
 bytes = { workspace = true }
+# `outbound::is_public`: a registry host's addresses must all be public.
+chelabase-http = { workspace = true }
 chelabase-types = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
@@ -42,7 +44,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-chelabase-http = { workspace = true }
 chelabase-metadata = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }

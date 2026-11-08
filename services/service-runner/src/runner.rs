@@ -293,6 +293,25 @@ impl From<&Container> for Status {
     }
 }
 
+/// Resolves a registry host (the engine pulls from the host's network namespace).
+#[async_trait::async_trait]
+pub trait Resolve: Send + Sync + 'static {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::IpAddr>>;
+}
+
+/// The system resolver.
+pub struct SystemResolver;
+
+#[async_trait::async_trait]
+impl Resolve for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+        Ok(tokio::net::lookup_host((host, port))
+            .await?
+            .map(|a| a.ip())
+            .collect())
+    }
+}
+
 /// The per-(service, branch) locks ensure holds and reconcile tries.
 type Slots = Mutex<HashMap<(Uuid, Uuid), Arc<tokio::sync::Mutex<()>>>>;
 
@@ -303,6 +322,7 @@ pub struct Runner {
     caps: Caps,
     digest_key: [u8; 32],
     slots: Slots,
+    resolver: Arc<dyn Resolve>,
 }
 
 impl Runner {
@@ -318,7 +338,17 @@ impl Runner {
             caps,
             digest_key,
             slots: Mutex::new(HashMap::new()),
+            // Unit tests never reach real DNS: every host resolves to a public address there.
+            #[cfg(not(test))]
+            resolver: Arc::new(SystemResolver),
+            #[cfg(test)]
+            resolver: Arc::new(fake::PublicResolver),
         }
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<dyn Resolve>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     pub fn with_digest_key(mut self, key: [u8; 32]) -> Self {
@@ -473,6 +503,7 @@ impl Runner {
     pub async fn ensure(&self, req: &EnsureRequest) -> Result<Container, RunnerError> {
         let spec = spec::parse(&req.spec, &self.caps)?;
         spec::environment(&req.env, spec.port)?;
+        self.check_registry(&spec.image).await?;
         let key = Key {
             service_id: req.service_id,
             branch_id: req.branch_id,
@@ -514,20 +545,80 @@ impl Runner {
         self.guarded(&id).await
     }
 
+    /// The registry host's every address must be public: the engine pulls from the host's
+    /// network namespace, and treats a registry on a loopback address as plain HTTP. This
+    /// narrows pull-side SSRF but can't close it: a registry on a public address can still send
+    /// the engine anywhere through its token `realm` (an auth redirect the runner never sees),
+    /// and a name can resolve differently when the engine looks it up. A host that doesn't
+    /// resolve is refused too.
+    async fn check_registry(&self, image: &spec::ImageRef) -> Result<(), RunnerError> {
+        let Some((host, port)) = spec::registry_host(image) else {
+            return Ok(());
+        };
+        let refuse = |why: String| Err(RunnerError::Invalid(SpecError(why)));
+        match self.resolver.resolve(&host, port).await {
+            Ok(addrs) if addrs.is_empty() => refuse(format!("registry {host} has no address")),
+            Ok(addrs) => match addrs
+                .iter()
+                .find(|a| !chelabase_http::outbound::is_public(**a))
+            {
+                Some(a) => refuse(format!(
+                    "registry {host} resolves to a non-public address ({a})"
+                )),
+                None => Ok(()),
+            },
+            Err(e) => refuse(format!("registry {host} doesn't resolve: {e}")),
+        }
+    }
+
+    /// Runs `op` on the container `id` names under its slot's lock (ensure's), checking it again
+    /// once the lock is held: an ensure that finished in between may have replaced it.
+    async fn locked<T>(
+        &self,
+        id: &str,
+        op: impl AsyncFnOnce(&Container) -> Result<T, RunnerError>,
+    ) -> Result<T, RunnerError> {
+        let c = self.guarded(id).await?;
+        let _slot = match key_of(&c) {
+            Some(k) => Some(self.lock(k.slot()).await),
+            None => None,
+        };
+        let c = self.guarded(&c.id).await?;
+        op(&c).await
+    }
+
     pub async fn start(&self, id: &str) -> Result<Status, RunnerError> {
+        self.locked(id, async |c| self.start_unlocked(&c.id).await)
+            .await
+    }
+
+    pub async fn stop(&self, id: &str) -> Result<Status, RunnerError> {
+        self.locked(id, async |c| self.stop_unlocked(&c.id).await)
+            .await
+    }
+
+    /// Removes the container and then its service's network.
+    pub async fn remove(&self, id: &str) -> Result<(), RunnerError> {
+        self.locked(id, async |c| self.remove_unlocked(&c.id).await)
+            .await
+    }
+
+    /// [`Runner::start`] for a caller already holding the slot's lock (reconcile).
+    pub async fn start_unlocked(&self, id: &str) -> Result<Status, RunnerError> {
         let c = self.guarded(id).await?;
         self.backend.start(&c.id).await?;
         Ok(Status::from(&self.guarded(&c.id).await?))
     }
 
-    pub async fn stop(&self, id: &str) -> Result<Status, RunnerError> {
+    /// [`Runner::stop`] for a caller already holding the slot's lock (reconcile).
+    pub async fn stop_unlocked(&self, id: &str) -> Result<Status, RunnerError> {
         let c = self.guarded(id).await?;
         self.backend.stop(&c.id).await?;
         Ok(Status::from(&self.guarded(&c.id).await?))
     }
 
-    /// Removes the container and then its service's network.
-    pub async fn remove(&self, id: &str) -> Result<(), RunnerError> {
+    /// [`Runner::remove`] for a caller already holding the slot's lock (reconcile).
+    pub async fn remove_unlocked(&self, id: &str) -> Result<(), RunnerError> {
         let c = self.guarded(id).await?;
         self.backend.remove(&c.id).await?;
         // The network goes with the slot's last container.
@@ -565,7 +656,32 @@ pub mod fake {
         pub image: Mutex<ImageFacts>,
         /// The compose project's functions containers.
         pub functions: Mutex<Vec<String>>,
+        /// When set, `image` waits for a permit (to hold an ensure mid-call).
+        pub image_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         next: Mutex<u32>,
+    }
+
+    /// Every host is a public address.
+    pub struct PublicResolver;
+
+    #[async_trait::async_trait]
+    impl Resolve for PublicResolver {
+        async fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec!["93.184.216.34".parse().unwrap()])
+        }
+    }
+
+    /// Fixed answers by host; anything else fails to resolve.
+    pub struct MapResolver(pub HashMap<String, Vec<std::net::IpAddr>>);
+
+    #[async_trait::async_trait]
+    impl Resolve for MapResolver {
+        async fn resolve(&self, host: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            self.0
+                .get(host)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such host"))
+        }
     }
 
     impl Fake {
@@ -655,6 +771,10 @@ pub mod fake {
                 .collect())
         }
         async fn image(&self, image: &ImageRef) -> anyhow::Result<ImageFacts> {
+            let gate = self.image_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let mut facts = self.image.lock().unwrap().clone();
             if facts.id.is_empty() {
                 facts.id = format!("sha256:{:064x}", image.to_string().len());
@@ -1009,6 +1129,136 @@ mod tests {
             Err(RunnerError::Backend(_))
         ));
         assert!(fake.network("foreign").unwrap().containers.is_empty());
+    }
+
+    /// Re-audit S2: a registry host that resolves to any loopback, link-local, private, CGNAT,
+    /// unspecified or multicast address (or doesn't resolve) is refused with nothing touched,
+    /// including the auditor's four DNS names.
+    #[tokio::test]
+    async fn registries_resolving_to_local_addresses_are_refused() {
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        let answers: HashMap<String, Vec<std::net::IpAddr>> = [
+            ("127.0.0.1.nip.io", vec![ip("127.0.0.1")]),
+            ("localtest.me", vec![ip("127.0.0.1"), ip("::1")]),
+            ("169.254.169.254.nip.io", vec![ip("169.254.169.254")]),
+            ("0x7f000001.nip.io", vec![ip("127.0.0.1")]),
+            ("ten.example", vec![ip("10.1.2.3")]),
+            ("cgnat.example", vec![ip("100.64.0.9")]),
+            ("ula.example", vec![ip("fd00::1")]),
+            ("mapped.example", vec![ip("::ffff:127.0.0.1")]),
+            ("multicast.example", vec![ip("239.1.1.1")]),
+            ("zero.example", vec![ip("0.0.0.0")]),
+            (
+                "mixed.example",
+                vec![ip("93.184.216.34"), ip("192.168.1.1")],
+            ),
+            ("empty.example", vec![]),
+            ("ghcr.io", vec![ip("140.82.112.33")]),
+            (
+                "registry.example.com",
+                vec![ip("93.184.216.34"), ip("2606:2800:220:1::1")],
+            ),
+        ]
+        .into_iter()
+        .map(|(h, a)| (h.to_string(), a))
+        .collect();
+        let fake = Arc::new(Fake::default());
+        let r = runner(&fake, "a").with_resolver(Arc::new(fake::MapResolver(answers)));
+        for image in [
+            "127.0.0.1.nip.io:8100/echo:1",
+            "localtest.me:4500/echo:1",
+            "169.254.169.254.nip.io/echo:1",
+            "0x7f000001.nip.io/echo:1",
+            "ten.example/echo:1",
+            "cgnat.example/echo:1",
+            "ula.example/echo:1",
+            "mapped.example/echo:1",
+            "multicast.example/echo:1",
+            "zero.example/echo:1",
+            "mixed.example/echo:1",
+            "empty.example/echo:1",
+            "nxdomain.example/echo:1",
+        ] {
+            let mut req = request(&new_key());
+            req.spec["image"] = json!(image);
+            assert!(
+                matches!(r.ensure(&req).await, Err(RunnerError::Invalid(_))),
+                "{image}"
+            );
+        }
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        for image in [
+            "ghcr.io/acme/echo:1",
+            "registry.example.com:5000/a/b:1",
+            "busybox:1",
+            "acme/echo:1",
+        ] {
+            let mut req = request(&new_key());
+            req.spec["image"] = json!(image);
+            assert!(r.ensure(&req).await.is_ok(), "{image}");
+        }
+    }
+
+    /// Re-audit N2: start, stop and remove wait for the slot's lock, like ensure.
+    #[tokio::test]
+    async fn lifecycle_calls_wait_for_the_slot() {
+        let fake = Arc::new(Fake::default());
+        let r = Arc::new(runner(&fake, "a"));
+        let key = new_key();
+        let c = r.ensure(&request(&key)).await.unwrap();
+        let held = r.lock(key.slot()).await;
+        let (r2, id) = (r.clone(), c.id.clone());
+        let stop = tokio::spawn(async move { r2.stop(&id).await.map(|s| s.state) });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.get(&c.id).unwrap().state,
+            "running",
+            "stop must wait for the slot"
+        );
+        drop(held);
+        assert_eq!(stop.await.unwrap().unwrap(), "exited");
+    }
+
+    /// Re-audit N2: a remove racing an ensure on the same slot waits for it. The ensure (a new
+    /// env, so a replacement) is held mid-call; the old container stays until it finishes, and
+    /// afterwards the remove finds it already replaced (404) and leaves the new container and its
+    /// network, with the functions service attached, alone.
+    #[tokio::test]
+    async fn a_remove_racing_an_ensure_waits_for_it() {
+        let fake = Arc::new(Fake::default());
+        fake.functions.lock().unwrap().push("functions-ctr".into());
+        let r = Arc::new(runner(&fake, "a"));
+        let key = new_key();
+        let old = r.ensure(&request(&key)).await.unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fake.image_gate.lock().unwrap() = Some(gate.clone());
+        let mut rotated = request(&key);
+        rotated.env.insert("SECRET".into(), "rotated".into());
+        let r1 = r.clone();
+        let ensure = tokio::spawn(async move { r1.ensure(&rotated).await.map(|c| c.id) });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let (r2, old_id) = (r.clone(), old.id.clone());
+        let remove = tokio::spawn(async move { r2.remove(&old_id).await });
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            fake.get(&old.id).is_some(),
+            "the remove must wait for the ensure in flight"
+        );
+        gate.add_permits(1);
+        let new_id = ensure.await.unwrap().unwrap();
+        assert!(matches!(remove.await.unwrap(), Err(RunnerError::NotFound)));
+        assert_eq!(fake.get(&new_id).unwrap().state, "running");
+        let net = fake
+            .network(&container_name("a", key.service_id, key.branch_id))
+            .unwrap();
+        assert!(net.containers.contains(&"functions-ctr".to_string()));
+        assert!(net.containers.contains(&new_id));
     }
 
     /// Audit N2: the branch's secrets never reach a log through `Debug`.

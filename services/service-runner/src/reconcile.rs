@@ -198,9 +198,10 @@ pub async fn reconcile_once(
             None => None,
         };
         let result = match &action {
-            Action::Start(id) => runner.start(id).await.map(drop),
-            Action::Stop(id) => runner.stop(id).await.map(drop),
-            Action::Remove(id) => runner.remove(id).await,
+            // Under the slot's lock already (taken above).
+            Action::Start(id) => runner.start_unlocked(id).await.map(drop),
+            Action::Stop(id) => runner.stop_unlocked(id).await.map(drop),
+            Action::Remove(id) => runner.remove_unlocked(id).await,
             Action::RemoveNetwork(s, b) => runner.remove_network(*s, *b).await,
             Action::Attach(id) => runner.attach_functions(id).await,
         };

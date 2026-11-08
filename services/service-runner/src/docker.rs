@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, HostConfigLogConfig, Mount,
-    MountTmpfsOptions, MountType, NetworkConnectRequest, NetworkCreateRequest,
-    NetworkDisconnectRequest, RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, EndpointSettings, HostConfig, HostConfigCgroupnsModeEnum,
+    HostConfigLogConfig, Mount, MountTmpfsOptions, MountType, NetworkConnectRequest,
+    NetworkCreateRequest, NetworkDisconnectRequest, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, ListContainersOptions, ListNetworksOptions,
@@ -379,7 +379,12 @@ impl ContainerBackend for DockerBackend {
                 network,
                 NetworkConnectRequest {
                     container: container.to_string(),
-                    endpoint_config: None,
+                    // Below every other network's priority: a service network never takes the
+                    // container's default route (its outbound traffic stays on its own network).
+                    endpoint_config: Some(EndpointSettings {
+                        gw_priority: Some(-1),
+                        ..Default::default()
+                    }),
                 },
             )
             .await

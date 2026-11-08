@@ -97,7 +97,17 @@ impl Fixture {
             functions: String::new(),
         };
         let project = f.stack.clone();
-        // On the default bridge (a container in `none` mode can't join other networks).
+        // On its project's `<project>_default` network, as compose would put it. The name sorts
+        // after the runner's `chelabase-…-svc-…` networks, so an attach without a gateway
+        // priority would take its default route (re-audit S1).
+        let default_net = format!("{project}_default");
+        f.docker
+            .create_network(bollard::models::NetworkCreateRequest {
+                name: default_net.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         f.functions = f
             .container(
                 "functions",
@@ -105,7 +115,7 @@ impl Fixture {
                     ("com.docker.compose.project", &project),
                     ("com.docker.compose.service", "functions"),
                 ],
-                "bridge",
+                &default_net,
             )
             .await;
         f
@@ -743,6 +753,7 @@ async fn service_containers_reach_nothing_but_their_own_port() {
         "the stack's functions container: {functions:?}"
     );
     let runner = Runner::new(backend, &f.stack, &project, Caps::default());
+    let route_before = default_route(&f.docker, &functions[0]).await;
     let attacker = runner.ensure(&request(&key(), f.spec())).await.unwrap();
     let victim = runner.ensure(&request(&key(), f.spec())).await.unwrap();
     let net = attacker.label(BRANCH_LABEL).map(|b| {
@@ -821,8 +832,10 @@ async fn service_containers_reach_nothing_but_their_own_port() {
         ],
     )
     .await;
+    let route_attached = default_route(&f.docker, &functions[0]).await;
     runner.remove(&attacker.id).await.unwrap();
     runner.remove(&victim.id).await.unwrap();
+    let route_after = default_route(&f.docker, &functions[0]).await;
     let still: Vec<String> = f
         .docker
         .inspect_container(&functions[0], None)
@@ -843,6 +856,12 @@ async fn service_containers_reach_nothing_but_their_own_port() {
         fn_code, 0,
         "the functions container must reach the service: {fn_out}"
     );
+    assert!(
+        route_before.is_some(),
+        "the functions container has a default route"
+    );
+    assert_eq!(route_attached, route_before, "re-audit S1: attached");
+    assert_eq!(route_after, route_before, "re-audit S1: detached");
     assert!(
         still.is_empty(),
         "the functions container is detached afterwards: {still:?}"
@@ -999,4 +1018,31 @@ async fn service_containers_cannot_reach_each_other() {
         [0, 0],
         "the functions service reaches each service"
     );
+}
+
+/// The container's default route, from `/proc/net/route`: `(interface, gateway hex)`.
+async fn default_route(docker: &Docker, id: &str) -> Option<(String, String)> {
+    let (_, out) = exec(docker, id, &["cat", "/proc/net/route"]).await;
+    out.lines().skip(1).find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.get(1) == Some(&"00000000")).then(|| (f[0].to_string(), f[2].to_string()))
+    })
+}
+
+/// Re-audit S1: attaching the functions container to a service network (and detaching it)
+/// never moves its default route off its own network.
+#[tokio::test]
+#[ignore = "needs the workbench stack's Docker engine"]
+async fn service_networks_never_take_the_functions_default_route() {
+    let f = Fixture::new().await;
+    let before = default_route(&f.docker, &f.functions).await;
+    assert!(before.is_some(), "the stand-in has a default route");
+    let runner = f.runner();
+    let c = runner.ensure(&request(&key(), f.spec())).await.unwrap();
+    let attached = default_route(&f.docker, &f.functions).await;
+    runner.remove(&c.id).await.unwrap();
+    let after = default_route(&f.docker, &f.functions).await;
+    f.finish().await;
+    assert_eq!(attached, before, "attached to a service network");
+    assert_eq!(after, before, "after the service network went");
 }
