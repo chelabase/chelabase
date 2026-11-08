@@ -72,5 +72,7 @@ reqwest = { workspace = true, features = ["stream"] }
 # The storage service in-process (its failure paths, against a real compute): its router, the
 # compute TLS, and an object store that fails on demand.
 chelabase-storage-service = { path = "../storage" }
+# m13b: the functions service's database-event dispatcher in-process, against a real compute.
+chelabase-functions = { path = "../functions" }
 chelabase-query = { workspace = true }
 async-trait = { workspace = true }

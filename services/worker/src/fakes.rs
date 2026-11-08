@@ -2634,6 +2634,8 @@ impl WorkerMetadata for FakeMetadata {
                 authenticator_password_enc: b.authenticator_password_enc.clone(),
                 storage_password_enc: state.storage_logins.get(&branch).map(|l| l.0.clone()),
                 storage_password_salt: state.storage_logins.get(&branch).map(|l| l.1.clone()),
+                functions_password_enc: None,
+                functions_password_salt: None,
                 settings: DataApiSettings {
                     max_rows: db.max_rows,
                     statement_timeout_ms: db.statement_timeout_ms,

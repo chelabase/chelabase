@@ -702,12 +702,14 @@ mod fn_triggers {
             // The state a failed first sync leaves: the parent's trigger still in the child's
             // database, writing on the child's timeline, and the child's rows pending.
             let parent_wanted = worker::fn_triggers::wanted_in(&fx.triggers(main).await, &fx.database);
-            let role: u32 = fx
-                .value(dev, "SELECT oid FROM pg_roles WHERE rolname = 'chelabase_functions_owner'")
-                .await
-                .parse()
-                .unwrap();
-            fx.sql(dev, &worker::fn_triggers::sync_sql(&parent_wanted, false, Some(role)))
+            let oid = |name: &'static str| async move {
+                fx.value(dev, &format!("SELECT oid FROM pg_roles WHERE rolname = '{name}'")).await.parse::<u32>().ok()
+            };
+            let role = worker::fn_triggers::Roles {
+                owner: oid("chelabase_functions_owner").await,
+                dispatch: oid("chelabase_functions_dispatch").await,
+            };
+            fx.sql(dev, &worker::fn_triggers::sync_sql(&parent_wanted, false, role))
                 .await;
             fx.sql(dev, "INSERT INTO public.orders VALUES (1)").await;
             sqlx::query("UPDATE function_triggers SET state = 'pending_install' WHERE branch_id = $1")
@@ -802,7 +804,7 @@ mod fn_triggers {
             CREATE OR REPLACE FUNCTION public.spy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;
             CREATE OR REPLACE FUNCTION public.spy_bool() RETURNS boolean LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN true; END$$;"#;
         // (name, where, as the owner, setup SQL, table to trigger on, expected outcome)
-        let moves: [(&str, At, bool, &str, &str, Expect); 14] = [
+        let moves: [(&str, At, bool, &str, &str, Expect); 19] = [
             ("hostile casts", At::SharedBefore, true,
              r#"CREATE TYPE public.mood AS ENUM ('ok');
                 CREATE FUNCTION public.mood_json(public.mood) RETURNS json LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN '"x"'::json; END$$;
@@ -856,6 +858,27 @@ mod fn_triggers {
             ("replaced enqueue()", At::SharedBetween, false,
              "CREATE OR REPLACE FUNCTION chelabase_functions.enqueue() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;",
              "", Expect::Flows("plain")),
+            // m13b: the dispatch login's grants are an exact allowlist; anything more is revoked.
+            ("grants to the dispatch role", At::SharedBetween, false,
+             "GRANT SELECT ON public.plain TO chelabase_functions_dispatch;
+              GRANT INSERT, TRUNCATE ON chelabase_functions.outbox TO chelabase_functions_dispatch;
+              GRANT UPDATE (payload) ON chelabase_functions.outbox TO chelabase_functions_dispatch;
+              GRANT SELECT ON chelabase_functions.outbox TO chelabase_functions_dispatch WITH GRANT OPTION;
+              GRANT USAGE ON SEQUENCE chelabase_functions.outbox_id_seq TO chelabase_functions_dispatch;
+              GRANT EXECUTE ON FUNCTION chelabase_functions.enqueue() TO chelabase_functions_dispatch;
+              GRANT CREATE ON SCHEMA chelabase_functions TO chelabase_functions_dispatch;",
+             "", Expect::Flows("plain")),
+            ("default privileges to the dispatch role, by authenticated", At::SharedBetween, false,
+             "BEGIN; SET LOCAL ROLE authenticated; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO chelabase_functions_dispatch; COMMIT;",
+             "", Expect::Flows("plain")),
+            ("dispatch role as a key role", At::SharedBetween, false, "@check_data_role chelabase_functions_dispatch", "", Expect::Refused),
+            // m13b: any attribute or membership on the dispatch login refuses the install.
+            ("pre-made dispatch role with an attribute", At::Own, false,
+             "CREATE ROLE chelabase_functions_dispatch LOGIN NOINHERIT CREATEDB CONNECTION LIMIT 40;",
+             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_dispatch has attributes")),
+            ("pre-made dispatch role with a membership", At::Own, false,
+             "CREATE ROLE chelabase_functions_dispatch LOGIN NOINHERIT CONNECTION LIMIT 40; GRANT pg_read_all_data TO chelabase_functions_dispatch;",
+             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_dispatch has members or memberships")),
         ];
         let shared: &'static Fx = Box::leak(Box::new(Fx::provision().await));
         let mut own: Vec<&'static Fx> = Vec::new();
@@ -997,6 +1020,25 @@ mod fn_triggers {
             assert_eq!(
                 shared.value(shared.main, "SELECT has_table_privilege('authenticated', 'chelabase_functions.outbox', 'SELECT')::text || has_function_privilege('authenticated', 'chelabase_functions.enqueue()', 'EXECUTE')::text").await,
                 "falsefalse"
+            );
+            // m13b: after the sweep, the dispatch login holds exactly its allowlist.
+            assert_eq!(
+                shared.value(shared.main, "SELECT concat_ws(',',
+                    has_schema_privilege('chelabase_functions_dispatch', 'chelabase_functions', 'USAGE'),
+                    has_schema_privilege('chelabase_functions_dispatch', 'chelabase_functions', 'CREATE'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'SELECT'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'UPDATE'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'DELETE'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'INSERT'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'TRUNCATE'),
+                    has_table_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox', 'SELECT WITH GRANT OPTION'),
+                    (SELECT attacl IS NULL FROM pg_attribute WHERE attrelid = 'chelabase_functions.outbox'::regclass AND attname = 'payload'),
+                    has_sequence_privilege('chelabase_functions_dispatch', 'chelabase_functions.outbox_id_seq', 'USAGE'),
+                    has_function_privilege('chelabase_functions_dispatch', 'chelabase_functions.enqueue()', 'EXECUTE'),
+                    has_table_privilege('chelabase_functions_dispatch', 'public.plain', 'SELECT'),
+                    (SELECT count(*) FROM pg_default_acl a, aclexplode(a.defaclacl) x
+                      WHERE x.grantee = 'chelabase_functions_dispatch'::regrole))").await,
+                "t,f,t,t,t,f,f,f,t,f,f,f,0"
             );
         })
         .await;
@@ -1433,42 +1475,159 @@ mod fn_triggers {
         .await;
     }
 
+    // m13b (#186): the functions service's dispatcher, in this process, connected to the
+    // fixture's compute as `chelabase_functions_dispatch`.
+    //
+    // S1: the fixtures' functions stay *disabled* in the metadata, so the stack's own
+    // dispatcher holds their events (it neither delivers nor deletes a pending row); the
+    // dispatcher here reads the metadata through `Meta`, which shows the functions in `on` as
+    // enabled. Only it delivers.
+
+    use functions::events::dispatch::{Dispatcher, EventsMetadata, Invoker, Pass, Session, Woken};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use worker::fn_triggers::DISPATCH;
+
+    /// The metadata, with the functions in `on` shown as enabled.
+    struct Meta {
+        inner: MetadataClient,
+        on: Mutex<HashSet<Uuid>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventsMetadata for Meta {
+        async fn branch(&self, b: BranchId) -> Result<Option<BranchRecord>, String> {
+            self.inner.branch(b).await
+        }
+        async fn triggers(&self, b: BranchId) -> Result<Vec<TriggerRecord>, String> {
+            self.inner.triggers(b).await
+        }
+        async fn functions(&self, b: BranchId) -> Result<Vec<chelabase_metadata::BranchFunction>, String> {
+            let on = self.on.lock().unwrap().clone();
+            Ok(EventsMetadata::functions(&self.inner, b)
+                .await?
+                .into_iter()
+                .map(|mut f| {
+                    f.enabled = on.contains(&f.function_id);
+                    f
+                })
+                .collect())
+        }
+        async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String> {
+            self.inner.targets(limit).await
+        }
+        async fn record(&self, b: BranchId, d: &[chelabase_metadata::TriggerDelivery]) -> Result<(), String> {
+            self.inner.record(b, d).await
+        }
+    }
+
+    /// The dispatch login's connection info as the orchestrator's functions route answers it:
+    /// the compute's address and TLS name from the stack's data route, the user and the branch's
+    /// password from the metadata (the stack's orchestrator may predate the functions route).
+    struct Source {
+        data: chelabase_pgsession::InternalSource,
+        metadata: MetadataClient,
+        key: chelabase_secrets::SecretKey,
+    }
+
+    impl chelabase_pgsession::ConnSource for Source {
+        async fn fetch(&self, branch: Uuid) -> Result<chelabase_pgsession::ConnInfo, chelabase_pgsession::ConnError> {
+            let mut info = self.data.fetch(branch).await?;
+            let row = self.metadata.branch_connection(BranchId(branch)).await.unwrap().unwrap();
+            let sealed = row
+                .functions_password_enc
+                .ok_or_else(|| chelabase_pgsession::ConnError::NotReady("no dispatch login yet".into()))?;
+            info.user = DISPATCH.into();
+            info.password = chelabase_secrets::open_credential(
+                &self.key,
+                &branch.to_string(),
+                chelabase_secrets::Purpose::FunctionsDispatch,
+                &sealed,
+            )
+            .unwrap();
+            Ok(info)
+        }
+    }
+
+    /// A change made just before a delivery (m13b: mid-batch).
+    type Hook = Box<dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
     /// m13: an invoker that records each event's body and answers the scripted statuses in
-    /// turn (then 200).
+    /// turn (then 200); `hook` runs before each delivery (m13b: a change mid-batch).
     struct Scripted {
-        statuses: std::sync::Mutex<Vec<u16>>,
-        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        statuses: Mutex<Vec<u16>>,
+        seen: Mutex<Vec<(Instant, serde_json::Value)>>,
+        hook: Mutex<Option<Hook>>,
     }
 
     impl Scripted {
-        fn new(statuses: &[u16]) -> std::sync::Arc<Scripted> {
-            std::sync::Arc::new(Scripted {
-                statuses: std::sync::Mutex::new(statuses.iter().rev().copied().collect()),
-                seen: std::sync::Mutex::new(Vec::new()),
+        fn new(statuses: &[u16]) -> Arc<Scripted> {
+            Arc::new(Scripted {
+                statuses: Mutex::new(statuses.iter().rev().copied().collect()),
+                seen: Mutex::new(Vec::new()),
+                hook: Mutex::new(None),
             })
         }
         fn seen(&self) -> Vec<serde_json::Value> {
-            self.seen.lock().unwrap().clone()
+            self.seen.lock().unwrap().iter().map(|(_, v)| v.clone()).collect()
         }
     }
 
     #[async_trait::async_trait]
-    impl worker::fn_schedules::Invoker for Scripted {
-        async fn invoke(&self, _: BranchId, _: &str, _: serde_json::Value) -> Result<u16, String> {
-            Err("not a scheduled run".into())
-        }
-        async fn deliver_event(&self, _: BranchId, _: &str, body: Vec<u8>) -> Result<u16, String> {
-            self.seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+    impl Invoker for Scripted {
+        async fn deliver(&self, _: BranchId, _: &str, body: Vec<u8>) -> Result<u16, String> {
+            let hook = self.hook.lock().unwrap().as_mut().map(|h| h());
+            if let Some(hook) = hook {
+                hook.await;
+            }
+            self.seen.lock().unwrap().push((Instant::now(), serde_json::from_slice(&body).unwrap()));
             Ok(self.statuses.lock().unwrap().pop().unwrap_or(200))
         }
     }
 
-    /// m13 (#175): passes until the outbox is quiet (each pass waits up to 5 s inside the
-    /// database for a due row; a retried row is due within its backoff).
-    async fn dispatch(fx: &Fx, invoker: &Scripted, passes: usize) {
+    type Disp = Dispatcher<Meta, Source>;
+
+    /// The dispatcher for `fx` with `invoker`, and its metadata view (functions in `on`).
+    async fn dispatcher(fx: &Fx, invoker: Arc<Scripted>, on: &[Uuid]) -> (Disp, Arc<Meta>) {
+        let url = std::env::var("CHELABASE_INTERNAL_URL").unwrap_or_else(|_| "http://orchestrator:8083".into());
+        let token = std::fs::read_to_string(std::env::var("CHELABASE_STORAGE_INTERNAL_TOKEN_FILE").expect("the storage bearer"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let ca = std::env::var("CHELABASE_COMPUTE_CA_FILE").expect("the compute CA");
+        let tls = chelabase_query::server_tls::ServerTls::from_ca_file(std::path::Path::new(&ca)).unwrap();
+        let meta = Arc::new(Meta { inner: fx.metadata.clone(), on: Mutex::new(on.iter().copied().collect()) });
+        let source = Source {
+            data: chelabase_pgsession::InternalSource::new(&url, &token),
+            metadata: fx.metadata.clone(),
+            key: fx.worker.key.clone(),
+        };
+        (Dispatcher::new(meta.clone(), source, Some(tls), invoker), meta)
+    }
+
+    /// A session on main's database (the connection info is fresh: a sync just set the login).
+    async fn session(fx: &Fx, d: &Disp) -> Session {
+        d.open(fx.main, &fx.database).await.unwrap().expect("something to dispatch")
+    }
+
+    /// Passes until the outbox is quiet: a retried row's backoff (under 20 s) is waited out.
+    async fn drive(d: &Disp, s: &mut Session, passes: usize) -> Pass {
+        let mut last = Pass::Stop;
         for _ in 0..passes {
-            fx.worker.dispatch_once(invoker, fx.main, &fx.database).await.unwrap();
+            last = d.pass(s).await.unwrap();
+            match last {
+                Pass::More => {}
+                Pass::Idle(idle) if idle < Duration::from_secs(20) => {
+                    d.wait(s, idle).await.unwrap();
+                }
+                _ => break,
+            }
         }
+        last
+    }
+
+    async fn trigger_row(fx: &Fx, id: Uuid) -> TriggerRecord {
+        fx.triggers(fx.main).await.into_iter().find(|r| r.id == id).unwrap()
     }
 
     /// m13 AC: a committed insert is delivered once, a rolled-back one never; 500 three times
@@ -1481,12 +1640,13 @@ mod fn_triggers {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY, note text); CREATE TABLE public.secrets (id int PRIMARY KEY, s text);").await;
             let f = fx.function("hello").await;
-            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
             let t = fx.trigger(main, f, "orders", &["insert"]).await;
             fx.worker.sync_fn_triggers(main, false).await.unwrap();
             fx.sql(main, "BEGIN; INSERT INTO public.orders VALUES (9, 'no'); ROLLBACK; INSERT INTO public.orders VALUES (1, 'a');").await;
             let invoker = Scripted::new(&[]);
-            dispatch(fx, &invoker, 1).await;
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
             let seen = invoker.seen();
             assert_eq!(seen.len(), 1, "{seen:?}");
             assert_eq!(seen[0]["type"], "INSERT");
@@ -1495,11 +1655,13 @@ mod fn_triggers {
             assert_eq!(fx.outbox(main).await, 0);
 
             let failing = Scripted::new(&[500, 500, 500]);
+            let (d, _) = dispatcher(fx, failing.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
             fx.sql(main, "INSERT INTO public.orders VALUES (2, 'b');").await;
-            dispatch(fx, &failing, 6).await;
+            drive(&d, &mut s, 8).await;
             assert_eq!(failing.seen().len(), 4, "three failures, then the 2xx");
             assert_eq!(fx.outbox(main).await, 0);
-            let row = fx.triggers(main).await.into_iter().find(|r| r.id == t).unwrap();
+            let row = trigger_row(fx, t).await;
             assert_eq!(row.last_delivery_error, None, "the delivery cleared it");
             assert!(row.last_delivered_at.is_some());
 
@@ -1513,38 +1675,272 @@ mod fn_triggers {
                 Uuid::new_v4()
             )).await;
             let quiet = Scripted::new(&[]);
-            dispatch(fx, &quiet, 1).await;
+            let (d, _) = dispatcher(fx, quiet.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
             assert!(quiet.seen().is_empty(), "{:?}", quiet.seen());
             assert_eq!(fx.outbox(main).await, 0, "the forged rows were deleted");
         })
         .await;
     }
 
-    /// m13 AC: the dispatcher's database role reads the outbox and no member table, and a
-    /// disabled function's events queue until it is enabled again.
+    /// m13b AC: the dispatch login reads, claims and deletes outbox rows and nothing else: no
+    /// member table, no insert into the outbox, no `enqueue()`, no sequence; LOGIN NOINHERIT
+    /// with no other attribute and no membership, so `SET ROLE` to anything fails. A disabled
+    /// function's events queue until it is enabled again.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn dispatcher_role_reads_only_the_outbox_and_disabled_functions_queue() {
+    async fn dispatch_role_privilege_matrix() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY); INSERT INTO public.orders VALUES (0);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let attrs = fx
+                .value(main, &format!(
+                    "SELECT rolcanlogin::text || rolinherit::text || rolsuper::text || rolcreaterole::text || rolcreatedb::text
+                       || rolreplication::text || rolbypassrls::text || rolconnlimit::text
+                       || (SELECT count(*) FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid)::text
+                     FROM pg_roles r WHERE rolname = '{DISPATCH}'"
+                ))
+                .await;
+            assert_eq!(attrs, "truefalsefalsefalsefalsefalsefalse400", "LOGIN NOINHERIT, nothing else, no membership");
+            for (what, sql) in [
+                ("select a member table", "SELECT count(*) FROM public.orders"),
+                ("insert a member table", "INSERT INTO public.orders VALUES (5)"),
+                ("update a member table", "UPDATE public.orders SET id = 6"),
+                ("delete a member table", "DELETE FROM public.orders"),
+                ("call enqueue()", "SELECT chelabase_functions.enqueue()"),
+                ("insert into the outbox", "INSERT INTO chelabase_functions.outbox (trigger_id, payload) VALUES (gen_random_uuid(), '{}')"),
+                ("the outbox's sequence", "SELECT nextval('chelabase_functions.outbox_id_seq')"),
+                ("set role to the owner", "SET ROLE chelabase_functions_owner"),
+                ("set role to the database owner", "SET ROLE postgres"),
+                ("set role to authenticated", "SET ROLE authenticated"),
+                ("set_config role", "SELECT set_config('role', 'chelabase_functions_owner', false)"),
+                ("create in the schema", "CREATE TABLE chelabase_functions.x (id int)"),
+            ] {
+                let out = fx.on_as(main, DISPATCH, sql).await;
+                assert!(
+                    out.as_ref().is_err_and(|e| e.contains("permission denied") || e.contains("must be")),
+                    "{what}: {out:?}"
+                );
+            }
+            for sql in [
+                "SELECT count(*) FROM chelabase_functions.outbox",
+                "UPDATE chelabase_functions.outbox SET attempts = attempts WHERE false",
+                "DELETE FROM chelabase_functions.outbox WHERE false",
+            ] {
+                fx.on_as(main, DISPATCH, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+
+            // The function is disabled: events queue, and are delivered once it is enabled.
+            fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
+            let invoker = Scripted::new(&[]);
+            let (d, meta) = dispatcher(fx, invoker.clone(), &[]).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            assert!(invoker.seen().is_empty());
+            assert_eq!(fx.outbox(main).await, 1, "queued while the function is off");
+            meta.on.lock().unwrap().insert(f);
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(invoker.seen().len(), 1, "delivered once it is on again");
+        })
+        .await;
+    }
+
+    /// m13b AC: an insert is delivered within 1 s, woken by LISTEN, not by the sweep.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_wakes_on_listen() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
             let f = fx.function("hello").await;
             fx.trigger(main, f, "orders", &["insert"]).await;
             fx.worker.sync_fn_triggers(main, false).await.unwrap();
-            let denied = fx.on(main, &format!("BEGIN; SET LOCAL ROLE {OWNER}; SELECT count(*) FROM public.orders; COMMIT;")).await;
-            assert!(denied.as_ref().is_err_and(|e| e.contains("permission denied")), "{denied:?}");
-            let outbox = fx.on(main, &format!("BEGIN; SET LOCAL ROLE {OWNER}; SELECT count(*) FROM chelabase_functions.outbox; COMMIT;")).await;
-            assert!(outbox.is_ok(), "{outbox:?}");
+            let invoker = Scripted::new(&[]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            let Pass::Idle(idle) = d.pass(&mut s).await.unwrap() else { panic!("an empty outbox is idle") };
+            assert!(idle > Duration::from_secs(20), "nothing due: the sweep's wait, {idle:?}");
+            let insert = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let at = Instant::now();
+                fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
+                at
+            });
+            assert_eq!(d.wait(&mut s, idle).await.unwrap(), Woken::Notified);
+            d.pass(&mut s).await.unwrap();
+            let committed = insert.await.unwrap();
+            let seen = invoker.seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            let took = seen[0].0.duration_since(committed);
+            assert!(took < Duration::from_secs(1), "delivered {took:?} after the insert");
+        })
+        .await;
+    }
 
-            // The function is disabled (a new deployment's state starts off): events queue.
+    /// m13b AC (B1): the bound never deletes a pending row; dead rows over the cap are removed
+    /// and counted in the trigger's `dropped_count`.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn outbox_cap_never_drops_a_pending_event() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let n = functions::events::OUTBOX_CAP + 5;
+            fx.sql(main, &format!("INSERT INTO public.orders SELECT g FROM generate_series(1, {n}) g;")).await;
+            let invoker = Scripted::new(&[]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            assert_eq!(d.pass(&mut s).await.unwrap(), Pass::More, "a sweep, then a whole batch");
+            let delivered = invoker.seen().len() as i64;
+            let row = trigger_row(fx, t).await;
+            assert_eq!(
+                (delivered + fx.outbox(main).await, row.dead_count, row.dropped_count),
+                (n, 0, 0),
+                "no pending event was lost"
+            );
+
+            // Dead rows past the cap: the oldest go, counted.
+            fx.sql(main, "DELETE FROM chelabase_functions.outbox;").await;
+            let tl = fx.value(main, "SELECT current_setting('neon.timeline_id')").await;
+            let dead = functions::events::OUTBOX_CAP + 3;
+            fx.sql(main, &format!(
+                "INSERT INTO chelabase_functions.outbox (trigger_id, payload, timeline_id, status, attempts)
+                 SELECT '{t}', '{{}}', '{tl}', 'dead', 10 FROM generate_series(1, {dead});
+                 INSERT INTO public.orders VALUES (0);"
+            )).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(
+                fx.value(main, "SELECT count(*) FILTER (WHERE status = 'dead')::text || ' ' || count(*) FILTER (WHERE status = 'pending')::text FROM chelabase_functions.outbox").await,
+                format!("{} 0", functions::events::OUTBOX_CAP),
+                "the cap kept the newest dead rows; the pending one was delivered"
+            );
+            assert_eq!(trigger_row(fx, t).await.dropped_count, 3);
+        })
+        .await;
+    }
+
+    /// m13b AC (S3): a trigger disabled or deleted while its batch is claimed gets no further
+    /// delivery (its rows are deleted, a disabled one's counted); a function turned off
+    /// mid-batch keeps its rows queued (released, the attempt taken back).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_stops_on_delete_or_disable_mid_batch() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let invoker = Scripted::new(&[]);
+            let (d, meta) = dispatcher(fx, invoker.clone(), &[f]).await;
+
+            // The function goes off after the first delivery: the other two are released.
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2), (3);").await;
+            let off = meta.clone();
+            *invoker.hook.lock().unwrap() = Some(Box::new(move || {
+                off.on.lock().unwrap().clear();
+                Box::pin(async {})
+            }));
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(invoker.seen().len(), 1, "no delivery after the function went off");
+            assert_eq!(
+                fx.value(main, "SELECT count(*)::text || ' ' || max(attempts)::text FROM chelabase_functions.outbox WHERE status = 'pending'").await,
+                "2 0",
+                "released, the attempt taken back"
+            );
+
+            // The trigger is disabled after the next delivery: the last row is deleted, counted.
+            meta.on.lock().unwrap().insert(f);
+            let m = fx.metadata.clone();
+            *invoker.hook.lock().unwrap() = Some(Box::new(move || {
+                let m = m.clone();
+                Box::pin(async move {
+                    m.update_trigger(main, f, t, false).await.unwrap();
+                })
+            }));
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(invoker.seen().len(), 2);
+            assert_eq!(fx.outbox(main).await, 0);
+            assert_eq!(trigger_row(fx, t).await.dropped_count, 1);
+
+            // A deleted trigger: likewise, from the next row on.
+            let u = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.orders VALUES (4), (5);").await;
+            let m = fx.metadata.clone();
+            *invoker.hook.lock().unwrap() = Some(Box::new(move || {
+                let m = m.clone();
+                Box::pin(async move {
+                    let _ = m.delete_trigger(main, f, u).await;
+                })
+            }));
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(invoker.seen().len(), 3, "one more, then none after the delete");
+            assert_eq!(fx.outbox(main).await, 0);
+        })
+        .await;
+    }
+
+    /// m13b (B3): the dispatcher stops on a branch that stopped being ready (deleted, reset):
+    /// the pass says stop and no session opens.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_stops_on_branch_delete() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
             fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
             let invoker = Scripted::new(&[]);
-            dispatch(fx, &invoker, 1).await;
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            fx.claim(main).await;
+            assert_eq!(d.pass(&mut s).await.unwrap(), Pass::Stop);
+            assert!(d.open(main, &fx.database).await.unwrap().is_none());
             assert!(invoker.seen().is_empty());
-            assert_eq!(fx.outbox(main).await, 1, "queued while the function is off");
-            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
-            dispatch(fx, &invoker, 1).await;
-            assert_eq!(invoker.seen().len(), 1, "delivered once it is on again");
+            assert!(
+                fx.metadata.set_branch_status(main, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap()
+            );
+        })
+        .await;
+    }
+
+    /// m13b (B3): the tenth failure leaves the event dead, counted in the API's `dead_count`
+    /// with its error, and never delivered again.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn tenth_failure_is_dead_and_counted() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.orders VALUES (1); UPDATE chelabase_functions.outbox SET attempts = 9;").await;
+            let invoker = Scripted::new(&[500]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(
+                fx.value(main, "SELECT status || ':' || attempts FROM chelabase_functions.outbox").await,
+                "dead:10"
+            );
+            let row = trigger_row(fx, t).await;
+            assert_eq!((row.dead_count, row.last_delivery_error.as_deref()), (1, Some("the function answered 500")));
+            d.pass(&mut s).await.unwrap();
+            assert_eq!(invoker.seen().len(), 1, "a dead event is never delivered again");
         })
         .await;
     }
@@ -1559,7 +1955,6 @@ mod fn_triggers {
             fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
             let f = fx.function("hello").await;
             let g = fx.function("other").await;
-            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
             let t = fx.trigger(main, f, "orders", &["insert"]).await;
             let u = fx.trigger(main, g, "orders", &["insert"]).await;
             fx.worker.sync_fn_triggers(main, false).await.unwrap();
@@ -1567,8 +1962,10 @@ mod fn_triggers {
             assert!(fx.metadata.delete_trigger(main, f, t).await.unwrap());
             fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
             let invoker = Scripted::new(&[]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
             // The deleted trigger's row is unknown and deleted; the disabled function's held.
-            dispatch(fx, &invoker, 1).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
             assert_eq!(fx.outbox(main).await, 1, "only the held row stays");
             fx.worker.sync_pending_fn_triggers().await;
             assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[u]));
@@ -1577,11 +1974,7 @@ mod fn_triggers {
             assert_eq!(fx.db_triggers(main).await, "", "dropped with no trigger left");
             assert!(fx.metadata.trigger_drops(main).await.unwrap().is_empty(), "then forgotten");
             assert!(invoker.seen().is_empty());
-            assert_eq!(
-                fx.worker.dispatch_once(&*invoker, main, &fx.database).await,
-                Ok(worker::fn_events::Pass::Stop),
-                "no trigger left: the dispatcher stops"
-            );
+            assert_eq!(d.pass(&mut s).await, Ok(Pass::Stop), "no trigger left: the dispatcher stops");
         })
         .await;
     }
