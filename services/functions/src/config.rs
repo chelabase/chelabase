@@ -9,6 +9,9 @@ pub const ORCHESTRATOR_TOKEN: &str = "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN";
 /// The worker's bearer for `POST /internal/invoke/...` (cron and events, m7 and m8).
 pub const WORKER_TOKEN: &str = "CHELABASE_WORKER_FUNCTIONS_TOKEN";
 
+/// m11: this service's bearer for the service runner.
+pub const RUNNER_TOKEN: &str = "CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN";
+
 pub struct Config {
     /// `CHELABASE_FUNCTIONS_ADDR` (default `127.0.0.1:8091`): the public listener, behind the
     /// gateway; comma-separated `host:port`s resolved at start like the internal one (compose
@@ -41,6 +44,11 @@ pub struct Config {
     /// m13b: `CHELABASE_COMPUTE_CA_FILE`: every compute is verified against it. Unset: database
     /// events aren't dispatched.
     pub compute_ca: Option<std::path::PathBuf>,
+    /// m11: `CHELABASE_SERVICE_RUNNER_URL` and `CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN` (or its
+    /// `_FILE`): the service runner and this service's bearer for it. Either unset: container
+    /// services answer `runner_unavailable`.
+    pub runner_url: Option<String>,
+    pub runner_token: Option<String>,
     /// The bundle store (`CHELABASE_STORAGE_BACKEND`, `CHELABASE_STORAGE_S3_*`; bucket
     /// `chelabase-functions`).
     pub store: StorageConfig,
@@ -92,6 +100,10 @@ impl Config {
             worker_token,
             internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
             compute_ca: non_blank("CHELABASE_COMPUTE_CA_FILE").map(Into::into),
+            runner_url: non_blank("CHELABASE_SERVICE_RUNNER_URL"),
+            runner_token: chelabase_types::secret_env::lookup_secret(&get, RUNNER_TOKEN)
+                .map_err(anyhow::Error::msg)?
+                .filter(|t| !t.trim().is_empty()),
             store: StorageConfig::from_lookup(&get)?,
         })
     }

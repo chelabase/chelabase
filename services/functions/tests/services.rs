@@ -25,13 +25,15 @@ mod services {
     use chelabase_metadata::{FunctionAuth, ServiceTarget};
     use chelabase_storage::MemoryStore;
     use chelabase_types::data_key::DataKeyKind;
-    use functions::app::{AppState, public_router};
+    use functions::app::{AppState, control_router, public_router};
     use functions::bundles::Bundles;
     use functions::directory::{Directory, External, Parts};
     use functions::host::Workerd;
     use functions::resolver::{Resolver, TTL};
     use functions::services::health::check_all;
     use functions::services::signature::{Rejected, Verifier};
+    use functions::services::container::Keeper;
+    use functions::services::runner::{ContainerStatus, Ensure, RunnerApi, RunnerError};
     use functions::services::{Services, outbound_from_lookup};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -140,6 +142,56 @@ mod services {
     struct Fake {
         services: Mutex<HashMap<String, (String, FunctionAuth, bool)>>,
         health: Mutex<Vec<(Uuid, bool)>>,
+        /// m11: the container service `box` (its port, enabled) on every branch.
+        container: Mutex<Option<(u16, bool, Uuid)>>,
+    }
+
+    /// m11: `box`'s spec.
+    fn box_spec(port: u16) -> serde_json::Value {
+        json!({"backend": "container", "image": format!("ghcr.io/acme/echo@sha256:{}", "a".repeat(64)), "port": port, "health_path": "/healthz"})
+    }
+
+    type Ensured = (Uuid, Uuid, HashMap<String, String>);
+
+    /// m11: a runner whose containers are all the local upstream (it reports 127.0.0.1), or
+    /// unavailable.
+    #[derive(Default)]
+    struct FakeRunner {
+        down: AtomicBool,
+        ensured: Mutex<Vec<Ensured>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunnerApi for FakeRunner {
+        async fn ensure(&self, req: &Ensure<'_>) -> Result<ContainerStatus, RunnerError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(RunnerError::Unavailable("down".into()));
+            }
+            self.ensured.lock().unwrap().push((
+                req.branch_id,
+                req.deployment_id,
+                req.env.iter().map(|(k, v)| (k.clone(), v.to_string())).collect(),
+            ));
+            Ok(ContainerStatus {
+                id: format!("ctr-{}", req.deployment_id.simple()),
+                state: "running".into(),
+                deployment_id: Some(req.deployment_id.to_string()),
+                port: req.spec["port"].as_u64().map(|p| p as u16),
+                address: Some("127.0.0.1".into()),
+            })
+        }
+        async fn remove(&self, _: &str) -> Result<(), RunnerError> {
+            Ok(())
+        }
+        async fn logs(&self, container: &str) -> Result<String, RunnerError> {
+            Ok(format!("logs of {container}"))
+        }
+        async fn resolve_image(&self, image: &str) -> Result<String, RunnerError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(RunnerError::Unavailable("down".into()));
+            }
+            Ok(format!("{}@sha256:{}", image.split(':').next().unwrap(), "b".repeat(64)))
+        }
     }
 
     fn deployment(name: &str) -> Uuid {
@@ -163,6 +215,25 @@ mod services {
                     service: None,
                 }));
             }
+            if name == "box" {
+                let Some((port, enabled, dep)) = *self.container.lock().unwrap() else {
+                    return Ok(None);
+                };
+                return Ok(Some(Parts {
+                    database_id: Uuid::nil(),
+                    function_id: deployment("box"),
+                    bundle_sha256: String::new(),
+                    auth: FunctionAuth::Key,
+                    enabled,
+                    secrets: Vec::new(),
+                    service_key: None,
+                    service: Some({
+                        let mut e = External::from_spec(dep, &box_spec(port)).unwrap();
+                        e.secret = Some(Zeroizing::new(SECRET.into()));
+                        e
+                    }),
+                }));
+            }
             let Some((url, auth, enabled)) = self.services.lock().unwrap().get(name).cloned()
             else {
                 return Ok(None);
@@ -179,6 +250,7 @@ mod services {
                     deployment_id: deployment(name),
                     url: Url::parse(&url).unwrap(),
                     secret: Some(Zeroizing::new(SECRET.into())),
+                    container: None,
                 }),
             }))
         }
@@ -205,7 +277,32 @@ mod services {
             self.health.lock().unwrap().push((deployment, healthy));
             Ok(())
         }
+        async fn container_targets(&self) -> anyhow::Result<Vec<chelabase_metadata::ContainerTarget>> {
+            Ok(match *self.container.lock().unwrap() {
+                Some((port, true, dep)) => vec![chelabase_metadata::ContainerTarget {
+                    branch_id: chelabase_types::BranchId(*BRANCH.get().unwrap()),
+                    function_id: deployment("box"),
+                    deployment_id: dep,
+                    spec: box_spec(port),
+                }],
+                _ => vec![],
+            })
+        }
+        async fn container_env(
+            &self,
+            branch: Uuid,
+            _: Uuid,
+        ) -> anyhow::Result<std::collections::BTreeMap<String, Zeroizing<String>>> {
+            Ok([("CHELABASE_BRANCH_ID".to_string(), Zeroizing::new(branch.to_string()))].into())
+        }
+        async fn deployment_spec(&self, function: Uuid, _: Uuid) -> anyhow::Result<Option<serde_json::Value>> {
+            let port = self.container.lock().unwrap().map(|c| c.0);
+            Ok(port.filter(|_| function == deployment("box")).map(box_spec))
+        }
     }
+
+    /// The harness's branch (the container targets name it).
+    static BRANCH: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
 
     struct H {
         public: String,
@@ -220,7 +317,13 @@ mod services {
         signer: InternalSigner,
         branch: Uuid,
         http: chelabase_http::Client,
+        /// m11: the container keeper, the runner fake, and the control listener.
+        keeper: Keeper,
+        runner: Arc<FakeRunner>,
+        control: String,
     }
+
+    const ORCHESTRATOR: &str = "orchestrator-bearer-0123456789abcdef0123";
 
     async fn harness() -> H {
         let inner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -269,8 +372,12 @@ mod services {
             .allow_hosts(["svc.test", "inside.test"])
             .deny_nets(["10.0.0.0/8".parse().unwrap()])
             .with_lookup(Arc::new(Dns));
-        let services = Services::new(&outbound).unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let services = Services::new(&outbound)
+            .unwrap()
+            .with_runner(runner.clone(), Arc::default());
         let handles = (services.client.clone(), services.health.clone());
+        let keeper = services.keeper(dir.clone());
         let (private, public) = chelabase_auth::internal::generate_keypair_pem();
         let resolver = Arc::new(Resolver::new(
             dir.clone(),
@@ -282,14 +389,20 @@ mod services {
             Arc::new(Workerd::new("http://127.0.0.1:9", Duration::from_millis(500)).unwrap()),
             InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             Bundles::new(Arc::new(MemoryStore::default())),
-            "orchestrator-bearer-0123456789abcdef0123".into(),
+            ORCHESTRATOR.into(),
             "worker-bearer-0123456789abcdef0123456789".into(),
         )
         .with_services(services);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let app = public_router(Arc::new(state));
+        let state = Arc::new(state);
+        let app = public_router(state.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control.local_addr().unwrap().to_string();
+        let app = control_router(state);
+        tokio::spawn(async move { axum::serve(control, app).await.unwrap() });
+        let branch = *BRANCH.get_or_init(Uuid::new_v4);
         H {
             public: format!("http://{addr}"),
             addr,
@@ -298,8 +411,11 @@ mod services {
             dir,
             services: handles,
             signer: InternalSigner::from_pem(private.as_bytes()).unwrap(),
-            branch: Uuid::new_v4(),
+            branch,
             http: chelabase_http::client_builder().build().unwrap(),
+            keeper,
+            runner,
+            control: format!("http://{control_addr}"),
         }
     }
 
@@ -761,5 +877,118 @@ mod services {
             );
         }
         assert_eq!(h.calls(), 0);
+    }
+
+    /// m11 AC 1: a container service answers 503 `service_starting` until the keeper has
+    /// ensured it (with its branch's env) and placed it at the runner-reported address; then
+    /// the call reaches it with the rest, signed; failing health checks make it 503.
+    #[tokio::test]
+    async fn a_container_service_is_reached_where_the_runner_put_it() {
+        let h = harness().await;
+        let dep = Uuid::new_v4();
+        *h.dir.container.lock().unwrap() = Some((h.up.port, true, dep));
+        let call = || async {
+            h.call(reqwest::Method::POST, "/services/v1/box/hi?x=1", Cred::User)
+                .body("ping")
+                .send()
+                .await
+                .unwrap()
+        };
+        let resp = call().await;
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["error"]["code"], "service_starting");
+        assert_eq!(h.calls(), 0);
+        h.keeper.round().await;
+        let ensured = h.runner.ensured.lock().unwrap().clone();
+        assert_eq!(ensured.len(), 1);
+        assert_eq!((ensured[0].0, ensured[0].1), (h.branch, dep));
+        assert_eq!(ensured[0].2["CHELABASE_BRANCH_ID"], h.branch.to_string());
+        let resp = call().await;
+        assert_eq!(resp.status(), 200);
+        let seen = h.last();
+        assert_eq!(seen.uri, "/hi?x=1");
+        assert_eq!(seen.body, "ping");
+        assert_eq!(seen.header("chelabase-branch"), Some(h.branch.to_string().as_str()));
+        assert_eq!(
+            Verifier::new(SECRET).verify("POST", &seen.uri, &seen.headers, &seen.body, now()),
+            Ok(())
+        );
+        assert!(h.dir.health.lock().unwrap().contains(&(dep, true)));
+        h.up.healthy.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            h.keeper.round().await;
+        }
+        let resp = call().await;
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["error"]["code"], "service_unhealthy");
+        // Disabled: 503 at once, whatever the container does.
+        h.up.healthy.store(true, Ordering::SeqCst);
+        h.keeper.round().await;
+        *h.dir.container.lock().unwrap() = Some((h.up.port, false, dep));
+        // (The resolution is cached for the TTL; a change event drops it in the service.)
+        assert!(h.keeper.containers.get(h.branch, deployment("box"), dep).is_some());
+    }
+
+    /// m11: the orchestrator's calls on the control side: its bearer only; image resolution and
+    /// a rollout through the runner (placed at once for the switch), logs of a placed container,
+    /// and `runner_unavailable` when the runner is down.
+    #[tokio::test]
+    async fn the_control_side_resolves_rolls_out_and_tails() {
+        let h = harness().await;
+        let dep = Uuid::new_v4();
+        *h.dir.container.lock().unwrap() = Some((h.up.port, true, dep));
+        let post = |path: &str, bearer: &str, body: serde_json::Value| {
+            h.http
+                .post(format!("{}{path}", h.control))
+                .bearer_auth(bearer)
+                .json(&body)
+                .send()
+        };
+        let image = json!({"image": "ghcr.io/acme/echo:1"});
+        let resp = post("/internal/services/images/resolve", "worker-bearer-0123456789abcdef0123456789", image.clone()).await.unwrap();
+        assert_eq!(resp.status(), 403);
+        let resp = post("/internal/services/images/resolve", "nope", image.clone()).await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = post("/internal/services/images/resolve", ORCHESTRATOR, image.clone()).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap()["image"],
+            format!("ghcr.io/acme/echo@sha256:{}", "b".repeat(64))
+        );
+        let next = Uuid::new_v4();
+        let rollout = json!({"branch_id": h.branch, "function_id": deployment("box"), "deployment_id": next});
+        let resp = post("/internal/services/rollout", ORCHESTRATOR, rollout.clone()).await.unwrap();
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+        let logs = h
+            .http
+            .get(format!("{}/internal/services/logs/{}/{}/{next}", h.control, h.branch, deployment("box")))
+            .bearer_auth(ORCHESTRATOR)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(logs.status(), 200);
+        assert_eq!(logs.text().await.unwrap(), format!("logs of ctr-{}", next.simple()));
+        let missing = h
+            .http
+            .get(format!("{}/internal/services/logs/{}/{}/{}", h.control, h.branch, deployment("box"), Uuid::new_v4()))
+            .bearer_auth(ORCHESTRATOR)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+        let resp = post(
+            "/internal/services/rollout",
+            ORCHESTRATOR,
+            json!({"branch_id": h.branch, "function_id": Uuid::new_v4(), "deployment_id": next}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        h.runner.down.store(true, Ordering::SeqCst);
+        for (path, body) in [("/internal/services/images/resolve", image), ("/internal/services/rollout", rollout)] {
+            let resp = post(path, ORCHESTRATOR, body).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["error"]["code"], "runner_unavailable");
+        }
     }
 }

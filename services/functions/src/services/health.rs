@@ -71,7 +71,7 @@ impl Health {
     }
 
     /// Forgets every deployment not in `keep`.
-    fn retain(&self, keep: &HashSet<Uuid>) {
+    pub fn retain(&self, keep: &HashSet<Uuid>) {
         self.entries
             .lock()
             .expect("not poisoned")

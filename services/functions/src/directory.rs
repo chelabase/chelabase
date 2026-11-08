@@ -8,7 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chelabase_http::outbound::Url;
 use chelabase_metadata::{
-    FunctionAuth, FunctionKind, MetadataClient, MetadataError, ResolvedFunction, ServiceTarget,
+    ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind, MetadataClient, MetadataError,
+    ResolvedFunction, ServiceTarget,
 };
 use chelabase_types::{BranchId, DatabaseId};
 use uuid::Uuid;
@@ -34,24 +35,38 @@ pub struct Resolution {
 
 /// m9: where an external service is (`spec = {backend: "external", url, health_path}`) and its
 /// signing secret (wiped on drop; `None` when it has none, and every call answers 503).
+///
+/// m11: a container service (`spec = {backend: "container", image, port, …}`) has `container`
+/// set to its port, and `url` is a placeholder never dialled: its address is the one the
+/// service runner reports ([`crate::services::container`]).
 pub struct External {
     pub deployment_id: Uuid,
     pub url: Url,
     pub secret: Option<Zeroizing<String>>,
+    pub container: Option<u16>,
 }
 
 impl External {
-    /// The external target a resolved service's deployment names, when it is one.
+    /// The target a resolved service's deployment names: an external URL or a container.
     pub fn from_spec(deployment_id: Uuid, spec: &serde_json::Value) -> Option<Self> {
-        if spec.get("backend")?.as_str()? != "external" {
-            return None;
+        match spec.get("backend")?.as_str()? {
+            "external" => Some(External {
+                deployment_id,
+                url: Url::parse(spec.get("url")?.as_str()?).ok()?,
+                secret: None,
+                container: None,
+            }),
+            "container" => {
+                let port = u16::try_from(spec.get("port")?.as_u64()?).ok()?;
+                Some(External {
+                    deployment_id,
+                    url: Url::parse("http://container.invalid/").expect("a valid URL"),
+                    secret: None,
+                    container: Some(port),
+                })
+            }
+            _ => None,
         }
-        let url = Url::parse(spec.get("url")?.as_str()?).ok()?;
-        Some(External {
-            deployment_id,
-            url,
-            secret: None,
-        })
     }
 }
 
@@ -126,6 +141,27 @@ pub trait Directory: Send + Sync + 'static {
     async fn record_health(&self, _deployment: Uuid, _healthy: bool) -> anyhow::Result<()> {
         Ok(())
     }
+    /// m11: the container services enabled on live branches, to ensure and health-check.
+    async fn container_targets(&self) -> anyhow::Result<Vec<ContainerTarget>> {
+        Ok(Vec::new())
+    }
+    /// m11: a container service's env on `branch`: its secrets, then [`ENV_URL`] and
+    /// [`ENV_BRANCH_ID`] (decrypted, wiped on drop).
+    async fn container_env(
+        &self,
+        _branch: Uuid,
+        _function: Uuid,
+    ) -> anyhow::Result<BTreeMap<String, Zeroizing<String>>> {
+        Ok(BTreeMap::new())
+    }
+    /// m11: a deployment's spec, when it is the function's.
+    async fn deployment_spec(
+        &self,
+        _function: Uuid,
+        _deployment: Uuid,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
 }
 
 /// What [`Metadata`] needs from the metadata database: [`MetadataClient`]'s calls, behind a
@@ -166,6 +202,12 @@ pub trait MetadataPort: Send + Sync + 'static {
     }
     async fn set_service_health(&self, _deployment: Uuid, _healthy: bool) -> Result<(), MetadataError> {
         Ok(())
+    }
+    async fn list_container_targets(&self) -> Result<Vec<ContainerTarget>, MetadataError> {
+        Ok(Vec::new())
+    }
+    async fn list_deployments(&self, _function: Uuid) -> Result<Vec<DeploymentRecord>, MetadataError> {
+        Ok(Vec::new())
     }
 }
 
@@ -215,12 +257,20 @@ impl MetadataPort for MetadataClient {
     async fn set_service_health(&self, deployment: Uuid, healthy: bool) -> Result<(), MetadataError> {
         MetadataClient::set_service_health(self, deployment, healthy).await
     }
+    async fn list_container_targets(&self) -> Result<Vec<ContainerTarget>, MetadataError> {
+        MetadataClient::list_container_targets(self).await
+    }
+    async fn list_deployments(&self, function: Uuid) -> Result<Vec<DeploymentRecord>, MetadataError> {
+        MetadataClient::list_deployments(self, function).await
+    }
 }
 
 /// The metadata database. Its client carries the secrets key (`with_secrets_key`): function
 /// secrets and the managed run-as key open with it.
 pub struct Metadata<P = MetadataClient> {
     pub client: P,
+    /// m11: a container service's `CHELABASE_URL`.
+    pub public_url: String,
 }
 
 #[async_trait::async_trait]
@@ -304,6 +354,41 @@ impl<P: MetadataPort> Directory for Metadata<P> {
 
     async fn record_health(&self, deployment: Uuid, healthy: bool) -> anyhow::Result<()> {
         Ok(self.client.set_service_health(deployment, healthy).await?)
+    }
+
+    async fn container_targets(&self) -> anyhow::Result<Vec<ContainerTarget>> {
+        Ok(self.client.list_container_targets().await?)
+    }
+
+    async fn container_env(
+        &self,
+        branch: Uuid,
+        function: Uuid,
+    ) -> anyhow::Result<BTreeMap<String, Zeroizing<String>>> {
+        let mut env: BTreeMap<String, Zeroizing<String>> = self
+            .client
+            .decrypt_secrets(BranchId(branch), function)
+            .await?
+            .into_iter()
+            .map(|(name, value)| (name, Zeroizing::new(value)))
+            .collect();
+        env.insert(ENV_URL.into(), Zeroizing::new(self.public_url.clone()));
+        env.insert(ENV_BRANCH_ID.into(), Zeroizing::new(branch.to_string()));
+        Ok(env)
+    }
+
+    async fn deployment_spec(
+        &self,
+        function: Uuid,
+        deployment: Uuid,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(self
+            .client
+            .list_deployments(function)
+            .await?
+            .into_iter()
+            .find(|d| d.id == deployment && d.function_id == function)
+            .map(|d| d.spec))
     }
 }
 
@@ -427,7 +512,7 @@ mod tests {
     }
 
     async fn service_key_of(port: FakePort) -> Option<String> {
-        let dir = Metadata { client: port };
+        let dir = Metadata { client: port, public_url: "u".into() };
         let parts = dir.resolve(Uuid::new_v4(), "hello").await.unwrap().unwrap();
         parts.service_key.map(|k| k.to_string())
     }
@@ -436,7 +521,7 @@ mod tests {
     async fn a_live_managed_key_becomes_the_service_key() {
         let key = Uuid::new_v4();
         let port = FakePort::new(Some(key), Some((key, "chk_sec_reporter".into())));
-        let dir = Metadata { client: port };
+        let dir = Metadata { client: port, public_url: "u".into() };
         let branch = Uuid::new_v4();
         let parts = dir.resolve(branch, "hello").await.unwrap().unwrap();
         assert_eq!(
@@ -465,6 +550,7 @@ mod tests {
     async fn last_error_goes_through_the_metadata_call() {
         let dir = Metadata {
             client: FakePort::new(None, None),
+            public_url: "u".into(),
         };
         let (branch, function) = (Uuid::new_v4(), Uuid::new_v4());
         dir.record_error(branch, function, "timed out")
