@@ -10,6 +10,7 @@ use crate::registry::Site;
 use crate::upstreams::Upstreams;
 use async_trait::async_trait;
 use bytes::Bytes;
+use chelabase_routes::Service;
 use chelabase_types::entry::Scheme;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
@@ -285,13 +286,7 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         response.insert_header(REQUEST_ID_HEADER, ctx.request_id.as_str())?;
         if let Some(plan) = &ctx.plan {
-            for (name, value) in &plan.response_headers {
-                if name.eq_ignore_ascii_case("vary") {
-                    merge_vary(response, value)?;
-                } else {
-                    response.insert_header(*name, value.as_str())?;
-                }
-            }
+            apply_response_headers(response, plan)?;
         }
         Ok(())
     }
@@ -386,6 +381,23 @@ fn is_websocket_upgrade(headers: &http::HeaderMap) -> bool {
 }
 
 /// Add `value` to the response's `Vary` unless an existing entry already covers it.
+/// The plan's response headers (CORS) onto the upstream's response. A function or service owns
+/// its CORS answer: the gateway only fills the CORS headers it left out.
+fn apply_response_headers(response: &mut ResponseHeader, plan: &ProxyPlan) -> Result<()> {
+    let upstream_owns_cors = plan.endpoint.service == Service::Functions;
+    for (name, value) in &plan.response_headers {
+        if upstream_owns_cors && name.starts_with("access-control-") && response.headers.contains_key(*name) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("vary") {
+            merge_vary(response, value)?;
+        } else {
+            response.insert_header(*name, value.as_str())?;
+        }
+    }
+    Ok(())
+}
+
 fn merge_vary(response: &mut ResponseHeader, value: &str) -> Result<()> {
     let already = response.headers.get_all("vary").iter().any(|v| {
         v.to_str().is_ok_and(|list| {
@@ -543,6 +555,39 @@ mod tests {
             h.append(http::header::UPGRADE, http::HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    fn plan(endpoint: &'static chelabase_routes::Endpoint) -> ProxyPlan {
+        ProxyPlan {
+            endpoint,
+            identity: None,
+            response_headers: vec![
+                ("access-control-allow-origin", "*".to_string()),
+                ("access-control-expose-headers", "etag, content-range".to_string()),
+            ],
+            client_ip: None,
+            forwarded: Vec::new(),
+        }
+    }
+
+    /// Review: a function or a service sets its own CORS headers (say an
+    /// `access-control-expose-headers` naming its own header), and the gateway only fills the
+    /// ones it left out. Any other any-origin route still gets exactly the gateway's.
+    #[test]
+    fn a_functions_own_cors_headers_survive() {
+        use chelabase_routes::{functions, rest};
+        for endpoint in [&functions::INVOKE, &functions::INVOKE_PUBLIC_PATH, &functions::CALL_SERVICE_PATH] {
+            let mut response = ResponseHeader::build(200, None).unwrap();
+            response.insert_header("access-control-expose-headers", "x-trace").unwrap();
+            apply_response_headers(&mut response, &plan(endpoint)).unwrap();
+            let get = |n: &str| response.headers.get(n).map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(get("access-control-expose-headers").as_deref(), Some("x-trace"), "{}", endpoint.name);
+            assert_eq!(get("access-control-allow-origin").as_deref(), Some("*"), "{}", endpoint.name);
+        }
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("access-control-expose-headers", "x-trace").unwrap();
+        apply_response_headers(&mut response, &plan(&rest::QUERY)).unwrap();
+        assert_eq!(response.headers.get("access-control-expose-headers").unwrap(), "etag, content-range");
     }
 
     #[test]
