@@ -10,13 +10,18 @@ use async_trait::async_trait;
 use crate::spec::{ImageRef, Limits};
 
 /// A container as the runner sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Container {
     /// The engine's full id (never the name a caller gave).
     pub id: String,
     pub labels: HashMap<String, String>,
     /// The engine's state word (`running`, `exited`, `created`, …).
     pub state: String,
+    /// When it was created (Unix seconds; 0 when unknown).
+    pub created: i64,
+    /// Its address on each network it's attached to, by network name (m11: the functions
+    /// service dials a service's container at its address on the service's network).
+    pub addresses: HashMap<String, String>,
 }
 
 impl Container {
@@ -79,6 +84,9 @@ pub trait ContainerBackend: Send + Sync + 'static {
     async fn list(&self, stack: &str) -> anyhow::Result<Vec<Container>>;
     /// The image's facts, pulling it first (with the engine's credentials) when it's missing.
     async fn image(&self, image: &ImageRef) -> anyhow::Result<ImageFacts>;
+    /// m11: pulls the image (always, so a moved tag is seen) and returns its registry digests
+    /// (`name@sha256:…`, the engine's `RepoDigests`); empty for an image no registry knows.
+    async fn repo_digests(&self, image: &ImageRef) -> anyhow::Result<Vec<String>>;
     /// Creates the container on `network` and returns its id; it isn't started.
     async fn create(&self, plan: &ContainerPlan, network: &str) -> anyhow::Result<String>;
     /// Every network labelled with `stack` and with a service label (labels checked again by
