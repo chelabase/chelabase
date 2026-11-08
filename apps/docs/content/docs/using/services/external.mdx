@@ -47,18 +47,11 @@ A self-hosted install usually wants services on its own network. The operator se
 | `CHELABASE_SERVICES_ALLOW_HOSTS` | Comma-separated host names or IP literals, **without a port**, that may resolve to non-public addresses. An entry with a port never matches (the functions service logs a warning). |
 | `CHELABASE_SERVICES_ALLOW_HTTP` | `true` also accepts `http` URLs. |
 
-These are separate from the webhooks' `CHELABASE_WEBHOOKS_ALLOW_*`; the one has no effect on the other. A compose override does it:
+These are separate from the webhooks' `CHELABASE_WEBHOOKS_ALLOW_*`; the one has no effect on the other. The compose files pass both through to the orchestrator and the functions service, so with Compose set them once in `.env`:
 
-```yaml
-services:
-  orchestrator:
-    environment:
-      CHELABASE_SERVICES_ALLOW_HOSTS: billing.internal
-      CHELABASE_SERVICES_ALLOW_HTTP: "true"
-  functions:
-    environment:
-      CHELABASE_SERVICES_ALLOW_HOSTS: billing.internal
-      CHELABASE_SERVICES_ALLOW_HTTP: "true"
+```bash
+CHELABASE_SERVICES_ALLOW_HOSTS=billing.internal
+CHELABASE_SERVICES_ALLOW_HTTP=true
 ```
 
 ### What is always denied

@@ -18,12 +18,12 @@ The signed string is these lines joined by a line feed (`\n`), with no trailing 
 <METHOD> <request-target>
 <chelabase-branch>
 <chelabase-role>
-<chelabase-user>
+<chelabase-user-id>
 <Content-Digest>          (only when the body is signed)
 ```
 
 - `request-target` is the exact path and query the service **receives**, the base URL's path prefix included (`/api/a/b?x=1`, not `/services/v1/echo/a/b?x=1`). Take it from the request line, not from a re-serialised URL.
-- `chelabase-user` is empty for a caller that is not an app user (the line is still there, empty).
+- `chelabase-user-id` is empty for a caller that is not an app user (the line is still there, empty).
 - A body of **up to 1 MiB** (an empty body included) is buffered and signed: the request carries `Content-Digest: sha-256=:<base64 of the SHA-256 of the body>:` (RFC 9530), and the digest is the last line. A larger body streams through; the request says `chelabase-body: unsigned` and the signed string has **no** digest line, so the body is not covered. Chelabase sets the marker only above 1 MiB, so a route that never takes large bodies can refuse any request marked `unsigned`.
 - No part may hold CR or LF; Chelabase refuses to sign such a request.
 
@@ -96,7 +96,7 @@ export function createVerifier(secret: string) {
       `${method} ${target}`,
       need("chelabase-branch"),
       need("chelabase-role"),
-      need("chelabase-user"), // empty unless the caller is an app user
+      need("chelabase-user-id"), // empty unless the caller is an app user
       ...(digest === undefined ? [] : [digest]),
     ];
     const mac = createHmac("sha256", secret).update(`${signedAt}.${lines.join("\n")}`).digest();
@@ -205,7 +205,7 @@ impl Verifier {
             format!("{method} {target}"),
             need("chelabase-branch")?.to_owned(),
             need("chelabase-role")?.to_owned(),
-            need("chelabase-user")?.to_owned(), // empty unless the caller is an app user
+            need("chelabase-user-id")?.to_owned(), // empty unless the caller is an app user
         ];
         lines.extend(digest.map(str::to_owned));
         let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes()).expect("any key size");

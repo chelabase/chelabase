@@ -7,9 +7,19 @@ A **trigger** delivers events to a function's `fetch` handler. There are two sou
 
 Triggers are per branch and managed with the [Management API](/reference/management/functions/createFunctionTrigger) (Developer on an unprotected branch, Admin on a protected one; Viewer may list). A new branch copies its parent's triggers.
 
-{/* TODO(#173): confirm against landed code: `chelabase functions trigger add|rm|list` (`--table` or `--storage --bucket --prefix`), and the Triggers section of Studio's function drawer. */}
+## From the CLI and Studio
 
-The CLI commands `chelabase functions trigger add|rm|list` and the **Triggers** section of Studio's function drawer manage the same triggers.
+```bash
+chelabase functions trigger add NAME (--table SCHEMA.TABLE | --storage [--bucket B] [--prefix P]) --pg-database DB --events e1,e2
+chelabase functions trigger rm NAME ID
+chelabase functions trigger list NAME
+```
+
+- `add` needs `--pg-database` and `--events` (comma-separated, from the lists below), and exactly one of `--table` and `--storage`. It prints the trigger's id.
+- `--table` takes `schema.table` as plain text, unquoted (no `"…"` quoting); a bare name means `public`. `--bucket` and `--prefix` go with `--storage` only.
+- `list` prints one line per trigger: its id, source and target, events, state, enabled or disabled, `dead=`, `dropped=`, `delivered=` (the last delivery time) and the install error (`last_error`).
+
+The CLI can't turn a trigger on or off. The **Triggers** section of Studio's function drawer can: it lists the triggers with their state and counts, adds a table or storage trigger, turns each on or off with a switch and deletes it. It refreshes while a trigger is `pending_install`.
 
 ## Table triggers
 
@@ -49,6 +59,10 @@ curl -X POST "$BASE" -H "Authorization: Bearer $MEMBER_TOKEN" -H 'content-type: 
 - **At most 100,000 events per Chelabase database**, across all its branches, are held. When a database passes the cap its oldest events are evicted, delivered or not. A storage trigger counts the events evicted before it settled them in `dropped_count`. (Events evicted while no worker was running the trigger can't be counted.)
 - A disabled trigger isn't delivered, and re-enabling it doesn't replay the time it was off. A disabled *function* keeps its trigger, and its events wait (up to the 24 hours).
 - Up to four deliveries per trigger run at once.
+
+<Callout type="warn">
+A storage event says which object changed, not what is in it. A function that reads the object with its [run-as key](/using/functions/environment#acting-as-the-function) gets 403 from the storage API when the run-as role is a custom one: today the storage tables are granted only to `anon` and `authenticated`, whatever storage policies you write for another role. Letting custom roles use storage under RLS is tracked in [#187](https://github.com/chelabase/chelabase/issues/187).
+</Callout>
 
 ## Limits and counters
 

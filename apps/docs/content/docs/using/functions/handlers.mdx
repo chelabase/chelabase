@@ -38,6 +38,12 @@ A request body is at most 6 MiB (413 `payload_too_large` above it).
 
 Two more headers let a function call the data API **as the caller**: `chelabase-caller-key` (the caller's public key, sent only for a public key or an app user, never a secret key) and `chelabase-caller-token` (the app user's token, only for an app user). See [acting as the caller](/using/functions/environment#acting-as-the-caller).
 
+### CORS
+
+Functions (and [services](/using/services)) are callable from any origin. The gateway answers a browser's preflight (`OPTIONS` with `Access-Control-Request-Method`) itself, without calling the function: `Access-Control-Allow-Origin: *`, the route's method, `Access-Control-Allow-Headers` echoing the headers the browser asked for, and `Access-Control-Max-Age: 600`.
+
+On the actual response, CORS headers the function sets itself (`Access-Control-Allow-Origin`, `Access-Control-Expose-Headers`, …) are kept as they are; the gateway only adds the ones the function left out (`Access-Control-Allow-Origin: *` and its default exposed headers).
+
 ## scheduled: cron
 
 ```ts

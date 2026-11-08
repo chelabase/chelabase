@@ -128,6 +128,9 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
 | `CHELABASE_SMTP_*` | unset | The identity service's email (below) |
 | `CHELABASE_WEBHOOKS_ALLOW_HOSTS`, `CHELABASE_WEBHOOKS_ALLOW_HTTP` | empty, `false` | Where storage webhooks may be delivered. By default only `https` URLs whose host resolves to public addresses. List host names (no port) that may resolve to private addresses, such as a receiver on your own network, and set `true` to also accept `http` URLs |
+| `CHELABASE_SERVICES_ALLOW_HOSTS`, `CHELABASE_SERVICES_ALLOW_HTTP` | empty, `false` | Where [external services](/using/services/external#the-allow-list) may point: the same rules as the webhooks' pair, checked separately |
+| `CHELABASE_FUNCTIONS_RUNTIME_MEMORY` | `1g` | The functions runtime container's memory limit, shared by every function ([Functions](/self-hosting/functions#settings)) |
+| `CHELABASE_SERVICE_RUNNER_RECONCILE_SECS` | `30` | How often the service runner reconciles [container services](/using/services/containers) with their desired state, in seconds (`services` profile only) |
 | `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | How long a member access token lives, 60 to 900 seconds |
 | `CHELABASE_MEMBER_SESSION_CHECK_SECS` | `15` | How long the orchestrator reuses the identity service's answer that a member token's session is live, 0 to 30 seconds (0 asks every time). A token stops working at most this long after logout or a password reset |
 
