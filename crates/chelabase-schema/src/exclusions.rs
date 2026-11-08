@@ -22,6 +22,24 @@ pub const EXCLUDED_SCHEMAS: [&str; 8] = [
 /// (`services/worker/src/fn_triggers.rs`), owned by the NOLOGIN `chelabase_functions_owner`.
 pub const FUNCTIONS_SCHEMA: &str = "chelabase_functions";
 
+/// Edge functions m13b: the functions service's database-event dispatcher login, made and
+/// granted by the worker's install (`services/worker/src/fn_triggers.rs`), with which the
+/// functions service connects (`services/functions/src/events/dispatch.rs`).
+pub const FUNCTIONS_DISPATCH_ROLE: &str = "chelabase_functions_dispatch";
+
+/// Edge functions m13: the channel `chelabase_functions.enqueue()` notifies after each insert,
+/// on which the dispatcher listens.
+pub const FUNCTIONS_NOTIFY_CHANNEL: &str = "chelabase_functions";
+
+/// Edge functions m13b: every privilege [`FUNCTIONS_DISPATCH_ROLE`] holds on [`FUNCTIONS_SCHEMA`]
+/// (sorted), granted by the schema's owner without grant option.
+pub const FUNCTIONS_DISPATCH_SCHEMA_GRANTS: &[&str] = &["USAGE"];
+
+/// Edge functions m13b: every privilege [`FUNCTIONS_DISPATCH_ROLE`] holds on the outbox,
+/// `chelabase_functions.outbox` (sorted), granted by its owner without grant option: it claims,
+/// leases and deletes rows, never inserts (not the sequence, not `enqueue()`).
+pub const FUNCTIONS_DISPATCH_OUTBOX_GRANTS: &[&str] = &["DELETE", "SELECT", "UPDATE"];
+
 /// Edge functions m8: the triggers the worker installs on user tables,
 /// `chelabase_fn_<trigger id as 32 hex>`, each running `chelabase_functions.enqueue()`. The
 /// catalog and the protection review leave out a trigger with this prefix only when it runs a
@@ -138,6 +156,15 @@ mod tests {
         assert!(EXCLUDED_SCHEMAS.contains(&"storage"));
         assert!(crate::ddl::hidden_schema("storage"));
         assert!(!crate::ddl::hidden_schema("storage2") && !crate::ddl::hidden_schema("public"));
+    }
+
+    /// Edge functions m13b: the dispatch grants are sorted, as the worker's exact check
+    /// compares them with `aclexplode`'s entries ordered by privilege.
+    #[test]
+    fn functions_dispatch_grants_are_sorted() {
+        for grants in [FUNCTIONS_DISPATCH_SCHEMA_GRANTS, FUNCTIONS_DISPATCH_OUTBOX_GRANTS] {
+            assert!(grants.is_sorted(), "{grants:?}");
+        }
     }
 
     /// Edge functions m8: the `chelabase_functions` schema (outbox, trigger function) is read

@@ -36,7 +36,8 @@
 //! **Invariant (dispatch, m13b).** The dispatch login [`DISPATCH`] holds exactly its
 //! allowlist and nothing that could reach member data or another role: LOGIN NOINHERIT with
 //! [`DISPATCH_CONNECTION_LIMIT`], no other attribute, no member or membership, nothing owned,
-//! exactly [`DISPATCH_SETTINGS`], and exactly the grants [`DISPATCH_GRANTS`] (from the owner,
+//! exactly [`DISPATCH_SETTINGS`], and exactly the grants [`FUNCTIONS_DISPATCH_SCHEMA_GRANTS`]
+//! and [`FUNCTIONS_DISPATCH_OUTBOX_GRANTS`] (from the owner,
 //! without grant option). Any attribute, membership, setting or ownership beyond that refuses
 //! the install (the foreign check, as for [`OWNER`]); any grant beyond it is revoked on every
 //! pass ([`revoke_sql`]), and a missing one is put back. Its password is the branch's own
@@ -135,7 +136,10 @@ use chelabase_metadata::{
 };
 use chelabase_nats::{AllRowsCheckReply, AllRowsCheckRequest};
 use chelabase_neon::ComputeBackend;
-use chelabase_schema::exclusions::{FUNCTION_TRIGGER_PREFIX, FUNCTIONS_SCHEMA};
+use chelabase_schema::exclusions::{
+    FUNCTION_TRIGGER_PREFIX, FUNCTIONS_DISPATCH_OUTBOX_GRANTS, FUNCTIONS_DISPATCH_ROLE,
+    FUNCTIONS_DISPATCH_SCHEMA_GRANTS, FUNCTIONS_NOTIFY_CHANNEL, FUNCTIONS_SCHEMA,
+};
 use chelabase_schema::sql::literal;
 use chelabase_types::BranchId;
 use chelabase_types::data_key::{self, DataKeyKind};
@@ -152,17 +156,13 @@ use crate::review::review_databases_sql;
 pub const OWNER: &str = "chelabase_functions_owner";
 
 /// m13b: the functions service's dispatcher login (LOGIN NOINHERIT, no other attribute or
-/// membership), granted exactly [`DISPATCH_GRANTS`].
-pub const DISPATCH: &str = "chelabase_functions_dispatch";
+/// membership), granted exactly [`FUNCTIONS_DISPATCH_SCHEMA_GRANTS`] and
+/// [`FUNCTIONS_DISPATCH_OUTBOX_GRANTS`] (the shared names, `chelabase_schema::exclusions`).
+pub const DISPATCH: &str = FUNCTIONS_DISPATCH_ROLE;
 
 /// m13b: the dispatch login's connection limit. The dispatcher holds one connection per
 /// branch database with an installed trigger; during a rolling deploy two replicas may each.
 pub const DISPATCH_CONNECTION_LIMIT: u32 = 40;
-
-/// m13b: everything the dispatch login holds, as the foreign check and the revoke read it:
-/// `USAGE` on the schema and `SELECT, UPDATE, DELETE` on the outbox, granted by the owner
-/// without grant option. Not the sequence (it inserts nothing), not `enqueue()`.
-pub const DISPATCH_GRANTS: &str = "USAGE on chelabase_functions; SELECT, UPDATE, DELETE on chelabase_functions.outbox";
 
 /// m13b: the dispatch login's settings, sorted as the foreign check compares them: no event
 /// trigger (a login one included) fires for its sessions, and names resolve in `pg_catalog`.
@@ -173,7 +173,7 @@ const DISPATCH_SETTINGS: [&str; 2] = ["event_triggers=off", "search_path=pg_cata
 pub const RESERVED_SCHEMA: &str = "function triggers can't go on a reserved schema";
 
 /// The channel `enqueue()` notifies after each insert (the dispatcher listens, m13).
-pub const NOTIFY_CHANNEL: &str = "chelabase_functions";
+pub const NOTIFY_CHANNEL: &str = FUNCTIONS_NOTIFY_CHANNEL;
 
 /// The script's first line (the fakes' needle).
 pub const SYNC_MARK: &str = "-- chelabase: function triggers";
@@ -227,9 +227,11 @@ pub fn install_error(answer: &str) -> String {
     }
 }
 
-/// The settings every script starts with: the search path, event triggers off, and the
-/// short lock wait ([`SWEEP_LOCK_TIMEOUT`]).
-const PRELUDE: &str = "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\nSET LOCAL lock_timeout = '2s';\n";
+/// The settings every script starts with: the search path, event triggers off, the short lock
+/// wait ([`SWEEP_LOCK_TIMEOUT`]), and a statement timeout of its own: a database's or role's
+/// shorter `statement_timeout` (a tenant's `ALTER DATABASE … SET`) would otherwise fail every
+/// pass, and none of a sync's statements waits on more than a lock.
+const PRELUDE: &str = "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\nSET LOCAL lock_timeout = '2s';\nSET LOCAL statement_timeout = '2min';\n";
 
 /// Run once per sync in the compute's system database, before any check: makes [`OWNER`]
 /// when `create` and it's missing (`NOLOGIN NOINHERIT CONNECTION LIMIT 0`, by the superuser,
@@ -703,7 +705,8 @@ END $chelabase_fn$;
 /// is (taking the role out of it would change the table owner's row security), as is any
 /// other entry this doesn't know.
 ///
-/// m13b: [`DISPATCH`]'s grants are an exact allowlist ([`DISPATCH_GRANTS`]). Its entries on
+/// m13b: [`DISPATCH`]'s grants are an exact allowlist ([`FUNCTIONS_DISPATCH_SCHEMA_GRANTS`],
+/// [`FUNCTIONS_DISPATCH_OUTBOX_GRANTS`]). Its entries on
 /// the schema and the outbox are left to the exact step: when they aren't exactly those
 /// privileges, granted by the owner without grant option, every privilege it holds there is
 /// revoked and exactly those are granted (DDL only when the catalog differs, as the install).
@@ -712,6 +715,8 @@ END $chelabase_fn$;
 fn revoke_sql() -> String {
     let ours = ours_sql();
     let owner_grants = grants_to_sql(OWNER, "");
+    let (schema_want, schema_grant) = exact_grants(FUNCTIONS_DISPATCH_SCHEMA_GRANTS);
+    let (box_want, box_grant) = exact_grants(FUNCTIONS_DISPATCH_OUTBOX_GRANTS);
     let dispatch_grants = grants_to_sql(
         DISPATCH,
         "\n      AND NOT ((d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = ours)\n        OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objsubid = 0 AND d.objid = box))",
@@ -750,22 +755,29 @@ BEGIN
     IF (SELECT pg_catalog.array_agg(a.privilege_type || ':' || a.is_grantable || ':' || (a.grantor = n.nspowner)
           ORDER BY a.privilege_type)
         FROM pg_catalog.pg_namespace n CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a
-        WHERE n.oid = ours AND a.grantee = drole) IS DISTINCT FROM ARRAY['USAGE:false:true']::pg_catalog.text[] THEN
+        WHERE n.oid = ours AND a.grantee = drole) IS DISTINCT FROM {schema_want} THEN
       REVOKE ALL ON SCHEMA {FUNCTIONS_SCHEMA} FROM {DISPATCH} CASCADE;
-      GRANT USAGE ON SCHEMA {FUNCTIONS_SCHEMA} TO {DISPATCH};
+      GRANT {schema_grant} ON SCHEMA {FUNCTIONS_SCHEMA} TO {DISPATCH};
     END IF;
     IF box IS NOT NULL AND (SELECT pg_catalog.array_agg(a.privilege_type || ':' || a.is_grantable || ':' || (a.grantor = c.relowner)
           ORDER BY a.privilege_type)
         FROM pg_catalog.pg_class c CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
         WHERE c.oid = box AND a.grantee = drole)
-        IS DISTINCT FROM ARRAY['DELETE:false:true', 'SELECT:false:true', 'UPDATE:false:true']::pg_catalog.text[] THEN
+        IS DISTINCT FROM {box_want} THEN
       REVOKE ALL ON TABLE {FUNCTIONS_SCHEMA}.outbox FROM {DISPATCH} CASCADE;
-      GRANT SELECT, UPDATE, DELETE ON TABLE {FUNCTIONS_SCHEMA}.outbox TO {DISPATCH};
+      GRANT {box_grant} ON TABLE {FUNCTIONS_SCHEMA}.outbox TO {DISPATCH};
     END IF;
   END IF;
 {owner_grants}{dispatch_grants}END $chelabase_fn$;
 "#
     )
+}
+
+/// For an exact grant of `privileges` (sorted, as `aclexplode` entries ordered by privilege
+/// sort): the `privilege:grantable:by owner` array the catalog must hold, and the `GRANT` list.
+fn exact_grants(privileges: &[&str]) -> (String, String) {
+    let want: Vec<String> = privileges.iter().map(|p| format!("'{p}:false:true'")).collect();
+    (format!("ARRAY[{}]::pg_catalog.text[]", want.join(", ")), privileges.join(", "))
 }
 
 /// The loop that revokes every grant *to* `role` outside the schema (see [`revoke_sql`]):
@@ -890,8 +902,12 @@ DO $chelabase_fn$ BEGIN
   END IF;
 END $chelabase_fn$;
 CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2) ON COMMIT DROP;
-{insert}-- After the lock: a database where a wanted trigger is already exactly in place was synced on
--- this timeline (a sweep got there first), so the truncate is skipped.
+{insert}-- After the lock. `fresh`: none of this branch's wanted triggers (its own trigger ids) is
+-- exactly in place, so the database holds only what it came with (the source's triggers, under
+-- the source's ids) and its outbox only the source's rows: a create, reset or restore truncates
+-- it. Once one is in place, a sync of this branch already ran here and its triggers may have
+-- queued this branch's own events since, so nothing is truncated. Either way the cleanup below
+-- deletes every row of another timeline or of an unwanted trigger.
 SELECT pg_catalog.set_config('chelabase_fn.fresh', (NOT EXISTS (SELECT FROM pg_temp.chelabase_fn_wanted w
   JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name
   JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
@@ -1787,6 +1803,30 @@ mod tests {
         }
     }
 
+    /// The functions service's dispatcher keeps its own copies of the login and channel names
+    /// (`functions::events::dispatch`); until it uses the shared ones they must be equal.
+    #[test]
+    fn fn_triggers_dispatch_names_match_the_functions_service() {
+        assert_eq!(functions::events::dispatch::LOGIN, DISPATCH);
+        assert_eq!(functions::events::dispatch::CHANNEL, NOTIFY_CHANNEL);
+        // The exact grants the install makes and checks are the shared lists.
+        let sql = revoke_sql();
+        assert!(sql.contains("GRANT USAGE ON SCHEMA chelabase_functions TO chelabase_functions_dispatch;"), "{sql}");
+        assert!(sql.contains("IS DISTINCT FROM ARRAY['USAGE:false:true']::pg_catalog.text[]"), "{sql}");
+    }
+
+    /// A database-level (or role-level) `statement_timeout` shorter than a sync's statements
+    /// never fails every pass: each script sets its own, bounded, before anything else runs.
+    #[test]
+    fn fn_triggers_scripts_set_their_own_statement_timeout() {
+        let set = "SET LOCAL statement_timeout = '2min';";
+        let sync = sync_sql(&[wanted("orders", &["insert"])], false, ROLES);
+        for script in [role_sql(true, Some(VERIFIER)), check_sql(ROLES), drop_triggers_sql(), sync] {
+            let at = script.find(set).unwrap_or_else(|| panic!("no {set} in {script}"));
+            assert!(at < script.find("DO $chelabase_fn$").unwrap_or(usize::MAX), "{script}");
+        }
+    }
+
     fn record(enabled: bool, state: TriggerState) -> TriggerRecord {
         TriggerRecord {
             id: Uuid::new_v4(),
@@ -1900,7 +1940,7 @@ mod tests {
             "ARRAY['event_triggers=off', 'search_path=pg_catalog, pg_temp']::pg_catalog.text[]",
             "the role chelabase_functions_dispatch owns objects",
             "GRANT USAGE ON SCHEMA chelabase_functions TO chelabase_functions_dispatch;",
-            "GRANT SELECT, UPDATE, DELETE ON TABLE chelabase_functions.outbox TO chelabase_functions_dispatch;",
+            "GRANT DELETE, SELECT, UPDATE ON TABLE chelabase_functions.outbox TO chelabase_functions_dispatch;",
             "IS DISTINCT FROM ARRAY['USAGE:false:true']::pg_catalog.text[]",
             "IS DISTINCT FROM ARRAY['DELETE:false:true', 'SELECT:false:true', 'UPDATE:false:true']::pg_catalog.text[]",
             "REVOKE ALL ON SCHEMA chelabase_functions FROM chelabase_functions_dispatch CASCADE;",
