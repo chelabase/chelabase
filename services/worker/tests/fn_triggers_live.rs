@@ -549,4 +549,192 @@ mod fn_triggers {
         })
         .await;
     }
+    /// Audit B1: no column value is evaluated with a user's cast in `enqueue()`'s definer
+    /// context. An enum with casts to json and text, a domain over it, a composite holding it
+    /// and an array of it are written as their type output (strings); built-in types keep
+    /// their JSON types. No hostile function runs, as anyone.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_hostile_casts_never_run_in_enqueue() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(
+                main,
+                r#"CREATE TABLE public.seen (who text); GRANT INSERT ON public.seen TO PUBLIC;
+                   CREATE TYPE public.mood AS ENUM ('ok');
+                   CREATE FUNCTION public.mood_json(public.mood) RETURNS json LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN '"x"'::json; END$$;
+                   CREATE CAST (public.mood AS json) WITH FUNCTION public.mood_json(public.mood);
+                   CREATE FUNCTION public.mood_text(public.mood) RETURNS text LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN 'x'; END$$;
+                   CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood);
+                   CREATE FUNCTION public.mood_jsonb(public.mood) RETURNS jsonb LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN '"x"'::jsonb; END$$;
+                   CREATE CAST (public.mood AS jsonb) WITH FUNCTION public.mood_jsonb(public.mood);
+                   CREATE DOMAIN public.dmood AS public.mood;
+                   CREATE TYPE public.pair AS (m public.mood, n int);
+                   CREATE TABLE public.orders (id int, m public.mood, d public.dmood, p public.pair, a public.mood[], j jsonb, t text, z public.mood);"#,
+            )
+            .await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert", "update", "delete"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(
+                main,
+                r#"INSERT INTO public.orders VALUES (1, 'ok', 'ok', ROW('ok', 2), ARRAY['ok']::public.mood[], '{"k": [1]}', 'hi', NULL);
+                   UPDATE public.orders SET id = 2; DELETE FROM public.orders;"#,
+            )
+            .await;
+            let who = fx.value(main, "SELECT coalesce(string_agg(who, ','), '') FROM public.seen").await;
+            assert_ne!(who, "chelabase_functions_owner", "user cast function ran as the owner role");
+            assert_eq!(who, "", "a user cast ran");
+            let record = fx
+                .value(main, "SELECT payload->'record' FROM chelabase_functions.outbox ORDER BY id LIMIT 1")
+                .await;
+            let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+            assert_eq!(
+                record,
+                serde_json::json!({"id": 1, "m": "ok", "d": "ok", "p": "(ok,2)", "a": "{ok}", "j": {"k": [1]}, "t": "hi", "z": null})
+            );
+            let ops = fx
+                .value(main, "SELECT string_agg((payload->>'type') || ':' || coalesce(payload->'old_record'->>'id', '-'), ',' ORDER BY id) FROM chelabase_functions.outbox")
+                .await;
+            assert_eq!(ops, "INSERT:-,UPDATE:1,DELETE:2");
+        })
+        .await;
+    }
+
+    /// Audit B2 and the worker's cleanup: grants to named roles on the schema, the outbox, its
+    /// sequence and `enqueue()` are revoked on every run; a tampered outbox (a TRUNCATE
+    /// trigger, a rule, a policy) is rebuilt before anything runs on it, so the cleanup never
+    /// runs a planted function; a stray function in the schema is dropped.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_named_grants_and_a_tampered_outbox_are_repaired() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE TABLE public.seen (who text); GRANT INSERT ON public.seen TO PUBLIC;").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let outbox_oid = "SELECT 'chelabase_functions.outbox'::regclass::oid";
+            let untouched = fx.value(main, outbox_oid).await;
+            fx.sql(
+                main,
+                "GRANT USAGE ON SCHEMA chelabase_functions TO authenticated;
+                 GRANT SELECT ON chelabase_functions.outbox TO authenticated;
+                 GRANT USAGE ON SEQUENCE chelabase_functions.outbox_id_seq TO authenticated;
+                 GRANT EXECUTE ON FUNCTION chelabase_functions.enqueue() TO authenticated;",
+            )
+            .await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let grants = "SELECT has_schema_privilege('authenticated', 'chelabase_functions', 'USAGE')::text
+                 || has_table_privilege('authenticated', 'chelabase_functions.outbox', 'SELECT')::text
+                 || has_sequence_privilege('authenticated', 'chelabase_functions.outbox_id_seq', 'USAGE')::text
+                 || has_function_privilege('authenticated', 'chelabase_functions.enqueue()', 'EXECUTE')::text";
+            assert_eq!(fx.value(main, grants).await, "falsefalsefalsefalse", "a named grant survived the install");
+            assert_eq!(fx.value(main, outbox_oid).await, untouched, "an untampered outbox is kept");
+
+            // An event before the tampering (the planted policy would run on any insert; the
+            // test plants it as the superuser, which no member can be).
+            fx.sql(main, "INSERT INTO public.orders VALUES (1)").await;
+            fx.sql(
+                main,
+                r#"CREATE FUNCTION public.spy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;
+                   CREATE TRIGGER spy AFTER TRUNCATE ON chelabase_functions.outbox FOR EACH STATEMENT EXECUTE FUNCTION public.spy();
+                   CREATE TRIGGER spy_rows AFTER DELETE ON chelabase_functions.outbox FOR EACH ROW EXECUTE FUNCTION public.spy();
+                   CREATE RULE spy_rule AS ON DELETE TO chelabase_functions.outbox DO ALSO INSERT INTO public.seen VALUES ('rule:' || current_user);
+                   CREATE FUNCTION public.spy_policy() RETURNS boolean LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES ('policy:' || current_user); RETURN true; END$$;
+                   ALTER TABLE chelabase_functions.outbox ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+                   CREATE POLICY spy ON chelabase_functions.outbox USING (public.spy_policy());
+                   CREATE FUNCTION chelabase_functions.extra() RETURNS int LANGUAGE sql AS 'SELECT 1';"#,
+            )
+            .await;
+            fx.worker.sync_fn_triggers(main, true).await.unwrap();
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(fx.value(main, "SELECT coalesce(string_agg(who, ','), '') FROM public.seen").await, "", "a planted function ran");
+            let shape = fx
+                .value(
+                    main,
+                    "SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'chelabase_functions.outbox'::regclass)
+                     + (SELECT count(*) FROM pg_rewrite WHERE ev_class = 'chelabase_functions.outbox'::regclass)
+                     + (SELECT count(*) FROM pg_policy WHERE polrelid = 'chelabase_functions.outbox'::regclass)
+                     + (SELECT count(*) FROM pg_class WHERE oid = 'chelabase_functions.outbox'::regclass AND relrowsecurity)
+                     + (SELECT count(*) FROM pg_proc WHERE pronamespace = 'chelabase_functions'::regnamespace AND proname <> 'enqueue')",
+                )
+                .await;
+            assert_eq!(shape, "0", "the outbox or schema kept a planted object");
+            assert_eq!(fx.value(main, grants).await, "falsefalsefalsefalse");
+            fx.sql(main, "INSERT INTO public.orders VALUES (2)").await;
+            assert_eq!(fx.outbox(main).await, 1, "events land in the rebuilt outbox");
+        })
+        .await;
+    }
+
+    /// Audit S1: when a create's own sync failed, the sweep (no truncate) still leaves the
+    /// child's outbox without the rows its inherited parent triggers wrote on its timeline,
+    /// and keeps the rows of its own triggers.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_sweep_after_a_failed_create_sync_drops_foreign_events() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int)").await;
+            let f = fx.function("hello").await;
+            let parent = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let dev = fx.create("dev").await;
+            let mine = fx.triggers(dev).await[0].id;
+            // The state a failed first sync leaves: the parent's trigger still in the child's
+            // database, writing on the child's timeline, and the child's rows pending.
+            let parent_wanted = worker::fn_triggers::wanted_in(&fx.triggers(main).await, &fx.database);
+            fx.sql(dev, &worker::fn_triggers::sync_sql(&parent_wanted, false)).await;
+            fx.sql(dev, "INSERT INTO public.orders VALUES (1)").await;
+            sqlx::query("UPDATE function_triggers SET state = 'pending_install' WHERE branch_id = $1")
+                .bind(dev.as_uuid())
+                .execute(fx.metadata.pool())
+                .await
+                .unwrap();
+            fx.worker.sync_pending_fn_triggers().await;
+            assert!(fx.triggers(dev).await.iter().all(|t| t.state == TriggerState::Installed));
+            fx.sql(dev, "INSERT INTO public.orders VALUES (2)").await;
+            let ids = fx
+                .value(dev, "SELECT coalesce(string_agg(DISTINCT trigger_id::text, ','), '') FROM chelabase_functions.outbox")
+                .await;
+            assert_eq!(ids, mine.to_string(), "the parent's {parent} events stayed");
+        })
+        .await;
+    }
+
+    /// Audit S3: a child's run-as key that can't be minted (the all-rows check can't read a
+    /// database) is recorded as `run_as_key_pending: …`, and a later reconcile pass mints it
+    /// once the check runs, clearing the error.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_child_run_as_key_retried_until_minted() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE ROLE reporter NOLOGIN").await;
+            let oid: i64 = fx.value(main, "SELECT oid FROM pg_roles WHERE rolname = 'reporter'").await.parse().unwrap();
+            let f = fx.function("hello").await;
+            assert!(fx.metadata.set_run_as(main, f, Some(&run_as("reporter", oid))).await.unwrap());
+            // A database no session can open: the all-rows check fails on it.
+            fx.sql(main, "CREATE DATABASE fn_broken").await;
+            fx.sql(main, "ALTER DATABASE fn_broken SET session_preload_libraries = 'chelabase_no_such_library'").await;
+            let dev = fx.create("dev").await;
+            let state = |b: BranchId| async move {
+                let all = fx.metadata.list_for_branch(b).await.unwrap();
+                let s = all.into_iter().find(|s| s.function_id == f).unwrap();
+                (s.run_as_key_id, s.last_error)
+            };
+            let (key, error) = state(dev).await;
+            assert_eq!(key, None);
+            assert!(error.as_deref().is_some_and(|e| e.starts_with("run_as_key_pending: ")), "{error:?}");
+            fx.worker.sync_pending_run_as().await;
+            assert_eq!(state(dev).await.0, None, "still pending while the check can't run");
+            fx.sql(dev, "ALTER DATABASE fn_broken RESET session_preload_libraries").await;
+            fx.worker.sync_pending_run_as().await;
+            let (key, error) = state(dev).await;
+            assert!(key.is_some(), "minted on a later pass");
+            assert_eq!(error, None, "the pending error is cleared");
+        })
+        .await;
+    }
 }
