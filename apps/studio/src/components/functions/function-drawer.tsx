@@ -4,7 +4,7 @@ import { X } from "lucide-react";
 import { useListFunctionDeployments, type Function as FunctionInfo } from "@chelabase/management-client";
 import { CopyButton } from "@/components/copy-button";
 import { Button } from "@/components/ui/button";
-import { curlFor, functionErrorText, invokeUrl } from "@/lib/functions";
+import { curlFor, functionErrorText, invokeUrl, rolloutNotice } from "@/lib/functions";
 import { deploymentTarget, serviceSpecOf } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
@@ -51,6 +51,7 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
   const current = deployments.data?.find((d) => d.id === fn.deployment_id);
   const backend = current ? serviceSpecOf(current.spec)?.backend : undefined;
   const reason = canChange ? null : VIEWER_REASON;
+  const notice = rolloutNotice(fn.rollout);
 
   async function makeActive(id: string) {
     setActivating(id);
@@ -81,6 +82,12 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
               <X aria-hidden="true" size={16} strokeWidth={1.5} />
             </DialogPrimitive.Close>
           </div>
+
+          {notice && (
+            <p role="status" className={`border p-2 text-xs ${notice.tone === "failed" ? "border-coral/50 text-coral" : "border-line-strong text-chalk-dim"}`}>
+              {notice.text}
+            </p>
+          )}
 
           {fn.last_error && (
             <p className="border border-coral/50 p-2 font-mono text-xs break-all text-coral">

@@ -7,6 +7,8 @@ import {
   initialToggles,
   invokeUrl,
   isPlatformModeRefusal,
+  rolloutNotice,
+  rolloutPending,
   runAsReason,
   secretNameReason,
   togglesReducer,
@@ -135,5 +137,31 @@ describe("errors", () => {
     expect(functionErrorText(new ApiError(409, "conflict", "raw", { reason: "function_active_on_protected_branch" }))).toMatch(/protected branch/);
     expect(functionErrorText(new ApiError(409, "conflict", "raw", { reason: "managed_key" }))).toMatch(/run-as key/);
     expect(functionErrorText(new ApiError(422, "invalid_request", "role \"x\" does not exist"))).toBe('role "x" does not exist');
+  });
+});
+
+describe("rolloutNotice", () => {
+  const D = "abcdef12-0000-0000-0000-000000000000";
+  const at = "2026-11-08T00:00:00Z";
+  it("no_rollover_says_nothing", () => {
+    expect(rolloutNotice(null)).toBeNull();
+  });
+  it("a_pending_one_names_the_deployment_and_that_the_old_one_serves", () => {
+    const n = rolloutNotice({ deployment_id: D, state: "pending", error: null, started_at: at });
+    expect(n?.tone).toBe("pending");
+    expect(n?.text).toContain("abcdef12");
+    expect(n?.text).toContain("previous deployment serves");
+  });
+  it("a_failed_one_gives_the_reason", () => {
+    const n = rolloutNotice({ deployment_id: D, state: "failed", error: "never passed GET /h", started_at: at });
+    expect(n?.tone).toBe("failed");
+    expect(n?.text).toContain("never passed GET /h");
+    expect(n?.text).toContain("abcdef12");
+  });
+  it("polls_only_while_one_is_pending", () => {
+    const fn = (state: "pending" | "failed" | null) =>
+      ({ rollout: state ? { deployment_id: D, state, error: null, started_at: at } : null }) as Parameters<typeof rolloutPending>[0][number];
+    expect(rolloutPending([fn(null), fn("pending")])).toBe(true);
+    expect(rolloutPending([fn(null), fn("failed")])).toBe(false);
   });
 });
