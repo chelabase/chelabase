@@ -45,6 +45,8 @@ Two one-shot containers do the setup, and both must exit 0:
 | `storage` | Object storage: files in buckets at `/storage/v1`, signed URLs and storage webhooks. Its files live in SeaweedFS's `chelabase-storage` bucket |
 | `metadata-db`, `nats`, `valkey` | The control plane's database (the identity service's schemas live there too), jobs, and caches |
 | `storage-*`, `pageserver`, `safekeeper*`, `proxy`, `seaweedfs` | Neon's storage and the Postgres proxy |
+| `functions`, `functions-runtime` | [Edge functions](/self-hosting/functions). Only with the `functions` Compose profile (`COMPOSE_PROFILES=functions` in `.env`, or `--profile functions`); without it, function calls answer 503 `functions_unavailable` |
+| `service-runner` | [Container services](/using/services/containers). Only with the `services` profile, beside `functions` (`COMPOSE_PROFILES=functions,services`) |
 
 Running `docker compose up` again with nothing changed recreates nothing and prints no new code. `docker compose down` followed by `up` keeps the secrets.
 
@@ -230,6 +232,8 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up --build --wa
 ```
 
 This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio and the identity service from their Dockerfiles. The wiring, secrets and health checks are the same.
+
+The same command builds the edge functions images when their profile is on (`COMPOSE_PROFILES=functions`, plus `services` for container services, in `.env` or before the command). Until the first image pin after edge functions are released those images aren't published, so this is the way to run them. See [Functions and services](/self-hosting/functions#turn-edge-functions-on).
 
 ## Logs
 
