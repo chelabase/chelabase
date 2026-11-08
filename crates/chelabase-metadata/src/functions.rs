@@ -411,6 +411,22 @@ pub struct TriggerDelivery {
     pub error: Option<String>,
 }
 
+/// m14: an enabled storage trigger the worker delivers to
+/// ([`MetadataClient::storage_trigger_targets`]): the trigger, its branch, its function's
+/// name and database, its filters and the time it was (re)enabled (its consumer starts then).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageTriggerTarget {
+    pub id: Uuid,
+    pub branch_id: BranchId,
+    pub database_id: DatabaseId,
+    pub function_name: String,
+    pub pg_database: String,
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    pub events: Vec<String>,
+    pub enabled_since: DateTime<Utc>,
+}
+
 /// One table trigger's install, as the worker reports it
 /// ([`MetadataClient::settle_trigger_installs`]): the row and the `enabled_since` it read (the
 /// generation it installed), and `None` when the trigger is in the database, or why not.
@@ -2137,6 +2153,38 @@ impl MetadataClient {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(b, db)| (BranchId(b), db)).collect())
+    }
+
+    /// m14: every enabled storage trigger on a live branch of a live database, for the
+    /// worker's storage consumers. Whether the function itself is on doesn't matter here: a
+    /// disabled function's events wait (the functions service refuses them, so they are
+    /// retried). A read.
+    pub async fn storage_trigger_targets(&self) -> Result<Vec<StorageTriggerTarget>, MetadataError> {
+        let rows = sqlx::query(
+            "SELECT t.id, t.branch_id, f.database_id, f.name, t.pg_database, t.bucket, t.prefix,
+                    t.events, t.enabled_since
+             FROM function_triggers t JOIN functions f ON f.id = t.function_id
+             JOIN branches b ON b.id = t.branch_id JOIN databases d ON d.id = b.database_id
+             WHERE t.source = 'storage' AND t.enabled
+               AND b.status NOT IN ('deleting', 'deleted') AND d.status NOT IN ('deleting', 'deleted')
+             ORDER BY t.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| StorageTriggerTarget {
+                id: r.get("id"),
+                branch_id: BranchId(r.get("branch_id")),
+                database_id: DatabaseId(r.get("database_id")),
+                function_name: r.get("name"),
+                pg_database: r.get("pg_database"),
+                bucket: r.get("bucket"),
+                prefix: r.get("prefix"),
+                events: r.get("events"),
+                enabled_since: r.get("enabled_since"),
+            })
+            .collect())
     }
 
     /// Settles the worker's table-trigger installs on `branch` (edge functions m8): each row
