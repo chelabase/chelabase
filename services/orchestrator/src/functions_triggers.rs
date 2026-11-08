@@ -16,7 +16,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chelabase_metadata::{MetadataClient, MetadataError, NewTrigger, TriggerRecord, TriggerSource};
+use chelabase_metadata::{
+    FunctionKind, MetadataClient, MetadataError, NewTrigger, TriggerRecord, TriggerSource,
+};
 use chelabase_routes::orchestrator as ep;
 use chelabase_types::api_error::{ApiError, ErrorEnvelope};
 use chelabase_types::{ApiPath, BranchId};
@@ -130,6 +132,9 @@ struct TriggerView {
     last_error: Option<String>,
     /// Events that went dead after 10 failed deliveries.
     dead_count: i64,
+    /// Events the outbox bound removed undelivered: dead events past 10,000 per database or 7
+    /// days, and the queued events of a trigger turned off. A pending event is never removed.
+    dropped_count: i64,
     /// Why the last failed delivery failed; cleared by a delivery.
     #[schema(required = true)]
     last_delivery_error: Option<String>,
@@ -155,6 +160,7 @@ impl From<TriggerRecord> for TriggerView {
             events: t.events,
             last_error: t.last_error,
             dead_count: t.dead_count,
+            dropped_count: t.dropped_count,
             last_delivery_error: t.last_delivery_error,
             last_delivered_at: t.last_delivered_at,
         }
@@ -235,6 +241,14 @@ fn check(r: &CreateRequest) -> Result<(), ApiError> {
             SourceView::Storage => "a storage trigger takes no schema or table",
         }));
     }
+    // m13b (B2): never on Chelabase's or Postgres's own schemas (the worker refuses too).
+    if let Some(schema) = r.schema.as_deref()
+        && chelabase_schema::exclusions::function_trigger_schema_refused(schema)
+    {
+        return Err(unprocessable(&format!(
+            "schema: {schema} is reserved; a table trigger goes on a table of your own schema"
+        )));
+    }
     Ok(())
 }
 
@@ -309,7 +323,7 @@ where
     operation_id = "createFunctionTrigger",
     tag = "functions",
     summary = "Add a trigger to a function on the branch",
-    description = "A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled. The database's compute stays awake while it has an installed table trigger. A `storage` trigger starts `installed`. A new branch inherits the triggers.",
+    description = "A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled; a pending event is never dropped, and dead events past 10,000 per database or 7 days are removed and counted (`dropped_count`). The database's compute stays awake while it has an installed table trigger. A `storage` trigger starts `installed`. A new branch inherits the triggers.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -323,7 +337,7 @@ where
         (status = 403, description = "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, or an unknown field", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`) or on a service", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -344,6 +358,10 @@ where
             let request: CreateRequest = parse_body(&body)?;
             check(&request)?;
             let function = find(&state, &record, &name).await?;
+            // m13b (S4): a service never gets database events.
+            if request.source == SourceView::Table && function.kind != FunctionKind::Function {
+                return Err(unprocessable("a table trigger needs a function; a service never gets database events"));
+            }
             let events: Vec<&str> = request.events.iter().map(String::as_str).collect();
             let trigger_id = state
                 .metadata

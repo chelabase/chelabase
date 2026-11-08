@@ -119,6 +119,11 @@ async fn main() -> anyhow::Result<()> {
         rest_token: internal_config.rest_token.clone(),
         realtime_token: internal_config.realtime_token.clone(),
         storage_token: internal_config.storage_token.clone(),
+        // m13b: the functions service asks for its dispatcher login with the bearer the
+        // orchestrator calls it with (both ways, as rest's); unset closes the route.
+        functions_token: chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_default(),
         rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,

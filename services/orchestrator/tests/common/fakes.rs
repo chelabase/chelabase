@@ -193,6 +193,7 @@ impl orchestrator::functions_triggers::TriggersPort for FakeMetadata {
             events: t.events.iter().map(|e| e.to_string()).collect(),
             last_error: None,
             dead_count: 0,
+            dropped_count: 0,
             last_delivery_error: None,
             last_delivered_at: None,
         });
