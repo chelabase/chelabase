@@ -1,6 +1,6 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectCapsContext, projectCaps } from "@/lib/capabilities";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
@@ -35,6 +35,8 @@ function setup(level: Level, routes: Record<string, FakeHandler>, branchId = "b2
   const r = renderWithQuery(ui(branchId), { fetch: f });
   return { ...r, f, ui };
 }
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("FunctionList", () => {
   it("switch_reverts_and_says_why_when_the_api_refuses", async () => {
@@ -123,6 +125,29 @@ describe("FunctionList", () => {
     rerender(ui("b3"));
     await waitFor(() => expect(screen.getByRole("switch", { name: "hello enabled" })).not.toBeChecked());
     expect(screen.getByRole("switch", { name: "hello enabled" })).not.toHaveAttribute("data-disabled");
+  });
+
+  it("a_container_service_shows_its_kind_backend_status_and_logs", async () => {
+    const user = userEvent.setup();
+    const svcDeployments = [{ ...DEPLOYMENTS[0], id: "svc-dep-1", spec: { backend: "container", image: "echo@sha256:" + "b".repeat(64), port: 8080 } }];
+    const { f } = setup("developer", {
+      [`GET ${base("b2")}`]: () => jsonResponse([fn("echo", { kind: "service", auth: null, enabled: true, deployment_id: "svc-dep-1", health: "healthy" })]),
+      [`GET ${base("b2")}/echo/deployments`]: () => jsonResponse(svcDeployments),
+      [`GET ${base("b2")}/echo/logs`]: () => new Response("ready\n", { status: 200 }),
+      [`GET ${base("b2")}/echo/secrets`]: () => jsonResponse([]),
+      [`GET ${base("b2")}/echo/schedules`]: () => jsonResponse([]),
+      [`GET ${base("b2")}/echo/triggers`]: () => jsonResponse([]),
+    });
+    // Logs are read as text outside the client's JSON parse, through the global fetch.
+    vi.stubGlobal("fetch", f);
+    expect(await screen.findByText("Running")).toBeInTheDocument();
+    expect(screen.getByText("service")).toBeInTheDocument();
+    expect(await screen.findByText("container")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "echo" }));
+    expect(await screen.findByRole("heading", { name: "Logs" })).toBeInTheDocument();
+    expect(await screen.findByText(/^ready/)).toBeInTheDocument();
+    expect(screen.getAllByText("echo@sha256:" + "b".repeat(64)).length).toBeGreaterThan(0);
+    expect(screen.getByText("http://api.test/services/v1/echo")).toBeInTheDocument();
   });
 
   it("empty_state_shows_the_dev_command", async () => {

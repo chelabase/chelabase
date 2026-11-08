@@ -13,6 +13,7 @@ import { CopyIconButton } from "@/components/copy-button";
 import { Switch } from "@/components/ui/switch";
 import { useProjectCaps } from "@/lib/capabilities";
 import { effectiveEnabled, functionErrorText, initialToggles, isPlatformModeRefusal, togglesReducer } from "@/lib/functions";
+import { serviceSpecOf, serviceStatus, type StatusTone } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
 import { FunctionDrawer } from "./function-drawer";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
@@ -27,11 +28,30 @@ export const DEV_COMMAND = "chelabase functions dev --watch";
 
 const AUTH_LABEL: Record<string, string> = { key: "Data key", app_user: "App user", public: "Public" };
 
+/** The function's active deployment (the list only names its id); the same query the drawer reads. */
+function useActiveDeployment(databaseId: string, branchId: string, fn: FunctionInfo) {
+  const deployments = useListFunctionDeployments(databaseId, branchId, fn.name, { query: { enabled: fn.deployment_id !== null } });
+  return fn.deployment_id === null ? undefined : deployments.data?.find((x) => x.id === fn.deployment_id);
+}
+
+/** The kind badge, and a service's backend (from its active deployment's spec). */
+function KindCell({ databaseId, branchId, fn }: { databaseId: string; branchId: string; fn: FunctionInfo }) {
+  const d = useActiveDeployment(databaseId, branchId, fn);
+  const backend = fn.kind === "service" && d ? serviceSpecOf(d.spec)?.backend : undefined;
+  return (
+    <span className="flex flex-col items-start gap-0.5">
+      <span className={`border px-1.5 text-xs ${fn.kind === "service" ? "border-sand/60 text-sand" : "border-line-strong text-chalk-dim"}`}>{fn.kind}</span>
+      {backend && <span className="text-xs text-chalk-dim">{backend}</span>}
+    </span>
+  );
+}
+
+const TONE: Record<StatusTone, string> = { good: "text-seafoam", bad: "text-coral", dim: "text-chalk-dim" };
+
 /** The active deployment's id, note and age (the list only names its id). */
 function ActiveDeployment({ databaseId, branchId, fn }: { databaseId: string; branchId: string; fn: FunctionInfo }) {
-  const deployments = useListFunctionDeployments(databaseId, branchId, fn.name, { query: { enabled: fn.deployment_id !== null } });
+  const d = useActiveDeployment(databaseId, branchId, fn);
   if (fn.deployment_id === null) return <span className="text-chalk-dim">None</span>;
-  const d = deployments.data?.find((x) => x.id === fn.deployment_id);
   return (
     <span className="flex min-w-0 flex-col">
       <span className="font-mono text-xs">{fn.deployment_id.slice(0, 8)}</span>
@@ -114,12 +134,13 @@ export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps
   return (
     <div className="mx-auto w-full max-w-6xl p-4 text-sm sm:p-8">
       <div className="overflow-x-auto border border-line">
-        <table className="w-full min-w-[48rem] text-left">
+        <table className="w-full min-w-[56rem] text-left">
           <thead className="border-b border-line text-xs text-chalk-dim">
             <tr>
               <th className="px-3 py-2 font-medium">Name</th>
               <th className="px-3 py-2 font-medium">Enabled</th>
               <th className="px-3 py-2 font-medium">Kind</th>
+              <th className="px-3 py-2 font-medium">Status</th>
               <th className="px-3 py-2 font-medium">Active deployment</th>
               <th className="px-3 py-2 font-medium">Auth</th>
               <th className="px-3 py-2 font-medium">Last error</th>
@@ -130,6 +151,7 @@ export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps
               const enabled = effectiveEnabled(toggles, fn.name, fn.enabled);
               const pending = fn.name in toggles.overrides;
               const error = toggles.errors[fn.name];
+              const status = serviceStatus(fn, enabled);
               return (
                 <tr key={fn.id} className="border-b border-line align-top last:border-0">
                   <td className="px-3 py-2">
@@ -156,11 +178,16 @@ export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps
                       </p>
                     )}
                   </td>
-                  <td className="px-3 py-2">{fn.kind}</td>
+                  <td className="px-3 py-2">
+                    <KindCell databaseId={databaseId} branchId={branchId} fn={fn} />
+                  </td>
+                  <td className="px-3 py-2">
+                    {status ? <span className={`text-xs ${TONE[status.tone]}`}>{status.label}</span> : <span className="text-xs text-chalk-dim">{enabled ? "Enabled" : "Disabled"}</span>}
+                  </td>
                   <td className="max-w-56 px-3 py-2">
                     <ActiveDeployment databaseId={databaseId} branchId={branchId} fn={fn} />
                   </td>
-                  <td className="px-3 py-2">{fn.auth ? AUTH_LABEL[fn.auth] : <span className="text-chalk-dim">Not set</span>}</td>
+                  <td className="px-3 py-2">{fn.kind === "service" ? AUTH_LABEL.key : fn.auth ? AUTH_LABEL[fn.auth] : <span className="text-chalk-dim">Not set</span>}</td>
                   <td className="max-w-64 px-3 py-2">
                     {fn.last_error ? (
                       <span title={fn.last_error} className="line-clamp-2 font-mono text-xs break-all text-coral">
