@@ -21,6 +21,11 @@ export interface MeResponse {
      */
   email: string | null;
   /**
+     * Whether members may manage and run edge functions on this instance (false in platform
+     * mode, where every functions route answers 403 `not_available_in_platform_mode`).
+     */
+  functions_available: boolean;
+  /**
      * Whether the caller may use instance routes (self-hosted: an active tenant admin;
      * platform: a member of the operator tenant).
      */

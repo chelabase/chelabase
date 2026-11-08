@@ -84,6 +84,9 @@ pub enum Service {
     Rest,
     /// Object storage: its role sessions and its managed pool together.
     Storage,
+    /// Edge functions m13b: the database-event dispatcher's dedicated connections
+    /// ([`connect_dedicated`]), outside any budget (one per branch database with triggers).
+    Functions,
 }
 
 impl Service {
@@ -92,6 +95,7 @@ impl Service {
         match self {
             Service::Rest => "chelabase-rest",
             Service::Storage => "chelabase-storage",
+            Service::Functions => "chelabase-functions",
         }
     }
 }
@@ -268,7 +272,7 @@ pub struct InternalSource {
     http: chelabase_http::Client,
     base: String,
     token: String,
-    /// `data` or `storage`: `/internal/{route}/branches/{id}/connection`.
+    /// `data`, `storage` or `functions`: `/internal/{route}/branches/{id}/connection`.
     route: &'static str,
 }
 
@@ -281,6 +285,12 @@ impl InternalSource {
     /// asked with storage's bearer.
     pub fn storage_login(base_url: &str, token: &str) -> Self {
         Self::at(base_url, token, "storage")
+    }
+
+    /// m13b: the `chelabase_functions_dispatch` login's connection info (the functions
+    /// service's database-event dispatcher), asked with the functions service's bearer.
+    pub fn functions_login(base_url: &str, token: &str) -> Self {
+        Self::at(base_url, token, "functions")
     }
 
     fn at(base_url: &str, token: &str, route: &'static str) -> Self {
@@ -528,6 +538,68 @@ fn service_login_hook(user: String) -> deadpool_postgres::Hook {
             }
         })
     })
+}
+
+/// m13b: a dedicated connection and the notifications it receives (`LISTEN`).
+pub struct Dedicated {
+    pub client: tokio_postgres::Client,
+    /// Each `NOTIFY` delivered to the session; closed when the connection ends.
+    pub notifications: tokio::sync::mpsc::UnboundedReceiver<tokio_postgres::Notification>,
+}
+
+/// m13b: one connection to `database` of `info`, outside any pool or budget, for a long-lived
+/// session of a service's own login (the functions dispatcher, which `LISTEN`s). It connects
+/// as the pools do (TLS verified as the compute's name, [`connect_config`]), starts with
+/// `search_path = pg_catalog, pg_temp`, and must pass [`SERVICE_LOGIN_SQL`] as `info.user`
+/// before it's handed out: a login that could become another role is closed unused.
+pub async fn connect_dedicated(
+    info: &ConnInfo,
+    database: &str,
+    server_tls: Option<&ServerTls>,
+    service: Service,
+) -> Result<Dedicated, ConnError> {
+    let (mut config, connector) = connect_config(info, database, server_tls, service)?;
+    config.options("-c search_path=pg_catalog,pg_temp");
+    let (tx, notifications) = tokio::sync::mpsc::unbounded_channel();
+    let refused = |e: tokio_postgres::Error| ConnError::Unreachable(format!("connecting: {e}"));
+    let client = match connector {
+        Some(connector) => {
+            let (client, conn) = config.connect(connector).await.map_err(refused)?;
+            tokio::spawn(forward_notifications(conn, tx));
+            client
+        }
+        None => {
+            let (client, conn) = config.connect(tokio_postgres::NoTls).await.map_err(refused)?;
+            tokio::spawn(forward_notifications(conn, tx));
+            client
+        }
+    };
+    let row = client
+        .query_one(SERVICE_LOGIN_SQL, &[&info.user])
+        .await
+        .map_err(|e| ConnError::Unreachable(format!("checking the login: {e}")))?;
+    if row.get::<_, Option<bool>>(0) != Some(true) {
+        return Err(ConnError::Unreachable(format!(
+            "the connection isn't the bare service login {}",
+            info.user
+        )));
+    }
+    Ok(Dedicated { client, notifications })
+}
+
+/// Drives `conn` until it ends, sending each notification on `tx`.
+async fn forward_notifications<S, T>(
+    mut conn: tokio_postgres::Connection<S, T>,
+    tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(Ok(message)) = std::future::poll_fn(|cx| conn.poll_message(cx)).await {
+        if let tokio_postgres::AsyncMessage::Notification(n) = message {
+            let _ = tx.send(n);
+        }
+    }
 }
 
 /// A pool of up to `max_size` connections opened with `config`: TLS through `connector`
@@ -1455,6 +1527,63 @@ mod tests {
         );
         assert_eq!(info.user, "chelabase_storage");
         assert_eq!(info.database_id, Some(Uuid::from_u128(7)));
+    }
+
+    /// m13b: the functions dispatcher's login source asks the functions route with its bearer.
+    #[tokio::test]
+    async fn the_functions_login_source_asks_the_functions_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let branch = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let body = serde_json::json!({
+                "host": "10.0.0.1", "port": 5432, "database": "main",
+                "user": "chelabase_functions_dispatch", "password": "fpw", "status": "ready",
+                "settings": { "max_rows": 1, "statement_timeout_ms": 1, "max_connections": 1 },
+            })
+            .to_string();
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(answer.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        let info = InternalSource::functions_login(&base, "fn-token")
+            .fetch(branch)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(&format!("GET /internal/functions/branches/{branch}/connection ")),
+            "{request}"
+        );
+        assert!(
+            request.to_ascii_lowercase().contains("authorization: bearer fn-token"),
+            "{request}"
+        );
+        assert_eq!(info.user, "chelabase_functions_dispatch");
+        assert_eq!(Service::Functions.application_name(), "chelabase-functions");
+    }
+
+    /// m13b: a dedicated connection that can't show it is the bare service login is closed
+    /// before anything runs on it (this fake refuses the check; the live tests pass a real one).
+    #[tokio::test]
+    async fn a_dedicated_connection_failing_the_login_check_is_refused() {
+        let fake = crate::session::tests::recorder(|_, _| false).await;
+        let mut info = test_support::two_databases();
+        info.port = fake.port;
+        let out = connect_dedicated(&info, "main", None, Service::Functions).await;
+        assert!(out.is_err());
+        assert!(
+            fake.queries.lock().unwrap().iter().all(|q| !q.to_ascii_lowercase().contains("listen")),
+            "{:?}",
+            fake.queries.lock().unwrap()
+        );
     }
 
     /// The shape before served databases existed: main alone, with the settings'

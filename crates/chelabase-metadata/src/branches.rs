@@ -465,6 +465,16 @@ impl MetadataClient {
         // (they take only a key-share lock through the FK), so a concurrent add/remove may or
         // may not reach the child.
         copy_guard_exemptions(&mut tx, b.parent_branch_id.as_uuid(), b.id.as_uuid()).await?;
+        // Unlike the exemptions, an exact copy: every function write on the parent takes the
+        // database row `FOR SHARE`, which the lock above excludes. A failure (a parent secret
+        // that doesn't open, no secrets key) rolls the whole create back.
+        crate::functions::copy_branch_functions(
+            &mut tx,
+            self.secrets_key.as_deref(),
+            b.parent_branch_id.as_uuid(),
+            b.id.as_uuid(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(CreateBranchOutcome::Created)
     }
@@ -922,8 +932,10 @@ impl MetadataClient {
         })
     }
 
-    /// Clears owner_password_enc, sets deleted_at.
+    /// Clears owner_password_enc, sets deleted_at, and purges the branch's function state
+    /// (active deployments, secrets, schedules, triggers), in one transaction.
     pub async fn mark_branch_deleted(&self, id: BranchId) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE branches
              SET status = 'deleted', deleted_at = now(), updated_at = now(),
@@ -931,8 +943,10 @@ impl MetadataClient {
              WHERE id = $1",
         )
         .bind(id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        crate::functions::purge_branch_functions(&mut tx, &[id.as_uuid()]).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1165,7 +1179,8 @@ impl MetadataClient {
     /// (the LSN of the parent the new timeline starts at; it is the base location of the
     /// branch's schema). Only while resetting and while the pending
     /// timeline is `expected_pending` (the one the caller created). False otherwise, with
-    /// nothing written.
+    /// nothing written. The branch's table triggers go back to `pending_install` (edge
+    /// functions m8: the worker reinstalls them on the new timeline).
     pub async fn switch_to_pending_timeline(
         &self,
         id: BranchId,
@@ -1192,6 +1207,9 @@ impl MetadataClient {
         let Some((endpoint_id, timeline_id)) = switched else {
             return Ok(false);
         };
+        // Edge functions m8: the new timeline's triggers are reinstalled (before the endpoint
+        // row: the function tables' lock order).
+        crate::functions::pend_table_triggers(&mut tx, id.as_uuid()).await?;
         move_endpoint(&mut tx, endpoint_id.as_deref(), &timeline_id).await?;
         tx.commit().await?;
         Ok(true)
@@ -1209,6 +1227,12 @@ impl MetadataClient {
     /// the old timeline at `restore_lsn` (the point the restored timeline was branched at) are
     /// appended again, positioned at the restored timeline's start, so they're current after
     /// the switch.
+    ///
+    /// The branch's table triggers go back to `pending_install` (as for a reset), so the worker
+    /// reinstalls them on the restored timeline.
+    ///
+    /// The backup gets no function state (functions, secrets, schedules, triggers): only
+    /// `create_branch` copies it, so a branch later created from the backup inherits none.
     pub async fn switch_to_restored_timeline(
         &self,
         id: BranchId,
@@ -1263,6 +1287,7 @@ impl MetadataClient {
         .bind(id.as_uuid())
         .fetch_one(&mut *tx)
         .await?;
+        crate::functions::pend_table_triggers(&mut tx, id.as_uuid()).await?;
         move_endpoint(&mut tx, endpoint_id.as_deref(), &timeline_id).await?;
         if let Some(old_timeline) = old_timeline.as_deref() {
             crate::schema_bases::copy_bases_for_restore(

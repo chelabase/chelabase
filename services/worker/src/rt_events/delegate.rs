@@ -23,6 +23,10 @@ use super::PublishingMetadata;
 use crate::ports::WorkerMetadata;
 
 impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
+    fn functions(&self) -> Option<&chelabase_metadata::MetadataClient> {
+        self.inner().functions()
+    }
+
     type EndpointLock = M::EndpointLock;
 
     async fn lock_endpoint(&self, endpoint_id: &str) -> Result<Self::EndpointLock, MetadataError> {

@@ -90,6 +90,15 @@ x-app-env: &app-env
   # listener (Studio's storage routes).
   CHELABASE_STORAGE_URL: http://storage:8089
   CHELABASE_STORAGE_INTERNAL_URL: http://storage:8090
+  # Edge functions (m4b): the gateway's upstream (the public listener, on the default network),
+  # and the internal listener the orchestrator (bundle uploads) and the worker (invocations)
+  # reach on the internal `functions-control` network.
+  CHELABASE_FUNCTIONS_URL: http://functions-public:8091
+  CHELABASE_FUNCTIONS_INTERNAL_URL: http://functions-control:8080
+  # Edge functions (m10): the service runner's internal API (profile `services`), which the
+  # functions service and the worker reach on the internal `services-control` network. Without
+  # the profile the name doesn't resolve and container services answer 503 (m11).
+  CHELABASE_SERVICE_RUNNER_URL: http://service-runner-control:8094
   CHELABASE_STUDIO_UPSTREAM: http://studio:3000
   CHELABASE_ORCHESTRATOR_ADDR: 0.0.0.0:8081
   CHELABASE_WORKER_HEALTH_ADDR: 0.0.0.0:8082
@@ -205,7 +214,8 @@ services:
         for d in bootstrap; do
           [ -d "$$S/$$d" ] || mkdir -m 0700 "$$S/$$d"
         done
-        # The object-store identity `storage` (bucket chelabase-storage only) beside Neon's `s3/`
+        # The object-store identities `storage` (bucket chelabase-storage only) and `functions`
+        # (bucket chelabase-functions only: function bundles, edge-functions m1) beside Neon's `s3/`
         # pair (chelabase-init makes that one), and SeaweedFS's gRPC mutual TLS: one CA and a
         # server and a client certificate (P-256, ten years). Each is made only when missing, so
         # an upgraded install keeps every key it has and only gains these. Same owner, group and
@@ -219,6 +229,8 @@ services:
         }
         new_key storage-s3/access-key 20
         new_key storage-s3/secret-key 40
+        new_key functions-s3/access-key 20
+        new_key functions-s3/secret-key 40
         T="$$S/grpc-tls"
         install -d -m 0700 "$$T"
         ec="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"
@@ -373,11 +385,13 @@ services:
 
   # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL,
   # and for user objects (bucket `chelabase-storage`, written by the storage service).
-  # Two S3 identities are rendered from their key files into a private file of the container
+  # and for function bundles (bucket `chelabase-functions`, written by the functions service).
+  # Three S3 identities are rendered from their key files into a private file of the container
   # (SeaweedFS takes them only in that JSON; the key files hold no quote or backslash):
-  #   neon     Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
-  #   storage  the same on bucket `chelabase-storage` only
-  # No admin identity exists: both buckets are made over loopback by `weed shell` (below).
+  #   neon       Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
+  #   storage    the same on bucket `chelabase-storage` only
+  #   functions  Read/Write/List on bucket `chelabase-functions` only
+  # No admin identity exists: every bucket is made over loopback by `weed shell` (below).
   # Master (9333), volume (8080) and filer (8888) have no auth and bypass S3 IAM, and so do the
   # gRPC ports (+10000) of those three and of the S3 server (18333). The first three bind to and
   # advertise 127.0.0.1; S3 (8333) and its gRPC listen on the network, so every gRPC listener
@@ -385,7 +399,7 @@ services:
   # grpc-tls files; the paths are in it, no secret). The Iceberg and Lance catalog ports and the
   # embedded IAM API are off, so identities change only through the s3.json.
   # `weed server` stays the container's process (a crash restarts it); the bucket step is a
-  # background loop that touches /tmp/buckets-ready once both buckets are listed.
+  # background loop that touches /tmp/buckets-ready once every bucket is listed.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     restart: unless-stopped
@@ -403,7 +417,10 @@ services:
           printf '"}],\n   "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},\n'
           printf '  {"name": "storage",\n   "credentials": [{"accessKey": "'
           key storage-s3/access-key; printf '", "secretKey": "'; key storage-s3/secret-key
-          printf '"}],\n   "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]}]}\n'
+          printf '"}],\n   "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]},\n'
+          printf '  {"name": "functions",\n   "credentials": [{"accessKey": "'
+          key functions-s3/access-key; printf '", "secretKey": "'; key functions-s3/secret-key
+          printf '"}],\n   "actions": ["Read:chelabase-functions", "Write:chelabase-functions", "List:chelabase-functions"]}]}\n'
         } > /tmp/s3.json
         D=/run/chelabase/secrets/grpc-tls
         mkdir -p /etc/seaweedfs
@@ -421,14 +438,15 @@ services:
         (
           i=0; out=
           while [ "$$i" -lt 40 ]; do
-            out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.list\n' |
+            out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.create -name chelabase-functions\ns3.bucket.list\n' |
               timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)"
-            if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage; then
+            if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage &&
+              printf '%s' "$$out" | grep -qw chelabase-functions; then
               touch /tmp/buckets-ready; exec sleep 2147483647
             fi
             i=$$((i + 1)); sleep 2
           done
-          echo "seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:" >&2
+          echo "seaweedfs: buckets neon, chelabase-storage and chelabase-functions not created after 40 tries; last weed shell output:" >&2
           printf '%s\n' "$$out" >&2
           kill 1
         ) &
@@ -439,12 +457,14 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/secret-key, read_only: true, volume: {subpath: s3/secret-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/access-key, read_only: true, volume: {subpath: functions-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/secret-key, read_only: true, volume: {subpath: functions-s3/secret-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/ca.crt, read_only: true, volume: {subpath: grpc-tls/ca.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.crt, read_only: true, volume: {subpath: grpc-tls/server.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.key, read_only: true, volume: {subpath: grpc-tls/server.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.crt, read_only: true, volume: {subpath: grpc-tls/client.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.key, read_only: true, volume: {subpath: grpc-tls/client.key}}
-    # Healthy = both buckets exist and S3 answers an unsigned request with its error document.
+    # Healthy = every bucket exists and S3 answers an unsigned request with its error document.
     healthcheck:
       test:
         - CMD-SHELL
@@ -977,6 +997,8 @@ services:
       CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-auth.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
       CHELABASE_STORAGE_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/storage-internal.token
+      # Edge functions (m4b): its bearer for the functions service's bundle uploads.
+      CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-functions.token
       CHELABASE_PROXY_API_TOKEN_FILE: /run/chelabase/secrets/tokens/proxy-api.token
       CHELABASE_STORCON_HOOK_TOKEN_FILE: /run/chelabase/secrets/tokens/storcon-hook.token
       # auth-replacement m5: its identity bearer.
@@ -986,14 +1008,20 @@ services:
       # https to public addresses only.
       CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
       CHELABASE_WEBHOOKS_ALLOW_HTTP: ${CHELABASE_WEBHOOKS_ALLOW_HTTP:-}
+      # Edge functions m9: where external service URLs may point (checked when one is saved; the
+      # functions service checks every connection). Blank: https to public addresses only.
+      CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      CHELABASE_SERVICES_ALLOW_HTTP: ${CHELABASE_SERVICES_ALLOW_HTTP:-}
     # The default network for the apps, `control` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute` (P4): computes call its hooks listener
-    # (8083) as `orchestrator`.
+    # (8083) as `orchestrator`. `functions-control` (m4b): the functions service's internal
+    # listener, for bundle uploads.
     networks:
       default: {}
       control:
         ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:-10.214.0.10}
       compute: {}
+      functions-control: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
@@ -1007,6 +1035,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-auth.token, read_only: true, volume: {subpath: tokens/app-auth.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storage-internal.token, read_only: true, volume: {subpath: tokens/storage-internal.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-functions.token, read_only: true, volume: {subpath: tokens/orchestrator-functions.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storcon-hook.token, read_only: true, volume: {subpath: tokens/storcon-hook.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
@@ -1059,6 +1088,11 @@ services:
       # auth-replacement m5: its identity bearer (pool lifecycle, the users sync).
       CHELABASE_IDENTITY_URL: http://identity:8080
       CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      # Edge functions (m4b): its bearer for the functions service's invocations (cron and
+      # events, m7 and m8).
+      CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-functions.token
+      # Edge functions (m10): its bearer for the service runner (lifecycle, status, logs).
+      CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-service-runner.token
       # object-storage m8: the sweep reads and deletes unreferenced blobs as the `storage`
       # identity (bucket chelabase-storage only).
       CHELABASE_STORAGE_BACKEND: seaweedfs
@@ -1069,14 +1103,23 @@ services:
       CHELABASE_STORAGE_SWEEP_GRACE_SECS: ${CHELABASE_STORAGE_SWEEP_GRACE_SECS:-}
       CHELABASE_STORAGE_SWEEP_SECS: ${CHELABASE_STORAGE_SWEEP_SECS:-}
       CHELABASE_STORAGE_SWEEP_DRY_RUN: ${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
+      # Edge functions m7: the bundle sweep reads and deletes unreferenced function bundles as
+      # the `functions` identity (bucket chelabase-functions only), over the settings above.
+      CHELABASE_FUNCTIONS_S3_BUCKET: chelabase-functions
+      CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/functions-s3/access-key
+      CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE: /run/chelabase/secrets/functions-s3/secret-key
       # object-storage m18: where it delivers storage webhooks (checked again on each delivery).
       # Blank: https to public addresses only.
       CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
       CHELABASE_WEBHOOKS_ALLOW_HTTP: ${CHELABASE_WEBHOOKS_ALLOW_HTTP:-}
-    # P4: it dials computes (compute_ctl) on the compute network.
+    # P4: it dials computes (compute_ctl) on the compute network. `functions-control` (m4b): the
+    # functions service's internal listener, for invocations. `services-control` (m10): the
+    # service runner's API.
     networks:
       default: {}
       compute: {}
+      functions-control: {}
+      services-control: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/neon/compute-jwt.pem, read_only: true, volume: {subpath: neon/compute-jwt.pem}}
@@ -1085,12 +1128,16 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/valkey/control.password, read_only: true, volume: {subpath: valkey/control.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/pg.password, read_only: true, volume: {subpath: realtime/pg.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-functions.token, read_only: true, volume: {subpath: tokens/worker-functions.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-service-runner.token, read_only: true, volume: {subpath: tokens/worker-service-runner.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca, volume: {subpath: compute-ca}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, volume: {subpath: realtime-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/access-key, read_only: true, volume: {subpath: functions-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/secret-key, read_only: true, volume: {subpath: functions-s3/secret-key}}
       - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
     healthcheck:
       <<: *app-health
@@ -1134,12 +1181,16 @@ services:
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
     ports:
       - "${CHELABASE_HTTP_ADDR:-127.0.0.1}:${CHELABASE_HTTP_PORT:-${CHELABASE_PUBLIC_PORT:-8000}}:${CHELABASE_PUBLIC_PORT:-8000}"
+    # #183: also on the runtime's `functions` network as `gateway-functions`, the address of the
+    # functions' `env.CHELABASE` binding (always on the API host; it grants nothing by itself).
     networks:
       default:
         aliases:
           - ${CHELABASE_STUDIO_HOST_NAME:-studio.chelabase.localhost}
           - ${CHELABASE_API_HOST_NAME:-api.chelabase.localhost}
           - ${CHELABASE_AUTH_HOST_NAME:-auth.chelabase.localhost}
+      functions:
+        aliases: [gateway-functions]
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-signing.pem, read_only: true, volume: {subpath: gateway/internal-signing.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
@@ -1324,6 +1375,175 @@ services:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_STUDIO_HOST_NAME:-studio.chelabase.localhost}", "http://127.0.0.1:3000/"]
 
+  # Edge functions (m4b): runs a branch's functions in the runtime and serves their bundles. Its
+  # public listener (8091) takes the gateway's /functions/v1 calls on the default network; its
+  # internal one (8080) serves bundles to the runtime on `functions` and takes the orchestrator's
+  # bundle uploads and the worker's invocations, each with its own bearer, on `functions-control`.
+  # Each listener binds the service's alias on its networks only (plus loopback for the
+  # healthcheck), never 0.0.0.0. It reads the metadata database (resolutions, secrets, the
+  # run-as key) and the bundles bucket as the `functions` S3 identity, and listens for
+  # `chelabase.fn.changed.*` as its own NATS user. Profile `functions` (with the runtime) until
+  # its image's first pin: `COMPOSE_PROFILES=functions` with a locally built image
+  # (docker-compose.build.yml). Without it the gateway's /functions/v1 and the orchestrator's
+  # deployments answer as unavailable; the worker's invocations fail and retry.
+  functions:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["functions"]
+    restart: unless-stopped
+    read_only: true
+    environment:
+      <<: *app-env
+      # Fixed addresses only: the service runner attaches this container to each service's own
+      # network (m10), where it must listen on nothing, so traffic flows functions → service.
+      CHELABASE_FUNCTIONS_ADDR: functions-public:8091,127.0.0.1:8091
+      # The internal listener in two sides (#181): bundle GETs for the runtime, uploads and
+      # invocations for the orchestrator and the worker.
+      CHELABASE_FUNCTIONS_INTERNAL_ADDR: functions-internal:8080
+      CHELABASE_FUNCTIONS_CONTROL_ADDR: functions-control:8080
+      CHELABASE_FUNCTIONS_RUNTIME_URL: http://functions-runtime:8080
+      CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
+      CHELABASE_NATS_USER: functions
+      CHELABASE_NATS_PASSWORD_FILE: /run/chelabase/secrets/nats/functions.password
+      CHELABASE_NATS_INBOX_PREFIX: _INBOX_functions
+      # The orchestrator's bearer, both ways (m13b: the dispatcher login's connection info).
+      CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-functions.token
+      CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-functions.token
+      # Edge functions (m10): its bearer for the service runner (container services, m11).
+      CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/functions-service-runner.token
+      CHELABASE_STORAGE_BACKEND: seaweedfs
+      CHELABASE_STORAGE_S3_ENDPOINT: http://seaweedfs:8333
+      CHELABASE_STORAGE_S3_BUCKET: chelabase-functions
+      CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/functions-s3/access-key
+      CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/functions-s3/secret-key
+      # .env's tunables (blank = the service's default).
+      CHELABASE_FUNCTIONS_TIMEOUT_MS: ${CHELABASE_FUNCTIONS_TIMEOUT_MS:-}
+      # External services: hosts allowed to resolve to private addresses, and http (both blank =
+      # public https only). The orchestrator checks the same at save time.
+      CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      CHELABASE_SERVICES_ALLOW_HTTP: ${CHELABASE_SERVICES_ALLOW_HTTP:-}
+    networks:
+      default:
+        aliases: [functions-public]
+      functions:
+        aliases: [functions-internal]
+      functions-control:
+        aliases: [functions-control]
+      services-control: {}
+      # m13b: the database-event dispatcher dials computes as its own login (verified against
+      # the compute CA, as rest). It listens on nothing here: its listeners bind the aliases
+      # above only.
+      compute: {}
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/nats/functions.password, read_only: true, volume: {subpath: nats/functions.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-functions.token, read_only: true, volume: {subpath: tokens/orchestrator-functions.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-functions.token, read_only: true, volume: {subpath: tokens/worker-functions.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/functions-service-runner.token, read_only: true, volume: {subpath: tokens/functions-service-runner.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/access-key, read_only: true, volume: {subpath: functions-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/functions-s3/secret-key, read_only: true, volume: {subpath: functions-s3/secret-key}}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8091/health"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+
+  # Edge functions (m10): the service runner, the one component that starts member service
+  # containers, so the only new holder of the Docker socket (the orchestrator and the worker
+  # hold it for computes; functions, the runtime and service containers never). Profile
+  # `services`, off by default. It acts only on containers labelled with this stack and a
+  # service, hardens every one it creates (non-root, read-only, no capability, no host mount,
+  # device or namespace, limits) and puts each on a private network of its own, which only this
+  # project's functions container joins (the runner attaches it). Its API binds its alias on
+  # the internal `services-control` network (the functions service and the worker, each with its
+  # own bearer) and loopback; it reads the metadata (desired state) on the default network.
+  service-runner:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["services"]
+    restart: unless-stopped
+    user: "0"
+    entrypoint: *app-with-docker
+    command: ["service-runner"]
+    read_only: true
+    environment:
+      <<: *app-env
+      CHELABASE_SERVICE_RUNNER_ADDR: service-runner-control:8094,127.0.0.1:8094
+      # Whose `functions` container it attaches to each service network.
+      CHELABASE_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
+      CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
+      CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/functions-service-runner.token
+      CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-service-runner.token
+      # .env's tunables (blank = the service's default).
+      CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB: ${CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB:-}
+      CHELABASE_SERVICE_RUNNER_CPU_CAP: ${CHELABASE_SERVICE_RUNNER_CPU_CAP:-}
+      CHELABASE_SERVICE_RUNNER_RECONCILE_SECS: ${CHELABASE_SERVICE_RUNNER_RECONCILE_SECS:-}
+    networks:
+      default: {}
+      services-control:
+        aliases: [service-runner-control]
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/functions-service-runner.token, read_only: true, volume: {subpath: tokens/functions-service-runner.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-service-runner.token, read_only: true, volume: {subpath: tokens/worker-service-runner.token}}
+      - {type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8094/health"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      metadata-db:
+        condition: service_healthy
+
+  # Edge functions (m1): workerd running member bundles, loaded by hash through its Worker Loader
+  # from the functions service's internal listener (`functions-internal:8080`), its only peer on
+  # the internal `functions` network. Its outbound is `functions-egress` alone, and workerd's
+  # `egress` service lets user code reach public addresses only
+  # (infra/functions-runtime/config.capnp). It never shares a network with the orchestrator or
+  # the worker. No secret, no published port, no volume; non-root on a read-only root with every
+  # capability dropped. workerd runs all isolates on one thread, so a bundle in a busy loop stalls
+  # the others: the image's watchdog probes a trivial worker every 2s and after 3 failures ends
+  # the container, which `always` restarts. Profile `functions`, with the functions service: its
+  # image isn't published yet, so run both from a build of the clone (docker-compose.build.yml:
+  # `COMPOSE_PROFILES=functions docker compose -f docker-compose.yml -f docker-compose.build.yml
+  # up -d --build`). Setting CHELABASE_IMAGE_REPO or CHELABASE_IMAGE_TAG instead would retag
+  # every app image, not just these two.
+  functions-runtime:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["functions"]
+    # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
+    # its listening port, always on the API host.
+    command: ["/usr/local/bin/workerd", "serve", "--experimental",
+              "--external-addr", "chelabase-api=gateway-functions:${CHELABASE_PUBLIC_PORT:-8000}",
+              "/etc/functions-runtime/config.capnp"]
+    environment:
+      CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
+    restart: always
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CHELABASE_FUNCTIONS_RUNTIME_MEMORY:-1g}
+    pids_limit: 256
+    networks:
+      functions: {}
+      functions-egress: {}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/busybox", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:9090/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
 networks:
   # Orchestrator and realtime to computes (<project>_control), with static addresses for the
   # login rules; computes take addresses from the upper /23 only. Change it in .env when it
@@ -1336,11 +1556,25 @@ networks:
   # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
   # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
   # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime,
-  # storage).
+  # storage, functions).
   # Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the storage broker or controller,
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).
   compute: {}
+  # Edge functions (m1): the functions service and the runtime, and the gateway's alias for the
+  # runtime's `env.CHELABASE` binding (#183); nothing else, no route out.
+  functions:
+    internal: true
+  # Edge functions (m4b): the orchestrator and the worker to the functions service's internal
+  # listener; never the runtime. No route out.
+  functions-control:
+    internal: true
+  # The runtime's only way out (workerd allows public addresses only); nothing else is on it.
+  functions-egress: {}
+  # Edge functions (m10): the functions service and the worker to the service runner's API; no
+  # route out.
+  services-control:
+    internal: true
 
 volumes:
   # Every key, password and token, chelabase-init's layout (plus bootstrap/). Never delete it

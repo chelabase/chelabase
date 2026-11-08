@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the ten release images
+#   scripts/image-inputs.sh images                  the thirteen release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD
@@ -18,21 +18,24 @@
 #   Rust images   the service's closure of workspace path crates (normal and build deps, from
 #                 `cargo metadata`), the manifest of every crate any Rust image builds (one cargo
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
-#                 .cargo/ (storage's package is chelabase-storage-service; the others are named
-#                 after their image)
+#                 .cargo/ (storage's package is chelabase-storage-service, functions'
+#                 chelabase-functions, service-runner's chelabase-service-runner; the others are
+#                 named after their image)
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
 #                 the build reads outside the graph: studio.Caddyfile, openapi/,
 #                 infra/compose/.env.example (its pin block left out: pinning rewrites it)
 #   identity      services/identity and its workspace: dependencies, package.json, pnpm-lock.yaml,
 #                 pnpm-workspace.yaml, identity.Dockerfile
+#   functions-runtime  infra/functions-runtime (the supervisor, its config and the watchdog) and
+#                 functions-runtime.Dockerfile
 # A pin commit missing from history (or no pin yet: the default tag `unpublished`) counts as
 # changed, with a warning.
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime storage init studio identity)
-rust=(gateway orchestrator worker rest auth realtime storage init)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
+rust=(gateway orchestrator worker rest auth realtime storage functions service-runner init)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
@@ -43,6 +46,8 @@ meta="" # cargo metadata, read once by the main part
 package() { # package <image>: the cargo package it builds (server.Dockerfile's `-p`)
   case "$1" in
     storage) echo chelabase-storage-service ;;
+    functions) echo chelabase-functions ;;
+    service-runner) echo chelabase-service-runner ;;
     *) echo "$1" ;;
   esac
 }
@@ -90,6 +95,8 @@ inputs() { # inputs <image>
     identity)
       pnpm_dirs services/identity
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/identity.Dockerfile ;;
+    functions-runtime)
+      printf '%s\n' infra/functions-runtime infra/images/functions-runtime.Dockerfile ;;
     *)
       rust_dirs "$1"
       rust_dirs "${rust[@]}" | sed 's#$#/Cargo.toml#'
@@ -169,6 +176,7 @@ case "$cmd" in
       copies "$root/infra/images/server.Dockerfile" "${rust[@]}" || rc=1
       copies "$root/infra/images/studio.Dockerfile" studio || rc=1
       copies "$root/infra/images/identity.Dockerfile" identity || rc=1
+      copies "$root/infra/images/functions-runtime.Dockerfile" functions-runtime || rc=1
       [[ $rc -eq 0 ]] && echo "image-inputs: every Dockerfile COPY is within its images' inputs"
       exit $rc
     fi ;;

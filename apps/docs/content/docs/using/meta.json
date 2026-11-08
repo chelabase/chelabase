@@ -12,6 +12,8 @@
     "data-api",
     "client",
     "storage",
+    "functions",
+    "services",
     "app-users",
     "sql-editor",
     "table-editor",

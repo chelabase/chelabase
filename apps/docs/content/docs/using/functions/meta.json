@@ -1,0 +1,14 @@
+{
+  "title": "Functions",
+  "pages": [
+    "index",
+    "quickstart",
+    "project-file",
+    "handlers",
+    "bundling",
+    "environment",
+    "auth-and-limits",
+    "schedules",
+    "triggers"
+  ]
+}

@@ -626,6 +626,9 @@ pub struct InternalState<M, L> {
     pub realtime_token: String,
     /// The storage service's token: its login's connection info, and the data connection info.
     pub storage_token: String,
+    /// Edge functions m13b: the functions service's token (the orchestrator's bearer for it,
+    /// both ways as rest's): the dispatcher login's connection info only. Empty: refused.
+    pub functions_token: String,
     /// Publishes realtime's events (the DDL hook's `pg_database.*`).
     pub rt_events: Arc<dyn realtime::RtEvents>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
@@ -739,6 +742,15 @@ where
             get(data::storage_connection::<M, L>),
         )
         .route_layer(middleware::from_fn_with_state(storage_token, require_bearer));
+    // m13b: the `chelabase_functions_dispatch` login's password: the functions service's
+    // bearer only.
+    let functions_token: Arc<str> = state.functions_token.as_str().into();
+    let functions = Router::new()
+        .route(
+            "/internal/functions/branches/{id}/connection",
+            get(data::functions_connection::<M, L>),
+        )
+        .route_layer(middleware::from_fn_with_state(functions_token, require_bearer));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -756,6 +768,7 @@ where
         .merge(data_keys)
         .merge(rest)
         .merge(storage)
+        .merge(functions)
         .merge(signup)
         .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())

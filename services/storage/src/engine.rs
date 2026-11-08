@@ -283,9 +283,9 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                 })
                 .await
                 .map_err(|e| match e {
-                    RoleRefused::OwnerLevel(role) | RoleRefused::UnknownRole(role) => {
-                        Failure::role_not_allowed(&role)
-                    }
+                    RoleRefused::OwnerLevel(role)
+                    | RoleRefused::Reserved(role)
+                    | RoleRefused::UnknownRole(role) => Failure::role_not_allowed(&role),
                     RoleRefused::Check(f) => Failure(f),
                 })?;
                 let settings = session.settings(&served);

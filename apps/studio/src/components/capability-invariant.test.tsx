@@ -96,7 +96,7 @@ function meFor(p: Persona): Me {
   const role = grantRole(p);
   const databases = narrowedPersona(p) ? [{ database_id: "d1", platform_role: "viewer" as const, roles: ["reporting"] }] : [];
   return {
-    sub: "u", email: "u@example.test", name: "U", tenant_id: "t1", instance_admin: tenantAdmin, tenant_admins: [],
+    sub: "u", email: "u@example.test", name: "U", tenant_id: "t1", instance_admin: tenantAdmin, functions_available: true, tenant_admins: [],
     member: { id: "u", status: "active", tenant_admin: tenantAdmin },
     projects: [{ project_id: "p1", platform_role: role, roles: tenantAdmin ? "all" : ["reporting"], databases }],
     user: { sub: "u" },

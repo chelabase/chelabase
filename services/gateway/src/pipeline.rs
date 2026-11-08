@@ -38,12 +38,19 @@ pub const SERVER_KEY_HEADER: &str = "chelabase-server-key";
 /// (`Auth::PublicDataKey`) and only with the branch's secret key in [`SERVER_KEY_HEADER`];
 /// never forwarded.
 pub const CLIENT_IP_HEADER: &str = "chelabase-client-ip";
+/// For the functions service only, set by the gateway after it verified them: the caller's
+/// key when it is a public key, and the verified user token. Every other upstream gets
+/// neither, and a client's copies are removed everywhere.
+pub const FORWARDED_KEY_HEADER: &str = "chelabase-forwarded-key";
+pub const FORWARDED_USER_HEADER: &str = "chelabase-forwarded-user";
 const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     IDENTITY_HEADER,
     "authorization",
     USER_TOKEN_HEADER,
     SERVER_KEY_HEADER,
     CLIENT_IP_HEADER,
+    FORWARDED_KEY_HEADER,
+    FORWARDED_USER_HEADER,
 ];
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id, x-chelabase-studio";
 /// Any-origin (data key, app user) routes: the request headers `@chelabase/client` sends to the
@@ -86,6 +93,8 @@ pub struct ProxyPlan {
     /// The address `X-Forwarded-For` names upstream: the request's client address, or on an
     /// app auth route the one the app's server vouched for with its secret key.
     pub client_ip: Option<IpAddr>,
+    /// [`FORWARDED_KEY_HEADER`] and [`FORWARDED_USER_HEADER`], on a functions call only.
+    pub forwarded: Vec<(&'static str, String)>,
 }
 
 /// Header edits for the upstream request: remove first, then set.
@@ -102,6 +111,7 @@ impl ProxyPlan {
         if let Some(token) = &self.identity {
             set.push((IDENTITY_HEADER, token.clone()));
         }
+        set.extend(self.forwarded.iter().cloned());
         UpstreamHeaders {
             remove: STRIPPED_REQUEST_HEADERS,
             set,
@@ -262,6 +272,7 @@ impl Pipeline {
         let cors = self.cors_headers(endpoint, req.headers);
 
         let mut client_ip = req.client_ip;
+        let mut forwarded = Vec::new();
         let identity = match endpoint.policy.auth {
             Auth::Public => None,
             Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
@@ -271,9 +282,12 @@ impl Pipeline {
                     .authenticate_key(endpoint.service, req, secret_only, public_only, request_id)
                     .await
                 {
-                    Ok((token, vouch)) => {
+                    Ok((token, vouch, forward)) => {
                         if let Vouch::ClientIp(ip) = vouch {
                             client_ip = Some(ip);
+                        }
+                        if endpoint.service == Service::Functions {
+                            forwarded = forward;
                         }
                         Some(token)
                     }
@@ -302,6 +316,7 @@ impl Pipeline {
             identity,
             response_headers: cors,
             client_ip,
+            forwarded,
         })
     }
 
@@ -316,13 +331,19 @@ impl Pipeline {
             return None;
         };
         if endpoint.policy.cors == Cors::Any {
+            // A function or service reads headers of its own choosing, so its routes allow what
+            // the browser asks for; the other routes allow the client library's fixed list.
+            let allow_headers = match header_str(req.headers, "access-control-request-headers") {
+                Some(asked) if endpoint.service == Service::Functions => asked,
+                _ => CORS_ANY_ALLOW_HEADERS,
+            };
             // Exactly the matched endpoint's method: the route table, not a hand list.
             return Some(GatewayResponse {
                 status: 204,
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
                     ("access-control-allow-methods", endpoint.method.as_str().to_string()),
-                    ("access-control-allow-headers", CORS_ANY_ALLOW_HEADERS.to_string()),
+                    ("access-control-allow-headers", allow_headers.to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
                 body: None,
@@ -392,7 +413,7 @@ impl Pipeline {
         secret_only: bool,
         public_only: bool,
         request_id: &str,
-    ) -> Result<(String, Vouch), GatewayResponse> {
+    ) -> Result<(String, Vouch, Vec<(&'static str, String)>), GatewayResponse> {
         let key = bearer_token(req.headers).ok_or(KeyError::Missing).map_err(key_error)?;
         let resolved = self.keys.resolve(key, req.client_ip).await.map_err(key_error)?;
         if let Some(refused) = key_kind_refusal(secret_only, public_only, resolved.kind) {
@@ -435,6 +456,16 @@ impl Pipeline {
         } else {
             Vouch::None
         };
+        // What a functions call may hand its function (the caller's own public key and verified
+        // token, so the function can call the data API as the caller); the caller keeps the
+        // list for `Service::Functions` only. A secret key is never in it.
+        let mut forward = Vec::new();
+        if resolved.kind == DataKeyKind::Public {
+            forward.push((FORWARDED_KEY_HEADER, key.to_string()));
+            if let Some(token) = header_str(req.headers, USER_TOKEN_HEADER) {
+                forward.push((FORWARDED_USER_HEADER, token.to_string()));
+            }
+        }
         let identity = Identity {
             sub: resolved.key_id.to_string(),
             auth: AuthMethod::DataKey,
@@ -457,7 +488,7 @@ impl Pipeline {
             error!("mint internal identity: {err}");
             internal_key_error(request_id)
         })?;
-        Ok((token, vouch))
+        Ok((token, vouch, forward))
     }
 
     /// What the app's server vouches for when [`SERVER_KEY_HEADER`] holds the secret key of the
@@ -1581,6 +1612,50 @@ mod tests {
         assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), Some("etag, content-range"));
     }
 
+    /// Review: a function or service reads its own request headers, so the preflight for those
+    /// routes allows what the browser asks for; other any-origin routes keep the fixed list.
+    #[tokio::test]
+    async fn a_functions_preflight_allows_the_requested_headers() {
+        let h = data_harness().await;
+        let public = format!("/functions/v1/public/{}/hello", TestUuid::new_v4());
+        for path in ["/functions/v1/hello", "/functions/v1/hello/a", public.as_str(), "/services/v1/box/x"] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", "PATCH"),
+                        ("access-control-request-headers", "x-custom, content-type"),
+                    ],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(resp.status, 204, "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"), "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-headers"), Some("x-custom, content-type"), "{path}");
+        }
+        let resp = expect_response(
+            run(
+                &h.pipeline,
+                "OPTIONS",
+                "/data/v1/query",
+                None,
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "POST"),
+                    ("access-control-request-headers", "x-custom"),
+                ],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(header(&resp.headers, "access-control-allow-headers"), Some(CORS_ANY_ALLOW_HEADERS));
+    }
+
     #[tokio::test]
     async fn cors_any_preflight_and_response_headers() {
         let h = data_harness().await;
@@ -2326,6 +2401,135 @@ mod tests {
         assert!(text.contains("chelabase-client-ip"), "the decisions are logged:\n{text}");
         for value in [k.secret.as_str(), k.public.as_str(), &other, &unknown, &failing, "203.0.113", "2001:db8", "unknown-ip-value"] {
             assert!(!text.contains(value), "{value} logged:\n{text}");
+        }
+    }
+
+    // ---- edge functions m4: the functions upstream ----
+
+    fn set_value<'a>(edits: &'a UpstreamHeaders, name: &str) -> Option<&'a str> {
+        edits.set.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
+    }
+
+    /// The gateway hands the functions service the caller's key only when it is a public key,
+    /// after resolving it; a secret key never leaves the gateway. The identity is minted for
+    /// `functions` and names the key's branch.
+    #[tokio::test]
+    async fn functions_calls_forward_a_public_key_only() {
+        let h = data_harness().await;
+        for kind in [DataKeyKind::Public, DataKeyKind::Secret] {
+            let key = dk::new_key(kind);
+            let resolved = dk::resolved(kind);
+            h.mock.set(&key, Answer::Known(resolved.clone()));
+            for path in ["/functions/v1/hello", "/functions/v1/hello/a/b"] {
+                let plan = expect_plan(data_call(&h, "POST", path, Some(&key)).await.outcome);
+                assert_eq!(plan.endpoint.service, Service::Functions, "{path}");
+                let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "functions").unwrap();
+                assert_eq!(claims.data.unwrap().branch_id, resolved.branch_id);
+                let edits = plan.upstream_headers("rid");
+                let forwarded = set_value(&edits, FORWARDED_KEY_HEADER);
+                match kind {
+                    DataKeyKind::Public => assert_eq!(forwarded, Some(key.as_str())),
+                    DataKeyKind::Secret => assert_eq!(forwarded, None),
+                }
+                assert_eq!(set_value(&edits, FORWARDED_USER_HEADER), None);
+                assert!(edits.remove.contains(&"authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn functions_calls_forward_the_verified_user_token() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let bearer = format!("Bearer {}", case.key);
+        let plan = expect_plan(
+            run(&h.pipeline, "GET", "/functions/v1/hello", None, &[("authorization", &bearer), ("chelabase-user", &token)])
+                .await
+                .outcome,
+        );
+        let edits = plan.upstream_headers("rid");
+        assert_eq!(set_value(&edits, FORWARDED_KEY_HEADER), Some(case.key.as_str()));
+        assert_eq!(set_value(&edits, FORWARDED_USER_HEADER), Some(token.as_str()));
+        assert!(edits.remove.contains(&USER_TOKEN_HEADER));
+    }
+
+    #[tokio::test]
+    async fn functions_key_form_without_a_key_is_401() {
+        let h = data_harness().await;
+        let resp = expect_response(data_call(&h, "GET", "/functions/v1/hello", None).await.outcome);
+        assert_eq!(resp.status, 401);
+    }
+
+    /// The keyless `/public/` form: no identity, nothing forwarded, whatever the client sent.
+    #[tokio::test]
+    async fn the_public_functions_form_mints_and_forwards_nothing() {
+        let h = data_harness().await;
+        let key = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&key, Answer::Known(dk::resolved(DataKeyKind::Public)));
+        let bearer = format!("Bearer {key}");
+        let path = format!("/functions/v1/public/{}/hello/x", TestUuid::new_v4());
+        let plan = expect_plan(
+            run(
+                &h.pipeline,
+                "GET",
+                &path,
+                None,
+                &[("authorization", &bearer), (FORWARDED_KEY_HEADER, "forged"), (FORWARDED_USER_HEADER, "forged")],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(plan.endpoint.service, Service::Functions);
+        assert_eq!(plan.identity, None);
+        let edits = plan.upstream_headers("rid");
+        assert_eq!(set_value(&edits, FORWARDED_KEY_HEADER), None);
+        assert_eq!(set_value(&edits, FORWARDED_USER_HEADER), None);
+        assert!(edits.remove.contains(&FORWARDED_KEY_HEADER));
+        assert!(edits.remove.contains(&FORWARDED_USER_HEADER));
+    }
+
+    /// No other upstream ever gets either forwarded header: the client's copies are removed
+    /// and the gateway sets them for the functions service only.
+    #[tokio::test]
+    async fn neither_forwarded_header_reaches_rest_or_realtime() {
+        let h = data_harness().await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        let token = user_token(&h, case.project, case.sid, 300);
+        let bearer = format!("Bearer {}", case.key);
+        let forged = [
+            ("authorization", bearer.as_str()),
+            ("chelabase-user", token.as_str()),
+            (FORWARDED_KEY_HEADER, "forged"),
+            (FORWARDED_USER_HEADER, "forged"),
+        ];
+        let mut services = Vec::new();
+        for (method, path) in [("POST", "/data/v1/query"), ("GET", "/v1/realtime/socket")] {
+            let handled = run(&h.pipeline, method, path, None, &forged).await;
+            let Outcome::Proxy(plan) = handled.outcome else { continue };
+            services.push(plan.endpoint.service);
+            let edits = plan.upstream_headers("rid");
+            assert!(edits.remove.contains(&FORWARDED_KEY_HEADER), "{path}");
+            assert!(edits.remove.contains(&FORWARDED_USER_HEADER), "{path}");
+            assert_eq!(set_value(&edits, FORWARDED_KEY_HEADER), None, "{path}");
+            assert_eq!(set_value(&edits, FORWARDED_USER_HEADER), None, "{path}");
+        }
+        assert_eq!(services, vec![Service::Rest, Service::Realtime]);
+    }
+
+    #[tokio::test]
+    async fn the_functions_internal_routes_are_not_routable() {
+        let h = data_harness().await;
+        let sha = "a".repeat(64);
+        for (method, path) in [
+            ("GET", format!("/internal/bundles/{}/{sha}", TestUuid::new_v4())),
+            ("PUT", format!("/internal/bundles/{}/{sha}", TestUuid::new_v4())),
+            ("POST", format!("/internal/invoke/{}/hello", TestUuid::new_v4())),
+        ] {
+            let resp = expect_response(run(&h.pipeline, method, &path, None, &[]).await.outcome);
+            assert_eq!(resp.status, 404, "{method} {path}");
         }
     }
 }

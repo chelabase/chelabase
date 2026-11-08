@@ -72,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
 
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
+    // Every later use (the API, the internal listener) seals function secrets with it.
+    let metadata = orchestrator::with_function_secrets(metadata, &secrets);
 
     let data_api_database_cap = orchestrator::data_api_database_cap(
         std::env::var("CHELABASE_BRANCH_DATA_API_DATABASE_CAP").ok().as_deref(),
@@ -100,6 +102,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(ProxyCache::from_lookup(&internal_config.valkey_url, |name| {
             std::env::var(name).ok()
         })?);
+    // m13b: the bearer the orchestrator calls the functions service with, and the one that
+    // service asks for its dispatcher login with (both ways, as rest's). Read once; unset or
+    // blank closes the route and makes deployments answer 503.
+    let functions_token = chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
         locator: DockerLocator::connect(&internal_config.compute_network, &internal_config.stack)?,
@@ -117,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         rest_token: internal_config.rest_token.clone(),
         realtime_token: internal_config.realtime_token.clone(),
         storage_token: internal_config.storage_token.clone(),
+        // m13b: the functions service asks for its dispatcher login with the bearer the
+        // orchestrator calls it with (both ways, as rest's); unset closes the route.
+        functions_token: functions_token.clone(),
         rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
@@ -150,11 +161,32 @@ async fn main() -> anyhow::Result<()> {
 
     let rt_events: Arc<dyn orchestrator::internal::realtime::RtEvents> = Arc::new(nats.clone());
     // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
-    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::WEBHOOKS_ENV, |name| std::env::var(name).ok())
         .map_err(anyhow::Error::msg)?;
     for entry in webhooks.allow_hosts_with_port() {
         warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
     }
+    // Edge functions m9: where external services' URLs may point (CHELABASE_SERVICES_*, never
+    // the webhooks' settings), checked at save time; the functions service checks again at
+    // every connection. The stack's names, loopback, link-local and its networks
+    // (CHELABASE_INTERNAL_SUBNETS and those this container is on) are refused even when allowed.
+    let mut internal_nets = chelabase_http::outbound::parse_nets(&std::env::var("CHELABASE_INTERNAL_SUBNETS").unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("CHELABASE_INTERNAL_SUBNETS: {e}"))?;
+    internal_nets.extend(chelabase_http::outbound::attached_nets());
+    let services = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::SERVICES_ENV, |name| std::env::var(name).ok())
+        .map_err(anyhow::Error::msg)?
+        .deny_stack(internal_nets);
+    // Edge functions m3: bundles go to the functions service's internal listener.
+    let functions_url = std::env::var("CHELABASE_FUNCTIONS_INTERNAL_URL").ok().filter(|v| !v.trim().is_empty());
+    if functions_url.is_none() {
+        warn!("CHELABASE_FUNCTIONS_INTERNAL_URL is unset or blank: function deployments answer 503");
+    }
+    let bundles: orchestrator::functions::Bundles = Arc::new(orchestrator::functions::HttpBundleSink::new(
+        functions_url,
+        functions_token,
+        // Never a redirect (#26): the bearer goes to the functions service only.
+        chelabase_http::client_builder().build()?,
+    ));
     let state = AppState {
         metadata,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
@@ -193,6 +225,9 @@ async fn main() -> anyhow::Result<()> {
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
         webhooks,
+        services,
+        bundles,
+        rollouts: Default::default(),
         compute_tls: Some(compute_tls),
     };
 

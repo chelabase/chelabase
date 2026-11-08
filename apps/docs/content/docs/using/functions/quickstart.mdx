@@ -1,0 +1,89 @@
+---
+title: Functions quickstart
+description: Sign in, deploy a function with the CLI, edit it live with --watch, and call it with curl.
+---
+
+<AlphaNotice />
+
+This takes a running self-hosted stack to a function you can call. It needs a [database](/using/projects-and-databases) that is ready, Node.js (for esbuild) and the `chelabase` CLI. From a checkout of the repository, `cargo run -p chelabase --` stands in for `chelabase` in every command below.
+
+## 1. Sign in
+
+```bash
+chelabase login --url http://api.chelabase.localhost:8000 --email you@example.com
+```
+
+The password is prompted for (or read from stdin). The session is kept per instance URL in `~/.config/chelabase/credentials.json`, mode 0600, and the CLI never prints the token. An account that has a second sign-in step gets a clear error: only password sign-in is supported.
+
+## 2. Make a project
+
+Choose a folder, install esbuild, and write `chelabase.toml`. The database id is on the database's page in Studio, and in `GET /v1/databases`.
+
+```bash
+mkdir hello-functions && cd hello-functions
+npm init -y
+npm install --save-dev esbuild
+mkdir -p functions/hello
+```
+
+**`chelabase.toml`**
+
+```toml
+[project]
+url = "http://api.chelabase.localhost:8000"
+database = "<your database id>"
+
+[functions.hello]
+entry = "functions/hello/index.ts"
+```
+
+**`functions/hello/index.ts`**
+
+```ts
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const name = new URL(request.url).searchParams.get("name") ?? "world";
+    return Response.json({ hello: name });
+  },
+};
+```
+
+With no `branch`, the CLI uses the database's main branch. The full format is in [the project file](/using/functions/project-file).
+
+## 3. Deploy, and keep deploying on save
+
+```bash
+chelabase functions dev --watch
+```
+
+`dev` deploys every function in `chelabase.toml`, then redeploys each one whose files change. For each deploy it prints the deployment id and, on a change, how long the change took to go live:
+
+```text
+hello: deployed 6f1c…
+hello: deployed 0b8e… (412 ms after the change)
+```
+
+The first deploy creates the function and turns it on. A syntax error prints esbuild's message and leaves the previous deployment live. (`chelabase functions deploy` does one deploy and exits.)
+
+## 4. Call it
+
+Take the branch's **public key** (`chk_pub_…`) from the database's **Data API** view in Studio, and call the function:
+
+```bash
+export CHELABASE_PUBLIC_KEY=chk_pub_…
+curl -H "Authorization: Bearer $CHELABASE_PUBLIC_KEY" \
+  "http://api.chelabase.localhost:8000/functions/v1/hello?name=Ada"
+```
+
+```json
+{"hello":"Ada"}
+```
+
+Edit the file while `dev --watch` runs, save, and call again: the new code answers within a couple of seconds.
+
+## Where next
+
+- [Handlers](/using/functions/handlers): `fetch`, `scheduled` and event payloads.
+- [Secrets, env and the data API](/using/functions/environment): read and write your database from a function.
+- [Auth modes and limits](/using/functions/auth-and-limits).
+- [Schedules](/using/functions/schedules) and [Triggers](/using/functions/triggers).
