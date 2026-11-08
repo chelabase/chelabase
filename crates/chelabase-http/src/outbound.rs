@@ -216,12 +216,28 @@ pub fn parse_nets(list: &str) -> Result<Vec<Net>, String> {
         .collect()
 }
 
-/// The IPv4 networks this host is directly attached to (`/proc/net/route` routes without a
-/// gateway): a container's compose networks. Empty where the file can't be read.
+/// The networks this host is directly attached to: the IPv4 (`/proc/net/route`) and IPv6
+/// (`/proc/net/ipv6_route`) routes without a gateway, a container's compose networks. A table
+/// that can't be read adds none.
 pub fn attached_nets() -> Vec<Net> {
-    std::fs::read_to_string("/proc/net/route")
-        .map(|t| parse_route_table(&t))
-        .unwrap_or_default()
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let mut nets = parse_route_table(&read("/proc/net/route"));
+    nets.extend(parse_ipv6_route_table(&read("/proc/net/ipv6_route")));
+    nets
+}
+
+/// `ipv6_route` lines: destination, prefix length, source, source prefix, next hop (hex), …
+fn parse_ipv6_route_table(table: &str) -> Vec<Net> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let dest = u128::from_str_radix(f.first()?, 16).ok()?;
+            let prefix = u8::from_str_radix(f.get(1)?, 16).ok()?;
+            let next_hop = u128::from_str_radix(f.get(4)?, 16).ok()?;
+            (next_hop == 0 && prefix > 0).then(|| Net::new(IpAddr::V6(Ipv6Addr::from(dest)), prefix))?
+        })
+        .collect()
 }
 
 fn parse_route_table(table: &str) -> Vec<Net> {
@@ -1187,6 +1203,27 @@ mod tests {
                 Net::new(ip("192.168.16.0"), 20).unwrap()
             ]
         );
+    }
+
+    /// Audit S1: the IPv6 attached networks are the routes without a next hop (the default
+    /// route is not one).
+    #[test]
+    fn attached_ipv6_networks_come_from_the_route_table() {
+        let table = "\
+fd00000000000000000000000000ab00 78 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fd0000000000000000000000000000ab 00000400 00000001 00000000 00000003     eth0
+20010db8000000000000000000000000 40 00000000000000000000000000000000 00 fd0000000000000000000000000000ab 00000400 00000001 00000000 00000003     eth0
+";
+        assert_eq!(
+            parse_ipv6_route_table(table),
+            vec![
+                Net::new(ip("fd00::ab00"), 120).unwrap(),
+                Net::new(ip("fe80::"), 64).unwrap()
+            ]
+        );
+        let nets = parse_ipv6_route_table(table);
+        assert!(nets[0].contains(ip("fd00::abff")) && !nets[0].contains(ip("fd00::ac00")));
     }
 
     /// m9's hard deny: the stack's names in any case, with a trailing dot or as container
