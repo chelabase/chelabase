@@ -131,7 +131,7 @@
 
 use chelabase_metadata::{
     BranchRecord, BranchStatus, DatabaseOrigin, MetadataClient, RunAs, RunAsMint, RunAsUnmintable,
-    TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
+    TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
 };
 use chelabase_nats::{AllRowsCheckReply, AllRowsCheckRequest};
 use chelabase_neon::ComputeBackend;
@@ -923,17 +923,24 @@ BEGIN
 END $chelabase_fn$;
 DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
+  dropped pg_catalog.text;
 BEGIN
   IF ours IS NULL OR pg_catalog.to_regclass('{FUNCTIONS_SCHEMA}.outbox') IS NULL THEN
     RETURN;
   END IF;
   -- The outbox was repaired above; its cleanup runs as its owner, never as the superuser.
   SET LOCAL ROLE {OWNER};
-{truncate}  DELETE FROM {FUNCTIONS_SCHEMA}.outbox
-    WHERE timeline_id IS DISTINCT FROM pg_catalog.current_setting('neon.timeline_id', true)
-       OR trigger_id <> ALL (ARRAY[{ids}]::pg_catalog.uuid[]);
+{truncate}  -- m13b fix (S2): this timeline's rows it removes, per trigger, from the DELETE itself.
+  WITH d AS (DELETE FROM {FUNCTIONS_SCHEMA}.outbox
+      WHERE timeline_id IS DISTINCT FROM pg_catalog.current_setting('neon.timeline_id', true)
+         OR trigger_id <> ALL (ARRAY[{ids}]::pg_catalog.uuid[])
+      RETURNING trigger_id, timeline_id IS NOT DISTINCT FROM pg_catalog.current_setting('neon.timeline_id', true) AS here)
+  SELECT pg_catalog.string_agg(c.t || ':' || c.n, ' ') INTO dropped
+    FROM (SELECT d.trigger_id::pg_catalog.text AS t, pg_catalog.count(*)::pg_catalog.text AS n FROM d WHERE d.here GROUP BY 1) c;
   RESET ROLE;
+  PERFORM pg_catalog.set_config('chelabase_fn.dropped', coalesce(dropped, ''), true);
 END $chelabase_fn$;
+SELECT 'fn_dropped ' || coalesce(pg_catalog.current_setting('chelabase_fn.dropped', true), '');
 SELECT 'fn_trigger ' || w.trigger_id || CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_trigger tg
     JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     WHERE {EXACT}) THEN ' ok'
@@ -977,6 +984,19 @@ pub fn parse_sync(out: &str) -> Vec<(Uuid, Option<String>)> {
 /// default iteration count), so the install sets exactly it.
 pub fn dispatch_verifier(password: &str, salt: &[u8]) -> String {
     chelabase_neon::scram::verifier_with_salt(password, salt, 4096)
+}
+
+/// m13b fix (S2): the cleanup's `fn_dropped <id>:<n> …` line: the rows of each trigger it
+/// removed from this timeline.
+pub fn parse_dropped(out: &str) -> Vec<(Uuid, i64)> {
+    out.lines()
+        .filter_map(|l| l.trim().strip_prefix("fn_dropped"))
+        .flat_map(|rest| rest.split_whitespace())
+        .filter_map(|pair| {
+            let (id, n) = pair.split_once(':')?;
+            Some((id.parse().ok()?, n.parse().ok()?))
+        })
+        .collect()
 }
 
 /// What psql says when the database isn't there.
@@ -1107,6 +1127,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         }
         let mut answers: Vec<(Uuid, Option<String>)> = Vec::new();
+        let mut dropped: Vec<(Uuid, i64)> = Vec::new();
         let mut failure = None;
         let mut complete = true;
         for db in &databases {
@@ -1116,7 +1137,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .admin_sql(&ep, db, &sync_sql(&wanted, truncate, role))
                 .await
             {
-                Ok(out) => answers.extend(parse_sync(&out)),
+                Ok(out) => {
+                    answers.extend(parse_sync(&out));
+                    dropped.extend(parse_dropped(&out));
+                }
                 Err(e) => {
                     let e = format!("{e:#}");
                     let why = if database_missing(&e, db) {
@@ -1154,6 +1178,24 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         })
         .await?;
+        // m13b fix (S2): the queued events of a trigger no longer wanted (turned off, failed)
+        // count in its `dropped_count`, as when the dispatcher removes them.
+        let drops: Vec<TriggerDelivery> = dropped
+            .into_iter()
+            .filter(|(id, _)| triggers.iter().any(|t| t.id == *id))
+            .map(|(id, n)| TriggerDelivery {
+                id,
+                delivered: false,
+                dead: 0,
+                dropped: n,
+                error: None,
+            })
+            .collect();
+        if !drops.is_empty()
+            && let Err(e) = meta.record_trigger_deliveries(branch, &drops).await
+        {
+            warn!(branch_id = %branch, "recording the dropped events: {e}");
+        }
         failure.map_or(Ok(complete), Err)
     }
 
@@ -1604,7 +1646,7 @@ mod tests {
             "PERFORM pg_catalog.pg_notify('chelabase_functions', '');",
             "pg_catalog.jsonb_build_object(",
             "TRUNCATE chelabase_functions.outbox;",
-            "OR trigger_id <> ALL (ARRAY['01234567-89ab-cdef-0123-456789abcdef']::pg_catalog.uuid[]);",
+            "OR trigger_id <> ALL (ARRAY['01234567-89ab-cdef-0123-456789abcdef']::pg_catalog.uuid[])",
             "REVOKE ALL ON %s FROM %s CASCADE",
             "OR EXISTS (SELECT FROM pg_catalog.pg_trigger WHERE tgrelid = box)",
         ] {
@@ -1902,5 +1944,20 @@ mod tests {
         assert_eq!(refusal(&outbox), Some(RESERVED_SCHEMA));
         assert_eq!(refusal(&storage), Some(RESERVED_SCHEMA));
         assert_eq!(refusal(&fine), None);
+    }
+
+    /// m13b fix (S2): the cleanup counts this timeline's removed rows per trigger, from the
+    /// DELETE itself, as its owner; the worker reads them back.
+    #[test]
+    fn fn_triggers_cleanup_counts_what_it_drops() {
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, ROLES);
+        let role = sql.find("SET LOCAL ROLE chelabase_functions_owner;").unwrap();
+        let delete = sql.find("WITH d AS (DELETE FROM chelabase_functions.outbox").unwrap();
+        assert!(role < delete && delete < sql.find("RESET ROLE;").unwrap());
+        assert!(sql.contains("FROM d WHERE d.here GROUP BY 1"));
+        assert!(sql.contains("SELECT 'fn_dropped ' || coalesce(pg_catalog.current_setting('chelabase_fn.dropped', true), '');"));
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(parse_dropped(&format!("x\nfn_dropped {a}:2 {b}:1\n")), vec![(a, 2), (b, 1)]);
+        assert!(parse_dropped("fn_dropped \n").is_empty());
     }
 }
