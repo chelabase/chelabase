@@ -148,7 +148,7 @@ services:
   # `docker compose run --rm --no-deps --user 10001:10001 --entrypoint chelabase-init init-secrets setup-code --dir /var/lib/chelabase/secrets`
   # (the code is in the logs of the container that made it; a recreated init-secrets has none).
   init-secrets:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:88b4b76616b55880528324b70db1d8de58bf7d382772a9650a1d58f7d70dd946}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:626ed6c87f2ba8748705630428ff701e0bbbd41daaf5ecb75fff784acbc166b7}
     restart: "no"
     user: "0"
     network_mode: none
@@ -273,7 +273,7 @@ services:
   # migrated the metadata database (chelabase-init bootstrap); retries readiness on its own and
   # is never restarted, so `up --wait` reports a failure. Writes only bootstrap/ (its lock).
   init-bootstrap:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:88b4b76616b55880528324b70db1d8de58bf7d382772a9650a1d58f7d70dd946}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:626ed6c87f2ba8748705630428ff701e0bbbd41daaf5ecb75fff784acbc166b7}
     restart: "no"
     group_add: ["70"]
     command: ["chelabase-init", "bootstrap", "--out", "/run/chelabase/secrets/bootstrap"]
@@ -891,7 +891,7 @@ services:
   # Its image is a pinned release image like the apps' (CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick it too).
   identity:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:6f6292e2e788f3ec527837e1c99f358365bd709d742e470a45715d86737eabf5}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:e1dba9b1f5efa31b88d593cdcba2aa46f3321218b5b6be9e67ee771f9b50fd9d}
     restart: unless-stopped
     user: "10001:10001"
     read_only: true
@@ -963,7 +963,7 @@ services:
         condition: service_healthy
 
   orchestrator:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:8ec1df0075b15389d73c21a8e91c2e649b47ba861fdcfa4ccba644407adb71a1}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:8fbedd776addefe0519e2ea23f1ccc0c59a18191669946a695a7546a660a9cf5}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1060,7 +1060,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:7fa37425c4f01539103e6cb75fadecd043e7dac67e05e525fec6a75ee002e6be}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:efb06b1b98c1f9565f3966cfc8732a95bb004bbda1d840afdb9d6a17e6122fc8}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1170,7 +1170,7 @@ services:
   # member tokens' issuer only: the gateway serves nothing there.
   # Liveness only in its healthcheck (`/_gateway/ready` waits for its member verify key).
   gateway:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:2b04d608e2a237c3526184554e5940c64a1a510df9263b95bd986a2388c6070f}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:5808d0c3d7f8fea6b2e214b330b922bc5b47a2d8d95e0b5cf0935a3cc89e109c}
     restart: unless-stopped
     # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
     environment:
@@ -1208,7 +1208,7 @@ services:
   # computes reach it directly: only the gateway's X-Forwarded-For counts
   # (CHELABASE_AUTH_TRUSTED_PROXY=gateway, ruling (e)).
   auth:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:c03b174c91351140e8ec7775fe23ed078a4b169d7f25607ef51f104f1da198e5}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:e740d364e94d959ed3e7f775062bd469db8b0a5772b44c16883a5b05e0e9cab0}
     restart: unless-stopped
     # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
     environment:
@@ -1242,7 +1242,7 @@ services:
         condition: service_completed_successfully
 
   rest:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:e9142b67ee349bbb2ce9e472c6dd06e643126c3bc2731fc0396092590972e680}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:b4b63bbc83ea8d2e741ee3a7988155fb43af2843bd8e8f7f9765021a3e931b44}
     restart: unless-stopped
     # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
     environment:
@@ -1270,7 +1270,7 @@ services:
   # /health, which waits for the OIDC audiences. It verifies the gateway's identity on ticket
   # requests.
   realtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:e35a465a48236090bdacd229fe3d8a2b8eded12092671aabed68988a410716b9}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:cff7e9ea1f86251b70f278d5b358f791302654b8d8346be96599f3614dccf436}
     restart: unless-stopped
     # S1: its own credentials, from its own files below; Valkey TLS is platform mode's (S7).
     environment:
@@ -1324,7 +1324,7 @@ services:
   # Its image is a release image like the apps', pinned the same way (CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick it too).
   storage:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:0831e74428b6bae3ee34e752f53af0609a2fe3c82b3a4abbe5fc0aba2d77420c}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:2f422fc56dba60db780710bd1d56a37b2332e334fb4a8e4b90183f34b2cfb5a0}
     restart: unless-stopped
     read_only: true
     environment:
@@ -1367,7 +1367,7 @@ services:
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-ff5f35f85415@sha256:0c092c1fb9f54b0ac79a77bf668f207efb907818688c7d7c7a09d9e30624ee11}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:3954eac652d3051a53565bad16f703ca2beacc72e0f6ef3548b6bd0e226da03a}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
@@ -1382,13 +1382,9 @@ services:
   # Each listener binds the service's alias on its networks only (plus loopback for the
   # healthcheck), never 0.0.0.0. It reads the metadata database (resolutions, secrets, the
   # run-as key) and the bundles bucket as the `functions` S3 identity, and listens for
-  # `chelabase.fn.changed.*` as its own NATS user. Profile `functions` (with the runtime) until
-  # its image's first pin: `COMPOSE_PROFILES=functions` with a locally built image
-  # (docker-compose.build.yml). Without it the gateway's /functions/v1 and the orchestrator's
-  # deployments answer as unavailable; the worker's invocations fail and retry.
+  # `chelabase.fn.changed.*` as its own NATS user. On by default, with the runtime.
   functions:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-unpublished}
-    profiles: ["functions"]
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:6e71117032744afdc99d6626caeb5972ba7996db44205b7df81043e7b7bf9de9}
     restart: unless-stopped
     read_only: true
     environment:
@@ -1467,7 +1463,7 @@ services:
   # the internal `services-control` network (the functions service and the worker, each with its
   # own bearer) and loopback; it reads the metadata (desired state) on the default network.
   service-runner:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-unpublished}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:86abed797a9b6934c8c46d12016c3f77d4fd5b0fe89f2b89cabab7dcae42cf1a}
     profiles: ["services"]
     restart: unless-stopped
     user: "0"
@@ -1512,14 +1508,9 @@ services:
   # the worker. No secret, no published port, no volume; non-root on a read-only root with every
   # capability dropped. workerd runs all isolates on one thread, so a bundle in a busy loop stalls
   # the others: the image's watchdog probes a trivial worker every 2s and after 3 failures ends
-  # the container, which `always` restarts. Profile `functions`, with the functions service: its
-  # image isn't published yet, so run both from a build of the clone (docker-compose.build.yml:
-  # `COMPOSE_PROFILES=functions docker compose -f docker-compose.yml -f docker-compose.build.yml
-  # up -d --build`). Setting CHELABASE_IMAGE_REPO or CHELABASE_IMAGE_TAG instead would retag
-  # every app image, not just these two.
+  # the container, which `always` restarts. On by default, with the functions service.
   functions-runtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
-    profiles: ["functions"]
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-25ba87906cb8@sha256:086a53f7b691b863c9049ba3be2c560307be835ce478f324f403f6ce3bc607e0}
     # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
     # its listening port, always on the API host.
     command: ["/usr/local/bin/workerd", "serve", "--experimental",

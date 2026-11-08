@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # edge-functions m1: the functions runtime container is locked down as compose runs it.
 # shared-state: starts (or recreates) `functions-runtime` on this checkout's workbench stack
-# (profile `functions`) from the local image `chelabase/functions-runtime:latest`
+# from the local image `chelabase/functions-runtime:latest`
 # (`docker buildx bake -f infra/images/docker-bake.hcl functions-runtime`), then checks
 # `docker inspect`: non-root, read-only root, every capability dropped, no-new-privileges,
 # memory and pids limits, restart always, no published port, no secret mounted, and only the
@@ -26,7 +26,7 @@ ok() { echo "hardening: ok   $*"; }
 
 docker compose -p "$project" --project-directory "$root/infra/compose" \
   -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
-  --env-file "$env_file" --profile functions up -d --no-deps --wait --wait-timeout 60 functions-runtime
+  --env-file "$env_file" up -d --no-deps --wait --wait-timeout 60 functions-runtime
 
 c="$(docker ps -q --filter "label=com.docker.compose.project=$project" \
   --filter "label=com.docker.compose.service=functions-runtime" | head -n1)"

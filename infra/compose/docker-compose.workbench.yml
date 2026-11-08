@@ -209,12 +209,9 @@ services:
 
   # Edge functions (m1): the image `chelabase workbench up` builds locally from
   # infra/images/functions-runtime.Dockerfile, tagged by its inputs' hash (m4b).
-  # The base file's profile `functions` (until its images' first pin) is always on here: the
-  # workbench builds both images itself.
   functions-runtime:
     image: chelabase/functions-runtime:${CHELABASE_FUNCTIONS_RUNTIME_TAG:-latest}
     pull_policy: never
-    profiles: !reset []
 
   safekeeper1:
     user: "0"
@@ -730,8 +727,6 @@ services:
   functions:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/functions"]
-    # The base file's profile `functions` is always on here (see functions-runtime).
-    profiles: !reset []
     read_only: !reset null
     env_file:
       - *stack-env

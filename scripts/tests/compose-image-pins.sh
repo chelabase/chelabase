@@ -31,11 +31,10 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
 done
 digests="${1:-}"
 images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner)
-# Edge functions (m4b): the functions service and its runtime (profile `functions`), and the
-# service runner (profile `services`), until their first pin.
-unpublished=(functions functions-runtime service-runner)
+# Images added before their first release (none right now).
+unpublished=()
 # Every profile of the base file, so a render sees every service.
-profiles=(--profile services --profile functions)
+profiles=(--profile services)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }

@@ -177,7 +177,7 @@ Calls to a [function](/using/functions) (`/functions/v1/…`) and a [service](/u
 
 | Status | Code | Meaning |
 |---|---|---|
-| 503 | `functions_unavailable` | Edge functions aren't running on this instance: the gateway can't reach the functions service (the `functions` Compose profile is off, or the service is down). |
+| 503 | `functions_unavailable` | Edge functions aren't running on this instance: the gateway can't reach the functions service (the service is stopped or down). |
 | 404 | `function_not_found` | No such function, it's disabled on the branch, it's a service (call it on `/services/v1`), or the keyless `/functions/v1/public/…` form was used for a function that isn't `public`. |
 | 413 | `payload_too_large` | The request body is over 6 MiB. |
 | 504 | `function_timeout` | The function didn't answer within the wall clock (30 s, `CHELABASE_FUNCTIONS_TIMEOUT_MS`). Recorded as its `last_error`. |
@@ -195,7 +195,7 @@ The Management API's function routes answer the general codes above, and:
 
 | Status | Code | Meaning |
 |---|---|---|
-| 503 | `functions_unavailable` | The orchestrator can't reach the functions service (the `functions` Compose profile is off, or it's down), so bundles can't be deployed and container services can't be deployed, rolled over or read. Nothing was recorded. |
+| 503 | `functions_unavailable` | The orchestrator can't reach the functions service (it's stopped or down), so bundles can't be deployed and container services can't be deployed, rolled over or read. Nothing was recorded. |
 
 Container services add:
 

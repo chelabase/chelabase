@@ -7,9 +7,8 @@
 # Studio is built from infra/images/studio.Dockerfile, the identity service from
 # infra/images/identity.Dockerfile (Node, no cargo build) and the functions runtime from
 # infra/images/functions-runtime.Dockerfile (workerd, no cargo build). Nothing else changes: the same
-# wiring, secrets, users and healthchecks as docker-compose.yml. The functions service and its
-# runtime run only with their profile (`COMPOSE_PROFILES=functions`), the service runner with
-# `services`.
+# wiring, secrets, users and healthchecks as docker-compose.yml. The service runner runs only
+# with its profile (`COMPOSE_PROFILES=services`).
 
 # Built once (by init-secrets' build section); the other services use the same local image.
 x-server: &server
