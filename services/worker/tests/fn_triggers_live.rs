@@ -1488,15 +1488,20 @@ mod fn_triggers {
     use std::sync::{Arc, Mutex};
     use worker::fn_triggers::DISPATCH;
 
-    /// The metadata, with the functions in `on` shown as enabled.
+    /// The metadata, with the functions in `on` shown as enabled; while `down`, reading a
+    /// branch fails (m13b fix S1: a metadata blip mid-batch).
     struct Meta {
         inner: MetadataClient,
         on: Mutex<HashSet<Uuid>>,
+        down: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl EventsMetadata for Meta {
         async fn branch(&self, b: BranchId) -> Result<Option<BranchRecord>, String> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("metadata down".into());
+            }
             self.inner.branch(b).await
         }
         async fn triggers(&self, b: BranchId) -> Result<Vec<TriggerRecord>, String> {
@@ -1596,7 +1601,7 @@ mod fn_triggers {
             .to_string();
         let ca = std::env::var("CHELABASE_COMPUTE_CA_FILE").expect("the compute CA");
         let tls = chelabase_query::server_tls::ServerTls::from_ca_file(std::path::Path::new(&ca)).unwrap();
-        let meta = Arc::new(Meta { inner: fx.metadata.clone(), on: Mutex::new(on.iter().copied().collect()) });
+        let meta = Arc::new(Meta { inner: fx.metadata.clone(), on: Mutex::new(on.iter().copied().collect()), down: Default::default() });
         let source = Source {
             data: chelabase_pgsession::InternalSource::new(&url, &token),
             metadata: fx.metadata.clone(),
@@ -1891,11 +1896,11 @@ mod fn_triggers {
         .await;
     }
 
-    /// m13b (B3): the dispatcher stops on a branch that stopped being ready (deleted, reset):
-    /// the pass says stop and no session opens.
+    /// m13b (B3): the dispatcher stops on a branch that stopped being ready (here, a reset
+    /// began): the pass says stop and no session opens.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn dispatcher_stops_on_branch_delete() {
+    async fn dispatcher_stops_when_the_branch_isnt_ready() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
@@ -1913,6 +1918,132 @@ mod fn_triggers {
             assert!(
                 fx.metadata.set_branch_status(main, &[BranchStatus::Resetting], BranchStatus::Ready).await.unwrap()
             );
+        })
+        .await;
+    }
+
+    /// m13b (B3, fix N3): the dispatcher stops on a deleted (tombstoned) branch: its pass says
+    /// stop, no session opens, and nothing of it is delivered.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_stops_on_branch_delete() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let dev = fx.create("dev").await;
+            assert!(fx.triggers(dev).await.iter().all(|t| t.state == TriggerState::Installed), "the child's copy is installed");
+            fx.sql(dev, "INSERT INTO public.orders VALUES (1);").await;
+            let invoker = Scripted::new(&[]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = d.open(dev, &fx.database).await.unwrap().expect("the child dispatches");
+            fx.metadata.mark_branch_deleted(dev).await.unwrap();
+            assert_eq!(fx.branch(dev).await.status, BranchStatus::Deleted);
+            assert_eq!(d.pass(&mut s).await.unwrap(), Pass::Stop);
+            assert!(d.open(dev, &fx.database).await.unwrap().is_none());
+            assert!(invoker.seen().is_empty());
+        })
+        .await;
+    }
+
+    /// m13b fix (B1): neither NOTIFY spam on an empty outbox nor a due row locked by another
+    /// session makes the dispatcher spin: passes stay bounded per second.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_does_not_spin() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let invoker = Scripted::new(&[]);
+            let (d, _) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            d.pass(&mut s).await.unwrap();
+            async fn passes_for(d: &Disp, s: &mut Session, span: Duration) -> usize {
+                let (start, mut n) = (Instant::now(), 0);
+                while start.elapsed() < span {
+                    n += 1;
+                    if let Pass::Idle(idle) = d.pass(s).await.unwrap() {
+                        d.wait(s, idle.min(span.saturating_sub(start.elapsed()))).await.unwrap();
+                    }
+                }
+                n
+            }
+            let spam = tokio::spawn(async move {
+                fx.on(main, "DO $$ BEGIN FOR i IN 1..1500 LOOP PERFORM pg_notify('chelabase_functions', i::text); COMMIT; PERFORM pg_sleep(0.002); END LOOP; END $$;").await
+            });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let spammed = passes_for(&d, &mut s, Duration::from_secs(2)).await;
+            spam.abort();
+            assert!(spammed <= 40, "{spammed} passes in 2 s from NOTIFY spam alone");
+
+            let lock = tokio::spawn(async move {
+                fx.on(main, "INSERT INTO public.orders VALUES (1); BEGIN; SELECT id FROM chelabase_functions.outbox FOR UPDATE; SELECT pg_sleep(6); COMMIT;").await
+            });
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let locked = passes_for(&d, &mut s, Duration::from_secs(2)).await;
+            assert!(locked <= 40, "{locked} passes in 2 s around a locked due row");
+            let _ = lock.await;
+            drive(&d, &mut s, 4).await;
+            assert_eq!(invoker.seen().len(), 1, "delivered once the lock went");
+        })
+        .await;
+    }
+
+    /// m13b fix (S1): a metadata error while re-checking a later row settles the rows already
+    /// delivered (deleted, never delivered again) and releases the rest.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_mid_batch_metadata_error_settles_delivered_rows() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2), (3);").await;
+            let invoker = Scripted::new(&[]);
+            let (d, meta) = dispatcher(fx, invoker.clone(), &[f]).await;
+            let mut s = session(fx, &d).await;
+            let down = meta.clone();
+            *invoker.hook.lock().unwrap() = Some(Box::new(move || {
+                down.down.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {})
+            }));
+            let out = d.pass(&mut s).await;
+            assert_eq!(out, Err("metadata down".to_string()));
+            assert_eq!(invoker.seen().len(), 1);
+            assert_eq!(
+                fx.value(main, "SELECT count(*)::text || ' ' || string_agg(attempts::text, ',' ORDER BY id) FROM chelabase_functions.outbox").await,
+                "2 0,0",
+                "the delivered row settled, the others released"
+            );
+        })
+        .await;
+    }
+
+    /// m13b fix (S2): a disabled trigger's queued events count in `dropped_count` when the
+    /// worker's sync removes them (no dispatcher running).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn worker_counts_a_disabled_triggers_queued_events() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2);").await;
+            fx.metadata.update_trigger(main, f, t, false).await.unwrap();
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(fx.outbox(main).await, 0);
+            assert_eq!(trigger_row(fx, t).await.dropped_count, 2);
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(trigger_row(fx, t).await.dropped_count, 2, "counted once");
         })
         .await;
     }
