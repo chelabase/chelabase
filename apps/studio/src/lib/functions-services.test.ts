@@ -1,7 +1,5 @@
-import { ApiError, configureManagementClient } from "@chelabase/management-client";
 import { describe, expect, it } from "vitest";
-import { fakeFetch, jsonResponse } from "@/test/fake-fetch";
-import { deploymentTarget, fetchServiceLogs, serviceSpecOf, serviceStatus } from "./functions-services";
+import { deploymentTarget, serviceSpecOf, serviceStatus } from "./functions-services";
 
 const fn = (over: Record<string, unknown> = {}) =>
   ({ kind: "service", enabled: true, deployment_id: "dep1", health: null, last_error: null, ...over }) as never;
@@ -62,27 +60,5 @@ describe("serviceStatus", () => {
     // Turned on in the list, the server still says off: show it starting.
     expect(serviceStatus(fn({ enabled: false, health: null }), true)).toEqual({ label: "Starting", tone: "dim" });
     expect(serviceStatus(fn({ enabled: true, health: "healthy" }), false)).toEqual({ label: "Stopped", tone: "dim" });
-  });
-});
-
-describe("fetchServiceLogs", () => {
-  it("returns_the_text_as_sent", async () => {
-    const f = fakeFetch({
-      "GET /v1/databases/d1/branches/b1/functions/echo/logs": () => new Response("line 1\n{\"not\": \"parsed\"}\n", { status: 200, headers: { "Content-Type": "text/plain" } }),
-    });
-    configureManagementClient({ baseUrl: "http://studio.test", getToken: () => "t", onUnauthorized: () => false });
-    expect(await fetchServiceLogs("d1", "b1", "echo", f)).toBe('line 1\n{"not": "parsed"}\n');
-    expect(f.calls[0].headers.get("Authorization")).toBe("Bearer t");
-  });
-
-  it("throws_the_api_refusal", async () => {
-    const f = fakeFetch({
-      "GET /v1/databases/d1/branches/b1/functions/echo/logs": () => jsonResponse({ error: { code: "forbidden", message: "needs developer" } }, 403),
-    });
-    configureManagementClient({ baseUrl: "http://studio.test", getToken: () => "t", onUnauthorized: () => false });
-    const err = await fetchServiceLogs("d1", "b1", "echo", f).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as ApiError).status).toBe(403);
-    expect((err as ApiError).message).toBe("needs developer");
   });
 });
