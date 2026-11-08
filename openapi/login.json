@@ -2683,7 +2683,8 @@
           "invalid_successor",
           "exposure_unconfirmed",
           "identity_unavailable",
-          "runner_unavailable"
+          "runner_unavailable",
+          "functions_unavailable"
         ]
       },
       "ErrorEnvelope": {

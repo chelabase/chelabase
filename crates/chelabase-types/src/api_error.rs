@@ -156,13 +156,16 @@ pub enum ErrorCode {
     /// 503: the identity service (app users' pools) can't be reached or refused Chelabase's call.
     IdentityUnavailable,
     /// 503: edge functions m11: the service runner (the `services` profile) can't be reached,
-    /// so container services can't be deployed or started.
+    /// so container services can't be deployed or started. The functions service reports it.
     RunnerUnavailable,
+    /// 503: the functions service (the `functions` profile) can't be reached: edge functions
+    /// aren't running on this instance.
+    FunctionsUnavailable,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 106] = [
+    pub const ALL: [ErrorCode; 107] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantRequired,
@@ -269,6 +272,7 @@ impl ErrorCode {
         Self::ExposureUnconfirmed,
         Self::IdentityUnavailable,
         Self::RunnerUnavailable,
+        Self::FunctionsUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -379,6 +383,7 @@ impl ErrorCode {
             Self::ExposureUnconfirmed => "exposure_unconfirmed",
             Self::IdentityUnavailable => "identity_unavailable",
             Self::RunnerUnavailable => "runner_unavailable",
+            Self::FunctionsUnavailable => "functions_unavailable",
         }
     }
 }
@@ -481,7 +486,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 106] = [
+    const ALL: [(ErrorCode, &str); 107] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantRequired, "tenant_required"),
@@ -593,6 +598,7 @@ mod tests {
         (ErrorCode::ExposureUnconfirmed, "exposure_unconfirmed"),
         (ErrorCode::IdentityUnavailable, "identity_unavailable"),
         (ErrorCode::RunnerUnavailable, "runner_unavailable"),
+        (ErrorCode::FunctionsUnavailable, "functions_unavailable"),
     ];
 
     #[test]

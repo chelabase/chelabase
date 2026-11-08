@@ -1258,13 +1258,21 @@ mod functions {
         assert_eq!(list.as_array().unwrap().len(), 2);
     }
 
-    /// AC 5: without the runner a container deploy is 503 `runner_unavailable` and records
+    /// AC 5: without the runner a container deploy is 503 `runner_unavailable` (and with the
+    /// functions service unreachable, `functions_unavailable`) and records
     /// nothing; external services still deploy.
     #[tokio::test]
     async fn functions_container_without_the_runner_is_refused() {
         let w = echo_world().await;
-        *w.w.app.bundles.control_error.lock().unwrap() =
-            Some(orchestrator::functions::ControlError::Unavailable("no route to host".into()));
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Unavailable("no route to host".into()));
+        let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"]["code"], "functions_unavailable", "the functions service itself is unreachable");
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
+            status: 503,
+            code: "runner_unavailable".into(),
+            message: "the service runner isn't running".into(),
+        });
         let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
         assert_eq!(status, 503, "{body}");
         assert_eq!(body["error"]["code"], "runner_unavailable");
@@ -1340,6 +1348,14 @@ mod functions {
         assert_eq!(status, 422);
         *w.w.app.bundles.control_error.lock().unwrap() =
             Some(orchestrator::functions::ControlError::Unavailable("down".into()));
+        let (status, body) = w.json("dee", "GET", &logs, None).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "functions_unavailable");
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
+            status: 503,
+            code: "runner_unavailable".into(),
+            message: "the service runner isn't running".into(),
+        });
         let (status, body) = w.json("dee", "GET", &logs, None).await;
         assert_eq!(status, 503);
         assert_eq!(body["error"]["code"], "runner_unavailable");
