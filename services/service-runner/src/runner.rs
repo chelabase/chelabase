@@ -3,15 +3,18 @@
 //! (an unlabelled container such as `metadata-db`, a compute, another stack's service) is
 //! [`RunnerError::NotFound`], whatever id or name the caller gives, and is never touched.
 //!
-//! Each service's container runs on its own private network (one per service per branch),
-//! labelled like the container, which only the stack's functions service joins: containers can't
-//! reach each other, and the functions service listens on none of these networks (it binds
-//! fixed addresses only), so traffic flows functions → container alone.
+//! Each service's containers run on its own private network (one per service per branch),
+//! labelled like them, which only the stack's functions service joins: different services'
+//! containers can't reach each other, and the functions service listens on none of these
+//! networks (it binds fixed addresses only), so traffic flows functions → container alone.
 //!
 //! m11: a container is per deployment ([`deployment_container_name`]), so a rollover runs the
-//! new deployment's container beside the old one until the new one is healthy; ensure leaves the
-//! slot's other deployments alone, and reconcile removes whichever isn't active once it's older
-//! than its grace ([`crate::reconcile::PENDING_GRACE_SECS`]).
+//! new deployment's container beside the active one until the new one is healthy. The slot's
+//! deployments share its network: they are the same service on the same branch, with the same
+//! secrets. A slot holds at most the active deployment's container and the newest pending one:
+//! ensure removes the rest ([`Runner::ensure`]), and reconcile removes a pending one once it's
+//! past its grace ([`crate::reconcile::PENDING_GRACE_SECS`]), at once when the service is
+//! disabled or gone.
 //!
 //! Only [`Runner::ensure`] creates a container (the functions service calls it with the branch's
 //! secrets); reconcile only starts, stops and removes. A container carries a keyed digest of its
@@ -28,6 +31,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::backend::{Container, ContainerBackend, ContainerPlan, ImageFacts, Network};
+use crate::reconcile::ActiveSource;
 use crate::spec::{self, Caps, SpecError, Validated};
 use crate::{BRANCH_LABEL, DEPLOYMENT_LABEL, PORT_LABEL, SERVICE_LABEL, STACK_LABEL};
 
@@ -111,6 +115,19 @@ pub fn deployment_container_name(stack: &str, key: &Key) -> String {
         container_name(stack, key.service_id, key.branch_id),
         key.deployment_id.simple()
     )
+}
+
+/// A repository name in one form for comparison: Docker Hub's `docker.io/`, `index.docker.io/`
+/// and `library/` spellings are the engine's short form (`acme/echo`, `nginx`).
+pub fn repository(name: &str) -> &str {
+    let name = name
+        .strip_prefix("docker.io/")
+        .or_else(|| name.strip_prefix("index.docker.io/"))
+        .unwrap_or(name);
+    match name.strip_prefix("library/") {
+        Some(rest) if !rest.contains('/') => rest,
+        _ => name,
+    }
 }
 
 /// HMAC-SHA256 under `key` of the environment, each name and value length-prefixed (so no two
@@ -341,6 +358,8 @@ pub struct Runner {
     digest_key: [u8; 32],
     slots: Slots,
     resolver: Arc<dyn Resolve>,
+    /// m11: where ensure reads a slot's active deployment when it prunes.
+    active: Option<Arc<dyn ActiveSource>>,
 }
 
 impl Runner {
@@ -361,7 +380,14 @@ impl Runner {
             resolver: Arc::new(SystemResolver),
             #[cfg(test)]
             resolver: Arc::new(fake::PublicResolver),
+            active: None,
         }
+    }
+
+    /// m11: ensure reads each slot's active deployment here when it prunes.
+    pub fn with_active(mut self, active: Arc<dyn ActiveSource>) -> Self {
+        self.active = Some(active);
+        self
     }
 
     pub fn with_resolver(mut self, resolver: Arc<dyn Resolve>) -> Self {
@@ -424,14 +450,15 @@ impl Runner {
             return Ok(image.to_string());
         }
         let digests = self.backend.repo_digests(&image).await?;
+        let want = repository(&image.name);
         let digest = digests
             .iter()
-            .find(|d| d.split_once('@').is_some_and(|(n, _)| n == image.name))
-            .or_else(|| digests.first())
-            .and_then(|d| d.split_once('@').map(|(_, digest)| digest))
+            .filter_map(|d| d.split_once('@'))
+            .find(|(n, _)| repository(n) == want)
+            .map(|(_, digest)| digest)
             .ok_or_else(|| {
                 SpecError(format!(
-                    "{image} has no registry digest; push it to a registry and deploy that"
+                    "{image} has no registry digest for its own repository; push it to a registry and deploy that"
                 ))
             })?;
         let resolved = format!("{}@{digest}", image.name);
@@ -554,8 +581,14 @@ impl Runner {
 
     /// A running container for the request's service on its branch, at its deployment, with its
     /// environment. The spec, env and image are checked before anything else happens (refused:
-    /// nothing is created or removed). A container at another deployment or with another env is
+    /// nothing is created or removed). A container at this deployment with another env is
     /// replaced; a matching one is started if it was stopped and otherwise kept as it is.
+    ///
+    /// The slot's other deployments' containers are then pruned to at most one: the active
+    /// deployment's when this one isn't it (a rollover's new container), else the newest other
+    /// one (a rollover in flight). With no row for the service, none is kept; without an
+    /// [`ActiveSource`], the newest; when it can't be read, nothing is pruned (reconcile still
+    /// bounds the slot).
     pub async fn ensure(&self, req: &EnsureRequest) -> Result<Container, RunnerError> {
         let spec = spec::parse(&req.spec, &self.caps)?;
         spec::environment(&req.env, spec.port)?;
@@ -567,12 +600,14 @@ impl Runner {
         };
         let digest = env_digest(&self.digest_key, &req.env);
         let _slot = self.lock(key.slot()).await;
-        let (mut keep, mut stale) = (None, Vec::new());
+        let (mut keep, mut stale, mut others) = (None, Vec::new(), Vec::new());
         for c in self.ours().await? {
             let Some(k) = key_of(&c) else { continue };
-            // Another deployment's container stays: it serves until a rollover's switch, and
-            // reconcile removes it once it's neither active nor new.
-            if k.slot() != key.slot() || k.deployment_id != key.deployment_id {
+            if k.slot() != key.slot() {
+                continue;
+            }
+            if k.deployment_id != key.deployment_id {
+                others.push((k.deployment_id, c));
                 continue;
             }
             if k == key && c.label(ENV_DIGEST_LABEL) == Some(digest.as_str()) && keep.is_none() {
@@ -589,6 +624,7 @@ impl Runner {
             if !c.running() {
                 self.backend.start(&c.id).await?;
             }
+            self.prune(&key, others).await?;
             return self.guarded(&c.id).await;
         }
         // Everything that can refuse comes before the old container goes.
@@ -600,7 +636,48 @@ impl Runner {
         let network = self.service_network(key.service_id, key.branch_id).await?;
         let id = self.backend.create(&plan, &network).await?;
         self.backend.start(&id).await?;
+        self.prune(&key, others).await?;
         self.guarded(&id).await
+    }
+
+    /// [`Runner::ensure`]'s cap on the slot's other deployments (under the slot's lock).
+    async fn prune(
+        &self,
+        key: &Key,
+        mut others: Vec<(Uuid, Container)>,
+    ) -> Result<(), RunnerError> {
+        if others.is_empty() {
+            return Ok(());
+        }
+        let active = match &self.active {
+            Some(src) => match src.active(key.service_id, key.branch_id).await {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    tracing::warn!(
+                        "read service {}'s active deployment: {e:#}; not pruning",
+                        key.service_id
+                    );
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        // Newest first.
+        others.sort_by(|a, b| (b.1.created, &b.1.id).cmp(&(a.1.created, &a.1.id)));
+        let kept: Option<String> = match active {
+            Some(Some(a)) if a != key.deployment_id => others
+                .iter()
+                .find(|(d, _)| *d == a)
+                .map(|(_, c)| c.id.clone()),
+            Some(None) => None,
+            _ => others.first().map(|(_, c)| c.id.clone()),
+        };
+        for (_, c) in others {
+            if Some(&c.id) != kept.as_ref() {
+                self.backend.remove(&c.id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The registry host's every address must be public: the engine pulls from the host's
@@ -765,6 +842,8 @@ pub mod fake {
                     id: id.clone(),
                     labels: l,
                     state: state.into(),
+                    // In creation order (ensure prunes the oldest first).
+                    created: i64::from(*self.next.lock().unwrap()),
                     ..Default::default()
                 },
                 None,
@@ -1162,6 +1241,117 @@ mod tests {
         assert_eq!(r.ours().await.unwrap().len(), 2);
     }
 
+    /// Re-audit S1: a slot holds at most two running containers however many deployments are
+    /// ensured in a row.
+    #[tokio::test]
+    async fn audit_a_slot_holds_at_most_two_containers() {
+        let fake = Arc::new(Fake::default());
+        let r = runner(&fake, "a");
+        let base = new_key();
+        for _ in 0..10 {
+            r.ensure(&request(&Key {
+                deployment_id: Uuid::new_v4(),
+                ..base
+            }))
+            .await
+            .unwrap();
+        }
+        let running = r
+            .ours()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|c| c.running())
+            .count();
+        assert!(running <= 2, "{running} containers running in one slot");
+    }
+
+    async fn deployments(r: &Runner) -> Vec<Uuid> {
+        let mut v: Vec<Uuid> = r
+            .ours()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(key_of)
+            .map(|k| k.deployment_id)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The active deployment as the test sets it (`Err` when unset: unreadable).
+    struct Active(Mutex<Option<Option<Uuid>>>);
+
+    #[async_trait::async_trait]
+    impl ActiveSource for Active {
+        async fn active(&self, _: Uuid, _: Uuid) -> anyhow::Result<Option<Uuid>> {
+            self.0
+                .lock()
+                .unwrap()
+                .ok_or_else(|| anyhow::anyhow!("metadata down"))
+        }
+    }
+
+    /// Re-audit S1 with the metadata: a rollover's ensure keeps the active deployment's
+    /// container and its own; ensuring the active one keeps it and the newest pending one; no
+    /// row keeps none of the others; an unreadable active deployment prunes nothing.
+    #[tokio::test]
+    async fn ensure_keeps_the_active_and_the_newest_pending() {
+        let fake = Arc::new(Fake::default());
+        let src = Arc::new(Active(Mutex::new(None)));
+        let r = runner(&fake, "a").with_active(src.clone());
+        let a = new_key();
+        let d = |_: u8| Key {
+            deployment_id: Uuid::new_v4(),
+            ..a
+        };
+        let sorted = |mut v: Vec<Uuid>| {
+            v.sort();
+            v
+        };
+        *src.0.lock().unwrap() = Some(None);
+        r.ensure(&request(&a)).await.unwrap();
+        *src.0.lock().unwrap() = Some(Some(a.deployment_id));
+        let (d1, d2, d3) = (d(1), d(2), d(3));
+        for k in [d1, d2, d3] {
+            r.ensure(&request(&k)).await.unwrap();
+        }
+        assert_eq!(
+            deployments(&r).await,
+            sorted(vec![a.deployment_id, d3.deployment_id])
+        );
+        r.ensure(&request(&a)).await.unwrap();
+        assert_eq!(
+            deployments(&r).await,
+            sorted(vec![a.deployment_id, d3.deployment_id])
+        );
+        *src.0.lock().unwrap() = None;
+        let d4 = d(4);
+        r.ensure(&request(&d4)).await.unwrap();
+        assert_eq!(deployments(&r).await.len(), 3, "unreadable: nothing pruned");
+        *src.0.lock().unwrap() = Some(None);
+        r.ensure(&request(&d4)).await.unwrap();
+        assert_eq!(deployments(&r).await, vec![d4.deployment_id], "no row");
+    }
+
+    /// Re-audit S2: a Docker Hub reference matches the engine's short form, never another
+    /// repository's digest.
+    #[tokio::test]
+    async fn audit_docker_hub_names_match_exactly() {
+        let fake = Arc::new(Fake::default());
+        let r = runner(&fake, "a");
+        let d1 = format!("sha256:{}", "1".repeat(64));
+        let d2 = format!("sha256:{}", "2".repeat(64));
+        *fake.repo_digests.lock().unwrap() = vec![
+            format!("ghcr.io/other/thing@{d2}"),
+            format!("acme/echo@{d1}"),
+        ];
+        assert_eq!(
+            r.resolve_image("docker.io/acme/echo:1").await.ok(),
+            Some(format!("docker.io/acme/echo@{d1}"))
+        );
+    }
+
     /// m11: status (and ensure's answer over the API) gives the container's address on its
     /// service's network, nothing from another network.
     #[tokio::test]
@@ -1201,11 +1391,26 @@ mod tests {
             format!("ghcr.io/acme/echo@{d1}")
         );
         assert_eq!(*fake.pulled.lock().unwrap(), ["ghcr.io/acme/echo:1"]);
+        // Re-audit S2: another repository's digest is never taken.
         *fake.repo_digests.lock().unwrap() = vec![format!("mirror.example/echo@{d2}")];
-        assert_eq!(
-            r.resolve_image("ghcr.io/acme/echo:2").await.unwrap(),
-            format!("ghcr.io/acme/echo@{d2}")
-        );
+        assert!(matches!(
+            r.resolve_image("ghcr.io/acme/echo:2").await,
+            Err(RunnerError::Invalid(_))
+        ));
+        for (reference, engine) in [
+            ("docker.io/library/nginx:1", "nginx"),
+            ("nginx:1", "nginx"),
+            ("index.docker.io/acme/echo:1", "acme/echo"),
+            ("acme/echo:1", "docker.io/acme/echo"),
+        ] {
+            *fake.repo_digests.lock().unwrap() = vec![format!("{engine}@{d2}")];
+            let name = reference.rsplit_once(':').unwrap().0;
+            assert_eq!(
+                r.resolve_image(reference).await.unwrap(),
+                format!("{name}@{d2}"),
+                "{reference}"
+            );
+        }
         fake.repo_digests.lock().unwrap().clear();
         assert!(matches!(
             r.resolve_image("ghcr.io/acme/echo:local").await,

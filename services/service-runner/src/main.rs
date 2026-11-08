@@ -41,9 +41,12 @@ async fn main() -> anyhow::Result<()> {
     // The env digest's key, derived from the functions caller's bearer: stable across restarts,
     // never written anywhere.
     let runner = Arc::new(
-        Runner::new(backend, &config.stack, &config.project, config.caps).with_digest_key(
-            service_runner::runner::derive_digest_key(&config.functions_token),
-        ),
+        Runner::new(backend, &config.stack, &config.project, config.caps)
+            .with_digest_key(service_runner::runner::derive_digest_key(
+                &config.functions_token,
+            ))
+            // m11: ensure keeps a slot's active deployment when it prunes.
+            .with_active(Arc::new(MetadataDesired { pool: pool.clone() })),
     );
     spawn_loop(
         runner.clone(),

@@ -52,21 +52,35 @@ impl Action {
     }
 }
 
-/// m11: a container of a deployment that isn't its slot's active one is left alone this long
-/// after it was created: a rollover runs the new deployment beside the old one and switches
-/// only once it's healthy (up to 60 s). Past it, it's removed like any stale container.
+/// m11: a rollover's new container (a pending deployment: one the metadata has for the slot's
+/// live, enabled service, not the active one) is left alone this long after it was created: a
+/// rollover runs it beside the active one and switches only once it's healthy (up to 60 s). Past
+/// it, or without such a row, it's removed like any stale container.
 pub const PENDING_GRACE_SECS: i64 = 120;
 
+/// Whether a container created at `created` (Unix seconds) is within the grace at `now`; one
+/// created in the future (a remote engine's clock ahead) never is.
+pub fn in_grace(created: i64, now: i64) -> bool {
+    created > 0
+        && now
+            .checked_sub(created)
+            .is_some_and(|age| (0..PENDING_GRACE_SECS).contains(&age))
+}
+
 /// What to do, given the desired rows (already checked: an invalid spec is left out, so its
-/// container goes), this stack's containers and networks, and the functions containers:
-/// - a container whose service and branch have no row, or whose deployment isn't the row's, or
-///   a second one for the same row, is removed, unless it's another deployment's created less
-///   than [`PENDING_GRACE_SECS`] before `now` (a rollover's new container: left alone);
+/// container goes), the pending deployments, this stack's containers and networks, and the
+/// functions containers:
+/// - a container whose service and branch have no row, or a second one for the same row, is
+///   removed;
+/// - one of another deployment is removed, unless the row is enabled, its deployment is
+///   pending, it's [`in_grace`] and it's the slot's newest such container (a rollover's new
+///   container: left alone, at most one per slot beside the active one);
 /// - an enabled row's stopped container is started; a disabled row's running one is stopped;
 /// - a network whose slot keeps no container is removed; one that keeps a container and lacks a
 ///   functions container gets it attached.
 pub fn plan(
     desired: &[Desired],
+    pending: &HashSet<Key>,
     actual: &[Container],
     networks: &[Network],
     functions: &[String],
@@ -75,6 +89,22 @@ pub fn plan(
     let rows: HashMap<(Uuid, Uuid), &Desired> = desired.iter().map(|d| (d.key.slot(), d)).collect();
     let mut kept: HashSet<(Uuid, Uuid)> = HashSet::new();
     let mut actions = Vec::new();
+    // Each slot's one spared rollover container: the newest that qualifies.
+    let mut spared: HashMap<(Uuid, Uuid), (i64, &str)> = HashMap::new();
+    for c in actual {
+        let Some(k) = key_of(c) else { continue };
+        let qualifies = rows
+            .get(&k.slot())
+            .is_some_and(|d| d.enabled && d.key.deployment_id != k.deployment_id)
+            && pending.contains(&k)
+            && in_grace(c.created, now);
+        if qualifies {
+            let e = spared.entry(k.slot()).or_insert((c.created, c.id.as_str()));
+            if (c.created, c.id.as_str()) > *e {
+                *e = (c.created, c.id.as_str());
+            }
+        }
+    }
     for c in actual {
         let Some(k) = key_of(c) else {
             actions.push(Action::Remove(c.id.clone()));
@@ -92,7 +122,7 @@ pub fn plan(
             Some(d) if d.key.deployment_id == k.deployment_id => {
                 actions.push(Action::Remove(c.id.clone()));
             }
-            _ if c.created > 0 && now.saturating_sub(c.created) < PENDING_GRACE_SECS => {}
+            Some(_) if spared.get(&k.slot()).is_some_and(|(_, id)| *id == c.id) => {}
             _ => actions.push(Action::Remove(c.id.clone())),
         }
     }
@@ -116,6 +146,18 @@ pub fn plan(
 #[async_trait]
 pub trait DesiredSource: Send + Sync + 'static {
     async fn desired(&self) -> anyhow::Result<Vec<Desired>>;
+    /// m11: the pending deployments: every other container deployment of a service that is
+    /// enabled on a live branch, by (service, branch, deployment). Only these get a grace.
+    async fn pending(&self) -> anyhow::Result<Vec<Key>> {
+        Ok(Vec::new())
+    }
+}
+
+/// m11: a slot's active deployment, which ensure keeps when it prunes the slot.
+#[async_trait]
+pub trait ActiveSource: Send + Sync + 'static {
+    /// `None` when the service has no row on the branch.
+    async fn active(&self, service: Uuid, branch: Uuid) -> anyhow::Result<Option<Uuid>>;
 }
 
 /// The metadata database (read only).
@@ -137,8 +179,48 @@ pub const DESIRED_SQL: &str = "
       AND b.deleted_at IS NULL
       AND db.status NOT IN ('deleting', 'deleted')";
 
+/// m11: the pending deployments ([`DesiredSource::pending`]).
+pub const PENDING_SQL: &str = "
+    SELECT bf.function_id, bf.branch_id, d.id
+    FROM branch_functions bf
+    JOIN functions f ON f.id = bf.function_id
+    JOIN function_deployments d ON d.function_id = bf.function_id AND d.id <> bf.deployment_id
+    JOIN branches b ON b.id = bf.branch_id
+    JOIN databases db ON db.id = f.database_id
+    WHERE f.kind = 'service'
+      AND bf.enabled
+      AND d.spec->>'backend' = 'container'
+      AND b.deleted_at IS NULL
+      AND db.status NOT IN ('deleting', 'deleted')";
+
+#[async_trait]
+impl ActiveSource for MetadataDesired {
+    async fn active(&self, service: Uuid, branch: Uuid) -> anyhow::Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT deployment_id FROM branch_functions WHERE function_id = $1 AND branch_id = $2",
+        )
+        .bind(service)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+}
+
 #[async_trait]
 impl DesiredSource for MetadataDesired {
+    async fn pending(&self) -> anyhow::Result<Vec<Key>> {
+        let rows: Vec<(Uuid, Uuid, Uuid)> =
+            sqlx::query_as(PENDING_SQL).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(service_id, branch_id, deployment_id)| Key {
+                service_id,
+                branch_id,
+                deployment_id,
+            })
+            .collect())
+    }
+
     async fn desired(&self) -> anyhow::Result<Vec<Desired>> {
         let rows: Vec<(Uuid, Uuid, Uuid, bool, serde_json::Value)> =
             sqlx::query_as(DESIRED_SQL).fetch_all(&self.pool).await?;
@@ -187,6 +269,7 @@ pub async fn reconcile_once(
             }
         })
         .collect();
+    let pending: HashSet<Key> = source.pending().await?.into_iter().collect();
     let mut slots: HashMap<String, (Uuid, Uuid)> = actual
         .iter()
         .filter_map(|c| Some((c.id.clone(), key_of(c)?.slot())))
@@ -200,7 +283,7 @@ pub async fn reconcile_once(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    for action in plan(&desired, &actual, &networks, &functions, now) {
+    for action in plan(&desired, &pending, &actual, &networks, &functions, now) {
         let guard = match action.slot(&slots) {
             Some(slot) => match runner.try_lock(slot) {
                 Some(g) => Some(g),
@@ -354,7 +437,14 @@ mod tests {
             network("n-gone", &gone, &["functions", "gone"]),
             network("n-orphan", &orphan, &["functions"]),
         ];
-        let actions = plan(&rows, &actual, &networks, std::slice::from_ref(&f), NOW);
+        let actions = plan(
+            &rows,
+            &none(),
+            &actual,
+            &networks,
+            std::slice::from_ref(&f),
+            NOW,
+        );
         let k = |k: &Key| (k.service_id, k.branch_id);
         assert_eq!(
             actions,
@@ -378,12 +468,13 @@ mod tests {
         let mut unlabelled = container("half", &on, "running");
         unlabelled.labels.remove(DEPLOYMENT_LABEL);
         assert_eq!(
-            plan(&[], &[unlabelled], &[], &[], NOW),
+            plan(&[], &none(), &[unlabelled], &[], &[], NOW),
             [Action::Remove("half".into())]
         );
         assert!(
             plan(
                 &[desired(on, true)],
+                &none(),
                 &[container("x", &on, "running")],
                 &[],
                 &[],
@@ -392,14 +483,16 @@ mod tests {
             .is_empty()
         );
         assert!(
-            plan(&[desired(fresh, true)], &[], &[], &[], NOW).is_empty(),
+            plan(&[desired(fresh, true)], &none(), &[], &[], &[], NOW).is_empty(),
             "never a create"
         );
     }
 
-    /// m11: another deployment's container younger than the grace (a rollover's new one) is left
-    /// alone, with or without a row, and its slot's network stays; past the grace, or with no
-    /// creation time, it goes. A same-deployment duplicate goes however young.
+    /// m11 (re-audit B1, B2, S1): only a pending deployment's container of an enabled row
+    /// gets the grace, and only the slot's newest one; the slot's network stays meanwhile. Past
+    /// the grace, with no creation time, without a pending row, with no row at all (a first deploy
+    /// never rolls over) or with the row disabled, it goes. A same-deployment duplicate goes
+    /// however young.
     #[test]
     fn a_rollovers_new_container_has_a_grace() {
         let active = key();
@@ -407,46 +500,154 @@ mod tests {
             deployment_id: Uuid::new_v4(),
             ..active
         };
+        let older = Key {
+            deployment_id: Uuid::new_v4(),
+            ..active
+        };
         let young = |id: &str, k: &Key, age: i64| Container {
             created: NOW - age,
             ..container(id, k, "running")
         };
+        let known: HashSet<Key> = [pending, older].into();
         let net = network("n", &active, &["functions", "old", "new"]);
         let f = ["functions".to_string()];
         let rows = [desired(active, true)];
         let actual = [young("old", &active, 3600), young("new", &pending, 30)];
-        assert!(plan(&rows, &actual, std::slice::from_ref(&net), &f, NOW).is_empty());
+        assert!(plan(&rows, &known, &actual, std::slice::from_ref(&net), &f, NOW).is_empty());
+        assert_eq!(
+            plan(&rows, &none(), &actual, std::slice::from_ref(&net), &f, NOW),
+            [Action::Remove("new".into())],
+            "not a pending deployment"
+        );
+        assert_eq!(
+            plan(&[desired(active, false)], &known, &actual, &[], &f, NOW),
+            [Action::Stop("old".into()), Action::Remove("new".into())],
+            "disabled"
+        );
         let actual = [
             young("old", &active, 3600),
             young("new", &pending, PENDING_GRACE_SECS),
         ];
         assert_eq!(
-            plan(&rows, &actual, std::slice::from_ref(&net), &f, NOW),
+            plan(&rows, &known, &actual, std::slice::from_ref(&net), &f, NOW),
             [Action::Remove("new".into())]
         );
-        // A first deploy: no row yet while it's checked.
-        assert!(
-            plan(
-                &[],
-                &[young("new", &pending, 5)],
-                std::slice::from_ref(&net),
-                &f,
-                NOW
-            )
-            .is_empty()
+        // Two young pending containers: only the newest stays.
+        let actual = [
+            young("old", &active, 3600),
+            young("p1", &older, 20),
+            young("new", &pending, 10),
+        ];
+        assert_eq!(
+            plan(&rows, &known, &actual, &[], &f, NOW),
+            [Action::Remove("p1".into())]
         );
         assert_eq!(
-            plan(&[], &[container("new", &pending, "running")], &[], &f, NOW),
-            [Action::Remove("new".into())]
+            plan(&[], &known, &[young("new", &pending, 5)], &[], &f, NOW),
+            [Action::Remove("new".into())],
+            "no row"
+        );
+        assert_eq!(
+            plan(
+                &rows,
+                &known,
+                &[container("new", &pending, "running")],
+                &[],
+                &f,
+                NOW
+            ),
+            [Action::Remove("new".into())],
+            "no creation time"
         );
         let actual = [young("old", &active, 3600), young("dup", &active, 1)];
         assert_eq!(
-            plan(&rows, &actual, &[], &f, NOW),
+            plan(&rows, &known, &actual, &[], &f, NOW),
             [Action::Remove("dup".into())]
         );
     }
 
+    fn none() -> HashSet<Key> {
+        HashSet::new()
+    }
+
     const NOW: i64 = 1_800_000_000;
+
+    /// Re-audit B1: a deleted function's container (no row, no pending deployment) goes on the
+    /// first pass, however young.
+    #[test]
+    fn audit_deleted_function_container_removed_at_once() {
+        let k = key();
+        let c = Container {
+            created: NOW - 5,
+            ..container("c", &k, "exited")
+        };
+        assert_eq!(
+            plan(&[], &none(), &[c], &[], &[], NOW),
+            [Action::Remove("c".into())]
+        );
+    }
+
+    /// Re-audit B2: a disabled row's young container of another deployment is removed at once.
+    #[test]
+    fn audit_disabled_row_stops_a_young_pending_container() {
+        let active = key();
+        let pending = Key {
+            deployment_id: Uuid::new_v4(),
+            ..active
+        };
+        let young = Container {
+            created: NOW - 10,
+            ..container("new", &pending, "running")
+        };
+        let old = Container {
+            created: NOW - 3600,
+            ..container("old", &active, "exited")
+        };
+        let actions = plan(
+            &[desired(active, false)],
+            &[pending].into(),
+            &[old, young],
+            &[],
+            &[],
+            NOW,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Stop(id) | Action::Remove(id) if id == "new")),
+            "disabled service's pending container left running: {actions:?}"
+        );
+    }
+
+    /// Re-audit N1: a container created in the future (a remote engine's clock ahead) gets no
+    /// grace.
+    #[test]
+    fn audit_future_created_gets_no_grace() {
+        let active = key();
+        let pending = Key {
+            deployment_id: Uuid::new_v4(),
+            ..active
+        };
+        let future = Container {
+            created: NOW + 86_400,
+            ..container("new", &pending, "running")
+        };
+        let old = Container {
+            created: NOW - 3600,
+            ..container("old", &active, "running")
+        };
+        assert_eq!(
+            plan(
+                &[desired(active, true)],
+                &[pending].into(),
+                &[old, future],
+                &[],
+                &[],
+                NOW
+            ),
+            [Action::Remove("new".into())]
+        );
+    }
 
     struct Rows(Mutex<anyhow::Result<Vec<Desired>>>);
 

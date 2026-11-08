@@ -689,7 +689,9 @@ async fn reconcile_follows_the_metadata() {
             deployment_id: deployments[0]
         }
     );
-    let runner = f.runner();
+    let runner = f.runner().with_active(Arc::new(MetadataDesired {
+        pool: client.pool().clone(),
+    }));
     // Reconcile never creates (audit B1): only the functions service's ensure does.
     assert!(reconcile_once(&runner, &source).await.unwrap().is_empty());
     assert!(runner.ours().await.unwrap().is_empty());
@@ -711,8 +713,53 @@ async fn reconcile_follows_the_metadata() {
     assert_eq!(ours.len(), 1);
     assert!(ours[0].running());
     let net = container_name(&f.stack, svc.id, branch.as_uuid());
+    // m11 (re-audit B1, B2): a rollover's new deployment is pending in the metadata, so its
+    // young container outlives a pass while the service is enabled, beside the active one.
+    let next = client
+        .create_deployment(&NewDeployment {
+            id: Uuid::new_v4(),
+            function_id: svc.id,
+            bundle_sha256: None,
+            bundle_size: None,
+            spec: &spec,
+            compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            created_by: "m11 live",
+            note: None,
+        })
+        .await
+        .unwrap()
+        .id;
+    let pending_key = Key {
+        service_id: svc.id,
+        branch_id: branch.as_uuid(),
+        deployment_id: next,
+    };
+    assert_eq!(source.pending().await.unwrap(), vec![pending_key]);
+    assert_eq!(
+        service_runner::reconcile::ActiveSource::active(&source, svc.id, branch.as_uuid())
+            .await
+            .unwrap(),
+        Some(deployments[0])
+    );
+    let rollover = runner
+        .ensure(&EnsureRequest {
+            service_id: svc.id,
+            branch_id: branch.as_uuid(),
+            deployment_id: next,
+            spec: spec.clone(),
+            env: [("API_KEY".to_string(), "s3cret".to_string())].into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reconcile_once(&runner, &source).await.unwrap().is_empty(),
+        "the pending container is in its grace"
+    );
+    assert_eq!(runner.ours().await.unwrap().len(), 2);
+    // Disabled: the active container stops and the pending one goes at once.
     client.set_enabled(branch, svc.id, false).await.unwrap();
     reconcile_once(&runner, &source).await.unwrap();
+    assert_eq!(f.state(&rollover.id).await, None);
     assert_eq!(f.state(&ours[0].id).await.as_deref(), Some("exited"));
     client
         .delete_function_unprotected(db, svc.id)
