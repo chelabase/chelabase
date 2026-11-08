@@ -42,6 +42,8 @@ A new image reference is a new deployment, and it **rolls over** without downtim
 
 If the new image never passes its health check, traffic stays on the old container, the deployment's `last_error` says why, and the deploy command exits non-zero.
 
+The rollover runs in the background: the deploy (or rollback) answers `202` with `rollout: pending`, and the service's `rollout` field in the API says `pending`, then disappears once the new deployment is active, or turns `failed` with the reason. `chelabase services deploy` and `rollback` wait for it, and Studio shows it on the service.
+
 {/* TODO(#173): confirm against landed code: rollover timeout (60 s), `last_error` wording and the command's exit code. */}
 
 ## Switch off and logs
