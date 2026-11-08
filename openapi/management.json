@@ -2818,7 +2818,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the functions service is unavailable; nothing was recorded",
+            "description": "`functions_unavailable`: the functions service can't be reached (edge functions aren't running on this instance); `runner_unavailable`: a container spec, and the service runner isn't running; `unavailable`: the functions service couldn't store the bundle. Nothing was recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -2956,7 +2956,7 @@
             }
           },
           "503": {
-            "description": "`runner_unavailable`: the service runner isn't running",
+            "description": "`functions_unavailable`: the functions service can't be reached; `runner_unavailable`: the service runner isn't running",
             "content": {
               "application/json": {
                 "schema": {
@@ -25787,7 +25787,8 @@
           "invalid_successor",
           "exposure_unconfirmed",
           "identity_unavailable",
-          "runner_unavailable"
+          "runner_unavailable",
+          "functions_unavailable"
         ]
       },
       "ErrorEnvelope": {

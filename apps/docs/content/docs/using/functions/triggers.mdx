@@ -17,7 +17,7 @@ chelabase functions trigger list NAME
 
 - `add` needs `--pg-database` and `--events` (comma-separated, from the lists below), and exactly one of `--table` and `--storage`. It prints the trigger's id.
 - `--table` takes `schema.table` as plain text, unquoted (no `"…"` quoting); a bare name means `public`. `--bucket` and `--prefix` go with `--storage` only.
-- `list` prints one line per trigger: its id, source and target, events, state, enabled or disabled, `dead=`, `dropped=`, `delivered=` (the last delivery time) and the install error (`last_error`).
+- `list` prints one line per trigger: its id, source and target, events, state, enabled or disabled, `dead=`, `dropped=`, `delivered=` (the last delivery time) and the install error (`last_error`). When the last delivery failed, the line ends with `delivery: <error>` (the trigger's `last_delivery_error`).
 
 The CLI can't turn a trigger on or off. The **Triggers** section of Studio's function drawer can: it lists the triggers with their state and counts, adds a table or storage trigger, turns each on or off with a switch and deletes it. It refreshes while a trigger is `pending_install`.
 

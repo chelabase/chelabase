@@ -738,7 +738,7 @@ pub(crate) fn control_error(err: ControlError) -> ApiError {
         ControlError::Status { code, .. } if code == "runner_unavailable" => runner_unavailable(),
         ControlError::Unavailable(why) => {
             warn!("functions control side unavailable: {why}");
-            runner_unavailable()
+            functions_unavailable()
         }
         ControlError::Status { status, code, message } => {
             warn!("functions control side answered {status} {code}: {message}");
@@ -749,6 +749,11 @@ pub(crate) fn control_error(err: ControlError) -> ApiError {
 
 fn runner_unavailable() -> ApiError {
     ApiError::new(503, ErrorCode::RunnerUnavailable, "container services are unavailable (the service runner isn't running)")
+}
+
+/// The functions service itself can't be reached (its `functions` profile is off, or it's down).
+fn functions_unavailable() -> ApiError {
+    ApiError::new(503, ErrorCode::FunctionsUnavailable, "edge functions aren't running on this instance (the functions service can't be reached)")
 }
 
 /// A container spec as stored, or why it's refused: its image resolved to a digest.
@@ -1483,7 +1488,10 @@ where
             Err(ControlError::Status { message, .. }) if !message.is_empty() => Some(message.clone()),
             Err(e) => {
                 warn!(branch_id = %branch, %function, %deployment, "rollover: {e:?}");
-                Some("the service runner couldn't start or check the new container; the previous deployment still serves".to_owned())
+                Some(match e {
+                    ControlError::Unavailable(_) => "the functions service couldn't be reached; the previous deployment still serves",
+                    ControlError::Status { .. } => "the service runner couldn't start or check the new container; the previous deployment still serves",
+                }.to_owned())
             }
         };
         // Switch (or record the failure) only while this is still the service's rollover.
@@ -1685,11 +1693,7 @@ fn sink_error(err: SinkError) -> ApiError {
         }
         SinkError::Unavailable(err) => {
             error!("bundle upload: {err}");
-            ApiError::new(
-                503,
-                ErrorCode::Unavailable,
-                "the functions service is unavailable; try again",
-            )
+            functions_unavailable()
         }
     }
 }
@@ -1771,7 +1775,7 @@ where
         (status = 422, description = "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, a bundle for a service or a spec for a function, or a refused URL or health path", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 502, description = "`unavailable`: the functions service refused the bundle", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the functions service is unavailable; nothing was recorded", body = ErrorEnvelope),
+        (status = 503, description = "`functions_unavailable`: the functions service can't be reached (edge functions aren't running on this instance); `runner_unavailable`: a container spec, and the service runner isn't running; `unavailable`: the functions service couldn't store the bundle. Nothing was recorded", body = ErrorEnvelope),
     ),
 )]
 async fn create_deployment<M, J>(
@@ -1918,7 +1922,7 @@ where
         (status = 409, description = "`conflict` with `reason` `not_deployed`: no deployment on the branch", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: not a container service", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`runner_unavailable`: the service runner isn't running", body = ErrorEnvelope),
+        (status = 503, description = "`functions_unavailable`: the functions service can't be reached; `runner_unavailable`: the service runner isn't running", body = ErrorEnvelope),
     ),
 )]
 async fn service_logs<M, J>(
@@ -2121,4 +2125,39 @@ where
         }
         .await,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_functions_service_is_functions_unavailable() {
+        for why in ["CHELABASE_FUNCTIONS_INTERNAL_URL is unset", "dns error: no such host"] {
+            let e = control_error(ControlError::Unavailable(why.into()));
+            assert_eq!((e.status, e.code.as_str()), (503, "functions_unavailable"), "{why}");
+            assert!(e.message.contains("edge functions"), "{}", e.message);
+            let e = sink_error(SinkError::Unavailable(why.into()));
+            assert_eq!((e.status, e.code.as_str()), (503, "functions_unavailable"), "{why}");
+        }
+    }
+
+    #[test]
+    fn runner_unavailable_is_what_the_functions_service_reports() {
+        let e = control_error(ControlError::Status {
+            status: 503,
+            code: "runner_unavailable".into(),
+            message: "the service runner isn't running".into(),
+        });
+        assert_eq!((e.status, e.code.as_str()), (503, "runner_unavailable"));
+        assert!(e.message.contains("service runner"), "{}", e.message);
+    }
+
+    #[test]
+    fn other_functions_service_answers_keep_their_codes() {
+        let e = control_error(ControlError::Status { status: 500, code: "internal".into(), message: String::new() });
+        assert_eq!((e.status, e.code.as_str()), (502, "unavailable"));
+        let e = sink_error(SinkError::Status(503));
+        assert_eq!((e.status, e.code.as_str()), (503, "unavailable"));
+    }
 }

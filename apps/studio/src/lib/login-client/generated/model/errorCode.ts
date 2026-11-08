@@ -118,4 +118,5 @@ export const ErrorCode = {
   exposure_unconfirmed: 'exposure_unconfirmed',
   identity_unavailable: 'identity_unavailable',
   runner_unavailable: 'runner_unavailable',
+  functions_unavailable: 'functions_unavailable',
 } as const;

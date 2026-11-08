@@ -1175,6 +1175,7 @@ dependencies = [
  "chelabase-nats",
  "chelabase-pgsession",
  "chelabase-query",
+ "chelabase-schema",
  "chelabase-secrets",
  "chelabase-storage",
  "chelabase-types",

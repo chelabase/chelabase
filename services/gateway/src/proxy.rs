@@ -292,7 +292,8 @@ impl ProxyHttp for Gateway {
     }
 
     async fn fail_to_proxy(&self, session: &mut Session, e: &Error, ctx: &mut RequestCtx) -> FailToProxy {
-        let status = failure_status(e.esource(), e.etype());
+        let service = ctx.plan.as_ref().map(|p| p.endpoint.service);
+        let (status, code, message) = api_failure(service, e.esource(), e.etype());
         // Once the upstream response has started (headers sent, or a websocket
         // upgraded), writing our own error would splice JSON into it. Let the
         // connection close so the client sees a truncated response instead.
@@ -301,14 +302,6 @@ impl ProxyHttp for Gateway {
             // A site is a web page, not the API: a plain-text error, no JSON.
             let _ = write_plain_response(session, status, &ctx.request_id).await;
         } else if can_answer {
-            let (code, message) = match status {
-                502 => ("unavailable", "upstream unavailable"),
-                504 => ("timeout", "upstream timed out"),
-                400 => ("invalid_request", "bad request"),
-                408 => ("timeout", "request timed out"),
-                413 => ("too_large", "request body too large"),
-                _ => ("internal", "internal error"),
-            };
             let headers = ctx
                 .plan
                 .as_ref()
@@ -526,6 +519,34 @@ fn next_attempt(attempt: usize, candidates: usize) -> Option<usize> {
     (next < candidates).then_some(next)
 }
 
+/// Status, error code and message for an API proxying failure (`service` is the plan's
+/// upstream; a site has none); status 0 means the client is gone and nothing is written.
+fn api_failure(
+    service: Option<Service>,
+    source: &ErrorSource,
+    etype: &ErrorType,
+) -> (u16, &'static str, &'static str) {
+    let status = failure_status(source, etype);
+    // The functions service is optional (a compose profile): when it can't be reached at
+    // all, say that edge functions aren't running rather than a generic upstream failure.
+    let unreachable = matches!(
+        etype,
+        ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectError
+    );
+    if service == Some(Service::Functions) && unreachable && status == 502 {
+        return (503, "functions_unavailable", "edge functions aren't running on this instance");
+    }
+    let (code, message) = match status {
+        502 => ("unavailable", "upstream unavailable"),
+        504 => ("timeout", "upstream timed out"),
+        400 => ("invalid_request", "bad request"),
+        408 => ("timeout", "request timed out"),
+        413 => ("too_large", "request body too large"),
+        _ => ("internal", "internal error"),
+    };
+    (status, code, message)
+}
+
 /// HTTP status for a proxying failure; 0 means the client is gone and
 /// nothing should be written.
 fn failure_status(source: &ErrorSource, etype: &ErrorType) -> u16 {
@@ -654,6 +675,40 @@ mod tests {
             assert_eq!(failure_status(&ErrorSource::Unset, &etype), 502);
         }
         assert_eq!(failure_status(&ErrorSource::Upstream, &ErrorType::H1Error), 502);
+    }
+
+    #[test]
+    fn unreachable_functions_service_is_503_functions_unavailable() {
+        // The functions service sits behind a compose profile: absent, its host doesn't
+        // resolve (ConnectError) or refuses the connection.
+        for etype in [ErrorType::ConnectRefused, ErrorType::ConnectNoRoute, ErrorType::ConnectError] {
+            for source in [ErrorSource::Unset, ErrorSource::Upstream, ErrorSource::Internal] {
+                let (status, code, message) = api_failure(Some(Service::Functions), &source, &etype);
+                assert_eq!((status, code), (503, "functions_unavailable"), "{source:?} {etype:?}");
+                assert_eq!(message, "edge functions aren't running on this instance");
+            }
+        }
+    }
+
+    #[test]
+    fn functions_failures_after_connect_keep_their_status() {
+        let f = Some(Service::Functions);
+        assert_eq!(api_failure(f, &ErrorSource::Upstream, &ErrorType::H1Error).0, 502);
+        assert_eq!(api_failure(f, &ErrorSource::Upstream, &ErrorType::ReadTimedout).1, "timeout");
+        assert_eq!(api_failure(f, &ErrorSource::Downstream, &ErrorType::ConnectionClosed).0, 0);
+        assert_eq!(api_failure(f, &ErrorSource::Downstream, &ErrorType::ConnectError).0, 400);
+    }
+
+    #[test]
+    fn other_upstreams_unreachable_stay_502_unavailable() {
+        for service in [Some(Service::Rest), Some(Service::Orchestrator), None] {
+            for etype in [ErrorType::ConnectRefused, ErrorType::ConnectNoRoute, ErrorType::ConnectError] {
+                assert_eq!(
+                    api_failure(service, &ErrorSource::Unset, &etype),
+                    (502, "unavailable", "upstream unavailable"),
+                );
+            }
+        }
     }
 
     #[test]
