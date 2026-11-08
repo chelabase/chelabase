@@ -133,13 +133,21 @@ describe("LandingPage", () => {
       .map((h) => h.querySelector(".sr-only")?.textContent ?? h.textContent);
     expect(headers).toEqual(COLUMNS);
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows).toHaveLength(13);
+    expect(rows).toHaveLength(14);
     for (const r of rows) expect(within(r).getAllByRole("cell")).toHaveLength(COLUMNS.length);
     expect(table.textContent).not.toMatch(/to survey/i);
     const merge = rows.find((r) => within(r).getByRole("rowheader").textContent === "Schema merge between branches")!;
     expect(within(merge).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Partly", "No", "No", "No", "Yes"]);
     const storage = rows.find((r) => within(r).getByRole("rowheader").textContent === "Object storage")!;
     expect(within(storage).getAllByRole("cell")[0]).toHaveTextContent("Yes");
+  });
+
+  it("edge_functions_row_matches_the_survey", () => {
+    renderPage();
+    const table = screen.getByRole("table", { name: /comparison preview/i });
+    const rows = within(table).getAllByRole("row").slice(1);
+    const fns = rows.find((r) => within(r).getByRole("rowheader").textContent === "Serverless functions")!;
+    expect(within(fns).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Yes", "Yes", "Yes", "No", "No"]);
   });
 
   it("labels_the_branching_drawings_as_illustrations", () => {

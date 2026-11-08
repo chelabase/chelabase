@@ -11,9 +11,9 @@ import {
   LayoutDashboard,
   Maximize2,
   Radio,
+  SquareCode,
   Waypoints,
   X,
-  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
@@ -398,7 +398,7 @@ const PIECES: Piece[] = [
   },
   {
     id: "functions",
-    icon: Zap,
+    icon: SquareCode,
     title: "Edge functions",
     body: "Your own Workers-style TypeScript, with WebAssembly, run next to your database per branch and live within seconds of a save. Called over HTTP, on a schedule, or by table and storage events.",
     to: "using/functions",
@@ -794,6 +794,7 @@ const ROWS: Array<{ label: string; cells: Cells }> = [
   { label: "Live rows in the editor", cells: ["yes", "no", "yes", "no", "no", "no"] },
   { label: "Realtime for your app", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
   { label: "Object storage", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "Serverless functions", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
 ];
 
 function CompareCell({ cell }: { cell: Cell }) {
@@ -867,11 +868,13 @@ function Compare() {
             />
           </div>
           <p className="mt-4.5 max-w-[70ch] text-chalk-dim text-[0.95rem]">
-            From each product's docs, November 2026. Neon's realtime and object storage are in beta; Neon's schema diff
+            From each product's docs, November 2026. Neon's realtime and object storage are in beta, and its API reference still labels Functions beta; Neon's schema diff
             compares branches but doesn't merge them. Supabase merges a branch into production through a schema diff,
             and self-hosted Supabase runs one project without branching or point-in-time restore. PlanetScale merges
             schema through deploy requests on MySQL (Vitess) only. Firebase's Postgres is SQL Connect (Cloud SQL for
-            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't.
+            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't. Functions are Edge Functions on Supabase (Deno,
+            also in self-hosted Supabase), Cloud Functions on Firebase (not edge) and Node.js on a Neon branch; Chelabase
+            runs them in self-hosted mode only.
           </p>
         </div>
       </div>
