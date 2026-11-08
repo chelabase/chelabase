@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod app_users;
+mod db_events;
 mod scheduled;
 mod services;
 
