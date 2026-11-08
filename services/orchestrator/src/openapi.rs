@@ -914,6 +914,22 @@ impl crate::functions_schedules::SchedulesPort for Doc {
 }
 
 #[allow(unused_variables)]
+impl crate::functions_triggers::TriggersPort for Doc {
+    async fn add_trigger(&self, trigger: &chelabase_metadata::NewTrigger<'_>) -> Result<Uuid, MetadataError> {
+        match *self {}
+    }
+    async fn list_triggers(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::TriggerRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn update_trigger(&self, branch: BranchId, function: Uuid, id: Uuid, enabled: bool) -> Result<Option<chelabase_metadata::TriggerRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_trigger(&self, branch: BranchId, function: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
 impl members::MemberRolesQueue for Doc {
     async fn enqueue_member_roles(&self, branch: BranchId) -> Result<(), BoxError> {
         match *self {}
@@ -1253,6 +1269,7 @@ mod tests {
             ),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}", "deleteFunction"),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "deleteFunctionSchedule"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}", "deleteFunctionTrigger"),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}", "deleteFunctionSecret"),
             (
                 "DELETE /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
@@ -1313,6 +1330,7 @@ mod tests {
             ("GET /v1/databases/{id}/branches/{branch_id}/functions", "listFunctions"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "listFunctionDeployments"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "listFunctionSchedules"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers", "listFunctionTriggers"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets", "listFunctionSecrets"),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/guard-exemptions",
@@ -1385,6 +1403,7 @@ mod tests {
             ),
             ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}", "updateFunction"),
             ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "updateFunctionSchedule"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}", "updateFunctionTrigger"),
             (
                 "PATCH /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
                 "updateKey",
@@ -1413,6 +1432,7 @@ mod tests {
             ),
             ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "createFunctionDeployment"),
             ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "createFunctionSchedule"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers", "createFunctionTrigger"),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys",
                 "createKey",
@@ -1733,6 +1753,7 @@ mod tests {
             "CreateDatabaseRequest",
             "CreateFunctionDeploymentRequest",
             "CreateFunctionScheduleRequest",
+            "CreateFunctionTriggerRequest",
             "CreateInviteRequest",
             "CreateKeyRequest",
             "CreateMergeRequest",
@@ -1784,6 +1805,8 @@ mod tests {
             "FunctionKind",
             "FunctionRef",
             "FunctionSchedule",
+            "FunctionTrigger",
+            "FunctionTriggerSource",
             "Grant",
             "GrantOverride",
             "Grantee",
@@ -1926,6 +1949,7 @@ mod tests {
             "UpdateDatabaseRequest",
             "UpdateFunctionRequest",
             "UpdateFunctionScheduleRequest",
+            "UpdateFunctionTriggerRequest",
             "UpdateInstanceSettingsRequest",
             "UpdateKeyRequest",
             "UpdateMemberRequest",

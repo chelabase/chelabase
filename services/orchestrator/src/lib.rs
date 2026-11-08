@@ -49,6 +49,7 @@ mod app_users;
 mod data_keys;
 pub mod functions;
 pub mod functions_schedules;
+pub mod functions_triggers;
 pub mod internal;
 pub mod members;
 pub mod member_sessions;
@@ -130,7 +131,7 @@ pub(crate) fn proxy_host(endpoint_id: &str, domain: &str) -> String {
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`. The member API's reads
 /// and writes are [`members::MembersPort`].
 pub trait MetadataPort:
-    members::MembersPort + functions::FunctionsPort + functions_schedules::SchedulesPort + Send + Sync + 'static
+    members::MembersPort + functions::FunctionsPort + functions_schedules::SchedulesPort + functions_triggers::TriggersPort + Send + Sync + 'static
 {
     /// Whether the tenant exists (#119: a member token's `tid` names one that may be gone).
     fn tenant_exists(&self, tenant: TenantId) -> impl Future<Output = Result<bool, MetadataError>> + Send {
@@ -2675,6 +2676,7 @@ where
         .merge(teams::routes())
         .merge(functions::routes())
         .merge(functions_schedules::routes())
+        .merge(functions_triggers::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.

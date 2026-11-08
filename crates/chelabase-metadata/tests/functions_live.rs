@@ -2386,9 +2386,9 @@ mod functions {
         let fresh = row(c.list_triggers(main).await.unwrap());
         assert_eq!((fresh.dead_count, fresh.last_delivery_error, fresh.last_delivered_at), (0, None, None));
         let failed = TriggerDelivery { id: t, delivered: false, dead: 2, error: Some("the function answered 500".into()) };
-        assert_eq!(c.record_trigger_deliveries(main, &[failed.clone()]).await.unwrap(), 1);
+        assert_eq!(c.record_trigger_deliveries(main, std::slice::from_ref(&failed)).await.unwrap(), 1);
         let (_, other) = s.database().await;
-        assert_eq!(c.record_trigger_deliveries(other, &[failed.clone()]).await.unwrap(), 0, "another branch's");
+        assert_eq!(c.record_trigger_deliveries(other, std::slice::from_ref(&failed)).await.unwrap(), 0, "another branch's");
         let after = row(c.list_triggers(main).await.unwrap());
         assert_eq!((after.dead_count, after.last_delivery_error.as_deref()), (2, Some("the function answered 500")));
         assert_eq!(after.last_delivered_at, None);

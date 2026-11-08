@@ -172,6 +172,56 @@ struct FakeMetadata {
     functions: Arc<Mutex<FakeFunctions>>,
 }
 
+impl orchestrator::functions_triggers::TriggersPort for FakeMetadata {
+    async fn add_trigger(&self, t: &chelabase_metadata::NewTrigger<'_>) -> Result<uuid::Uuid, MetadataError> {
+        self.fn_scope(t.branch_id, t.function_id)?;
+        let id = uuid::Uuid::new_v4();
+        let table = t.source == chelabase_metadata::TriggerSource::Table;
+        self.functions.lock().unwrap().triggers.push(chelabase_metadata::TriggerRecord {
+            id,
+            branch_id: t.branch_id,
+            function_id: t.function_id,
+            source: t.source,
+            enabled: true,
+            state: if table { chelabase_metadata::TriggerState::PendingInstall } else { chelabase_metadata::TriggerState::Installed },
+            enabled_since: chrono::Utc::now(),
+            pg_database: t.pg_database.to_string(),
+            schema_name: t.schema_name.map(str::to_string),
+            table_name: t.table_name.map(str::to_string),
+            bucket: t.bucket.map(str::to_string),
+            prefix: t.prefix.map(str::to_string),
+            events: t.events.iter().map(|e| e.to_string()).collect(),
+            last_error: None,
+            dead_count: 0,
+            last_delivery_error: None,
+            last_delivered_at: None,
+        });
+        Ok(id)
+    }
+
+    async fn list_triggers(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::TriggerRecord>, MetadataError> {
+        Ok(self.functions.lock().unwrap().triggers.iter().filter(|t| t.branch_id == branch).cloned().collect())
+    }
+
+    async fn update_trigger(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid, enabled: bool) -> Result<Option<chelabase_metadata::TriggerRecord>, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let Some(t) = fs.triggers.iter_mut().find(|t| t.id == id && t.branch_id == branch && t.function_id == function) else {
+            return Ok(None);
+        };
+        t.enabled = enabled;
+        Ok(Some(t.clone()))
+    }
+
+    async fn delete_trigger(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let before = fs.triggers.len();
+        fs.triggers.retain(|t| !(t.id == id && t.branch_id == branch && t.function_id == function));
+        Ok(fs.triggers.len() < before)
+    }
+}
+
 /// Edge functions m3: what the metadata's functions tables hold.
 #[derive(Default)]
 struct FakeFunctions {
@@ -182,6 +232,8 @@ struct FakeFunctions {
     secrets: std::collections::BTreeMap<(uuid::Uuid, uuid::Uuid, String), String>,
     /// Edge functions m7: every branch's schedules, oldest first.
     schedules: Vec<chelabase_metadata::ScheduleRecord>,
+    /// Edge functions m13: every branch's triggers, oldest first.
+    triggers: Vec<chelabase_metadata::TriggerRecord>,
 }
 
 /// Members hub step 2 (T23): one team as the fake keeps it.
