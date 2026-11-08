@@ -98,6 +98,13 @@
 //! (`MetadataClient::settle_trigger_installs`): only `installed` rows are the dispatcher's
 //! (m13).
 //!
+//! m13 (#175): a disabled trigger is never wanted (its database trigger is dropped and its
+//! queued events deleted); a deleted or disabled trigger, and a deleted function's triggers,
+//! are recorded in `function_trigger_drops`, which keeps the branch in the reconcile sweep
+//! until a complete sync ([`Worker::sync_fn_triggers`] answers `Ok(true)`) has dropped them
+//! ("drop, then forget"). `enqueue()` also records the transaction id (`txid`). The events are
+//! delivered by [`crate::fn_events`].
+//!
 //! When: after a branch create (the child's rows are copies, `pending_install`, and its
 //! database still has the parent's triggers and outbox); after a reset or restore (the switch
 //! pended every table trigger of the branch); and on each reconcile pass
@@ -369,15 +376,14 @@ pub fn trigger_events(events: &[String]) -> Option<(String, i16)> {
 }
 
 /// The table trigger rows a database wants, from `triggers` (any source): the wanted list.
+/// A failed row is never wanted (its database trigger is dropped, never installed), nor is a
+/// disabled one (m13: its database trigger is dropped and the cleanup deletes its queued
+/// events, so a disabled trigger queues nothing; a disabled *function*'s triggers stay and
+/// queue, `fn_events`).
 pub fn wanted_in(triggers: &[TriggerRecord], db: &str) -> Vec<Wanted> {
     triggers
         .iter()
-        // A failed row is never wanted: its database trigger is dropped, never installed.
-        .filter(|t| {
-            t.source == TriggerSource::Table
-                && t.state != TriggerState::Failed
-                && t.pg_database == db
-        })
+        .filter(|t| t.pg_database == db && wanted(t))
         .filter_map(|t| {
             Some(Wanted {
                 id: t.id,
@@ -387,6 +393,11 @@ pub fn wanted_in(triggers: &[TriggerRecord], db: &str) -> Vec<Wanted> {
             })
         })
         .collect()
+}
+
+/// A table trigger row whose database trigger should be in place: enabled and not failed.
+fn wanted(t: &TriggerRecord) -> bool {
+    t.source == TriggerSource::Table && t.enabled && t.state != TriggerState::Failed
 }
 
 /// The predicate "trigger `tg` on `c` in `n` is exactly the wanted `w`", for the script.
@@ -497,7 +508,7 @@ BEGIN
   INSERT INTO {FUNCTIONS_SCHEMA}.outbox (trigger_id, payload, timeline_id)
   VALUES (TG_ARGV[0]::pg_catalog.uuid,
     pg_catalog.jsonb_build_object('type', TG_OP, 'schema', TG_TABLE_SCHEMA, 'table', TG_TABLE_NAME,
-      'record', rec, 'old_record', old_rec),
+      'record', rec, 'old_record', old_rec, 'txid', pg_catalog.txid_current()),
     pg_catalog.current_setting('neon.timeline_id', true));
   PERFORM pg_catalog.pg_notify('{NOTIFY_CHANNEL}', '');
   RETURN NULL;
@@ -813,7 +824,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     Worker<M, S, C, N, P>
 {
     /// The ready branch's record and its endpoint, or `None` (not ready, gone, no endpoint).
-    async fn ready_endpoint(
+    pub(crate) async fn ready_endpoint(
         &self,
         branch: BranchId,
     ) -> Result<Option<(BranchRecord, String)>, String> {
@@ -840,12 +851,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// is still pending: a sweep that got there first already cleaned it. A database that
     /// can't be reached keeps its rows as they are (the sweep retries) and makes the call
     /// fail; one that doesn't exist fails its rows.
-    pub async fn sync_fn_triggers(&self, branch: BranchId, truncate: bool) -> Result<(), String> {
+    ///
+    /// `Ok(true)` when every database of the branch was brought in step (or refused, with its
+    /// triggers dropped); `Ok(false)` when nothing ran (the branch isn't ready) or a database
+    /// yielded to a tenant's lock or another sync (m13: a recorded drop is cleared only after
+    /// a complete sync).
+    pub async fn sync_fn_triggers(&self, branch: BranchId, truncate: bool) -> Result<bool, String> {
         let Some(meta) = self.metadata.functions() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some((_, ep)) = self.ready_endpoint(branch).await? else {
-            return Ok(());
+            return Ok(false);
         };
         let triggers: Vec<TriggerRecord> = meta
             .list_triggers(branch)
@@ -858,7 +874,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             && triggers
                 .iter()
                 .any(|t| t.state == TriggerState::PendingInstall);
-        let wanted_any = triggers.iter().any(|t| t.state != TriggerState::Failed);
+        let wanted_any = triggers.iter().any(wanted);
         let role = self
             .computes
             .admin_sql(&ep, SYSTEM_DATABASE, &role_sql(wanted_any))
@@ -910,6 +926,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         }
                         self.settle(meta, branch, &triggers, |_| Some(Some(refusal.clone())))
                             .await
+                            .map(|()| true)
                     }
                     None => Err(format!("checking the function triggers' role in {db}: {e}")),
                 };
@@ -917,6 +934,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         let mut answers: Vec<(Uuid, Option<String>)> = Vec::new();
         let mut failure = None;
+        let mut complete = true;
         for db in &databases {
             let wanted = wanted_in(&triggers, db);
             match self
@@ -939,6 +957,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         // A lock a tenant held, or another sync of the database: the rows
                         // stay as they are and the next pass comes back. Not a failure.
                         None if retry_later(&e) => {
+                            complete = false;
                             info!(branch_id = %branch, database = %db, "function triggers' sync yields: {}", e.lines().find(|l| l.contains("ERROR")).unwrap_or(&e));
                         }
                         None => {
@@ -958,7 +977,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         })
         .await?;
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(complete), Err)
     }
 
     /// Settles each row read that `outcome` answers for (`Some(None)`: in the database;
@@ -1023,8 +1042,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         for branch in self.sweep_batch(Sweep::Triggers, &candidates) {
             self.attempted(Sweep::Triggers, branch);
-            if let Err(e) = self.sync_fn_triggers(branch, false).await {
-                warn!(branch_id = %branch, "function triggers not synced: {e}");
+            // m13: drop, then forget. The drops read before a complete sync are cleared after it:
+            // that sync no longer wanted their triggers, so it dropped them.
+            let drops = match meta.trigger_drops(branch).await {
+                Ok(drops) => drops,
+                Err(e) => {
+                    warn!(branch_id = %branch, "reading the function triggers to drop: {e}");
+                    continue;
+                }
+            };
+            match self.sync_fn_triggers(branch, false).await {
+                Ok(true) if !drops.is_empty() => {
+                    if let Err(e) = meta.clear_trigger_drops(branch, &drops).await {
+                        warn!(branch_id = %branch, "clearing the dropped function triggers: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(branch_id = %branch, "function triggers not synced: {e}"),
             }
         }
     }
@@ -1473,6 +1507,45 @@ mod tests {
         for script in [role_sql(true), check_sql(Some(1)), drop_triggers_sql()] {
             assert!(script.contains("SET LOCAL lock_timeout = '2s';"), "{script}");
         }
+    }
+
+    fn record(enabled: bool, state: TriggerState) -> TriggerRecord {
+        TriggerRecord {
+            id: Uuid::new_v4(),
+            branch_id: BranchId::new(),
+            function_id: Uuid::new_v4(),
+            source: TriggerSource::Table,
+            enabled,
+            state,
+            enabled_since: chrono::Utc::now(),
+            pg_database: "app".into(),
+            schema_name: Some("public".into()),
+            table_name: Some("orders".into()),
+            bucket: None,
+            prefix: None,
+            events: vec!["insert".into()],
+            last_error: None,
+            dead_count: 0,
+            last_delivery_error: None,
+            last_delivered_at: None,
+        }
+    }
+
+    /// m13 (#175, S4): a disabled trigger is never wanted, so its database trigger is dropped
+    /// and the cleanup deletes its queued events: a disabled trigger queues nothing.
+    #[test]
+    fn fn_triggers_disabled_rows_are_not_wanted() {
+        let on = record(true, TriggerState::Installed);
+        let off = record(false, TriggerState::Installed);
+        let pending_off = record(false, TriggerState::PendingInstall);
+        let wanted = wanted_in(&[on.clone(), off, pending_off], "app");
+        assert_eq!(wanted.iter().map(|w| w.id).collect::<Vec<_>>(), vec![on.id]);
+    }
+
+    /// m13: `enqueue()` records the transaction id, for the event's `txid`.
+    #[test]
+    fn fn_triggers_enqueue_records_the_txid() {
+        assert!(enqueue_body().contains("'txid', pg_catalog.txid_current()"));
     }
 
     /// Round 2 (B1, B2): plain tables only; the install adopts nothing it didn't make.

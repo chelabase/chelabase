@@ -28,6 +28,7 @@ pub mod credentials;
 pub mod data_api;
 pub mod delete;
 pub mod fn_bundle_sweep;
+pub mod fn_events;
 pub mod fn_triggers;
 pub mod fn_schedules;
 #[cfg(test)]
