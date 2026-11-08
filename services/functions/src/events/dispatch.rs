@@ -39,9 +39,9 @@ use super::{
 };
 
 /// The channel `enqueue()` notifies after each insert.
-pub const CHANNEL: &str = "chelabase_functions";
+pub const CHANNEL: &str = chelabase_schema::exclusions::FUNCTIONS_NOTIFY_CHANNEL;
 /// The dispatcher's login, made and granted by the worker's install.
-pub const LOGIN: &str = "chelabase_functions_dispatch";
+pub const LOGIN: &str = chelabase_schema::exclusions::FUNCTIONS_DISPATCH_ROLE;
 /// The most databases one service dispatches at once.
 pub const MAX_TARGETS: usize = 500;
 /// A failed session waits this long before it connects again.

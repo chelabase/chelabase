@@ -26,6 +26,9 @@ chelabase-nats = { workspace = true }
 # m13b: the database-event dispatcher's connections to branch computes (as rest's).
 chelabase-pgsession = { workspace = true }
 chelabase-query = { workspace = true }
+# The dispatcher's login and NOTIFY channel, shared with the worker's install (already in the
+# tree through chelabase-pgsession).
+chelabase-schema = { workspace = true }
 chelabase-secrets = { workspace = true }
 # The bundle store (bucket chelabase-functions, the `functions` S3 identity).
 chelabase-storage = { workspace = true }
