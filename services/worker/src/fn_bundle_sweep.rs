@@ -15,6 +15,15 @@
 //!
 //! Keys that aren't `{uuid}/{64 hex}` are left alone. A database whose references can't be
 //! read loses nothing this pass.
+//!
+//! **The remaining window.** The recheck and the delete are two calls: a redeploy of that very
+//! hash landing between them (its `PUT`, then its deployment row) loses its bundle, and the
+//! function fails to load until it is deployed again (which uploads the bundle again). The
+//! delete can't be made conditional: [`ObjectStore`] has no conditional delete, S3's
+//! `DeleteObject` takes no `If-Unmodified-Since`, and an `If-Match` on the ETag can't tell a
+//! rewrite of the same bytes (a bundle's key is its hash) from the object listed. The window is
+//! the gap between two requests, and only for a bundle no deployment references and nothing
+//! has written for longer than [`GRACE`].
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, SystemTime};

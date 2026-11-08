@@ -176,7 +176,9 @@ async fn main() -> anyhow::Result<()> {
         Some((url, token)) => {
             let invoker: Arc<dyn worker::fn_schedules::Invoker> =
                 Arc::new(worker::fn_schedules::HttpInvoker::new(url, token.clone())?);
-            // m13b: database events are the functions service's (its own login, LISTEN).
+            // m7: scheduled runs. (Database events aren't invoked from here: the reconcile
+            // sweep installs their triggers, `fn_triggers`, and the functions service
+            // dispatches the outbox as its own login, m13b.)
             tokio::spawn(worker::fn_schedules::schedule_loop(
                 worker.metadata.inner().clone(),
                 invoker.clone(),
