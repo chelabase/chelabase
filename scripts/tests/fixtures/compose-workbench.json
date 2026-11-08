@@ -34,10 +34,6 @@
       "ipam": {},
       "name": "chelabase-feat-x_functions-egress"
     },
-    "services": {
-      "ipam": {},
-      "name": "chelabase-feat-x_services"
-    },
     "services-control": {
       "internal": true,
       "ipam": {},
@@ -477,7 +473,7 @@
         }
       ],
       "environment": {
-        "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,functions-services:8091,127.0.0.1:8091",
+        "CHELABASE_FUNCTIONS_ADDR": "functions-public:8091,127.0.0.1:8091",
         "CHELABASE_FUNCTIONS_CONTROL_ADDR": "functions-control:8080",
         "CHELABASE_FUNCTIONS_INTERNAL_ADDR": "functions-internal:8080",
         "CHELABASE_FUNCTIONS_RUNTIME_URL": "http://functions-runtime:8080",
@@ -523,11 +519,6 @@
         "functions-control": {
           "aliases": [
             "functions-control"
-          ]
-        },
-        "services": {
-          "aliases": [
-            "functions-services"
           ]
         },
         "services-control": {}
@@ -2151,8 +2142,8 @@
         }
       ],
       "environment": {
+        "CHELABASE_COMPOSE_PROJECT": "chelabase-feat-x",
         "CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/functions-service-runner.token",
-        "CHELABASE_SERVICES_NETWORK": "chelabase-feat-x_services",
         "CHELABASE_SERVICE_RUNNER_ADDR": "service-runner-control:8094,127.0.0.1:8094",
         "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token"
       },

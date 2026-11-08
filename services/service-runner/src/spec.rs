@@ -261,8 +261,10 @@ fn valid_name(name: &str) -> bool {
     if parts.iter().any(|p| p.is_empty()) {
         return false;
     }
-    // A first part with a `.` or `:`, or `localhost`, is a registry host.
-    if parts.len() > 1 && (parts[0].contains(['.', ':']) || parts[0] == "localhost") {
+    // A first part with a `.` or `:`, or `localhost` (any case), is a registry host.
+    if parts.len() > 1
+        && (parts[0].contains(['.', ':']) || parts[0].eq_ignore_ascii_case("localhost"))
+    {
         let host = parts.remove(0);
         let (h, port) = match host.split_once(':') {
             Some((h, p)) => (h, Some(p)),
@@ -274,7 +276,17 @@ fn valid_name(name: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || b"-.".contains(&b));
         let port_ok = port
             .is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
-        if !host_ok || !port_ok {
+        // The engine pulls from the host's network namespace: no loopback or `localhost` name,
+        // and no IP literal (a numeric last label is never a real top-level domain, so `127.1`
+        // and `2130706433` count too).
+        let lower = h.to_ascii_lowercase();
+        let local = lower == "localhost"
+            || lower.ends_with(".localhost")
+            || h.parse::<std::net::IpAddr>().is_ok()
+            || h.rsplit('.')
+                .next()
+                .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+        if !host_ok || !port_ok || local {
             return false;
         }
     }
@@ -436,7 +448,6 @@ mod tests {
         for ok in [
             "busybox:1.37".to_string(),
             "ghcr.io/acme/echo:v1".to_string(),
-            "localhost:5000/echo:latest".to_string(),
             "registry.example.com:443/a/b_c__d/e-f.g:tag_1.2-x".to_string(),
             format!("ghcr.io/acme/echo@{digest}"),
         ] {
@@ -468,6 +479,30 @@ mod tests {
         let mut s = base();
         s["image"] = json!(format!("busybox@{digest}"));
         assert!(parse(&s, &caps()).is_ok());
+    }
+
+    /// Audit N1: the engine pulls from the host's network namespace, so a loopback, IP-literal
+    /// or `localhost` registry would let a spec reach the host's own listeners.
+    #[test]
+    fn local_and_ip_registries_are_refused() {
+        for bad in [
+            "localhost/echo:1",
+            "localhost:5000/echo:1",
+            "LOCALHOST:5000/echo:1",
+            "registry.localhost/echo:1",
+            "127.0.0.1:2375/echo:1",
+            "127.0.0.1/echo:1",
+            "10.0.0.5:5000/echo:1",
+            "169.254.169.254/echo:1",
+            "127.1:5000/echo:1",
+            "2130706433:5000/echo:1",
+            "[::1]:5000/echo:1",
+        ] {
+            assert!(parse_image(bad).is_err(), "{bad}");
+        }
+        assert!(parse_image("ghcr.io/acme/echo:1").is_ok());
+        assert!(parse_image("registry.example.com:5000/echo:1").is_ok());
+        assert!(parse_image("my-registry.internal.example:443/a/b:1").is_ok());
     }
 
     #[test]

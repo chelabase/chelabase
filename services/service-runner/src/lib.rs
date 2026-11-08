@@ -6,7 +6,10 @@
 //!   or a compute) is "not found" even when its id is given;
 //! - every container it creates is hardened the same way ([`docker::create_body`]): non-root,
 //!   read-only root, every capability dropped, no new privileges, memory, CPU and pids limits, no
-//!   host mount, device or namespace, and only the `services` network;
+//!   host mount, device or namespace, on a private network of its own that only the stack's
+//!   functions container joins (so service containers never reach each other);
+//! - only ensure creates a container (with the branch's secrets); reconcile starts, stops and
+//!   removes;
 //! - its callers (the functions service and the worker) each present their own bearer.
 
 pub mod app;

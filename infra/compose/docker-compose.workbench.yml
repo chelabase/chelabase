@@ -728,7 +728,7 @@ services:
     env_file:
       - *stack-env
     environment: !override
-      - CHELABASE_FUNCTIONS_ADDR=functions-public:8091,functions-services:8091,127.0.0.1:8091
+      - CHELABASE_FUNCTIONS_ADDR=functions-public:8091,127.0.0.1:8091
       - CHELABASE_FUNCTIONS_INTERNAL_ADDR=functions-internal:8080
       - CHELABASE_FUNCTIONS_CONTROL_ADDR=functions-control:8080
       - CHELABASE_FUNCTIONS_RUNTIME_URL=http://functions-runtime:8080
@@ -780,7 +780,7 @@ services:
       - *stack-env
     environment: !override
       - CHELABASE_SERVICE_RUNNER_ADDR=service-runner-control:8094,127.0.0.1:8094
-      - CHELABASE_SERVICES_NETWORK=${COMPOSE_PROJECT_NAME}_services
+      - CHELABASE_COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME}
       - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
       - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
     group_add: ["${CHELABASE_DOCKER_GID}"]

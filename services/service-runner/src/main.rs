@@ -38,12 +38,13 @@ async fn main() -> anyhow::Result<()> {
         .connect_lazy(&database_url)
         .context("the metadata database URL")?;
     let backend = Arc::new(DockerBackend::connect()?);
-    let runner = Arc::new(Runner::new(
-        backend,
-        &config.stack,
-        &config.network,
-        config.caps,
-    ));
+    // The env digest's key, derived from the functions caller's bearer: stable across restarts,
+    // never written anywhere.
+    let runner = Arc::new(
+        Runner::new(backend, &config.stack, &config.project, config.caps).with_digest_key(
+            service_runner::runner::derive_digest_key(&config.functions_token),
+        ),
+    );
     spawn_loop(
         runner.clone(),
         Arc::new(MetadataDesired { pool }),
@@ -78,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
         "CHELABASE_SERVICE_RUNNER_ADDR names no address"
     );
     info!(
-        "service-runner listening on {addrs:?}, stack {}, network {}, caps {:?}",
-        config.stack, config.network, config.caps
+        "service-runner listening on {addrs:?}, stack {}, compose project {}, caps {:?}",
+        config.stack, config.project, config.caps
     );
     let mut servers = tokio::task::JoinSet::new();
     for addr in addrs {
