@@ -46,6 +46,13 @@ pub const LOGIN: &str = "chelabase_functions_dispatch";
 pub const MAX_TARGETS: usize = 500;
 /// A failed session waits this long before it connects again.
 pub const RETRY: Duration = Duration::from_secs(5);
+/// The shortest idle after a pass that claimed less than a whole batch (fix B1): a due row
+/// another session holds locked (the claim skips it) never makes the session spin.
+pub const IDLE_FLOOR: Duration = Duration::from_millis(250);
+/// The shortest gap between a pass and the next one a notification wakes (fix B1): any role
+/// may `NOTIFY chelabase_functions`, so wakeups are coalesced; delivery still starts well
+/// within a second.
+pub const NOTIFY_GAP: Duration = Duration::from_millis(100);
 
 /// What the dispatcher reads and records in the metadata.
 #[async_trait::async_trait]
@@ -116,6 +123,8 @@ pub struct Session {
     client: Client,
     notifications: tokio::sync::mpsc::UnboundedReceiver<tokio_postgres::Notification>,
     last_sweep: Option<Instant>,
+    /// When the last pass started ([`NOTIFY_GAP`]).
+    last_pass: Option<Instant>,
 }
 
 /// Why a wait ended.
@@ -145,7 +154,7 @@ const GUARD_SQL: &str = "SELECT EXISTS (SELECT FROM pg_catalog.pg_class c
 const CLEANUP_SQL: &str = "DELETE FROM chelabase_functions.outbox
   WHERE timeline_id IS DISTINCT FROM $1::pg_catalog.text
      OR trigger_id OPERATOR(pg_catalog.<>) ALL ($2::pg_catalog.text[]::pg_catalog.uuid[])
-  RETURNING trigger_id::pg_catalog.text";
+  RETURNING CASE WHEN timeline_id IS NOT DISTINCT FROM $1::pg_catalog.text THEN trigger_id::pg_catalog.text END";
 
 /// The bound (B1): dead rows only, past the newest `$1` dead ones or dead for longer than `$2`
 /// seconds; the trigger id of each. A pending row is never touched.
@@ -158,6 +167,8 @@ const BOUND_SQL: &str = "DELETE FROM chelabase_functions.outbox
 
 /// Settles the rows `$1`..: deletes the delivered and dropped ones (`$1` alone), or sets
 /// status, delay and the attempt taken back of the others.
+/// Deletes the rows `$1` of triggers no longer delivered; the trigger id of each it removed.
+const DROP_SQL: &str = "DELETE FROM chelabase_functions.outbox WHERE id OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[]) RETURNING trigger_id::pg_catalog.text";
 const DELETE_SQL: &str = "DELETE FROM chelabase_functions.outbox WHERE id OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])";
 const UPDATE_SQL: &str = "UPDATE chelabase_functions.outbox o SET status = v.status,
     attempts = o.attempts OPERATOR(pg_catalog.-) v.back,
@@ -323,12 +334,14 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
             client: conn.client,
             notifications: conn.notifications,
             last_sweep: None,
+            last_pass: None,
         }))
     }
 
     /// One pass (see [`super`]); a sweep when [`SWEEP_EVERY`] has passed since the last one
     /// (or this is the session's first).
     pub async fn pass(&self, s: &mut Session) -> Result<Pass, String> {
+        s.last_pass = Some(Instant::now());
         let sweep = s.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY);
         let (branch, db) = (s.branch, s.database.clone());
         let Some((timeline, known, plan)) = self.current(branch, &db).await? else {
@@ -371,8 +384,10 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
                     .await
                     .map_err(pg("bounding the outbox"))?,
             );
+            // Counted from what each DELETE removed (fix N1): a row two dispatchers race for
+            // is counted by the one that deleted it.
             for row in removed {
-                if let Ok(id) = row.get::<_, String>(0).parse() {
+                if let Some(Ok(id)) = row.get::<_, Option<String>>(0).map(|t| t.parse()) {
                     tally.dropped(id, &known);
                 }
             }
@@ -400,7 +415,10 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
             .map_err(pg("claiming events"))?;
         let full = claimed.len() as i64 >= CLAIM_BATCH;
         let mut settled: Vec<(i64, Settle)> = Vec::with_capacity(claimed.len());
+        // Rows of a trigger deleted or disabled since the claim: deleted and counted (fix N1).
+        let mut drops: Vec<i64> = Vec::new();
         let mut stop = false;
+        let mut failed = None;
         for row in &claimed {
             let id: i64 = row.get(0);
             // N3: a row that doesn't parse is untrusted and deleted, never leased forever.
@@ -420,21 +438,25 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
                 (Ok(_), None) => unreachable!("vet refuses a row without its trigger"),
             };
             // S3: the branch, the trigger and its function as they are now, per row.
-            match self.current(branch, &db).await? {
-                Some((now, latest, p)) if now == s.timeline => {
+            match self.current(branch, &db).await {
+                Ok(Some((now, _, p))) if now == s.timeline => {
                     if !p.deliver.iter().any(|x| x.trigger_id == d.trigger_id) {
                         if p.hold.contains(&d.trigger_id) {
                             settled.push((id, Settle::Release));
                         } else {
-                            tally.dropped(d.trigger_id, &latest);
-                            settled.push((id, Settle::Delete));
+                            drops.push(id);
                         }
                         continue;
                     }
                 }
-                // Gone, not ready, or moved: the rest keep their leases.
-                _ => {
+                // Gone, not ready, or moved: the pass stops.
+                Ok(_) => {
                     stop = true;
+                    break;
+                }
+                // Fix S1: what was delivered is still settled below, then the error returns.
+                Err(e) => {
+                    failed = Some(e);
                     break;
                 }
             }
@@ -444,10 +466,41 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
             tally.settled(d.trigger_id, &outcome, st);
             settled.push((id, st));
         }
+        // Rows the loop never reached (it stopped) are released, not left to the lease.
+        let reached: std::collections::HashSet<i64> = settled
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(drops.iter().copied())
+            .collect();
+        for row in &claimed {
+            let id: i64 = row.get(0);
+            if !reached.contains(&id) {
+                settled.push((id, Settle::Release));
+            }
+        }
         self.settle(s, &settled).await?;
+        if !drops.is_empty() {
+            let gone = s
+                .client
+                .query(DROP_SQL, &[&drops])
+                .await
+                .map_err(pg("dropping events"))?;
+            for row in gone {
+                if let Ok(id) = row.get::<_, String>(0).parse() {
+                    tally.dropped(id, &known);
+                }
+            }
+        }
         let deliveries: Vec<TriggerDelivery> = tally.0.into_values().collect();
         if !deliveries.is_empty() {
-            self.meta.record(branch, &deliveries).await?;
+            match (self.meta.record(branch, &deliveries).await, &failed) {
+                (Err(e), None) => return Err(e),
+                (Err(e), Some(_)) => warn!(branch_id = %branch, database = %db, "{e}"),
+                (Ok(()), _) => {}
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         if stop {
             return Ok(Pass::Stop);
@@ -466,7 +519,7 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
         let idle = next.map_or(until_sweep, |secs| {
             Duration::from_secs_f64(secs.max(0.0)).min(until_sweep)
         });
-        Ok(Pass::Idle(idle))
+        Ok(Pass::Idle(idle.max(IDLE_FLOOR)))
     }
 
     async fn invoke(&self, branch: BranchId, d: &Deliverable, event: &super::Event) -> Outcome {
@@ -515,7 +568,8 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
         Ok(())
     }
 
-    /// Waits up to `idle` for a notification on the session.
+    /// Waits up to `idle` for a notification on the session; a notification wakes the next
+    /// pass no sooner than [`NOTIFY_GAP`] after the last one began.
     pub async fn wait(&self, s: &mut Session, idle: Duration) -> Result<Woken, String> {
         let woken = tokio::select! {
             n = s.notifications.recv() => match n {
@@ -524,6 +578,15 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
             },
             _ = tokio::time::sleep(idle) => Woken::TimedOut,
         };
+        // Fix B1: at most one notification-woken pass per NOTIFY_GAP, whoever notifies.
+        if woken == Woken::Notified
+            && let Some(gap) = s
+                .last_pass
+                .map(|t| NOTIFY_GAP.saturating_sub(t.elapsed()))
+                .filter(|g| !g.is_zero())
+        {
+            tokio::time::sleep(gap).await;
+        }
         // One pass serves every notification that came meanwhile.
         while s.notifications.try_recv().is_ok() {}
         Ok(woken)
