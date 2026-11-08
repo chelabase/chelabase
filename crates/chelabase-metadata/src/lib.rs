@@ -48,7 +48,7 @@ pub use functions::{
     Advance, BranchFunction, ClaimedSchedule, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
-    ServiceTarget, RunAsMint, RunAsUnmintable, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
+    ServiceTarget, RunAsMint, RunAsUnmintable, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
     valid_function_name, valid_secret_name,
 };
 pub use merges::{
@@ -479,7 +479,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261107000006).
+        // this file when adding one (last: 20261108000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,

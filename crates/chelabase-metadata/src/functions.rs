@@ -21,7 +21,8 @@
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes) | branch create copies (insert), tombstone purge (delete) |
 //! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
-//! | 4b | `function_triggers` | `INSERT` (add); the worker's settle `UPDATE`, alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
+//! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the dispatcher's delivery record `UPDATE`, each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
+//! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
 //! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync |
 //!
@@ -38,7 +39,11 @@
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
 //! alone, skipping any another transaction holds, and takes nothing after them.
 //! The worker's trigger settle ([`MetadataClient::settle_trigger_installs`]) updates trigger rows (4b)
-//! alone and takes nothing after them.
+//! alone and takes nothing after them, as does the dispatcher's
+//! [`MetadataClient::record_trigger_deliveries`] (m13); the worker's
+//! [`MetadataClient::clear_trigger_drops`] deletes drop rows (4c) alone. A drop row is only
+//! ever inserted, by a writer already holding what it needs, and has no foreign key, so it can't
+//! close a wait cycle: a function delete inserts its drops before its cascade takes 4 and 4b.
 //! `function_writes_keep_the_lock_order` (`tests/functions_live.rs`) runs each function write
 //! against each existing writer, stalled on each row in turn, in both orders.
 //!
@@ -381,6 +386,24 @@ pub struct TriggerRecord {
     pub events: Vec<String>,
     /// Why the worker couldn't install it (state `failed`), as the worker words it.
     pub last_error: Option<String>,
+    /// m13: events that went dead (10 failed deliveries), since the trigger was made.
+    pub dead_count: i64,
+    /// m13: why the last failed delivery failed; cleared by a delivery.
+    pub last_delivery_error: Option<String>,
+    /// m13: when an event was last delivered.
+    pub last_delivered_at: Option<DateTime<Utc>>,
+}
+
+/// m13: what one dispatcher pass saw for a trigger ([`MetadataClient::record_trigger_deliveries`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerDelivery {
+    pub id: Uuid,
+    /// At least one event was delivered (a 2xx).
+    pub delivered: bool,
+    /// Events that went dead.
+    pub dead: i64,
+    /// The last failure's reason, when a delivery failed.
+    pub error: Option<String>,
 }
 
 /// One table trigger's install, as the worker reports it
@@ -598,6 +621,21 @@ async fn lock_function_unprotected(
     Ok(Some(FunctionKind::parse(&kind)?))
 }
 
+/// m13: records that `trigger`'s database trigger on `branch` must be dropped (4c: an insert
+/// with no foreign key, so it locks no other row).
+async fn record_drop(
+    tx: &mut Transaction<'static, Postgres>,
+    branch: BranchId,
+    trigger: Uuid,
+) -> Result<(), MetadataError> {
+    sqlx::query("INSERT INTO function_trigger_drops (branch_id, trigger_id) VALUES ($1, $2)")
+        .bind(branch.as_uuid())
+        .bind(trigger)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Revokes the keys a function manages (dropping their sealed values, before the delete nulls
 /// `managed_by_function_id`) and deletes it, with its deployments and every branch's state.
 /// The caller holds the function row `FOR UPDATE`.
@@ -605,6 +643,15 @@ async fn delete_locked_function(
     tx: &mut Transaction<'static, Postgres>,
     function: Uuid,
 ) -> Result<(), MetadataError> {
+    // m13: drop, then forget. The cascade below deletes the trigger rows; their database
+    // triggers are dropped by the worker from these rows (4c, an insert that locks nothing).
+    sqlx::query(
+        "INSERT INTO function_trigger_drops (branch_id, trigger_id)
+         SELECT branch_id, id FROM function_triggers WHERE function_id = $1 AND source = 'table'",
+    )
+    .bind(function)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "UPDATE data_api_keys SET revoked_at = coalesce(revoked_at, now()), sealed = NULL
          WHERE managed_by_function_id = $1 AND (revoked_at IS NULL OR sealed IS NOT NULL)",
@@ -643,6 +690,11 @@ fn deployment_from_row(r: &PgRow) -> DeploymentRecord {
     }
 }
 
+/// The columns [`trigger_from_row`] reads.
+const TRIGGER_COLUMNS: &str = "id, branch_id, function_id, source, enabled, state, enabled_since,
+    pg_database, schema_name, table_name, bucket, prefix, events, last_error, dead_count,
+    last_delivery_error, last_delivered_at";
+
 fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
     Ok(TriggerRecord {
         id: r.get("id"),
@@ -659,6 +711,9 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         prefix: r.get("prefix"),
         events: r.get("events"),
         last_error: r.get("last_error"),
+        dead_count: r.get("dead_count"),
+        last_delivery_error: r.get("last_delivery_error"),
+        last_delivered_at: r.get("last_delivered_at"),
     })
 }
 
@@ -772,6 +827,7 @@ pub(crate) async fn purge_branch_functions(
         "branch_function_secrets",
         "function_schedules",
         "function_triggers",
+        "function_trigger_drops",
         "branch_functions",
     ] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1891,17 +1947,184 @@ impl MetadataClient {
         &self,
         branch: BranchId,
     ) -> Result<Vec<TriggerRecord>, MetadataError> {
-        sqlx::query(
-            "SELECT id, branch_id, function_id, source, enabled, state, enabled_since,
-                    pg_database, schema_name, table_name, bucket, prefix, events, last_error
-             FROM function_triggers WHERE branch_id = $1 ORDER BY created_at, id",
-        )
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {TRIGGER_COLUMNS} FROM function_triggers WHERE branch_id = $1
+             ORDER BY created_at, id"
+        )))
         .bind(branch.as_uuid())
         .fetch_all(&self.pool)
         .await?
         .iter()
         .map(trigger_from_row)
         .collect()
+    }
+
+    /// m13: turns the function's trigger on the branch on or off; `None` for an unknown
+    /// trigger, or one of another function or branch. Turning a table trigger on pends it
+    /// again (a new `enabled_since`, no error: the worker installs it); turning it off records
+    /// a drop (`function_trigger_drops`): the worker drops its database trigger and its queued
+    /// events, so a disabled trigger queues nothing. A storage trigger turned on delivers from
+    /// then (`enabled_since`).
+    ///
+    /// Lock order (module docs): the per-branch locks (1, 2, 3), then the trigger row (4b),
+    /// then the drop insert (4c), which locks nothing.
+    pub async fn update_trigger(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<Option<TriggerRecord>, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE function_triggers t
+             SET enabled = $4,
+                 state = CASE WHEN $4 AND NOT t.enabled AND t.source = 'table'
+                              THEN 'pending_install' ELSE t.state END,
+                 enabled_since = CASE WHEN $4 AND NOT t.enabled THEN clock_timestamp()
+                                      ELSE t.enabled_since END,
+                 last_error = CASE WHEN $4 AND NOT t.enabled AND t.source = 'table'
+                                   THEN NULL ELSE t.last_error END
+             WHERE t.id = $3 AND t.branch_id = $1 AND t.function_id = $2
+             RETURNING {TRIGGER_COLUMNS}"
+        )))
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let record = trigger_from_row(&row)?;
+        if !enabled && record.source == TriggerSource::Table {
+            record_drop(&mut tx, branch, id).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(record))
+    }
+
+    /// m13: deletes the function's trigger on the branch ("drop, then forget": a table
+    /// trigger's drop is recorded in the same transaction, and the worker drops its database
+    /// trigger and queued events). False for an unknown trigger, or one of another function
+    /// or branch. Lock order: as [`Self::update_trigger`].
+    pub async fn delete_trigger(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let source: Option<String> = sqlx::query_scalar(
+            "DELETE FROM function_triggers WHERE id = $3 AND branch_id = $1 AND function_id = $2
+             RETURNING source",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(source) = source else {
+            return Ok(false);
+        };
+        if TriggerSource::parse(&source)? == TriggerSource::Table {
+            record_drop(&mut tx, branch, id).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// m13: the branch's recorded drops (`function_trigger_drops` ids), for the worker to
+    /// clear ([`Self::clear_trigger_drops`]) once it has synced every database of the branch
+    /// after reading them. A read.
+    pub async fn trigger_drops(&self, branch: BranchId) -> Result<Vec<i64>, MetadataError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM function_trigger_drops WHERE branch_id = $1 ORDER BY id",
+        )
+        .bind(branch.as_uuid())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// m13: forgets the drops `ids` of the branch (read before a sync that then completed in
+    /// every database). One statement on drop rows (4c) alone.
+    pub async fn clear_trigger_drops(
+        &self,
+        branch: BranchId,
+        ids: &[i64],
+    ) -> Result<u64, MetadataError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(sqlx::query("DELETE FROM function_trigger_drops WHERE branch_id = $1 AND id = ANY($2)")
+            .bind(branch.as_uuid())
+            .bind(ids)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    /// m13: what the dispatcher saw on the branch: each trigger's dead events are added to
+    /// `dead_count`; a failure sets `last_delivery_error`, a delivery without failure clears
+    /// it; a delivery sets `last_delivered_at`. Rows of another branch, or gone, are skipped.
+    /// One statement on trigger rows (4b) alone, taking nothing after.
+    pub async fn record_trigger_deliveries(
+        &self,
+        branch: BranchId,
+        deliveries: &[TriggerDelivery],
+    ) -> Result<u64, MetadataError> {
+        if deliveries.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = deliveries.iter().map(|d| d.id).collect();
+        let delivered: Vec<bool> = deliveries.iter().map(|d| d.delivered).collect();
+        let dead: Vec<i64> = deliveries.iter().map(|d| d.dead.max(0)).collect();
+        let errors: Vec<Option<String>> = deliveries
+            .iter()
+            .map(|d| d.error.as_ref().map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect()))
+            .collect();
+        Ok(sqlx::query(
+            "UPDATE function_triggers t
+             SET dead_count = t.dead_count + d.dead,
+                 last_delivery_error = CASE WHEN d.error IS NOT NULL THEN d.error
+                                            WHEN d.delivered THEN NULL
+                                            ELSE t.last_delivery_error END,
+                 last_delivered_at = CASE WHEN d.delivered THEN now() ELSE t.last_delivered_at END
+             FROM unnest($2::uuid[], $3::bool[], $4::bigint[], $5::text[])
+                  AS d(id, delivered, dead, error)
+             WHERE t.id = d.id AND t.branch_id = $1",
+        )
+        .bind(branch.as_uuid())
+        .bind(ids)
+        .bind(delivered)
+        .bind(dead)
+        .bind(errors)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// m13: up to `limit` (ready branch of a live database, Postgres database) pairs with at
+    /// least one `installed`, enabled table trigger: where the dispatcher runs. A read.
+    pub async fn dispatch_targets(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(BranchId, String)>, MetadataError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT DISTINCT t.branch_id, t.pg_database
+             FROM function_triggers t JOIN branches b ON b.id = t.branch_id
+             JOIN databases d ON d.id = b.database_id
+             WHERE t.source = 'table' AND t.state = 'installed' AND t.enabled
+               AND b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
+             ORDER BY 1, 2 LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(b, db)| (BranchId(b), db)).collect())
     }
 
     /// Settles the worker's table-trigger installs on `branch` (edge functions m8): each row
@@ -1953,12 +2176,17 @@ impl MetadataClient {
         &self,
         limit: i64,
     ) -> Result<Vec<(BranchId, bool)>, MetadataError> {
+        // m13: a disabled pending row is never installed, so it doesn't count as pending; a
+        // branch with a trigger to drop (`function_trigger_drops`) does.
         let rows: Vec<(Uuid, bool)> = sqlx::query_as(
-            "SELECT b.id, bool_or(t.state = 'pending_install')
+            "SELECT b.id, bool_or(c.pending)
              FROM branches b JOIN databases d ON d.id = b.database_id
-             JOIN function_triggers t ON t.branch_id = b.id AND t.source = 'table'
+             JOIN (SELECT t.branch_id, t.state = 'pending_install' AND t.enabled AS pending
+                   FROM function_triggers t
+                   WHERE t.source = 'table' AND t.state IN ('pending_install', 'installed')
+                   UNION ALL
+                   SELECT branch_id, true FROM function_trigger_drops) c ON c.branch_id = b.id
              WHERE b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
-               AND t.state IN ('pending_install', 'installed')
              GROUP BY b.id ORDER BY b.id LIMIT $1",
         )
         .bind(limit)
