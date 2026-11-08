@@ -1,0 +1,65 @@
+---
+title: External services
+description: Register a URL you run as a service, which targets are allowed, and the operator allow-list.
+---
+
+An **external service** proxies `/services/v1/{name}` to a base URL you run. Creating one, changing its URL and rotating its signing secret need a **tenant admin**: a URL gives the platform a network path, so a Developer can't register one.
+
+## Register one
+
+A service is made in three calls on the [Management API](/reference/management/functions/putFunction). The CLI commands for services come with the container services ([below](/using/services/containers)); until then use the API:
+
+```bash
+BASE="$API/v1/databases/$DB/branches/$BRANCH/functions/echo"
+AUTH="Authorization: Bearer $ADMIN_TOKEN"
+
+# 1. Make the service. The answer carries its signing_secret (whsec_…), once.
+curl -X PUT "$BASE" -H "$AUTH" -H 'content-type: application/json' -d '{"kind": "service"}'
+
+# 2. Deploy its target and make it active.
+curl -X POST "$BASE/deployments" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"spec": {"backend": "external", "url": "https://svc.example.com/api", "health_path": "/healthz"}}'
+
+# 3. Turn it on.
+curl -X PATCH "$BASE" -H "$AUTH" -H 'content-type: application/json' -d '{"enabled": true}'
+```
+
+- `url`: `https` (or `http` where the operator allows it), at most 2048 bytes, no credentials, query or fragment. Its path is a prefix every proxied request stays inside.
+- `health_path`: starts with `/`, at most 256 printable ASCII characters, no `#`.
+- `signing_secret` (`whsec_…`) is shown **only** in the answer that made the service and in the answer that rotates it (`PATCH` with `{"rotate_signing_secret": true}`, tenant admin; the old secret stops working). Keep it: it is how the service [verifies requests](/using/services/verify-signature).
+
+A deploy changes the target, so a new deployment is a new URL; `rollback` works as for functions.
+
+## Where a service may be
+
+The URL is checked when you save it (422 for a refusal) and again at **every connection**, inside the client's own resolver, so the address that was checked is the address dialled (no DNS-rebinding window). By default a service must be on a **public address**:
+
+- loopback, private, CGNAT and link-local addresses (the cloud metadata address included) are refused in every spelling (decimal, octal, hex, IPv4-mapped IPv6);
+- redirects are not followed and no proxy is used;
+- `file:` and the like are refused: only `https`, or `http` when allowed.
+
+### The allow-list
+
+A self-hosted install usually wants services on its own network. The operator sets, on **both the orchestrator and the functions service** (the first checks at save time, the second at connect time):
+
+| Variable | Meaning |
+|---|---|
+| `CHELABASE_SERVICES_ALLOW_HOSTS` | Comma-separated host names or IP literals, **without a port**, that may resolve to non-public addresses. An entry with a port never matches (the functions service logs a warning). |
+| `CHELABASE_SERVICES_ALLOW_HTTP` | `true` also accepts `http` URLs. |
+
+These are separate from the webhooks' `CHELABASE_WEBHOOKS_ALLOW_*`; the one has no effect on the other. The compose files pass both through to the orchestrator and the functions service, so with Compose set them once in `.env`:
+
+```bash
+CHELABASE_SERVICES_ALLOW_HOSTS=billing.internal
+CHELABASE_SERVICES_ALLOW_HTTP=true
+```
+
+### What is always denied
+
+The allow-list never lifts a **hard deny**: the platform's own services by name (`metadata-db`, `nats`, `orchestrator`, `worker`, `gateway`, `functions`, `functions-runtime`, `storage`, `seaweedfs`, `service-runner`, …, compared without case or a trailing dot, container names `<project>-<name>-<n>` included), loopback, link-local, `0.0.0.0/8`, and every network the functions container is attached to (IPv4 and IPv6, read at start). An allowlisted name that resolves into one of those is refused too. `CHELABASE_INTERNAL_SUBNETS` (comma-separated CIDRs; the compose files don't set it) adds networks to the deny.
+
+The compute and control networks are also kept apart from the functions service by Docker's bridge isolation, which this check doesn't replace.
+
+## Paths
+
+The rest of the path is resolved inside the base URL's path: `.` and `..` segments (also as `%2e`) are removed within the rest and can't climb out of the prefix, and the request-target that is signed is exactly the one sent. A segment holding an encoded `/` or `\` (`%2f`, `%5c`) answers 400 `invalid_path`, because many servers decode these before resolving dot segments.

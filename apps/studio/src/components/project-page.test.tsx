@@ -15,7 +15,7 @@ const me: Me = {
   name: "U1",
   tenant_id: "t1",
   member: { id: "m-self", status: "active", tenant_admin: true },
-  instance_admin: true, tenant_admins: [],
+  instance_admin: true, functions_available: true, tenant_admins: [],
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
   user: { sub: "u1" },
   tenant: {

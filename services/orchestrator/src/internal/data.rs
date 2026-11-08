@@ -1,6 +1,7 @@
 //! Routes the gateway and the REST and storage services call: a key's hash to its branch and
-//! role, and a branch's connection info (as `authenticator`, or as storage's own
-//! `chelabase_storage` login). None serves data for a branch that isn't ready.
+//! role, and a branch's connection info (as `authenticator`, as storage's own
+//! `chelabase_storage` login, or as the functions dispatcher's `chelabase_functions_dispatch`).
+//! None serves data for a branch that isn't ready.
 
 use std::sync::Arc;
 
@@ -81,6 +82,8 @@ fn parse_hash(hash: &str) -> Option<[u8; 32]> {
 enum Login {
     Authenticator,
     Storage,
+    /// Edge functions m13b: the functions service's database-event dispatcher.
+    FunctionsDispatch,
 }
 
 /// Where and as whom the REST service connects to a branch, and which databases it serves. 404 for an unknown or deleted
@@ -109,6 +112,21 @@ where
     L: ComputeLocator,
 {
     connection(&state, BranchId(id), Login::Storage).await
+}
+
+/// [`branch_connection`] as the functions dispatcher's login (m13b):
+/// `chelabase_functions_dispatch` and its password (sealed `Purpose::FunctionsDispatch`), 409
+/// until the worker stored one; no `replication_host`. Behind the functions service's bearer
+/// only.
+pub(super) async fn functions_connection<M, L>(
+    State(state): State<Arc<InternalState<M, L>>>,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    connection(&state, BranchId(id), Login::FunctionsDispatch).await
 }
 
 async fn connection<M, L>(state: &InternalState<M, L>, branch: BranchId, login: Login) -> Response
@@ -147,6 +165,11 @@ where
             "chelabase_storage",
             Purpose::Storage,
             row.storage_password_enc.as_deref(),
+        ),
+        Login::FunctionsDispatch => (
+            "chelabase_functions_dispatch",
+            Purpose::FunctionsDispatch,
+            row.functions_password_enc.as_deref(),
         ),
     };
     let (Some(endpoint), Some(database), Some(sealed)) = (

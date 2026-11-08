@@ -171,6 +171,49 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 422 | `constraint_violation` | The users table refused the row. `error.constraint` names the constraint. |
 | 503 | `identity_unavailable` | The identity service that holds the project's users can't be reached. Try again. When a deactivate or delete answers this, the user's sessions were already revoked. |
 
+### Functions and services
+
+Calls to a [function](/using/functions) (`/functions/v1/…`) and a [service](/using/services) (`/services/v1/…`), answered by the functions service through the gateway. Both also answer 401 `unauthorized` (the credential doesn't fit the function's [auth mode](/using/functions/auth-and-limits#auth-modes)) and 503 `unavailable` (the lookup is briefly unavailable; retry).
+
+| Status | Code | Meaning |
+|---|---|---|
+| 503 | `functions_unavailable` | Edge functions aren't running on this instance: the gateway can't reach the functions service (the service is stopped or down). |
+| 404 | `function_not_found` | No such function, it's disabled on the branch, it's a service (call it on `/services/v1`), or the keyless `/functions/v1/public/…` form was used for a function that isn't `public`. |
+| 413 | `payload_too_large` | The request body is over 6 MiB. |
+| 504 | `function_timeout` | The function didn't answer within the wall clock (30 s, `CHELABASE_FUNCTIONS_TIMEOUT_MS`). Recorded as its `last_error`. |
+| 502 | `runtime_unavailable` | The functions runtime didn't answer; retry shortly. Recorded as the function's `last_error`. |
+| 404 | `service_not_found` | No such service, or no deployment on the branch. |
+| 503 | `service_disabled` | The service is turned off on the branch. |
+| 503 | `service_unhealthy` | The service failed its last three health checks. |
+| 503 | `service_starting` | A container service's container isn't placed on the branch yet (just enabled, rolled over, or the runner is catching up); retry shortly. |
+| 400 | `invalid_path` | The path holds an encoded `/` or `\` (`%2f`, `%5c`). |
+| 502 | `service_unreachable` | The service didn't answer, or its answer was invalid. |
+| 502 | `service_refused` | The service's address was refused at connect time: a non-public address not on `CHELABASE_SERVICES_ALLOW_HOSTS`, or one of the stack's own. |
+| 504 | `service_timeout` | The service's response headers didn't arrive within 30 seconds. |
+
+The Management API's function routes answer the general codes above, and:
+
+| Status | Code | Meaning |
+|---|---|---|
+| 503 | `functions_unavailable` | The orchestrator can't reach the functions service (it's stopped or down), so bundles can't be deployed and container services can't be deployed, rolled over or read. Nothing was recorded. |
+
+Container services add:
+
+| Status | Code | Meaning |
+|---|---|---|
+| 503 | `runner_unavailable` | The functions service is running but reports that the service runner isn't (the `services` Compose profile is off), so container services can't be deployed, rolled over or read. External services still work. |
+| 409 | `conflict` | With `reason: "not_deployed"`: the service has no deployment on the branch (logs, auth). With `reason: "unhealthy"`: the container never passed its health check. |
+
+The functions service's internal control routes (called by the orchestrator, never by clients) use their own codes, which the Management API translates:
+
+| Status | Code | Meaning | Management API answer |
+|---|---|---|---|
+| 404 | `no_container` | The service has no running container on the branch. | 404 `not_found` |
+| 422 | `invalid_spec` | The runner refused the container spec, or the deployment isn't a container one. | 422 `invalid_request` |
+| 422 | `invalid_image` | The image reference can't be resolved, or its registry is refused. | 422 `invalid_request` |
+| 503 | `runner_unavailable` | The functions service can't reach the service runner. | 503 `runner_unavailable` (when the functions service itself can't be reached, the Management API answers 503 `functions_unavailable`) |
+| 409 | `unhealthy` | The new container never passed its health check within 60 seconds. | 409 `conflict`, `reason: "unhealthy"`; a background rollover reports it as `rollout.state: "failed"` with the reason, and the service's `last_error` |
+
 ### SQL editor
 
 | Status | Code | Meaning |
@@ -227,7 +270,7 @@ The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:
 | 401 | `user_token_expired` | The `Chelabase-User` token has expired. |
 | 401 | `user_session_revoked` | The user's session was revoked. |
 | 403 | `permission_denied` | Postgres refused the role (42501); the same code as the table API's. |
-| 403 | `role_not_allowed` | A secret key's role is owner-level or has system privileges: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin` or the `pg_*_server_*` roles: what key creation refuses. Take those away, or use another role (`BYPASSRLS` alone is allowed). |
+| 403 | `role_not_allowed` | A secret key's role is owner-level or has system privileges: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, or a member (at any depth) of a superuser role, `neon_superuser`, `chelabase_admin` or the `pg_*_server_*` roles: what key creation refuses. Take those away, or use another role (`BYPASSRLS` alone is allowed). Also answered for a role whose name is reserved for Chelabase (`chelabase_…`, `cb_m_…`), whatever its attributes: use a role of your own. |
 | 404 | `unknown_table` | A table or view that doesn't exist or that the key's role can't reach. |
 | 404 | `unknown_function` | A function that doesn't exist, can't be called through the API, or that the key's role can't execute. |
 | 404 | `unknown_database` | The database doesn't exist, isn't served, or isn't on the key's allow-list. One text for all three, so a key can't discover database names. |

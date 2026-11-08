@@ -1,0 +1,52 @@
+[package]
+name = "chelabase-service-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase service runner: the one component that starts member service containers, label-scoped and hardened"
+
+[lib]
+name = "service_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "service-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+# The Docker Engine API, over the socket (the only new socket holder; edge functions m10).
+bollard = { workspace = true }
+bytes = { workspace = true }
+# `outbound::is_public`: a registry host's addresses must all be public.
+chelabase-http = { workspace = true }
+chelabase-types = { workspace = true }
+dotenvy = { workspace = true }
+futures-util = { workspace = true }
+# A random digest key when none is derived (tests).
+getrandom = { workspace = true }
+hex = { workspace = true }
+# The keyed digest of a container's environment (its label).
+hmac = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Desired state: the metadata's container services (read only).
+sqlx = { workspace = true }
+# The callers' bearers, compared in constant time.
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chelabase-metadata = { workspace = true }
+chelabase-secrets = { workspace = true }
+chelabase-types = { workspace = true }
+chrono = { workspace = true }
+proptest = { workspace = true }
+tower = { version = "0.5.3", features = ["util"] }

@@ -2194,6 +2194,7 @@ impl WorkerMetadata for FakeMetadata {
                 role_oid: k.role_oid,
                 role_timeline: k.role_timeline.clone(),
                 role_bypass_rls: k.role_bypass_rls,
+                managed_by_function: None,
             })
             .collect())
     }
@@ -2633,6 +2634,8 @@ impl WorkerMetadata for FakeMetadata {
                 authenticator_password_enc: b.authenticator_password_enc.clone(),
                 storage_password_enc: state.storage_logins.get(&branch).map(|l| l.0.clone()),
                 storage_password_salt: state.storage_logins.get(&branch).map(|l| l.1.clone()),
+                functions_password_enc: None,
+                functions_password_salt: None,
                 settings: DataApiSettings {
                     max_rows: db.max_rows,
                     statement_timeout_ms: db.statement_timeout_ms,
@@ -4083,6 +4086,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
         recreate_backoff: Mutex::default(),
+        fn_sweeps: Mutex::default(),
         identity: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),

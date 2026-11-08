@@ -4821,3 +4821,102 @@ async fn storage_ref_commit_time_refusal_live() {
     }))
     .await;
 }
+
+// --- Protection review (#185): storage's own functions are not findings --------------------
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_schema_review_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { review(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn review(fx: &Fx) {
+    use chelabase_schema::review::{parse_review, review_sql};
+    let scan = || async {
+        // json_agg breaks lines between items: the document is everything from `[` to `]`.
+        let out = fx.admin(&review_sql(OWNER)).await;
+        let json = &out[out.find('[').expect("a JSON array")..=out.rfind(']').expect("a JSON array")];
+        parse_review("app", json).expect("the review's document")
+    };
+
+    // Why a chelabase_admin-owned `storage` is skipped: nobody but chelabase_admin (which no
+    // role may join) and superusers can create in it.
+    assert_eq!(
+        fx.value("SELECT coalesce(string_agg(rolname, ',' ORDER BY rolname), '-') FROM pg_roles WHERE NOT rolsuper AND has_schema_privilege(oid, 'storage', 'CREATE')").await,
+        "chelabase_admin"
+    );
+    assert_eq!(
+        fx.value("SELECT count(*) FROM pg_auth_members WHERE roleid = 'chelabase_admin'::regrole").await,
+        "0"
+    );
+
+    // Storage installed at provision: none of its functions, triggers or rules is a finding.
+    let items = scan().await;
+    assert!(
+        items.iter().all(|i| i.schema != "storage"),
+        "storage's own objects listed: {items:#?}"
+    );
+
+    // A user-owned SECURITY DEFINER function in public is still listed.
+    fx.admin(
+        "CREATE ROLE rv_dev NOLOGIN; GRANT CREATE ON SCHEMA public TO rv_dev;
+         BEGIN; SET LOCAL ROLE rv_dev;
+         CREATE FUNCTION public.rv_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         COMMIT;",
+    )
+    .await;
+    let keys: Vec<String> = scan().await.into_iter().map(|i| i.key).collect();
+    assert!(
+        keys.contains(&"app/function/public.rv_definer()".to_string()),
+        "{keys:?}"
+    );
+
+    // #185 audit B1: in a database the owner makes (no bootstrap runs there), a `storage`
+    // schema of the owner's, where another role can create, is reviewed: a planted SECURITY
+    // DEFINER function and a trigger on a table there are listed.
+    fx.owner("CREATE DATABASE rv_other")
+        .await
+        .expect("the owner creates a database");
+    let other = |sql: String| async move {
+        fx.worker
+            .computes
+            .admin_sql(&fx.ep, "rv_other", &sql)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    };
+    other(format!(
+        "BEGIN; SET LOCAL ROLE {OWNER};
+         CREATE SCHEMA storage;
+         CREATE ROLE rv_dev2 NOLOGIN;
+         GRANT USAGE, CREATE ON SCHEMA storage TO rv_dev2;
+         COMMIT;
+         BEGIN; SET LOCAL ROLE rv_dev2;
+         CREATE FUNCTION storage.rv_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         CREATE FUNCTION storage.rv_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE storage.t (a int);
+         CREATE TRIGGER rv_tg BEFORE INSERT ON storage.t FOR EACH ROW EXECUTE FUNCTION storage.rv_trg();
+         COMMIT;"
+    ))
+    .await
+    .expect("plant");
+    let out = other(review_sql(OWNER)).await.expect("scan rv_other");
+    let json = &out[out.find('[').expect("a JSON array")..=out.rfind(']').expect("a JSON array")];
+    let keys: Vec<String> = parse_review("rv_other", json)
+        .expect("the review's document")
+        .into_iter()
+        .map(|i| i.key)
+        .collect();
+    for key in [
+        "rv_other/function/storage.rv_planted()",
+        "rv_other/function/storage.rv_trg()",
+        "rv_other/trigger/storage.rv_tg(storage.t)",
+    ] {
+        assert!(keys.contains(&key.to_string()), "{key} hidden: {keys:?}");
+    }
+}

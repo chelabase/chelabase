@@ -4,9 +4,11 @@
 #
 # One all-in-one image (infra/images/server.Dockerfile, target `all`: every Rust binary, from
 # one cargo build) runs every Rust service and the init one-shots, each with its own command;
-# Studio is built from infra/images/studio.Dockerfile and the identity service from
-# infra/images/identity.Dockerfile (Node, no cargo build). Nothing else changes: the same
-# wiring, secrets, users and healthchecks as docker-compose.yml.
+# Studio is built from infra/images/studio.Dockerfile, the identity service from
+# infra/images/identity.Dockerfile (Node, no cargo build) and the functions runtime from
+# infra/images/functions-runtime.Dockerfile (workerd, no cargo build). Nothing else changes: the same
+# wiring, secrets, users and healthchecks as docker-compose.yml. The service runner runs only
+# with its profile (`COMPOSE_PROFILES=services`).
 
 # Built once (by init-secrets' build section); the other services use the same local image.
 x-server: &server
@@ -42,6 +44,18 @@ services:
   storage:
     <<: *server
     command: ["storage"]
+  functions:
+    <<: *server
+    command: ["functions"]
+  service-runner:
+    <<: *server
+    command: ["service-runner"]
+  functions-runtime:
+    image: chelabase/functions-runtime:local
+    pull_policy: build
+    build:
+      context: ../..
+      dockerfile: infra/images/functions-runtime.Dockerfile
   studio:
     image: chelabase/studio:local
     pull_policy: build

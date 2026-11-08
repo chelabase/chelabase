@@ -19,7 +19,7 @@ export function meAs(level: Level, roles: string[] = []) {
   return {
     sub: "u2", email: "bo@example.test", name: "Bo", tenant_id: "t1",
     member: { id: "m-self", status: "active", tenant_admin: false },
-    instance_admin: false, tenant_admins: [],
+    instance_admin: false, functions_available: true, tenant_admins: [],
     // R17: a project Admin's grant is every role ("all") unless the test names roles.
     projects: ["p1", "p2"].map((project_id) => ({ project_id, platform_role: level, roles: level === "admin" && roles.length === 0 ? ("all" as const) : roles, databases: [] as unknown[] })),
     user: { sub: "u2" },

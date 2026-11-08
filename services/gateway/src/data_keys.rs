@@ -56,6 +56,9 @@ pub struct DataKeyResolver {
     ttl_cache: Cache<[u8; 32], Option<ResolvedKey>>,
     limiter: moka::sync::Cache<IpAddr, Arc<Mutex<(f64, Instant)>>>,
     misses_per_sec: u32,
+    /// The miss buckets' clock: `Instant::now`, or a frozen one in tests so a slow run never
+    /// refills a bucket the test has drained.
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl DataKeyResolver {
@@ -89,7 +92,15 @@ impl DataKeyResolver {
                 .time_to_idle(Duration::from_secs(60))
                 .build(),
             misses_per_sec: misses_per_sec.max(1),
+            clock: Arc::new(Instant::now),
         }
+    }
+
+    /// Replaces the miss buckets' clock (tests only).
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     pub fn with_ttl(internal_url: &str, bearer: &str, ttl: Duration) -> Self {
@@ -157,7 +168,7 @@ impl DataKeyResolver {
     /// Token bucket per client address (IPv6 by /64, unknown addresses share one).
     fn allow_miss(&self, client_ip: Option<IpAddr>) -> bool {
         let rate = f64::from(self.misses_per_sec);
-        let now = Instant::now();
+        let now = (self.clock)();
         let bucket = self
             .limiter
             .get_with(limiter_key(client_ip), || Arc::new(Mutex::new((rate, now))));

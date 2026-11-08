@@ -82,10 +82,21 @@ pub fn invalidate_branch(cache: &OwnerLevelCache, branch: Uuid) {
 pub enum RoleRefused<E> {
     /// The role is owner-level.
     OwnerLevel(String),
+    /// The role is one of Chelabase's own (`chelabase_…`, among them the function triggers'
+    /// owner role, or a hidden `cb_m_…` member role, any case): nothing may run as it,
+    /// whatever its attributes say. Refused before Postgres is asked.
+    Reserved(String),
     /// The console's role doesn't exist.
     UnknownRole(String),
     /// The check itself failed.
     Check(E),
+}
+
+/// A role no request may run as by name, as the worker's create-time check
+/// (`refuse_by_name`) refuses it: a key or a console session that names one is refused on
+/// every request, so a key minted before the name was reserved never runs either.
+fn reserved(role: &str) -> bool {
+    chelabase_types::role_name::has_reserved_prefix(role)
 }
 
 /// Whether `role` is owner-level on `branch` (cached), `None` when it doesn't exist (not
@@ -125,6 +136,9 @@ where
     if data.kind != DataKeyKind::Secret {
         return Ok(());
     }
+    if reserved(&data.role) {
+        return Err(RoleRefused::Reserved(data.role.clone()));
+    }
     match owner_level(cache, data.branch_id, &data.role, fetch)
         .await
         .map_err(RoleRefused::Check)?
@@ -134,7 +148,8 @@ where
     }
 }
 
-/// The console's role must exist and not be owner-level (the secret key's 403).
+/// The console's role must exist, not be reserved and not be owner-level (the secret key's
+/// 403).
 pub async fn ensure_console_role<F, Fut, E>(
     cache: &OwnerLevelCache,
     branch: Uuid,
@@ -145,6 +160,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<Option<bool>, E>>,
 {
+    if reserved(role) {
+        return Err(RoleRefused::Reserved(role.to_owned()));
+    }
     match owner_level(cache, branch, role, fetch)
         .await
         .map_err(RoleRefused::Check)?
@@ -183,6 +201,46 @@ mod tests {
                 "{status:?}"
             );
         }
+    }
+
+    /// Edge functions m8 (round 4, B3): a key whose role is one of Chelabase's own
+    /// (`chelabase_…`, among them the function triggers' owner role, or a hidden `cb_m_…`
+    /// member role, any case) is refused on every request without asking Postgres, as the
+    /// worker's create-time check refuses it; the console's role too. Other names go to the
+    /// owner-level check as before.
+    #[tokio::test]
+    async fn a_reserved_role_is_refused_before_the_owner_level_check() {
+        let cache = owner_level_cache();
+        let identity = |role: &str| DataIdentity {
+            branch_id: Uuid::nil(),
+            key_id: Uuid::nil(),
+            kind: DataKeyKind::Secret,
+            role: role.to_owned(),
+            claims: serde_json::Value::Object(Default::default()),
+            databases: None,
+            project_id: None,
+            role_oid: None,
+            server_vouched: false,
+        };
+        let never = || async { panic!("asked Postgres about a reserved role") };
+        for role in ["chelabase_functions_owner", "Chelabase_Admin", "cb_m_0123", "CB_M_x"] {
+            let r: Result<(), RoleRefused<()>> =
+                ensure_not_owner_level(&cache, &identity(role), never).await;
+            assert_eq!(r, Err(RoleRefused::Reserved(role.to_owned())), "{role}");
+            let r: Result<(), RoleRefused<()>> =
+                ensure_console_role(&cache, Uuid::nil(), role, never).await;
+            assert_eq!(r, Err(RoleRefused::Reserved(role.to_owned())), "{role}");
+        }
+        // A plain role is asked about as before, and a public key never is.
+        let r: Result<(), RoleRefused<()>> =
+            ensure_not_owner_level(&cache, &identity("reporter"), || async { Ok(Some(false)) }).await;
+        assert_eq!(r, Ok(()));
+        let public = DataIdentity {
+            kind: DataKeyKind::Public,
+            ..identity("chelabase_functions_owner")
+        };
+        let r: Result<(), RoleRefused<()>> = ensure_not_owner_level(&cache, &public, never).await;
+        assert_eq!(r, Ok(()));
     }
 
     /// A [`QueryClient`] over a connection whose server is gone, recording `mark_broken`.

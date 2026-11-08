@@ -157,3 +157,19 @@ fn the_scan_is_one_read_only_select_for_the_owner() {
         assert!(!sql.contains(gone), "{gone}");
     }
 }
+
+/// #185: object storage's own `storage` schema is skipped like `chelabase_guard`, but only
+/// when `chelabase_admin` owns it; a `storage` schema anyone else owns is reviewed.
+#[test]
+fn the_scan_skips_object_storages_schema_only_when_chelabase_admin_owns_it() {
+    let sql = review_sql("owner");
+    let skipped = &sql[sql.find("skipped AS (").unwrap()..];
+    let skipped = &skipped[..skipped.find("\n),").unwrap()];
+    assert!(
+        skipped.contains(
+            "OR (n.nspname OPERATOR(pg_catalog.=) 'storage'\n         AND n.nspowner OPERATOR(pg_catalog.=) (SELECT r.oid FROM pg_catalog.pg_roles r\n           WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'))"
+        ),
+        "{skipped}"
+    );
+    assert_eq!(skipped.matches("'storage'").count(), 1, "no name-only skip: {skipped}");
+}

@@ -1,0 +1,127 @@
+---
+title: Handlers
+description: The fetch and scheduled handlers, the caller header, and the payloads of database and storage events.
+---
+
+A function is an ES module whose default export has the handlers you use:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return new Response("hi");
+  },
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // runs on a cron schedule
+  },
+};
+```
+
+`fetch` serves HTTP calls **and** the two kinds of events (database and storage), told apart by a header. `scheduled` serves [cron schedules](/using/functions/schedules). `env` holds the function's [secrets and Chelabase's own values](/using/functions/environment).
+
+## fetch: HTTP calls
+
+The request is the caller's, with the method, path rest, query and body intact. Chelabase removes `Authorization`, `Host`, `Content-Length` and every `chelabase-*` and `x-chelabase-*` header (including any the client sent to forge them), and adds the headers below. The function's response goes back as it is, except that `chelabase-*` response headers are removed.
+
+A request body is at most 6 MiB (413 `payload_too_large` above it).
+
+### Who called
+
+`chelabase-caller` is JSON that says who called, as the gateway verified it:
+
+| `kind` | When | Other fields |
+|---|---|---|
+| `public_key` | A public key | `role` (`anon`) |
+| `secret_key` | A secret key | `role` |
+| `app_user` | A public key with a valid app-user token | `role` (`authenticated`), `user_id`, `claims` |
+| `anonymous` | The keyless `/functions/v1/public/…` form | `role` is null |
+| `internal` | A schedule or an event | `role` is null |
+
+Two more headers let a function call the data API **as the caller**: `chelabase-caller-key` (the caller's public key, sent only for a public key or an app user, never a secret key) and `chelabase-caller-token` (the app user's token, only for an app user). See [acting as the caller](/using/functions/environment#acting-as-the-caller).
+
+### CORS
+
+Functions (and [services](/using/services)) are callable from any origin. The gateway answers a browser's preflight (`OPTIONS` with `Access-Control-Request-Method`) itself, without calling the function: `Access-Control-Allow-Origin: *`, the route's method, `Access-Control-Allow-Headers` echoing the headers the browser asked for, and `Access-Control-Max-Age: 600`.
+
+On the actual response, CORS headers the function sets itself (`Access-Control-Allow-Origin`, `Access-Control-Expose-Headers`, …) are kept as they are; the gateway only adds the ones the function left out (`Access-Control-Allow-Origin: *` and its default exposed headers).
+
+## scheduled: cron
+
+```ts
+async scheduled(controller, env, ctx) {
+  console.log(controller.cron, controller.scheduledTime); // "*/15 * * * *", a Date
+}
+```
+
+`controller.cron` is the schedule's cron expression and `controller.scheduledTime` the tick it was due. A function with no `scheduled` handler, or one that throws, records `scheduled handler: <outcome>` as its last error. See [Schedules](/using/functions/schedules).
+
+## Database events
+
+A [table trigger](/using/functions/triggers#table-triggers) delivers each committed row change to `fetch` as a `POST` with the header `chelabase-event: db` and a JSON body:
+
+```json
+{
+  "id": "0123456789abcdef0123456789abcdef:app:7",
+  "type": "INSERT",
+  "schema": "public",
+  "table": "orders",
+  "record": { "id": 1, "total": "9.50" },
+  "old_record": null,
+  "txid": 42
+}
+```
+
+- `type` is `INSERT`, `UPDATE` or `DELETE`. `record` is the new row (null for a delete), `old_record` the old one (null for an insert).
+- `id` is `<timeline>:<database>:<row id>` and is the same on every attempt of the event: use it to deduplicate.
+- Columns of built-in types are JSON values; any other type is its text form.
+- **Large events:** when the body would pass 256 KiB, `record` and `old_record` are `null`, `truncated` is `true`, and `primary_key` holds the key's values (null for a table without a primary key). Fetch the row from the data API if you need it.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.headers.get("chelabase-event") === "db") {
+      const event = await request.json<{ id: string; type: string; record: unknown }>();
+      await handleOnce(event.id, event);
+      return new Response(null, { status: 204 }); // any 2xx acknowledges
+    }
+    return new Response("hi");
+  },
+};
+```
+
+The function's `auth` mode doesn't apply to events. Answering anything but 2xx makes Chelabase retry; see [Delivery](#delivery).
+
+## Storage events
+
+A [storage trigger](/using/functions/triggers#storage-triggers) delivers each matching object event to `fetch` as a `POST` with `chelabase-event: storage`. The body is the event alone, the same JSON that [storage webhooks](/using/storage/webhooks#whats-sent) carry:
+
+```json
+{
+  "id": "0b7c…",
+  "type": "object.created",
+  "time": "2026-11-07T10:12:03.511Z",
+  "database_id": "95b6…",
+  "branch_id": "95b6…",
+  "pg_database": "app",
+  "bucket": "avatars",
+  "name": "public/me.png",
+  "version_id": "4c1e…",
+  "size": 48213,
+  "content_type": "image/png",
+  "actor": { "role": "authenticated", "sub": "2b1c…" }
+}
+```
+
+`object.moved` adds `from: { bucket, name }`, and `object.deleted` has no `version_id`. Events never carry the object's bytes: read the object with the [storage API](/using/storage) if you need it. `id` is stable across attempts.
+
+## Delivery
+
+Events are delivered **at least once**: a function can see the same event more than once (a timeout after the work was done, a restart between delivery and acknowledgement), so deduplicate on `id`.
+
+| | Database events | Storage events |
+|---|---|---|
+| Acknowledged by | Any 2xx | Any 2xx |
+| On failure | Retried with backoff: 1 s, doubling, at most 5 minutes | Retried with the same backoff as webhooks |
+| Gives up | After **10 attempts** the event is `dead` | After **24 hours** the event is dropped |
+| Counted in | The trigger's `dead_count`, then `dropped_count` when removed | `dropped_count` |
+
+Database events that stay unacknowledged for 15 minutes (for instance because the dispatcher stopped) become due again. The limits and what is counted are in [Triggers](/using/functions/triggers#limits-and-counters).

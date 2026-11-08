@@ -32,6 +32,15 @@
 #      a secret in argv or its environment), read-only, and names every secret by a `*_FILE`
 #      path. NATS restarts when init-secrets is updated, so an upgrade's new NATS users (storage's)
 #      reach it.
+#   7. the functions service's boundary (edge functions m4b): its NATS password and each internal
+#      bearer (the orchestrator's, the worker's), only the gateway mounting the signing key, no
+#      Docker socket for functions or the runtime, and the runtime's networks.
+#   8. the service runner's boundary (edge functions m10): profile `services`, the only new
+#      Docker socket holder, each caller's bearer, and no shared network for service containers
+#      (the runner gives each its own at run time, audit B3; the functions service binds none of
+#      them).
+# Every render takes every profile (sites, runner, services), so profiled services
+# are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -49,10 +58,10 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -67,6 +76,8 @@ seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
 seaweedfs	storage-s3/access-key	ro
 seaweedfs	storage-s3/secret-key	ro
+seaweedfs	functions-s3/access-key	ro
+seaweedfs	functions-s3/secret-key	ro
 seaweedfs	grpc-tls/ca.crt	ro
 seaweedfs	grpc-tls/server.crt	ro
 seaweedfs	grpc-tls/server.key	ro
@@ -120,6 +131,7 @@ orchestrator	tokens/data-keys.token	ro
 orchestrator	tokens/app-auth.token	ro
 orchestrator	tokens/app-sessions.token	ro
 orchestrator	tokens/storage-internal.token	ro
+orchestrator	tokens/orchestrator-functions.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
 orchestrator	tokens/orchestrator-identity.token	ro
@@ -140,6 +152,10 @@ worker	realtime-tls	rw
 worker	db/metadata.password	ro
 worker	storage-s3/access-key	ro
 worker	storage-s3/secret-key	ro
+worker	tokens/worker-functions.token	ro
+worker	tokens/worker-service-runner.token	ro
+worker	functions-s3/access-key	ro
+worker	functions-s3/secret-key	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
@@ -163,6 +179,19 @@ storage	tokens/storage-internal.token	ro
 storage	nats/storage.password	ro
 storage	storage-s3/access-key	ro
 storage	storage-s3/secret-key	ro
+functions	secrets/secrets.key	ro
+functions	compute-ca/ca.crt	ro
+functions	gateway/internal-verify.pem	ro
+functions	db/metadata.password	ro
+functions	nats/functions.password	ro
+functions	tokens/orchestrator-functions.token	ro
+functions	tokens/worker-functions.token	ro
+functions	tokens/functions-service-runner.token	ro
+functions	functions-s3/access-key	ro
+functions	functions-s3/secret-key	ro
+service-runner	db/metadata.password	ro
+service-runner	tokens/functions-service-runner.token	ro
+service-runner	tokens/worker-service-runner.token	ro
 realtime	gateway/internal-verify.pem	ro
 realtime	compute-ca/ca.crt	ro
 realtime	nats/realtime.password	ro
@@ -204,7 +233,7 @@ jq -r --arg k "$keys/" --arg st "$state" '.services | to_entries[] | .key as $s
   | if (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|storage-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|storage-s3/|functions-s3/|grpc-tls/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true
@@ -267,13 +296,15 @@ leaks="$(jq -r '.services | to_entries[] | .key as $s
        | select(.key | test("^(AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)|CHELABASE_STORAGE_S3_(ACCESS|SECRET)_KEY)$"))
        | "\($s): environment \(.key) is set in the base file"),
     ((.value.volumes // [])[] | select(.type == "bind")
-       | select(.source | test("storage-s3|grpc-tls|/s3/"))
+       | select(.source | test("storage-s3|functions-s3|grpc-tls|/s3/"))
        | "\($s): bind \(.source)")' "$tmp/base.json")"
 [[ -z "$leaks" ]] || err "an object-store key reaches a service through its environment or a bind:"$'\n'"$leaks"
 # init-secrets, which makes the files, is the one name besides their readers: grpc-tls/ is
 # seaweedfs's; storage-s3/ (the `storage` identity) is seaweedfs's, the storage service's and the
 # worker's (the blob sweep, m8), in the base file (m19) as under the workbench.
-for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker "; do
+# functions-s3/ (the `functions` identity, edge-functions m1) is seaweedfs's, the functions
+# service's (m4) and the worker's (the bundle sweep, m7); never the runtime's.
+for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker " "functions-s3:functions seaweedfs worker "; do
   dir="${want%%:*}"
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
@@ -281,6 +312,8 @@ for want in "grpc-tls:seaweedfs " "storage-s3:seaweedfs storage worker "; do
 done
 users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
 [[ "$users" == "seaweedfs storage worker " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage worker ]"
+users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("functions-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
+[[ "$users" == "functions seaweedfs worker " ]] || err "workbench services mounting functions-s3/: got [$users], want [functions seaweedfs worker ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
   | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
   err "an admin S3 identity or key file is back"
@@ -290,6 +323,8 @@ users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.targe
 sw_cmd="$(jq -r '.services.seaweedfs.command | join("\n")' "$tmp/base.json")"
 for want in '"Read:neon", "Write:neon", "List:neon", "Tagging:neon"' \
   '"Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"' \
+  '"Read:chelabase-functions", "Write:chelabase-functions", "List:chelabase-functions"' \
+  's3.bucket.create -name chelabase-functions' \
   '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.ip.bind=0.0.0.0' '-s3.iam=false' 'exec weed server' \
   '/etc/seaweedfs/security.toml' '[grpc.%s]' 'for c in master volume filer s3' '[grpc.client]' \
   's3.bucket.create -name neon' 's3.bucket.create -name chelabase-storage' '/tmp/buckets-ready'; do
@@ -355,6 +390,166 @@ done
 # An upgrade re-renders nats/auth.conf with the new users; NATS reads it at start only.
 [[ "$(jq -r '.services.nats.depends_on["init-secrets"].restart' "$tmp/base.json")" == true ]] ||
   err "nats restarts when init-secrets is updated (depends_on init-secrets: restart: true)"
+
+# 7. The functions service (edge functions m4b), in both renders (the runner left out): its NATS
+# password is its own; each internal bearer goes to its one caller and the service.
+for render in base wb; do
+  boundary nats/functions.password "functions" "$render" "$tmp/readers.$render"
+  boundary tokens/orchestrator-functions.token "functions orchestrator" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-functions.token "functions worker" "$render" "$tmp/readers.$render"
+done
+# Only the gateway mounts the signing key, under any name; the runtime and the functions service
+# never mount the Docker socket.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  got="$(jq -r '.services | to_entries[] | select(.key != "runner")
+    | select(any(.value.volumes[]?; ((.target // "") + " " + (.source // "")) | contains("internal-signing.pem"))) | .key' "$f" | sort | tr '\n' ' ')"
+  [[ "$got" == "gateway " ]] || err "$render: internal-signing.pem is mounted by [$got], expected [gateway ]"
+  for svc in functions functions-runtime; do
+    jq -e --arg s "$svc" '.services[$s]' "$f" >/dev/null || { err "$render: no $svc service"; continue; }
+    ! jq -e --arg s "$svc" 'any(.services[$s].volumes[]?; (.source // "") | contains("docker.sock"))' "$f" >/dev/null ||
+      err "$render: $svc mounts the Docker socket"
+  done
+done
+fs="$(jq -c '.services.functions // {} | {entrypoint, command, read_only, user}' "$tmp/base.json")"
+[[ "$fs" == '{"entrypoint":null,"command":null,"read_only":true,"user":null}' ]] ||
+  err "functions runs its image's binary as its user, read-only, with no entrypoint or command: got $fs"
+img="$(jq -r '.services.functions.image // ""' "$tmp/base.json")"
+[[ "$img" == ghcr.io/chelabase/functions:* ]] || err "functions runs the ghcr.io/chelabase/functions release image: got $img"
+for sub in nats/functions.password tokens/orchestrator-functions.token tokens/worker-functions.token \
+  functions-s3/access-key functions-s3/secret-key db/metadata.password; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services.functions.environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "functions reads $sub through a *_FILE setting"
+done
+for svc in orchestrator worker; do
+  token="tokens/$svc-functions.token"
+  var="CHELABASE_$(tr a-z A-Z <<<"$svc")_FUNCTIONS_TOKEN_FILE"
+  [[ "$(jq -r --arg s "$svc" --arg v "$var" '.services[$s].environment[$v] // ""' "$tmp/base.json")" == "/run/chelabase/secrets/$token" ]] ||
+    err "$svc reads $token through $var"
+done
+# Networks (the runtime's boundary): the runtime is on `functions` and `functions-egress` only;
+# `functions` holds the runtime and the functions service; `functions-control` holds the service
+# and its two callers (and the workbench runner, for the e2e); both are internal. The listeners
+# bind named aliases, never 0.0.0.0, and the runtime's bundle store is the internal alias.
+members() { # members <network> <render file>
+  jq -r --arg n "$1" '.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key' "$2" | sort | tr '\n' ' '
+}
+for render in base wb; do
+  f="$tmp/base.json"
+  runner=""
+  [[ "$render" == wb ]] && { f="$tmp/wb.json"; runner="runner "; }
+  got="$(jq -r '.services["functions-runtime"].networks // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "functions functions-egress" ]] || err "$render: functions-runtime is on [$got], expected [functions functions-egress]"
+  # #183: the gateway joins the runtime's network as `gateway-functions` (the runtime's
+  # `env.CHELABASE` binding), and nothing else does.
+  got="$(members functions "$f")"
+  [[ "$got" == "functions functions-runtime gateway " ]] || err "$render: the functions network holds [$got]"
+  got="$(jq -c '.services.gateway.networks.functions.aliases // []' "$f")"
+  [[ "$got" == '["gateway-functions"]' ]] || err "$render: the gateway's alias on the functions network: got $got"
+  for svc in orchestrator worker metadata-db nats seaweedfs storage rest auth realtime identity; do
+    ! jq -e --arg s "$svc" '.services[$s].networks // {} | has("functions")' "$f" >/dev/null ||
+      err "$render: $svc must not be on the runtime's network"
+  done
+  # The binding's address is the gateway's alias and port, and its host the gateway's API host.
+  rt_cmd="$(jq -r '.services["functions-runtime"].command // [] | join(" ")' "$f")"
+  gw_port="$(jq -r '.services.gateway.environment.CHELABASE_GATEWAY_LISTEN // ""' "$f" | sed 's/.*://')"
+  [[ -z "$gw_port" ]] && gw_port="$(sed -n 's/^CHELABASE_GATEWAY_LISTEN=.*://p' "$root/scripts/tests/fixtures/workbench-stack.env")"
+  [[ "$rt_cmd" == "/usr/local/bin/workerd serve --experimental --external-addr chelabase-api=gateway-functions:$gw_port /etc/functions-runtime/config.capnp" ]] ||
+    err "$render: the runtime's binding must reach gateway-functions:$gw_port; command: $rt_cmd"
+  rt_host="$(jq -r '.services["functions-runtime"].environment.CHELABASE_API_HOST // ""' "$f")"
+  api_host="$(jq -r '.services.gateway.environment.CHELABASE_API_HOST // ""' "$f")"
+  [[ -z "$api_host" ]] && api_host="$(sed -n 's/^CHELABASE_API_HOST=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
+  [[ -n "$rt_host" && "$rt_host" == "$api_host" ]] || err "$render: the runtime's CHELABASE_API_HOST ($rt_host) must be the gateway's API host ($api_host)"
+  got="$(jq -r '.services["functions-runtime"].environment // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "CHELABASE_API_HOST" ]] || err "$render: the runtime gets CHELABASE_API_HOST and no other setting; got [$got]"
+  got="$(members functions-control "$f")"
+  [[ "$got" == "functions orchestrator ${runner}worker " ]] || err "$render: the functions-control network holds [$got]"
+  got="$(members functions-egress "$f")"
+  [[ "$got" == "functions-runtime " ]] || err "$render: the functions-egress network holds [$got]"
+  for n in functions functions-control; do
+    [[ "$(jq -r --arg n "$n" '.networks[$n].internal' "$f")" == true ]] || err "$render: the $n network must be internal"
+  done
+  for svc in orchestrator worker; do
+    ! jq -e --arg s "$svc" '.services[$s].networks // {} | has("functions")' "$f" >/dev/null ||
+      err "$render: $svc must not be on the runtime's network"
+  done
+  got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
+  # m13b: `compute` (no alias: it dials computes and listens on nothing there).
+  [[ "$got" == '{"compute":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
+    err "$render: the functions service's network aliases: got $got"
+done
+# #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
+# invocations only; each binds its own network's alias.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  fenv="$(jq -c '.services.functions.environment | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
+    | {CHELABASE_FUNCTIONS_ADDR, CHELABASE_FUNCTIONS_INTERNAL_ADDR, CHELABASE_FUNCTIONS_CONTROL_ADDR}' "$f")"
+  [[ "$fenv" == '{"CHELABASE_FUNCTIONS_ADDR":"functions-public:8091,127.0.0.1:8091","CHELABASE_FUNCTIONS_INTERNAL_ADDR":"functions-internal:8080","CHELABASE_FUNCTIONS_CONTROL_ADDR":"functions-control:8080"}' ]] ||
+    err "$render: functions binds its aliases only, one side per network: got $fenv"
+done
+grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
+  err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
+# Functions and the runtime run in every install and every workbench stack (no profile).
+for svc in functions functions-runtime; do
+  for render in base wb; do
+    [[ "$(jq -r --arg s "$svc" '.services[$s].profiles // [] | length' "$tmp/$render.json")" == 0 ]] ||
+      err "$render: $svc runs with no profile"
+  done
+done
+
+# 8. The service runner (edge functions m10), in both renders.
+for render in base wb; do
+  boundary tokens/functions-service-runner.token "functions service-runner" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-service-runner.token "service-runner worker" "$render" "$tmp/readers.$render"
+done
+for render in base wb; do
+  f="$tmp/base.json"
+  runner=""
+  [[ "$render" == wb ]] && { f="$tmp/wb.json"; runner="runner "; }
+  # The Docker socket: the computes' two holders, the service runner, and the workbench's test
+  # runner; never functions, the runtime or anything else, in any profile.
+  got="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.source // "") | contains("docker.sock"))) | .key' "$f" | sort | tr '\n' ' ')"
+  [[ "$got" == "orchestrator ${runner}service-runner worker " ]] || err "$render: the Docker socket is mounted by [$got]"
+  [[ "$(jq -c '.services["service-runner"].profiles // []' "$f")" == '["services"]' ]] ||
+    err "$render: service-runner runs in profile services only (off by default)"
+  # No shared network for service containers (audit B3): the runner makes one per service at run
+  # time and attaches the functions container there; compose declares none. `services-control`:
+  # the runner and its two callers, internal. The runner itself is never on `functions` or
+  # `functions-control`.
+  [[ "$(jq -r '.networks | has("services")' "$f")" == false ]] || err "$render: a shared services network is back"
+  got="$(members services "$f")"
+  [[ -z "$got" ]] || err "$render: [$got] joins a shared services network"
+  got="$(members services-control "$f")"
+  [[ "$got" == "functions service-runner worker " ]] || err "$render: the services-control network holds [$got]"
+  [[ "$(jq -r '.networks["services-control"].internal' "$f")" == true ]] || err "$render: services-control must be internal"
+  got="$(jq -r '.services["service-runner"].networks // {} | keys | join(" ")' "$f")"
+  [[ "$got" == "default services-control" ]] || err "$render: service-runner is on [$got]"
+  got="$(jq -c '.services["service-runner"].networks["services-control"].aliases // []' "$f")"
+  [[ "$got" == '["service-runner-control"]' ]] || err "$render: service-runner's alias on services-control: got $got"
+  senv="$(jq -c '.services["service-runner"].environment | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
+    | {CHELABASE_SERVICE_RUNNER_ADDR, CHELABASE_COMPOSE_PROJECT, CHELABASE_SERVICES_NETWORK}' "$f")"
+  [[ "$senv" == '{"CHELABASE_SERVICE_RUNNER_ADDR":"service-runner-control:8094,127.0.0.1:8094","CHELABASE_COMPOSE_PROJECT":"'"$(jq -r .name "$f")"'","CHELABASE_SERVICES_NETWORK":null}' ]] ||
+    err "$render: service-runner binds its control alias only and attaches its project's functions container: got $senv"
+done
+for sub in tokens/functions-service-runner.token tokens/worker-service-runner.token db/metadata.password; do
+  jq -e --arg p "/run/chelabase/secrets/$sub" '.services["service-runner"].environment // {} | to_entries
+    | any(.value == $p and (.key | endswith("_FILE")))' "$tmp/base.json" >/dev/null ||
+    err "service-runner reads $sub through a *_FILE setting"
+done
+for pair in functions:FUNCTIONS worker:WORKER; do
+  svc="${pair%%:*}"
+  var="CHELABASE_${pair##*:}_SERVICE_RUNNER_TOKEN_FILE"
+  [[ "$(jq -r --arg s "$svc" --arg v "$var" '.services[$s].environment[$v] // ""' "$tmp/base.json")" == "/run/chelabase/secrets/tokens/$svc-service-runner.token" ]] ||
+    err "$svc reads its service-runner bearer through $var"
+done
+sr="$(jq -c '.services["service-runner"] | {read_only, image: (.image | sub(":.*"; ""))}' "$tmp/base.json")"
+[[ "$sr" == '{"read_only":true,"image":"ghcr.io/chelabase/service-runner"}' ]] ||
+  err "service-runner runs its release image read-only: got $sr"
+[[ "$(jq -r '.services["service-runner"].environment.CHELABASE_SERVICE_RUNNER_URL // ""' "$tmp/base.json")" == http://service-runner-control:8094 ]] ||
+  err "CHELABASE_SERVICE_RUNNER_URL is the runner's control alias"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

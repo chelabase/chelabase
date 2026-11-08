@@ -13,6 +13,9 @@ pub enum Method {
     Delete,
     /// Only object storage's metadata read (`storage.head_object`).
     Head,
+    /// Every method a function may answer: [`Method::ANY_TOKENS`] (edge functions m3, the
+    /// functions service's invoke routes only).
+    Any,
 }
 
 impl Method {
@@ -24,6 +27,20 @@ impl Method {
             Method::Patch => "PATCH",
             Method::Delete => "DELETE",
             Method::Head => "HEAD",
+            // The form of an `Allow` or `Access-Control-Allow-Methods` header.
+            Method::Any => "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
+        }
+    }
+
+    /// The tokens [`Method::Any`] takes.
+    pub const ANY_TOKENS: [&'static str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+    /// Whether a request with the HTTP method `token` may reach an endpoint declared with this
+    /// method: its own token, or for [`Method::Any`] one of [`Method::ANY_TOKENS`].
+    pub fn accepts(self, token: &str) -> bool {
+        match self {
+            Method::Any => Self::ANY_TOKENS.contains(&token),
+            declared => Method::parse(token) == Some(declared),
         }
     }
 
@@ -50,6 +67,8 @@ pub enum Service {
     Realtime,
     /// Object storage (buckets and objects).
     Storage,
+    /// Edge functions' invocations (edge functions m4).
+    Functions,
 }
 
 impl Service {
@@ -61,6 +80,7 @@ impl Service {
             Service::Rest => "rest",
             Service::Realtime => "realtime",
             Service::Storage => "storage",
+            Service::Functions => "functions",
         }
     }
 }
@@ -1206,6 +1226,77 @@ pub mod orchestrator {
         Access::Project(Developer),
     );
 
+    /// Edge functions m3: a branch's functions. Reads need Viewer; every per-branch write is
+    /// `BRANCH` (Developer, Admin on a protected branch). A function's row is the database's,
+    /// so deleting it needs Admin (the handler also asks Admin to change its kind).
+    const FUNCTIONS: &str = "/v1/databases/{id}/branches/{branch_id}/functions";
+    const FUNCTION: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}";
+    const FUNCTION_DEPLOYMENTS: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments";
+    const FUNCTION_SECRETS: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets";
+    const FUNCTION_SECRET: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}";
+    pub const LIST_FUNCTIONS: Endpoint =
+        key_endpoint("orchestrator.list_functions", Method::Get, FUNCTIONS, Access::Project(Viewer));
+    pub const PUT_FUNCTION: Endpoint = key_endpoint("orchestrator.put_function", Method::Put, FUNCTION, BRANCH);
+    pub const UPDATE_FUNCTION: Endpoint =
+        key_endpoint("orchestrator.update_function", Method::Patch, FUNCTION, BRANCH);
+    pub const DELETE_FUNCTION: Endpoint =
+        key_endpoint("orchestrator.delete_function", Method::Delete, FUNCTION, Access::Project(Admin));
+    pub const CREATE_FUNCTION_DEPLOYMENT: Endpoint =
+        key_endpoint("orchestrator.create_function_deployment", Method::Post, FUNCTION_DEPLOYMENTS, BRANCH);
+    pub const LIST_FUNCTION_DEPLOYMENTS: Endpoint = key_endpoint(
+        "orchestrator.list_function_deployments",
+        Method::Get,
+        FUNCTION_DEPLOYMENTS,
+        Access::Project(Viewer),
+    );
+    /// Edge functions m11: a container service's logs need Developer (what it prints).
+    pub const GET_SERVICE_LOGS: Endpoint = key_endpoint(
+        "orchestrator.get_service_logs",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/logs",
+        Access::Project(Developer),
+    );
+    pub const LIST_FUNCTION_SECRETS: Endpoint =
+        key_endpoint("orchestrator.list_function_secrets", Method::Get, FUNCTION_SECRETS, Access::Project(Viewer));
+    pub const PUT_FUNCTION_SECRET: Endpoint =
+        key_endpoint("orchestrator.put_function_secret", Method::Put, FUNCTION_SECRET, BRANCH);
+    pub const DELETE_FUNCTION_SECRET: Endpoint =
+        key_endpoint("orchestrator.delete_function_secret", Method::Delete, FUNCTION_SECRET, BRANCH);
+    /// Edge functions m7: a function's schedules on a branch, as its secrets.
+    const FUNCTION_SCHEDULES: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules";
+    const FUNCTION_SCHEDULE: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}";
+    pub const LIST_FUNCTION_SCHEDULES: Endpoint = key_endpoint(
+        "orchestrator.list_function_schedules",
+        Method::Get,
+        FUNCTION_SCHEDULES,
+        Access::Project(Viewer),
+    );
+    pub const CREATE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.create_function_schedule", Method::Post, FUNCTION_SCHEDULES, BRANCH);
+    pub const UPDATE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.update_function_schedule", Method::Patch, FUNCTION_SCHEDULE, BRANCH);
+    pub const DELETE_FUNCTION_SCHEDULE: Endpoint =
+        key_endpoint("orchestrator.delete_function_schedule", Method::Delete, FUNCTION_SCHEDULE, BRANCH);
+    /// Edge functions m13: a function's triggers on a branch, as its schedules.
+    const FUNCTION_TRIGGERS: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers";
+    const FUNCTION_TRIGGER: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}";
+    pub const LIST_FUNCTION_TRIGGERS: Endpoint = key_endpoint(
+        "orchestrator.list_function_triggers",
+        Method::Get,
+        FUNCTION_TRIGGERS,
+        Access::Project(Viewer),
+    );
+    pub const CREATE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.create_function_trigger", Method::Post, FUNCTION_TRIGGERS, BRANCH);
+    pub const UPDATE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.update_function_trigger", Method::Patch, FUNCTION_TRIGGER, BRANCH);
+    pub const DELETE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.delete_function_trigger", Method::Delete, FUNCTION_TRIGGER, BRANCH);
+
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
         Endpoint {
@@ -1480,6 +1571,48 @@ pub mod storage {
     pub const ABORT_UPLOAD: Endpoint = data("storage.abort_upload", Method::Delete, SESSION);
 }
 
+/// Edge functions (m3 declares, m4 serves): a function's URL on the caller's branch. The key
+/// form takes a data key (the branch is the key's) and, as the data API, an app user's token
+/// beside it; the literal `public` segment makes the keyless form for `auth = public`
+/// functions only (the functions service checks) and keeps it from tying with the key form.
+pub mod functions {
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    const fn invoke(name: &'static str, path: &'static str, auth: Auth, access: Access) -> Endpoint {
+        Endpoint {
+            name,
+            method: Method::Any,
+            path,
+            scope: Scope::Api,
+            service: Service::Functions,
+            policy: Policy { auth, cors: Cors::Any, access },
+            websocket: false,
+        }
+    }
+
+    pub const INVOKE: Endpoint =
+        invoke("functions.invoke", "/functions/v1/{name}", Auth::DataKey, Access::DataKey);
+    pub const INVOKE_PATH: Endpoint =
+        invoke("functions.invoke_path", "/functions/v1/{name}/{*rest}", Auth::DataKey, Access::DataKey);
+    pub const INVOKE_PUBLIC: Endpoint = invoke(
+        "functions.invoke_public",
+        "/functions/v1/public/{branch_id}/{name}",
+        Auth::Public,
+        Access::Public,
+    );
+    pub const INVOKE_PUBLIC_PATH: Endpoint = invoke(
+        "functions.invoke_public_path",
+        "/functions/v1/public/{branch_id}/{name}/{*rest}",
+        Auth::Public,
+        Access::Public,
+    );
+    /// m9: an external service, proxied by the functions service with the rest and query.
+    pub const CALL_SERVICE: Endpoint =
+        invoke("functions.call_service", "/services/v1/{name}", Auth::DataKey, Access::DataKey);
+    pub const CALL_SERVICE_PATH: Endpoint =
+        invoke("functions.call_service_path", "/services/v1/{name}/{*rest}", Auth::DataKey, Access::DataKey);
+}
+
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
@@ -1688,6 +1821,30 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::LIST_PARTS,
     storage::COMPLETE_UPLOAD,
     storage::ABORT_UPLOAD,
+    orchestrator::LIST_FUNCTIONS,
+    orchestrator::PUT_FUNCTION,
+    orchestrator::UPDATE_FUNCTION,
+    orchestrator::DELETE_FUNCTION,
+    orchestrator::CREATE_FUNCTION_DEPLOYMENT,
+    orchestrator::LIST_FUNCTION_DEPLOYMENTS,
+    orchestrator::LIST_FUNCTION_SECRETS,
+    orchestrator::PUT_FUNCTION_SECRET,
+    orchestrator::DELETE_FUNCTION_SECRET,
+    orchestrator::LIST_FUNCTION_SCHEDULES,
+    orchestrator::CREATE_FUNCTION_SCHEDULE,
+    orchestrator::UPDATE_FUNCTION_SCHEDULE,
+    orchestrator::DELETE_FUNCTION_SCHEDULE,
+    orchestrator::LIST_FUNCTION_TRIGGERS,
+    orchestrator::GET_SERVICE_LOGS,
+    orchestrator::CREATE_FUNCTION_TRIGGER,
+    orchestrator::UPDATE_FUNCTION_TRIGGER,
+    orchestrator::DELETE_FUNCTION_TRIGGER,
+    functions::INVOKE,
+    functions::INVOKE_PATH,
+    functions::INVOKE_PUBLIC,
+    functions::INVOKE_PUBLIC_PATH,
+    functions::CALL_SERVICE,
+    functions::CALL_SERVICE_PATH,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1704,7 +1861,6 @@ pub fn match_endpoint(scope: Scope, method: &str, path: &str) -> Match {
 }
 
 fn match_in(endpoints: &'static [Endpoint], scope: Scope, method: &str, path: &str) -> Match {
-    let method = Method::parse(method);
     let mut best: Option<(&'static Endpoint, Vec<bool>)> = None;
     let mut allowed = Vec::new();
 
@@ -1712,7 +1868,7 @@ fn match_in(endpoints: &'static [Endpoint], scope: Scope, method: &str, path: &s
         let Some(specificity) = path_specificity(ep.path, path) else {
             continue;
         };
-        if Some(ep.method) == method {
+        if ep.method.accepts(method) {
             let better = best
                 .as_ref()
                 .is_none_or(|(_, current)| specificity > *current);
@@ -2656,6 +2812,34 @@ mod tests {
             ("storage.list_parts", Access::DataKey),
             ("storage.complete_upload", Access::DataKey),
             ("storage.abort_upload", Access::DataKey),
+            // Edge functions m3: the management API.
+            ("orchestrator.list_functions", Access::Project(Viewer)),
+            ("orchestrator.put_function", BRANCH),
+            ("orchestrator.update_function", BRANCH),
+            ("orchestrator.delete_function", Access::Project(Admin)),
+            ("orchestrator.create_function_deployment", BRANCH),
+            ("orchestrator.list_function_deployments", Access::Project(Viewer)),
+            ("orchestrator.list_function_secrets", Access::Project(Viewer)),
+            ("orchestrator.put_function_secret", BRANCH),
+            ("orchestrator.delete_function_secret", BRANCH),
+            // Edge functions m7: schedules.
+            ("orchestrator.list_function_schedules", Access::Project(Viewer)),
+            ("orchestrator.create_function_schedule", BRANCH),
+            ("orchestrator.update_function_schedule", BRANCH),
+            ("orchestrator.delete_function_schedule", BRANCH),
+            ("orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("orchestrator.get_service_logs", Access::Project(Developer)),
+            ("orchestrator.create_function_trigger", BRANCH),
+            ("orchestrator.update_function_trigger", BRANCH),
+            ("orchestrator.delete_function_trigger", BRANCH),
+            // Edge functions m3: invocations (served by m4).
+            ("functions.invoke", Access::DataKey),
+            ("functions.invoke_path", Access::DataKey),
+            ("functions.invoke_public", Access::Public),
+            ("functions.invoke_public_path", Access::Public),
+            // Edge functions m9: external services.
+            ("functions.call_service", Access::DataKey),
+            ("functions.call_service_path", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.
@@ -2867,5 +3051,205 @@ mod tests {
         for path in ["/v1/realtime", "/v1/realtime/", "/v1/realtime/socket/x", "/v1/realtime/tickets/x", "/v1/realtime/other"] {
             assert_eq!(match_endpoint(Scope::Api, "GET", path), Match::NotFound, "{path}");
         }
+    }
+
+    /// Edge functions m3: the `Any` method takes every method a function may answer, and
+    /// nothing else (`TRACE`, `CONNECT`, lowercase tokens).
+    #[test]
+    fn any_method_accepts_exactly_the_function_methods() {
+        for token in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            assert!(Method::Any.accepts(token), "{token}");
+        }
+        for token in ["TRACE", "CONNECT", "get", "", "PROPFIND"] {
+            assert!(!Method::Any.accepts(token), "{token}");
+        }
+        // A declared method takes only its own token.
+        assert!(Method::Get.accepts("GET"));
+        assert!(!Method::Get.accepts("HEAD"));
+        assert!(!Method::Post.accepts("OPTIONS"));
+        // The preflight and `Allow` header form lists every method.
+        assert_eq!(Method::Any.as_str(), "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS");
+    }
+
+    /// Edge functions m3: a function's URL, with a data key (`/functions/v1/{name}[/rest]`) or
+    /// none on the literal `/public/` form (`/functions/v1/public/{branch_id}/{name}[/rest]`),
+    /// for any method; served by the functions service (m4).
+    #[test]
+    fn function_invoke_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        let open = Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public };
+        let b = "6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10";
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            for (path, name, policy) in [
+                ("/functions/v1/hello".to_owned(), "functions.invoke", key),
+                ("/functions/v1/hello/sub".to_owned(), "functions.invoke_path", key),
+                ("/functions/v1/hello/a/b/c".to_owned(), "functions.invoke_path", key),
+                (format!("/functions/v1/public/{b}/hello"), "functions.invoke_public", open),
+                (format!("/functions/v1/public/{b}/hello/a"), "functions.invoke_public_path", open),
+                (format!("/functions/v1/public/{b}/hello/a/b"), "functions.invoke_public_path", open),
+                // A function named `public` (m3 refuses the name) is never reached keyless.
+                ("/functions/v1/public".to_owned(), "functions.invoke", key),
+                (format!("/functions/v1/public/{b}"), "functions.invoke_path", key),
+            ] {
+                let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                    panic!("{method} {path} isn't routed");
+                };
+                assert_eq!((ep.name, ep.policy), (name, policy), "{method} {path}");
+                assert_eq!(ep.service, Service::Functions, "{method} {path}");
+                assert_eq!(ep.method, Method::Any);
+                assert!(!ep.websocket);
+            }
+        }
+        assert_eq!(Service::Functions.name(), "functions");
+        for path in ["/functions/v1", "/functions/v1/", "/functions/v1/hello/", "/functions/v1/hello//x"] {
+            assert!(
+                !matches!(match_endpoint(Scope::Api, "GET", path), Match::Found(ep) if ep.service == Service::Functions),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "TRACE", "/functions/v1/hello"),
+            Match::MethodNotAllowed(vec![Method::Any])
+        );
+    }
+
+    /// Edge functions m9: an external service's URL, with a data key, any method, served by
+    /// the functions service (which proxies it).
+    #[test]
+    fn service_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            for (path, name) in [
+                ("/services/v1/stub", "functions.call_service"),
+                ("/services/v1/stub/a", "functions.call_service_path"),
+                ("/services/v1/stub/a/b/c", "functions.call_service_path"),
+                ("/services/v1/public", "functions.call_service"),
+            ] {
+                let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                    panic!("{method} {path} isn't routed");
+                };
+                assert_eq!((ep.name, ep.policy, ep.method), (name, key, Method::Any), "{method} {path}");
+                assert_eq!(ep.service, Service::Functions, "{method} {path}");
+                assert!(!ep.websocket);
+            }
+        }
+        for path in ["/services/v1", "/services/v1/", "/services/v1/stub/"] {
+            assert!(
+                !matches!(match_endpoint(Scope::Api, "GET", path), Match::Found(ep) if ep.service == Service::Functions),
+                "{path}"
+            );
+        }
+    }
+
+    /// Whether `a` and `b` tie for some path: [`match_in`] keeps whichever is declared first,
+    /// so a tie between endpoints of different auth would pick one silently. Specificities are
+    /// equal exactly when both templates have as many segments (a tail counts as one) and, at
+    /// each position, both are the same literal or both are a param or tail; such a pair ties
+    /// on the path with each param (and tail) filled with one segment.
+    fn tie_witness(a: &Endpoint, b: &Endpoint) -> Option<String> {
+        let methods_overlap =
+            a.method == b.method || a.method == Method::Any || b.method == Method::Any;
+        if a.scope != b.scope || !methods_overlap {
+            return None;
+        }
+        let is_param = |s: &str| s.starts_with('{');
+        let (ta, tb): (Vec<&str>, Vec<&str>) = (a.path.split('/').collect(), b.path.split('/').collect());
+        if ta.len() != tb.len() {
+            return None;
+        }
+        let mut witness = Vec::with_capacity(ta.len());
+        for (sa, sb) in ta.iter().zip(&tb) {
+            match (is_param(sa), is_param(sb)) {
+                (true, true) => witness.push("x"),
+                (false, false) if sa == sb => witness.push(sa),
+                _ => return None,
+            }
+        }
+        Some(witness.join("/"))
+    }
+
+    fn ties(endpoints: &'static [Endpoint]) -> Vec<(&'static str, &'static str, String)> {
+        let mut out = Vec::new();
+        for (i, a) in endpoints.iter().enumerate() {
+            for b in &endpoints[i + 1..] {
+                if let Some(path) = tie_witness(a, b) {
+                    // The witness really matches both, equally specifically.
+                    assert_eq!(
+                        path_specificity(a.path, &path),
+                        path_specificity(b.path, &path),
+                        "{} / {} on {path}",
+                        a.name,
+                        b.name
+                    );
+                    assert!(path_specificity(a.path, &path).is_some(), "{path}");
+                    out.push((a.name, b.name, path));
+                }
+            }
+        }
+        out
+    }
+
+    const TIED: &[Endpoint] = &[
+        Endpoint { name: "test.tail", method: Method::Any, path: "/f/v1/{name}/{*rest}", ..orchestrator::HEALTH },
+        Endpoint { name: "test.param", method: Method::Get, path: "/f/v1/{branch}/{name}", ..orchestrator::HEALTH },
+        Endpoint { name: "test.literal", method: Method::Get, path: "/f/v1/public/{name}", ..orchestrator::HEALTH },
+    ];
+
+    /// Edge functions m3: no path matches two declared endpoints equally (the first declared
+    /// would win silently). Checked pairwise from every template, so a new route that ties
+    /// fails here.
+    #[test]
+    fn no_two_endpoints_tie_for_any_path() {
+        // The check itself finds a tie, a tail against a param included, and lets a literal
+        // segment break one.
+        let found: Vec<_> = ties(TIED).into_iter().map(|(a, b, _)| (a, b)).collect();
+        assert_eq!(found, vec![("test.tail", "test.param")]);
+        assert_eq!(
+            match_in(TIED, Scope::Api, "GET", "/f/v1/public/n"),
+            Match::Found(&TIED[2])
+        );
+
+        let declared = ties(ENDPOINTS);
+        assert!(declared.is_empty(), "tied endpoints: {declared:?}");
+    }
+
+    /// Edge functions m3: the management routes, member token from Studio; reads at Viewer,
+    /// per-branch writes `Branch(Developer, Admin)`, a delete Admin.
+    #[test]
+    fn function_management_routes() {
+        use PlatformRole::{Admin, Developer, Viewer};
+        let branch = Access::Branch { unprotected: Developer, protected: Admin };
+        let base = "/v1/databases/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/branches/7a1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/functions";
+        for (method, tail, name, access) in [
+            ("GET", "", "orchestrator.list_functions", Access::Project(Viewer)),
+            ("PUT", "/hello", "orchestrator.put_function", branch),
+            ("PATCH", "/hello", "orchestrator.update_function", branch),
+            ("DELETE", "/hello", "orchestrator.delete_function", Access::Project(Admin)),
+            ("POST", "/hello/deployments", "orchestrator.create_function_deployment", branch),
+            ("GET", "/hello/deployments", "orchestrator.list_function_deployments", Access::Project(Viewer)),
+            ("GET", "/hello/secrets", "orchestrator.list_function_secrets", Access::Project(Viewer)),
+            ("PUT", "/hello/secrets/API_KEY", "orchestrator.put_function_secret", branch),
+            ("DELETE", "/hello/secrets/API_KEY", "orchestrator.delete_function_secret", branch),
+            ("GET", "/hello/schedules", "orchestrator.list_function_schedules", Access::Project(Viewer)),
+            ("POST", "/hello/schedules", "orchestrator.create_function_schedule", branch),
+            ("PATCH", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_schedule", branch),
+            ("DELETE", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_schedule", branch),
+            ("GET", "/hello/triggers", "orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("GET", "/hello/logs", "orchestrator.get_service_logs", Access::Project(Developer)),
+            ("POST", "/hello/triggers", "orchestrator.create_function_trigger", branch),
+            ("PATCH", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_trigger", branch),
+            ("DELETE", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_trigger", branch),
+        ] {
+            let path = format!("{base}{tail}");
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy.access), (name, access), "{method} {tail}");
+            assert_eq!((ep.policy.auth, ep.policy.cors), (Auth::Management, Cors::Studio));
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "POST", &format!("{base}/hello")),
+            Match::MethodNotAllowed(vec![Method::Put, Method::Patch, Method::Delete])
+        );
     }
 }

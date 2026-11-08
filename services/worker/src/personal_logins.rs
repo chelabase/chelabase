@@ -722,6 +722,7 @@ mod tests {
             role_oid: None,
             role_timeline: None,
             role_bypass_rls: false,
+            managed_by_function: None,
         }
     }
 }

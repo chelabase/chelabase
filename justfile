@@ -324,6 +324,22 @@ storage-iam-e2e:
 storage-e2e *args:
     cargo run -q -p chelabase -- workbench run scripts/storage-e2e.sh "$@"
 
+# CI runs this when infra/functions-runtime/ changes. Needs Docker, no stack.
+# The functions runtime's node tests, against a freshly baked image in throwaway containers
+functions-runtime-test:
+    docker buildx bake -f infra/images/docker-bake.hcl --load functions-runtime
+    node --test infra/functions-runtime/tests/
+
+# Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
+# it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
+# and call a public function on the keyless form. Shared-state: writes and removes its own rows.
+functions-e2e:
+    cargo run -q -p chelabase -- workbench test -p chelabase-functions --test e2e -- --run-ignored only
+
+# Live external-service e2e (edge functions m9): needs infra/compose/fixtures/stub-service.yml up
+functions-services-e2e port="18099":
+    cargo run -q -p chelabase -- workbench test --env CHELABASE_STUB_SERVICE_URL=http://host.docker.internal:{{port}} -p chelabase-functions --test e2e -- --run-ignored only services::
+
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:
     cargo run -q -p chelabase -- workbench run scripts/data-e2e.sh

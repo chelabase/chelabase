@@ -104,6 +104,9 @@ pub enum Purpose {
     MemberRole,
     /// The `chelabase_storage` login's password on a branch (the storage service's own).
     Storage,
+    /// The `chelabase_functions_dispatch` login's password on a branch (the functions
+    /// service's database-event dispatcher, edge functions m13b).
+    FunctionsDispatch,
     /// The key storage signs its object URLs with ([`derive_key`]; never a sealed value).
     StorageUrl,
     /// A storage webhook endpoint's signing secret (bound to the endpoint, see
@@ -120,6 +123,7 @@ impl Purpose {
             Purpose::Role => "role",
             Purpose::MemberRole => "member_role",
             Purpose::Storage => "storage",
+            Purpose::FunctionsDispatch => "functions_dispatch",
             Purpose::StorageUrl => "storage_url",
             Purpose::Webhook => "webhook",
         }
@@ -406,8 +410,9 @@ mod credential_tests {
     #[test]
     fn authenticator_and_data_key_purposes_round_trip_and_differ_in_aad() {
         let key = SecretKey::generate();
-        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey, Purpose::Storage];
+        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey, Purpose::Storage, Purpose::FunctionsDispatch];
         assert_eq!(Purpose::Owner.as_str(), "owner");
+        assert_eq!(Purpose::FunctionsDispatch.as_str(), "functions_dispatch");
         assert_eq!(Purpose::Storage.as_str(), "storage");
         assert_eq!(Purpose::Authenticator.as_str(), "authenticator");
         assert_eq!(Purpose::DataKey.as_str(), "data_key");

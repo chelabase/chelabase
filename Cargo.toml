@@ -8,6 +8,8 @@ members = [
     "services/rest",
     "services/realtime",
     "services/storage",
+    "services/functions",
+    "services/service-runner",
     "services/init",
     "tools/cli",
     "tools/bench-data-api",
@@ -71,6 +73,9 @@ sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "ch
 async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "aws-lc-rs", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 dotenvy = "0.15.7"
 chrono = { version = "0.4.45", features = ["serde"] }
+# Edge functions m7: function schedules (5-field cron, IANA time zones).
+croner = { version = "4.0.2", default-features = false, features = ["chrono"] }
+chrono-tz = "0.10.4"
 # async-nats's own time type (a consumer's start time); already in the tree through it.
 time = "0.3.55"
 humantime = "2.4.0"
@@ -91,6 +96,8 @@ parking_lot = "0.12.5"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 base64 = "0.23.1"
 tempfile = "3.27.0"
+notify = "8.2.0"
+toml = "1.1.8"
 pingora-core = "0.9.0"
 pingora-proxy = "0.9.0"
 pingora-http = "0.9.0"
@@ -124,6 +131,8 @@ pbkdf2 = "0.13.0"
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
+# Edge functions m4: wipes decrypted function secrets (already in the tree through aes-gcm).
+zeroize = "1.9.0"
 # Fork round 3: compute TLS (a platform CA, compute server and orchestrator client certificates).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 x509-parser = "0.18.1"

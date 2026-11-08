@@ -14,8 +14,8 @@
 #
 # --rev compares with the compose files at that commit instead (a manual check), and --env-file
 # (only with --rev) renders both sides with a live stack's env/stack.env instead of the fixture
-# stack (feat-x). Every render uses every profile (sites, runner), and the check fails on any
-# difference in:
+# stack (feat-x). Every render uses every profile (sites, runner, services), and the
+# check fails on any difference in:
 #   - `docker compose config --format json --no-env-resolution`, keys sorted, with the top-level
 #     `x-*` extension fields dropped. Those hold only YAML anchors, which can't cross files, so
 #     where they live changes; Compose never applies them to a container. `--no-env-resolution`
@@ -63,11 +63,11 @@ compose() {
     docker compose -p "$project" --project-directory "$dir" "$@"
 }
 render() { # render <-f args…>
-  compose "$@" --env-file "$env_file" --profile sites --profile runner config --format json \
+  compose "$@" --env-file "$env_file" --profile sites --profile runner --profile services config --format json \
     --no-env-resolution | jq -S 'with_entries(select(.key | startswith("x-") | not))'
 }
 hashes() { # hashes <-f args…>
-  compose "$@" --env-file "$env_file" --profile sites --profile runner config --hash '*' | sort
+  compose "$@" --env-file "$env_file" --profile sites --profile runner --profile services config --hash '*' | sort
 }
 
 render -f "$base" -f "$overlay" >"$tmp/split.json" || fail "rendering base + overlay failed"

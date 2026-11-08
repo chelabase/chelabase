@@ -1,0 +1,9 @@
+{
+  "title": "Services",
+  "pages": [
+    "index",
+    "external",
+    "verify-signature",
+    "containers"
+  ]
+}

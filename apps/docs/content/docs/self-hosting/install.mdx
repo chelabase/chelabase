@@ -45,6 +45,8 @@ Two one-shot containers do the setup, and both must exit 0:
 | `storage` | Object storage: files in buckets at `/storage/v1`, signed URLs and storage webhooks. Its files live in SeaweedFS's `chelabase-storage` bucket |
 | `metadata-db`, `nats`, `valkey` | The control plane's database (the identity service's schemas live there too), jobs, and caches |
 | `storage-*`, `pageserver`, `safekeeper*`, `proxy`, `seaweedfs` | Neon's storage and the Postgres proxy |
+| `functions`, `functions-runtime` | [Edge functions](/self-hosting/functions) |
+| `service-runner` | [Container services](/using/services/containers). Only with the `services` Compose profile (`COMPOSE_PROFILES=services` in `.env`, or `--profile services`) |
 
 Running `docker compose up` again with nothing changed recreates nothing and prints no new code. `docker compose down` followed by `up` keeps the secrets.
 
@@ -128,6 +130,9 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
 | `CHELABASE_SMTP_*` | unset | The identity service's email (below) |
 | `CHELABASE_WEBHOOKS_ALLOW_HOSTS`, `CHELABASE_WEBHOOKS_ALLOW_HTTP` | empty, `false` | Where storage webhooks may be delivered. By default only `https` URLs whose host resolves to public addresses. List host names (no port) that may resolve to private addresses, such as a receiver on your own network, and set `true` to also accept `http` URLs |
+| `CHELABASE_SERVICES_ALLOW_HOSTS`, `CHELABASE_SERVICES_ALLOW_HTTP` | empty, `false` | Where [external services](/using/services/external#the-allow-list) may point: the same rules as the webhooks' pair, checked separately |
+| `CHELABASE_FUNCTIONS_RUNTIME_MEMORY` | `1g` | The functions runtime container's memory limit, shared by every function ([Functions](/self-hosting/functions#settings)) |
+| `CHELABASE_SERVICE_RUNNER_RECONCILE_SECS` | `30` | How often the service runner reconciles [container services](/using/services/containers) with their desired state, in seconds (`services` profile only) |
 | `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | How long a member access token lives, 60 to 900 seconds |
 | `CHELABASE_MEMBER_SESSION_CHECK_SECS` | `15` | How long the orchestrator reuses the identity service's answer that a member token's session is live, 0 to 30 seconds (0 asks every time). A token stops working at most this long after logout or a password reset |
 
@@ -227,6 +232,8 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up --build --wa
 ```
 
 This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio and the identity service from their Dockerfiles. The wiring, secrets and health checks are the same.
+
+The same command builds the edge functions images, and the service runner's when the `services` profile is on (`COMPOSE_PROFILES=services`, in `.env` or before the command).
 
 ## Logs
 

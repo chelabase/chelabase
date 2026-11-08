@@ -1,0 +1,79 @@
+---
+title: Triggers
+description: Run a function on every committed row change of a table, or on storage object events, delivered at least once.
+---
+
+A **trigger** delivers events to a function's `fetch` handler. There are two sources: **table** triggers (database row changes) and **storage** triggers (object created, updated, deleted, moved). The payloads are in [Handlers](/using/functions/handlers#database-events), and delivery semantics (at least once, dedupe on `id`) are described there too.
+
+Triggers are per branch and managed with the [Management API](/reference/management/functions/createFunctionTrigger) (Developer on an unprotected branch, Admin on a protected one; Viewer may list). A new branch copies its parent's triggers.
+
+## From the CLI and Studio
+
+```bash
+chelabase functions trigger add NAME (--table SCHEMA.TABLE | --storage [--bucket B] [--prefix P]) --pg-database DB --events e1,e2
+chelabase functions trigger rm NAME ID
+chelabase functions trigger list NAME
+```
+
+- `add` needs `--pg-database` and `--events` (comma-separated, from the lists below), and exactly one of `--table` and `--storage`. It prints the trigger's id.
+- `--table` takes `schema.table` as plain text, unquoted (no `"…"` quoting); a bare name means `public`. `--bucket` and `--prefix` go with `--storage` only.
+- `list` prints one line per trigger: its id, source and target, events, state, enabled or disabled, `dead=`, `dropped=`, `delivered=` (the last delivery time) and the install error (`last_error`). When the last delivery failed, the line ends with `delivery: <error>` (the trigger's `last_delivery_error`).
+
+The CLI can't turn a trigger on or off. The **Triggers** section of Studio's function drawer can: it lists the triggers with their state and counts, adds a table or storage trigger, turns each on or off with a switch and deletes it. It refreshes while a trigger is `pending_install`.
+
+## Table triggers
+
+```bash
+BASE="$API/v1/databases/$DB/branches/$BRANCH/functions/on-order/triggers"
+
+curl -X POST "$BASE" -H "Authorization: Bearer $MEMBER_TOKEN" -H 'content-type: application/json' \
+  -d '{"source": "table", "pg_database": "<postgres database>", "schema": "public", "table": "orders", "events": ["insert", "update"]}'
+```
+
+`pg_database` names the Postgres database on the branch that holds the table. `events` is any of `insert`, `update`, `delete`, each at most once. The worker installs a row-level `AFTER` trigger on the table in the branch's database; each committed matching change is queued in an outbox in that database and delivered by the functions service. A new trigger is `pending_install`, then `installed` (events flow) or `failed` (with `last_error`).
+
+What it can and can't trigger on:
+
+- **Plain tables only.** A partitioned table fails with `function triggers support plain tables only`.
+- **Not Chelabase's own or reserved schemas:** `chelabase*`, `pg_*`, `storage` and `information_schema` are refused (422).
+- Installing needs nothing from you in SQL, and nothing a database member creates ever runs with the install's rights. The trigger function does not evaluate your types' code.
+
+Things to know:
+
+- **The compute stays awake** while a branch has an installed, enabled table trigger, so events can be delivered. A branch with a trigger doesn't scale to zero.
+- **Turning a trigger off uninstalls it** from the table and **drops its queued events** (counted in `dropped_count`). Turning it on installs it again. Deleting it does the same.
+- **A disabled function's events queue** and are delivered after you re-enable it. They aren't dropped.
+- The outbox is `chelabase_functions.outbox` in the branch's database. The database's owner-level roles can read it directly (and write to it, but every row is checked against the trigger metadata before delivery and a forged row is deleted, never delivered).
+- A reset or restore puts the branch's table triggers back to `pending_install` and empties the outbox, because the database came from another timeline.
+
+## Storage triggers
+
+```bash
+curl -X POST "$BASE" -H "Authorization: Bearer $MEMBER_TOKEN" -H 'content-type: application/json' \
+  -d '{"source": "storage", "pg_database": "<postgres database>", "events": ["object.created"], "bucket": "avatars", "prefix": "public/"}'
+```
+
+`events` is any of `object.created`, `object.updated`, `object.deleted`, `object.moved`. `bucket` and `prefix` narrow it (every bucket and every key when absent); a move matches on where the object went or where it came from. A storage trigger starts `installed` and needs nothing in the database. It receives the events of **its own branch** only, from the moment it is enabled.
+
+- **Retention: 24 hours.** A failed delivery is retried for up to 24 hours after the event; after that it is dropped and counted.
+- **At most 100,000 events per Chelabase database**, across all its branches, are held. When a database passes the cap its oldest events are evicted, delivered or not. A storage trigger counts the events evicted before it settled them in `dropped_count`. (Events evicted while no worker was running the trigger can't be counted.)
+- A disabled trigger isn't delivered, and re-enabling it doesn't replay the time it was off. A disabled *function* keeps its trigger, and its events wait (up to the 24 hours).
+- Up to four deliveries per trigger run at once.
+
+<Callout type="warn">
+A storage event says which object changed, not what is in it. A function that reads the object with its [run-as key](/using/functions/environment#acting-as-the-function) gets 403 from the storage API when the run-as role is a custom one: today the storage tables are granted only to `anon` and `authenticated`, whatever storage policies you write for another role. Letting custom roles use storage under RLS is tracked in [#187](https://github.com/chelabase/chelabase/issues/187).
+</Callout>
+
+## Limits and counters
+
+A trigger reports, besides its `state`:
+
+| Field | Meaning |
+|---|---|
+| `last_error` | Why the install failed. |
+| `last_delivery_error` | Why the last failed delivery failed; cleared by a delivery. |
+| `last_delivered_at` | When the last event was delivered. |
+| `dead_count` | Database events that went dead after 10 failed attempts. |
+| `dropped_count` | Events removed undelivered: dead events past 10,000 per database or 7 days old, the queued events of a trigger turned off, and storage events that expired or were evicted. |
+
+**The outbox caps apply to dead rows only.** A pending event is never removed by the cap: delivery is at least once, and a function that stays off keeps its events queued, bounded only by the database's own size. Dead rows beyond 10,000, or older than 7 days, are deleted oldest first and counted in `dropped_count`.

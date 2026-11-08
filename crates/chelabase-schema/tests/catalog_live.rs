@@ -1131,3 +1131,74 @@ async fn shell_types_are_not_listed() {
     s.sql(&format!("DROP OWNED BY \"{owner}\"")).await;
     s.finish().await;
 }
+
+/// Edge functions m8: two states of one database that differ only in function triggers (the
+/// `chelabase_functions` schema with its outbox and `SECURITY DEFINER` function, and a
+/// `chelabase_fn_*` trigger on a user table) read as the same model (so the merge plans
+/// nothing), digest alike, and add nothing to the protection review. A user's own trigger
+/// named `chelabase_fn_…` on another function is still read.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn function_trigger_exclusions_leave_the_model_and_digest_alone() {
+    use chelabase_schema::plan::admin_digest_sql;
+    use chelabase_schema::review::{parse_review, review_sql};
+
+    let mut s = Scratch::new().await;
+    s.fixture().await;
+    // The real owner is `chelabase_functions_owner`, a role the catalog never reads; this
+    // run's own role (roles are cluster-wide) exists before the first read.
+    let owner = s.role("fn_owner");
+    s.sql(&format!("CREATE TABLE public.\"Ord ers\" (id int PRIMARY KEY); CREATE ROLE {owner} NOLOGIN"))
+        .await;
+    let digest = async |s: &Scratch| texts(&s.client, &admin_digest_sql()).await.pop().unwrap();
+    let review = async |s: &Scratch| {
+        let out = texts(&s.client, &review_sql("postgres")).await.join("\n");
+        parse_review("db", &out).unwrap()
+    };
+    let (model, before, items) = (s.model().await, digest(&s).await, review(&s).await);
+    s.sql(&format!(
+        "CREATE SCHEMA chelabase_functions AUTHORIZATION {owner};
+         CREATE TABLE chelabase_functions.outbox (id bigserial PRIMARY KEY, trigger_id uuid, payload jsonb);
+         ALTER TABLE chelabase_functions.outbox OWNER TO {owner};
+         CREATE FUNCTION chelabase_functions.enqueue() RETURNS trigger LANGUAGE plpgsql
+           SECURITY DEFINER SET search_path = pg_catalog, chelabase_functions, pg_temp
+           AS $$BEGIN INSERT INTO chelabase_functions.outbox (trigger_id) VALUES (TG_ARGV[0]::uuid); RETURN NULL; END$$;
+         ALTER FUNCTION chelabase_functions.enqueue() OWNER TO {owner};
+         CREATE TRIGGER chelabase_fn_0123456789abcdef0123456789abcdef AFTER INSERT ON public.\"Ord ers\"
+           FOR EACH ROW EXECUTE FUNCTION chelabase_functions.enqueue('01234567-89ab-cdef-0123-456789abcdef');
+         INSERT INTO public.\"Ord ers\" VALUES (1);"
+    ))
+    .await;
+    let (model_after, after, items_after) = (s.model().await, digest(&s).await, review(&s).await);
+    // The review skips `chelabase_functions` only when `chelabase_functions_owner` owns it (the
+    // owner check from #185/#188): owned by this run's role, the function triggers are reviewed.
+    let flagged: Vec<String> = items_after.iter().map(|i| i.key.clone()).collect();
+    // Handed to the real owner (a cluster-wide role the catalog never reads; made if missing and
+    // kept, since other runs share it), they reach the review no more.
+    s.sql(
+        "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'chelabase_functions_owner')
+           THEN CREATE ROLE chelabase_functions_owner NOLOGIN; END IF; END$$;
+         ALTER SCHEMA chelabase_functions OWNER TO chelabase_functions_owner;
+         ALTER TABLE chelabase_functions.outbox OWNER TO chelabase_functions_owner;
+         ALTER FUNCTION chelabase_functions.enqueue() OWNER TO chelabase_functions_owner;"
+    )
+    .await;
+    let items_owned = review(&s).await;
+    // A user's trigger with the prefix on their own function stays in the model.
+    s.sql(
+        "CREATE FUNCTION public.mine() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;
+         CREATE TRIGGER chelabase_fn_mine AFTER INSERT ON public.\"Ord ers\" FOR EACH ROW EXECUTE FUNCTION public.mine();",
+    )
+    .await;
+    let with_mine = s.model().await;
+    s.finish().await;
+    assert_eq!(model_after, model, "the function triggers changed the model");
+    assert_eq!(after, before, "the function triggers changed the digest");
+    assert!(
+        flagged.iter().any(|k| k.contains("chelabase_functions.enqueue()"))
+            && flagged.iter().any(|k| k.contains("chelabase_fn_0123456789abcdef0123456789abcdef")),
+        "a chelabase_functions schema owned by someone else is reviewed: {flagged:?}"
+    );
+    assert_eq!(items_owned, items, "the function triggers reached the review");
+    assert_ne!(with_mine, model, "a user's chelabase_fn_ trigger on their own function is read");
+}

@@ -1,0 +1,71 @@
+---
+title: Services
+description: Put a microservice you already run behind Chelabase's keys, routing and signed requests, as an external URL or a container.
+---
+
+<AlphaNotice />
+
+A **service** is a backend you run, not code Chelabase runs for you. Chelabase routes `/services/v1/{name}/…` to it, checks the caller's key first, tells the service who called in signed headers, and switches it off and on per branch. A service is a [function](/using/functions) of kind `service`: it shares the name space, the enabled switch, the [auth modes](/using/functions/auth-and-limits#auth-modes), the branch inheritance and the Studio list.
+
+## Two backends
+
+| | External | Container |
+|---|---|---|
+| What it is | A URL you already run: a container in your compose or k8s, or a VM | An image Chelabase starts for you through the service runner |
+| Set up | A base URL and a health path ([External services](/using/services/external)) | An image, a port and a health path ([Container services](/using/services/containers)) |
+| Needs | `CHELABASE_SERVICES_ALLOW_HOSTS` for a private target | The `services` compose profile |
+| Who may create it | A **tenant admin** | A **tenant admin** |
+
+Both are tenant-admin only: an external URL opens a network path from the platform, and pulling an image opens one from the Docker host.
+
+## Calling a service
+
+```bash
+curl -H "Authorization: Bearer $CHELABASE_PUBLIC_KEY" \
+  "http://api.chelabase.localhost:8000/services/v1/echo/a/b?x=1"
+```
+
+`ANY /services/v1/{name}` and `/services/v1/{name}/{rest}` take any method and need a [data key](/using/data-api/keys) (and, for an `app_user` service, a user token). The request is proxied to the service's base URL with the rest and the query: `/a/b?x=1` arrives as `<base path>/a/b?x=1`. The response streams back as it is, a redirect included (Chelabase never follows one).
+
+| Answer | Meaning |
+|---|---|
+| 404 `service_not_found` | No such service, or no deployment on the branch |
+| 503 `service_disabled` | Turned off on the branch |
+| 503 `service_unhealthy` | The last three health checks failed |
+| 503 `service_starting` | A container service's container isn't placed on the branch yet; retry shortly |
+| 400 `invalid_path` | The path holds an encoded `/` or `\` (`%2f`, `%5c`) |
+| 502 `service_unreachable` | The service could not be reached, or its answer was invalid |
+| 502 `service_refused` | The service's address was refused at connect time (a non-public address not on the allow-list) |
+| 504 `service_timeout` | The service's response headers didn't arrive within 30 seconds |
+
+There is no total timeout, so long responses stream through: only 30 seconds for the response's headers and 30 seconds between reads.
+
+Preflights and CORS headers work as for functions: see [CORS](/using/functions/handlers#cors).
+
+## What the service receives
+
+Hop-by-hop headers, `Host`, `Authorization`, and every `chelabase-*` and `x-chelabase-*` header and `Content-Digest` from the client are dropped (a client can't forge identity). The service gets:
+
+| Header | Value |
+|---|---|
+| `chelabase-branch` | The branch id |
+| `chelabase-role` | The caller's role (`anon`, `authenticated`, or the key's role) |
+| `chelabase-user-id` | The app user's subject, else empty |
+| `chelabase-request-id` | A fresh id per request |
+| `Chelabase-Signature` | `t=<unix seconds>,v1=<hex HMAC-SHA256>`: see [Verify the signature](/using/services/verify-signature) |
+| `Content-Digest` | `sha-256=:<base64>:` of the body, for bodies up to 1 MiB |
+| `chelabase-body` | `unsigned`, only for a larger body that streamed through |
+
+**Always verify the signature** unless the service is reachable only through Chelabase: anyone who can reach the service's address can send the same headers.
+
+## Health
+
+Every 15 seconds Chelabase sends a `GET` of the base URL plus the health path to each enabled service. A 2xx within 5 seconds passes. Three failures in a row make it `unhealthy` (calls answer 503 until a check passes again); a service not yet checked is called. The status is in the `health` field of the function in the API.
+
+## Branches and Studio
+
+Services are per branch like functions: a new branch copies its parent's service state, and each branch has its own enabled switch. A service is listed with the functions in Studio's **Functions** tab.
+
+## Platform mode
+
+Services, like functions, are self-hosted only: in platform mode every route answers 403 `not_available_in_platform_mode`.
