@@ -1756,9 +1756,10 @@ impl MetadataClient {
 
     /// Settles the worker's table-trigger installs on `branch` (edge functions m8): each row
     /// still `pending_install` at the `enabled_since` the worker read becomes `installed` (no
-    /// error) or `failed` (its error, cut to [`MAX_LAST_ERROR_CHARS`]). A row pended again
-    /// meanwhile (a new generation), already settled, or of another branch is left alone. The
-    /// number of rows settled.
+    /// error) or `failed` (its error, cut to [`MAX_LAST_ERROR_CHARS`]); an `installed` row
+    /// whose database trigger the worker couldn't put back (drift: its table is gone, or the
+    /// database was refused) becomes `failed`. A row pended again meanwhile (a new generation),
+    /// already failed, or of another branch is left alone. The number of rows settled.
     ///
     /// Lock order (module docs): one statement on trigger rows (4b) alone, taking nothing after.
     pub async fn settle_trigger_installs(
@@ -1781,7 +1782,8 @@ impl MetadataClient {
                  last_error = i.error
              FROM unnest($2::uuid[], $3::timestamptz[], $4::text[]) AS i(id, since, error)
              WHERE t.id = i.id AND t.branch_id = $1 AND t.source = 'table'
-               AND t.state = 'pending_install' AND t.enabled_since = i.since",
+               AND (t.state = 'pending_install' OR (t.state = 'installed' AND i.error IS NOT NULL))
+               AND t.enabled_since = i.since",
         )
         .bind(branch.as_uuid())
         .bind(ids)
@@ -1792,28 +1794,33 @@ impl MetadataClient {
         .rows_affected())
     }
 
-    /// Up to `limit` ready branches (of live databases) with a table trigger
-    /// `pending_install`: the worker's sweep installs them (edge functions m8).
-    pub async fn pending_trigger_branches(
+    /// Up to `limit` ready branches (of live databases) with a table trigger the worker's
+    /// sweep looks at (edge functions m8): `pending_install` (to install) or `installed` (to
+    /// check for drift), each with whether it has a pending one. A `failed` row never comes
+    /// back here until it is pended again (a reset, a restore, or a change to the trigger), so
+    /// a refusal is terminal. The worker orders them by its own last attempt. A read.
+    pub async fn trigger_sweep_branches(
         &self,
         limit: i64,
-    ) -> Result<Vec<BranchId>, MetadataError> {
-        let ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT b.id FROM branches b JOIN databases d ON d.id = b.database_id
+    ) -> Result<Vec<(BranchId, bool)>, MetadataError> {
+        let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+            "SELECT b.id, bool_or(t.state = 'pending_install')
+             FROM branches b JOIN databases d ON d.id = b.database_id
+             JOIN function_triggers t ON t.branch_id = b.id AND t.source = 'table'
              WHERE b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
-               AND EXISTS (SELECT 1 FROM function_triggers t WHERE t.branch_id = b.id
-                           AND t.source = 'table' AND t.state = 'pending_install')
-             ORDER BY b.id LIMIT $1",
+               AND t.state IN ('pending_install', 'installed')
+             GROUP BY b.id ORDER BY b.id LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(ids.into_iter().map(BranchId).collect())
+        Ok(rows.into_iter().map(|(id, pending)| (BranchId(id), pending)).collect())
     }
 
     /// Up to `limit` ready `normal` branches (of live databases) with a function that has a
-    /// `run_as_role` but no key, and no error or a `run_as_key_pending: …` one: the worker's
-    /// sweep mints their run-as keys (edge functions m8). A read; it locks nothing.
+    /// `run_as_role` but no key: the worker's sweep mints their run-as keys (edge functions
+    /// m8). Chosen by state alone, whatever `last_error` says (the functions service overwrites
+    /// it on any invocation error); the worker orders them by its own last attempt. A read.
     pub async fn pending_run_as_branches(
         &self,
         limit: i64,
@@ -1823,8 +1830,7 @@ impl MetadataClient {
              WHERE b.status = 'ready' AND b.kind = 'normal'
                AND d.status NOT IN ('deleting', 'deleted')
                AND EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.branch_id = b.id
-                           AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL
-                           AND (bf.last_error IS NULL OR bf.last_error LIKE 'run\\_as\\_key\\_pending: %'))
+                           AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL)
              ORDER BY b.id LIMIT $1",
         )
         .bind(limit)

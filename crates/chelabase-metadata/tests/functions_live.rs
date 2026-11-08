@@ -1985,7 +1985,7 @@ mod functions {
         let b = c.add_trigger(&table_trigger(main, f, &["delete"])).await.unwrap();
         let read = c.list_triggers(main).await.unwrap();
         let since = |id: Uuid| read.iter().find(|t| t.id == id).unwrap().enabled_since;
-        assert_eq!(c.pending_trigger_branches(10).await.unwrap(), vec![main]);
+        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, true)]);
         let stale = since(a) - chrono::Duration::seconds(1);
         let settled = c
             .settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: stale, error: None }])
@@ -2007,12 +2007,28 @@ mod functions {
         let row = |id: Uuid| after.iter().find(|t| t.id == id).unwrap().clone();
         assert_eq!((row(a).state, row(a).last_error), (TriggerState::Installed, None));
         assert_eq!((row(b).state, row(b).last_error.as_deref()), (TriggerState::Failed, Some("table_missing")));
-        assert!(c.pending_trigger_branches(10).await.unwrap().is_empty());
+        // Round 2: an installed row stays in the sweep (its drift is checked), not pending.
+        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
         let again = c
-            .settle_trigger_installs(main, &[TriggerInstall { id: b, enabled_since: since(b), error: None }])
+            .settle_trigger_installs(
+                main,
+                &[
+                    TriggerInstall { id: b, enabled_since: since(b), error: None },
+                    TriggerInstall { id: a, enabled_since: since(a), error: None },
+                ],
+            )
             .await
             .unwrap();
-        assert_eq!(again, 0, "only pending rows settle");
+        assert_eq!(again, 0, "a failed row is never settled again; an installed one stays installed");
+        // Round 2 (S4): an installed row whose database trigger can't be put back fails.
+        let failed = c
+            .settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: since(a), error: Some("table_missing".into()) }])
+            .await
+            .unwrap();
+        assert_eq!(failed, 1);
+        let row_a = c.list_triggers(main).await.unwrap().into_iter().find(|t| t.id == a).unwrap();
+        assert_eq!((row_a.state, row_a.last_error.as_deref()), (TriggerState::Failed, Some("table_missing")));
+        assert!(c.trigger_sweep_branches(10).await.unwrap().is_empty(), "failed rows leave the sweep");
         let (_, other) = s.database().await;
         assert_eq!(
             c.settle_trigger_installs(other, &[TriggerInstall { id: a, enabled_since: since(a), error: None }])
@@ -2138,4 +2154,23 @@ mod functions {
         s.finish().await;
     }
 
+
+    /// m8 round 2 (S3): a child's run-as key is retried from state alone (a role and no key on
+    /// a live normal branch), whatever its `last_error` says (an invocation error, say).
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_sweep_selects_by_state() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let (f, _) = s.full_function(db, main, "hello").await;
+        let c = &s.client;
+        assert!(c.pending_run_as_branches(10).await.unwrap().is_empty(), "main has its key");
+        let child = s.branch(db, main, "dev").await;
+        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child]);
+        c.set_function_last_error(child, f, Some("TypeError: boom")).await.unwrap();
+        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child], "an invocation error doesn't stop it");
+        c.set_function_last_error(child, f, Some("run_as_role_missing")).await.unwrap();
+        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child], "nor a missing role (it may come back)");
+        s.finish().await;
+    }
 }
