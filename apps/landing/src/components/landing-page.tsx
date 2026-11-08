@@ -400,8 +400,8 @@ const PIECES: Piece[] = [
     id: "functions",
     icon: Zap,
     title: "Edge functions",
-    body: "Your own TypeScript and WASM, run next to your database, deployed per branch and hot-loaded from your machine. Triggered over HTTP, on a schedule, or by row and storage events. Not available yet.",
-    soon: true,
+    body: "Your own Workers-style TypeScript, with WebAssembly, run next to your database per branch and live within seconds of a save. Called over HTTP, on a schedule, or by table and storage events.",
+    to: "using/functions",
   },
 ];
 
