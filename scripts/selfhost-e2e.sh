@@ -44,8 +44,9 @@
 # shared with `just images`). SELFHOST_E2E_IMAGES=local runs the base file on the images
 # `just images` already built (CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG, default chelabase:latest;
 # nothing is pulled for them). For a mixed release set, CHELABASE_IMAGE_TAG_<IMAGE> (e.g.
-# CHELABASE_IMAGE_TAG_STUDIO) tags one image; once any is set, the images with neither it nor
-# CHELABASE_IMAGE_TAG stay at their compose pins (pulled by digest when missing).
+# CHELABASE_IMAGE_TAG_STUDIO, CHELABASE_IMAGE_TAG_FUNCTIONS_RUNTIME) tags one image; once any is
+# set, the images with neither it nor CHELABASE_IMAGE_TAG stay at their compose pins (pulled by
+# digest when missing).
 # The default (build) mode runs storage from the all-in-one server image, like the other apps, so
 # the storage release image's read-only start is checked by scripts/tests/images-smoke.sh.
 #
@@ -281,9 +282,10 @@ if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]] && compgen -v CHELABASE_IMAGE_TAG_ 
   svc=""
   while IFS= read -r line; do
     [[ "$line" =~ ^\ \ ([a-z0-9-]+):$ ]] && svc="${BASH_REMATCH[1]}"
-    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
+    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z-]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
     img="${BASH_REMATCH[2]}"
     var="CHELABASE_IMAGE_TAG_${img^^}"
+    var="${var//-/_}" # functions-runtime → CHELABASE_IMAGE_TAG_FUNCTIONS_RUNTIME
     if [[ -n "${!var:-}${CHELABASE_IMAGE_TAG:-}" ]]; then
       ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:${!var:-$CHELABASE_IMAGE_TAG}"
     elif [[ "${BASH_REMATCH[3]}" == unpublished ]]; then

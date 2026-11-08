@@ -39,7 +39,7 @@
 #      Docker socket holder, each caller's bearer, and no shared network for service containers
 #      (the runner gives each its own at run time, audit B3; the functions service binds none of
 #      them).
-# Every render takes every profile (sites, runner, services, functions), so profiled services
+# Every render takes every profile (sites, runner, services), so profiled services
 # are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -58,10 +58,10 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile functions >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services --profile functions \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -492,13 +492,12 @@ for render in base wb; do
 done
 grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
   err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
-# Profile `functions` in the base file until the images' first pin (scripts/tests/
-# compose-image-pins.sh), always on in the workbench, which builds both images itself.
+# Functions and the runtime run in every install and every workbench stack (no profile).
 for svc in functions functions-runtime; do
-  [[ "$(jq -c --arg s "$svc" '.services[$s].profiles // []' "$tmp/base.json")" == '["functions"]' ]] ||
-    err "base: $svc runs in profile functions only (its image isn't published)"
-  [[ "$(jq -r --arg s "$svc" '.services[$s].profiles // [] | length' "$tmp/wb.json")" == 0 ]] ||
-    err "wb: $svc runs in every workbench stack (no profile)"
+  for render in base wb; do
+    [[ "$(jq -r --arg s "$svc" '.services[$s].profiles // [] | length' "$tmp/$render.json")" == 0 ]] ||
+      err "$render: $svc runs with no profile"
+  done
 done
 
 # 8. The service runner (edge functions m10), in both renders.
@@ -546,8 +545,8 @@ for pair in functions:FUNCTIONS worker:WORKER; do
   [[ "$(jq -r --arg s "$svc" --arg v "$var" '.services[$s].environment[$v] // ""' "$tmp/base.json")" == "/run/chelabase/secrets/tokens/$svc-service-runner.token" ]] ||
     err "$svc reads its service-runner bearer through $var"
 done
-sr="$(jq -c '.services["service-runner"] | {read_only, image}' "$tmp/base.json")"
-[[ "$sr" == '{"read_only":true,"image":"ghcr.io/chelabase/service-runner:unpublished"}' ]] ||
+sr="$(jq -c '.services["service-runner"] | {read_only, image: (.image | sub(":.*"; ""))}' "$tmp/base.json")"
+[[ "$sr" == '{"read_only":true,"image":"ghcr.io/chelabase/service-runner"}' ]] ||
   err "service-runner runs its release image read-only: got $sr"
 [[ "$(jq -r '.services["service-runner"].environment.CHELABASE_SERVICE_RUNNER_URL // ""' "$tmp/base.json")" == http://service-runner-control:8094 ]] ||
   err "CHELABASE_SERVICE_RUNNER_URL is the runner's control alias"
