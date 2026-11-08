@@ -27,7 +27,8 @@
 //!
 //! No writer takes a row of a lower number while holding a higher one: no writer of an
 //! endpoint or key row (5, 6) touches 3 or 4 afterwards, and `set_run_as` takes the endpoint
-//! (5) before it revokes or inserts a key (6). A function delete writes key rows without an
+//! (5) before it revokes or inserts a key (6); the worker's guarded run-as mint
+//! ([`MetadataClient::settle_run_as_mint`]) takes the same rows in the same order. A function delete writes key rows without an
 //! endpoint row: it revokes only its own managed keys (at most one live per branch) and waits
 //! for nothing after them, so a role drop holding the endpoint and one of those rows can't
 //! wait on it in a cycle. `set_function_last_error` updates its state row alone,
@@ -107,6 +108,28 @@ macro_rules! text_enum {
 
 text_enum!(FunctionKind, "function kind", FunctionKind::Function => "function", FunctionKind::Service => "service");
 text_enum!(FunctionAuth, "function auth", FunctionAuth::Key => "key", FunctionAuth::AppUser => "app_user", FunctionAuth::Public => "public");
+/// Why a branch's run-as key will never be minted by the worker (`run_as_unmintable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAsUnmintable {
+    /// No role by that name on the branch.
+    Missing,
+    /// A role by that name with another OID than the approved one, or no approved OID.
+    Changed,
+    /// The role checks refuse the role.
+    Refused,
+}
+
+text_enum!(RunAsUnmintable, "run-as outcome", RunAsUnmintable::Missing => "missing", RunAsUnmintable::Changed => "changed", RunAsUnmintable::Refused => "refused");
+
+/// What the worker's child run-as mint settles ([`MetadataClient::settle_run_as_mint`]).
+#[derive(Debug, Clone, Copy)]
+pub enum RunAsMint<'a> {
+    /// The key, bound to the approved role and OID.
+    Key(&'a RunAs),
+    /// Never: the outcome, and the `last_error` to show.
+    Unmintable(RunAsUnmintable, &'a str),
+}
+
 text_enum!(TriggerSource, "trigger source", TriggerSource::Table => "table", TriggerSource::Storage => "storage");
 text_enum!(TriggerState, "trigger state", TriggerState::PendingInstall => "pending_install", TriggerState::Installed => "installed", TriggerState::Failed => "failed");
 
@@ -157,6 +180,12 @@ pub struct BranchFunction {
     pub auth: FunctionAuth,
     pub run_as_role: Option<String>,
     pub run_as_key_id: Option<Uuid>,
+    /// The role OID a member approved for `run_as_role` (`set_run_as`), copied to a new
+    /// branch: a child's key is minted only for that OID.
+    pub run_as_role_oid: Option<i64>,
+    /// Why the worker will never mint this branch's run-as key, until a member sets run-as
+    /// again ([`MetadataClient::settle_run_as_mint`]).
+    pub run_as_unmintable: Option<RunAsUnmintable>,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
     /// m9: what the last health check of the active deployment saw (`healthy` or
@@ -672,8 +701,9 @@ pub(crate) async fn copy_branch_functions(
 ) -> Result<(), MetadataError> {
     sqlx::query(
         "INSERT INTO branch_functions
-             (branch_id, function_id, deployment_id, enabled, auth, run_as_role, run_as_key_id)
-         SELECT $2, function_id, deployment_id, enabled, auth, run_as_role, NULL
+             (branch_id, function_id, deployment_id, enabled, auth, run_as_role, run_as_key_id,
+              run_as_role_oid)
+         SELECT $2, function_id, deployment_id, enabled, auth, run_as_role, NULL, run_as_role_oid
          FROM branch_functions WHERE branch_id = $1",
     )
     .bind(parent)
@@ -949,16 +979,131 @@ impl MetadataClient {
             .map_err(map_check)?;
         }
         sqlx::query(
-            "UPDATE branch_functions SET run_as_role = $3, run_as_key_id = $4, updated_at = now()
+            "UPDATE branch_functions
+             SET run_as_role = $3, run_as_key_id = $4, run_as_role_oid = $5,
+                 run_as_unmintable = NULL, updated_at = now()
              WHERE branch_id = $1 AND function_id = $2",
         )
         .bind(branch.as_uuid())
         .bind(function_id)
         .bind(run_as.map(|r| r.role.as_str()))
         .bind(run_as.map(|r| r.key_id))
+        .bind(run_as.map(|r| r.role_oid))
         .execute(&mut *tx)
         .await
         .map_err(map_check)?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The worker's child run-as mint (edge functions m8, audit round 3), guarded: writes only
+    /// while the branch's state row still has `run_as_role = expected_role`, `run_as_role_oid`
+    /// equal to `expected_oid` (the approved OID), no key and no terminal outcome. A `Key` must
+    /// be bound to that role and OID ([`MetadataError::InvalidFunction`] otherwise); it is
+    /// stored as `set_run_as` stores one. An `Unmintable` records the outcome and its
+    /// `last_error`. False, with nothing written (the caller drops the key), when the guard
+    /// doesn't match: a member changed or cleared the run-as role meanwhile, or another worker
+    /// settled it first. So the worker never overrides a member's run-as choice.
+    ///
+    /// Lock order (module docs): `set_run_as`'s. The branch-function locks, the state row
+    /// `FOR NO KEY UPDATE`, then (a key only) the branch's endpoint row `FOR SHARE` before any
+    /// key row.
+    pub async fn settle_run_as_mint(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        expected_role: &str,
+        expected_oid: Option<i64>,
+        outcome: RunAsMint<'_>,
+    ) -> Result<bool, MetadataError> {
+        let sealed = match outcome {
+            RunAsMint::Key(r) => {
+                if r.role != expected_role || Some(r.role_oid) != expected_oid {
+                    return Err(invalid("a run-as key is bound to the approved role and OID"));
+                }
+                Some(chelabase_secrets::seal_credential(
+                    self.secrets_key()?,
+                    &r.key_id.to_string(),
+                    chelabase_secrets::Purpose::DataKey,
+                    &r.secret,
+                ))
+            }
+            RunAsMint::Unmintable(..) => None,
+        };
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT f.name FROM branch_functions bf JOIN functions f ON f.id = bf.function_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2 AND bf.run_as_role = $3
+               AND bf.run_as_role_oid IS NOT DISTINCT FROM $4 AND bf.run_as_key_id IS NULL
+               AND bf.run_as_unmintable IS NULL
+             FOR NO KEY UPDATE OF bf",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(expected_role)
+        .bind(expected_oid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(name) = name else {
+            return Ok(false);
+        };
+        match outcome {
+            RunAsMint::Key(r) => {
+                lock_endpoint_share(&mut tx, branch).await?;
+                sqlx::query(
+                    "UPDATE data_api_keys SET revoked_at = now(), sealed = NULL
+                     WHERE branch_id = $1 AND managed_by_function_id = $2 AND revoked_at IS NULL",
+                )
+                .bind(branch.as_uuid())
+                .bind(function_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO data_api_keys
+                         (id, branch_id, kind, role, name, prefix, sha256, sealed, role_oid,
+                          role_timeline, role_bypass_rls, managed_by_function_id)
+                     VALUES ($1, $2, 'secret', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                )
+                .bind(r.key_id)
+                .bind(branch.as_uuid())
+                .bind(&r.role)
+                .bind(&name)
+                .bind(&r.prefix)
+                .bind(r.sha256.as_slice())
+                .bind(&sealed)
+                .bind(r.role_oid)
+                .bind(&r.role_timeline)
+                .bind(r.role_bypass_rls)
+                .bind(function_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_check)?;
+                sqlx::query(
+                    "UPDATE branch_functions SET run_as_key_id = $3, updated_at = now()
+                     WHERE branch_id = $1 AND function_id = $2",
+                )
+                .bind(branch.as_uuid())
+                .bind(function_id)
+                .bind(r.key_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            RunAsMint::Unmintable(why, error) => {
+                let error: String = error.chars().take(MAX_LAST_ERROR_CHARS).collect();
+                sqlx::query(
+                    "UPDATE branch_functions
+                     SET run_as_unmintable = $3, last_error = $4, updated_at = now()
+                     WHERE branch_id = $1 AND function_id = $2",
+                )
+                .bind(branch.as_uuid())
+                .bind(function_id)
+                .bind(why.as_str())
+                .bind(error)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         tx.commit().await?;
         Ok(true)
     }
@@ -1234,8 +1379,8 @@ impl MetadataClient {
     ) -> Result<Vec<BranchFunction>, MetadataError> {
         sqlx::query(
             "SELECT bf.function_id, f.name, f.kind, bf.deployment_id, bf.enabled, bf.auth,
-                    bf.run_as_role, bf.run_as_key_id, bf.last_error, bf.updated_at,
-                    h.status AS health
+                    bf.run_as_role, bf.run_as_key_id, bf.run_as_role_oid, bf.run_as_unmintable,
+                    bf.last_error, bf.updated_at, h.status AS health
              FROM branch_functions bf JOIN functions f ON f.id = bf.function_id
              LEFT JOIN service_health h ON h.deployment_id = bf.deployment_id
              WHERE bf.branch_id = $1 ORDER BY f.name",
@@ -1254,6 +1399,11 @@ impl MetadataClient {
                 auth: FunctionAuth::parse(r.get("auth"))?,
                 run_as_role: r.get("run_as_role"),
                 run_as_key_id: r.get("run_as_key_id"),
+                run_as_role_oid: r.get("run_as_role_oid"),
+                run_as_unmintable: r
+                    .get::<Option<&str>, _>("run_as_unmintable")
+                    .map(RunAsUnmintable::parse)
+                    .transpose()?,
                 last_error: r.get("last_error"),
                 updated_at: r.get("updated_at"),
                 health: r.get("health"),
@@ -1818,8 +1968,8 @@ impl MetadataClient {
     }
 
     /// Up to `limit` ready `normal` branches (of live databases) with a function that has a
-    /// `run_as_role` but no key: the worker's sweep mints their run-as keys (edge functions
-    /// m8). Chosen by state alone, whatever `last_error` says (the functions service overwrites
+    /// `run_as_role`, no key and no terminal outcome (`run_as_unmintable`): the worker's sweep
+    /// mints their run-as keys (edge functions m8). Chosen by state alone, whatever `last_error` says (the functions service overwrites
     /// it on any invocation error); the worker orders them by its own last attempt. A read.
     pub async fn pending_run_as_branches(
         &self,
@@ -1830,7 +1980,8 @@ impl MetadataClient {
              WHERE b.status = 'ready' AND b.kind = 'normal'
                AND d.status NOT IN ('deleting', 'deleted')
                AND EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.branch_id = b.id
-                           AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL)
+                           AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL
+                           AND bf.run_as_unmintable IS NULL)
              ORDER BY b.id LIMIT $1",
         )
         .bind(limit)

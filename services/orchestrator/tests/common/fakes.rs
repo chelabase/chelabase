@@ -5428,6 +5428,8 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
                     auth: chelabase_metadata::FunctionAuth::Key,
                     run_as_role: None,
                     run_as_key_id: None,
+                    run_as_role_oid: None,
+                    run_as_unmintable: None,
                     last_error: None,
                     updated_at: chrono::Utc::now(),
                     health: None,
