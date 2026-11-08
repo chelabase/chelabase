@@ -1,4 +1,5 @@
-import { ApiError, type FunctionAuth } from "@chelabase/management-client";
+import { useEffect, useReducer } from "react";
+import { ApiError, type FunctionAuth, type FunctionKind } from "@chelabase/management-client";
 import { errorText } from "./errors";
 import { actAsReserved } from "./role-rules";
 
@@ -65,16 +66,23 @@ export function secretNameReason(raw: string): string | null {
   return /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(raw) ? null : "Start with a letter or _, then up to 127 letters, digits or _.";
 }
 
-/** The URL a client calls: a public function names its branch; any other is routed by the caller's key. */
-export function invokeUrl(apiUrl: string, auth: FunctionAuth | null, branchId: string, name: string): string {
+/**
+ * The URL a client calls. A service is at `/services/v1/{name}` with a data key; a public
+ * function names its branch; any other function is routed by the caller's key.
+ */
+export function invokeUrl(apiUrl: string, auth: FunctionAuth | null, branchId: string, name: string, kind: FunctionKind = "function"): string {
   const base = apiUrl.replace(/\/+$/, "");
   const fn = encodeURIComponent(name);
+  if (kind === "service") return `${base}/services/v1/${fn}`;
   return auth === "public" ? `${base}/functions/v1/public/${branchId}/${fn}` : `${base}/functions/v1/${fn}`;
 }
 
-export function curlFor(apiUrl: string, auth: FunctionAuth | null, branchId: string, name: string): string {
-  const url = invokeUrl(apiUrl, auth, branchId, name);
-  return auth === "public" ? `curl -X POST ${url}` : `curl -X POST ${url} \\\n  -H "Authorization: Bearer $CHELABASE_DATA_KEY"`;
+const KEY_HEADER = '-H "Authorization: Bearer $CHELABASE_DATA_KEY"';
+
+export function curlFor(apiUrl: string, auth: FunctionAuth | null, branchId: string, name: string, kind: FunctionKind = "function"): string {
+  const url = invokeUrl(apiUrl, auth, branchId, name, kind);
+  if (kind === "service") return `curl ${url} \\\n  ${KEY_HEADER}`;
+  return auth === "public" ? `curl -X POST ${url}` : `curl -X POST ${url} \\\n  ${KEY_HEADER}`;
 }
 
 export function isPlatformModeRefusal(err: unknown): boolean {
@@ -89,4 +97,29 @@ export function functionErrorText(err: unknown): string {
     if (reason === "managed_key") return "That key is a function's run-as key: change it through the function's run-as role.";
   }
   return errorText(err);
+}
+
+/**
+ * Optimistic switches for one scope (a function's schedules, say): `flip` shows the new value at
+ * once, sends it, refreshes, and reverts with the reason on a refusal. A new scope starts empty.
+ */
+export function useToggles(scope: string) {
+  const [state, dispatch] = useReducer(togglesReducer, scope, initialToggles);
+  useEffect(() => dispatch({ type: "scope", scope }), [scope]);
+  async function flip(id: string, enabled: boolean, send: () => Promise<unknown>, refresh: () => Promise<unknown>) {
+    dispatch({ type: "flip", scope, name: id, enabled });
+    try {
+      await send();
+      await refresh();
+      dispatch({ type: "settled", scope, name: id });
+    } catch (err) {
+      dispatch({ type: "failed", scope, name: id, error: functionErrorText(err) });
+    }
+  }
+  return {
+    enabled: (id: string, server: boolean) => effectiveEnabled(state, id, server),
+    pending: (id: string) => id in state.overrides,
+    error: (id: string) => state.errors[id],
+    flip,
+  };
 }

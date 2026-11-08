@@ -49,7 +49,7 @@ export function RunAsForm({ fn, canChange, onSave }: RunAsFormProps) {
   return (
     <div className="space-y-3 text-sm">
       {fn.run_as_role === null ? (
-        <p className="text-chalk-dim">None. The function gets no service key and acts only as its caller.</p>
+        <p className="text-chalk-dim">None: no service key is given, so it acts only as its caller.</p>
       ) : (
         <p className="flex flex-wrap items-center gap-2">
           <span className="font-mono">{fn.run_as_role}</span>

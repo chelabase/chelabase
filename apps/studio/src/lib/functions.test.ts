@@ -109,6 +109,13 @@ describe("invoke URLs", () => {
     expect(invokeUrl("http://api.test", null, B1, "a b")).toBe("http://api.test/functions/v1/a%20b");
   });
 
+  it("a_service_is_called_under_services_v1", () => {
+    expect(invokeUrl("http://api.test/", "key", B1, "echo", "service")).toBe("http://api.test/services/v1/echo");
+    expect(curlFor("http://api.test", "key", B1, "echo", "service")).toBe(
+      'curl http://api.test/services/v1/echo \\\n  -H "Authorization: Bearer $CHELABASE_DATA_KEY"',
+    );
+  });
+
   it("curl_sends_the_key_only_when_one_is_needed", () => {
     expect(curlFor("http://api.test", "public", B1, "hello")).toBe(`curl -X POST http://api.test/functions/v1/public/${B1}/hello`);
     expect(curlFor("http://api.test", "key", B1, "hello")).toBe(

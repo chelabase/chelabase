@@ -5,10 +5,14 @@ import { useListFunctionDeployments, type Function as FunctionInfo } from "@chel
 import { CopyButton } from "@/components/copy-button";
 import { Button } from "@/components/ui/button";
 import { curlFor, functionErrorText, invokeUrl } from "@/lib/functions";
+import { deploymentTarget, serviceSpecOf } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
 import { RunAsForm } from "./run-as-form";
+import { SchedulesSection } from "./schedules-section";
 import { FunctionSecrets } from "./secrets-form";
+import { ServiceLogs } from "./service-logs";
+import { TriggersSection } from "./triggers-section";
 
 export interface FunctionDrawerProps {
   fn: FunctionInfo;
@@ -41,8 +45,11 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
   const deployments = useListFunctionDeployments(databaseId, branchId, fn.name);
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const url = invokeUrl(apiUrl, fn.auth, branchId, fn.name);
-  const curl = curlFor(apiUrl, fn.auth, branchId, fn.name);
+  const url = invokeUrl(apiUrl, fn.auth, branchId, fn.name, fn.kind);
+  const curl = curlFor(apiUrl, fn.auth, branchId, fn.name, fn.kind);
+  const service = fn.kind === "service";
+  const current = deployments.data?.find((d) => d.id === fn.deployment_id);
+  const backend = current ? serviceSpecOf(current.spec)?.backend : undefined;
   const reason = canChange ? null : VIEWER_REASON;
 
   async function makeActive(id: string) {
@@ -83,7 +90,9 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
           )}
 
           <Section title="Invoke">
-            <p className="text-xs text-chalk-dim">{fn.auth ? AUTH_TEXT[fn.auth] : "Auth isn't set: calls are refused until it is."}</p>
+            <p className="text-xs text-chalk-dim">
+              {service ? "Any data key; the rest of the path and the query go to the service." : fn.auth ? AUTH_TEXT[fn.auth] : "Auth isn't set: calls are refused until it is."}
+            </p>
             <div className="flex items-center gap-2">
               <code className="min-w-0 flex-1 bg-ink px-2 py-1 font-mono text-xs break-all">{url}</code>
               <CopyButton value={url} label="Copy invoke URL" />
@@ -93,6 +102,12 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
               <CopyButton value={curl} label="Copy curl command" />
             </div>
           </Section>
+
+          {service && backend === "container" && (
+            <Section title="Logs">
+              <ServiceLogs databaseId={databaseId} branchId={branchId} name={fn.name} />
+            </Section>
+          )}
 
           <Section title="Run as">
             <RunAsForm key={fn.run_as_role ?? ""} fn={fn} canChange={canChange} onSave={(role) => update({ run_as_role: role })} />
@@ -124,6 +139,11 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
                             {relativeTime(d.created_at)}
                           </time>
                         </p>
+                        {deploymentTarget(d) && (
+                          <p title={deploymentTarget(d) ?? undefined} className="truncate font-mono text-xs text-chalk-dim">
+                            {deploymentTarget(d)}
+                          </p>
+                        )}
                       </div>
                       {!active && (
                         <ReadOnlyHint reason={reason}>
@@ -142,6 +162,14 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
                 {error}
               </p>
             )}
+          </Section>
+
+          <Section title="Schedules">
+            <SchedulesSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
+          </Section>
+
+          <Section title="Triggers">
+            <TriggersSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
           </Section>
 
           <Section title="Secrets">
