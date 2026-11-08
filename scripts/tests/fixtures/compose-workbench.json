@@ -506,6 +506,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
+        "compute": {},
         "default": {
           "aliases": [
             "functions-public"
@@ -532,6 +533,10 @@
         {
           "source": "internal-verify",
           "target": "/m/.chelabase/gateway/internal-verify.pem"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/m/.chelabase/compute-ca/ca.crt"
         },
         {
           "source": "nats-functions",
