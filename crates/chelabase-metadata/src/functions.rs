@@ -19,12 +19,12 @@
 //! | 1 | `databases` | `FOR SHARE` (all) | `create_branch` `FOR NO KEY UPDATE`; database tombstone `UPDATE` |
 //! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
-//! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes) | branch create copies (insert), tombstone purge (delete) |
+//! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes; a rollover's guarded switch) | branch create copies (insert), tombstone purge (delete) |
 //! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
 //! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
-//! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync |
+//! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync; tombstone purge (revokes the branches' managed keys, after 4) |
 //!
 //! No writer takes a row of a lower number while holding a higher one: no writer of an
 //! endpoint or key row (5, 6) touches 3 or 4 afterwards, and `set_run_as` takes the endpoint
@@ -32,7 +32,10 @@
 //! ([`MetadataClient::settle_run_as_mint`]) takes the same rows in the same order. A function delete writes key rows without an
 //! endpoint row: it revokes only its own managed keys (at most one live per branch) and waits
 //! for nothing after them, so a role drop holding the endpoint and one of those rows can't
-//! wait on it in a cycle. `set_function_last_error` updates its state row alone,
+//! wait on it in a cycle; a tombstone's purge revokes the branches' managed keys the same way,
+//! after their state rows. `put_secret` takes a transaction advisory lock on its branch and
+//! function after the per-branch locks (so two writes can't pass the secrets' total cap
+//! together) and only secret rows after it. `set_function_last_error` updates its state row alone,
 //! `set_service_signing_secret` (m9) its function row (3) alone, and `set_service_health` (m9)
 //! takes a `service_health` row (beside 3, written by nobody else) and, inserting it, its
 //! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
@@ -65,6 +68,10 @@ use crate::{MetadataClient, MetadataError};
 pub const MAX_BUNDLE_SIZE: i64 = 10 * 1024 * 1024;
 /// A secret value may be at most 64 KiB.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
+/// A function's secrets on one branch together may be at most 128 KiB, measured as the JSON
+/// object they travel in ([`secrets_env_bytes`]): the functions service sends that object,
+/// base64-encoded (4/3 of it), in one header, and the runtime caps a function's env at 256 KiB.
+pub const MAX_SECRETS_ENV_BYTES: usize = 128 * 1024;
 /// A function's recorded last error is cut to this many characters.
 pub const MAX_LAST_ERROR_CHARS: usize = 1024;
 
@@ -499,6 +506,17 @@ fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The size of `secrets` as the JSON object of the env they travel in (`{"NAME":"value",…}`,
+/// escapes included), which [`MAX_SECRETS_ENV_BYTES`] caps.
+pub fn secrets_env_bytes<'a>(secrets: impl IntoIterator<Item = (&'a str, &'a str)>) -> usize {
+    let json_len = |s: &str| serde_json::to_string(s).map_or(usize::MAX / 4, |j| j.len());
+    let mut total = 2;
+    for (i, (name, value)) in secrets.into_iter().enumerate() {
+        total += json_len(name) + 1 + json_len(value) + usize::from(i > 0);
+    }
+    total
+}
+
 /// A secret's AAD: it opens only for that branch, function and name.
 fn secret_aad(branch: Uuid, function: Uuid, name: &str) -> String {
     format!("fn-secret:{branch}:{function}:{name}")
@@ -525,12 +543,13 @@ fn map_check(err: sqlx::Error) -> MetadataError {
 
 /// Takes the locks every per-branch write needs (see the module docs) and checks that the
 /// branch and its database are live and that `function` belongs to that database. Anything
-/// missing, tombstoned or foreign is [`MetadataError::FunctionNotFound`].
+/// missing, tombstoned or foreign is [`MetadataError::FunctionNotFound`]. The function's kind,
+/// read under its `FOR KEY SHARE` lock: a kind change (`FOR UPDATE`) waits for this write.
 async fn lock_branch_function(
     tx: &mut Transaction<'static, Postgres>,
     branch: BranchId,
     function: Uuid,
-) -> Result<(), MetadataError> {
+) -> Result<FunctionKind, MetadataError> {
     let database: Option<Uuid> =
         sqlx::query_scalar("SELECT database_id FROM branches WHERE id = $1")
             .bind(branch.as_uuid())
@@ -557,10 +576,10 @@ async fn lock_branch_function(
         }
         None => None,
     };
-    let ours: Option<i32> = match branch_live {
+    let kind: Option<String> = match branch_live {
         Some(_) => {
             sqlx::query_scalar(
-                "SELECT 1 FROM functions WHERE id = $1 AND database_id = $2 FOR KEY SHARE",
+                "SELECT kind FROM functions WHERE id = $1 AND database_id = $2 FOR KEY SHARE",
             )
             .bind(function)
             .bind(database)
@@ -569,8 +588,13 @@ async fn lock_branch_function(
         }
         None => None,
     };
-    ours.map(|_| ()).ok_or(MetadataError::FunctionNotFound)
+    FunctionKind::parse(&kind.ok_or(MetadataError::FunctionNotFound)?)
 }
+
+/// Why a service never gets a schedule or a trigger: the functions service only ever invokes
+/// a function's bundle on one (a service has none), so it would never run.
+const SERVICE_NO_EVENTS: &str =
+    "a service never runs on a schedule or a trigger (only a function does): deploy a function that calls it";
 
 /// Takes the branch's endpoint row `FOR SHARE` (waiting at most 5 s), after the branch row:
 /// the order `create_secret_key` and the DDL receiver use.
@@ -850,7 +874,10 @@ pub(crate) async fn copy_branch_functions(
 }
 
 /// Deletes the branches' function state (secrets, schedules, triggers, active deployments),
-/// in a tombstone's transaction.
+/// in a tombstone's transaction, and revokes the run-as keys functions manage on them,
+/// dropping their sealed values (6, after the state rows 4: a function delete's order). A
+/// tombstoned branch never serves a function again, and a sealed value left behind would
+/// hold a new secrets key off ([`crate::SECRETS_KEY_SEALED`]) for ever.
 pub(crate) async fn purge_branch_functions(
     tx: &mut PgConnection,
     branches: &[Uuid],
@@ -869,6 +896,14 @@ pub(crate) async fn purge_branch_functions(
         .execute(&mut *tx)
         .await?;
     }
+    sqlx::query(
+        "UPDATE data_api_keys SET revoked_at = coalesce(revoked_at, now()), sealed = NULL
+         WHERE branch_id = ANY($1) AND managed_by_function_id IS NOT NULL
+           AND (revoked_at IS NULL OR sealed IS NOT NULL)",
+    )
+    .bind(branches)
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -942,6 +977,11 @@ impl MetadataClient {
 
     /// Deletes a function with its deployments and every branch's state for it, and revokes
     /// the data keys it manages. False for an unknown function or one of another database.
+    ///
+    /// A test helper: it doesn't check protected branches. Every product path (the management
+    /// API) uses [`Self::delete_function_unprotected`], which refuses while a protected branch
+    /// has the function active. Kept public because other crates' live tests call it.
+    #[doc(hidden)]
     pub async fn delete_function(
         &self,
         database_id: DatabaseId,
@@ -1290,6 +1330,22 @@ impl MetadataClient {
                 "a function with deployments keeps its kind (delete it and create it again)",
             ));
         }
+        // Schedule and trigger rows are written under the function row `FOR KEY SHARE`, which
+        // this transaction's `FOR UPDATE` excludes: none appears after this count.
+        if kind == FunctionKind::Service {
+            let events: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM function_schedules WHERE function_id = $1)
+                     OR EXISTS (SELECT 1 FROM function_triggers WHERE function_id = $1)",
+            )
+            .bind(function_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if events {
+                return Err(invalid(format!(
+                    "{SERVICE_NO_EVENTS}; delete its schedules and triggers first"
+                )));
+            }
+        }
         sqlx::query("UPDATE functions SET kind = $2 WHERE id = $1")
             .bind(function_id)
             .bind(kind.as_str())
@@ -1426,6 +1482,7 @@ impl MetadataClient {
              VALUES ($1, $2, $3)
              ON CONFLICT (branch_id, function_id)
              DO UPDATE SET deployment_id = EXCLUDED.deployment_id, last_error = NULL,
+                           deployment_generation = branch_functions.deployment_generation + 1,
                            updated_at = now()",
         )
         .bind(branch.as_uuid())
@@ -1435,6 +1492,65 @@ impl MetadataClient {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The function's active deployment on the branch and its `deployment_generation`, which
+    /// every [`Self::set_active_deployment`] (and switch) moves on; `None` when it has no
+    /// deployment there. A container rollover reads it when it starts
+    /// ([`Self::switch_active_deployment`]).
+    pub async fn active_deployment_generation(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+    ) -> Result<Option<(Uuid, i64)>, MetadataError> {
+        Ok(sqlx::query_as(
+            "SELECT deployment_id, deployment_generation FROM branch_functions
+             WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// A rollover's switch: makes `deployment_id` the function's active deployment on the
+    /// branch only while its `deployment_generation` is still `generation` (what
+    /// [`Self::active_deployment_generation`] read when the rollover started). False, nothing
+    /// written, when anything set the active deployment meanwhile (a newer rollover, a PATCH, a
+    /// rollback, even to the deployment already active) or the function has no state there.
+    /// Lock order: the per-branch locks (1, 2, 3), then the state row (4).
+    pub async fn switch_active_deployment(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        generation: i64,
+        deployment_id: Uuid,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT function_id FROM function_deployments WHERE id = $1")
+                .bind(deployment_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owner != Some(function_id) {
+            return Err(invalid("the deployment belongs to another function"));
+        }
+        let switched = sqlx::query(
+            "UPDATE branch_functions
+             SET deployment_id = $3, last_error = NULL,
+                 deployment_generation = deployment_generation + 1, updated_at = now()
+             WHERE branch_id = $1 AND function_id = $2 AND deployment_generation = $4",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(deployment_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(switched == 1)
     }
 
     /// Turns the function on or off on the branch. False when it has no deployment there.
@@ -1674,6 +1790,41 @@ impl MetadataClient {
         );
         let mut tx = self.pool.begin().await?;
         lock_branch_function(&mut tx, branch, function_id).await?;
+        // One secret write at a time per branch and function, so two can't each fit the cap
+        // alone and pass it together. Taken last, and only the secret rows follow it.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("fn-secrets:{branch}:{function_id}"))
+            .execute(&mut *tx)
+            .await?;
+        let others: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, ciphertext FROM branch_function_secrets
+             WHERE branch_id = $1 AND function_id = $2 AND name <> $3",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(name)
+        .fetch_all(&mut *tx)
+        .await?;
+        let key = self.secrets_key()?;
+        let mut opened = Vec::with_capacity(others.len());
+        for (other, ciphertext) in others {
+            let aad = secret_aad(branch.as_uuid(), function_id, &other);
+            let value = chelabase_secrets::open(key, &aad, &ciphertext)
+                .map_err(|e| MetadataError::Secret(format!("function secret {other}: {e}")))?;
+            opened.push((other, value));
+        }
+        let total = secrets_env_bytes(
+            opened
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .chain([(name, value)]),
+        );
+        if total > MAX_SECRETS_ENV_BYTES {
+            return Err(invalid(format!(
+                "a function's secrets on a branch are at most {MAX_SECRETS_ENV_BYTES} bytes together \
+                 (as the JSON env they travel in); these would be {total}"
+            )));
+        }
         sqlx::query(
             "INSERT INTO branch_function_secrets (branch_id, function_id, name, ciphertext)
              VALUES ($1, $2, $3, $4)
@@ -1764,7 +1915,9 @@ impl MetadataClient {
             ));
         }
         let mut tx = self.pool.begin().await?;
-        lock_branch_function(&mut tx, s.branch_id, s.function_id).await?;
+        if lock_branch_function(&mut tx, s.branch_id, s.function_id).await? != FunctionKind::Function {
+            return Err(invalid(SERVICE_NO_EVENTS));
+        }
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
@@ -1969,7 +2122,9 @@ impl MetadataClient {
             return Err(invalid("a trigger names each event once"));
         }
         let mut tx = self.pool.begin().await?;
-        lock_branch_function(&mut tx, t.branch_id, t.function_id).await?;
+        if lock_branch_function(&mut tx, t.branch_id, t.function_id).await? != FunctionKind::Function {
+            return Err(invalid(SERVICE_NO_EVENTS));
+        }
         let id = Uuid::new_v4();
         let state = match t.source {
             TriggerSource::Table => TriggerState::PendingInstall,
@@ -2340,5 +2495,29 @@ impl MetadataClient {
         .bind(database_id.as_uuid())
         .fetch_one(&self.pool)
         .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Review fix: the secrets' total is their size as the env's JSON object, escapes included.
+    #[test]
+    fn secrets_env_bytes_is_the_json_size() {
+        let env = |pairs: &[(&str, &str)]| {
+            let map: serde_json::Map<String, serde_json::Value> =
+                pairs.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect();
+            serde_json::to_string(&map).unwrap().len()
+        };
+        for pairs in [
+            &[][..],
+            &[("A", "one")][..],
+            &[("A", "one"), ("TOKEN", "two \"quoted\" \\ and\nnewline")][..],
+            &[("CTRL", "\u{1}\u{2}"), ("UTF", "é漢")][..],
+        ] {
+            assert_eq!(secrets_env_bytes(pairs.iter().copied()), env(pairs), "{pairs:?}");
+        }
+        assert_eq!(secrets_env_bytes([("C", "\u{1}")]), r#"{"C":"\u0001"}"#.len());
     }
 }

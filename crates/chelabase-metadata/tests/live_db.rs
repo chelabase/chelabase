@@ -625,6 +625,16 @@ impl SealedFixture {
                 .await
                 .unwrap();
             }
+            ("functions", "signing_secret") => {
+                sqlx::query(
+                    "INSERT INTO functions (id, database_id, name, kind, signing_secret)
+                     VALUES (gen_random_uuid(), $1, 'key-check', 'service', 'v1:x')",
+                )
+                .bind(database.as_uuid())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             other => panic!("no fixture for sealed column {other:?}: add one here"),
         }
         fixture
@@ -794,9 +804,20 @@ async fn key_check_waits_for_an_inflight_sealed_write() {
 }
 
 /// Metadata columns named like sealed ones that don't hold a secrets-key value, each with why.
-const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[];
+const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[
+    ("branches", "storage_password_salt", "the storage login's SCRAM salt, not secret"),
+    ("branches", "functions_password_salt", "the dispatch login's SCRAM salt, not secret"),
+    ("control_settings", "key", "a setting's name"),
+    ("invites", "token_hash", "a SHA-256 of the invite token, never opened"),
+    ("neon_endpoints", "compute_token_sha256", "a SHA-256 of the compute token, never opened"),
+    // TODO(#178): sealed with the secrets key (`Purpose::Webhook`) but not yet in
+    // SECRETS_KEY_SEALED; #178 adds it (and its fixture) and removes this entry.
+    ("storage_webhooks", "secret_enc", "TODO(#178)"),
+];
 
-// #38: a new sealed column must join the key check (or be excluded here, with a reason).
+// #38: a new sealed column must join the key check (or be excluded here, with a reason). Edge
+// functions review: discovered from the schema by any secret-looking name, not only `_enc` and
+// `sealed` (`functions.signing_secret` slipped through those), among text and bytea columns.
 #[tokio::test]
 #[ignore]
 async fn every_sealed_column_is_checked() {
@@ -804,7 +825,8 @@ async fn every_sealed_column_is_checked() {
     let columns: Vec<(String, String)> = sqlx::query_as(
         r"SELECT table_name::text, column_name::text FROM information_schema.columns
           WHERE table_schema = current_schema()
-            AND (column_name LIKE '%\_enc' OR column_name LIKE '%sealed%')
+            AND data_type IN ('text', 'bytea', 'character varying', 'jsonb')
+            AND column_name ~ '(secret|_enc$|sealed|cipher|password|token|^key$|_key$)'
           ORDER BY 1, 2",
     )
     .fetch_all(client.pool())
@@ -823,6 +845,13 @@ async fn every_sealed_column_is_checked() {
         missing.is_empty(),
         "sealed-looking columns neither in SECRETS_KEY_SEALED nor excluded: {missing:?}"
     );
+    // The exclusions name only columns that exist (a stale one would hide a new column).
+    for (table, column, _) in NOT_SECRETS_KEY_SEALED {
+        assert!(
+            columns.iter().any(|(t, c)| (t.as_str(), c.as_str()) == (*table, *column)),
+            "NOT_SECRETS_KEY_SEALED names {table}.{column}, which doesn't exist or no longer matches"
+        );
+    }
     // The list names only columns that exist.
     for (table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         assert!(

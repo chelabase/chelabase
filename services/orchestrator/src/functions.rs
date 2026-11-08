@@ -75,6 +75,20 @@ pub trait FunctionsPort: Send + Sync {
         function: Uuid,
         deployment: Uuid,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// The active deployment on the branch and its generation (a rollover's start).
+    fn active_deployment_generation(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> impl Future<Output = Result<Option<(Uuid, i64)>, MetadataError>> + Send;
+    /// A rollover's switch, only while the generation is still `generation`.
+    fn switch_active_deployment(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        generation: i64,
+        deployment: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn set_enabled(
         &self,
         branch: BranchId,
@@ -181,6 +195,23 @@ impl FunctionsPort for MetadataClient {
         deployment: Uuid,
     ) -> Result<(), MetadataError> {
         MetadataClient::set_active_deployment(self, branch, function, deployment).await
+    }
+    async fn active_deployment_generation(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+    ) -> Result<Option<(Uuid, i64)>, MetadataError> {
+        MetadataClient::active_deployment_generation(self, branch, function).await
+    }
+    async fn switch_active_deployment(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        generation: i64,
+        deployment: Uuid,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::switch_active_deployment(self, branch, function, generation, deployment)
+            .await
     }
     async fn set_enabled(
         &self,
@@ -1107,10 +1138,11 @@ where
         (status = 201, description = "The function, created", body = Function),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden` (`required` names what's missing): Developer on the branch (Admin when it's protected), Admin to change the kind, a tenant admin to make a service or turn a function into one; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: `reason` `function_active_on_protected_branch` (a kind change), `not_deployed` (auth for a function with no deployment on the branch), or a concurrent create took the name", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: a bad or reserved name, or a kind change for a function with deployments", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: a bad or reserved name, a kind change for a function with deployments, or to a service for a function with schedules or triggers", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -1332,7 +1364,9 @@ where
 
 /// m11: container rollovers, run in the background: the health wait (up to 60 s, after a pull)
 /// outlasts what a request through the gateway may take. One per (branch, service); a newer one
-/// replaces it, and an older one that ends later changes nothing. Kept in this process: a
+/// replaces it, and an older one that ends later changes nothing. The switch is a
+/// compare-and-set on the branch state's `deployment_generation` read when the rollover began,
+/// so nothing that set the active deployment meanwhile (a PATCH, a rollback) is overwritten. Kept in this process: a
 /// rollover cut short by a restart leaves the old deployment active (the runner removes the new
 /// container after its grace) and is forgotten.
 #[derive(Default)]
@@ -1419,6 +1453,16 @@ where
     if spec.get("backend").and_then(|b| b.as_str()) != Some("container") {
         return Ok(false);
     }
+    // Read first: anything that sets the active deployment after this moves the generation on,
+    // and the switch below then changes nothing.
+    let Some((_, generation)) = state
+        .metadata
+        .active_deployment_generation(branch, function)
+        .await
+        .map_err(|e| metadata_error("read the active deployment", e))?
+    else {
+        return Ok(false);
+    };
     let serving = state
         .metadata
         .list_for_branch(branch)
@@ -1447,13 +1491,26 @@ where
             if !state.rollouts.get(branch, function).is_some_and(|r| r.deployment_id == deployment && r.state == RolloutState::Pending) {
                 return;
             }
-            if let Err(e) = state.metadata.set_active_deployment(branch, function, deployment).await {
-                warn!(branch_id = %branch, %function, %deployment, "switch to a rolled-over deployment: {e}");
-                state.rollouts.finish(branch, function, deployment, Some("the switch to the new deployment failed; retry".into()));
-                return;
+            // A compare-and-set on the generation read at the start: a newer rollover, a PATCH
+            // or a rollback made meanwhile (in this process or another) is never overwritten.
+            match state.metadata.switch_active_deployment(branch, function, generation, deployment).await {
+                Ok(true) => {
+                    state.rollouts.finish(branch, function, deployment, None);
+                    info!(branch_id = %branch, function = %name, %deployment, "rolled over");
+                }
+                Ok(false) => {
+                    let why = "the active deployment changed while the new container was checked, so it wasn't switched to";
+                    if !state.rollouts.finish(branch, function, deployment, Some(why.into())) {
+                        return;
+                    }
+                    info!(branch_id = %branch, function = %name, %deployment, "rollover superseded");
+                }
+                Err(e) => {
+                    warn!(branch_id = %branch, %function, %deployment, "switch to a rolled-over deployment: {e}");
+                    state.rollouts.finish(branch, function, deployment, Some("the switch to the new deployment failed; retry".into()));
+                    return;
+                }
             }
-            state.rollouts.finish(branch, function, deployment, None);
-            info!(branch_id = %branch, function = %name, %deployment, "rolled over");
         } else if let Some(why) = &error {
             if !state.rollouts.finish(branch, function, deployment, Some(why.clone())) {
                 return;
@@ -1964,7 +2021,7 @@ where
     operation_id = "putFunctionSecret",
     tag = "functions",
     summary = "Set a function's secret on the branch",
-    description = "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB. The value is never returned, logged or echoed in an error.",
+    description = "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -1978,7 +2035,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: a bad name, or a value over 64 KiB", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: a bad name, a value over 64 KiB, or the function's secrets on the branch over 128 KiB together (as the JSON env they travel in)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]

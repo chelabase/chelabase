@@ -337,7 +337,7 @@ where
         (status = 403, description = "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`) or on a service", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`), or any trigger on a service", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -358,9 +358,10 @@ where
             let request: CreateRequest = parse_body(&body)?;
             check(&request)?;
             let function = find(&state, &record, &name).await?;
-            // m13b (S4): a service never gets database events.
-            if request.source == SourceView::Table && function.kind != FunctionKind::Function {
-                return Err(unprocessable("a table trigger needs a function; a service never gets database events"));
+            // m13b (S4), review fix: a service is never invoked by a trigger (only a function's
+            // bundle is), so neither a table nor a storage trigger is added for one.
+            if function.kind != FunctionKind::Function {
+                return Err(unprocessable("a trigger needs a function: a service is never invoked by a trigger (deploy a function that calls it)"));
             }
             let events: Vec<&str> = request.events.iter().map(String::as_str).collect();
             let trigger_id = state

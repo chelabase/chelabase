@@ -89,21 +89,39 @@ fn project() -> Result<Config> {
     }
 }
 
+/// `name` in the branch's listing (every function of the database): the service when it's one,
+/// `None` when there's none of that name, and an error when it's a function. `services deploy`
+/// checks this before any write: a `PUT {"kind":"service"}` to a function would turn it into a
+/// service.
+pub fn existing_service<'a>(list: &'a Value, name: &str) -> Result<Option<&'a Value>> {
+    let list = list.as_array().context("the branch's functions")?;
+    match list.iter().find(|f| f["name"] == name) {
+        None => Ok(None),
+        Some(f) if f["kind"] == "service" => Ok(Some(f)),
+        Some(_) => bail!("{name} is a function, not a service: pick another name for the service"),
+    }
+}
+
 async fn deploy(api: &Api, d: &Deploy) -> Result<()> {
     let name = &d.name;
-    let service = api
-        .json(
-            Method::PUT,
-            &format!("/{name}"),
-            json!({ "kind": "service" }),
-        )
-        .await?;
-    if service["kind"] != "service" {
-        bail!("{name} is a function, not a service");
-    }
-    if let Some(secret) = service["signing_secret"].as_str() {
-        println!("{name}: signing secret {secret} (shown only now)");
-    }
+    let list = api.send(Method::GET, "", None).await?;
+    let service = match existing_service(&list, name)? {
+        Some(service) => service.clone(),
+        None => {
+            let made = api
+                .json(Method::PUT, &format!("/{name}"), json!({ "kind": "service" }))
+                .await?;
+            // Only a function made under this name since the listing gets here (a narrow
+            // race): the answer then says what it is.
+            if made["kind"] != "service" {
+                bail!("{name} is a function, not a service: pick another name for the service");
+            }
+            if let Some(secret) = made["signing_secret"].as_str() {
+                println!("{name}: signing secret {secret} (shown only now)");
+            }
+            made
+        }
+    };
     let made = api
         .json(
             Method::POST,
@@ -285,15 +303,32 @@ mod tests {
         assert!(matches!(rollout_outcome(&json!({"deployment_id": "d1", "rollout": null}), "d2"), Some(Err(_))));
     }
 
+    /// Review fix: `services deploy` never sends a kind change: a name that's a function is
+    /// refused before any write, an existing service is deployed to as it is, and a new name is
+    /// made a service.
     #[test]
-    fn an_unhealthy_rollover_names_the_new_deployment_and_the_reason() {
+    fn deploy_checks_the_name_before_writing() {
+        let list = json!([
+            {"name": "hello", "kind": "function", "deployment_id": null},
+            {"name": "echo", "kind": "service", "deployment_id": "d1"},
+        ]);
+        let err = existing_service(&list, "hello").unwrap_err().to_string();
+        assert!(err.contains("hello is a function, not a service"), "{err}");
+        assert_eq!(existing_service(&list, "echo").unwrap(), Some(&list[1]));
+        assert_eq!(existing_service(&list, "new").unwrap(), None);
+        assert!(existing_service(&json!({"error": {}}), "echo").is_err(), "not a listing");
+    }
+
+    /// A failed call reads as method, path, status and the API's message; a 409 is no
+    /// different (a rollover's failure comes from the listing, never a 409).
+    #[test]
+    fn a_failed_call_names_the_call_and_the_message() {
         let body = json!({"error": {"code": "conflict", "reason": "unhealthy", "deployment_id": "d2",
                                      "message": "the new container never passed /status/500 in 60 s"}});
-        let msg = crate::functions::error_message("POST", "/x/deployments", 409, &body);
-        assert!(msg.contains("d2"), "{msg}");
-        assert!(msg.contains("never passed /status/500 in 60 s"), "{msg}");
-        assert!(msg.contains("previous deployment stays live"), "{msg}");
-        // Another 409 reads as a plain error.
+        assert_eq!(
+            crate::functions::error_message("POST", "/x/deployments", 409, &body),
+            "POST /x/deployments: 409 the new container never passed /status/500 in 60 s"
+        );
         let other = json!({"error": {"code": "conflict", "reason": "not_deployed", "message": "no deployment"}});
         assert_eq!(
             crate::functions::error_message("PATCH", "/x", 409, &other),

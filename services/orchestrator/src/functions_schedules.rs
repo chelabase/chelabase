@@ -15,7 +15,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chelabase_metadata::{
-    MetadataClient, MetadataError, NewSchedule, Schedule, ScheduleError, ScheduleRecord,
+    FunctionKind, MetadataClient, MetadataError, NewSchedule, Schedule, ScheduleError,
+    ScheduleRecord,
 };
 use chelabase_routes::orchestrator as ep;
 use chelabase_types::ApiPath;
@@ -28,7 +29,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::branches::parse_body;
+use crate::branches::{parse_body, unprocessable};
 use crate::functions::{begin, find, metadata_error, respond};
 use crate::{ApiBytes, AppState, AuthPrincipal, JobPort, MetadataPort};
 
@@ -228,7 +229,7 @@ where
         (status = 403, description = "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: a bad cron or time zone (`field` names it), or an unknown field", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: a bad cron or time zone (`field` names it), an unknown field, or a schedule for a service", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -256,6 +257,10 @@ where
             let timezone = request.timezone.as_deref().unwrap_or("UTC");
             let schedule = Schedule::parse(&request.cron, timezone).map_err(invalid)?;
             let function = find(&state, &record, &name).await?;
+            // Review fix: only a function's bundle is ever run on a schedule.
+            if function.kind != FunctionKind::Function {
+                return Err(unprocessable("a schedule needs a function: a service is never run on a schedule (deploy a function that calls it)"));
+            }
             let next_run_at = schedule.next_after(Utc::now());
             let schedule_id = state
                 .metadata

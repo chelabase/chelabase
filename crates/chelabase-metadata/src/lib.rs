@@ -46,10 +46,10 @@ pub use storage_webhooks::{
 pub use ddl::DdlTx;
 pub use functions::{
     Advance, BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
-    FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment,
+    FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
     ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
-    valid_function_name, valid_secret_name,
+    secrets_env_bytes, valid_function_name, valid_secret_name,
 };
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
@@ -298,7 +298,9 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// (`chelabase_secrets::SecretKey`). A row counts as sealed when `column IS NOT NULL` and, if
 /// `also` is set, that SQL condition holds too (a value that can never be opened again doesn't
 /// count). [`MetadataClient::ensure_key_check`] adopts a new key only while no row counts; a
-/// live test fails when a metadata column named like a sealed one is missing here.
+/// live test (`every_sealed_column_is_checked`) fails when a metadata text or bytea column whose
+/// name looks secret (`secret`, `_enc`, `sealed`, `cipher`, `password`, `token`) is neither here
+/// nor excluded there with a reason.
 ///
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
@@ -312,7 +314,9 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// app refresh, `seal`; opened only while `grace_until > now()`, see
 /// [`MetadataClient::refresh_app_session`], and nothing clears it once the window is over);
 /// `branch_function_secrets.ciphertext` (orchestrator function secrets and branch create,
-/// `seal` with AAD `fn-secret:{branch}:{function}:{name}`).
+/// `seal` with AAD `fn-secret:{branch}:{function}:{name}`); `functions.signing_secret` (a
+/// service's signing secret, orchestrator, [`MetadataClient::set_service_signing_secret`]:
+/// `seal` with AAD `{function}:service-signing`).
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
@@ -324,6 +328,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branch_auth_sync", "password_sealed", None),
     ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
     ("branch_function_secrets", "ciphertext", None),
+    ("functions", "signing_secret", None),
 ];
 
 /// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
@@ -481,7 +486,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261108000001).
+        // this file when adding one (last: 20261108000003).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,

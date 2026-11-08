@@ -102,6 +102,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(ProxyCache::from_lookup(&internal_config.valkey_url, |name| {
             std::env::var(name).ok()
         })?);
+    // m13b: the bearer the orchestrator calls the functions service with, and the one that
+    // service asks for its dispatcher login with (both ways, as rest's). Read once; unset or
+    // blank closes the route and makes deployments answer 503.
+    let functions_token = chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
         locator: DockerLocator::connect(&internal_config.compute_network, &internal_config.stack)?,
@@ -121,9 +127,7 @@ async fn main() -> anyhow::Result<()> {
         storage_token: internal_config.storage_token.clone(),
         // m13b: the functions service asks for its dispatcher login with the bearer the
         // orchestrator calls it with (both ways, as rest's); unset closes the route.
-        functions_token: chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
-            .map_err(anyhow::Error::msg)?
-            .unwrap_or_default(),
+        functions_token: functions_token.clone(),
         rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
@@ -179,9 +183,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let bundles: orchestrator::functions::Bundles = Arc::new(orchestrator::functions::HttpBundleSink::new(
         functions_url,
-        chelabase_types::secret_env::env_secret("CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN")
-            .map_err(anyhow::Error::msg)?
-            .unwrap_or_default(),
+        functions_token,
         // Never a redirect (#26): the bearer goes to the functions service only.
         chelabase_http::client_builder().build()?,
     ));

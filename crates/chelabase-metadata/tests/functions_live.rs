@@ -1716,7 +1716,7 @@ mod functions {
     type Fut = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MetadataError>> + Send>>;
     type Op = fn(MetadataClient, Contended) -> Fut;
 
-    /// The function writes (m2, m3a, m7's schedule writes and claim).
+    /// The function writes (m2, m3a, m7's schedule writes and claim, and every later one).
     fn function_writes() -> Vec<(&'static str, Op)> {
         vec![
             ("set_run_as", |c, x| Box::pin(async move { c.set_run_as(x.main, x.f, Some(&run_as("writer", 5151))).await.map(drop) })),
@@ -1727,6 +1727,35 @@ mod functions {
             ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t").await })),
             ("set_active_deployment", |c, x| Box::pin(async move { c.set_active_deployment(x.main, x.f, x.deployment).await })),
             ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
+            // Review fix: the rest of the function writes.
+            ("set_enabled", |c, x| Box::pin(async move { c.set_enabled(x.main, x.f, false).await.map(drop) })),
+            ("delete_secret", |c, x| Box::pin(async move { c.delete_secret(x.main, x.f, "API_KEY").await.map(drop) })),
+            ("create_function", |c, x| Box::pin(async move { c.create_function(x.db, "extra", FunctionKind::Function).await.map(drop) })),
+            ("create_deployment", |c, x| Box::pin(async move {
+                let spec = serde_json::json!({});
+                c.create_deployment(&NewDeployment {
+                    id: Uuid::new_v4(),
+                    function_id: x.f,
+                    bundle_sha256: Some(&sha('e')),
+                    bundle_size: Some(1),
+                    spec: &spec,
+                    compatibility_date: date(),
+                    created_by: "member-1",
+                    note: None,
+                })
+                .await
+                .map(drop)
+            })),
+            ("add_schedule", |c, x| Box::pin(async move {
+                c.add_schedule(&NewSchedule { branch_id: x.main, function_id: x.f, cron: "0 * * * *", timezone: "UTC", next_run_at: None })
+                    .await
+                    .map(drop)
+            })),
+            ("add_trigger", |c, x| Box::pin(async move { c.add_trigger(&storage_trigger(x.main, x.f, &["object.created"])).await.map(drop) })),
+            ("switch_active_deployment", |c, x| Box::pin(async move {
+                let Some((_, generation)) = c.active_deployment_generation(x.main, x.f).await? else { return Ok(()) };
+                c.switch_active_deployment(x.main, x.f, generation, x.deployment).await.map(drop)
+            })),
             ("update_schedule", |c, x| Box::pin(async move { c.update_schedule(x.main, x.f, x.schedule, Some("*/5 * * * *"), None, None).await.map(drop) })),
             ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
@@ -2504,6 +2533,131 @@ mod functions {
             .await
             .unwrap();
         assert!(mine(c.storage_trigger_targets().await.unwrap()).is_empty(), "a deleting database");
+        s.finish().await;
+    }
+
+    /// Review fix: a service is never invoked on a schedule or a trigger (it has no bundle), so
+    /// neither is added for one, and a function with either never becomes a service.
+    #[tokio::test]
+    #[ignore]
+    async fn service_takes_no_schedule_or_trigger() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let c = &s.client;
+        let svc = c.create_function(db, "svc", FunctionKind::Service).await.unwrap().id;
+        let schedule = NewSchedule { branch_id: main, function_id: svc, cron: "* * * * *", timezone: "UTC", next_run_at: None };
+        let err = c.add_schedule(&schedule).await.unwrap_err();
+        assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.contains("service")), "{err:?}");
+        for t in [table_trigger(main, svc, &["insert"]), storage_trigger(main, svc, &["object.created"])] {
+            let err = c.add_trigger(&t).await.unwrap_err();
+            assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.contains("service")), "{:?}: {err:?}", t.source);
+        }
+        assert!(c.list_schedules(main).await.unwrap().is_empty());
+        assert!(c.list_triggers(main).await.unwrap().is_empty());
+        // A function (no deployment yet) with a schedule, or a trigger, keeps its kind.
+        let timed = s.function(db, "timed").await;
+        c.add_schedule(&NewSchedule { function_id: timed, ..schedule }).await.unwrap();
+        let fired = s.function(db, "fired").await;
+        c.add_trigger(&storage_trigger(main, fired, &["object.created"])).await.unwrap();
+        for f in [timed, fired] {
+            let err = c.set_function_kind(db, f, FunctionKind::Service).await.unwrap_err();
+            assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.contains("schedules and triggers")), "{err:?}");
+        }
+        let plain = s.function(db, "plain").await;
+        assert!(c.set_function_kind(db, plain, FunctionKind::Service).await.unwrap(), "nothing in the way");
+        s.finish().await;
+    }
+
+    /// Review fix: a branch or database tombstone revokes the run-as keys functions manage on
+    /// its branches and drops their sealed values, in the purge's transaction; other keys and
+    /// other branches are untouched.
+    #[tokio::test]
+    #[ignore]
+    async fn purge_revokes_managed_run_as_keys() {
+        let s = Scratch::new().await;
+        let c = &s.client;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let child = s.branch(db, main, "dev").await;
+        let on_main = run_as("reporter", 4242);
+        assert!(c.set_run_as(main, f, Some(&on_main)).await.unwrap());
+        let on_child = run_as("reporter", 4242);
+        assert!(c.set_run_as(child, f, Some(&on_child)).await.unwrap());
+        let plain = s.data_key(child).await;
+        c.mark_branch_deleted(child).await.unwrap();
+        assert_eq!(s.key_state(on_child.key_id).await, (true, true), "the child's managed key");
+        assert_eq!(s.key_state(on_main.key_id).await, (false, false), "main's is untouched");
+        assert_eq!(s.key_state(plain).await, (false, true), "an unmanaged key is untouched");
+        c.mark_deleted(db).await.unwrap();
+        assert_eq!(s.key_state(on_main.key_id).await, (true, true), "the database tombstone's");
+        let sealed: i64 = sqlx::query_scalar("SELECT count(*) FROM data_api_keys WHERE managed_by_function_id = $1 AND sealed IS NOT NULL")
+            .bind(f)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(sealed, 0, "no sealed value is left to hold a new secrets key off");
+        s.finish().await;
+    }
+
+    /// Review fix: a function's secrets on a branch travel together in one header, so their
+    /// total (as the env's JSON) is capped at write time; a replaced value counts once, and
+    /// another branch or function has its own budget.
+    #[tokio::test]
+    #[ignore]
+    async fn secrets_total_capped() {
+        use chelabase_metadata::{MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES};
+        let s = Scratch::new().await;
+        let c = &s.client;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let big = "x".repeat(MAX_SECRET_BYTES - 1024);
+        c.put_secret(main, f, "A", &big).await.unwrap();
+        c.put_secret(main, f, "B", &big).await.unwrap();
+        let err = c.put_secret(main, f, "C", &"y".repeat(4096)).await.unwrap_err();
+        assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.contains(&MAX_SECRETS_ENV_BYTES.to_string())), "{err:?}");
+        assert_eq!(c.secret_names(main, f).await.unwrap(), ["A", "B"], "nothing written");
+        // Escapes count: a value of control characters is six bytes each in the JSON.
+        let err = c.put_secret(main, f, "C", &"\u{1}".repeat(1024)).await.unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
+        // Replacing a value counts it once.
+        c.put_secret(main, f, "A", &big).await.unwrap();
+        c.put_secret(main, f, "A", "small").await.unwrap();
+        c.put_secret(main, f, "C", &"y".repeat(4096)).await.unwrap();
+        let g = s.function(db, "other").await;
+        c.put_secret(main, g, "A", &big).await.unwrap();
+        s.finish().await;
+    }
+
+    /// Review fix: a container rollover's switch is a compare-and-set on the generation it read
+    /// when it started, so nothing set meanwhile is overwritten: not a rollback to the serving
+    /// deployment, not a newer switch.
+    #[tokio::test]
+    #[ignore]
+    async fn rollover_switch_is_compare_and_set() {
+        let s = Scratch::new().await;
+        let c = &s.client;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let d1 = s.deployment(f, &sha('1')).await;
+        let d2 = s.deployment(f, &sha('2')).await;
+        assert_eq!(c.active_deployment_generation(main, f).await.unwrap(), None);
+        assert!(!c.switch_active_deployment(main, f, 0, d2).await.unwrap(), "no state: nothing to switch");
+        c.set_active_deployment(main, f, d1).await.unwrap();
+        let (active, started) = c.active_deployment_generation(main, f).await.unwrap().unwrap();
+        assert_eq!(active, d1);
+        // A rollback to the serving deployment while the rollover runs: the rollover loses.
+        c.set_active_deployment(main, f, d1).await.unwrap();
+        assert!(!c.switch_active_deployment(main, f, started, d2).await.unwrap());
+        assert_eq!(s.client.list_for_branch(main).await.unwrap()[0].deployment_id, d1);
+        let (_, now) = c.active_deployment_generation(main, f).await.unwrap().unwrap();
+        assert!(c.switch_active_deployment(main, f, now, d2).await.unwrap());
+        assert_eq!(s.client.list_for_branch(main).await.unwrap()[0].deployment_id, d2);
+        assert!(!c.switch_active_deployment(main, f, now, d1).await.unwrap(), "a generation switches once");
+        let other = s.function(db, "other").await;
+        let foreign = s.deployment(other, &sha('3')).await;
+        let (_, now) = c.active_deployment_generation(main, f).await.unwrap().unwrap();
+        let err = c.switch_active_deployment(main, f, now, foreign).await.unwrap_err();
+        assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
         s.finish().await;
     }
 }

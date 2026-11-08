@@ -874,6 +874,12 @@ impl functions::FunctionsPort for Doc {
     async fn set_active_deployment(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> Result<(), MetadataError> {
         match *self {}
     }
+    async fn active_deployment_generation(&self, branch: BranchId, function: Uuid) -> Result<Option<(Uuid, i64)>, MetadataError> {
+        match *self {}
+    }
+    async fn switch_active_deployment(&self, branch: BranchId, function: Uuid, generation: i64, deployment: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
     async fn set_enabled(&self, branch: BranchId, function: Uuid, enabled: bool) -> Result<bool, MetadataError> {
         match *self {}
     }
