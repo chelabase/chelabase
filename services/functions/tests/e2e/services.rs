@@ -92,7 +92,8 @@ async fn flow(s: &Stack, stub: &str) {
         "a replay"
     );
 
-    // A client's identity headers never reach the service.
+    // AC 7 through the gateway: `chelabase-user` is the app-user token header there, so a
+    // forged one is refused before anything is proxied.
     let resp = s
         .http
         .get(format!("{}/services/v1/stub/x", s.api))
@@ -101,16 +102,50 @@ async fn flow(s: &Stack, stub: &str) {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "user_token_invalid", "{body}");
+    // The other identity headers a client forges are replaced with the gateway's.
+    let resp = s
+        .http
+        .get(format!("{}/services/v1/stub/x", s.api))
+        .bearer_auth(&s.key)
+        .header("chelabase-role", "service_role")
+        .header("chelabase-branch", uuid::Uuid::new_v4().to_string())
+        .header("chelabase-request-id", "forged")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
     let echo: Value = resp.json().await.unwrap();
-    assert_eq!(echoed_headers(&echo).get("chelabase-user").unwrap(), "");
+    let headers = echoed_headers(&echo);
+    assert_eq!(headers.get("chelabase-role").unwrap(), "anon");
+    assert_eq!(
+        headers.get("chelabase-branch").unwrap(),
+        s.branch.to_string().as_str()
+    );
+    assert_eq!(headers.get("chelabase-user").unwrap(), "");
+    let id = headers
+        .get("chelabase-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}");
+    assert_eq!(headers.get_all("chelabase-role").iter().count(), 1);
+    assert_eq!(
+        Verifier::new(&secret).verify("GET", "/anything/x", &headers, b"", now()),
+        Ok(())
+    );
 
     // AC 5: a redirect to an internal address comes back as it is. `root` is the stub's root.
     s.service("root", stub, "/status/200").await;
-    let redirect = "/services/v1/root/redirect-to?url=http%3A%2F%2Fmetadata-db%3A5432%2F&status_code=302";
+    let redirect =
+        "/services/v1/root/redirect-to?url=http%3A%2F%2Fmetadata-db%3A5432%2F&status_code=302";
+    // Never following a redirect: what the gateway answered is what is checked.
+    let no_redirects = chelabase_http::client_builder().build().unwrap();
     let start = Instant::now();
     let resp = loop {
-        let r = s
-            .http
+        let r = no_redirects
             .get(format!("{}{redirect}", s.api))
             .bearer_auth(&s.key)
             .send()

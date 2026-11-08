@@ -22,6 +22,9 @@ services:
     image: mccutchen/go-httpbin:2.26.0@sha256:873b4fdb27fe7cc66fa12cb9362574e1b0bf31df7ca8a71b2502988327a0b8a4
     restart: unless-stopped
     read_only: true
+    # The e2e streams /drip for 45 s; go-httpbin caps a request at 10 s by default.
+    environment:
+      - MAX_DURATION=90s
     ports:
       - "${CHELABASE_STUB_SERVICE_BIND:-172.17.0.1}:${CHELABASE_STUB_SERVICE_PORT:-18099}:8080"
     networks: [stub]
