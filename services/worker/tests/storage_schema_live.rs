@@ -4845,8 +4845,8 @@ async fn review(fx: &Fx) {
         parse_review("app", json).expect("the review's document")
     };
 
-    // Why `storage` is skipped by name: nobody but chelabase_admin (which no role may join)
-    // and superusers can create in it.
+    // Why a chelabase_admin-owned `storage` is skipped: nobody but chelabase_admin (which no
+    // role may join) and superusers can create in it.
     assert_eq!(
         fx.value("SELECT coalesce(string_agg(rolname, ',' ORDER BY rolname), '-') FROM pg_roles WHERE NOT rolsuper AND has_schema_privilege(oid, 'storage', 'CREATE')").await,
         "chelabase_admin"
@@ -4876,4 +4876,47 @@ async fn review(fx: &Fx) {
         keys.contains(&"app/function/public.rv_definer()".to_string()),
         "{keys:?}"
     );
+
+    // #185 audit B1: in a database the owner makes (no bootstrap runs there), a `storage`
+    // schema of the owner's, where another role can create, is reviewed: a planted SECURITY
+    // DEFINER function and a trigger on a table there are listed.
+    fx.owner("CREATE DATABASE rv_other")
+        .await
+        .expect("the owner creates a database");
+    let other = |sql: String| async move {
+        fx.worker
+            .computes
+            .admin_sql(&fx.ep, "rv_other", &sql)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    };
+    other(format!(
+        "BEGIN; SET LOCAL ROLE {OWNER};
+         CREATE SCHEMA storage;
+         CREATE ROLE rv_dev2 NOLOGIN;
+         GRANT USAGE, CREATE ON SCHEMA storage TO rv_dev2;
+         COMMIT;
+         BEGIN; SET LOCAL ROLE rv_dev2;
+         CREATE FUNCTION storage.rv_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         CREATE FUNCTION storage.rv_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE storage.t (a int);
+         CREATE TRIGGER rv_tg BEFORE INSERT ON storage.t FOR EACH ROW EXECUTE FUNCTION storage.rv_trg();
+         COMMIT;"
+    ))
+    .await
+    .expect("plant");
+    let out = other(review_sql(OWNER)).await.expect("scan rv_other");
+    let json = &out[out.find('[').expect("a JSON array")..=out.rfind(']').expect("a JSON array")];
+    let keys: Vec<String> = parse_review("rv_other", json)
+        .expect("the review's document")
+        .into_iter()
+        .map(|i| i.key)
+        .collect();
+    for key in [
+        "rv_other/function/storage.rv_planted()",
+        "rv_other/function/storage.rv_trg()",
+        "rv_other/trigger/storage.rv_tg(storage.t)",
+    ] {
+        assert!(keys.contains(&key.to_string()), "{key} hidden: {keys:?}");
+    }
 }
