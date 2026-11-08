@@ -2279,13 +2279,15 @@ mod tests {
 
     /// Edge functions m4b: the functions service mounts exactly its own files, each made by a
     /// fresh run (the layout's; the S3 pair by init-secrets' script), and NATS's auth file
-    /// carries its user. The orchestrator and the worker each mount their bearer.
+    /// carries its user. The orchestrator and the worker each mount their bearer. m13b: the
+    /// compute CA's certificate too (the dispatcher verifies computes).
     #[test]
     fn functions_service_mounts_come_from_init() {
         let mounts = selfhost_mounts("functions");
         assert_eq!(
             mounts,
             [
+                "compute-ca/ca.crt",
                 "db/metadata.password",
                 "functions-s3/access-key",
                 "functions-s3/secret-key",

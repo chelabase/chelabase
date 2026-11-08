@@ -44,6 +44,8 @@ rust_reads=(
   'infra/compose/docker-compose.workbench.yml                self     chelabase-init chelabase'
   'infra/compose/docker-compose.example.yml                  self     init'
   'infra/workbench/*                                         self     chelabase'
+  'infra/functions-runtime/*                                 self     chelabase'
+  'infra/images/functions-runtime.Dockerfile                 self     chelabase'
   'infra/neon/NEON_REF                                       closure  bench-data-api'
   'scripts/compute-network-e2e.sh                            self     orchestrator'
   'scripts/neon-images.sh                                    self     chelabase-neon chelabase'

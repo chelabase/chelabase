@@ -12,6 +12,8 @@
 #                              .env sets (the line is the workbench's)
 #   CHELABASE_OPERATOR_TENANT_ID
 #                              platform mode only: never passed
+#   CHELABASE_FUNCTIONS_RUNTIME_MEMORY
+#                              the runtime container's mem_limit (a size, not an env var)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -34,12 +36,17 @@ awk -v want="^# --- ($sections)( .*)? ---\$" '
 
 {
   cp "$example" "$tmp/env"
-  while read -r name; do echo "$name=tunable-$name"; done <"$tmp/names"
+  while read -r name; do
+    case "$name" in
+      CHELABASE_FUNCTIONS_RUNTIME_MEMORY) echo "$name=777m" ;;
+      *) echo "$name=tunable-$name" ;;
+    esac
+  done <"$tmp/names"
 } >"$tmp/env.all"
 mv "$tmp/env.all" "$tmp/env"
 
 docker compose -p chelabase-env-tunables --project-directory "$dir" -f "$dir/docker-compose.yml" \
-  --profile services --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
+  --profile services --profile functions --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
   { cat "$tmp/config.err" >&2; err "docker compose config failed"; exit 1; }
 
 checked=0
@@ -48,6 +55,11 @@ while read -r name; do
     CHELABASE_MODE)
       modes="$(jq -r '[.services[] | .environment.CHELABASE_MODE // empty] | unique | join(",")' "$tmp/config.json")"
       [[ "$modes" == self-hosted ]] || err "CHELABASE_MODE in the services is '$modes' (wanted self-hosted only, whatever .env says)"
+      ;;
+    CHELABASE_FUNCTIONS_RUNTIME_MEMORY)
+      got="$(jq -r '.services["functions-runtime"].mem_limit // empty' "$tmp/config.json")"
+      [[ "$got" == $((777 * 1024 * 1024)) || "$got" == 777m ]] ||
+        err "$name doesn't set functions-runtime's mem_limit (got '$got')"
       ;;
     CHELABASE_OPERATOR_TENANT_ID)
       [[ -z "$(jq -r --arg n "$name" '[.services[] | .environment[$n] // empty] | join(",")' "$tmp/config.json")" ]] ||

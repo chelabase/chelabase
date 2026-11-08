@@ -46,14 +46,39 @@ mod fn_triggers {
         database: String,
     }
 
+    /// Panics, saying to rebuild, unless the shared metadata database has every migration of
+    /// this checkout (`crates/chelabase-metadata/migrations`): this suite's in-process worker
+    /// runs this checkout's queries.
+    async fn stack_is_migrated(metadata: &MetadataClient) {
+        let dir = crate::common::workspace_root().join("crates/chelabase-metadata/migrations");
+        let newest: i64 = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .filter_map(|f| {
+                let name = f.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".sql")?.split('_').next()?.parse().ok()
+            })
+            .max()
+            .expect("a metadata migration");
+        let applied: Option<i64> =
+            sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+                .fetch_one(metadata.pool())
+                .await
+                .expect("reading the metadata database's migrations");
+        assert!(
+            applied.is_some_and(|v| v >= newest),
+            "the stack is behind this checkout: its metadata database's newest migration is \
+             {applied:?}, this checkout's {newest}. Rebuild it (`just workbench up`)."
+        );
+    }
+
     impl Fx {
         async fn provision() -> Fx {
             let (worker, metadata, _config) = setup().await;
             // `set_run_as` seals the key, as the orchestrator's client does.
             let metadata = metadata.with_secrets_key(worker.key.clone());
-            // The worker migrates at start; this suite's worker is in-process, so it does too
-            // (the strict migrator: a new migration is applied and recorded as the binary would).
-            metadata.migrate().await.expect("metadata migrations");
+            // The stack's orchestrator migrates the shared metadata database; this suite never
+            // does, it only refuses to run against one behind this checkout.
+            stack_is_migrated(&metadata).await;
             let id = DatabaseId::new();
             let name = format!("fn-{}", &id.to_string()[..8]);
             let project = metadata
