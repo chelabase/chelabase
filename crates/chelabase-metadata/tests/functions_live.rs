@@ -14,7 +14,8 @@ mod functions {
     use chelabase_metadata::{
         BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
-        KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, TriggerInstall, TriggerSource,
+        KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, RunAsMint, RunAsUnmintable,
+        TriggerInstall, TriggerSource,
         TriggerState,
     };
     use chelabase_types::data_key::{self, DataKeyKind};
@@ -1643,6 +1644,8 @@ mod functions {
         managed_key: Uuid,
         other_key: Uuid,
         schedule: Uuid,
+        /// A second function whose run-as key is still to mint (role `minter`, OID 5252).
+        g: Uuid,
     }
 
     impl Scratch {
@@ -1673,7 +1676,22 @@ mod functions {
                 .unwrap();
             c.set_service_health(deployment, true).await.unwrap();
             c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
-            Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key, schedule }
+            let g = self.function(db, "minted").await;
+            let gd = self.deployment(g, &sha('d')).await;
+            c.set_active_deployment(main, g, gd).await.unwrap();
+            let minter = run_as("minter", 5252);
+            assert!(c.set_run_as(main, g, Some(&minter)).await.unwrap());
+            sqlx::query("UPDATE data_api_keys SET revoked_at = now(), sealed = NULL WHERE id = $1")
+                .bind(minter.key_id)
+                .execute(self.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE branch_functions SET run_as_key_id = NULL WHERE function_id = $1")
+                .bind(g)
+                .execute(self.pool())
+                .await
+                .unwrap();
+            Contended { db, main, ep, f, deployment, managed_key: ra.key_id, other_key, schedule, g }
         }
     }
 
@@ -1714,6 +1732,9 @@ mod functions {
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
             ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
             ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
+            ("settle_run_as_mint", |c, x| Box::pin(async move {
+                c.settle_run_as_mint(x.main, x.g, "minter", Some(5252), RunAsMint::Key(&run_as("minter", 5252))).await.map(drop)
+            })),
             ("settle_trigger_installs", |c, x| Box::pin(async move {
                 let installs: Vec<TriggerInstall> = c
                     .list_triggers(x.main)
@@ -1863,8 +1884,8 @@ mod functions {
             ("database", "SELECT 1 FROM databases WHERE id = $1 FOR UPDATE"),
             ("branch", "SELECT 1 FROM branches WHERE id = $2 FOR UPDATE"),
             ("endpoint", "SELECT 1 FROM neon_endpoints WHERE id = $3 FOR UPDATE"),
-            ("function", "SELECT 1 FROM functions WHERE id = $4 FOR UPDATE"),
-            ("branch state", "SELECT 1 FROM branch_functions WHERE function_id = $4 FOR UPDATE"),
+            ("function", "SELECT 1 FROM functions WHERE database_id = $1 FOR UPDATE"),
+            ("branch state", "SELECT 1 FROM branch_functions WHERE branch_id = $2 FOR UPDATE"),
             ("schedule", "SELECT 1 FROM function_schedules WHERE function_id = $4 FOR UPDATE"),
             ("trigger", "SELECT 1 FROM function_triggers WHERE function_id = $4 FOR UPDATE"),
             ("managed key", "SELECT 1 FROM data_api_keys WHERE id = $5 FOR UPDATE"),
@@ -2169,8 +2190,70 @@ mod functions {
         assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child]);
         c.set_function_last_error(child, f, Some("TypeError: boom")).await.unwrap();
         assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child], "an invocation error doesn't stop it");
-        c.set_function_last_error(child, f, Some("run_as_role_missing")).await.unwrap();
-        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child], "nor a missing role (it may come back)");
+        // Round 3 (B2): only the state decides, and a terminal outcome is state too.
+        let st = c.list_for_branch(child).await.unwrap().into_iter().find(|b| b.function_id == f).unwrap();
+        let settled = c
+            .settle_run_as_mint(child, f, "reporter", st.run_as_role_oid, RunAsMint::Unmintable(RunAsUnmintable::Missing, "run_as_role_missing"))
+            .await
+            .unwrap();
+        assert!(settled);
+        assert!(c.pending_run_as_branches(10).await.unwrap().is_empty(), "a terminal outcome leaves the sweep");
+        s.finish().await;
+    }
+
+    /// m8 round 3 (B1, B2): the invariant "a minted run-as key is always bound to the role OID a
+    /// member approved, and the worker never overrides a member's run-as choice". `set_run_as`
+    /// records the approved OID and a child copies it; the guarded mint writes only while the
+    /// state row still names that role and OID with no key and no terminal outcome, and binds
+    /// the key to that OID; anything else writes nothing.
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_mint_is_guarded_and_bound() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let d = s.deployment(f, &sha('a')).await;
+        let c = &s.client;
+        c.set_active_deployment(main, f, d).await.unwrap();
+        assert!(c.set_run_as(main, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        let st = |b: BranchId| async move {
+            c.list_for_branch(b).await.unwrap().into_iter().find(|x| x.function_id == f).unwrap()
+        };
+        assert_eq!(st(main).await.run_as_role_oid, Some(4242), "set_run_as records the approved OID");
+        let child = s.branch(db, main, "dev").await;
+        let copy = st(child).await;
+        assert_eq!((copy.run_as_role.as_deref(), copy.run_as_role_oid, copy.run_as_key_id, copy.run_as_unmintable), (Some("reporter"), Some(4242), None, None));
+        // Another role, another OID, or a key bound elsewhere: refused before anything is written.
+        for (role, expected, key) in [("other", Some(4242), run_as("other", 4242)), ("reporter", Some(77), run_as("reporter", 77)), ("reporter", Some(4242), run_as("reporter", 77))] {
+            let wrote = c.settle_run_as_mint(child, f, role, expected, RunAsMint::Key(&key)).await;
+            assert!(!matches!(wrote, Ok(true)), "{role} {expected:?}: {wrote:?}");
+        }
+        assert_eq!(st(child).await.run_as_key_id, None);
+        // The member clears the run-as role first: the mint writes nothing.
+        let ra = run_as("reporter", 4242);
+        assert!(c.set_run_as(child, f, None).await.unwrap());
+        assert!(!c.settle_run_as_mint(child, f, "reporter", Some(4242), RunAsMint::Key(&ra)).await.unwrap());
+        assert_eq!((st(child).await.run_as_role, st(child).await.run_as_key_id), (None, None));
+        assert!(s.managed_keys(f).await.iter().all(|k| k.0 != ra.key_id), "the discarded key was never stored");
+        // A fresh child: the mint binds the approved OID.
+        let child2 = s.branch(db, main, "dev2").await;
+        assert!(c.settle_run_as_mint(child2, f, "reporter", Some(4242), RunAsMint::Key(&ra)).await.unwrap());
+        assert_eq!(st(child2).await.run_as_key_id, Some(ra.key_id));
+        let bound: Option<i64> = sqlx::query_scalar("SELECT role_oid FROM data_api_keys WHERE id = $1")
+            .bind(ra.key_id)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(bound, Some(4242));
+        assert!(!c.settle_run_as_mint(child2, f, "reporter", Some(4242), RunAsMint::Key(&run_as("reporter", 4242))).await.unwrap(), "once");
+        // A terminal outcome stays until a member sets run-as again.
+        let child3 = s.branch(db, main, "dev3").await;
+        assert!(c.settle_run_as_mint(child3, f, "reporter", Some(4242), RunAsMint::Unmintable(RunAsUnmintable::Changed, "run_as_role_changed: x")).await.unwrap());
+        let t = st(child3).await;
+        assert_eq!((t.run_as_unmintable, t.last_error.as_deref()), (Some(RunAsUnmintable::Changed), Some("run_as_role_changed: x")));
+        assert!(!c.settle_run_as_mint(child3, f, "reporter", Some(4242), RunAsMint::Key(&run_as("reporter", 4242))).await.unwrap());
+        assert!(c.set_run_as(child3, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        assert_eq!(st(child3).await.run_as_unmintable, None, "a member's set_run_as clears it");
         s.finish().await;
     }
 }

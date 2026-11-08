@@ -5,6 +5,16 @@
 //! object it didn't create. The attack matrix in `tests/fn_triggers_live.rs`
 //! (`attack_matrix_keeps_the_invariant`) checks it move by move.
 //!
+//! **Invariant (run-as).** A minted run-as key is always bound to the role OID a member
+//! approved, and the worker never overrides a member's run-as choice. A child copies the
+//! approved OID (`run_as_role_oid`) at its create. [`Worker::mint_child_run_as`] mints only for
+//! a role of that very OID: a missing role, or a namesake with another OID, is a terminal
+//! `run_as_unmintable` the sweep never retries. It writes only through
+//! `MetadataClient::settle_run_as_mint`, which checks, under the function's locks, that the
+//! member's choice is still the one checked.
+//! `audit_run_as_mint_never_overrides_a_concurrent_change` and
+//! `audit_child_run_as_key_needs_the_approved_oid` test it.
+//!
 //! [`Worker::sync_fn_triggers`] keeps a branch's databases in step with its table triggers
 //! (`function_triggers`, source `table`), as the superuser (`cloud_admin`):
 //!
@@ -15,10 +25,14 @@
 //!   is installed anywhere, and again at the top of each install): the role and the schema
 //!   `chelabase_functions` must be exactly what the install makes. That means no attribute,
 //!   membership or setting on the role; nothing it owns or holds rights on outside the schema
-//!   (`pg_shdepend`: shared objects, and each database's own); the schema its own; nothing in
+//!   (`pg_shdepend`: shared objects, and each database's own). A grant *to* the role on a
+//!   table, routine, schema, type or database is let through and revoked: nobody can act as
+//!   the role, and `enqueue()` reads nothing. The schema must be its own, with nothing in
 //!   the schema but the outbox, its sequence, index and row type, and `enqueue()`. Anything
-//!   else is refused with [`FOREIGN_MARK`], never repaired, and every row read settles `failed`
-//!   (terminal until the trigger is changed or pended again).
+//!   else is refused with [`FOREIGN_MARK`], never repaired. Every `chelabase_fn_*` trigger
+//!   running `enqueue()` is dropped ([`drop_triggers_sql`]), and every row read settles
+//!   `failed` (terminal until the trigger is changed or pended again). A `failed` row is never
+//!   wanted, so its database trigger is dropped, never installed.
 //! - **The machinery**, made or put back each run while the database has a trigger to install:
 //!   the schema (no rights for PUBLIC, so no data API role reaches it), the outbox
 //!   `chelabase_functions.outbox` and the trigger function `chelabase_functions.enqueue()`,
@@ -36,7 +50,9 @@
 //!   defaults, triggers, rules, policies, row level security, extra constraints or indexes,
 //!   owner) is dropped and rebuilt ([`repair_sql`]).
 //! - **The outbox**: truncated after a branch create, reset or restore (the database came from
-//!   another timeline) while the rows read are still pending. On every run, its rows from
+//!   another timeline) while the rows read are still pending and, decided after the database's
+//!   advisory lock, no wanted trigger is in place yet (a sweep that got there first cleaned
+//!   it). On every run, its rows from
 //!   another timeline or for a trigger the database doesn't want are deleted. The cleanup runs
 //!   as [`OWNER`] (`SET LOCAL ROLE`), after the repair, never as the superuser.
 //! - **The triggers**: `chelabase_fn_<id as 32 hex>` ([`trigger_name`]), `AFTER <events> ON
@@ -66,8 +82,8 @@
 //! owed ([`Worker::sync_pending_run_as`], chosen by state, not by `last_error`).
 
 use chelabase_metadata::{
-    BranchRecord, BranchStatus, DatabaseOrigin, MetadataClient, RunAs, TriggerInstall,
-    TriggerRecord, TriggerSource, TriggerState,
+    BranchRecord, BranchStatus, DatabaseOrigin, MetadataClient, RunAs, RunAsMint, RunAsUnmintable,
+    TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
 };
 use chelabase_nats::{AllRowsCheckReply, AllRowsCheckRequest};
 use chelabase_neon::ComputeBackend;
@@ -102,6 +118,10 @@ pub const SYNC_LOCK_KEY: i64 = 0x6368_656c_6164_6208;
 
 /// `last_error` on a child's function whose run-as role its catalog doesn't have.
 pub const RUN_AS_ROLE_MISSING: &str = "run_as_role_missing";
+
+/// `last_error` prefix on a child's function whose run-as role name now belongs to another role
+/// than the one a member approved (another OID), or with no approved OID.
+pub const RUN_AS_ROLE_CHANGED: &str = "run_as_role_changed";
 
 /// `last_error` prefix on a child's function whose run-as role the checks refuse.
 pub const RUN_AS_ROLE_REFUSED: &str = "run_as_role_refused";
@@ -189,6 +209,8 @@ BEGIN
   ELSIF EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole = role) THEN
     why := 'the role {OWNER} has settings';
   ELSIF EXISTS (SELECT FROM pg_catalog.pg_shdepend d WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND d.refobjid = role
+      AND NOT (d.deptype = 'a' AND d.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_proc'::pg_catalog.regclass,
+        'pg_catalog.pg_namespace'::pg_catalog.regclass, 'pg_catalog.pg_type'::pg_catalog.regclass, 'pg_catalog.pg_database'::pg_catalog.regclass))
       AND (d.dbid = 0 OR (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
         AND NOT (d.deptype = 'o' AND (
           (d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = ns)
@@ -219,6 +241,31 @@ pub fn check_sql(role: Option<u32>) -> String {
     format!(
         "{SYNC_MARK} check\n{PRELUDE}{}ROLLBACK;\n",
         foreign_check_sql(role)
+    )
+}
+
+/// On a refusal: drops every `chelabase_fn_*` trigger running `chelabase_functions.enqueue()`
+/// in the database, so a refused branch's triggers don't keep filling an outbox nobody reads.
+/// A plain `DROP TRIGGER` as the superuser with event triggers off: nothing is adopted and no
+/// tenant code runs.
+pub fn drop_triggers_sql() -> String {
+    format!(
+        r#"{SYNC_MARK} drop
+{PRELUDE}DO $chelabase_fn$ DECLARE
+  t record;
+BEGIN
+  FOR t IN SELECT tg.tgname, n.nspname, c.relname FROM pg_catalog.pg_trigger tg
+    JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+    WHERE NOT tg.tgisinternal AND tg.tgparentid = 0
+      AND pg_catalog.starts_with(tg.tgname::pg_catalog.text, '{FUNCTION_TRIGGER_PREFIX}')
+      AND pn.nspname = '{FUNCTIONS_SCHEMA}' AND p.proname = 'enqueue'
+  LOOP
+    EXECUTE pg_catalog.format('DROP TRIGGER %I ON %I.%I', t.tgname, t.nspname, t.relname);
+  END LOOP;
+END $chelabase_fn$;
+COMMIT;
+"#
     )
 }
 
@@ -283,7 +330,12 @@ pub fn trigger_events(events: &[String]) -> Option<(String, i16)> {
 pub fn wanted_in(triggers: &[TriggerRecord], db: &str) -> Vec<Wanted> {
     triggers
         .iter()
-        .filter(|t| t.source == TriggerSource::Table && t.pg_database == db)
+        // A failed row is never wanted: its database trigger is dropped, never installed.
+        .filter(|t| {
+            t.source == TriggerSource::Table
+                && t.state != TriggerState::Failed
+                && t.pg_database == db
+        })
         .filter_map(|t| {
             Some(Wanted {
                 id: t.id,
@@ -458,6 +510,33 @@ BEGIN
     EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s CASCADE', g.obj,
       CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(g.grantee)) END);
   END LOOP;
+  -- Grants *to* the owner role on other objects (a table owner's, on their own table): the
+  -- foreign check lets them pass (nobody can act as the role, and enqueue() reads no
+  -- table), and they are revoked here.
+  FOR g IN SELECT d.classid, d.objid, d.objsubid FROM pg_catalog.pg_shdepend d
+    WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+      AND d.refobjid = (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = '{OWNER}') AND d.deptype = 'a'
+      AND (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+        OR (d.dbid = 0 AND d.classid = 'pg_catalog.pg_database'::pg_catalog.regclass))
+  LOOP
+    IF g.classid = 'pg_catalog.pg_class'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL %s ON %s %s FROM {OWNER} CASCADE',
+        CASE WHEN g.objsubid = 0 THEN '' ELSE pg_catalog.format('(%I)', (SELECT a.attname FROM pg_catalog.pg_attribute a
+          WHERE a.attrelid = g.objid AND a.attnum = g.objsubid)) END,
+        CASE WHEN (SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = g.objid) = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+        g.objid::pg_catalog.regclass);
+    ELSIF g.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON ROUTINE %s FROM {OWNER} CASCADE', g.objid::pg_catalog.regprocedure);
+    ELSIF g.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON SCHEMA %I FROM {OWNER} CASCADE', (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_type'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON %s %s FROM {OWNER} CASCADE',
+        CASE WHEN (SELECT t.typtype FROM pg_catalog.pg_type t WHERE t.oid = g.objid) = 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+        g.objid::pg_catalog.regtype);
+    ELSIF g.classid = 'pg_catalog.pg_database'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON DATABASE %I FROM {OWNER} CASCADE', (SELECT d.datname FROM pg_catalog.pg_database d WHERE d.oid = g.objid));
+    END IF;
+  END LOOP;
 END $chelabase_fn$;
 "#
     )
@@ -497,7 +576,9 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String 
     let check = foreign_check_sql(role);
     let (repair, revoke, ours) = (repair_sql(), revoke_sql(), ours_sql());
     let truncate = if truncate {
-        format!("  TRUNCATE {FUNCTIONS_SCHEMA}.outbox;\n")
+        format!(
+            "  IF pg_catalog.current_setting('chelabase_fn.fresh', true) = 'true' THEN\n    TRUNCATE {FUNCTIONS_SCHEMA}.outbox;\n  END IF;\n"
+        )
     } else {
         String::new()
     };
@@ -512,7 +593,13 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String 
 {PRELUDE}SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
 SELECT pg_catalog.pg_advisory_xact_lock({SYNC_LOCK_KEY}) IS NULL;
 CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2) ON COMMIT DROP;
-{insert}{check}{repair}{install_objects}{revoke}DO $chelabase_fn$ DECLARE
+{insert}-- After the lock: a database where a wanted trigger is already exactly in place was synced on
+-- this timeline (a sweep got there first), so the truncate is skipped.
+SELECT pg_catalog.set_config('chelabase_fn.fresh', (NOT EXISTS (SELECT FROM pg_temp.chelabase_fn_wanted w
+  JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name
+  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
+  JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = c.oid WHERE {EXACT}))::pg_catalog.text, true) IS NULL;
+{check}{repair}{install_objects}{revoke}DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
   t record;
 BEGIN
@@ -650,6 +737,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map(|out| parse_role(&out))
             .map_err(|e| format!("reading the function triggers' role: {e:#}"))?;
+        let mut databases: Vec<String> = self
+            .metadata
+            .branch_databases(branch)
+            .await
+            .map_err(|e| format!("listing the databases: {e}"))?
+            .into_iter()
+            .filter(|d| d.origin != DatabaseOrigin::System)
+            .map(|d| d.name)
+            .collect();
+        for t in &triggers {
+            if !databases.contains(&t.pg_database) {
+                databases.push(t.pg_database.clone());
+            }
+        }
         let compute_databases = self
             .computes
             .admin_sql(&ep, SYSTEM_DATABASE, &review_databases_sql())
@@ -665,25 +766,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 return match foreign_refusal(&e) {
                     Some(refusal) => {
                         warn!(branch_id = %branch, database = %db, "function triggers refused: {refusal}");
+                        // Nothing keeps firing: the triggers go first. A database that can't
+                        // be reached keeps the rows as they are, so the sweep comes back.
+                        for db in &databases {
+                            if let Err(e) =
+                                self.computes.admin_sql(&ep, db, &drop_triggers_sql()).await
+                            {
+                                let e = format!("{e:#}");
+                                if !database_missing(&e, db) {
+                                    return Err(format!(
+                                        "dropping the refused function triggers in {db}: {e}"
+                                    ));
+                                }
+                            }
+                        }
                         self.settle(meta, branch, &triggers, |_| Some(Some(refusal.clone())))
                             .await
                     }
                     None => Err(format!("checking the function triggers' role in {db}: {e}")),
                 };
-            }
-        }
-        let mut databases: Vec<String> = self
-            .metadata
-            .branch_databases(branch)
-            .await
-            .map_err(|e| format!("listing the databases: {e}"))?
-            .into_iter()
-            .filter(|d| d.origin != DatabaseOrigin::System)
-            .map(|d| d.name)
-            .collect();
-        for t in &triggers {
-            if !databases.contains(&t.pg_database) {
-                databases.push(t.pg_database.clone());
             }
         }
         let mut answers: Vec<(Uuid, Option<String>)> = Vec::new();
@@ -860,75 +961,159 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .list_for_branch(branch)
             .await
             .map_err(|e| e.to_string())?;
-        // Chosen by state alone: the functions service overwrites `last_error` on any
-        // invocation error, so it can't say whether a mint is still owed.
-        let mints = |e: &str| {
-            e.starts_with(RUN_AS_KEY_PENDING)
-                || e.starts_with(RUN_AS_ROLE_MISSING)
-                || e.starts_with(RUN_AS_ROLE_REFUSED)
-        };
-        for f in functions.iter().filter(|f| f.run_as_key_id.is_none()) {
+        // Chosen by state alone (the functions service overwrites `last_error` on any
+        // invocation error): a role, no key, no terminal outcome.
+        for f in functions
+            .iter()
+            .filter(|f| f.run_as_key_id.is_none() && f.run_as_unmintable.is_none())
+        {
             let Some(role) = f.run_as_role.as_deref() else {
                 continue;
             };
-            let refusal = match self.check_and_grant(branch, &ep, &db, role, None).await {
-                RoleCheck::Ok(oid, bypass) => {
-                    let request = AllRowsCheckRequest {
-                        branch_id: branch,
-                        starting: vec![role.to_string()],
-                        change: None,
-                    };
-                    match self.all_rows_check(request).await {
-                        AllRowsCheckReply::Clear => {
-                            let generated = data_key::generate(DataKeyKind::Secret);
-                            let run_as = RunAs {
-                                role: role.to_string(),
-                                role_oid: oid,
-                                role_timeline: record.timeline_id.clone(),
-                                role_bypass_rls: bypass,
-                                key_id: Uuid::new_v4(),
-                                prefix: generated.prefix,
-                                sha256: generated.sha256,
-                                secret: generated.key,
-                            };
-                            meta.set_run_as(branch, f.function_id, Some(&run_as))
-                                .await
-                                .map_err(|e| format!("function {}: {e}", f.name))?;
-                            info!(branch_id = %branch, function = %f.name, "minted the child's run-as key");
-                            if f.last_error.as_deref().is_some_and(mints) {
-                                meta.set_function_last_error(branch, f.function_id, None)
-                                    .await
-                                    .map_err(|e| format!("function {}: {e}", f.name))?;
+            let approved = f.run_as_role_oid;
+            let terminal = |why: RunAsUnmintable, error: String| (why, error);
+            let outcome: Result<Option<RunAs>, (RunAsUnmintable, String)> = match approved {
+                // Nothing to bind to: never a namesake.
+                None => Err(terminal(
+                    RunAsUnmintable::Changed,
+                    format!(
+                        "{RUN_AS_ROLE_CHANGED}: no approved role identity for {role}; set the run-as role again"
+                    ),
+                )),
+                // `Some(approved)`: the compute's check refuses a role holding the name with
+                // another OID before it grants anything.
+                Some(approved) => match self
+                    .check_and_grant(branch, &ep, &db, role, Some(approved))
+                    .await
+                {
+                    RoleCheck::Ok(oid, bypass) => {
+                        let request = AllRowsCheckRequest {
+                            branch_id: branch,
+                            starting: vec![role.to_string()],
+                            change: None,
+                        };
+                        match self.all_rows_check(request).await {
+                            AllRowsCheckReply::Clear => {
+                                let generated = data_key::generate(DataKeyKind::Secret);
+                                Ok(Some(RunAs {
+                                    role: role.to_string(),
+                                    role_oid: oid,
+                                    role_timeline: record.timeline_id.clone(),
+                                    role_bypass_rls: bypass,
+                                    key_id: Uuid::new_v4(),
+                                    prefix: generated.prefix,
+                                    sha256: generated.sha256,
+                                    secret: generated.key,
+                                }))
                             }
-                            None
-                        }
-                        AllRowsCheckReply::Exposed { .. } => Some(format!(
-                            "{RUN_AS_ROLE_REFUSED}: the role {role} reaches a role with the \"all rows\" policy"
-                        )),
-                        AllRowsCheckReply::Failed { message } => {
-                            warn!(branch_id = %branch, function = %f.name, "the all-rows check failed: {message}");
-                            Some(format!(
-                                "{RUN_AS_KEY_PENDING}: the \"all rows\" check failed: {message}"
-                            ))
+                            AllRowsCheckReply::Exposed { .. } => Err(terminal(
+                                RunAsUnmintable::Refused,
+                                format!(
+                                    "{RUN_AS_ROLE_REFUSED}: the role {role} reaches a role with the \"all rows\" policy"
+                                ),
+                            )),
+                            AllRowsCheckReply::Failed { message } => {
+                                self.mint_pending(
+                                    meta,
+                                    branch,
+                                    f,
+                                    &format!("the \"all rows\" check failed: {message}"),
+                                )
+                                .await?;
+                                Ok(None)
+                            }
                         }
                     }
-                }
-                RoleCheck::Refused(why) if why.ends_with("does not exist") => {
-                    Some(RUN_AS_ROLE_MISSING.to_string())
-                }
-                RoleCheck::Refused(why) => Some(format!("{RUN_AS_ROLE_REFUSED}: {why}")),
-                RoleCheck::NotReady => Some(format!(
-                    "{RUN_AS_KEY_PENDING}: the branch's compute couldn't check the role"
-                )),
-                RoleCheck::Failed(why) => Some(format!("{RUN_AS_KEY_PENDING}: {why}")),
+                    RoleCheck::Refused(why) if why.ends_with("does not exist") => Err(terminal(
+                        RunAsUnmintable::Missing,
+                        RUN_AS_ROLE_MISSING.to_string(),
+                    )),
+                    RoleCheck::Refused(why) if why.contains("different role") => Err(terminal(
+                        RunAsUnmintable::Changed,
+                        format!("{RUN_AS_ROLE_CHANGED}: {why}"),
+                    )),
+                    RoleCheck::Refused(why) => Err(terminal(
+                        RunAsUnmintable::Refused,
+                        format!("{RUN_AS_ROLE_REFUSED}: {why}"),
+                    )),
+                    RoleCheck::NotReady => {
+                        self.mint_pending(
+                            meta,
+                            branch,
+                            f,
+                            "the branch's compute couldn't check the role",
+                        )
+                        .await?;
+                        Ok(None)
+                    }
+                    RoleCheck::Failed(why) => {
+                        self.mint_pending(meta, branch, f, &why).await?;
+                        Ok(None)
+                    }
+                },
             };
-            if let Some(error) = refusal {
-                meta.set_function_last_error(branch, f.function_id, Some(&error))
+            let settled = match &outcome {
+                Ok(None) => continue,
+                Ok(Some(run_as)) => {
+                    meta.settle_run_as_mint(
+                        branch,
+                        f.function_id,
+                        role,
+                        approved,
+                        RunAsMint::Key(run_as),
+                    )
                     .await
-                    .map_err(|e| format!("function {}: {e}", f.name))?;
+                }
+                Err((why, error)) => {
+                    meta.settle_run_as_mint(
+                        branch,
+                        f.function_id,
+                        role,
+                        approved,
+                        RunAsMint::Unmintable(*why, error),
+                    )
+                    .await
+                }
+            }
+            .map_err(|e| format!("function {}: {e}", f.name))?;
+            if !settled {
+                // A member changed or cleared the run-as role meanwhile (or another worker
+                // settled it): their choice stands, and the generated key is dropped.
+                info!(branch_id = %branch, function = %f.name, "the run-as role changed while it was checked; nothing minted");
+                continue;
+            }
+            if outcome.is_ok() {
+                info!(branch_id = %branch, function = %f.name, "minted the child's run-as key");
+                if f.last_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(RUN_AS_KEY_PENDING))
+                {
+                    meta.set_function_last_error(branch, f.function_id, None)
+                        .await
+                        .map_err(|e| format!("function {}: {e}", f.name))?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Records that `f`'s run-as key couldn't be minted yet ([`RUN_AS_KEY_PENDING`]): the sweep
+    /// retries it.
+    async fn mint_pending(
+        &self,
+        meta: &MetadataClient,
+        branch: BranchId,
+        f: &chelabase_metadata::BranchFunction,
+        why: &str,
+    ) -> Result<(), String> {
+        warn!(branch_id = %branch, function = %f.name, "the child's run-as key isn't minted yet: {why}");
+        meta.set_function_last_error(
+            branch,
+            f.function_id,
+            Some(&format!("{RUN_AS_KEY_PENDING}: {why}")),
+        )
+        .await
+        .map_err(|e| format!("function {}: {e}", f.name))
     }
 }
 
@@ -1028,6 +1213,15 @@ mod tests {
         // Audit B1: the row is never handed to to_jsonb whole (a user's cast would run as the
         // owner); the cleanup runs as the owner, after the repair, never as the superuser.
         assert!(!sql.contains("to_jsonb(NEW)") && !sql.contains("to_jsonb(OLD)"));
+        // Round 3 (N1, S2): the truncate is decided after the lock; grants to the role revoked.
+        assert!(
+            sql.find("pg_advisory_xact_lock").unwrap() < sql.find("'chelabase_fn.fresh'").unwrap()
+        );
+        assert!(
+            sql.contains("IF pg_catalog.current_setting('chelabase_fn.fresh', true) = 'true' THEN")
+        );
+        assert!(sql.contains("REVOKE ALL ON ROUTINE %s FROM chelabase_functions_owner CASCADE"));
+        assert!(drop_triggers_sql().contains("pg_catalog.format('DROP TRIGGER %I ON %I.%I'"));
         let role = sql
             .find("SET LOCAL ROLE chelabase_functions_owner;")
             .unwrap();
