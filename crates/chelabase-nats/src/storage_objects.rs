@@ -339,10 +339,10 @@ pub fn fn_trigger_consumer(
 pub const WATCHER_INACTIVE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A storage trigger's watcher: an ephemeral consumer (a new name per start) on the same
-/// subject from stream sequence `from` (at least 1), headers only and never acked. The worker
-/// reads it at the head of the subject to see every event arrive, so it can count the ones the
-/// per-database cap ([`MAX_EVENTS_PER_DATABASE`]) evicts before the trigger's consumer reaches
-/// them.
+/// subject from stream sequence `from` (at least 1), never acked. The worker reads it at the
+/// head of the subject to see every event arrive (and whether it is the trigger's), so it can
+/// count the ones the per-database cap ([`MAX_EVENTS_PER_DATABASE`]) evicts before the
+/// trigger's consumer reaches them.
 pub fn fn_trigger_watcher(
     trigger: Uuid,
     database_id: Uuid,
@@ -356,7 +356,6 @@ pub fn fn_trigger_watcher(
             start_sequence: from.max(1),
         },
         ack_policy: AckPolicy::None,
-        headers_only: true,
         inactive_threshold: WATCHER_INACTIVE,
         ..Default::default()
     }
@@ -745,8 +744,8 @@ mod tests {
         );
     }
 
-    /// Its watcher sees every event of the database from a stream sequence on, headers only,
-    /// never acked, and is gone soon after nobody pulls from it.
+    /// Its watcher sees every event of the database from a stream sequence on, never acked, and
+    /// is gone soon after nobody pulls from it.
     #[test]
     fn a_function_trigger_watcher_reads_headers_from_a_sequence() {
         use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
@@ -758,7 +757,7 @@ mod tests {
         assert!(!name.contains(['.', '*', '>']));
         assert_ne!(name, fn_trigger_watcher(trigger, db, 42).name.unwrap(), "one per start");
         assert_eq!(w.filter_subject, subject(db));
-        assert!(w.headers_only);
+        assert!(!w.headers_only, "the payload says whether it is the trigger's");
         assert_eq!(w.ack_policy, AckPolicy::None);
         assert_eq!(w.deliver_policy, DeliverPolicy::ByStartSequence { start_sequence: 42 });
         assert!(w.inactive_threshold <= std::time::Duration::from_secs(600));

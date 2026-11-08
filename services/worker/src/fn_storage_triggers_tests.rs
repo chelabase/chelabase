@@ -302,14 +302,14 @@ fn fn_storage_triggers_cap_evictions_are_counted_as_dropped() {
     let mut dropped = 0;
     // Stream sequences 10, 20, ... (other databases in between): the consumer gets the first.
     for seq in (1..=3).map(|i| i * 10) {
-        dropped += g.arrived(seq);
+        dropped += g.arrived(seq, true);
     }
     let (d, ordinal) = g.first_delivered(10);
     assert_eq!((d, ordinal), (0, Some(1)));
     // 17 more arrive while it is stuck: 20 in all, so the subject keeps the newest 5
     // (160..=200) and 20..=150 (14 events) are gone.
     for seq in (4..=20).map(|i| i * 10) {
-        dropped += g.arrived(seq);
+        dropped += g.arrived(seq, true);
     }
     assert_eq!(dropped, 14);
     // The consumer resumes at the oldest kept one: nothing more is counted.
@@ -317,7 +317,22 @@ fn fn_storage_triggers_cap_evictions_are_counted_as_dropped() {
     for seq in [170, 180, 190, 200] {
         assert_eq!(g.first_delivered(seq).0, 0);
     }
-    assert_eq!(dropped + g.arrived(210), 14);
+    assert_eq!(dropped + g.arrived(210, true), 14);
+}
+
+/// Every event of the database counts toward its cap, but only the trigger's own (its branch,
+/// Postgres database and filters) are counted when evicted: another branch's would never have
+/// been delivered.
+#[test]
+fn fn_storage_triggers_only_the_triggers_own_evictions_are_counted() {
+    let mut g = Gaps::new(4, 0);
+    // The consumer is stuck; 2 of the trigger's events, then a burst of 6 on another branch.
+    assert_eq!(g.arrived(1, true) + g.arrived(2, true), 0);
+    let burst: u64 = (3..=8).map(|seq| g.arrived(seq, false)).sum();
+    assert_eq!(burst, 2, "both of the trigger's events were pushed out");
+    for seq in 5..=8 {
+        assert_eq!(g.first_delivered(seq).0, 0, "{seq}");
+    }
 }
 
 /// An event the consumer skips (gone before it got there, the cap or the stream's own
@@ -326,19 +341,19 @@ fn fn_storage_triggers_cap_evictions_are_counted_as_dropped() {
 fn fn_storage_triggers_a_skipped_sequence_is_a_gap() {
     let mut g = Gaps::new(100, 0);
     for seq in [1, 2, 3, 4] {
-        assert_eq!(g.arrived(seq), 0);
+        assert_eq!(g.arrived(seq, true), 0);
     }
     assert_eq!(g.first_delivered(1).0, 0);
     assert_eq!(g.first_delivered(4).0, 2, "2 and 3 were skipped");
     // The consumer ahead of the watcher: what the watcher sees later is already delivered.
     assert_eq!(g.first_delivered(6), (0, None));
-    assert_eq!(g.arrived(5), 0);
-    assert_eq!(g.arrived(6), 0);
+    assert_eq!(g.arrived(5, true), 0);
+    assert_eq!(g.arrived(6, true), 0);
     assert_eq!(g.first_delivered(7).0, 0);
     // The watcher started after the consumer's position: older sequences are never its gaps.
     let mut g = Gaps::new(100, 50);
     assert_eq!(g.first_delivered(40).0, 0);
-    assert_eq!(g.arrived(51), 0);
+    assert_eq!(g.arrived(51, true), 0);
     assert_eq!(g.first_delivered(51).0, 0);
 }
 
@@ -349,7 +364,7 @@ fn fn_storage_triggers_an_evicted_retry_is_counted() {
     let cap = 3;
     let mut g = Gaps::new(cap, 0);
     for seq in [1, 2] {
-        g.arrived(seq);
+        g.arrived(seq, true);
     }
     let (_, o1) = g.first_delivered(1);
     let (_, o2) = g.first_delivered(2);
@@ -358,15 +373,19 @@ fn fn_storage_triggers_an_evicted_retry_is_counted() {
     // Redelivered: in flight again, then settled.
     let o2 = g.redelivered(2);
     assert_eq!(o2, Some(2));
-    assert_eq!(g.arrived(3) + g.arrived(4), 1, "1 is gone (2, 3, 4 kept)");
+    assert_eq!(
+        g.arrived(3, true) + g.arrived(4, true),
+        1,
+        "1 is gone (2, 3, 4 kept)"
+    );
     assert_eq!(g.first_delivered(3).0, 0);
     assert_eq!(g.first_delivered(4).0, 0);
-    assert_eq!(g.arrived(5), 0, "2 was in flight, not waiting");
+    assert_eq!(g.arrived(5, true), 0, "2 was in flight, not waiting");
     assert_eq!(g.first_delivered(5).0, 0);
     // An unknown ordinal (the watcher hadn't seen it) counts from the newest arrival.
     g.unsettled(9, None);
-    assert_eq!(g.arrived(6) + g.arrived(7), 0);
-    assert_eq!(g.arrived(8), 1);
+    assert_eq!(g.arrived(6, true) + g.arrived(7, true), 0);
+    assert_eq!(g.arrived(8, true), 1);
     assert_eq!(g.redelivered(9), None, "counted once and forgotten");
 }
 

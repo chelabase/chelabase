@@ -25,9 +25,10 @@
 //! the trigger settled it (the per-database cap, [`storage_objects::MAX_EVENTS_PER_DATABASE`],
 //! or the stream's own limits) is counted in `dropped_count` exactly once, while one worker
 //! runs the trigger. JetStream keeps no per-subject sequence and says nothing about what it
-//! evicts, so each trigger also reads a watcher ([`storage_objects::fn_trigger_watcher`],
-//! headers only) at the subject's head and keeps the arrivals its consumer hasn't reached
-//! ([`Gaps`]): an arrival with `cap` newer arrivals after it is gone (the cap keeps the newest);
+//! evicts, so each trigger also reads a watcher ([`storage_objects::fn_trigger_watcher`]) at
+//! the subject's head and keeps the arrivals of its own (branch, Postgres database, filters)
+//! its consumer hasn't reached ([`Gaps`]): an arrival with `cap` newer arrivals of the database
+//! after it is gone (the cap keeps the newest);
 //! a sequence the consumer skips past is gone; a NAKed event awaiting redelivery is gone once
 //! `cap` events arrive after it. What was evicted while no worker ran the trigger is not
 //! counted. `fn_storage_triggers_cap_evictions_are_counted_as_dropped` and its neighbours test
@@ -232,10 +233,12 @@ impl Gaps {
         }
     }
 
-    /// The watcher saw stream sequence `seq` arrive: how many events are now known gone.
-    pub fn arrived(&mut self, seq: u64) -> u64 {
+    /// The watcher saw stream sequence `seq` arrive, the trigger's own event or not
+    /// (`relevant`: every event counts toward the cap, only the trigger's are counted when
+    /// gone): how many of the trigger's events are now known gone.
+    pub fn arrived(&mut self, seq: u64, relevant: bool) -> u64 {
         self.latest += 1;
-        if seq > self.delivered {
+        if relevant && seq > self.delivered {
             self.waiting.push_back((seq, self.latest));
         }
         self.evict()
@@ -447,15 +450,15 @@ async fn consume(
 
     let watch = async {
         while let Some(m) = arrivals.next().await {
-            let Ok(info) = m.as_ref().map_err(|e| e.to_string()).and_then(|m| {
-                m.info()
-                    .map(|i| i.stream_sequence)
-                    .map_err(|e| e.to_string())
-            }) else {
+            let Ok(m) = m else { continue };
+            let Ok(seq) = m.info().map(|i| i.stream_sequence) else {
                 continue;
             };
-            let gone = gaps.lock().expect("gaps").arrived(info);
             let current = live.borrow().clone();
+            // An unreadable event is the trigger's for counting: it is never delivered either.
+            let relevant = serde_json::from_slice::<ObjectEvent>(&m.payload)
+                .map_or(true, |e| matches(&current, &e));
+            let gone = gaps.lock().expect("gaps").arrived(seq, relevant);
             delivery.record_evicted(&current, gone).await;
         }
     };
