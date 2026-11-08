@@ -30,6 +30,9 @@ pub mod delete;
 pub mod fn_bundle_sweep;
 pub mod fn_triggers;
 pub mod fn_schedules;
+pub mod fn_storage_triggers;
+#[cfg(test)]
+mod fn_storage_triggers_tests;
 #[cfg(test)]
 mod f2_coder_tests;
 #[cfg(test)]

@@ -50,8 +50,8 @@ pub const PG_NAME_BYTES: usize = 63;
 
 /// Events the stream keeps for one database (one subject). Past this, the database's own
 /// oldest events are dropped, pending or not: about 1.1 events a second sustained over
-/// [`RETENTION`] while an endpoint is down. Nothing counts those drops yet; counting them
-/// (e.g. a consumer noticing a gap in its stream sequence) is a follow-up.
+/// [`RETENTION`] while an endpoint is down. Webhooks don't count those drops; a function's
+/// storage trigger does, through its watcher ([`fn_trigger_watcher`], edge functions m14).
 pub const MAX_EVENTS_PER_DATABASE: i64 = 100_000;
 
 /// The largest event the stream stores, JSON payload and `Nats-Msg-Id` header together. The
@@ -305,6 +305,58 @@ pub fn endpoint_consumer(
         max_deliver: -1,
         max_ack_pending: 64,
         inactive_threshold: CONSUMER_INACTIVE,
+        ..Default::default()
+    }
+}
+
+/// Edge functions m14: the durable consumer name of a storage trigger enabled since `since`
+/// (`fn-trigger-<id>-<enabled_since_ms>`): a re-enabled trigger gets a new consumer starting
+/// then, so nothing from the disabled window is replayed.
+pub fn fn_trigger_consumer_name(trigger: Uuid, since: DateTime<Utc>) -> String {
+    format!("fn-trigger-{trigger}-{}", since.timestamp_millis())
+}
+
+/// A storage trigger's consumer: [`endpoint_consumer`]'s shape (durable, filtered to the
+/// database, from the enable time, explicit acks, never given up on, orphans expiring after
+/// [`CONSUMER_INACTIVE`]) under the trigger's own name, with `ack_wait` longer than one
+/// invocation may take.
+pub fn fn_trigger_consumer(
+    trigger: Uuid,
+    database_id: Uuid,
+    since: DateTime<Utc>,
+    ack_wait: std::time::Duration,
+) -> async_nats::jetstream::consumer::pull::Config {
+    let name = fn_trigger_consumer_name(trigger, since);
+    async_nats::jetstream::consumer::pull::Config {
+        durable_name: Some(name.clone()),
+        name: Some(name),
+        ack_wait,
+        ..endpoint_consumer(trigger, database_id, since)
+    }
+}
+
+/// How long a watcher nobody pulls from lives on.
+pub const WATCHER_INACTIVE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A storage trigger's watcher: an ephemeral consumer (a new name per start) on the same
+/// subject from stream sequence `from` (at least 1), never acked. The worker reads it at the
+/// head of the subject to see every event arrive (and whether it is the trigger's), so it can
+/// count the ones the per-database cap ([`MAX_EVENTS_PER_DATABASE`]) evicts before the
+/// trigger's consumer reaches them.
+pub fn fn_trigger_watcher(
+    trigger: Uuid,
+    database_id: Uuid,
+    from: u64,
+) -> async_nats::jetstream::consumer::pull::Config {
+    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
+    pull::Config {
+        name: Some(format!("fn-watch-{trigger}-{}", Uuid::new_v4().simple())),
+        filter_subject: subject(database_id),
+        deliver_policy: DeliverPolicy::ByStartSequence {
+            start_sequence: from.max(1),
+        },
+        ack_policy: AckPolicy::None,
+        inactive_threshold: WATCHER_INACTIVE,
         ..Default::default()
     }
 }
@@ -653,6 +705,65 @@ mod tests {
         assert_ne!(
             endpoint_consumer_name(endpoint, since),
             endpoint_consumer_name(endpoint, since + chrono::Duration::seconds(1))
+        );
+    }
+
+    /// Edge functions m14: a storage trigger's consumer is its own (not an endpoint's), filtered
+    /// to its database from its enable time, expires like an endpoint's when orphaned, and
+    /// waits longer than an invocation for an ack.
+    #[test]
+    fn a_function_trigger_consumer_starts_at_its_enable_time() {
+        use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+        let (trigger, db) = (Uuid::new_v4(), Uuid::new_v4());
+        let since = DateTime::from_timestamp(1_700_000_000, 7_000_000).unwrap();
+        let ack_wait = std::time::Duration::from_secs(90);
+        let c = fn_trigger_consumer(trigger, db, since, ack_wait);
+        assert_eq!(
+            c.durable_name.as_deref(),
+            Some(format!("fn-trigger-{trigger}-1700000000007").as_str())
+        );
+        assert_eq!(c.name, c.durable_name);
+        assert_eq!(
+            fn_trigger_consumer_name(trigger, since),
+            format!("fn-trigger-{trigger}-1700000000007")
+        );
+        assert_ne!(c.durable_name, endpoint_consumer(trigger, db, since).durable_name);
+        assert_eq!(c.filter_subject, subject(db));
+        assert_eq!(c.ack_policy, AckPolicy::Explicit);
+        assert_eq!(c.ack_wait, ack_wait);
+        assert_eq!(c.max_deliver, -1);
+        assert_eq!(c.inactive_threshold, endpoint_consumer(trigger, db, since).inactive_threshold);
+        let DeliverPolicy::ByStartTime { start_time } = c.deliver_policy else {
+            panic!("{:?}", c.deliver_policy)
+        };
+        assert_eq!(start_time.unix_timestamp_nanos(), 1_700_000_000_007_000_000);
+        assert_ne!(
+            fn_trigger_consumer_name(trigger, since),
+            fn_trigger_consumer_name(trigger, since + chrono::Duration::milliseconds(1)),
+            "a re-enable is a new consumer"
+        );
+    }
+
+    /// Its watcher sees every event of the database from a stream sequence on, never acked, and
+    /// is gone soon after nobody pulls from it.
+    #[test]
+    fn a_function_trigger_watcher_reads_headers_from_a_sequence() {
+        use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+        let (trigger, db) = (Uuid::new_v4(), Uuid::new_v4());
+        let w = fn_trigger_watcher(trigger, db, 42);
+        assert!(w.durable_name.is_none());
+        let name = w.name.clone().unwrap();
+        assert!(name.starts_with(&format!("fn-watch-{trigger}-")), "{name}");
+        assert!(!name.contains(['.', '*', '>']));
+        assert_ne!(name, fn_trigger_watcher(trigger, db, 42).name.unwrap(), "one per start");
+        assert_eq!(w.filter_subject, subject(db));
+        assert!(!w.headers_only, "the payload says whether it is the trigger's");
+        assert_eq!(w.ack_policy, AckPolicy::None);
+        assert_eq!(w.deliver_policy, DeliverPolicy::ByStartSequence { start_sequence: 42 });
+        assert!(w.inactive_threshold <= std::time::Duration::from_secs(600));
+        assert_eq!(
+            fn_trigger_watcher(trigger, db, 0).deliver_policy,
+            DeliverPolicy::ByStartSequence { start_sequence: 1 }
         );
     }
 

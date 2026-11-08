@@ -2408,4 +2408,52 @@ mod functions {
         assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a deleted branch is never dispatched");
         s.finish().await;
     }
+
+    /// m14: the worker's storage targets are the enabled storage triggers of live branches of
+    /// live databases, each with its function's name and database and its `enabled_since`; a
+    /// disabled one, a table one, a deleted one and a tombstoned branch's are not.
+    #[tokio::test]
+    #[ignore]
+    async fn storage_trigger_targets_are_enabled_live_storage_triggers() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "resize").await;
+        let c = &s.client;
+        let t = c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+        let off = c.add_trigger(&storage_trigger(main, f, &["object.deleted"])).await.unwrap();
+        c.update_trigger(main, f, off, false).await.unwrap().unwrap();
+        c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        install_all(c, main).await;
+        let mine = |list: Vec<chelabase_metadata::StorageTriggerTarget>| {
+            list.into_iter().filter(|x| x.database_id == db).collect::<Vec<_>>()
+        };
+        let targets = mine(c.storage_trigger_targets().await.unwrap());
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        let row = c.list_triggers(main).await.unwrap().into_iter().find(|r| r.id == t).unwrap();
+        let got = &targets[0];
+        assert_eq!(
+            (got.id, got.branch_id, got.function_name.as_str(), got.pg_database.as_str()),
+            (t, main, "resize", "app")
+        );
+        assert_eq!((got.bucket.as_deref(), got.prefix.as_deref()), (Some("avatars"), Some("in/")));
+        assert_eq!((got.events.clone(), got.enabled_since), (vec!["object.created".to_string()], row.enabled_since));
+        // Re-enabling the other one: a new generation.
+        let on = c.update_trigger(main, f, off, true).await.unwrap().unwrap();
+        let targets = mine(c.storage_trigger_targets().await.unwrap());
+        assert_eq!(targets.iter().find(|x| x.id == off).map(|x| x.enabled_since), Some(on.enabled_since));
+        let child = s.branch(db, main, "dev").await;
+        assert_eq!(mine(c.storage_trigger_targets().await.unwrap()).len(), 4, "the child's copies");
+        assert!(c.delete_trigger(main, f, t).await.unwrap());
+        assert!(mine(c.storage_trigger_targets().await.unwrap()).iter().all(|x| x.id != t));
+        c.mark_branch_deleted(child).await.unwrap();
+        let left = mine(c.storage_trigger_targets().await.unwrap());
+        assert!(left.iter().all(|x| x.branch_id == main), "{left:?}");
+        sqlx::query("UPDATE databases SET status = 'deleting' WHERE id = $1")
+            .bind(db.as_uuid())
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert!(mine(c.storage_trigger_targets().await.unwrap()).is_empty(), "a deleting database");
+        s.finish().await;
+    }
 }
