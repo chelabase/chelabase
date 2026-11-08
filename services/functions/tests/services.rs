@@ -128,6 +128,7 @@ mod services {
             let out = match host {
                 "svc.test" => Ok(vec!["127.0.0.1".parse().unwrap()]),
                 "inside.test" => Ok(vec!["10.0.0.5".parse().unwrap()]),
+                "lan.test" => Ok(vec!["192.168.1.5".parse().unwrap()]),
                 _ => Err(std::io::Error::other("no such host")),
             };
             Box::pin(std::future::ready(out))
@@ -239,6 +240,18 @@ mod services {
             ("pre", format!("{base}/api"), FunctionAuth::Key, true),
             ("users", base.clone(), FunctionAuth::AppUser, true),
             ("off", base.clone(), FunctionAuth::Key, false),
+            (
+                "lan",
+                format!("http://lan.test:{}", up.port),
+                FunctionAuth::Key,
+                true,
+            ),
+            (
+                "ghost",
+                format!("http://ghost.test:{}", up.port),
+                FunctionAuth::Key,
+                true,
+            ),
             (
                 "inside",
                 format!("http://inside.test:{}", up.port),
@@ -462,7 +475,7 @@ mod services {
             ),
             ("/services/v1/pre/../../secret", "/api/secret"),
             ("/services/v1/pre/a/./%2E./.%2e/b", "/api/b"),
-            ("/services/v1/pre/a%2Fb", "/api/a%2Fb"),
+            ("/services/v1/pre/a%20b", "/api/a%20b"),
         ] {
             assert_eq!(h.raw_get(path).await, 200, "{path}");
             let seen = h.last();
@@ -473,6 +486,18 @@ mod services {
                 "{path}"
             );
         }
+        // Audit B2: an encoded slash or backslash could leave `/api` at an upstream that
+        // decodes first: 400, nothing sent.
+        let before = h.calls();
+        for path in [
+            "/services/v1/pre/%2e%2e%2fadmin",
+            "/services/v1/pre/..%2Fadmin",
+            "/services/v1/pre/..%5cadmin",
+            "/services/v1/pre/a%2fb",
+        ] {
+            assert_eq!(h.raw_get(path).await, 400, "{path}");
+        }
+        assert_eq!(h.calls(), before);
     }
 
     /// AC 5: a redirect comes back to the client; nothing follows it.
@@ -540,6 +565,24 @@ mod services {
                 .lock()
                 .unwrap()
                 .contains(&(deployment("stub"), true))
+        );
+        // Audit N1: every decided check is recorded (its time moves), not only a change, so a
+        // restarted or re-enabled service's record is fresh after its first decided check.
+        let passes = |h: &H| {
+            h.dir
+                .health
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| **r == (deployment("stub"), true))
+                .count()
+        };
+        let before = passes(&h);
+        check_all(h.dir.as_ref(), client, health).await;
+        assert_eq!(
+            passes(&h),
+            before + 1,
+            "a pass with no change is recorded too"
         );
     }
 
@@ -693,5 +736,30 @@ mod services {
             assert!(o.check_url(url).is_err(), "{url}");
         }
         assert!(outbound_from_lookup(env(&[("CHELABASE_INTERNAL_SUBNETS", "nope")])).is_err());
+    }
+
+    /// Audit S2: the proxy's other refusals: a host resolving to a private address that isn't
+    /// allowlisted, and one that doesn't resolve. 502, nothing sent.
+    #[tokio::test]
+    async fn every_connect_time_refusal_answers_502() {
+        let h = harness().await;
+        for (name, code) in [("lan", "service_refused"), ("ghost", "service_refused")] {
+            let resp = h
+                .call(
+                    reqwest::Method::GET,
+                    &format!("/services/v1/{name}/x"),
+                    Cred::Public,
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 502, "{name}");
+            assert_eq!(
+                resp.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+                code,
+                "{name}"
+            );
+        }
+        assert_eq!(h.calls(), 0);
     }
 }

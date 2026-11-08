@@ -30,6 +30,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 pub const SIGNATURE: &str = "chelabase-signature";
 pub const REQUEST_ID: &str = "chelabase-request-id";
@@ -114,17 +115,19 @@ pub enum Rejected {
     Replayed,
 }
 
-/// What a service does with each request: [`Verifier::verify`]. It remembers the request ids
-/// it accepted for [`TOLERANCE`] seconds.
+/// What a service does with each request: [`Verifier::verify`]. It remembers each request id
+/// it accepted until its signature's `t + TOLERANCE`: as long as the timestamp check would
+/// pass, whatever the skew between the proxy's clock and the receiver's.
 pub struct Verifier {
-    secret: String,
+    secret: Zeroizing<String>,
+    /// Request id → when it may be forgotten (`t + TOLERANCE`).
     seen: Mutex<HashMap<String, i64>>,
 }
 
 impl Verifier {
     pub fn new(secret: &str) -> Self {
         Self {
-            secret: secret.to_owned(),
+            secret: Zeroizing::new(secret.to_owned()),
             seen: Mutex::new(HashMap::new()),
         }
     }
@@ -185,11 +188,11 @@ impl Verifier {
             return Err(Rejected::Mismatch);
         }
         let mut seen = self.seen.lock().expect("not poisoned");
-        seen.retain(|_, at| now - *at <= TOLERANCE);
+        seen.retain(|_, until| now <= *until);
         if seen.contains_key(request_id) {
             return Err(Rejected::Replayed);
         }
-        seen.insert(request_id.to_owned(), now);
+        seen.insert(request_id.to_owned(), t + TOLERANCE);
         Ok(())
     }
 }
@@ -297,6 +300,28 @@ mod tests {
         // Outside the window a remembered id is forgotten, and the timestamp refuses it anyway.
         let h2 = request(b"", "r-1", t + 400);
         assert_eq!(v.verify("POST", "/api/a?x=1", &h2, b"", t + 400), Ok(()));
+    }
+
+    /// Audit B1: an id is kept until its signature's own `t + TOLERANCE`, so a receiver whose
+    /// clock is behind the proxy's still refuses a replay while the timestamp passes.
+    #[test]
+    fn a_replay_is_refused_for_as_long_as_the_timestamp_passes() {
+        let v = Verifier::new(SECRET);
+        let t = 1_700_000_000;
+        let h = request(b"", "r-1", t);
+        assert_eq!(v.verify("POST", "/api/a?x=1", &h, b"", t - 100), Ok(()));
+        assert_eq!(
+            v.verify("POST", "/api/a?x=1", &h, b"", t + 250),
+            Err(Rejected::Replayed)
+        );
+        assert_eq!(
+            v.verify("POST", "/api/a?x=1", &h, b"", t + TOLERANCE),
+            Err(Rejected::Replayed)
+        );
+        assert_eq!(
+            v.verify("POST", "/api/a?x=1", &h, b"", t + TOLERANCE + 1),
+            Err(Rejected::Expired)
+        );
     }
 
     /// The webhooks' verifier accepts the same header over the signed string.

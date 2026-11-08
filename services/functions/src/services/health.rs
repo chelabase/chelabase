@@ -2,7 +2,9 @@
 //! base URL with its `health_path`, through the services' guarded client. A 2xx within
 //! [`CHECK_TIMEOUT`] passes. [`FAILURES`] failures in a row make a service `unhealthy` (calls
 //! answer 503 `service_unhealthy`); one pass makes it `healthy`. A service not checked yet is
-//! `unknown` and is called. Each change is recorded in the metadata, for the API.
+//! `unknown` and is called. Every decided check (healthy or unhealthy) is recorded in the
+//! metadata for the API, not only a change, so the record is fresh after a restart or a
+//! re-enable. At most [`CONCURRENCY`] checks run at once.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -17,6 +19,8 @@ use crate::directory::Directory;
 pub const INTERVAL: Duration = Duration::from_secs(15);
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const FAILURES: u32 = 3;
+/// Checks in flight at once, across every tenant.
+pub const CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -106,18 +110,30 @@ pub async fn check_all(directory: &dyn Directory, client: &PublicClient, health:
         }
     };
     health.retain(&targets.iter().map(|t| t.deployment_id).collect());
-    let checks = targets.iter().map(|t| async move {
-        let passed = match health_url(&t.spec) {
-            Some(url) => passes(client, &url).await,
-            None => false,
-        };
-        (t.deployment_id, passed)
+    let permits = tokio::sync::Semaphore::new(CONCURRENCY);
+    let checks = targets.iter().map(|t| {
+        let permits = &permits;
+        async move {
+            let _permit = permits
+                .acquire()
+                .await
+                .expect("the semaphore is never closed");
+            let passed = match health_url(&t.spec) {
+                Some(url) => passes(client, &url).await,
+                None => false,
+            };
+            (t.deployment_id, passed)
+        }
     });
-    for (deployment, passed) in futures_util::future::join_all(checks).await {
-        let Some(status) = health.observe(deployment, passed) else {
+    let checks = futures_util::future::join_all(checks).await;
+    for (deployment, passed) in checks {
+        if let Some(status) = health.observe(deployment, passed) {
+            tracing::info!(%deployment, ?status, "service health changed");
+        }
+        let status = health.status(deployment);
+        if status == Status::Unknown {
             continue;
-        };
-        tracing::info!(%deployment, ?status, "service health changed");
+        }
         if let Err(e) = directory
             .record_health(deployment, status == Status::Healthy)
             .await
