@@ -28,11 +28,17 @@
 // {"type": "scheduled", "cron": "<5 fields>", "scheduledTime": <epoch ms>}. The supervisor then
 // runs the bundle's `scheduled(controller, env, ctx)` handler instead of `fetch`, and answers 200
 // {"outcome": "ok"}, or 500 `scheduled handler: <outcome>` when it is missing or throws.
+//
+// Storage events (m14): `x-chelabase-event: storage` on the worker's invocations, with the body
+// {"type": "storage", "event": {<the object event>}}. The supervisor hands the bundle's `fetch`
+// a POST whose body is the event alone (JSON) and which carries `chelabase-event: storage`; its
+// answer passes through as for any request. A body of another shape is 400 `storage event: ...`.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
 const ERROR_HEADER = "x-chelabase-error";
 const EVENT_HEADER = "x-chelabase-event";
+const STORAGE_EVENT_HEADER = "chelabase-event";
 const MAX_EVENT_BYTES = 64 << 10;
 const START_FAILED = "bundle failed to start";
 const BUNDLE_RE = /^([A-Za-z0-9_-]{1,64})\/([0-9a-f]{64})$/;
@@ -178,6 +184,22 @@ async function scheduledEvent(request) {
   return { cron, scheduledTime: new Date(scheduledTime) };
 }
 
+// The storage event's body: the object event itself, as JSON text.
+async function storageEvent(request) {
+  const bad = new Refused(400, "storage event: the body must be {type: \"storage\", event: {...}}");
+  const text = await request.text();
+  if (text.length > MAX_EVENT_BYTES) throw bad;
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw bad;
+  }
+  const { type, event } = body ?? {};
+  if (type !== "storage" || event === null || typeof event !== "object" || Array.isArray(event)) throw bad;
+  return JSON.stringify(event);
+}
+
 // Runs the loaded worker's `scheduled` handler (workerd's Fetcher.scheduled, which needs the
 // `service_binding_extra_handlers` flag on the supervisor).
 async function runScheduled(worker, event) {
@@ -225,9 +247,19 @@ export default {
       for (const [k, v] of request.headers) {
         if (!k.toLowerCase().startsWith(PRIVATE_PREFIX)) headers.append(k, v);
       }
+      let forward;
+      if (request.headers.get(EVENT_HEADER) === "storage") {
+        const event = await storageEvent(request);
+        headers.set(STORAGE_EVENT_HEADER, "storage");
+        headers.set("content-type", "application/json");
+        headers.delete("content-length");
+        forward = new Request(request.url, { method: "POST", headers, body: event });
+      } else {
+        forward = new Request(request, { headers });
+      }
       let res;
       try {
-        res = await worker.getEntrypoint().fetch(new Request(request, { headers }));
+        res = await worker.getEntrypoint().fetch(forward);
       } catch (e) {
         // An exception from the handler comes back marked `remote` and stays a 500. Anything
         // else is the loader failing to start the worker (a syntax error, an unknown
