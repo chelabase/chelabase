@@ -3,9 +3,10 @@
 //! The rest comes as the client sent it (percent-encoded). Its dot segments are resolved here,
 //! within the rest, so the result never leaves the base URL's path prefix: `.` and `..`, in any
 //! mix of `.` and `%2e` (a URL parser treats `%2e` as a dot), and a `..` at the top is dropped.
-//! A backslash is sent as `%5C` (a URL parser would read it as `/`). What the URL parser makes
-//! of the rest is what is sent and signed ([`Upstream::target`]), and it is checked to still
-//! start with the prefix.
+//! A segment holding a backslash or an encoded `/` or `\` (`%2f`, `%5c`, any case) is refused:
+//! many upstreams decode before they resolve dot segments, so `%2e%2e%2fadmin` would be
+//! `../admin` there. What the URL parser makes of the rest is what is sent and signed
+//! ([`Upstream::target`]), and it is checked to still start with the prefix.
 
 use chelabase_http::outbound::Url;
 
@@ -35,7 +36,7 @@ fn dots(segment: &str) -> usize {
 }
 
 /// `base` with `rest` (`""` or starting with `/`) under its path and `query`; `None` when the
-/// result would leave the base path.
+/// result would leave the base path, or a segment holds a separator in disguise.
 pub fn upstream(base: &Url, rest: &str, query: Option<&str>) -> Option<Upstream> {
     let prefix = base.path().trim_end_matches('/');
     let mut segments: Vec<String> = Vec::new();
@@ -44,6 +45,13 @@ pub fn upstream(base: &Url, rest: &str, query: Option<&str>) -> Option<Upstream>
         None if rest.is_empty() => Vec::new(),
         None => return None,
     };
+    let disguised = |p: &&str| {
+        let p = p.to_ascii_lowercase();
+        p.contains('\\') || p.contains("%2f") || p.contains("%5c")
+    };
+    if parts.iter().any(disguised) {
+        return None;
+    }
     let last = parts.len().saturating_sub(1);
     for (i, part) in parts.iter().enumerate() {
         match dots(part) {
@@ -51,7 +59,7 @@ pub fn upstream(base: &Url, rest: &str, query: Option<&str>) -> Option<Upstream>
             2 => {
                 segments.pop();
             }
-            _ => segments.push(part.replace('\\', "%5C")),
+            _ => segments.push((*part).to_owned()),
         }
         // A trailing dot segment still ends in a slash (`/a/..` is `/`).
         if i == last && dots(part) > 0 {
@@ -105,8 +113,8 @@ mod tests {
             Some("/api/a/")
         );
         assert_eq!(
-            target(api, "/a%2Fb/c%3F", Some("q=%20")).as_deref(),
-            Some("/api/a%2Fb/c%3F?q=%20")
+            target(api, "/a%20b/c%3F", Some("q=%20")).as_deref(),
+            Some("/api/a%20b/c%3F?q=%20")
         );
         assert_eq!(target(api, "/a//b", None).as_deref(), Some("/api/a//b"));
     }
@@ -123,12 +131,29 @@ mod tests {
             ("/%2E%2e/%2e./.%2E/secret", "/api/secret"),
             ("/a/%2e/b", "/api/a/b"),
             ("/a/b/..", "/api/a/"),
-            ("/a\\..\\..\\secret", "/api/a%5C..%5C..%5Csecret"),
-            ("/%2e%2e%2fsecret", "/api/%2e%2e%2fsecret"),
         ] {
             let got = target(api, rest, Some("x=1")).unwrap();
             assert_eq!(got, format!("{want}?x=1"), "{rest}");
             assert!(got.starts_with("/api/"), "{rest}: {got}");
+        }
+    }
+
+    /// Audit B2: an encoded `/` or `\` (any case), or a literal `\`, would let an upstream that
+    /// decodes before resolving dot segments leave the prefix: such a rest is refused.
+    #[test]
+    fn encoded_separators_are_refused() {
+        let api = "https://svc.example/api";
+        for rest in [
+            "/%2e%2e%2fadmin",
+            "/..%2fadmin",
+            "/..%2Fadmin",
+            "/..%5cadmin",
+            "/..%5Cadmin",
+            "/a%2fb",
+            "/a\\..\\..\\secret",
+            "/x/%2E%2E%2F%2E%2E%2Fadmin",
+        ] {
+            assert_eq!(target(api, rest, None), None, "{rest}");
         }
     }
 

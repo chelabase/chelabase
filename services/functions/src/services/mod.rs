@@ -186,7 +186,7 @@ pub(crate) async fn call(
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
-            "the path leaves the service",
+            "the path leaves the service, or holds an encoded / or \\",
         );
     };
     let Some(body) = payload(req.body).await else {

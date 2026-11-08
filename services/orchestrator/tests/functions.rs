@@ -1130,6 +1130,12 @@ mod functions {
             "https://nowhere.example.test/",
             "https://hooks.example.test/?q=1",
             "https://hooks.example.test/#f",
+            // Audit S2: credentials, and no host.
+            "https://u:p@hooks.example.test/",
+            "https://user@hooks.example.test/",
+            "https://",
+            "https:///path",
+            "mailto:ops@hooks.example.test",
         ] {
             let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external(url))).await;
             assert_eq!(status, 422, "{url}: {body}");
