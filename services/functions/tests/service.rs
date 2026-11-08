@@ -982,6 +982,53 @@ async fn a_scheduled_body_from_the_worker_is_marked_for_the_runtime() {
     assert_eq!(h.last().header("x-chelabase-event"), None);
 }
 
+/// Edge functions m13: the worker's database event (`chelabase-event: db` on the internal
+/// invoke) reaches the function's `fetch` marked `chelabase-event: db`, once; a public call's
+/// forged header never does.
+#[tokio::test]
+async fn a_db_event_from_the_worker_is_marked_for_the_function() {
+    let h = harness().await;
+    let url = format!("{}/internal/invoke/{}/users", h.control, h.branch);
+    let body = r#"{"id":"t:app:1","type":"INSERT","schema":"public","table":"orders","record":{"id":1},"old_record":null,"txid":7}"#;
+    let resp = h
+        .http
+        .post(&url)
+        .bearer_auth(WORKER)
+        .header("chelabase-event", "db")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen = h.last();
+    assert_eq!(seen.header("chelabase-event"), Some("db"));
+    assert_eq!(seen.headers.get_all("chelabase-event").iter().count(), 1);
+    assert_eq!(seen.header("x-chelabase-event"), None, "the fetch handler, not scheduled");
+    assert_eq!(seen.body, body.as_bytes());
+
+    let resp = h
+        .http
+        .post(&url)
+        .bearer_auth(WORKER)
+        .header("chelabase-event", "other")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("chelabase-event"), None);
+
+    let resp = h
+        .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
+        .header("chelabase-event", "db")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("chelabase-event"), None, "a forgery is stripped");
+}
+
 /// Polls `cond` for up to 2 s (the error is written in the background).
 async fn wait_for(cond: impl Fn() -> bool) {
     for _ in 0..200 {

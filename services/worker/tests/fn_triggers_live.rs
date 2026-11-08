@@ -1300,7 +1300,7 @@ mod fn_triggers {
                 other.is_ok(),
                 "a tenant INSERT stalled {waited:?} behind the drift sweep: {other:?}; outbox locks then: {locks}; sweep result {sweep:?}"
             );
-            assert_eq!(sweep, Ok(()), "the sweep failed on the tenant's open transaction");
+            assert_eq!(sweep.map(drop), Ok(()), "the sweep failed on the tenant's open transaction");
             assert_eq!(
                 fx.value(main, ROWS).await,
                 rows_before,
@@ -1414,7 +1414,7 @@ mod fn_triggers {
             let rows = fx.triggers(main).await;
             assert_eq!(
                 (synced, rows[0].state, rows[0].last_error.clone()),
-                (Ok(()), TriggerState::Installed, None),
+                (Ok(true), TriggerState::Installed, None),
                 "a session holding the sync's advisory key stalled the install ({took:?})"
             );
             assert!(took < Duration::from_secs(5), "waited on the squatter: {took:?}");
@@ -1425,10 +1425,163 @@ mod fn_triggers {
                 fx.worker.sync_fn_triggers(main, false),
                 fx.worker.sync_fn_triggers(main, false)
             );
-            assert_eq!((a, b), (Ok(()), Ok(())));
+            assert_eq!((a.map(drop), b.map(drop)), (Ok(()), Ok(())), "one may yield to the other");
             assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]));
             fx.sql(main, "INSERT INTO public.orders VALUES (1)").await;
             assert_eq!(fx.outbox(main).await, 1);
+        })
+        .await;
+    }
+
+    /// m13: an invoker that records each event's body and answers the scripted statuses in
+    /// turn (then 200).
+    struct Scripted {
+        statuses: std::sync::Mutex<Vec<u16>>,
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl Scripted {
+        fn new(statuses: &[u16]) -> std::sync::Arc<Scripted> {
+            std::sync::Arc::new(Scripted {
+                statuses: std::sync::Mutex::new(statuses.iter().rev().copied().collect()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn seen(&self) -> Vec<serde_json::Value> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl worker::fn_schedules::Invoker for Scripted {
+        async fn invoke(&self, _: BranchId, _: &str, _: serde_json::Value) -> Result<u16, String> {
+            Err("not a scheduled run".into())
+        }
+        async fn deliver_event(&self, _: BranchId, _: &str, body: Vec<u8>) -> Result<u16, String> {
+            self.seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+            Ok(self.statuses.lock().unwrap().pop().unwrap_or(200))
+        }
+    }
+
+    /// m13 (#175): passes until the outbox is quiet (each pass waits up to 5 s inside the
+    /// database for a due row; a retried row is due within its backoff).
+    async fn dispatch(fx: &Fx, invoker: &Scripted, passes: usize) {
+        for _ in 0..passes {
+            fx.worker.dispatch_once(invoker, fx.main, &fx.database).await.unwrap();
+        }
+    }
+
+    /// m13 AC: a committed insert is delivered once, a rolled-back one never; 500 three times
+    /// then 200 is four deliveries and the row removed; a forged row (another trigger id,
+    /// another table, another timeline) is deleted, never delivered.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_delivers_at_least_once_and_drops_forged_rows() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY, note text); CREATE TABLE public.secrets (id int PRIMARY KEY, s text);").await;
+            let f = fx.function("hello").await;
+            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "BEGIN; INSERT INTO public.orders VALUES (9, 'no'); ROLLBACK; INSERT INTO public.orders VALUES (1, 'a');").await;
+            let invoker = Scripted::new(&[]);
+            dispatch(fx, &invoker, 1).await;
+            let seen = invoker.seen();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0]["type"], "INSERT");
+            assert_eq!(seen[0]["record"], serde_json::json!({"id": 1, "note": "a"}));
+            assert!(seen[0]["txid"].as_u64().is_some());
+            assert_eq!(fx.outbox(main).await, 0);
+
+            let failing = Scripted::new(&[500, 500, 500]);
+            fx.sql(main, "INSERT INTO public.orders VALUES (2, 'b');").await;
+            dispatch(fx, &failing, 6).await;
+            assert_eq!(failing.seen().len(), 4, "three failures, then the 2xx");
+            assert_eq!(fx.outbox(main).await, 0);
+            let row = fx.triggers(main).await.into_iter().find(|r| r.id == t).unwrap();
+            assert_eq!(row.last_delivery_error, None, "the delivery cleared it");
+            assert!(row.last_delivered_at.is_some());
+
+            // Forgeries, written straight into the outbox as an owner-level role could.
+            let tl = fx.value(main, "SELECT current_setting('neon.timeline_id')").await;
+            fx.sql(main, &format!(
+                "INSERT INTO chelabase_functions.outbox (trigger_id, payload, timeline_id) VALUES
+                   ('{}', '{{\"type\":\"INSERT\",\"schema\":\"public\",\"table\":\"orders\",\"record\":{{\"id\":5}},\"old_record\":null}}', '{tl}'),
+                   ('{t}', '{{\"type\":\"INSERT\",\"schema\":\"public\",\"table\":\"secrets\",\"record\":{{\"id\":6}},\"old_record\":null}}', '{tl}'),
+                   ('{t}', '{{\"type\":\"INSERT\",\"schema\":\"public\",\"table\":\"orders\",\"record\":{{\"id\":7}},\"old_record\":null}}', 'another-timeline')",
+                Uuid::new_v4()
+            )).await;
+            let quiet = Scripted::new(&[]);
+            dispatch(fx, &quiet, 1).await;
+            assert!(quiet.seen().is_empty(), "{:?}", quiet.seen());
+            assert_eq!(fx.outbox(main).await, 0, "the forged rows were deleted");
+        })
+        .await;
+    }
+
+    /// m13 AC: the dispatcher's database role reads the outbox and no member table, and a
+    /// disabled function's events queue until it is enabled again.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn dispatcher_role_reads_only_the_outbox_and_disabled_functions_queue() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let denied = fx.on(main, &format!("BEGIN; SET LOCAL ROLE {OWNER}; SELECT count(*) FROM public.orders; COMMIT;")).await;
+            assert!(denied.as_ref().is_err_and(|e| e.contains("permission denied")), "{denied:?}");
+            let outbox = fx.on(main, &format!("BEGIN; SET LOCAL ROLE {OWNER}; SELECT count(*) FROM chelabase_functions.outbox; COMMIT;")).await;
+            assert!(outbox.is_ok(), "{outbox:?}");
+
+            // The function is disabled (a new deployment's state starts off): events queue.
+            fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
+            let invoker = Scripted::new(&[]);
+            dispatch(fx, &invoker, 1).await;
+            assert!(invoker.seen().is_empty());
+            assert_eq!(fx.outbox(main).await, 1, "queued while the function is off");
+            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
+            dispatch(fx, &invoker, 1).await;
+            assert_eq!(invoker.seen().len(), 1, "delivered once it is on again");
+        })
+        .await;
+    }
+
+    /// m13 (S2, S3): a deleted trigger, and a deleted function's triggers, are dropped from
+    /// the database by the sweep even with no trigger left on the branch; the dispatcher stops.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn deleted_triggers_and_functions_are_dropped() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
+            let f = fx.function("hello").await;
+            let g = fx.function("other").await;
+            assert!(fx.metadata.set_enabled(main, f, true).await.unwrap());
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            let u = fx.trigger(main, g, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t, u]));
+            assert!(fx.metadata.delete_trigger(main, f, t).await.unwrap());
+            fx.sql(main, "INSERT INTO public.orders VALUES (1);").await;
+            let invoker = Scripted::new(&[]);
+            // The deleted trigger's row is unknown and deleted; the disabled function's held.
+            dispatch(fx, &invoker, 1).await;
+            assert_eq!(fx.outbox(main).await, 1, "only the held row stays");
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[u]));
+            assert!(fx.metadata.delete_function(fx.id, g).await.unwrap());
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(fx.db_triggers(main).await, "", "dropped with no trigger left");
+            assert!(fx.metadata.trigger_drops(main).await.unwrap().is_empty(), "then forgotten");
+            assert!(invoker.seen().is_empty());
+            assert_eq!(
+                fx.worker.dispatch_once(&*invoker, main, &fx.database).await,
+                Ok(worker::fn_events::Pass::Stop),
+                "no trigger left: the dispatcher stops"
+            );
         })
         .await;
     }

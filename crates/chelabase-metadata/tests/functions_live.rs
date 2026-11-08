@@ -15,7 +15,7 @@ mod functions {
         BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
         KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, RunAsMint, RunAsUnmintable,
-        TriggerInstall, TriggerSource,
+        TriggerDelivery, TriggerInstall, TriggerSource,
         TriggerState,
     };
     use chelabase_types::data_key::{self, DataKeyKind};
@@ -1735,6 +1735,29 @@ mod functions {
             ("settle_run_as_mint", |c, x| Box::pin(async move {
                 c.settle_run_as_mint(x.main, x.g, "minter", Some(5252), RunAsMint::Key(&run_as("minter", 5252))).await.map(drop)
             })),
+            // m13: trigger enable/disable and delete (4b, then the drop 4c), the dispatcher's
+            // record (4b alone) and the worker's clear (4c alone).
+            ("update_trigger", |c, x| Box::pin(async move {
+                let Some(t) = c.list_triggers(x.main).await?.into_iter().next() else { return Ok(()) };
+                c.update_trigger(x.main, x.f, t.id, false).await.map(drop)
+            })),
+            ("delete_trigger", |c, x| Box::pin(async move {
+                let Some(t) = c.list_triggers(x.main).await?.into_iter().next() else { return Ok(()) };
+                c.delete_trigger(x.main, x.f, t.id).await.map(drop)
+            })),
+            ("record_trigger_deliveries", |c, x| Box::pin(async move {
+                let deliveries: Vec<TriggerDelivery> = c
+                    .list_triggers(x.main)
+                    .await?
+                    .into_iter()
+                    .map(|t| TriggerDelivery { id: t.id, delivered: false, dead: 1, error: Some("500".into()) })
+                    .collect();
+                c.record_trigger_deliveries(x.main, &deliveries).await.map(drop)
+            })),
+            ("clear_trigger_drops", |c, x| Box::pin(async move {
+                let drops = c.trigger_drops(x.main).await?;
+                c.clear_trigger_drops(x.main, &drops).await.map(drop)
+            })),
             ("settle_trigger_installs", |c, x| Box::pin(async move {
                 let installs: Vec<TriggerInstall> = c
                     .list_triggers(x.main)
@@ -2254,6 +2277,132 @@ mod functions {
         assert!(!c.settle_run_as_mint(child3, f, "reporter", Some(4242), RunAsMint::Key(&run_as("reporter", 4242))).await.unwrap());
         assert!(c.set_run_as(child3, f, Some(&run_as("reporter", 4242))).await.unwrap());
         assert_eq!(st(child3).await.run_as_unmintable, None, "a member's set_run_as clears it");
+        s.finish().await;
+    }
+
+    /// m13: settles every table trigger read as installed (as m8's worker does).
+    async fn install_all(c: &MetadataClient, branch: BranchId) {
+        let installs: Vec<TriggerInstall> = c
+            .list_triggers(branch)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| TriggerInstall { id: t.id, enabled_since: t.enabled_since, error: None })
+            .collect();
+        c.settle_trigger_installs(branch, &installs).await.unwrap();
+    }
+
+    /// m13 (#175, S2, S4): turning a table trigger off records a drop and keeps the row
+    /// (disabled triggers are dropped from the database, so they queue nothing); turning it on
+    /// pends it again; a delete records a drop ("drop, then forget"); a storage trigger never
+    /// records one. Only the function's own trigger on the branch is found, and a cleared drop
+    /// is only the one read.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_update_and_delete_record_drops() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let g = s.function(db, "other").await;
+        let c = &s.client;
+        let t = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        let st = c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+        install_all(c, main).await;
+        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
+        assert_eq!(c.update_trigger(main, g, t, false).await.unwrap(), None, "another function's");
+        let off = c.update_trigger(main, f, t, false).await.unwrap().unwrap();
+        assert_eq!((off.enabled, off.state), (false, TriggerState::Installed));
+        let drops = c.trigger_drops(main).await.unwrap();
+        assert_eq!(drops.len(), 1, "the disable records a drop");
+        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, true)], "a drop is pending work");
+        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a disabled trigger is never dispatched");
+        let on = c.update_trigger(main, f, t, true).await.unwrap().unwrap();
+        assert_eq!((on.enabled, on.state, on.last_error), (true, TriggerState::PendingInstall, None));
+        assert!(on.enabled_since > off.enabled_since, "a new generation");
+        // A second drop while the first is still recorded; clearing the first keeps it.
+        c.update_trigger(main, f, t, false).await.unwrap().unwrap();
+        assert_eq!(c.clear_trigger_drops(main, &drops).await.unwrap(), 1);
+        assert_eq!(c.trigger_drops(main).await.unwrap().len(), 1, "the newer drop stays");
+        // A disabled pending row is no pending work of its own.
+        let later = c.trigger_drops(main).await.unwrap();
+        c.clear_trigger_drops(main, &later).await.unwrap();
+        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
+        c.update_trigger(main, f, t, true).await.unwrap().unwrap();
+        assert!(!c.delete_trigger(main, g, t).await.unwrap(), "another function's");
+        assert!(c.delete_trigger(main, f, t).await.unwrap());
+        assert!(!c.delete_trigger(main, f, t).await.unwrap(), "once");
+        assert_eq!(c.trigger_drops(main).await.unwrap().len(), 1, "the delete records a drop");
+        let none = c.trigger_drops(main).await.unwrap();
+        c.clear_trigger_drops(main, &none).await.unwrap();
+        assert!(c.update_trigger(main, f, st, false).await.unwrap().is_some());
+        assert!(c.delete_trigger(main, f, st).await.unwrap());
+        assert!(c.trigger_drops(main).await.unwrap().is_empty(), "a storage trigger has no database trigger");
+        s.finish().await;
+    }
+
+    /// m13 (#175, S3): deleting a function records a drop for each of its table triggers on
+    /// every branch before the cascade deletes the rows; a branch tombstone purges its drops.
+    #[tokio::test]
+    #[ignore]
+    async fn function_delete_records_trigger_drops() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+        let child = s.branch(db, main, "dev").await;
+        assert_eq!(c.list_triggers(child).await.unwrap().len(), 2);
+        assert!(c.delete_function(db, f).await.unwrap());
+        assert!(c.list_triggers(main).await.unwrap().is_empty());
+        assert_eq!(c.trigger_drops(main).await.unwrap().len(), 1);
+        assert_eq!(c.trigger_drops(child).await.unwrap().len(), 1);
+        let mut sweep = c.trigger_sweep_branches(10).await.unwrap();
+        sweep.sort_by_key(|(b, _)| b.as_uuid());
+        let mut want = vec![(main, true), (child, true)];
+        want.sort_by_key(|(b, _)| b.as_uuid());
+        assert_eq!(sweep, want, "both branches still get synced");
+        c.mark_branch_deleted(child).await.unwrap();
+        assert!(c.trigger_drops(child).await.unwrap().is_empty(), "the tombstone purges them");
+        s.finish().await;
+    }
+
+    /// m13: the dispatcher's record adds dead events, keeps the last failure until a delivery
+    /// clears it, and stamps deliveries; a child's copy starts at zero. Dispatch targets are
+    /// installed, enabled table triggers on ready branches, by Postgres database.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_deliveries_recorded() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let t = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "pending rows aren't dispatched");
+        install_all(c, main).await;
+        assert_eq!(c.dispatch_targets(10).await.unwrap(), vec![(main, "app".to_string())]);
+        let row = |list: Vec<chelabase_metadata::TriggerRecord>| list.into_iter().find(|r| r.id == t).unwrap();
+        let fresh = row(c.list_triggers(main).await.unwrap());
+        assert_eq!((fresh.dead_count, fresh.last_delivery_error, fresh.last_delivered_at), (0, None, None));
+        let failed = TriggerDelivery { id: t, delivered: false, dead: 2, error: Some("the function answered 500".into()) };
+        assert_eq!(c.record_trigger_deliveries(main, std::slice::from_ref(&failed)).await.unwrap(), 1);
+        let (_, other) = s.database().await;
+        assert_eq!(c.record_trigger_deliveries(other, std::slice::from_ref(&failed)).await.unwrap(), 0, "another branch's");
+        let after = row(c.list_triggers(main).await.unwrap());
+        assert_eq!((after.dead_count, after.last_delivery_error.as_deref()), (2, Some("the function answered 500")));
+        assert_eq!(after.last_delivered_at, None);
+        c.record_trigger_deliveries(main, &[TriggerDelivery { id: t, delivered: true, dead: 1, error: None }])
+            .await
+            .unwrap();
+        let ok = row(c.list_triggers(main).await.unwrap());
+        assert_eq!((ok.dead_count, ok.last_delivery_error), (3, None));
+        assert!(ok.last_delivered_at.is_some());
+        let child = s.branch(db, main, "dev").await;
+        let copied = c.list_triggers(child).await.unwrap();
+        assert!(copied.iter().all(|r| r.dead_count == 0 && r.last_delivered_at.is_none()), "{copied:?}");
+        c.mark_branch_deleted(main).await.unwrap();
+        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a deleted branch is never dispatched");
         s.finish().await;
     }
 }

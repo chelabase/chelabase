@@ -1273,6 +1273,22 @@ pub mod orchestrator {
         key_endpoint("orchestrator.update_function_schedule", Method::Patch, FUNCTION_SCHEDULE, BRANCH);
     pub const DELETE_FUNCTION_SCHEDULE: Endpoint =
         key_endpoint("orchestrator.delete_function_schedule", Method::Delete, FUNCTION_SCHEDULE, BRANCH);
+    /// Edge functions m13: a function's triggers on a branch, as its schedules.
+    const FUNCTION_TRIGGERS: &str = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers";
+    const FUNCTION_TRIGGER: &str =
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}";
+    pub const LIST_FUNCTION_TRIGGERS: Endpoint = key_endpoint(
+        "orchestrator.list_function_triggers",
+        Method::Get,
+        FUNCTION_TRIGGERS,
+        Access::Project(Viewer),
+    );
+    pub const CREATE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.create_function_trigger", Method::Post, FUNCTION_TRIGGERS, BRANCH);
+    pub const UPDATE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.update_function_trigger", Method::Patch, FUNCTION_TRIGGER, BRANCH);
+    pub const DELETE_FUNCTION_TRIGGER: Endpoint =
+        key_endpoint("orchestrator.delete_function_trigger", Method::Delete, FUNCTION_TRIGGER, BRANCH);
 
     /// A management route callable from Studio.
     const fn key_endpoint(name: &'static str, method: Method, path: &'static str, access: Access) -> Endpoint {
@@ -1811,6 +1827,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::CREATE_FUNCTION_SCHEDULE,
     orchestrator::UPDATE_FUNCTION_SCHEDULE,
     orchestrator::DELETE_FUNCTION_SCHEDULE,
+    orchestrator::LIST_FUNCTION_TRIGGERS,
+    orchestrator::CREATE_FUNCTION_TRIGGER,
+    orchestrator::UPDATE_FUNCTION_TRIGGER,
+    orchestrator::DELETE_FUNCTION_TRIGGER,
     functions::INVOKE,
     functions::INVOKE_PATH,
     functions::INVOKE_PUBLIC,
@@ -2799,6 +2819,10 @@ mod tests {
             ("orchestrator.create_function_schedule", BRANCH),
             ("orchestrator.update_function_schedule", BRANCH),
             ("orchestrator.delete_function_schedule", BRANCH),
+            ("orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("orchestrator.create_function_trigger", BRANCH),
+            ("orchestrator.update_function_trigger", BRANCH),
+            ("orchestrator.delete_function_trigger", BRANCH),
             // Edge functions m3: invocations (served by m4).
             ("functions.invoke", Access::DataKey),
             ("functions.invoke_path", Access::DataKey),
@@ -3201,6 +3225,10 @@ mod tests {
             ("POST", "/hello/schedules", "orchestrator.create_function_schedule", branch),
             ("PATCH", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_schedule", branch),
             ("DELETE", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_schedule", branch),
+            ("GET", "/hello/triggers", "orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("POST", "/hello/triggers", "orchestrator.create_function_trigger", branch),
+            ("PATCH", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_trigger", branch),
+            ("DELETE", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_trigger", branch),
         ] {
             let path = format!("{base}{tail}");
             let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {

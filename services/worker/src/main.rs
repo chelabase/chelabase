@@ -178,10 +178,12 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(worker::fn_schedules::HttpInvoker::new(url, token.clone())?);
             tokio::spawn(worker::fn_schedules::schedule_loop(
                 worker.metadata.inner().clone(),
-                invoker,
+                invoker.clone(),
             ));
+            // m13: database events, delivered through the same internal invoke.
+            tokio::spawn(worker::fn_events::dispatch_loop(worker.clone(), invoker));
         }
-        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules don't run"),
+        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules and database events don't run"),
     }
     match &functions.bundles {
         Some(config) => {

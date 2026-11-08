@@ -273,6 +273,7 @@ fn path_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> String {
         .replace("{query_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{webhook_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{schedule_id}", &uuid::Uuid::new_v4().to_string())
+        .replace("{trigger_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{run_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{user_id}", &uuid::Uuid::new_v4().to_string())
         .replace("{member_id}", &uuid::Uuid::new_v4().to_string())
