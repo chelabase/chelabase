@@ -5,8 +5,7 @@
 # on a network of its own and is reached the way a self-hoster reaches a service on their own
 # machine: through `host.docker.internal` (the host gateway) and a port published on the
 # docker0 address (not on the LAN). The overlay allowlists that name for services only, on the
-# orchestrator (the save-time check) and the functions service (every connection), and tells
-# the runner where the stub is.
+# orchestrator (the save-time check) and the functions service (every connection).
 #
 # On a workbench stack, from the checkout the stack runs (`just workbench env` prints the
 # project and env file):
@@ -14,9 +13,12 @@
 #   docker compose -p <project> -f infra/compose/docker-compose.yml \
 #     -f infra/compose/docker-compose.workbench.yml -f infra/compose/fixtures/stub-service.yml \
 #     --env-file <stack.env> up -d stub-service orchestrator functions
-#   just functions-e2e
+#   just functions-services-e2e
 #
-# Without this overlay the e2e's service case says it is skipped.
+# which runs `chelabase workbench test --env CHELABASE_STUB_SERVICE_URL=http://host.docker.internal:18099
+# -p chelabase-functions --test e2e -- --run-ignored only services::` (`workbench test` runs its
+# own runner, so the URL is passed with --env). Without it the e2e's service case says it is
+# skipped.
 services:
   stub-service:
     image: mccutchen/go-httpbin:2.26.0@sha256:873b4fdb27fe7cc66fa12cb9362574e1b0bf31df7ca8a71b2502988327a0b8a4
@@ -40,10 +42,6 @@ services:
     environment:
       - CHELABASE_SERVICES_ALLOW_HOSTS=host.docker.internal
       - CHELABASE_SERVICES_ALLOW_HTTP=true
-
-  runner:
-    environment:
-      - CHELABASE_STUB_SERVICE_URL=http://host.docker.internal:${CHELABASE_STUB_SERVICE_PORT:-18099}
 
 networks:
   stub: {}
