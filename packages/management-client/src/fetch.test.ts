@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
 import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, fetchStorageObject, managementConnection, parseExact, streamRequest } from "./fetch";
-import { exportMergePlan, storageUploadObject } from "./generated/endpoints";
+import { exportMergePlan, getServiceLogs, storageUploadObject } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
   return new Response(body, { status, headers: { "content-type": type } });
@@ -196,6 +196,18 @@ describe("fetchMergePlanSql", () => {
     // A JSON answer is still parsed.
     setup((async () => res('{"a":1}', 200)) as typeof fetch);
     expect(await customFetch("/v1/x", { method: "GET" })).toEqual({ a: 1 });
+  });
+
+  it("the_generated_service_logs_client_returns_the_text", async () => {
+    // Log lines that look like JSON stay text; a JSON-parse would turn the first into a number.
+    const logs = "42\n{\"level\":\"info\"}\n";
+    const f = vi.fn(async () => res(logs, 200, "text/plain; charset=utf-8"));
+    setup(f as unknown as typeof fetch);
+    expect(await getServiceLogs("d", "b", "echo")).toBe(logs);
+    expect((f.mock.calls[0] as unknown as [string])[0]).toBe("https://api.test/v1/databases/d/branches/b/functions/echo/logs");
+    // Another path under the function is still JSON.
+    setup((async () => res("42", 200)) as typeof fetch);
+    expect(await customFetch("/v1/databases/d/branches/b/functions/echo/logs/x", { method: "GET" })).toBe(42);
   });
 
   it("errors_are_api_errors", async () => {

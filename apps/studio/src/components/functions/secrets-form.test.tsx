@@ -57,6 +57,8 @@ describe("FunctionSecrets", () => {
     await user.click(await screen.findByRole("button", { name: "Replace EXISTING" }));
     expect(screen.getByLabelText("Secret name")).toHaveValue("EXISTING");
     expect(screen.getByLabelText("Value")).toHaveValue("");
+    // The next thing to type is the new value.
+    expect(screen.getByLabelText("Value")).toHaveFocus();
   });
 
   it("refuses_a_bad_name_before_sending", async () => {

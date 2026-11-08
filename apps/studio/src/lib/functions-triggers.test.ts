@@ -3,6 +3,7 @@ import {
   STORAGE_EVENTS,
   TABLE_EVENTS,
   initialTriggerDraft,
+  triggersInstalling,
   splitQualified,
   triggerDraftReducer,
   triggerReason,
@@ -100,5 +101,14 @@ describe("triggerTarget", () => {
     expect(triggerTarget({ source: "storage", pg_database: "app", schema: null, table: null, bucket: null, prefix: null } as never)).toBe("app · every bucket");
     expect(triggerTarget({ source: "storage", pg_database: "app", schema: null, table: null, bucket: "avatars", prefix: "u/" } as never)).toBe("app · avatars/u/*");
     expect(triggerTarget({ source: "storage", pg_database: "app", schema: null, table: null, bucket: null, prefix: "u/" } as never)).toBe("app · every bucket, u/*");
+  });
+});
+
+describe("triggersInstalling", () => {
+  it("polls_only_while_one_is_pending_install", () => {
+    const t = (state: string) => ({ state }) as Parameters<typeof triggersInstalling>[0][number];
+    expect(triggersInstalling([t("installed"), t("pending_install")])).toBe(true);
+    expect(triggersInstalling([t("installed"), t("failed")])).toBe(false);
+    expect(triggersInstalling([])).toBe(false);
   });
 });

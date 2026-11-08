@@ -96,3 +96,8 @@ export function triggerTarget(t: Pick<FunctionTrigger, "source" | "pg_database" 
   if (t.bucket) return `${t.pg_database} · ${t.bucket}/${t.prefix ?? ""}*`;
   return `${t.pg_database} · every bucket${t.prefix ? `, ${t.prefix}*` : ""}`;
 }
+
+/** Whether any trigger is still being installed (the section polls until none is). */
+export function triggersInstalling(triggers: Pick<FunctionTrigger, "state">[]): boolean {
+  return triggers.some((t) => t.state === "pending_install");
+}

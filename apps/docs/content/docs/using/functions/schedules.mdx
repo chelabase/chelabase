@@ -25,9 +25,15 @@ curl -X DELETE "$BASE/$SCHEDULE_ID" -H "Authorization: Bearer $MEMBER_TOKEN"
 - `enabled`: a disabled schedule never runs. A schedule lists its `next_run_at`.
 - An invalid cron or time zone answers 422 naming the field.
 
-{/* TODO(#173): confirm against landed code: `chelabase functions schedule add|rm|list`, and the Schedules section of Studio's function drawer. */}
+From the CLI:
 
-The CLI commands `chelabase functions schedule add|rm|list` and a **Schedules** section in Studio's function drawer manage the same schedules.
+```bash
+chelabase functions schedule add NAME --cron '<5 fields>' [--timezone IANA]
+chelabase functions schedule rm NAME ID
+chelabase functions schedule list NAME
+```
+
+`add` prints the schedule's id (`--timezone` defaults to `UTC`). `list` prints one line per schedule: its id, cron, time zone, enabled or disabled, and `next=` its next run time. The CLI can't edit a schedule or turn one off; the **Schedules** section of Studio's function drawer can, and adds and deletes them too.
 
 ## How runs happen
 

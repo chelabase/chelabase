@@ -86,6 +86,10 @@ curl -X PATCH "$API/v1/databases/$DB/branches/$BRANCH/functions/billing" \
 - A child branch gets **its own key**, bound to the same role identity as the parent's (the role the member approved, by OID). If the role is missing on the child, or a different role has taken its name, no key is made and the function runs without `CHELABASE_SERVICE_KEY`.
 - `GET …/functions` reports `run_as_role` and `run_as_active` (whether a live key backs it).
 
+<Callout type="warn">
+A custom run-as role can't use the [storage API](/using/storage) yet: the storage tables are granted only to `anon` and `authenticated`, so the key gets 403 from storage whatever storage policies you write for its role. The data API is not affected. Letting custom roles use storage under RLS is tracked in [#187](https://github.com/chelabase/chelabase/issues/187).
+</Callout>
+
 ### Limits of the binding
 
 - **A function can call itself** through the binding (and so any function, including in a loop) with no hop limit. Guard against recursion in your own code.

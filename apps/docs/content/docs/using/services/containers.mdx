@@ -11,15 +11,23 @@ A **container service** is an image Chelabase pulls and runs for you through the
 Container deploys are **tenant-admin only**, and the runner puts **no egress filter** on its containers. Read [What the runner doesn't isolate](#what-the-runner-doesnt-isolate) before you let anyone deploy an image.
 </Callout>
 
-{/* TODO(#173): confirm against landed code: this page follows issue #173's text. Check every command, flag, field, answer and screen below once #173 lands. */}
-
 ## Deploy
 
 ```bash
+chelabase services deploy NAME --image <name:tag|name@sha256:…> --port <1-65535> [--health PATH] [--memory 256|256m|1g] [--cpus 0.5]
+
 chelabase services deploy echo --image registry.example.com/echo@sha256:… --port 8080 --health /healthz
 ```
 
-{/* TODO(#173): confirm against landed code: the exact `chelabase services deploy|list|enable|disable|logs|rollback` commands and flags (`--image`, `--port`, `--health`). */}
+The first deploy creates the service and prints its signing secret once (`echo: signing secret whsec_… (shown only now)`; keep it for [verifying requests](/using/services/verify-signature)). Every deploy prints `NAME: deployed <id>`, then waits for a background [rollover](#rollover) and exits non-zero if it fails or a newer deployment replaces it. The first deploy then turns the service on. `--memory` is MiB, or a size with an `m` or `g` suffix; `--memory` and `--cpus` set `resources` below.
+
+| Command | What it does |
+|---|---|
+| `services list` | The branch's services: name, enabled or disabled, health, active deployment, last error. |
+| `services enable NAME` | Turns the service on for this branch. |
+| `services disable NAME` | Turns it off: calls answer 503 and its container stops. |
+| `services logs NAME` | The container's last 200 log lines. |
+| `services rollback NAME DEPLOYMENT` | Rolls back to an earlier deployment, once its container is healthy (a rollover, like a deploy). |
 
 The deployment's spec is `{backend: "container", image, port, health_path, resources}`:
 
@@ -28,33 +36,38 @@ The deployment's spec is `{backend: "container", image, port, health_path, resou
 - `resources` may lower `memory_mb` and `cpus`, never raise them past the runner's caps (`CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB`, default 512, and `CHELABASE_SERVICE_RUNNER_CPU_CAP`, default 1).
 - Unknown spec fields are refused, so a spec can't ask for `privileged`, a mount or a network.
 
-The same screen exists in Studio: the **Functions** tab lists services with a kind badge, their backend, status and health, the last 200 log lines and an on/off switch.
-
-{/* TODO(#173): confirm against landed code: Studio's services list, kind badge, logs panel and switch. */}
+Studio's **Functions** tab lists services beside the functions: a `service` kind badge with the backend (`container` or `external`) under it, a **Status** (Running, Unhealthy, Starting, Not deployed, Stopped) and the enabled switch. A container service's drawer has a **Logs** section with the last 200 lines and a **Refresh** button (Developer and up), and a notice while a rollover is pending or after one failed.
 
 ## Rollover
 
 A new image reference is a new deployment, and it **rolls over** without downtime:
 
-1. the new container is started and checked until it is healthy (60 seconds at most);
+1. the new container is started and checked until it is healthy (60 seconds at most, then the rollover fails);
 2. the route switches to it;
 3. the old container is stopped.
 
-If the new image never passes its health check, traffic stays on the old container, the deployment's `last_error` says why, and the deploy command exits non-zero.
+The rollover runs in the background: the deploy (or rollback) of a service that is enabled on the branch answers `202` with `rollout: pending`, and the service's `rollout` field in the API says `pending`, then disappears once the new deployment is active, or turns `failed` with the reason (`rollout.state: "failed"`, `rollout.error`). `chelabase services deploy` and `rollback` wait for it, and Studio shows it on the service.
 
-The rollover runs in the background: the deploy (or rollback) answers `202` with `rollout: pending`, and the service's `rollout` field in the API says `pending`, then disappears once the new deployment is active, or turns `failed` with the reason. `chelabase services deploy` and `rollback` wait for it, and Studio shows it on the service.
-
-{/* TODO(#173): confirm against landed code: rollover timeout (60 s), `last_error` wording and the command's exit code. */}
+If the new image never passes its health check, traffic stays on the old container, the service's `last_error` on the branch says why, `rollout.state` is `failed` with the reason, and the deploy command exits non-zero.
 
 ## Switch off and logs
 
-Turning a service off answers 503 within about 2 seconds and stops its container within about 30 seconds. `chelabase services logs` and Studio's logs panel show the container's last 200 lines; `GET /functions/{name}/logs` is open to Developers and above (a Viewer gets 403) and answers for container services only.
+Turning a service off answers 503 within about 2 seconds and stops its container within about 30 seconds. `chelabase services logs` and Studio's logs panel show the container's last 200 lines, as text, from [`GET …/functions/{name}/logs`](/reference/management/functions/getServiceLogs):
 
-{/* TODO(#173): confirm against landed code: the logs command and route, the 2 s and 30 s timings, and the Viewer 403. */}
+- Developers and above may read them; a Viewer gets 403 (logs can hold what a service prints).
+- 404 when the service has no running container on the branch, 409 `conflict` with `reason: not_deployed` when it has no deployment there, 422 for a function or an external service.
 
-With the `services` profile off, a container deploy fails with `runner_unavailable` and external services keep working.
+With the `services` profile off, a container deploy, rollback or logs read answers 503 `runner_unavailable`, container services don't run, and external services keep working.
 
-{/* TODO(#173): confirm against landed code: `runner_unavailable` and the answer a call gets while the profile is off. */}
+## Environment
+
+A container gets the service's [secrets](/using/functions/environment#secrets) on the branch as environment variables, plus:
+
+| Variable | Value |
+|---|---|
+| `PORT` | The spec's `port` |
+| `CHELABASE_URL` | The instance's public API URL |
+| `CHELABASE_BRANCH_ID` | The branch the container serves |
 
 ## How the runner works
 

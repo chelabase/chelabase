@@ -1,4 +1,4 @@
-import { buildHeaders, getGetServiceLogsUrl, managementConnection, requestJson, type Function as FunctionInfo, type FunctionDeployment } from "@chelabase/management-client";
+import type { Function as FunctionInfo, FunctionDeployment } from "@chelabase/management-client";
 
 /** A service deployment's spec, read defensively: the API types it as an open object. */
 export interface ServiceSpecView {
@@ -44,17 +44,4 @@ export function serviceStatus(fn: Pick<FunctionInfo, "kind" | "enabled" | "deplo
   // A switch just turned on hasn't been checked yet, whatever the last check said.
   if (!fn.enabled || fn.health === null) return { label: "Starting", tone: "dim" };
   return fn.health === "healthy" ? { label: "Running", tone: "good" } : { label: "Unhealthy", tone: "bad" };
-}
-
-/**
- * A container service's last 200 log lines, as text. The generated `getServiceLogs` parses every
- * answer as JSON, which a plain-text body isn't, so this reads it as text.
- */
-export async function fetchServiceLogs(databaseId: string, branchId: string, name: string, fetchImpl: typeof fetch = (input, init) => globalThis.fetch(input, init)): Promise<string> {
-  const conn = managementConnection();
-  const init: RequestInit = { method: "GET" };
-  const headers = buildHeaders(init, conn.token ? { Authorization: `Bearer ${conn.token}` } : {});
-  headers.set("Accept", "text/plain, application/json");
-  const text = await requestJson<string | undefined>(fetchImpl, `${conn.baseUrl}${getGetServiceLogsUrl(databaseId, branchId, name)}`, { ...init, headers }, conn.onUnauthorized, (t) => t);
-  return text ?? "";
 }

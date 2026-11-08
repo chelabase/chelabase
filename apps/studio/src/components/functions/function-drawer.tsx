@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { curlFor, functionErrorText, invokeUrl, rolloutNotice } from "@/lib/functions";
 import { deploymentTarget, serviceSpecOf } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
-import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
+import { ReadOnlyHint, VIEWER_LOGS_REASON, VIEWER_REASON } from "./read-only-hint";
 import { RunAsForm } from "./run-as-form";
 import { SchedulesSection } from "./schedules-section";
 import { FunctionSecrets } from "./secrets-form";
@@ -40,7 +40,18 @@ const AUTH_TEXT: Record<string, string> = {
   public: "No credential: anyone with the URL.",
 };
 
-/** A side panel with one function: how to call it, its run-as role, its deployments and its secrets. */
+/** Who may call it. A service has no keyless URL, so a public one still takes any data key. */
+function authText(fn: FunctionInfo): string {
+  if (!fn.auth) return "Auth isn't set: calls are refused until it is.";
+  if (fn.kind !== "service") return AUTH_TEXT[fn.auth];
+  const who = fn.auth === "public" ? "Any data key (a service has no keyless URL)." : AUTH_TEXT[fn.auth];
+  return `${who} The rest of the path and the query go to the service.`;
+}
+
+/**
+ * A side panel with one function: how to call it, its run-as role, its deployments, schedules,
+ * triggers and secrets. A service has no run-as role, schedules or triggers; its logs need Developer.
+ */
 export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, update, onClose }: FunctionDrawerProps) {
   const deployments = useListFunctionDeployments(databaseId, branchId, fn.name);
   const [activating, setActivating] = useState<string | null>(null);
@@ -98,7 +109,7 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
 
           <Section title="Invoke">
             <p className="text-xs text-chalk-dim">
-              {service ? "Any data key; the rest of the path and the query go to the service." : fn.auth ? AUTH_TEXT[fn.auth] : "Auth isn't set: calls are refused until it is."}
+              {authText(fn)}
             </p>
             <div className="flex items-center gap-2">
               <code className="min-w-0 flex-1 bg-ink px-2 py-1 font-mono text-xs break-all">{url}</code>
@@ -112,13 +123,23 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
 
           {service && backend === "container" && (
             <Section title="Logs">
-              <ServiceLogs databaseId={databaseId} branchId={branchId} name={fn.name} />
+              {canChange ? (
+                <ServiceLogs databaseId={databaseId} branchId={branchId} name={fn.name} />
+              ) : (
+                <ReadOnlyHint reason={VIEWER_LOGS_REASON}>
+                  <Button size="xs" variant="outline" disabled>
+                    Read logs
+                  </Button>
+                </ReadOnlyHint>
+              )}
             </Section>
           )}
 
-          <Section title="Run as">
-            <RunAsForm key={fn.run_as_role ?? ""} fn={fn} canChange={canChange} onSave={(role) => update({ run_as_role: role })} />
-          </Section>
+          {!service && (
+            <Section title="Run as">
+              <RunAsForm key={fn.run_as_role ?? ""} fn={fn} canChange={canChange} onSave={(role) => update({ run_as_role: role })} />
+            </Section>
+          )}
 
           <Section title="Deployments">
             {deployments.error ? (
@@ -171,13 +192,17 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
             )}
           </Section>
 
-          <Section title="Schedules">
-            <SchedulesSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
-          </Section>
+          {!service && (
+            <>
+              <Section title="Schedules">
+                <SchedulesSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
+              </Section>
 
-          <Section title="Triggers">
-            <TriggersSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
-          </Section>
+              <Section title="Triggers">
+                <TriggersSection databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
+              </Section>
+            </>
+          )}
 
           <Section title="Secrets">
             <FunctionSecrets databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />

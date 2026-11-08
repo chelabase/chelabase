@@ -150,6 +150,58 @@ describe("FunctionList", () => {
     expect(screen.getByText("http://api.test/services/v1/echo")).toBeInTheDocument();
   });
 
+  it("a_service_shows_its_own_auth_and_no_function_only_sections", async () => {
+    const user = userEvent.setup();
+    const svcDeployments = [{ ...DEPLOYMENTS[0], id: "svc-dep-1", spec: { backend: "external", url: "https://echo.example" } }];
+    setup("developer", {
+      [`GET ${base("b2")}`]: () => jsonResponse([fn("echo", { kind: "service", auth: "app_user", enabled: true, deployment_id: "svc-dep-1", health: "healthy" })]),
+      [`GET ${base("b2")}/echo/deployments`]: () => jsonResponse(svcDeployments),
+      [`GET ${base("b2")}/echo/secrets`]: () => jsonResponse([]),
+    });
+    expect(await screen.findByText("App user")).toBeInTheDocument();
+    expect(screen.queryByText("Data key")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "echo" }));
+    expect(await screen.findByText(/A signed-in app user, or a secret key for server calls/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Deployments" })).toBeInTheDocument();
+    for (const h of ["Run as", "Schedules", "Triggers"]) expect(screen.queryByRole("heading", { name: h })).not.toBeInTheDocument();
+  });
+
+  it("a_public_service_still_needs_a_data_key", async () => {
+    const user = userEvent.setup();
+    setup("developer", {
+      [`GET ${base("b2")}`]: () => jsonResponse([fn("echo", { kind: "service", auth: "public", enabled: true, deployment_id: null, health: null })]),
+      [`GET ${base("b2")}/echo/deployments`]: () => jsonResponse([]),
+      [`GET ${base("b2")}/echo/secrets`]: () => jsonResponse([]),
+    });
+    await user.click(await screen.findByRole("button", { name: "echo" }));
+    expect(await screen.findByText(/Any data key/)).toBeInTheDocument();
+    expect(screen.queryByText(/anyone with the URL/)).not.toBeInTheDocument();
+  });
+
+  it("viewer_is_told_service_logs_need_developer_without_a_request", async () => {
+    const user = userEvent.setup();
+    const svcDeployments = [{ ...DEPLOYMENTS[0], id: "svc-dep-1", spec: { backend: "container", image: "echo@sha256:" + "b".repeat(64), port: 8080 } }];
+    const { f } = setup("viewer", {
+      [`GET ${base("b2")}`]: () => jsonResponse([fn("echo", { kind: "service", auth: "key", enabled: true, deployment_id: "svc-dep-1", health: "healthy" })]),
+      [`GET ${base("b2")}/echo/deployments`]: () => jsonResponse(svcDeployments),
+      [`GET ${base("b2")}/echo/secrets`]: () => jsonResponse([]),
+    });
+    await user.click(await screen.findByRole("button", { name: "echo" }));
+    expect(await screen.findByRole("heading", { name: "Logs" })).toBeInTheDocument();
+    const read = screen.getByRole("button", { name: "Read logs" });
+    expect(read).toBeDisabled();
+    await user.hover(read.parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Viewers can't read service logs");
+    expect(f.calls.some((c) => c.url.endsWith("/echo/logs"))).toBe(false);
+  });
+
+  it("a_plain_function_has_no_status", async () => {
+    setup("developer", { [`GET ${base("b2")}`]: () => jsonResponse([fn("hello")]) });
+    const row = (await screen.findByRole("button", { name: "hello" })).closest("tr")!;
+    const status = row.querySelectorAll("td")[3];
+    expect(status).toHaveTextContent(/^–$/);
+  });
+
   it("empty_state_shows_the_dev_command", async () => {
     setup("developer", { [`GET ${base("b2")}`]: () => jsonResponse([]) });
     expect(await screen.findByText(DEV_COMMAND)).toBeInTheDocument();

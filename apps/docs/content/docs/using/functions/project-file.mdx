@@ -62,6 +62,12 @@ Signs in to an instance with an email and password. The email is prompted for wh
 | `secrets set FUNCTION SECRET` | Sets a secret on a function. See below. |
 | `secrets unset FUNCTION SECRET` | Removes a secret. |
 | `secrets list FUNCTION` | The secrets' names. Values never come back. |
+| `schedule add NAME --cron '<5 fields>' [--timezone IANA]` | Adds a cron schedule; prints its id. See [Schedules](/using/functions/schedules). |
+| `schedule rm NAME ID` | Removes a schedule. |
+| `schedule list NAME` | The function's schedules, with `next=` their next run. |
+| `trigger add NAME (--table SCHEMA.TABLE \| --storage [--bucket B] [--prefix P]) --pg-database DB --events e1,e2` | Adds a table or storage trigger; prints its id. See [Triggers](/using/functions/triggers). |
+| `trigger rm NAME ID` | Removes a trigger. |
+| `trigger list NAME` | The function's triggers, with their state and delivery counts. |
 
 A secret's value is read from stdin when it is not a terminal (one trailing newline is dropped), else from a prompt that doesn't echo. It is never taken from the command line.
 
@@ -69,6 +75,8 @@ A secret's value is read from stdin when it is not a terminal (one trailing newl
 printf %s "$STRIPE_KEY" | chelabase functions secrets set billing STRIPE_KEY
 ```
 
-{/* TODO(#173): confirm against landed code: `chelabase functions schedule add|rm|list`, `functions trigger add|rm|list` (`--table` or `--storage --bucket --prefix`), and `chelabase services deploy|list|enable|disable|logs|rollback`. */}
+The CLI can't edit or turn off a schedule or a trigger, and has no command for a function's [run-as role](/using/functions/environment#acting-as-the-function): use Studio's function drawer or the [Management API](/reference/management/functions/listFunctions) for those.
 
-Schedules, triggers and run-as roles can be managed today with the [Management API](/reference/management/functions/listFunctions). The commands for them are described in [Schedules](/using/functions/schedules) and [Triggers](/using/functions/triggers).
+## chelabase services
+
+[Container services](/using/services/containers#deploy) have their own commands: `services deploy NAME --image … --port …`, `services list`, `services enable NAME`, `services disable NAME`, `services logs NAME` and `services rollback NAME DEPLOYMENT`. They need no `chelabase.toml`.

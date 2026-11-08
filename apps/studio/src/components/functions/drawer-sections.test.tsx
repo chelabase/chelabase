@@ -137,6 +137,15 @@ describe("TriggersSection", () => {
     await waitFor(() => expect(sent).toEqual([{ source: "storage", pg_database: "app", events: ["object.created", "object.updated", "object.deleted"] }]));
   });
 
+  it("polls_while_a_trigger_is_installing", async () => {
+    let reads = 0;
+    render(<TriggersSection databaseId="d1" branchId="b1" name="hello" canChange />, {
+      [`GET ${F}/triggers`]: () => jsonResponse([{ ...TRIGGER, state: ++reads === 1 ? "pending_install" : "installed" }]),
+    });
+    expect(await screen.findByText("pending install")).toBeInTheDocument();
+    expect(await screen.findByText("installed", undefined, { timeout: 4000 })).toBeInTheDocument();
+  });
+
   it("switch_reverts_on_refusal", async () => {
     const user = userEvent.setup();
     render(<TriggersSection databaseId="d1" branchId="b1" name="hello" canChange />, {

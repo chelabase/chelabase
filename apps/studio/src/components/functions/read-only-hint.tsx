@@ -25,3 +25,4 @@ export function ReadOnlyHint({ reason, children }: { reason: string | null; chil
 
 export const VIEWER_REASON = "Viewers can't change functions. Ask a Developer.";
 export const VIEWER_SECRETS_REASON = "Viewers can't change secrets. Ask a Developer.";
+export const VIEWER_LOGS_REASON = "Viewers can't read service logs. Ask a Developer.";

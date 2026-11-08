@@ -9,7 +9,7 @@ The user guides are [Functions](/using/functions) and [Services](/using/services
 
 | Piece | Role |
 |---|---|
-| `functions` | The functions service. Public listener behind the gateway at `/functions/v1` and `/services/v1`; an internal listener in two sides: the runtime's (bundle downloads) and the control side (bundle uploads from the orchestrator, invocations from the worker, each behind its own bearer). Resolves a branch's function, calls the runtime, proxies services, health-checks them, and delivers [database events](/using/functions/triggers#table-triggers) from the branches' outboxes. |
+| `functions` | The functions service. Public listener behind the gateway at `/functions/v1` and `/services/v1`; an internal listener in two sides: the runtime's (bundle downloads) and the control side (bundle uploads and the container services' internal routes, image resolving, rollovers and logs, from the orchestrator; invocations from the worker; each caller behind its own bearer). Resolves a branch's function, calls the runtime, proxies services, health-checks them, and delivers [database events](/using/functions/triggers#table-triggers) from the branches' outboxes. |
 | `functions-runtime` | workerd with a small supervisor. It loads bundles by hash through its Worker Loader, so a deploy needs no restart. Runs without secrets, as a non-root user, read-only, with every capability dropped and a memory limit, on two networks: `functions` (internal; shared only with the functions service and the gateway alias) and `functions-egress` (the way out for public addresses). |
 | Bundle bucket | The `chelabase-functions` bucket in the object store, written and read through a `functions` S3 identity that can reach that bucket only. Only the functions service and the worker mount its keys. |
 | Orchestrator | The [Management API](/reference/management/functions/listFunctions) routes. Sends bundles to the functions service. |
@@ -35,7 +35,7 @@ Set these in `.env` (blank means the default). Those marked "compose" are alread
 | `CHELABASE_FUNCTIONS_TIMEOUT_MS` | `30000` | An invocation's wall clock, in milliseconds. Past it: 504 `function_timeout`. A positive integer. |
 | `CHELABASE_FUNCTIONS_ADDR` | `127.0.0.1:8091` | The public listener (behind the gateway). Comma-separated `host:port`s, names resolved at start. Compose: `functions-public:8091,127.0.0.1:8091`. |
 | `CHELABASE_FUNCTIONS_INTERNAL_ADDR` | `127.0.0.1:8092` | The internal listener's runtime side (bundle GETs). Compose: `functions-internal:8080`. |
-| `CHELABASE_FUNCTIONS_CONTROL_ADDR` | `127.0.0.1:8093` | The internal listener's control side (bundle uploads, invocations). Compose: `functions-control:8080`. |
+| `CHELABASE_FUNCTIONS_CONTROL_ADDR` | `127.0.0.1:8093` | The internal listener's control side (bundle uploads, invocations, and the container services' image resolving, rollovers and logs). Compose: `functions-control:8080`. |
 | `CHELABASE_FUNCTIONS_RUNTIME_URL` | `http://127.0.0.1:8080` | The runtime it calls. Compose: `http://functions-runtime:8080`. |
 | `CHELABASE_FUNCTIONS_URL` | `http://127.0.0.1:8091` | The gateway's upstream for `/functions/v1` and `/services/v1`. Compose: `http://functions-public:8091`. |
 | `CHELABASE_FUNCTIONS_INTERNAL_URL` | `http://127.0.0.1:8093` | Where the orchestrator and the worker reach the control side. Compose: `http://functions-control:8080`. |
@@ -45,7 +45,7 @@ Set these in `.env` (blank means the default). Those marked "compose" are alread
 | `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | The orchestrator's internal listener, asked for the event dispatcher's database login. |
 | `CHELABASE_COMPUTE_CA_FILE` | none | The CA every compute is verified against. Unset: database events aren't dispatched. |
 | `CHELABASE_FUNCTIONS_S3_BUCKET`, `CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE`, `CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE` | compose sets `chelabase-functions` and the generated pair | The worker's bundle-sweep identity. (The functions service uses the `CHELABASE_STORAGE_BACKEND` and `CHELABASE_STORAGE_S3_*` settings with the same bucket and pair.) |
-| `CHELABASE_FUNCTIONS_RUNTIME_MEMORY` | `1g` | The runtime container's memory limit (compose). |
+| `CHELABASE_FUNCTIONS_RUNTIME_MEMORY` | `1g` | The runtime container's memory limit (a compose size); every function shares it. Settable in `.env`. |
 | `CHELABASE_FUNCTIONS_RUNTIME_TAG` | `latest` | The runtime image tag a workbench builds and runs. Development only. |
 | `CHELABASE_PUBLIC_SCHEME`, `CHELABASE_API_HOST` | as set | What `env.CHELABASE_URL` holds, and the host `env.CHELABASE` always reaches. See [Hosts](/self-hosting/hosts). |
 
@@ -57,7 +57,7 @@ Set these in `.env` (blank means the default). Those marked "compose" are alread
 | `CHELABASE_SERVICES_ALLOW_HTTP` | `false` | `true` accepts `http` service URLs. Same two services. |
 | `CHELABASE_INTERNAL_SUBNETS` | none | Comma-separated CIDRs added to the hard deny, beside every network the functions container is attached to. The compose files don't set it. |
 
-These are independent of `CHELABASE_WEBHOOKS_ALLOW_HOSTS` and `_ALLOW_HTTP`. The compose files don't pass the `CHELABASE_SERVICES_*` variables through; add them with a compose override (see [External services](/using/services/external#the-allow-list)). Internal hosts (the stack's own service names and networks) are always denied, allow-list or not.
+These are independent of `CHELABASE_WEBHOOKS_ALLOW_HOSTS` and `_ALLOW_HTTP`. The compose files pass `CHELABASE_SERVICES_ALLOW_HOSTS` and `CHELABASE_SERVICES_ALLOW_HTTP` through to the orchestrator and the functions service, so set them in `.env`. Internal hosts (the stack's own service names and networks) are always denied, allow-list or not.
 
 ### Service runner
 
@@ -65,7 +65,7 @@ These are independent of `CHELABASE_WEBHOOKS_ALLOW_HOSTS` and `_ALLOW_HTTP`. The
 |---|---|---|
 | `CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB` | `512` | The most memory a container gets (MiB, at least 16). A spec may ask for less. |
 | `CHELABASE_SERVICE_RUNNER_CPU_CAP` | `1` | The most CPU a container gets (0.01 to 256). |
-| `CHELABASE_SERVICE_RUNNER_RECONCILE_SECS` | `30` | How often it reconciles desired and actual containers. |
+| `CHELABASE_SERVICE_RUNNER_RECONCILE_SECS` | `30` | How often it reconciles desired and actual containers, in seconds. Settable in `.env`. |
 | `CHELABASE_SERVICE_RUNNER_URL` | none | Where the callers reach the runner. Compose: `http://service-runner-control:8094`. |
 | `CHELABASE_SERVICE_RUNNER_ADDR` | `127.0.0.1:8094` | Its API listener. Compose: `service-runner-control:8094,127.0.0.1:8094`. |
 | `CHELABASE_COMPOSE_PROJECT` | required | The compose project whose `functions` container the runner attaches to each service's network. Compose sets it from `COMPOSE_PROJECT_NAME`. |

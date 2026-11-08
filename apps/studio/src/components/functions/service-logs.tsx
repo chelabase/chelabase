@@ -1,17 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
-import { getGetServiceLogsQueryKey } from "@chelabase/management-client";
+import { getGetServiceLogsQueryKey, getServiceLogs } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { functionErrorText } from "@/lib/functions";
-import { fetchServiceLogs } from "@/lib/functions-services";
 
 /**
- * A container service's last 200 log lines on the branch. Reading them needs Developer: a Viewer
- * is shown the API's refusal rather than an empty panel.
+ * A container service's last 200 log lines on the branch. Reading them needs Developer (the drawer
+ * shows a Viewer a hint instead); any refusal is shown rather than an empty panel.
  */
 export function ServiceLogs({ databaseId, branchId, name }: { databaseId: string; branchId: string; name: string }) {
   const logs = useQuery({
     queryKey: getGetServiceLogsQueryKey(databaseId, branchId, name),
-    queryFn: () => fetchServiceLogs(databaseId, branchId, name),
+    queryFn: async () => (await getServiceLogs(databaseId, branchId, name)) ?? "",
     retry: false,
     staleTime: 0,
   });

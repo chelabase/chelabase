@@ -49,6 +49,4 @@ Reading functions needs Viewer access to the project. Deploying, enabling, rolli
 
 ## Studio
 
-The **Functions** tab lists a branch's functions with their enabled switch, auth mode, active deployment and last error. A function's drawer shows its invoke URL and a curl command, its run-as role, its deployments (with a button to make an earlier one active) and its secrets. Schedules and triggers are managed with the API for now, and from the CLI and Studio once #173 lands.
-
-{/* TODO(#173): confirm against landed code: Studio's Schedules and Triggers sections in the function drawer, and the services list in the same tab. */}
+The **Functions** tab lists a branch's functions and [services](/using/services) together: name, enabled switch, kind (a service also shows its backend), status (for a service), active deployment, auth mode and last error. A function's drawer shows its invoke URL and a curl command, its deployments (with a button to make an earlier one active) and its secrets, and for a function also its **Run as** role, **Schedules** (add, edit, turn on or off, delete) and **Triggers** (add, turn on or off, delete). A container service's drawer adds its **Logs** and any rollover in progress. Viewers see everything read-only, except service logs, which need Developer.

@@ -32,10 +32,15 @@ curl -H "Authorization: Bearer $CHELABASE_PUBLIC_KEY" \
 | 404 `service_not_found` | No such service, or no deployment on the branch |
 | 503 `service_disabled` | Turned off on the branch |
 | 503 `service_unhealthy` | The last three health checks failed |
+| 503 `service_starting` | A container service's container isn't placed on the branch yet; retry shortly |
 | 400 `invalid_path` | The path holds an encoded `/` or `\` (`%2f`, `%5c`) |
-| 502 | The service could not be reached, or its address was refused at connect time |
+| 502 `service_unreachable` | The service could not be reached, or its answer was invalid |
+| 502 `service_refused` | The service's address was refused at connect time (a non-public address not on the allow-list) |
+| 504 `service_timeout` | The service's response headers didn't arrive within 30 seconds |
 
 There is no total timeout, so long responses stream through: only 30 seconds for the response's headers and 30 seconds between reads.
+
+Preflights and CORS headers work as for functions: see [CORS](/using/functions/handlers#cors).
 
 ## What the service receives
 
@@ -45,7 +50,7 @@ Hop-by-hop headers, `Host`, `Authorization`, and every `chelabase-*` and `x-chel
 |---|---|
 | `chelabase-branch` | The branch id |
 | `chelabase-role` | The caller's role (`anon`, `authenticated`, or the key's role) |
-| `chelabase-user` | The app user's subject, else empty |
+| `chelabase-user-id` | The app user's subject, else empty |
 | `chelabase-request-id` | A fresh id per request |
 | `Chelabase-Signature` | `t=<unix seconds>,v1=<hex HMAC-SHA256>`: see [Verify the signature](/using/services/verify-signature) |
 | `Content-Digest` | `sha-256=:<base64>:` of the body, for bodies up to 1 MiB |
