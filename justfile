@@ -324,6 +324,12 @@ storage-iam-e2e:
 storage-e2e *args:
     cargo run -q -p chelabase -- workbench run scripts/storage-e2e.sh "$@"
 
+# CI runs this when infra/functions-runtime/ changes. Needs Docker, no stack.
+# The functions runtime's node tests, against a freshly baked image in throwaway containers
+functions-runtime-test:
+    docker buildx bake -f infra/images/docker-bake.hcl --load functions-runtime
+    node --test infra/functions-runtime/tests/
+
 # Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
 # it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
 # and call a public function on the keyless form. Shared-state: writes and removes its own rows.
