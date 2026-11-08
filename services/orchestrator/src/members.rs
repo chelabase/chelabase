@@ -1288,6 +1288,7 @@ where
     M: MetadataPort,
 {
     let Some(caller) = principal.member.as_ref() else {
+        tracing::error!(request_id = %principal.request_id, "visible projects: a member route has no member row");
         return Err(ApiError::internal());
     };
     if caller.tenant_admin {

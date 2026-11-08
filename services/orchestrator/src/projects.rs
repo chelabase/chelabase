@@ -193,6 +193,7 @@ where
     // Only the projects the caller has a grant on; tenant admins see them all.
     if !principal.member.as_ref().is_some_and(|m| m.tenant_admin) {
         let Some(member) = principal.member.as_ref() else {
+            error!(request_id = %principal.request_id, "list projects: a member route has no member row");
             return ApiError::internal().into_response();
         };
         // T2-4: every access source, not the own grants alone.

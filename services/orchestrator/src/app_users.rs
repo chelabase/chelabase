@@ -474,7 +474,10 @@ where
     let (row, accepted) = match state.metadata.begin_enable_app_users(&new).await {
         Ok(BeginEnable::Started | BeginEnable::Retry) => match read_auth(&state, &project).await {
             Ok(Some(row)) => (row, true),
-            Ok(None) => return ApiError::internal().into_response(),
+            Ok(None) => {
+                tracing::error!(project_id = %project.id, "app users: the settings row is gone right after enabling");
+                return ApiError::internal().into_response();
+            }
             Err(err) => return err.into_response(),
         },
         Ok(BeginEnable::Exists(row)) => {
@@ -495,7 +498,10 @@ where
                     let again = row.status == AppUsersStatus::Enabling;
                     (row, again)
                 }
-                Ok(None) => return ApiError::internal().into_response(),
+                Ok(None) => {
+                    tracing::error!(project_id = %project.id, "app users: the settings row is gone while updating its settings");
+                    return ApiError::internal().into_response();
+                }
                 Err(err) => {
                     error!("update app users settings: {err}");
                     return ApiError::internal().into_response();
@@ -593,7 +599,10 @@ where
     info!(request_id = %principal.request_id, project_id = %project.id, "app users disabling");
     match read_auth(&state, &project).await {
         Ok(Some(row)) => (StatusCode::ACCEPTED, Json(AppUsersSettings::from(row))).into_response(),
-        Ok(None) => ApiError::internal().into_response(),
+        Ok(None) => {
+            tracing::error!(project_id = %project.id, "app users: the settings row is gone right after disabling");
+            ApiError::internal().into_response()
+        }
         Err(err) => err.into_response(),
     }
 }

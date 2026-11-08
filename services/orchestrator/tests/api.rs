@@ -2604,6 +2604,56 @@ async fn parent_lookup_error_is_500() {
     assert!(t.published().is_empty());
 }
 
+/// A writer that keeps what the subscriber prints.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> CapturedLog {
+        self.clone()
+    }
+}
+
+// Issue #156: under the default log filter, a 500 leaves its cause in the log with the request
+// id (the gateway's `x-request-id`); the client's body keeps only the fixed message.
+#[tokio::test]
+async fn a_500_logs_its_cause_with_the_request_id_and_the_body_stays_fixed() {
+    let t = branching().await;
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(orchestrator::DEFAULT_LOG_FILTER))
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    *t.metadata.fail_get_branch.lock().unwrap() = true;
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", t.app.base, t.branches()))
+        .header(IDENTITY_HEADER, t.app.token_for_org("org-1"))
+        .header("x-request-id", "rid-500-1")
+        .json(&json!({ "name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    let body = error_of(resp, 500).await;
+    assert_eq!(code_of(&body), "internal");
+    assert!(!body.to_string().contains("injected"), "{body}");
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let cause = log.lines().find(|l| l.contains("injected")).unwrap_or_else(|| panic!("the cause isn't logged: {log:?}"));
+    assert!(cause.contains("ERROR") && cause.contains("rid-500-1"), "{cause}");
+}
+
 #[tokio::test]
 async fn publish_failure_is_503_worker_unavailable() {
     let t = branching().await;

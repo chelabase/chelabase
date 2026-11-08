@@ -403,6 +403,7 @@ async fn forward(
         .collect::<Vec<_>>()
         .join("&");
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
+        error!(method = %method, "storage console: the method can't be forwarded");
         return ApiError::internal().into_response();
     };
     let Some(url) = storage_url(&storage.url, path, &query) else {
@@ -461,7 +462,10 @@ async fn forward(
     }
     response
         .body(Body::from_stream(reply.bytes_stream()))
-        .unwrap_or_else(|_| ApiError::internal().into_response())
+        .unwrap_or_else(|err| {
+            error!("storage console: building the forwarded response: {err}");
+            ApiError::internal().into_response()
+        })
 }
 
 pub(crate) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>

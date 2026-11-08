@@ -231,6 +231,21 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up --build --wa
 
 This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio and the identity service from their Dockerfiles. The wiring, secrets and health checks are the same.
 
+## Logs
+
+Read a service's log with `docker compose logs <service>` (`orchestrator`, `worker`, `rest`, `realtime`, `auth`, `storage`, `gateway`). Each Rust service logs its own events and those of the Chelabase libraries it uses (the query engine, the connection pools, NATS, the metadata store) at `info`, so an `internal` error's cause is in the log next to its request id. Dependency crates such as `hyper` or `h2` are off. The orchestrator tags every line of a request with the request id the gateway set.
+
+To change that, set `RUST_LOG` on the service. It replaces the defaults, so name the service's own target as well. In `infra/compose`, a `docker-compose.override.yml` (Compose reads it by itself; with `-f` list it too):
+
+```yaml
+services:
+  rest:
+    environment:
+      RUST_LOG: rest=debug,chelabase_query=debug,chelabase_pgsession=info
+```
+
+Then run `docker compose up -d --wait`. Log targets are the crate names with underscores: `rest`, `worker`, `realtime`, `auth`, `storage`, `orchestrator`, `chelabase_query`, `chelabase_pgsession`, `chelabase_nats`, `chelabase_neon` and `chelabase_metadata`.
+
 ## Upgrade
 
 A release is a commit of the repository: its `docker-compose.yml` pins each image by digest. Update the checkout to get the new pins, then pull those images and recreate what changed:
