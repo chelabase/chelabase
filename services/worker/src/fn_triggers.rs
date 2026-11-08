@@ -1,53 +1,69 @@
 //! Edge functions m8: database-event triggers in a branch's databases.
 //!
-//! [`sync_sql`] keeps one database in step with its branch's table triggers
-//! (`function_triggers`, source `table`), as the superuser (`cloud_admin`), in one transaction:
+//! **Invariant.** No object a database member can create or alter ever runs with the rights
+//! of [`OWNER`] or of the worker's superuser connection, and the install never adopts an
+//! object it didn't create. The attack matrix in `tests/fn_triggers_live.rs`
+//! (`attack_matrix_keeps_the_invariant`) checks it move by move.
 //!
+//! [`Worker::sync_fn_triggers`] keeps a branch's databases in step with its table triggers
+//! (`function_triggers`, source `table`), as the superuser (`cloud_admin`):
+//!
+//! - **The role**: [`OWNER`], made once per compute by [`role_sql`] (NOLOGIN NOINHERIT
+//!   CONNECTION LIMIT 0, by the superuser, so it never has members). Every check and install
+//!   that follows requires that very role.
+//! - **The foreign check** ([`check_sql`], in every database of the compute, before anything
+//!   is installed anywhere, and again at the top of each install): the role and the schema
+//!   `chelabase_functions` must be exactly what the install makes. That means no attribute,
+//!   membership or setting on the role; nothing it owns or holds rights on outside the schema
+//!   (`pg_shdepend`: shared objects, and each database's own); the schema its own; nothing in
+//!   the schema but the outbox, its sequence, index and row type, and `enqueue()`. Anything
+//!   else is refused with [`FOREIGN_MARK`], never repaired, and every row read settles `failed`
+//!   (terminal until the trigger is changed or pended again).
 //! - **The machinery**, made or put back each run while the database has a trigger to install:
-//!   the NOLOGIN role [`OWNER`] (no members, no memberships, no login, no attributes), the
-//!   schema `chelabase_functions` it owns (no rights for PUBLIC, so no data API role reaches
-//!   it), the outbox `chelabase_functions.outbox` and the trigger function
-//!   `chelabase_functions.enqueue()`, both [`OWNER`]'s. Every grant on the schema, the outbox,
-//!   its sequence and the function to anyone but the owner is revoked on every run.
+//!   the schema (no rights for PUBLIC, so no data API role reaches it), the outbox
+//!   `chelabase_functions.outbox` and the trigger function `chelabase_functions.enqueue()`,
+//!   all [`OWNER`]'s. Every grant on them to anyone but the owner is revoked on every run.
 //!   The function is `SECURITY DEFINER` with `search_path = pg_catalog, chelabase_functions,
-//!   pg_temp` and qualifies every name, so a user's `public.pg_notify` or
-//!   `public.jsonb_build_object` never runs in it, and it evaluates no user code at all (audit
-//!   B1): a built-in-typed column goes through `to_jsonb`, any other value is its type output
-//!   text, so no user cast ever runs as [`OWNER`] ([`install_objects_sql`]). It inserts the
-//!   row's event (the trigger id from its argument, the operation, schema, table, new and old
-//!   rows, and the Neon timeline) and notifies [`NOTIFY_CHANNEL`].
-//! - **The repair**, before anything runs on the schema: an outbox of another shape (columns,
+//!   pg_temp` and qualifies every name, so a user's `public.pg_notify` never runs in it. It
+//!   evaluates no user code at all: a built-in-typed column goes through `to_jsonb`, and any
+//!   other value is its type output text, so no user cast ever runs as [`OWNER`]
+//!   ([`install_objects_sql`]). It inserts the row's event (the trigger id from its argument,
+//!   the operation, schema, table, new and old rows, and the Neon timeline) and notifies
+//!   [`NOTIFY_CHANNEL`]. Owner-level roles (`neon_superuser` holds `pg_read_all_data` and
+//!   `pg_write_all_data`) can still read and write the outbox directly, so a consumer must
+//!   check each row's trigger id and table against the metadata (m13, #175).
+//! - **The repair**, before anything runs on the outbox: an outbox of another shape (columns,
 //!   defaults, triggers, rules, policies, row level security, extra constraints or indexes,
-//!   owner) is dropped and rebuilt, and any other relation or routine in the schema is
-//!   dropped ([`repair_sql`]).
-//! - **The outbox**: truncated when asked (a branch create, reset or restore: the database
-//!   came from another timeline), and on every run its rows from another timeline or for a
-//!   trigger the database doesn't want are deleted (a create, reset or restore whose own run
-//!   failed is caught up by the sweep). The cleanup runs as [`OWNER`] (`SET LOCAL ROLE`),
-//!   after the repair, never as the superuser.
+//!   owner) is dropped and rebuilt ([`repair_sql`]).
+//! - **The outbox**: truncated after a branch create, reset or restore (the database came from
+//!   another timeline) while the rows read are still pending. On every run, its rows from
+//!   another timeline or for a trigger the database doesn't want are deleted. The cleanup runs
+//!   as [`OWNER`] (`SET LOCAL ROLE`), after the repair, never as the superuser.
 //! - **The triggers**: `chelabase_fn_<id as 32 hex>` ([`trigger_name`]), `AFTER <events> ON
-//!   <schema>.<table> FOR EACH ROW EXECUTE FUNCTION chelabase_functions.enqueue('<id>')`.
-//!   Every trigger running a function of `chelabase_functions`, and any trigger with a wanted
-//!   name, that isn't exactly a wanted one (name, table, function, events, argument, enabled,
-//!   no column list or `WHEN`) is dropped; then each wanted one whose table exists (a plain or
-//!   partitioned table) is created. Names reach the SQL only as literals, and the statements
-//!   are built by `format('%I')`, so any table name (quotes, spaces) is quoted.
-//! - Event triggers are off for the transaction (`SET LOCAL event_triggers = off`), so no
-//!   tenant code runs as the superuser. A `chelabase_functions` schema [`OWNER`] doesn't own
-//!   (a user's, from before the name was reserved) stops the install with [`FOREIGN_MARK`],
-//!   changing nothing; a database without wanted triggers then is left alone.
+//!   <schema>.<table> FOR EACH ROW EXECUTE FUNCTION chelabase_functions.enqueue('<id>')`, on
+//!   plain tables only. A partitioned table's row triggers would be cloned onto every new
+//!   partition with the rights of whoever adds it, and only [`OWNER`] may execute `enqueue()`;
+//!   such a row settles `failed` with [`PLAIN_TABLES_ONLY`]. A trigger is dropped when it runs
+//!   a function of `chelabase_functions`, or has a wanted name, and isn't exactly a wanted
+//!   one (name, plain table, function, events, argument, enabled, no column list or `WHEN`).
+//!   Then each wanted one whose table exists is created. Names reach the SQL only as literals,
+//!   and the statements are built by `format('%I')`.
+//! - Event triggers are off for every transaction (`SET LOCAL event_triggers = off`), so no
+//!   tenant code runs as the superuser.
 //!
-//! The script answers one line per wanted trigger: `fn_trigger <id> ok` or `fn_trigger <id>
-//! table_missing`. The worker then settles the rows it read `pending_install`
-//! (`MetadataClient::settle_trigger_installs`, by the `enabled_since` it read): only `installed`
-//! rows are the dispatcher's (m13).
+//! The script answers one line per wanted trigger: `fn_trigger <id> ok`, `… table_missing` or
+//! `… not_a_plain_table`. The worker settles the rows it read, by the `enabled_since` it read
+//! (`MetadataClient::settle_trigger_installs`): only `installed` rows are the dispatcher's
+//! (m13).
 //!
 //! When: after a branch create (the child's rows are copies, `pending_install`, and its
-//! database still has the parent's triggers and outbox), after a reset or restore (the switch
-//! pended every table trigger of the branch), and on reconcile for any branch with a pending
-//! row (a trigger just added, or a lifecycle run that failed). A branch create also mints the
-//! child's run-as keys ([`Worker::mint_child_run_as`]); one that can't be minted yet is
-//! retried by the reconcile sweep ([`Worker::sync_pending_run_as`]).
+//! database still has the parent's triggers and outbox); after a reset or restore (the switch
+//! pended every table trigger of the branch); and on each reconcile pass
+//! ([`Worker::sync_pending_fn_triggers`]). That pass covers branches with a pending row, and
+//! branches whose installed triggers are checked for drift (dropped, disabled or changed: put
+//! back), up to [`SWEEP_BATCH`], least recently attempted first. A branch create also mints the
+//! child's run-as keys ([`Worker::mint_child_run_as`]); the reconcile pass retries any still
+//! owed ([`Worker::sync_pending_run_as`], chosen by state, not by `last_error`).
 
 use chelabase_metadata::{
     BranchRecord, BranchStatus, DatabaseOrigin, MetadataClient, RunAs, TriggerInstall,
@@ -65,6 +81,8 @@ use uuid::Uuid;
 use crate::Worker;
 use crate::data_api::{LOCK_TIMEOUT_SECS, RoleCheck};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
+use crate::resync::SYSTEM_DATABASE;
+use crate::review::review_databases_sql;
 
 /// The NOLOGIN role owning the schema, the outbox and the trigger function.
 pub const OWNER: &str = "chelabase_functions_owner";
@@ -85,12 +103,149 @@ pub const SYNC_LOCK_KEY: i64 = 0x6368_656c_6164_6208;
 /// `last_error` on a child's function whose run-as role its catalog doesn't have.
 pub const RUN_AS_ROLE_MISSING: &str = "run_as_role_missing";
 
+/// `last_error` prefix on a child's function whose run-as role the checks refuse.
+pub const RUN_AS_ROLE_REFUSED: &str = "run_as_role_refused";
+
 /// `last_error` prefix on a child's function whose run-as key couldn't be minted yet (the
 /// role or "all rows" check couldn't run); the reconcile sweep retries it.
 pub const RUN_AS_KEY_PENDING: &str = "run_as_key_pending";
 
+/// `last_error` on a trigger whose table isn't a plain table (partitioned tables, views, …):
+/// a partitioned table's row triggers are cloned onto each new partition with the rights of
+/// whoever adds it, and nobody but [`OWNER`] may execute `enqueue()`.
+pub const PLAIN_TABLES_ONLY: &str = "function triggers support plain tables only";
+
+/// The stored error for a script answer.
+pub fn install_error(answer: &str) -> String {
+    match answer {
+        "not_a_plain_table" => PLAIN_TABLES_ONLY.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The settings every script starts with.
+const PRELUDE: &str =
+    "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\n";
+
+/// Run once per sync in the compute's system database, before any check: makes [`OWNER`]
+/// when `create` and it's missing (`NOLOGIN NOINHERIT CONNECTION LIMIT 0`, by the superuser,
+/// so nobody else is ever its member), and answers `fn_owner <oid>` when it exists. The
+/// checks and installs that follow require that very OID: a role made by anyone in between is
+/// refused.
+pub fn role_sql(create: bool) -> String {
+    let create = if create {
+        format!(
+            "DO $chelabase_fn$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}') THEN\n    \
+             CREATE ROLE {OWNER} NOLOGIN NOINHERIT CONNECTION LIMIT 0;\n  END IF;\nEND $chelabase_fn$;\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{SYNC_MARK} role\n{PRELUDE}{create}SELECT 'fn_owner ' || oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}';\nCOMMIT;\n"
+    )
+}
+
+/// The answer of [`role_sql`].
+pub fn parse_role(out: &str) -> Option<u32> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("fn_owner ")?.parse().ok())
+}
+
+/// The foreign check (the invariant's "never adopts"), for the database it runs in: raises
+/// [`FOREIGN_MARK`] with the reason when [`OWNER`] isn't the role `role` names (made by
+/// [`role_sql`]), when the schema isn't its, when the role has any attribute, membership,
+/// setting, ownership or right beyond what the install gives it (`pg_shdepend`: shared
+/// objects, and this database's objects outside the schema; the worker runs the check in
+/// every database of the compute), or when the schema holds anything the install doesn't
+/// make. Refused, never repaired.
+fn foreign_check_sql(role: Option<u32>) -> String {
+    let expected = role.map_or_else(|| "NULL".to_string(), |r| r.to_string());
+    format!(
+        r#"DO $chelabase_fn$ DECLARE
+  expected pg_catalog.oid := {expected};
+  role pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}');
+  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '{FUNCTIONS_SCHEMA}');
+  box pg_catalog.oid;
+  ours pg_catalog.oid[];
+  why pg_catalog.text;
+BEGIN
+  box := (SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = 'outbox');
+  ours := ARRAY(SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ns
+      AND ((c.relname = 'outbox' AND c.relkind = 'r') OR (c.relname = 'outbox_id_seq' AND c.relkind = 'S')
+        OR (c.relname = 'outbox_pkey' AND c.relkind = 'i'))
+    UNION SELECT c.reltoastrelid FROM pg_catalog.pg_class c WHERE c.oid = box AND c.reltoastrelid <> 0
+    UNION SELECT i.indexrelid FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.reltoastrelid = i.indrelid WHERE c.oid = box);
+  IF role IS DISTINCT FROM expected THEN
+    why := 'the role {OWNER} was made by someone else';
+  ELSIF ns IS NOT NULL AND (role IS NULL OR (SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid = ns) <> role) THEN
+    why := 'the schema {FUNCTIONS_SCHEMA} is not {OWNER}''s';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = role AND (a.rolsuper OR a.rolinherit OR a.rolcreaterole
+      OR a.rolcreatedb OR a.rolcanlogin OR a.rolreplication OR a.rolbypassrls OR a.rolconnlimit <> 0
+      OR a.rolpassword IS NOT NULL OR a.rolvaliduntil IS NOT NULL)) THEN
+    why := 'the role {OWNER} has attributes Chelabase never gives it';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_auth_members m WHERE m.roleid = role OR m.member = role) THEN
+    why := 'the role {OWNER} has members or memberships';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole = role) THEN
+    why := 'the role {OWNER} has settings';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_shdepend d WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND d.refobjid = role
+      AND (d.dbid = 0 OR (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+        AND NOT (d.deptype = 'o' AND (
+          (d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = ns)
+          OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = ANY (ours))
+          OR (d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+            AND d.objid = (SELECT p.oid FROM pg_catalog.pg_proc p WHERE p.pronamespace = ns AND p.proname = 'enqueue' AND p.pronargs = 0))))))) THEN
+    why := 'the role {OWNER} owns or holds rights on objects outside {FUNCTIONS_SCHEMA}';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = ns
+      AND NOT ((d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND d.objid IN (SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname IN ('outbox', 'outbox_id_seq', 'outbox_pkey')))
+        OR (d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+          AND d.objid IN (SELECT p.oid FROM pg_catalog.pg_proc p WHERE p.pronamespace = ns AND p.proname = 'enqueue' AND p.pronargs = 0))
+        OR (d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+          AND d.objid IN (SELECT t.oid FROM pg_catalog.pg_type t WHERE t.typnamespace = ns AND t.typname IN ('outbox', '_outbox'))))) THEN
+    why := 'the schema {FUNCTIONS_SCHEMA} holds objects Chelabase didn''t make';
+  END IF;
+  IF why IS NOT NULL THEN
+    RAISE EXCEPTION '{FOREIGN_MARK}: %; nothing was installed', why;
+  END IF;
+END $chelabase_fn$;
+"#
+    )
+}
+
+/// The foreign check alone, read-only, for one database (the worker runs it in every
+/// database of the compute before any install).
+pub fn check_sql(role: Option<u32>) -> String {
+    format!(
+        "{SYNC_MARK} check\n{PRELUDE}{}ROLLBACK;\n",
+        foreign_check_sql(role)
+    )
+}
+
+/// The refusal in a script's error, from [`FOREIGN_MARK`] on (the row's `last_error`).
+pub fn foreign_refusal(error: &str) -> Option<String> {
+    let at = error.find(FOREIGN_MARK)?;
+    let rest = &error[at..];
+    Some(rest.lines().next().unwrap_or(rest).trim().to_string())
+}
+
 /// Branches the reconcile sweep syncs per pass.
 const SWEEP_BATCH: i64 = 20;
+
+/// The most candidates a sweep reads per pass (it takes [`SWEEP_BATCH`] of them).
+const SWEEP_CANDIDATES: i64 = 1000;
+
+/// The two reconcile sweeps, each with its own attempt times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sweep {
+    Triggers,
+    RunAs,
+}
+
+/// When each branch was last attempted, per sweep (this worker's memory: a restart starts
+/// with every branch unattempted).
+pub type SweepAttempts =
+    std::collections::HashMap<Sweep, std::collections::HashMap<BranchId, std::time::Instant>>;
 
 /// A table trigger to install: its row's id, table and events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +301,7 @@ const EXACT: &str = "w.name = tg.tgname AND w.schema_name = n.nspname AND w.tabl
       AND tg.tgtype = w.tgtype AND tg.tgenabled = 'O' AND tg.tgnargs = 1
       AND tg.tgargs = pg_catalog.convert_to(w.trigger_id::pg_catalog.text, 'UTF8') || '\\x00'::pg_catalog.bytea
       AND tg.tgqual IS NULL AND pg_catalog.cardinality(tg.tgattr::pg_catalog.int2[]) = 0
-      AND tg.tgconstraint = 0 AND NOT tg.tgisinternal AND tg.tgparentid = 0";
+      AND tg.tgconstraint = 0 AND NOT tg.tgisinternal AND tg.tgparentid = 0 AND c.relkind = 'r'";
 
 /// The outbox's columns as the repair check reads them (name, type, NOT NULL, default as
 /// `pg_get_expr` prints it under the script's `search_path`). Any other shape is rebuilt.
@@ -163,48 +318,15 @@ fn ours_sql() -> String {
     )
 }
 
-/// The role's lockdown and the foreign-schema check (install only).
-fn install_role_sql() -> String {
-    format!(
-        r#"DO $chelabase_fn$ DECLARE
-  role pg_catalog.oid;
-  m record;
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}') THEN
-    CREATE ROLE {OWNER} NOLOGIN;
-  END IF;
-  role := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}');
-  IF EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = '{FUNCTIONS_SCHEMA}' AND nspowner <> role) THEN
-    RAISE EXCEPTION '{FOREIGN_MARK}: the schema {FUNCTIONS_SCHEMA} is not Chelabase''s; it was left alone';
-  END IF;
-  FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
-    JOIN pg_catalog.pg_roles r ON r.oid = a.member JOIN pg_catalog.pg_roles g ON g.oid = a.grantor
-    WHERE a.roleid = role
-  LOOP
-    EXECUTE pg_catalog.format('REVOKE {OWNER} FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
-  END LOOP;
-  FOR m IN SELECT r.rolname AS granted, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
-    JOIN pg_catalog.pg_roles r ON r.oid = a.roleid JOIN pg_catalog.pg_roles g ON g.oid = a.grantor
-    WHERE a.member = role
-  LOOP
-    EXECUTE pg_catalog.format('REVOKE %I FROM {OWNER} GRANTED BY %I CASCADE', m.granted, m.grantor);
-  END LOOP;
-END $chelabase_fn$;
-ALTER ROLE {OWNER} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 0 PASSWORD NULL;
-"#
-    )
-}
-
 /// `DROP <kind>` for a `pg_class.relkind` (the SQL `CASE`).
 const DROP_KIND: &str = "CASE t.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' \
 WHEN 'S' THEN 'SEQUENCE' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' \
 WHEN 'c' THEN 'TYPE' ELSE 'TABLE' END";
 
-/// Before anything else runs on the schema: an outbox of any other shape (kind, owner,
-/// columns, defaults, row level security, triggers, rules, policies, inheritance, constraints
-/// or indexes beyond its primary key) is dropped (a DROP runs none of them), and so is every
-/// relation and routine in the schema the install doesn't make. As the superuser: it only
-/// reads catalogs and drops.
+/// After the foreign check, before anything else runs on the schema: an outbox of any other
+/// shape (kind, owner, columns, defaults, row level security, triggers, rules, policies,
+/// inheritance, constraints or indexes beyond its primary key) is dropped (a DROP runs none of
+/// them) and made again. As the superuser: it only reads catalogs and drops.
 fn repair_sql() -> String {
     let ours = ours_sql();
     let shape = literal(OUTBOX_SHAPE);
@@ -237,17 +359,6 @@ BEGIN
       EXECUTE 'DROP ' || {DROP_KIND} || ' {FUNCTIONS_SCHEMA}.outbox CASCADE';
     END LOOP;
   END IF;
-  FOR t IN SELECT c.relname, c.relkind FROM pg_catalog.pg_class c WHERE c.relnamespace = ours
-      AND NOT ((c.relname = 'outbox' AND c.relkind = 'r') OR (c.relname = 'outbox_id_seq' AND c.relkind = 'S')
-        OR (c.relname = 'outbox_pkey' AND c.relkind = 'i'))
-  LOOP
-    EXECUTE pg_catalog.format('DROP %s IF EXISTS {FUNCTIONS_SCHEMA}.%I CASCADE', {DROP_KIND}, t.relname);
-  END LOOP;
-  FOR t IN SELECT p.oid::pg_catalog.regprocedure AS f FROM pg_catalog.pg_proc p
-      WHERE p.pronamespace = ours AND NOT (p.proname = 'enqueue' AND p.pronargs = 0)
-  LOOP
-    EXECUTE pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', t.f);
-  END LOOP;
 END $chelabase_fn$;
 "#
     )
@@ -355,7 +466,7 @@ END $chelabase_fn$;
 /// The script that brings one database in step with `wanted` (see the module docs);
 /// `truncate` empties the outbox first. Without wanted triggers it installs nothing, and only
 /// repairs, drops leftovers and cleans the outbox of a schema [`OWNER`] owns.
-pub fn sync_sql(wanted: &[Wanted], truncate: bool) -> String {
+pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String {
     let rows: Vec<String> = wanted
         .iter()
         .filter_map(|w| {
@@ -378,11 +489,12 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool) -> String {
             rows.join(",\n  ")
         )
     };
-    let (install_role, install_objects) = if rows.is_empty() {
-        (String::new(), String::new())
+    let install_objects = if rows.is_empty() {
+        String::new()
     } else {
-        (install_role_sql(), install_objects_sql())
+        install_objects_sql()
     };
+    let check = foreign_check_sql(role);
     let (repair, revoke, ours) = (repair_sql(), revoke_sql(), ours_sql());
     let truncate = if truncate {
         format!("  TRUNCATE {FUNCTIONS_SCHEMA}.outbox;\n")
@@ -397,13 +509,10 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool) -> String {
         .join(", ");
     format!(
         r#"{SYNC_MARK}
-BEGIN;
-SET LOCAL search_path = pg_catalog, pg_temp;
-SET LOCAL event_triggers = off;
-SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
+{PRELUDE}SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
 SELECT pg_catalog.pg_advisory_xact_lock({SYNC_LOCK_KEY}) IS NULL;
 CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2) ON COMMIT DROP;
-{insert}{install_role}{repair}{install_objects}{revoke}DO $chelabase_fn$ DECLARE
+{insert}{check}{repair}{install_objects}{revoke}DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
   t record;
 BEGIN
@@ -421,7 +530,7 @@ BEGIN
   END LOOP;
   FOR t IN SELECT w.* FROM pg_temp.chelabase_fn_wanted w
     JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name
-    JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name AND c.relkind IN ('r', 'p')
+    JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name AND c.relkind = 'r'
     WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_trigger tg WHERE tg.tgrelid = c.oid AND tg.tgname = w.name)
   LOOP
     EXECUTE pg_catalog.format('CREATE TRIGGER %I AFTER %s ON %I.%I FOR EACH ROW EXECUTE FUNCTION {FUNCTIONS_SCHEMA}.enqueue(%L)',
@@ -443,11 +552,27 @@ BEGIN
 END $chelabase_fn$;
 SELECT 'fn_trigger ' || w.trigger_id || CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_trigger tg
     JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-    WHERE {EXACT}) THEN ' ok' ELSE ' table_missing' END
+    WHERE {EXACT}) THEN ' ok'
+    WHEN EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = w.schema_name AND c.relname = w.table_name) THEN ' not_a_plain_table'
+    ELSE ' table_missing' END
   FROM pg_temp.chelabase_fn_wanted w;
 COMMIT;
 "#
     )
+}
+
+/// Up to `n` branches for the sweep: those with pending rows first, then by the least
+/// recent attempt (never attempted first), so no stuck branch starves another.
+pub fn sweep_order(
+    candidates: &[(BranchId, bool)],
+    attempts: &std::collections::HashMap<BranchId, std::time::Instant>,
+    n: usize,
+) -> Vec<BranchId> {
+    let mut ordered: Vec<&(BranchId, bool)> = candidates.iter().collect();
+    // Stable: pending first, then never attempted, then the oldest attempt.
+    ordered.sort_by_key(|(b, pending)| (!*pending, attempts.get(b).copied()));
+    ordered.into_iter().take(n).map(|(b, _)| *b).collect()
 }
 
 /// The script's answers: `(trigger id, None)` when installed, `(id, Some(why))` when not.
@@ -487,10 +612,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .and_then(|b| Some((b.clone(), b.endpoint_id?))))
     }
 
-    /// Brings every database of the ready `branch` in step with its table triggers
-    /// ([`sync_sql`]; `truncate` after a create, reset or restore) and settles the rows read
-    /// `pending_install`. A database that can't be reached keeps its rows pending (the
-    /// reconcile sweep retries) and makes the call fail; one that doesn't exist fails its rows.
+    /// Brings every database of the ready `branch` in step with its table triggers and
+    /// settles the rows read (`pending_install` → `installed` or `failed`; an `installed` one
+    /// whose trigger can't be put back → `failed`). In order:
+    ///
+    /// 1. [`role_sql`] in the system database (making [`OWNER`] when a trigger is wanted);
+    /// 2. [`check_sql`] in every database of the compute: a refusal ([`FOREIGN_MARK`]) fails
+    ///    every row read, terminally, and nothing is installed anywhere;
+    /// 3. [`sync_sql`] in each of the branch's databases (and any a trigger names).
+    ///
+    /// `truncate` (after a create, reset or restore) empties the outbox only while a row read
+    /// is still pending: a sweep that got there first already cleaned it. A database that
+    /// can't be reached keeps its rows as they are (the sweep retries) and makes the call
+    /// fail; one that doesn't exist fails its rows.
     pub async fn sync_fn_triggers(&self, branch: BranchId, truncate: bool) -> Result<(), String> {
         let Some(meta) = self.metadata.functions() else {
             return Ok(());
@@ -498,10 +632,46 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some((_, ep)) = self.ready_endpoint(branch).await? else {
             return Ok(());
         };
-        let triggers = meta
+        let triggers: Vec<TriggerRecord> = meta
             .list_triggers(branch)
             .await
-            .map_err(|e| format!("listing the triggers: {e}"))?;
+            .map_err(|e| format!("listing the triggers: {e}"))?
+            .into_iter()
+            .filter(|t| t.source == TriggerSource::Table)
+            .collect();
+        let truncate = truncate
+            && triggers
+                .iter()
+                .any(|t| t.state == TriggerState::PendingInstall);
+        let wanted_any = triggers.iter().any(|t| t.state != TriggerState::Failed);
+        let role = self
+            .computes
+            .admin_sql(&ep, SYSTEM_DATABASE, &role_sql(wanted_any))
+            .await
+            .map(|out| parse_role(&out))
+            .map_err(|e| format!("reading the function triggers' role: {e:#}"))?;
+        let compute_databases = self
+            .computes
+            .admin_sql(&ep, SYSTEM_DATABASE, &review_databases_sql())
+            .await
+            .map_err(|e| format!("listing the compute's databases: {e:#}"))?;
+        for db in compute_databases
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            if let Err(e) = self.computes.admin_sql(&ep, db, &check_sql(role)).await {
+                let e = format!("{e:#}");
+                return match foreign_refusal(&e) {
+                    Some(refusal) => {
+                        warn!(branch_id = %branch, database = %db, "function triggers refused: {refusal}");
+                        self.settle(meta, branch, &triggers, |_| Some(Some(refusal.clone())))
+                            .await
+                    }
+                    None => Err(format!("checking the function triggers' role in {db}: {e}")),
+                };
+            }
+        }
         let mut databases: Vec<String> = self
             .metadata
             .branch_databases(branch)
@@ -511,48 +681,69 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .filter(|d| d.origin != DatabaseOrigin::System)
             .map(|d| d.name)
             .collect();
-        for t in triggers.iter().filter(|t| t.source == TriggerSource::Table) {
+        for t in &triggers {
             if !databases.contains(&t.pg_database) {
                 databases.push(t.pg_database.clone());
             }
         }
-        let mut answers = Vec::new();
+        let mut answers: Vec<(Uuid, Option<String>)> = Vec::new();
         let mut failure = None;
         for db in &databases {
             let wanted = wanted_in(&triggers, db);
             match self
                 .computes
-                .admin_sql(&ep, db, &sync_sql(&wanted, truncate))
+                .admin_sql(&ep, db, &sync_sql(&wanted, truncate, role))
                 .await
             {
                 Ok(out) => answers.extend(parse_sync(&out)),
-                Err(e) if database_missing(&format!("{e:#}"), db) => {
-                    answers.extend(
-                        wanted
-                            .iter()
-                            .map(|w| (w.id, Some("database_missing".to_string()))),
-                    );
-                }
                 Err(e) => {
-                    warn!(branch_id = %branch, database = %db, "syncing the function triggers: {e:#}");
-                    failure = Some(format!("syncing the function triggers of {db}: {e:#}"));
+                    let e = format!("{e:#}");
+                    let why = if database_missing(&e, db) {
+                        Some("database_missing".to_string())
+                    } else {
+                        foreign_refusal(&e)
+                    };
+                    match why {
+                        Some(why) => {
+                            answers.extend(wanted.iter().map(|w| (w.id, Some(why.clone()))))
+                        }
+                        None => {
+                            warn!(branch_id = %branch, database = %db, "syncing the function triggers: {e}");
+                            failure = Some(format!("syncing the function triggers of {db}: {e}"));
+                        }
+                    }
                 }
             }
         }
+        self.settle(meta, branch, &triggers, |t| {
+            match answers.iter().find(|(id, _)| *id == t.id) {
+                Some((_, error)) => Some(error.as_deref().map(install_error)),
+                // Bad events never reach the script (the schema's CHECK refuses them).
+                None if trigger_events(&t.events).is_none() => Some(Some("invalid_events".into())),
+                None => None,
+            }
+        })
+        .await?;
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Settles each row read that `outcome` answers for (`Some(None)`: in the database;
+    /// `Some(Some(why))`: not), at the generation read.
+    async fn settle(
+        &self,
+        meta: &MetadataClient,
+        branch: BranchId,
+        triggers: &[TriggerRecord],
+        outcome: impl Fn(&TriggerRecord) -> Option<Option<String>>,
+    ) -> Result<(), String> {
         let installs: Vec<TriggerInstall> = triggers
             .iter()
-            .filter(|t| t.source == TriggerSource::Table && t.state == TriggerState::PendingInstall)
+            .filter(|t| t.state != TriggerState::Failed)
             .filter_map(|t| {
-                let error = match answers.iter().find(|(id, _)| *id == t.id) {
-                    Some((_, error)) => error.clone(),
-                    // Bad events never reach the script (the schema's CHECK refuses them).
-                    None if trigger_events(&t.events).is_none() => Some("invalid_events".into()),
-                    None => return None,
-                };
                 Some(TriggerInstall {
                     id: t.id,
                     enabled_since: t.enabled_since,
-                    error,
+                    error: outcome(t)?,
                 })
             })
             .collect();
@@ -563,37 +754,61 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if settled > 0 {
             info!(branch_id = %branch, settled, "function triggers settled");
         }
-        failure.map_or(Ok(()), Err)
+        Ok(())
     }
 
-    /// The reconcile sweep: syncs the branches with a pending table trigger (best effort).
+    /// Records an attempt on `branch` for the sweep of `kind`, now.
+    fn attempted(&self, kind: Sweep, branch: BranchId) {
+        let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
+        attempts
+            .entry(kind)
+            .or_default()
+            .insert(branch, std::time::Instant::now());
+    }
+
+    /// Up to [`SWEEP_BATCH`] of `candidates` for the sweep of `kind` ([`sweep_order`]).
+    fn sweep_batch(&self, kind: Sweep, candidates: &[(BranchId, bool)]) -> Vec<BranchId> {
+        let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
+        let map = attempts.entry(kind).or_default();
+        // Forget branches that left the sweep.
+        map.retain(|b, _| candidates.iter().any(|(c, _)| c == b));
+        sweep_order(candidates, map, SWEEP_BATCH as usize)
+    }
+
+    /// The reconcile sweep (best effort): branches with a pending table trigger to install,
+    /// then branches whose installed triggers are checked for drift (a dropped, disabled or
+    /// changed database trigger is put back; one whose table is gone fails), each pass taking
+    /// the least recently attempted. A `failed` row never comes back here.
     pub async fn sync_pending_fn_triggers(&self) {
         let Some(meta) = self.metadata.functions() else {
             return;
         };
-        let branches = match meta.pending_trigger_branches(SWEEP_BATCH).await {
-            Ok(branches) => branches,
-            Err(e) => return warn!("listing branches with pending function triggers: {e}"),
+        let candidates = match meta.trigger_sweep_branches(SWEEP_CANDIDATES).await {
+            Ok(candidates) => candidates,
+            Err(e) => return warn!("listing branches with function triggers: {e}"),
         };
-        for branch in branches {
+        for branch in self.sweep_batch(Sweep::Triggers, &candidates) {
+            self.attempted(Sweep::Triggers, branch);
             if let Err(e) = self.sync_fn_triggers(branch, false).await {
-                warn!(branch_id = %branch, "function triggers stay pending: {e}");
+                warn!(branch_id = %branch, "function triggers not synced: {e}");
             }
         }
     }
 
-    /// The reconcile sweep for child run-as keys still to mint: every ready branch with a
-    /// function that has a `run_as_role`, no key and no error but [`RUN_AS_KEY_PENDING`]'s
-    /// (best effort).
+    /// The reconcile sweep for child run-as keys still to mint (best effort): every ready
+    /// branch with a function that has a `run_as_role` and no key, chosen by state alone,
+    /// each pass taking the least recently attempted.
     pub async fn sync_pending_run_as(&self) {
         let Some(meta) = self.metadata.functions() else {
             return;
         };
-        let branches = match meta.pending_run_as_branches(SWEEP_BATCH).await {
-            Ok(branches) => branches,
-            Err(e) => return warn!("listing branches with run-as keys to mint: {e}"),
-        };
-        for branch in branches {
+        let candidates: Vec<(BranchId, bool)> =
+            match meta.pending_run_as_branches(SWEEP_CANDIDATES).await {
+                Ok(branches) => branches.into_iter().map(|b| (b, true)).collect(),
+                Err(e) => return warn!("listing branches with run-as keys to mint: {e}"),
+            };
+        for branch in self.sweep_batch(Sweep::RunAs, &candidates) {
+            self.attempted(Sweep::RunAs, branch);
             self.mint_child_run_as(branch).await;
         }
     }
@@ -613,7 +828,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// key is minted through `set_run_as`. A role the child doesn't have sets
     /// [`RUN_AS_ROLE_MISSING`]; a refused one `run_as_role_refused: <why>`. A check that can't
     /// run sets `run_as_key_pending: <why>` ([`RUN_AS_KEY_PENDING`]), which the reconcile sweep
-    /// retries; minting clears it. A function with any other error is left alone.
+    /// retries (it retries the other two as well: a role can be made, or changed, later);
+    /// minting clears these errors and never another one (an invocation error, say).
     pub(crate) async fn mint_child_run_as(&self, branch: BranchId) {
         let Some(meta) = self.metadata.functions() else {
             return;
@@ -644,14 +860,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .list_for_branch(branch)
             .await
             .map_err(|e| e.to_string())?;
-        let pending = |e: &Option<String>| {
-            e.as_deref()
-                .is_none_or(|e| e.starts_with(&format!("{RUN_AS_KEY_PENDING}: ")))
+        // Chosen by state alone: the functions service overwrites `last_error` on any
+        // invocation error, so it can't say whether a mint is still owed.
+        let mints = |e: &str| {
+            e.starts_with(RUN_AS_KEY_PENDING)
+                || e.starts_with(RUN_AS_ROLE_MISSING)
+                || e.starts_with(RUN_AS_ROLE_REFUSED)
         };
-        for f in functions
-            .iter()
-            .filter(|f| f.run_as_key_id.is_none() && pending(&f.last_error))
-        {
+        for f in functions.iter().filter(|f| f.run_as_key_id.is_none()) {
             let Some(role) = f.run_as_role.as_deref() else {
                 continue;
             };
@@ -679,7 +895,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                                 .await
                                 .map_err(|e| format!("function {}: {e}", f.name))?;
                             info!(branch_id = %branch, function = %f.name, "minted the child's run-as key");
-                            if f.last_error.is_some() {
+                            if f.last_error.as_deref().is_some_and(mints) {
                                 meta.set_function_last_error(branch, f.function_id, None)
                                     .await
                                     .map_err(|e| format!("function {}: {e}", f.name))?;
@@ -687,7 +903,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                             None
                         }
                         AllRowsCheckReply::Exposed { .. } => Some(format!(
-                            "run_as_role_refused: the role {role} reaches a role with the \"all rows\" policy"
+                            "{RUN_AS_ROLE_REFUSED}: the role {role} reaches a role with the \"all rows\" policy"
                         )),
                         AllRowsCheckReply::Failed { message } => {
                             warn!(branch_id = %branch, function = %f.name, "the all-rows check failed: {message}");
@@ -700,7 +916,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 RoleCheck::Refused(why) if why.ends_with("does not exist") => {
                     Some(RUN_AS_ROLE_MISSING.to_string())
                 }
-                RoleCheck::Refused(why) => Some(format!("run_as_role_refused: {why}")),
+                RoleCheck::Refused(why) => Some(format!("{RUN_AS_ROLE_REFUSED}: {why}")),
                 RoleCheck::NotReady => Some(format!(
                     "{RUN_AS_KEY_PENDING}: the branch's compute couldn't check the role"
                 )),
@@ -762,7 +978,7 @@ mod tests {
     #[test]
     fn fn_triggers_identifiers_only_as_literals() {
         let nasty = r#"or"d's $chelabase_fn$ \x; DROP TABLE t; --"#;
-        let sql = sync_sql(&[wanted(nasty, &["insert"])], false);
+        let sql = sync_sql(&[wanted(nasty, &["insert"])], false, Some(4242));
         let row = sql
             .lines()
             .find(|l| l.contains("chelabase_fn_0123"))
@@ -778,13 +994,16 @@ mod tests {
         assert!(sql.contains("pg_catalog.format('CREATE TRIGGER %I AFTER %s ON %I.%I FOR EACH ROW EXECUTE FUNCTION chelabase_functions.enqueue(%L)'"));
         assert!(sql.contains("pg_catalog.format('DROP TRIGGER %I ON %I.%I'"));
         // Rows with events the schema refuses never reach the script.
-        assert!(!sync_sql(&[wanted("t", &["truncate"])], false).contains("INSERT INTO pg_temp"));
+        assert!(
+            !sync_sql(&[wanted("t", &["truncate"])], false, Some(4242))
+                .contains("INSERT INTO pg_temp")
+        );
     }
 
     /// The function's privileges and search path, the event triggers off, the outbox cleaned.
     #[test]
     fn fn_triggers_script_is_locked_down() {
-        let sql = sync_sql(&[wanted("orders", &["insert"])], true);
+        let sql = sync_sql(&[wanted("orders", &["insert"])], true, Some(4242));
         assert!(sql.starts_with(&format!("{SYNC_MARK}\nBEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\n")));
         assert!(sql.trim_end().ends_with("COMMIT;"));
         for needle in [
@@ -794,7 +1013,6 @@ mod tests {
             "REVOKE ALL ON SCHEMA chelabase_functions FROM PUBLIC;",
             "REVOKE ALL ON TABLE chelabase_functions.outbox FROM PUBLIC;",
             "REVOKE ALL ON SEQUENCE chelabase_functions.outbox_id_seq FROM PUBLIC;",
-            "ALTER ROLE chelabase_functions_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT",
             "PERFORM pg_catalog.pg_notify('chelabase_functions', '');",
             "pg_catalog.jsonb_build_object(",
             "TRUNCATE chelabase_functions.outbox;",
@@ -804,18 +1022,24 @@ mod tests {
         ] {
             assert!(sql.contains(needle), "{needle}");
         }
-        assert!(!sync_sql(&[wanted("orders", &["insert"])], false).contains("TRUNCATE"));
+        assert!(
+            !sync_sql(&[wanted("orders", &["insert"])], false, Some(4242)).contains("TRUNCATE")
+        );
         // Audit B1: the row is never handed to to_jsonb whole (a user's cast would run as the
         // owner); the cleanup runs as the owner, after the repair, never as the superuser.
         assert!(!sql.contains("to_jsonb(NEW)") && !sql.contains("to_jsonb(OLD)"));
         let role = sql
             .find("SET LOCAL ROLE chelabase_functions_owner;")
             .unwrap();
-        assert!(sql.find("DROP ROUTINE IF EXISTS").unwrap() < role);
+        assert!(sql.find("had been changed; it was rebuilt").unwrap() < role);
+        assert!(
+            sql.find(FOREIGN_MARK).unwrap() < sql.find("CREATE SCHEMA").unwrap(),
+            "checked before any install"
+        );
         assert!(role < sql.find("TRUNCATE chelabase_functions.outbox;").unwrap());
         assert!(role < sql.find("DELETE FROM chelabase_functions.outbox").unwrap());
         // Nothing wanted: no install, only the cleanup of a schema that is ours.
-        let cleanup = sync_sql(&[], true);
+        let cleanup = sync_sql(&[], true, Some(4242));
         assert!(!cleanup.contains("CREATE SCHEMA") && !cleanup.contains("CREATE ROLE"));
         assert!(cleanup.contains("IF ours IS NULL THEN\n    RETURN;"));
     }
@@ -829,5 +1053,77 @@ mod tests {
             parse_sync(&out),
             vec![(a, None), (b, Some("table_missing".into()))]
         );
+    }
+    /// Round 2 (S2): 25 branches that always fail never starve the others: each pass takes
+    /// the least recently attempted, a branch with pending rows before one being checked for
+    /// drift, and every branch is attempted within two passes of 20.
+    #[test]
+    fn fn_triggers_sweep_order_rotates_past_stuck_branches() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let stuck: Vec<(BranchId, bool)> = (0..25).map(|_| (BranchId::new(), true)).collect();
+        let checked = (BranchId::new(), false);
+        let mut candidates = stuck.clone();
+        candidates.push(checked);
+        let mut attempts: HashMap<BranchId, Instant> = HashMap::new();
+        let mut clock = Instant::now();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let picked = sweep_order(&candidates, &attempts, 20);
+            assert_eq!(picked.len(), 20);
+            for b in picked {
+                clock += Duration::from_millis(1);
+                attempts.insert(b, clock);
+                seen.insert(b);
+            }
+        }
+        assert!(
+            stuck.iter().all(|(b, _)| seen.contains(b)),
+            "a stuck branch starved"
+        );
+        // A branch that just got a pending row goes first, before every stuck one.
+        let fresh = (BranchId::new(), true);
+        candidates.push(fresh);
+        assert_eq!(sweep_order(&candidates, &attempts, 1), vec![fresh.0]);
+        // A drift check comes after pending branches, however long it waited.
+        let only_pending = sweep_order(&candidates, &attempts, 26);
+        assert!(!only_pending.contains(&checked.0));
+        assert_eq!(
+            sweep_order(&candidates, &attempts, 27).last(),
+            Some(&checked.0)
+        );
+    }
+
+    /// Round 2 (B1, B2): plain tables only; the install adopts nothing it didn't make.
+    #[test]
+    fn fn_triggers_plain_tables_and_no_adoption() {
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, Some(4242));
+        assert!(sql.contains("c.relkind = 'r'"), "plain tables only");
+        assert!(!sql.contains("IN ('r', 'p')"));
+        assert!(sql.contains("' not_a_plain_table'"));
+        assert_eq!(install_error("not_a_plain_table"), PLAIN_TABLES_ONLY);
+        assert_eq!(install_error("table_missing"), "table_missing");
+        for needle in [
+            "pg_catalog.pg_shdepend",
+            "rolinherit",
+            "4242",
+            FOREIGN_MARK,
+            "pg_catalog.pg_db_role_setting",
+            "pg_catalog.pg_auth_members",
+        ] {
+            assert!(sql.contains(needle), "{needle}");
+        }
+        assert!(
+            !sql.contains("CREATE ROLE"),
+            "the role is made once, before the checks"
+        );
+        assert!(
+            !sql.contains("REVOKE chelabase_functions_owner FROM"),
+            "never repaired: refused"
+        );
+        assert!(check_sql(Some(4242)).contains(FOREIGN_MARK));
+        assert!(role_sql(true).contains(
+            "CREATE ROLE chelabase_functions_owner NOLOGIN NOINHERIT CONNECTION LIMIT 0"
+        ));
     }
 }

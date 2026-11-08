@@ -491,6 +491,7 @@ pub fn build_with(
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
         recreate_backoff: Default::default(),
+        fn_sweeps: Default::default(),
         identity: identity_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,

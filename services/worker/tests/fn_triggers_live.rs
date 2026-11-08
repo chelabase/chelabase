@@ -643,8 +643,7 @@ mod fn_triggers {
                    CREATE RULE spy_rule AS ON DELETE TO chelabase_functions.outbox DO ALSO INSERT INTO public.seen VALUES ('rule:' || current_user);
                    CREATE FUNCTION public.spy_policy() RETURNS boolean LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES ('policy:' || current_user); RETURN true; END$$;
                    ALTER TABLE chelabase_functions.outbox ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
-                   CREATE POLICY spy ON chelabase_functions.outbox USING (public.spy_policy());
-                   CREATE FUNCTION chelabase_functions.extra() RETURNS int LANGUAGE sql AS 'SELECT 1';"#,
+                   CREATE POLICY spy ON chelabase_functions.outbox USING (public.spy_policy());"#,
             )
             .await;
             fx.worker.sync_fn_triggers(main, true).await.unwrap();
@@ -660,7 +659,7 @@ mod fn_triggers {
                      + (SELECT count(*) FROM pg_proc WHERE pronamespace = 'chelabase_functions'::regnamespace AND proname <> 'enqueue')",
                 )
                 .await;
-            assert_eq!(shape, "0", "the outbox or schema kept a planted object");
+            assert_eq!(shape, "0", "the outbox kept a planted object");
             assert_eq!(fx.value(main, grants).await, "falsefalsefalsefalse");
             fx.sql(main, "INSERT INTO public.orders VALUES (2)").await;
             assert_eq!(fx.outbox(main).await, 1, "events land in the rebuilt outbox");
@@ -685,7 +684,13 @@ mod fn_triggers {
             // The state a failed first sync leaves: the parent's trigger still in the child's
             // database, writing on the child's timeline, and the child's rows pending.
             let parent_wanted = worker::fn_triggers::wanted_in(&fx.triggers(main).await, &fx.database);
-            fx.sql(dev, &worker::fn_triggers::sync_sql(&parent_wanted, false)).await;
+            let role: u32 = fx
+                .value(dev, "SELECT oid FROM pg_roles WHERE rolname = 'chelabase_functions_owner'")
+                .await
+                .parse()
+                .unwrap();
+            fx.sql(dev, &worker::fn_triggers::sync_sql(&parent_wanted, false, Some(role)))
+                .await;
             fx.sql(dev, "INSERT INTO public.orders VALUES (1)").await;
             sqlx::query("UPDATE function_triggers SET state = 'pending_install' WHERE branch_id = $1")
                 .bind(dev.as_uuid())
@@ -729,12 +734,219 @@ mod fn_triggers {
             assert!(error.as_deref().is_some_and(|e| e.starts_with("run_as_key_pending: ")), "{error:?}");
             fx.worker.sync_pending_run_as().await;
             assert_eq!(state(dev).await.0, None, "still pending while the check can't run");
+            // Round 2 (S3): an invocation error recorded meanwhile doesn't stop the retry, and
+            // isn't cleared (it isn't the mint's).
+            fx.metadata
+                .set_function_last_error(dev, f, Some("TypeError: boom"))
+                .await
+                .unwrap();
             fx.sql(dev, "ALTER DATABASE fn_broken RESET session_preload_libraries").await;
             fx.worker.sync_pending_run_as().await;
             let (key, error) = state(dev).await;
             assert!(key.is_some(), "minted on a later pass");
-            assert_eq!(error, None, "the pending error is cleared");
+            assert_eq!(error.as_deref(), Some("TypeError: boom"));
         })
         .await;
+    }
+
+    /// Where a move is set up, and when.
+    #[derive(Clone, Copy, PartialEq)]
+    enum At {
+        /// The shared database, before the first sync.
+        SharedBefore,
+        /// The shared database, after the first sync, before the sweep.
+        SharedBetween,
+        /// A database of its own, before its first sync (the compute's roles are its own).
+        Own,
+    }
+
+    /// What a move must end in.
+    enum Expect {
+        /// The table's trigger is installed and its events reach the outbox.
+        Flows(&'static str),
+        /// The table's trigger row is `failed` with this error prefix (nothing installed).
+        Failed(&'static str, &'static str),
+        /// The attacker's statement itself is refused.
+        Refused,
+    }
+
+    /// The invariant (`worker::fn_triggers` module docs): no object a database member can
+    /// create or alter ever runs with the rights of `chelabase_functions_owner` or the worker's
+    /// superuser connection, and the install never adopts an object it didn't create. Each
+    /// attacker move is set up before or between syncs; afterwards the outbox's owner and ACL
+    /// and `enqueue()` are as installed, no planted function ran (each logs `current_user`
+    /// into `public.seen`), and events flow or the row is `failed`. `owner` setups run as the
+    /// database owner (`postgres`), the others as the superuser (a state from the past).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn attack_matrix_keeps_the_invariant() {
+        const SPY: &str = r#"CREATE TABLE IF NOT EXISTS public.seen (who text); GRANT INSERT ON public.seen TO PUBLIC;
+            CREATE OR REPLACE FUNCTION public.spy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;
+            CREATE OR REPLACE FUNCTION public.spy_bool() RETURNS boolean LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN true; END$$;"#;
+        // (name, where, as the owner, setup SQL, table to trigger on, expected outcome)
+        let moves: [(&str, At, bool, &str, &str, Expect); 9] = [
+            ("hostile casts", At::SharedBefore, true,
+             r#"CREATE TYPE public.mood AS ENUM ('ok');
+                CREATE FUNCTION public.mood_json(public.mood) RETURNS json LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN '"x"'::json; END$$;
+                CREATE CAST (public.mood AS json) WITH FUNCTION public.mood_json(public.mood);
+                CREATE DOMAIN public.dmood AS public.mood; CREATE TYPE public.pair AS (m public.mood, n int);
+                CREATE TABLE public.casts (id int, m public.mood, d public.dmood, p public.pair, a public.mood[]);"#,
+             "casts", Expect::Flows("casts")),
+            ("partitioned table", At::SharedBefore, true,
+             "CREATE TABLE public.parts (id int) PARTITION BY RANGE (id); CREATE TABLE public.parts_1 PARTITION OF public.parts FOR VALUES FROM (0) TO (10);",
+             "parts", Expect::Failed("parts", "function triggers support plain tables only")),
+            ("named grants", At::SharedBetween, false,
+             "GRANT USAGE ON SCHEMA chelabase_functions TO authenticated; GRANT SELECT, INSERT ON chelabase_functions.outbox TO authenticated;
+              GRANT USAGE ON SEQUENCE chelabase_functions.outbox_id_seq TO authenticated; GRANT EXECUTE ON FUNCTION chelabase_functions.enqueue() TO authenticated;",
+             "", Expect::Flows("plain")),
+            ("tampered outbox", At::SharedBetween, false,
+             "CREATE TRIGGER spy AFTER DELETE ON chelabase_functions.outbox FOR EACH ROW EXECUTE FUNCTION public.spy();
+              CREATE RULE spy_rule AS ON DELETE TO chelabase_functions.outbox DO ALSO INSERT INTO public.seen VALUES ('rule:' || current_user);
+              ALTER TABLE chelabase_functions.outbox ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
+              CREATE POLICY spy ON chelabase_functions.outbox USING (public.spy_bool());
+              ALTER TABLE chelabase_functions.outbox ADD COLUMN extra text DEFAULT 'x';",
+             "", Expect::Flows("plain")),
+            ("trigger dropped", At::SharedBetween, true, "DROP TRIGGER {drop} ON public.dropped;", "dropped", Expect::Flows("dropped")),
+            ("trigger disabled", At::SharedBetween, true, "ALTER TABLE public.disabled DISABLE TRIGGER USER;", "disabled", Expect::Flows("disabled")),
+            ("ON TRUNCATE trigger", At::SharedBetween, true,
+             "CREATE TRIGGER spy_truncate AFTER TRUNCATE ON chelabase_functions.outbox FOR EACH STATEMENT EXECUTE FUNCTION public.spy();",
+             "", Expect::Refused),
+            ("pre-created role and schema", At::Own, true,
+             "CREATE ROLE chelabase_functions_owner NOLOGIN; GRANT chelabase_functions_owner TO postgres WITH SET TRUE;
+              CREATE SCHEMA chelabase_functions AUTHORIZATION chelabase_functions_owner;
+              GRANT CREATE ON SCHEMA public TO chelabase_functions_owner;
+              CREATE FUNCTION public.leftover() RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT current_user::text';
+              ALTER FUNCTION public.leftover() OWNER TO chelabase_functions_owner;",
+             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_owner has attributes")),
+            ("role owning an object in another database", At::Own, false,
+             "CREATE ROLE chelabase_functions_owner NOLOGIN NOINHERIT CONNECTION LIMIT 0; CREATE DATABASE fn_other;",
+             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_owner owns or holds rights on objects outside")),
+        ];
+        let shared: &'static Fx = Box::leak(Box::new(Fx::provision().await));
+        let mut own: Vec<&'static Fx> = Vec::new();
+        for _ in moves.iter().filter(|m| m.1 == At::Own) {
+            own.push(Box::leak(Box::new(Fx::provision().await)));
+        }
+        let all: Vec<&'static Fx> = std::iter::once(shared).chain(own.iter().copied()).collect();
+        let every = all.clone();
+        let outcome = tokio::spawn(async move {
+            let all = every;
+            let as_owner = |sql: &str| format!("BEGIN; SET LOCAL ROLE postgres; {sql}; COMMIT;");
+            for fx in std::iter::once(shared).chain(own.iter().copied()) {
+                fx.sql(fx.main, SPY).await;
+                fx.sql(fx.main, &as_owner("CREATE TABLE public.orders (id int); CREATE TABLE public.plain (id int); CREATE TABLE public.dropped (id int); CREATE TABLE public.disabled (id int)")).await;
+            }
+            let mut own_iter = own.iter().copied();
+            let mut placed: Vec<(&Fx, usize)> = Vec::new();
+            for (i, (name, at, owner, sql, table, _)) in moves.iter().enumerate() {
+                let fx = if *at == At::Own { own_iter.next().unwrap() } else { shared };
+                placed.push((fx, i));
+                if *at != At::SharedBetween {
+                    let sql = if *owner { as_owner(sql) } else { sql.to_string() };
+                    fx.on(fx.main, &sql).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    if name.contains("another database") {
+                        let ep = fx.branch(fx.main).await.endpoint_id.unwrap();
+                        fx.worker
+                            .computes
+                            .admin_sql(&ep, "fn_other", "CREATE TABLE public.theirs (id int); ALTER TABLE public.theirs OWNER TO chelabase_functions_owner;")
+                            .await
+                            .unwrap();
+                    }
+                }
+                let _ = table;
+            }
+            // Triggers on every table a move names, plus the shared `plain` one and the
+            // drift targets, then the first sync.
+            let f = shared.function("hello").await;
+            let mut ids = std::collections::HashMap::new();
+            for t in ["casts", "parts", "plain", "dropped", "disabled"] {
+                ids.insert(t, shared.trigger(shared.main, f, t, &["insert"]).await);
+            }
+            for fx in &own {
+                let g = fx.function("hello").await;
+                fx.trigger(fx.main, g, "orders", &["insert"]).await;
+            }
+            for fx in &all {
+                let _ = fx.worker.sync_fn_triggers(fx.main, false).await;
+            }
+            let acl = "SELECT (SELECT relowner::regrole::text || ' ' || coalesce(relacl::text, '') FROM pg_class WHERE oid = 'chelabase_functions.outbox'::regclass)
+                || ' | ' || (SELECT coalesce(relacl::text, '') FROM pg_class WHERE oid = 'chelabase_functions.outbox_id_seq'::regclass)
+                || ' | ' || (SELECT nspowner::regrole::text || ' ' || coalesce(nspacl::text, '') FROM pg_namespace WHERE nspname = 'chelabase_functions')
+                || ' | ' || (SELECT proowner::regrole::text || ' ' || coalesce(proacl::text, '') || ' ' || md5(prosrc) || ' ' || prosecdef || ' ' || proconfig::text
+                     FROM pg_proc WHERE oid = 'chelabase_functions.enqueue()'::regprocedure)";
+            let installed = shared.value(shared.main, acl).await;
+            assert!(installed.starts_with("chelabase_functions_owner "), "{installed}");
+            // Between syncs.
+            let mut refused = Vec::new();
+            for (i, (name, at, owner, sql, _, expect)) in moves.iter().enumerate() {
+                if *at != At::SharedBetween {
+                    continue;
+                }
+                let sql = sql.replace("{drop}", &trigger_name(ids["dropped"]));
+                let sql = if *owner { as_owner(&sql) } else { sql };
+                let result = shared.on(shared.main, &sql).await;
+                match expect {
+                    Expect::Refused => {
+                        let err = result.expect_err(name);
+                        assert!(err.contains("permission denied"), "{name}: {err}");
+                        refused.push(i);
+                    }
+                    _ => {
+                        result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    }
+                }
+            }
+            // The owner can still add and attach partitions (round 2, B1).
+            shared
+                .sql(shared.main, &as_owner("CREATE TABLE public.parts_2 PARTITION OF public.parts FOR VALUES FROM (10) TO (20); CREATE TABLE public.parts_3 (id int); ALTER TABLE public.parts ATTACH PARTITION public.parts_3 FOR VALUES FROM (20) TO (30)"))
+                .await;
+            // What the reconcile sweep runs for each branch: repair, revoke, drift.
+            for fx in &all {
+                let _ = fx.worker.sync_fn_triggers(fx.main, false).await;
+            }
+            assert_eq!(shared.value(shared.main, acl).await, installed, "the outbox, its ACL or enqueue() changed");
+            for (fx, i) in &placed {
+                let (name, _, _, _, _, expect) = &moves[*i];
+                let rows = fx.triggers(fx.main).await;
+                match expect {
+                    Expect::Flows(table) => {
+                        let row = rows.iter().find(|t| t.table_name.as_deref() == Some(*table)).unwrap();
+                        assert_eq!((row.state, row.last_error.as_deref()), (TriggerState::Installed, None), "{name}");
+                        let before = fx.outbox(fx.main).await;
+                        let insert = match *table {
+                            "casts" => "INSERT INTO public.casts VALUES (1, 'ok', 'ok', ROW('ok', 1), ARRAY['ok']::public.mood[])".to_string(),
+                            t => format!("INSERT INTO public.{t} (id) VALUES (1)"),
+                        };
+                        fx.sql(fx.main, &as_owner(&insert)).await;
+                        assert_eq!(fx.outbox(fx.main).await, before + 1, "{name}: no event");
+                    }
+                    Expect::Failed(table, prefix) => {
+                        let row = rows.iter().find(|t| t.table_name.as_deref() == Some(*table)).unwrap();
+                        assert_eq!(row.state, TriggerState::Failed, "{name}");
+                        assert!(row.last_error.as_deref().is_some_and(|e| e.starts_with(prefix)), "{name}: {:?}", row.last_error);
+                        assert!(!fx.db_triggers(fx.main).await.contains(&trigger_name(row.id)), "{name}: installed");
+                    }
+                    Expect::Refused => assert!(refused.contains(i), "{name}"),
+                }
+            }
+            for fx in &own {
+                // Never adopted: no enqueue() was made in a schema it didn't create.
+                assert_eq!(fx.value(fx.main, "SELECT to_regprocedure('chelabase_functions.enqueue()') IS NULL").await, "t");
+            }
+            for fx in &all {
+                assert_eq!(fx.value(fx.main, "SELECT coalesce(string_agg(who, ','), '') FROM public.seen").await, "", "a planted function ran");
+            }
+            assert_eq!(
+                shared.value(shared.main, "SELECT has_table_privilege('authenticated', 'chelabase_functions.outbox', 'SELECT')::text || has_function_privilege('authenticated', 'chelabase_functions.enqueue()', 'EXECUTE')::text").await,
+                "falsefalse"
+            );
+        })
+        .await;
+        for fx in all {
+            fx.teardown().await;
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic.into_panic());
+        }
     }
 }

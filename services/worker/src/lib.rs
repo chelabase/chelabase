@@ -122,6 +122,8 @@ pub struct Worker<M, S, C, N, P> {
     /// Endpoints whose last recreate left a compute that never got ready (reconcile skips them
     /// until their backoff ends).
     pub recreate_backoff: Mutex<std::collections::HashMap<String, reconcile::RecreateBackoff>>,
+    /// Edge functions m8: the function sweeps' last attempt per branch (`fn_triggers`).
+    pub fn_sweeps: Mutex<fn_triggers::SweepAttempts>,
     /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`):
     /// app-user pool create/drop and user reads. `None` when either is unset; app users and
     /// project delete jobs then fail and are retried.
