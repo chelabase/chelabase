@@ -94,7 +94,11 @@ export function FunctionSecrets({ databaseId, branchId, name, canChange }: Funct
                 ••••••
               </span>
               <ReadOnlyHint reason={reason}>
-                <Button size="xs" variant="ghost" disabled={!canChange || busy} aria-label={`Replace ${s}`} onClick={() => setSecretName(s)}>
+                <Button size="xs" variant="ghost" disabled={!canChange || busy} aria-label={`Replace ${s}`} onClick={() => {
+                    setSecretName(s);
+                    valueRef.current?.focus();
+                  }}
+                >
                   Replace
                 </Button>
               </ReadOnlyHint>

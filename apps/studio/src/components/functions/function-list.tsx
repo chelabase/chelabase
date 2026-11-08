@@ -184,12 +184,12 @@ export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps
                     <KindCell databaseId={databaseId} branchId={branchId} fn={fn} />
                   </td>
                   <td className="px-3 py-2">
-                    {status ? <span className={`text-xs ${TONE[status.tone]}`}>{status.label}</span> : <span className="text-xs text-chalk-dim">{enabled ? "Enabled" : "Disabled"}</span>}
+                    {status ? <span className={`text-xs ${TONE[status.tone]}`}>{status.label}</span> : <span className="text-xs text-chalk-dim">–</span>}
                   </td>
                   <td className="max-w-56 px-3 py-2">
                     <ActiveDeployment databaseId={databaseId} branchId={branchId} fn={fn} />
                   </td>
-                  <td className="px-3 py-2">{fn.kind === "service" ? AUTH_LABEL.key : fn.auth ? AUTH_LABEL[fn.auth] : <span className="text-chalk-dim">Not set</span>}</td>
+                  <td className="px-3 py-2">{fn.auth ? AUTH_LABEL[fn.auth] : <span className="text-chalk-dim">Not set</span>}</td>
                   <td className="max-w-64 px-3 py-2">
                     {fn.rollout?.state === "pending" ? (
                       <span className="text-xs text-chalk-dim">Rolling over…</span>

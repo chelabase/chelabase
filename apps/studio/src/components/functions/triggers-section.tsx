@@ -16,7 +16,8 @@ import { RadioGroup } from "@/components/ui/radio-group";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { functionErrorText, useToggles } from "@/lib/functions";
-import { STORAGE_EVENTS, TABLE_EVENTS, initialTriggerDraft, triggerDraftReducer, triggerReason, triggerRequest, triggerTarget } from "@/lib/functions-triggers";
+import { STORAGE_EVENTS, TABLE_EVENTS, initialTriggerDraft, triggerDraftReducer, triggerReason, triggerRequest, triggerTarget, triggersInstalling } from "@/lib/functions-triggers";
+import { pollWhile } from "@/lib/query";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
 
@@ -94,7 +95,7 @@ function TriggerRow({ t, canChange, busy, toggles, onToggle, onDelete }: {
 /** A function's table and storage triggers on the branch: list, add, turn on or off, delete. */
 export function TriggersSection({ databaseId, branchId, name, canChange }: TriggersSectionProps) {
   const queryClient = useQueryClient();
-  const list = useListFunctionTriggers(databaseId, branchId, name);
+  const list = useListFunctionTriggers(databaseId, branchId, name, { query: { refetchInterval: pollWhile<FunctionTrigger[]>(triggersInstalling) } });
   const dbs = useListBranchDatabases(databaseId, branchId);
   const main = dbs.data?.find((d) => d.main)?.name ?? dbs.data?.[0]?.name ?? "";
   const toggles = useToggles(`${databaseId}/${branchId}/${name}/triggers`);
