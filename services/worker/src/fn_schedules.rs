@@ -5,6 +5,11 @@
 //! the functions service's `POST /internal/invoke/{branch_id}/{name}` with the worker's bearer.
 //! A run is at most once: the claim has already moved `next_run_at` on, and a failed run is
 //! logged, not retried. Missed ticks (the worker was down) coalesce into one run.
+//!
+//! At most [`MAX_IN_FLIGHT`] runs are in flight per worker: a claim takes no more schedules
+//! than there are free slots (none while every slot is busy), so a slow functions service
+//! delays the next claims instead of piling up requests. Schedules left unclaimed stay due and
+//! run, coalesced, once a slot frees.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +17,15 @@ use std::time::Duration;
 use chelabase_metadata::MetadataClient;
 use chelabase_types::BranchId;
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 /// How often the loop claims.
 pub const EVERY: Duration = Duration::from_secs(5);
 /// At most this many schedules per claim; a full batch claims again at once.
 pub const BATCH: i64 = 50;
+/// At most this many runs in flight at once, per worker.
+pub const MAX_IN_FLIGHT: usize = 64;
 /// The longest a run's request may take (the functions service's own deadline is 30 s).
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -83,22 +91,32 @@ impl Invoker for HttpInvoker {
     }
 }
 
-/// One claim: advances every due schedule it took and starts the runs (without waiting for
-/// them). How many schedules it claimed.
-pub async fn claim_once(
-    metadata: &MetadataClient,
+/// How many schedules the next claim may take: the free run slots, at most [`BATCH`].
+pub fn claim_limit(permits: &Semaphore) -> i64 {
+    (permits.available_permits() as i64).min(BATCH)
+}
+
+/// Starts the runs of `claimed` (a schedule that only advanced has none), each in a slot of
+/// `permits` held until its request ends; waits for a slot when every one is busy, never for
+/// a run.
+pub async fn start_runs(
+    permits: &Arc<Semaphore>,
     invoker: &Arc<dyn Invoker>,
-) -> Result<usize, chelabase_metadata::MetadataError> {
-    let claimed = metadata.claim_due_schedules(BATCH).await?;
-    for s in &claimed {
+    claimed: &[chelabase_metadata::ClaimedSchedule],
+) {
+    for s in claimed {
         let Some(tick) = s.run else {
             debug!(schedule = %s.id, branch_id = %s.branch_id, function = %s.function_name, "schedule advanced without a run");
             continue;
+        };
+        let Ok(slot) = permits.clone().acquire_owned().await else {
+            return;
         };
         let invoker = invoker.clone();
         let (id, branch, name) = (s.id, s.branch_id, s.function_name.clone());
         let body = event_body(&s.cron, tick);
         tokio::spawn(async move {
+            let _slot = slot;
             match invoker.invoke(branch, &name, body).await {
                 Ok(status) if (200..300).contains(&status) => {
                     debug!(schedule = %id, branch_id = %branch, function = %name, "scheduled run done");
@@ -112,19 +130,37 @@ pub async fn claim_once(
             }
         });
     }
-    Ok(claimed.len())
 }
 
-/// The loop: a claim every [`EVERY`], and again at once after a full batch.
+/// One claim of up to [`claim_limit`] schedules: advances every due schedule it took and
+/// starts the runs (without waiting for them). Whether it took as many as it could, so the
+/// loop claims again at once (`false` when no slot was free).
+pub async fn claim_once(
+    metadata: &MetadataClient,
+    invoker: &Arc<dyn Invoker>,
+    permits: &Arc<Semaphore>,
+) -> Result<bool, chelabase_metadata::MetadataError> {
+    let limit = claim_limit(permits);
+    if limit == 0 {
+        debug!("every scheduled-run slot is busy: claiming later");
+        return Ok(false);
+    }
+    let claimed = metadata.claim_due_schedules(limit).await?;
+    start_runs(permits, invoker, &claimed).await;
+    Ok(claimed.len() as i64 >= limit)
+}
+
+/// The loop: a claim every [`EVERY`], and again at once after a full one.
 pub async fn schedule_loop(metadata: MetadataClient, invoker: Arc<dyn Invoker>) {
+    let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     let mut every = tokio::time::interval(EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
         loop {
-            match claim_once(&metadata, &invoker).await {
-                Ok(n) if n as i64 >= BATCH => continue,
-                Ok(_) => break,
+            match claim_once(&metadata, &invoker, &permits).await {
+                Ok(true) => continue,
+                Ok(false) => break,
                 Err(e) => {
                     warn!("claiming due schedules failed: {e}");
                     break;
@@ -240,6 +276,92 @@ mod tests {
         }
         assert!(Schedule::parse(&"1".repeat(101), "UTC").is_err());
         Schedule::parse("*/5 9-17 * * MON-FRI", "Europe/London").unwrap();
+    }
+
+    /// Holds every run until released, counting how many are in flight at once.
+    struct Held {
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        done: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl Invoker for Held {
+        async fn invoke(&self, _: BranchId, _: &str, _: serde_json::Value) -> Result<u16, String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(n, SeqCst);
+            self.release.acquire().await.unwrap().forget();
+            self.now.fetch_sub(1, SeqCst);
+            self.done.fetch_add(1, SeqCst);
+            Ok(200)
+        }
+    }
+
+    fn claimed(run: bool) -> chelabase_metadata::ClaimedSchedule {
+        chelabase_metadata::ClaimedSchedule {
+            id: uuid::Uuid::new_v4(),
+            branch_id: BranchId::new(),
+            function_name: "f".into(),
+            cron: "* * * * *".into(),
+            run: run.then(Utc::now),
+            next_run_at: None,
+        }
+    }
+
+    /// A slow functions service never piles up runs: at most the cap are in flight, a claim
+    /// takes no more than the free slots (none when full), and every claimed run still runs.
+    #[tokio::test]
+    async fn fn_schedules_runs_in_flight_are_capped() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let held = Arc::new(Held {
+            now: 0.into(),
+            most: 0.into(),
+            done: 0.into(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let invoker: Arc<dyn Invoker> = held.clone();
+        let permits = Arc::new(tokio::sync::Semaphore::new(3));
+        assert_eq!(claim_limit(&permits), 3);
+
+        // Five claimed runs (and one that only advanced) against three slots.
+        let batch: Vec<_> = (0..5)
+            .map(|_| claimed(true))
+            .chain([claimed(false)])
+            .collect();
+        let starting = {
+            let (permits, invoker) = (permits.clone(), invoker.clone());
+            tokio::spawn(async move { start_runs(&permits, &invoker, &batch).await })
+        };
+        while held.now.load(SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(claim_limit(&permits), 0, "a full cap claims nothing");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            held.now.load(SeqCst),
+            3,
+            "no fourth run while three are in flight"
+        );
+
+        held.release.add_permits(5);
+        starting.await.unwrap();
+        while held.done.load(SeqCst) < 5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(held.most.load(SeqCst), 3);
+        // Every slot is back once the runs end.
+        while permits.available_permits() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(claim_limit(&permits), 3);
+        assert_eq!(
+            claim_limit(&Arc::new(tokio::sync::Semaphore::new(500))),
+            BATCH
+        );
     }
 
     #[test]
