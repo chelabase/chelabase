@@ -985,6 +985,45 @@ async fn a_scheduled_body_from_the_worker_is_marked_for_the_runtime() {
     assert_eq!(h.last().header("x-chelabase-event"), None);
 }
 
+/// Edge functions m14: the worker's `{"type": "storage"}` body is marked for the runtime with
+/// `x-chelabase-event: storage` (its supervisor then hands the event to `fetch`); a forged
+/// header on the worker's call is replaced, and a public call's body or header is never an
+/// event.
+#[tokio::test]
+async fn a_storage_body_from_the_worker_is_marked_for_the_runtime() {
+    let h = harness().await;
+    let url = format!("{}/internal/invoke/{}/users", h.control, h.branch);
+    let body = r#"{"type":"storage","event":{"id":"00000000-0000-0000-0000-000000000000","type":"object.created"}}"#;
+    let resp = h
+        .http
+        .post(&url)
+        .bearer_auth(WORKER)
+        .header("x-chelabase-event", "scheduled")
+        .header("chelabase-event", "db")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen = h.last();
+    assert_eq!(seen.header("x-chelabase-event"), Some("storage"));
+    assert_eq!(seen.headers.get_all("x-chelabase-event").iter().count(), 1);
+    assert_eq!(seen.header("chelabase-event"), None);
+    assert_eq!(seen.body, body.as_bytes());
+
+    let resp = h
+        .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
+        .header("x-chelabase-event", "storage")
+        .header("chelabase-event", "storage")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("x-chelabase-event"), None);
+    assert_eq!(h.last().header("chelabase-event"), None);
+}
+
 /// Edge functions m13: the worker's database event (`chelabase-event: db` on the internal
 /// invoke) reaches the function's `fetch` marked `chelabase-event: db`, once; a public call's
 /// forged header never does.

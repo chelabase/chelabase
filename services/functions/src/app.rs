@@ -10,7 +10,8 @@
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
 //! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
 //! /internal/invoke/{branch_id}/{name}` (the worker's bearer; a `{"type": "scheduled"}` body
-//! reaches the runtime marked `x-chelabase-event: scheduled`, m7). A database event (m13) is
+//! reaches the runtime marked `x-chelabase-event: scheduled`, m7; a `{"type": "storage"}` one
+//! `x-chelabase-event: storage`, m14). A database event (m13) is
 //! marked `chelabase-event: db` only by this process's dispatcher ([`crate::events`], m13b):
 //! the header is stripped from every HTTP call, the worker's included.
 
@@ -426,8 +427,9 @@ async fn invoke(
         path_and_query.push_str(&q);
     }
     let mut headers = function_headers(&req.headers, &caller);
-    if form == Form::Internal && is_scheduled(&body) {
-        headers.insert(EVENT_HEADER, HeaderValue::from_static("scheduled"));
+    if form == Form::Internal && let Some(kind) = worker_event(&body) {
+        // m7 and m14: the runtime runs `scheduled`, or hands a storage event to `fetch`.
+        headers.insert(EVENT_HEADER, HeaderValue::from_static(kind));
     } else if form == Form::Internal
         && req.headers.get(DB_EVENT_HEADER).is_some_and(|v| v == "db")
     {
@@ -499,15 +501,19 @@ impl crate::events::dispatch::Invoker for AppState {
     }
 }
 
-/// The worker's scheduled event (m7): a JSON object whose `type` is `scheduled`. The runtime
-/// checks the rest of it.
-fn is_scheduled(body: &[u8]) -> bool {
+/// The worker's event: a JSON object whose `type` is `scheduled` (m7) or `storage` (m14), and
+/// which of the two. The runtime checks the rest of it.
+fn worker_event(body: &[u8]) -> Option<&'static str> {
     #[derive(serde::Deserialize)]
     struct Event<'a> {
         #[serde(borrow, rename = "type")]
         kind: Option<std::borrow::Cow<'a, str>>,
     }
-    serde_json::from_slice::<Event>(body).is_ok_and(|e| e.kind.as_deref() == Some("scheduled"))
+    match serde_json::from_slice::<Event>(body).ok()?.kind.as_deref()? {
+        "scheduled" => Some("scheduled"),
+        "storage" => Some("storage"),
+        _ => None,
+    }
 }
 
 /// Drops the headers that are ours or the hop's: every `x-chelabase-*` and `chelabase-*` (the
