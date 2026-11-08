@@ -4,9 +4,11 @@
 //! delivers nothing. The handler reads the uploaded object through the storage API and records
 //! the event through the data API, both with its run-as role's `CHELABASE_SERVICE_KEY`.
 //!
-//! The database, the tables, the storage policies and the role are made through the management
-//! API and SQL, as `db_events` makes them; the function, its run-as role and its trigger through
-//! the management API; the uploads through the gateway with a secret key of the branch.
+//! The database, the table and the storage policies are made through the management API and
+//! SQL, as `db_events` makes them; the function, its run-as role and its trigger through the
+//! management API; the uploads through the gateway with a secret key of the branch. The run-as
+//! role is `authenticated`: the storage schema grants its tables to `anon` and `authenticated`
+//! only, so a custom role reads no object whatever its policies say.
 
 use chelabase_metadata::DEMO_TENANT_ID;
 use chelabase_types::{BranchId, DatabaseId};
@@ -90,12 +92,9 @@ async fn flow(api: &Api, project: &str) {
             "CREATE TABLE seen (id bigint generated always as identity primary key, event_id text NOT NULL,
                  kind text NOT NULL, bucket text NOT NULL, name text NOT NULL, branch_id text NOT NULL,
                  body text, at timestamptz NOT NULL DEFAULT now());
-             CREATE ROLE fn_recorder NOLOGIN; GRANT fn_recorder TO authenticator;
-             GRANT USAGE ON SCHEMA public TO fn_recorder; GRANT SELECT, INSERT ON seen TO fn_recorder;
+             GRANT SELECT, INSERT ON seen TO authenticated;
              SELECT storage.create_policy('e2e_buckets', 'buckets', 'ALL', array['authenticated']::name[], 'true', 'true');
              SELECT storage.create_policy('e2e_objects', 'objects', 'ALL', array['authenticated']::name[], 'true', 'true');
-             SELECT storage.create_policy('fn_buckets', 'buckets', 'SELECT', array['fn_recorder']::name[], 'true', NULL);
-             SELECT storage.create_policy('fn_objects', 'objects', 'SELECT', array['fn_recorder']::name[], 'true', NULL);
              SELECT current_database();",
         )
         .await;
@@ -133,7 +132,7 @@ async fn flow(api: &Api, project: &str) {
     let set = s
         .patch(
             "recorder",
-            json!({ "run_as_role": "fn_recorder", "enabled": true }),
+            json!({ "run_as_role": "authenticated", "enabled": true }),
         )
         .await;
     assert_eq!(set["run_as_active"], json!(true), "{set}");
