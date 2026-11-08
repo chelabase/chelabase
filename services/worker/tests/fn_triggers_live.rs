@@ -24,14 +24,14 @@ mod fn_triggers {
         TriggerSource, TriggerState,
     };
     use chelabase_nats::{BranchJob, PointInTime};
-    use chelabase_neon::ComputeBackend;
+    use chelabase_neon::{ComputeBackend, SqlOpts};
     use chelabase_schema::catalog::{CATALOG_SQL, parse_catalog};
     use chelabase_schema::plan::admin_digest_sql;
     use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_types::{BranchId, DatabaseId, ProjectId};
     use uuid::Uuid;
     use worker::config::RealWorker;
-    use worker::fn_triggers::{RUN_AS_ROLE_MISSING, trigger_name};
+    use worker::fn_triggers::{OWNER, RUN_AS_ROLE_MISSING, SYNC_LOCK_KEY, trigger_name};
 
     use crate::common::{cleanup, setup};
 
@@ -105,6 +105,21 @@ mod fn_triggers {
             self.worker
                 .computes
                 .admin_sql(&ep, &self.database, sql)
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+
+        /// `sql` in a session of the login role `user` (the compute trusts local connections),
+        /// so the session user is a tenant's, not the superuser.
+        async fn on_as(&self, branch: BranchId, user: &str, sql: &str) -> Result<String, String> {
+            let ep = self.branch(branch).await.endpoint_id.expect("endpoint");
+            let opts = SqlOpts {
+                user: Some(user.to_string()),
+                ..SqlOpts::admin_default()
+            };
+            self.worker
+                .computes
+                .admin_sql_with(&ep, &self.database, sql, &opts)
                 .await
                 .map_err(|e| format!("{e:#}"))
         }
@@ -787,7 +802,7 @@ mod fn_triggers {
             CREATE OR REPLACE FUNCTION public.spy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;
             CREATE OR REPLACE FUNCTION public.spy_bool() RETURNS boolean LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN true; END$$;"#;
         // (name, where, as the owner, setup SQL, table to trigger on, expected outcome)
-        let moves: [(&str, At, bool, &str, &str, Expect); 9] = [
+        let moves: [(&str, At, bool, &str, &str, Expect); 14] = [
             ("hostile casts", At::SharedBefore, true,
              r#"CREATE TYPE public.mood AS ENUM ('ok');
                 CREATE FUNCTION public.mood_json(public.mood) RETURNS json LANGUAGE plpgsql AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN '"x"'::json; END$$;
@@ -823,7 +838,24 @@ mod fn_triggers {
              "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_owner has attributes")),
             ("role owning an object in another database", At::Own, false,
              "CREATE ROLE chelabase_functions_owner NOLOGIN NOINHERIT CONNECTION LIMIT 0; CREATE DATABASE fn_other;",
-             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_owner owns or holds rights on objects outside")),
+             "orders", Expect::Failed("orders", "chelabase_functions_foreign: the role chelabase_functions_owner owns objects outside")),
+            // Round 4 (B2): names the owner role where it gives nobody anything; never a refusal.
+            ("default privileges to the owner role, by authenticated", At::SharedBetween, false,
+             "BEGIN; SET LOCAL ROLE authenticated; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO chelabase_functions_owner; COMMIT;",
+             "", Expect::Flows("plain")),
+            ("large object granted to the owner role, by authenticated", At::SharedBetween, false,
+             "BEGIN; SET LOCAL ROLE authenticated; SELECT lo_create(4243); GRANT SELECT ON LARGE OBJECT 4243 TO chelabase_functions_owner; COMMIT;",
+             "", Expect::Flows("plain")),
+            ("policy naming the owner role", At::SharedBetween, true,
+             "ALTER TABLE public.plain ENABLE ROW LEVEL SECURITY; CREATE POLICY spy_policy ON public.plain TO chelabase_functions_owner USING (public.spy_bool());",
+             "", Expect::Flows("plain")),
+            // Round 4 (B3): an Admin names the owner role as a key's or a function's run-as role.
+            ("owner role as a key role", At::SharedBetween, false, "@check_data_role chelabase_functions_owner", "", Expect::Refused),
+            // Drift of the machinery itself (a state from the past): enqueue() replaced by a
+            // superuser is put back by the catalog comparison, and the spy never runs.
+            ("replaced enqueue()", At::SharedBetween, false,
+             "CREATE OR REPLACE FUNCTION chelabase_functions.enqueue() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN INSERT INTO public.seen VALUES (current_user); RETURN NULL; END$$;",
+             "", Expect::Flows("plain")),
         ];
         let shared: &'static Fx = Box::leak(Box::new(Fx::provision().await));
         let mut own: Vec<&'static Fx> = Vec::new();
@@ -885,6 +917,14 @@ mod fn_triggers {
                 if *at != At::SharedBetween {
                     continue;
                 }
+                if let Some(role) = sql.strip_prefix("@check_data_role ") {
+                    // The worker's key role check, as a data key's create or a run-as PATCH.
+                    let check = shared.worker.check_data_role(shared.main, role).await;
+                    assert!(matches!(expect, Expect::Refused), "{name}");
+                    assert!(matches!(check, worker::data_api::RoleCheck::Refused(_)), "{name}: {check:?}");
+                    refused.push(i);
+                    continue;
+                }
                 let sql = sql.replace("{drop}", &trigger_name(ids["dropped"]));
                 let sql = if *owner { as_owner(&sql) } else { sql };
                 let result = shared.on(shared.main, &sql).await;
@@ -907,6 +947,21 @@ mod fn_triggers {
             for fx in &all {
                 let _ = fx.worker.sync_fn_triggers(fx.main, false).await;
             }
+            // Round 4 (B1): with everything in place, a tenant transaction that wrote to a
+            // triggered table stays open through the next sweep (the steady state, every 30 s);
+            // another tenant writer must not queue behind the sweep.
+            let long = tokio::spawn(async move {
+                shared.on(shared.main, "BEGIN; INSERT INTO public.plain VALUES (0); SELECT pg_sleep(8); COMMIT;").await
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for fx in &all {
+                let _ = fx.worker.sync_fn_triggers(fx.main, false).await;
+            }
+            let other = shared
+                .on(shared.main, &as_owner("SET LOCAL statement_timeout = '3s'; INSERT INTO public.plain VALUES (-1)"))
+                .await;
+            assert!(other.is_ok(), "a tenant write queued behind the sweep: {other:?}");
+            let _ = long.await;
             assert_eq!(shared.value(shared.main, acl).await, installed, "the outbox, its ACL or enqueue() changed");
             for (fx, i) in &placed {
                 let (name, _, _, _, _, expect) = &moves[*i];
@@ -1200,6 +1255,180 @@ mod fn_triggers {
                     .all(|b| *b != dev),
                 "terminal: never retried"
             );
+        })
+        .await;
+    }
+
+    /// Round 4 (B1), the third invariant: the drift sweep (every reconcile pass, for every
+    /// branch with an installed trigger) never blocks the tenant's writes. A write transaction
+    /// open on a triggered table holds a lock on the outbox; the sweep neither waits on it nor
+    /// makes other writers queue behind it, and runs no DDL at all while the machinery is in
+    /// place (the catalog rows of the schema, the outbox and `enqueue()` keep their `xmin`).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_sweep_never_blocks_tenant_writes() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int)").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            const ROWS: &str = "SELECT (SELECT xmin FROM pg_namespace WHERE nspname = 'chelabase_functions') || ' ' \
+                || (SELECT xmin FROM pg_class WHERE oid = 'chelabase_functions.outbox'::regclass) || ' ' \
+                || (SELECT xmin FROM pg_proc WHERE oid = 'chelabase_functions.enqueue()'::regprocedure)";
+            let rows_before = fx.value(main, ROWS).await;
+            // A tenant transaction that wrote to a triggered table and is still open (8 s).
+            let long = tokio::spawn(async move {
+                fx.on(main, "BEGIN; INSERT INTO public.orders VALUES (1); SELECT pg_sleep(8); COMMIT;").await
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // The reconcile sweep's sync of an already-installed branch.
+            let sweep = tokio::spawn(async move { fx.worker.sync_fn_triggers(main, false).await });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Another tenant writer meanwhile: it must not wait behind the sweep.
+            let started = Instant::now();
+            let other = fx
+                .on(main, "SET statement_timeout = '3s'; INSERT INTO public.orders VALUES (2);")
+                .await;
+            let waited = started.elapsed();
+            let locks = fx
+                .value(main, "SELECT coalesce(string_agg(l.mode || ':' || l.granted, ','), '') FROM pg_locks l WHERE l.relation = 'chelabase_functions.outbox'::regclass")
+                .await;
+            let _ = long.await;
+            let sweep = sweep.await.unwrap();
+            assert!(
+                other.is_ok(),
+                "a tenant INSERT stalled {waited:?} behind the drift sweep: {other:?}; outbox locks then: {locks}; sweep result {sweep:?}"
+            );
+            assert_eq!(sweep, Ok(()), "the sweep failed on the tenant's open transaction");
+            assert_eq!(
+                fx.value(main, ROWS).await,
+                rows_before,
+                "the sweep ran DDL on machinery that was in place (a worker of the stack running the pre-fix code sweeps this branch too, every 30 s)"
+            );
+            assert_eq!(fx.outbox(main).await, 2);
+        })
+        .await;
+    }
+
+    /// Round 4 (B3): the owner role never backs a data key or a run-as key. The worker's role
+    /// check (the one every secret key and run-as role goes through) refuses it by name, so it
+    /// is never granted to `authenticator` and the next sync still finds it clean.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_owner_role_never_backs_a_key() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int)").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let check = fx.worker.check_data_role(main, OWNER).await;
+            let member = fx
+                .value(main, "SELECT pg_has_role('authenticator', 'chelabase_functions_owner', 'MEMBER')::text")
+                .await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let rows = fx.triggers(main).await;
+            let states: Vec<_> = rows.iter().map(|t| (t.state, t.last_error.clone())).collect();
+            assert!(
+                matches!(check, worker::data_api::RoleCheck::Refused(_)),
+                "the owner role passed the key role check: {check:?}; authenticator now a member: {member}; triggers after the next sync: {states:?}"
+            );
+            assert_eq!(member, "false");
+            assert_eq!(states, vec![(TriggerState::Installed, None)]);
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]));
+        })
+        .await;
+    }
+
+    /// Round 4 (B2), the third invariant: a role with no rights at all (`authenticated`), or a
+    /// table owner, can't turn off the database's function triggers by naming the owner role
+    /// where it gives nobody anything: a default privilege for its own future objects, a large
+    /// object's grant, a policy. The grants are revoked; the policy is left to its table's
+    /// owner (taking the role out of it would change their row security).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_unprivileged_role_cannot_disable_the_triggers() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE TABLE public.mine (id int); ALTER TABLE public.mine OWNER TO postgres").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            for (name, sql) in [
+                ("default privileges", "BEGIN; SET LOCAL ROLE authenticated; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO chelabase_functions_owner; COMMIT;"),
+                ("large object", "BEGIN; SET LOCAL ROLE authenticated; SELECT lo_create(4242); GRANT SELECT ON LARGE OBJECT 4242 TO chelabase_functions_owner; COMMIT;"),
+                ("policy", "BEGIN; SET LOCAL ROLE postgres; ALTER TABLE public.mine ENABLE ROW LEVEL SECURITY; CREATE POLICY p ON public.mine TO chelabase_functions_owner USING (true); COMMIT;"),
+            ] {
+                let moved = fx.on(main, sql).await;
+                assert!(moved.is_ok(), "setup {name}: {moved:?}");
+                fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                let rows = fx.triggers(main).await;
+                let row = rows.iter().find(|r| r.id == t).unwrap();
+                assert_eq!(
+                    (row.state, row.last_error.clone(), trigger_names(&fx.db_triggers(main).await)),
+                    (TriggerState::Installed, None, names(&[t])),
+                    "{name}: disabled the branch's function triggers"
+                );
+            }
+            // What names the role afterwards, beyond what it owns: only the policy.
+            assert_eq!(
+                fx.value(main, "SELECT coalesce(string_agg(d.deptype::text || ':' || d.classid::regclass::text, ',' ORDER BY 1), '') FROM pg_shdepend d WHERE d.refobjid = 'chelabase_functions_owner'::regrole AND d.refclassid = 'pg_authid'::regclass AND d.deptype <> 'o'").await,
+                "r:pg_policy",
+                "the grants to the owner role were not revoked"
+            );
+            // (The compute has default privileges of its own; none names the owner role.)
+            assert_eq!(
+                fx.value(main, "SELECT count(*) FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE a.grantee = 'chelabase_functions_owner'::regrole").await,
+                "0"
+            );
+            assert_eq!(
+                fx.value(main, "SELECT count(*) FROM pg_largeobject_metadata m CROSS JOIN LATERAL aclexplode(m.lomacl) a WHERE m.oid = 4242 AND a.grantee = 'chelabase_functions_owner'::regrole").await,
+                "0"
+            );
+        })
+        .await;
+    }
+
+    /// The third invariant, step-back: any session can hold the sync's advisory key
+    /// (`pg_advisory_lock` is everyone's). A tenant squatting on it never stalls the install,
+    /// and two syncs of one database still never run at once (the second yields and is
+    /// retried, never failed).
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_squatted_advisory_lock_never_stalls_the_install() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            // A login role with no rights at all, in a session of its own (the holder check
+            // reads the session user, which a `SET ROLE` never changes).
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE ROLE squatter LOGIN NOINHERIT").await;
+            let f = fx.function("hello").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            let squat = tokio::spawn(async move {
+                fx.on_as(main, "squatter", &format!("BEGIN; SELECT pg_advisory_xact_lock({SYNC_LOCK_KEY}); SELECT pg_sleep(8); COMMIT;")).await
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let started = Instant::now();
+            let synced = fx.worker.sync_fn_triggers(main, false).await;
+            let took = started.elapsed();
+            let rows = fx.triggers(main).await;
+            assert_eq!(
+                (synced, rows[0].state, rows[0].last_error.clone()),
+                (Ok(()), TriggerState::Installed, None),
+                "a session holding the sync's advisory key stalled the install ({took:?})"
+            );
+            assert!(took < Duration::from_secs(5), "waited on the squatter: {took:?}");
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]));
+            let _ = squat.await;
+            // Two syncs at once: both answer Ok, the trigger stays as it is.
+            let (a, b) = tokio::join!(
+                fx.worker.sync_fn_triggers(main, false),
+                fx.worker.sync_fn_triggers(main, false)
+            );
+            assert_eq!((a, b), (Ok(()), Ok(())));
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]));
+            fx.sql(main, "INSERT INTO public.orders VALUES (1)").await;
+            assert_eq!(fx.outbox(main).await, 1);
         })
         .await;
     }
