@@ -51,6 +51,9 @@ mod fn_triggers {
             let (worker, metadata, _config) = setup().await;
             // `set_run_as` seals the key, as the orchestrator's client does.
             let metadata = metadata.with_secrets_key(worker.key.clone());
+            // The worker migrates at start; this suite's worker is in-process, so it does too
+            // (the strict migrator: a new migration is applied and recorded as the binary would).
+            metadata.migrate().await.expect("metadata migrations");
             let id = DatabaseId::new();
             let name = format!("fn-{}", &id.to_string()[..8]);
             let project = metadata
@@ -948,5 +951,256 @@ mod fn_triggers {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic.into_panic());
         }
+    }
+
+    /// Round 3 (S1): a `failed` row is never wanted. Once its table appears, the sweep (kept
+    /// there by another installed trigger) doesn't install its database trigger.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_failed_row_never_installed() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int)").await;
+            let f = fx.function("hello").await;
+            let a = fx.trigger(main, f, "orders", &["insert"]).await;
+            let b = fx.trigger(main, f, "later", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let st = |rows: Vec<TriggerRecord>, id: Uuid| {
+                rows.into_iter().find(|t| t.id == id).unwrap().state
+            };
+            assert_eq!(st(fx.triggers(main).await, b), TriggerState::Failed);
+            fx.sql(main, "CREATE TABLE public.later (id int)").await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.later VALUES (1)").await;
+            assert_eq!(st(fx.triggers(main).await, b), TriggerState::Failed);
+            assert_eq!(
+                (
+                    trigger_names(&fx.db_triggers(main).await),
+                    fx.outbox(main).await
+                ),
+                (names(&[a]), 0),
+                "a failed row's trigger was installed and is capturing rows"
+            );
+        })
+        .await;
+    }
+
+    /// Round 3 (S2): a refusal found after the install (here an object outside the schema
+    /// owned by the owner role, a state from the past) fails the rows and drops every database
+    /// trigger running `enqueue()`, so nothing keeps filling an outbox nobody reads.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_refusal_after_install_drops_the_triggers() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int)").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "CREATE TABLE public.theirs (id int); ALTER TABLE public.theirs OWNER TO chelabase_functions_owner;").await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let rows = fx.triggers(main).await;
+            assert_eq!(rows[0].state, TriggerState::Failed);
+            assert!(rows[0].last_error.as_deref().is_some_and(|e| e.starts_with("chelabase_functions_foreign")), "{rows:?}");
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), Vec::<String>::new(), "a refused database kept its triggers");
+        })
+        .await;
+    }
+
+    /// Round 3 (S2): a table owner granting the owner role rights on their own table gives
+    /// nobody the role's rights (nobody can act as it, and `enqueue()` reads no table), so it
+    /// doesn't refuse the install; the grant is revoked.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_a_grant_to_the_owner_role_is_revoked_not_refused() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); ALTER TABLE public.orders OWNER TO postgres").await;
+            let f = fx.function("hello").await;
+            let a = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "BEGIN; SET LOCAL ROLE postgres; GRANT SELECT ON public.orders TO chelabase_functions_owner; GRANT CREATE ON SCHEMA public TO chelabase_functions_owner; COMMIT;").await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let rows = fx.triggers(main).await;
+            assert_eq!((rows[0].state, rows[0].last_error.as_deref()), (TriggerState::Installed, None));
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[a]));
+            assert_eq!(
+                fx.value(main, "SELECT has_table_privilege('chelabase_functions_owner', 'public.orders', 'SELECT')::text || has_schema_privilege('chelabase_functions_owner', 'public', 'CREATE')::text").await,
+                "falsefalse",
+                "the grants to the owner role were revoked"
+            );
+        })
+        .await;
+    }
+
+    /// Round 3 audit's escalation matrix: the database owner can't reach the owner role or
+    /// change the machinery.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_member_cannot_escalate() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); ALTER TABLE public.orders OWNER TO postgres").await;
+            let f = fx.function("hello").await;
+            fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            let mut ok = Vec::new();
+            for stmt in [
+                "GRANT chelabase_functions_owner TO postgres",
+                "ALTER ROLE chelabase_functions_owner LOGIN PASSWORD 'x'",
+                "ALTER ROLE chelabase_functions_owner SET search_path = public",
+                "ALTER FUNCTION chelabase_functions.enqueue() SECURITY INVOKER",
+                "CREATE OR REPLACE FUNCTION chelabase_functions.enqueue() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
+                "CREATE FUNCTION chelabase_functions.x() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                "ALTER TABLE chelabase_functions.outbox ADD COLUMN x int",
+                "CREATE TRIGGER t2 AFTER INSERT ON public.orders FOR EACH ROW EXECUTE FUNCTION chelabase_functions.enqueue('00000000-0000-0000-0000-000000000000')",
+                "ALTER SCHEMA chelabase_functions OWNER TO postgres",
+                "DROP SCHEMA chelabase_functions CASCADE",
+                "CREATE TRIGGER spy AFTER DELETE ON chelabase_functions.outbox FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()",
+                "COMMENT ON ROLE chelabase_functions_owner IS 'x'",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE chelabase_functions_owner GRANT SELECT ON TABLES TO postgres",
+                "REASSIGN OWNED BY chelabase_functions_owner TO postgres",
+                "DROP OWNED BY chelabase_functions_owner",
+                "SECURITY LABEL ON ROLE chelabase_functions_owner IS 'x'",
+            ] {
+                if fx.on(main, &format!("BEGIN; SET LOCAL ROLE postgres; {stmt}; ROLLBACK;")).await.is_ok() {
+                    ok.push(stmt);
+                }
+            }
+            assert!(ok.is_empty(), "the database owner could: {ok:#?}");
+        })
+        .await;
+    }
+
+    /// Round 3 (B1), the invariant's second half: a member who clears the child's run-as role
+    /// while the worker checks it keeps it cleared; the mint writes nothing.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_run_as_mint_never_overrides_a_concurrent_change() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE ROLE reporter NOLOGIN").await;
+            let oid: i64 = fx.value(main, "SELECT oid FROM pg_roles WHERE rolname = 'reporter'").await.parse().unwrap();
+            let f = fx.function("hello").await;
+            assert!(fx.metadata.set_run_as(main, f, Some(&run_as("reporter", oid))).await.unwrap());
+            let dev = fx.create("dev").await;
+            // The state a first mint that couldn't run leaves.
+            sqlx::query("UPDATE data_api_keys SET revoked_at = now(), sealed = NULL WHERE branch_id = $1 AND managed_by_function_id = $2")
+                .bind(dev.as_uuid()).bind(f).execute(fx.metadata.pool()).await.unwrap();
+            sqlx::query("UPDATE branch_functions SET run_as_key_id = NULL WHERE branch_id = $1")
+                .bind(dev.as_uuid()).execute(fx.metadata.pool()).await.unwrap();
+            let mut tx = fx.metadata.pool().begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM branch_functions WHERE branch_id = $1 AND function_id = $2 FOR UPDATE")
+                .bind(dev.as_uuid()).bind(f).execute(&mut *tx).await.unwrap();
+            let mint = tokio::spawn(async move { fx.worker.sync_pending_run_as().await });
+            let mut waited = false;
+            for _ in 0..300 {
+                let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%FOR NO KEY UPDATE OF bf%'")
+                    .fetch_one(fx.metadata.pool()).await.unwrap();
+                if n > 0 {
+                    waited = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(waited, "the mint never reached its write");
+            // The member clears the run-as role (what set_run_as(None) leaves).
+            sqlx::query("UPDATE branch_functions SET run_as_role = NULL, run_as_key_id = NULL, run_as_role_oid = NULL WHERE branch_id = $1 AND function_id = $2")
+                .bind(dev.as_uuid()).bind(f).execute(&mut *tx).await.unwrap();
+            tx.commit().await.unwrap();
+            mint.await.unwrap();
+            let s = fx.metadata.list_for_branch(dev).await.unwrap().into_iter().find(|s| s.function_id == f).unwrap();
+            assert_eq!((s.run_as_role.as_deref(), s.run_as_key_id), (None, None), "the worker put a cleared run-as role back");
+        })
+        .await;
+    }
+
+    /// Round 3 (B2), the invariant's first half: a child's key is bound only to the role OID
+    /// the member approved on the parent. A role missing at the branch point stays missing
+    /// for a later namesake; a namesake with another OID is `changed`; neither is retried.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn audit_child_run_as_key_needs_the_approved_oid() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE ROLE ghost NOLOGIN; CREATE ROLE twin NOLOGIN")
+                .await;
+            let oid = |name: &'static str| async move {
+                fx.value(
+                    main,
+                    &format!("SELECT oid FROM pg_roles WHERE rolname = '{name}'"),
+                )
+                .await
+                .parse::<i64>()
+                .unwrap()
+            };
+            let f = fx.function("hello").await;
+            let g = fx.function("twinned").await;
+            assert!(
+                fx.metadata
+                    .set_run_as(main, f, Some(&run_as("ghost", oid("ghost").await)))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                fx.metadata
+                    .set_run_as(main, g, Some(&run_as("twin", oid("twin").await)))
+                    .await
+                    .unwrap()
+            );
+            // `ghost` is gone at the branch point; `twin` is another role by the same name.
+            fx.sql(
+                main,
+                "DROP ROLE ghost; DROP ROLE twin; CREATE ROLE twin NOLOGIN",
+            )
+            .await;
+            let dev = fx.create("dev").await;
+            let st = |b: BranchId, func: Uuid| async move {
+                let s = fx
+                    .metadata
+                    .list_for_branch(b)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|s| s.function_id == func)
+                    .unwrap();
+                (s.run_as_key_id, s.last_error)
+            };
+            assert_eq!(
+                st(dev, f).await,
+                (None, Some(RUN_AS_ROLE_MISSING.to_string()))
+            );
+            let (key, error) = st(dev, g).await;
+            assert_eq!(key, None);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("run_as_role_changed")),
+                "{error:?}"
+            );
+            // Someone with CREATEROLE makes a role under the old name on the child.
+            fx.sql(
+                dev,
+                "BEGIN; SET LOCAL ROLE postgres; CREATE ROLE ghost NOLOGIN; COMMIT;",
+            )
+            .await;
+            fx.worker.sync_pending_run_as().await;
+            let (key, err) = st(dev, f).await;
+            assert_eq!(
+                key, None,
+                "a key was minted for a new role named ghost (error now {err:?})"
+            );
+            assert_eq!(st(dev, g).await.0, None);
+            assert!(
+                fx.metadata
+                    .pending_run_as_branches(1000)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b != dev),
+                "terminal: never retried"
+            );
+        })
+        .await;
     }
 }
