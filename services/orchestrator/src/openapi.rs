@@ -1926,6 +1926,8 @@ mod tests {
             "SequencePrivilege",
             "ServiceHealth",
             "ServiceResources",
+            "ServiceRollout",
+            "ServiceRolloutState",
             "ServiceSpec",
             "SkipReason",
             "StatementResult",

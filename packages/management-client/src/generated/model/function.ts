@@ -7,6 +7,7 @@
 import type { FunctionAuth } from './functionAuth.ts';
 import type { FunctionKind } from './functionKind.ts';
 import type { ServiceHealth } from './serviceHealth.ts';
+import type { ServiceRollout } from './serviceRollout.ts';
 
 /**
  * A function of the database, with its state on this branch (null fields when it has no
@@ -30,6 +31,7 @@ export interface Function {
      */
   last_error: string | null;
   name: string;
+  rollout: ServiceRollout | null;
   /** Whether a live function-managed key backs `run_as_role` on the branch. */
   run_as_active: boolean;
   /**

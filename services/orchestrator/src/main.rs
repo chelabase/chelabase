@@ -225,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         webhooks,
         services,
         bundles,
+        rollouts: Default::default(),
         compute_tls: Some(compute_tls),
     };
 

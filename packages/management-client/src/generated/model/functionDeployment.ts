@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { FunctionDeploymentSpec } from './functionDeploymentSpec.ts';
+import type { ServiceRolloutState } from './serviceRolloutState.ts';
 
 /**
  * An immutable deployment of a function.
@@ -24,6 +25,7 @@ export interface FunctionDeployment {
   id: string;
   /** @nullable */
   note: string | null;
+  rollout?: ServiceRolloutState | null;
   /**
      * A service's spec (`{backend: "external", url, health_path}`); null for a function.
      * @nullable

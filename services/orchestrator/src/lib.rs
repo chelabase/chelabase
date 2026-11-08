@@ -1977,6 +1977,8 @@ pub struct AppState<M, J> {
     pub services: chelabase_http::outbound::Outbound,
     /// Edge functions m3: where deployments' bundles are stored (the functions service).
     pub bundles: functions::Bundles,
+    /// Edge functions m11: container rollovers in flight or failed, per branch and service.
+    pub rollouts: Arc<functions::Rollouts>,
 }
 
 /// The metadata client with the orchestrator's secrets key (edge functions m2/m3): function

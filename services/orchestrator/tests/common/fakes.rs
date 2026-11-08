@@ -3258,6 +3258,7 @@ async fn spawn_app_core_with(
         // m9: the same resolver, http allowed so the hard deny is what refuses a stack host.
         services: webhook_outbound().allow_http(true).deny_stack([]),
         bundles: Arc::new(bundles.clone()),
+        rollouts: Default::default(),
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))
