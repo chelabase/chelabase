@@ -392,6 +392,9 @@ pub struct TriggerRecord {
     pub last_delivery_error: Option<String>,
     /// m13: when an event was last delivered.
     pub last_delivered_at: Option<DateTime<Utc>>,
+    /// m13b: events the outbox bound removed undelivered (dead ones past the cap or the
+    /// retention, a disabled trigger's queued ones).
+    pub dropped_count: i64,
 }
 
 /// m13: what one dispatcher pass saw for a trigger ([`MetadataClient::record_trigger_deliveries`]).
@@ -402,6 +405,8 @@ pub struct TriggerDelivery {
     pub delivered: bool,
     /// Events that went dead.
     pub dead: i64,
+    /// m13b: events the outbox bound removed undelivered.
+    pub dropped: i64,
     /// The last failure's reason, when a delivery failed.
     pub error: Option<String>,
 }
@@ -692,7 +697,7 @@ fn deployment_from_row(r: &PgRow) -> DeploymentRecord {
 
 /// The columns [`trigger_from_row`] reads.
 const TRIGGER_COLUMNS: &str = "id, branch_id, function_id, source, enabled, state, enabled_since,
-    pg_database, schema_name, table_name, bucket, prefix, events, last_error, dead_count,
+    pg_database, schema_name, table_name, bucket, prefix, events, last_error, dead_count, dropped_count,
     last_delivery_error, last_delivered_at";
 
 fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
@@ -712,6 +717,7 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         events: r.get("events"),
         last_error: r.get("last_error"),
         dead_count: r.get("dead_count"),
+        dropped_count: r.get("dropped_count"),
         last_delivery_error: r.get("last_delivery_error"),
         last_delivered_at: r.get("last_delivered_at"),
     })
@@ -2068,7 +2074,7 @@ impl MetadataClient {
     }
 
     /// m13: what the dispatcher saw on the branch: each trigger's dead events are added to
-    /// `dead_count`; a failure sets `last_delivery_error`, a delivery without failure clears
+    /// `dead_count` (m13b: and what the outbox bound removed, to `dropped_count`); a failure sets `last_delivery_error`, a delivery without failure clears
     /// it; a delivery sets `last_delivered_at`. Rows of another branch, or gone, are skipped.
     /// One statement on trigger rows (4b) alone, taking nothing after.
     pub async fn record_trigger_deliveries(
@@ -2082,6 +2088,7 @@ impl MetadataClient {
         let ids: Vec<Uuid> = deliveries.iter().map(|d| d.id).collect();
         let delivered: Vec<bool> = deliveries.iter().map(|d| d.delivered).collect();
         let dead: Vec<i64> = deliveries.iter().map(|d| d.dead.max(0)).collect();
+        let dropped: Vec<i64> = deliveries.iter().map(|d| d.dropped.max(0)).collect();
         let errors: Vec<Option<String>> = deliveries
             .iter()
             .map(|d| d.error.as_ref().map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect()))
@@ -2089,12 +2096,13 @@ impl MetadataClient {
         Ok(sqlx::query(
             "UPDATE function_triggers t
              SET dead_count = t.dead_count + d.dead,
+                 dropped_count = t.dropped_count + d.dropped,
                  last_delivery_error = CASE WHEN d.error IS NOT NULL THEN d.error
                                             WHEN d.delivered THEN NULL
                                             ELSE t.last_delivery_error END,
                  last_delivered_at = CASE WHEN d.delivered THEN now() ELSE t.last_delivered_at END
-             FROM unnest($2::uuid[], $3::bool[], $4::bigint[], $5::text[])
-                  AS d(id, delivered, dead, error)
+             FROM unnest($2::uuid[], $3::bool[], $4::bigint[], $5::text[], $6::bigint[])
+                  AS d(id, delivered, dead, error, dropped)
              WHERE t.id = d.id AND t.branch_id = $1",
         )
         .bind(branch.as_uuid())
@@ -2102,24 +2110,27 @@ impl MetadataClient {
         .bind(delivered)
         .bind(dead)
         .bind(errors)
+        .bind(dropped)
         .execute(&self.pool)
         .await?
         .rows_affected())
     }
 
     /// m13: up to `limit` (ready branch of a live database, Postgres database) pairs with at
-    /// least one `installed`, enabled table trigger: where the dispatcher runs. A read.
+    /// least one `installed`, enabled table trigger: where the dispatcher runs. A read. In a
+    /// random order (m13b, N2): past `limit`, no branch always loses.
     pub async fn dispatch_targets(
         &self,
         limit: i64,
     ) -> Result<Vec<(BranchId, String)>, MetadataError> {
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "SELECT DISTINCT t.branch_id, t.pg_database
-             FROM function_triggers t JOIN branches b ON b.id = t.branch_id
-             JOIN databases d ON d.id = b.database_id
-             WHERE t.source = 'table' AND t.state = 'installed' AND t.enabled
-               AND b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
-             ORDER BY 1, 2 LIMIT $1",
+            "SELECT branch_id, pg_database FROM (
+               SELECT DISTINCT t.branch_id, t.pg_database
+               FROM function_triggers t JOIN branches b ON b.id = t.branch_id
+               JOIN databases d ON d.id = b.database_id
+               WHERE t.source = 'table' AND t.state = 'installed' AND t.enabled
+                 AND b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')) targets
+             ORDER BY random() LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)

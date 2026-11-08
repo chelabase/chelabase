@@ -751,6 +751,8 @@ services:
     secrets:
       - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      # m13b: the dispatcher verifies computes (the network is the base file's `compute`).
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
       - {source: nats-functions, target: "${CHELABASE_KEYS_DIR}/nats/functions.password"}
       - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
       - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}

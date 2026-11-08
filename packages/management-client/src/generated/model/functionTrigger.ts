@@ -15,6 +15,11 @@ export interface FunctionTrigger {
   /** Events that went dead after 10 failed deliveries. */
   dead_count: number;
   /**
+     * Events the outbox bound removed undelivered: dead events past 10,000 per database or 7
+     * days, and the queued events of a trigger turned off. A pending event is never removed.
+     */
+  dropped_count: number;
+  /**
      * A disabled table trigger is uninstalled (its queued events are dropped); turning it on
      * installs it again.
      */

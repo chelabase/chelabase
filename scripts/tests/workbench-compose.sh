@@ -143,12 +143,15 @@ tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sour
 [[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
 on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
-[[ "$on_compute" == "auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
+[[ "$on_compute" == "auth functions orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
   fail "exactly the compute dependencies and the clients that dial computes are on the compute network; got: $on_compute"
 for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker; do
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
 done
 [[ "$(q '.services.runner.networks | keys | sort | join(" ")')" == "compute control default functions-control" ]] || fail "the runner is on default, control, compute and functions-control (the functions e2e)"
+# m13b: the functions service dials computes as its dispatcher login (never the control network).
+[[ "$(q '.services.functions.networks | keys | sort | join(" ")')" == "compute default functions functions-control services-control" ]] ||
+  fail "functions is on compute (m13b), default, functions, functions-control and services-control"
 for s in nats valkey metadata-db storcon-db identity mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
   [[ "$(q ".services[\"$s\"].networks // {} | has(\"compute\")")" == false ]] || fail "$s must not be on the compute network"
 done

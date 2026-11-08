@@ -173,9 +173,10 @@ mod functions_triggers {
         assert_eq!(
             (
                 made["dead_count"].as_i64(),
+                made["dropped_count"].as_i64(),
                 made["last_delivery_error"].clone()
             ),
-            (Some(0), Value::Null)
+            (Some(0), Some(0), Value::Null)
         );
         let (status, st) = w
             .call("dee", "POST", &base, Some(storage().to_string()))
@@ -266,6 +267,47 @@ mod functions_triggers {
         assert_eq!(status, 422, "enabled is required");
         let (_, list) = w.call("vic", "GET", &base, None).await;
         assert_eq!(list.as_array().unwrap().len(), 1, "nothing else was added");
+    }
+
+    /// m13b (B2): a table trigger on Chelabase's or Postgres's own schemas is 422 (a trigger on
+    /// `chelabase_functions.outbox` would recurse into `enqueue()`); (S4) so is a table trigger
+    /// on a service, which is never delivered events.
+    #[tokio::test]
+    async fn functions_triggers_reserved_schemas_and_services_422() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let base = w.path(w.w.dev, "/hello/triggers");
+        for (schema, table) in [
+            ("chelabase_functions", "outbox"),
+            ("chelabase_guard", "x"),
+            ("chelabase", "app_users_table"),
+            ("chelabase_merge", "x"),
+            ("storage", "objects"),
+            ("pg_catalog", "pg_authid"),
+            ("information_schema", "tables"),
+            ("pg_toast", "x"),
+            ("pg_temp_3", "x"),
+            ("chelabase_new", "x"),
+        ] {
+            let body = json!({"source": "table", "pg_database": "app", "schema": schema, "table": table, "events": ["insert"]});
+            let (status, err) = w.call("dee", "POST", &base, Some(body.to_string())).await;
+            assert_eq!(status, 422, "{schema}.{table}: {err}");
+            assert!(err["error"]["message"].as_str().unwrap_or("").contains("schema"), "{err}");
+        }
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert!(list.as_array().unwrap().is_empty(), "nothing was added");
+        // A service is a tenant admin's to make (m9).
+        w.w.metadata.add_member(w.w.tenant, "tom", MemberStatus::Active, true);
+        let (status, body) = w
+            .call("tom", "PUT", &w.path(w.w.dev, "/svc"), Some(json!({"kind": "service"}).to_string()))
+            .await;
+        assert!(status == 201 || status == 200, "{status} {body}");
+        let svc = w.path(w.w.dev, "/svc/triggers");
+        let (status, err) = w.call("dee", "POST", &svc, Some(table().to_string())).await;
+        assert_eq!(status, 422, "{err}");
+        assert!(err["error"]["message"].as_str().unwrap_or("").contains("service"), "{err}");
+        let (status, _) = w.call("dee", "POST", &base, Some(table().to_string())).await;
+        assert_eq!(status, 201, "a user schema is fine");
     }
 
     /// A Viewer reads and is 403 on every write; another project's Developer, and a path

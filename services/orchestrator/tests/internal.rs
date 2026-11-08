@@ -47,6 +47,8 @@ const COMPUTE_TOKEN: &str = "compute-token";
 const DATA_KEYS_TOKEN: &str = "data-keys-token";
 const REST_TOKEN: &str = "rest-token";
 const STORAGE_TOKEN: &str = "storage-token";
+/// Edge functions m13b: the functions service's bearer (both ways, as rest's).
+const FUNCTIONS_TOKEN: &str = "functions-token";
 const CONTROL_PLANE_URI: &str = "http://orchestrator:8083";
 const APP_AUTH_TOKEN: &str = "app-auth-token";
 const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
@@ -1524,6 +1526,7 @@ async fn spawn_with_app(
         rest_token: REST_TOKEN.into(),
         realtime_token: REALTIME_TOKEN.into(),
         storage_token: STORAGE_TOKEN.into(),
+        functions_token: FUNCTIONS_TOKEN.into(),
         rt_events: Arc::new(app.rt_events),
         secrets: key.clone(),
         roles,
@@ -2326,6 +2329,8 @@ fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option
         authenticator_password_enc: password,
         storage_password_enc: None,
         storage_password_salt: None,
+        functions_password_enc: None,
+        functions_password_salt: None,
         settings: DataApiSettings {
             max_rows: 500,
             statement_timeout_ms: 4000,
@@ -2845,6 +2850,52 @@ async fn storage_connection_opens_the_storage_password() {
     row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "swapped"));
     neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
     let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 500);
+    assert!(!body.to_string().contains("swapped"));
+}
+
+/// Edge functions m13b: the dispatcher's login route takes the functions service's bearer
+/// only, and answers as `chelabase_functions_dispatch` with its own password (sealed for the
+/// branch, `Purpose::FunctionsDispatch`); 409 until the worker stored one. No other route
+/// carries it, and the functions bearer opens no other connection route.
+#[tokio::test]
+async fn functions_connection_opens_the_dispatch_password() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    let branch = row.branch_id.to_string();
+    row.authenticator_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "auth-pw"));
+    row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Storage, "storage-pw"));
+    row.storage_password_salt = Some(vec![1; 16]);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let path = format!("/internal/functions/branches/{}/connection", row.branch_id.as_uuid());
+    for token in [None, Some("wrong"), Some(REST_TOKEN), Some(REALTIME_TOKEN), Some(STORAGE_TOKEN), Some(DATA_KEYS_TOKEN), Some(PROXY_TOKEN)] {
+        assert_eq!(app.get(&path, token).await.0, 401, "{token:?}");
+    }
+    let (code, body) = app.get(&path, Some(FUNCTIONS_TOKEN)).await;
+    assert_eq!((code, &body), (409, &json!({ "status": "ready" })));
+
+    row.functions_password_enc = Some(seal_credential(&app.key, &branch, Purpose::FunctionsDispatch, "dispatch-pw"));
+    row.functions_password_salt = Some(vec![2; 16]);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(FUNCTIONS_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!((&body["user"], &body["password"]), (&json!("chelabase_functions_dispatch"), &json!("dispatch-pw")));
+    assert_eq!((&body["host"], &body["port"], &body["server_name"]), (&json!("127.0.0.1"), &json!(55432), &json!("ep-1.compute.chelabase.internal")));
+    assert!(body.get("replication_host").is_none(), "{body}");
+    for (route, token) in [("data", STORAGE_TOKEN), ("storage", STORAGE_TOKEN)] {
+        let other = format!("/internal/{route}/branches/{}/connection", row.branch_id.as_uuid());
+        let (code, text) = app.get(&other, Some(token)).await;
+        assert_eq!(code, 200, "{route}");
+        assert!(!text.to_string().contains("dispatch-pw"), "{route}: {text}");
+        assert_eq!(app.get(&other, Some(FUNCTIONS_TOKEN)).await.0, 401, "{route}");
+    }
+    // A dispatch password sealed as another purpose doesn't open.
+    row.functions_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Storage, "swapped"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(FUNCTIONS_TOKEN)).await;
     assert_eq!(code, 500);
     assert!(!body.to_string().contains("swapped"));
 }

@@ -1750,7 +1750,7 @@ mod functions {
                     .list_triggers(x.main)
                     .await?
                     .into_iter()
-                    .map(|t| TriggerDelivery { id: t.id, delivered: false, dead: 1, error: Some("500".into()) })
+                    .map(|t| TriggerDelivery { id: t.id, delivered: false, dead: 1, dropped: 0, error: Some("500".into()) })
                     .collect();
                 c.record_trigger_deliveries(x.main, &deliveries).await.map(drop)
             })),
@@ -2385,22 +2385,25 @@ mod functions {
         let row = |list: Vec<chelabase_metadata::TriggerRecord>| list.into_iter().find(|r| r.id == t).unwrap();
         let fresh = row(c.list_triggers(main).await.unwrap());
         assert_eq!((fresh.dead_count, fresh.last_delivery_error, fresh.last_delivered_at), (0, None, None));
-        let failed = TriggerDelivery { id: t, delivered: false, dead: 2, error: Some("the function answered 500".into()) };
+        assert_eq!(fresh.dropped_count, 0);
+        let failed = TriggerDelivery { id: t, delivered: false, dead: 2, dropped: 4, error: Some("the function answered 500".into()) };
         assert_eq!(c.record_trigger_deliveries(main, std::slice::from_ref(&failed)).await.unwrap(), 1);
         let (_, other) = s.database().await;
         assert_eq!(c.record_trigger_deliveries(other, std::slice::from_ref(&failed)).await.unwrap(), 0, "another branch's");
         let after = row(c.list_triggers(main).await.unwrap());
         assert_eq!((after.dead_count, after.last_delivery_error.as_deref()), (2, Some("the function answered 500")));
+        // m13b (B1): what the outbox bound removed is counted too.
+        assert_eq!(after.dropped_count, 4);
         assert_eq!(after.last_delivered_at, None);
-        c.record_trigger_deliveries(main, &[TriggerDelivery { id: t, delivered: true, dead: 1, error: None }])
+        c.record_trigger_deliveries(main, &[TriggerDelivery { id: t, delivered: true, dead: 1, dropped: 1, error: None }])
             .await
             .unwrap();
         let ok = row(c.list_triggers(main).await.unwrap());
-        assert_eq!((ok.dead_count, ok.last_delivery_error), (3, None));
+        assert_eq!((ok.dead_count, ok.last_delivery_error, ok.dropped_count), (3, None, 5));
         assert!(ok.last_delivered_at.is_some());
         let child = s.branch(db, main, "dev").await;
         let copied = c.list_triggers(child).await.unwrap();
-        assert!(copied.iter().all(|r| r.dead_count == 0 && r.last_delivered_at.is_none()), "{copied:?}");
+        assert!(copied.iter().all(|r| r.dead_count == 0 && r.dropped_count == 0 && r.last_delivered_at.is_none()), "{copied:?}");
         c.mark_branch_deleted(main).await.unwrap();
         assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a deleted branch is never dispatched");
         s.finish().await;

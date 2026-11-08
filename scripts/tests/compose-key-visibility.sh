@@ -128,6 +128,7 @@ expected='{
   "functions": {
     "C/scripts/tests/workbench-compose.sh": "ro",
     "K/secrets/secrets.key": "ro", "K/gateway/internal-verify.pem": "ro",
+    "K/compute-ca/ca.crt": "ro",
     "K/nats/functions.password": "ro",
     "K/tokens/orchestrator-functions.token": "ro", "K/tokens/worker-functions.token": "ro",
     "K/tokens/functions-service-runner.token": "ro"

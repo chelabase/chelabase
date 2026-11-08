@@ -34,6 +34,13 @@ pub struct Config {
     pub orchestrator_token: String,
     /// [`WORKER_TOKEN`] or its `_FILE` (required).
     pub worker_token: String,
+    /// m13b: `CHELABASE_INTERNAL_URL` (default `http://127.0.0.1:8083`): the orchestrator's
+    /// internal listener, asked for the dispatcher login's connection info with
+    /// [`ORCHESTRATOR_TOKEN`] (both ways, as rest's bearer).
+    pub internal_url: String,
+    /// m13b: `CHELABASE_COMPUTE_CA_FILE`: every compute is verified against it. Unset: database
+    /// events aren't dispatched.
+    pub compute_ca: Option<std::path::PathBuf>,
     /// The bundle store (`CHELABASE_STORAGE_BACKEND`, `CHELABASE_STORAGE_S3_*`; bucket
     /// `chelabase-functions`).
     pub store: StorageConfig,
@@ -83,6 +90,8 @@ impl Config {
             timeout: Duration::from_millis(timeout_ms),
             orchestrator_token,
             worker_token,
+            internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
+            compute_ca: non_blank("CHELABASE_COMPUTE_CA_FILE").map(Into::into),
             store: StorageConfig::from_lookup(&get)?,
         })
     }

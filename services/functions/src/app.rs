@@ -10,8 +10,9 @@
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
 //! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
 //! /internal/invoke/{branch_id}/{name}` (the worker's bearer; a `{"type": "scheduled"}` body
-//! reaches the runtime marked `x-chelabase-event: scheduled`, m7; a call with `chelabase-event:
-//! db` reaches the function's `fetch` marked `chelabase-event: db`, m13).
+//! reaches the runtime marked `x-chelabase-event: scheduled`, m7). A database event (m13) is
+//! marked `chelabase-event: db` only by this process's dispatcher ([`crate::events`], m13b):
+//! the header is stripped from every HTTP call, the worker's included.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +35,7 @@ use crate::directory::Resolution;
 use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
 use crate::resolver::Resolver;
 
-/// m13: marks a database event, from the worker on the internal invoke to the function.
+/// m13: marks a database event to the function (m13b: set by the dispatcher in this process only).
 pub const DB_EVENT_HEADER: &str = "chelabase-event";
 
 /// A request body may be at most 6 MiB.
@@ -357,6 +358,9 @@ async fn invoke_internal(
     let Ok(branch) = Uuid::parse_str(&branch) else {
         return not_found();
     };
+    // m13b: database events come from this process's dispatcher only, never over HTTP.
+    let mut headers = headers;
+    headers.remove(DB_EVENT_HEADER);
     let req = Incoming {
         method: Method::POST,
         path: raw_tail(uri.path(), INTERNAL_PREFIX),
@@ -427,8 +431,8 @@ async fn invoke(
     } else if form == Form::Internal
         && req.headers.get(DB_EVENT_HEADER).is_some_and(|v| v == "db")
     {
-        // m13: the worker's database event goes to `fetch`, marked (any client's copy of the
-        // header was stripped above).
+        // m13b: the dispatcher's database event goes to `fetch`, marked (every HTTP caller's
+        // copy of the header was stripped).
         headers.insert(DB_EVENT_HEADER, HeaderValue::from_static("db"));
     }
     let inv = Invocation {
@@ -467,6 +471,31 @@ async fn invoke(
                 "the functions runtime is unavailable; retry shortly",
             )
         }
+    }
+}
+
+/// m13b: the dispatcher's invocations, in this process: the function's `fetch` handler as the
+/// internal invoke reaches it, marked `chelabase-event: db`, body the event's JSON.
+#[async_trait::async_trait]
+impl crate::events::dispatch::Invoker for AppState {
+    async fn deliver(
+        &self,
+        branch: chelabase_types::BranchId,
+        function: &str,
+        body: Vec<u8>,
+    ) -> Result<u16, String> {
+        let mut headers = HeaderMap::new();
+        headers.insert(DB_EVENT_HEADER, HeaderValue::from_static("db"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let req = Incoming {
+            method: Method::POST,
+            path: format!("/{function}"),
+            headers,
+            query: None,
+            body: Body::from(body),
+        };
+        let resp = invoke(self, branch.as_uuid(), function, Form::Internal, Caller::Internal, req).await;
+        Ok(resp.status().as_u16())
     }
 }
 

@@ -542,11 +542,12 @@ impl SealedFixture {
                     .await
                     .unwrap();
             }
-            // The storage login's password always has its salt beside it.
-            ("branches", "storage_password_enc") => {
-                sqlx::query(
-                    "UPDATE branches SET storage_password_enc = 'v1:x', storage_password_salt = '\\x00000000000000000000000000000000' WHERE id = $1",
-                )
+            // The storage and functions logins' passwords always have their salt beside them.
+            ("branches", "storage_password_enc" | "functions_password_enc") => {
+                let salt = column.replace("_enc", "_salt");
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE branches SET {column} = 'v1:x', {salt} = '\\x00000000000000000000000000000000' WHERE id = $1"
+                )))
                 .bind(branch)
                 .execute(pool)
                 .await
@@ -3070,6 +3071,9 @@ async fn branch_connection_returns_settings() {
     // The storage login's password and salt are stored together, once.
     client.set_storage_password(main_of(id), "v1:storage", &[7; 16]).await.unwrap();
     client.set_storage_password(main_of(id), "v1:later", &[8; 16]).await.unwrap();
+    // m13b: the functions dispatcher's login, the same way.
+    client.set_functions_password(main_of(id), "v1:functions", &[5; 16]).await.unwrap();
+    client.set_functions_password(main_of(id), "v1:later", &[6; 16]).await.unwrap();
     let with_storage = client.branch_connection(main_of(id)).await.unwrap().expect("row");
     let missing = client.branch_connection(BranchId::new()).await.unwrap();
     let record = main_branch(&client, id).await;
@@ -3087,6 +3091,9 @@ async fn branch_connection_returns_settings() {
     assert_eq!(with_storage.settings.storage_max_connections, 7);
     assert_eq!(with_storage.storage_password_enc.as_deref(), Some("v1:storage"));
     assert_eq!(with_storage.storage_password_salt.as_deref(), Some(&[7u8; 16][..]));
+    assert_eq!((ready.functions_password_enc.as_deref(), ready.functions_password_salt.as_deref()), (None, None));
+    assert_eq!(with_storage.functions_password_enc.as_deref(), Some("v1:functions"));
+    assert_eq!(with_storage.functions_password_salt.as_deref(), Some(&[5u8; 16][..]));
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
     assert!(missing.is_none());

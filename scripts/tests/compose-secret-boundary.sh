@@ -179,6 +179,7 @@ storage	nats/storage.password	ro
 storage	storage-s3/access-key	ro
 storage	storage-s3/secret-key	ro
 functions	secrets/secrets.key	ro
+functions	compute-ca/ca.crt	ro
 functions	gateway/internal-verify.pem	ro
 functions	db/metadata.password	ro
 functions	nats/functions.password	ro
@@ -474,7 +475,8 @@ for render in base wb; do
       err "$render: $svc must not be on the runtime's network"
   done
   got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
-  [[ "$got" == '{"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
+  # m13b: `compute` (no alias: it dials computes and listens on nothing there).
+  [[ "$got" == '{"compute":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
 # #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and

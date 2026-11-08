@@ -302,7 +302,8 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 ///
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
-/// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `data_api_keys.sealed`
+/// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `functions_password_enc`
+/// (worker function triggers, `Purpose::FunctionsDispatch`); `data_api_keys.sealed`
 /// (orchestrator public keys, `Purpose::DataKey` with AAD the key id; and a function's run-as
 /// key, live only, sealed the same way by [`MetadataClient::set_run_as`]); `neon_roles.password_enc` (worker roles, branch
 /// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
@@ -316,6 +317,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
     ("branches", "storage_password_enc", None),
+    ("branches", "functions_password_enc", None),
     ("data_api_keys", "sealed", None),
     ("neon_roles", "password_enc", None),
     ("member_branch_roles", "password_enc", None),

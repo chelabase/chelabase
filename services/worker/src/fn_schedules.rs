@@ -40,15 +40,7 @@ pub trait Invoker: Send + Sync + 'static {
         name: &str,
         body: serde_json::Value,
     ) -> Result<u16, String>;
-
-    /// m13: posts a database event (`body`, JSON) marked `chelabase-event: db`; the functions
-    /// service's status, or why it couldn't be reached.
-    async fn deliver_event(&self, branch: BranchId, name: &str, body: Vec<u8>)
-    -> Result<u16, String>;
 }
-
-/// The header that marks a database event on the internal invoke (m13).
-pub const DB_EVENT_HEADER: &str = "chelabase-event";
 
 /// The functions service's control listener (`CHELABASE_FUNCTIONS_INTERNAL_URL`) with the
 /// worker's bearer (`CHELABASE_WORKER_FUNCTIONS_TOKEN[_FILE]`).
@@ -84,26 +76,6 @@ impl Invoker for HttpInvoker {
             .bearer_auth(&self.token)
             .timeout(INVOKE_TIMEOUT)
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.without_url().to_string())?;
-        Ok(resp.status().as_u16())
-    }
-
-    async fn deliver_event(
-        &self,
-        branch: BranchId,
-        name: &str,
-        body: Vec<u8>,
-    ) -> Result<u16, String> {
-        let resp = self
-            .http
-            .post(format!("{}/internal/invoke/{branch}/{name}", self.url))
-            .bearer_auth(&self.token)
-            .header(DB_EVENT_HEADER, "db")
-            .header("content-type", "application/json")
-            .timeout(INVOKE_TIMEOUT)
-            .body(body)
             .send()
             .await
             .map_err(|e| e.without_url().to_string())?;

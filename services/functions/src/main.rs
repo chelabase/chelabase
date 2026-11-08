@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let client =
         MetadataClient::connect_lazy(&MetadataConfig { database_url })?.with_secrets_key(key);
     let resolver = Arc::new(Resolver::new(
-        Arc::new(Metadata { client }),
+        Arc::new(Metadata { client: client.clone() }),
         config.public_url.clone(),
         TTL,
     ));
@@ -72,6 +72,25 @@ async fn main() -> anyhow::Result<()> {
         config.worker_token.clone(),
     )
     .with_services(services));
+    // m13b: database events, as the dispatcher's own login on each branch's compute.
+    match &config.compute_ca {
+        Some(ca) => {
+            let tls = chelabase_query::server_tls::ServerTls::from_ca_file(ca)?;
+            let source = chelabase_pgsession::InternalSource::functions_login(
+                &config.internal_url,
+                &config.orchestrator_token,
+            );
+            let invoker: Arc<dyn functions::events::dispatch::Invoker> = state.clone();
+            let dispatcher = Arc::new(functions::events::dispatch::Dispatcher::new(
+                Arc::new(client.clone()),
+                source,
+                Some(tls),
+                invoker,
+            ));
+            tokio::spawn(dispatcher.supervise());
+        }
+        None => tracing::warn!("CHELABASE_COMPUTE_CA_FILE is unset: database events aren't delivered"),
+    }
     let public_addrs = resolve_all("CHELABASE_FUNCTIONS_ADDR", &config.addr).await?;
     // The internal listener's two sides: compose names the service's alias on the runtime's
     // network (bundle GETs) and on the orchestrator's and the worker's (uploads, invocations),

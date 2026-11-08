@@ -174,6 +174,8 @@ struct H {
     db: Uuid,
     branch: Uuid,
     http: chelabase_http::Client,
+    /// m13b: the dispatcher's in-process invoker.
+    state: Arc<AppState>,
 }
 
 async fn harness() -> H {
@@ -224,7 +226,8 @@ async fn harness_with(runtime_url: Option<String>) -> H {
     H {
         public: serve(public_router(state.clone())).await,
         runtime: serve(runtime_router(state.clone())).await,
-        control: serve(control_router(state)).await,
+        control: serve(control_router(state.clone())).await,
+        state,
         seen,
         dir,
         store,
@@ -987,9 +990,23 @@ async fn a_scheduled_body_from_the_worker_is_marked_for_the_runtime() {
 /// forged header never does.
 #[tokio::test]
 async fn a_db_event_from_the_worker_is_marked_for_the_function() {
+    use functions::events::dispatch::Invoker;
     let h = harness().await;
     let url = format!("{}/internal/invoke/{}/users", h.control, h.branch);
     let body = r#"{"id":"t:app:1","type":"INSERT","schema":"public","table":"orders","record":{"id":1},"old_record":null,"txid":7}"#;
+    // m13b: only the dispatcher in this process marks a database event.
+    let status = h
+        .state
+        .deliver(chelabase_types::BranchId(h.branch), "users", body.as_bytes().to_vec())
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    let seen = h.last();
+    assert_eq!(seen.header("chelabase-event"), Some("db"));
+    assert_eq!(seen.headers.get_all("chelabase-event").iter().count(), 1);
+    assert_eq!(seen.header("x-chelabase-event"), None, "the fetch handler, not scheduled");
+    assert_eq!(seen.body, body.as_bytes());
+    // Over HTTP, even with the worker's bearer, the header is stripped: no forged event.
     let resp = h
         .http
         .post(&url)
@@ -1000,11 +1017,7 @@ async fn a_db_event_from_the_worker_is_marked_for_the_function() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let seen = h.last();
-    assert_eq!(seen.header("chelabase-event"), Some("db"));
-    assert_eq!(seen.headers.get_all("chelabase-event").iter().count(), 1);
-    assert_eq!(seen.header("x-chelabase-event"), None, "the fetch handler, not scheduled");
-    assert_eq!(seen.body, body.as_bytes());
+    assert_eq!(h.last().header("chelabase-event"), None, "a worker call is no database event");
 
     let resp = h
         .http

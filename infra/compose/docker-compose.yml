@@ -1397,6 +1397,7 @@ services:
       CHELABASE_NATS_USER: functions
       CHELABASE_NATS_PASSWORD_FILE: /run/chelabase/secrets/nats/functions.password
       CHELABASE_NATS_INBOX_PREFIX: _INBOX_functions
+      # The orchestrator's bearer, both ways (m13b: the dispatcher login's connection info).
       CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-functions.token
       CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-functions.token
       # Edge functions (m10): its bearer for the service runner (container services, m11).
@@ -1416,8 +1417,13 @@ services:
       functions-control:
         aliases: [functions-control]
       services-control: {}
+      # m13b: the database-event dispatcher dials computes as its own login (verified against
+      # the compute CA, as rest). It listens on nothing here: its listeners bind the aliases
+      # above only.
+      compute: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/nats/functions.password, read_only: true, volume: {subpath: nats/functions.password}}
@@ -1534,7 +1540,7 @@ networks:
   # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
   # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
   # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime,
-  # storage).
+  # storage, functions).
   # Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the storage broker or controller,
   # the gateway or Studio. Every listener of its members needs a credential or is public by
   # design (scripts/compute-network-e2e.sh audits each one).

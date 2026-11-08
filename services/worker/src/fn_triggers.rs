@@ -33,12 +33,26 @@
 //! `audit_owner_role_never_backs_a_key` and `audit_squatted_advisory_lock_never_stalls_the_install`
 //! test it, and the attack matrix carries each move.
 //!
+//! **Invariant (dispatch, m13b).** The dispatch login [`DISPATCH`] holds exactly its
+//! allowlist and nothing that could reach member data or another role: LOGIN NOINHERIT with
+//! [`DISPATCH_CONNECTION_LIMIT`], no other attribute, no member or membership, nothing owned,
+//! exactly [`DISPATCH_SETTINGS`], and exactly the grants [`DISPATCH_GRANTS`] (from the owner,
+//! without grant option). Any attribute, membership, setting or ownership beyond that refuses
+//! the install (the foreign check, as for [`OWNER`]); any grant beyond it is revoked on every
+//! pass ([`revoke_sql`]), and a missing one is put back. Its password is the branch's own
+//! (sealed `Purpose::FunctionsDispatch`), set by [`role_sql`] only while the role has no
+//! membership either way. The name is reserved like the owner's (`refuse_by_name`'s
+//! `chelabase_` prefix), so no key or run-as role is ever bound to it. The attack matrix
+//! carries its moves; `dispatch_role_privilege_matrix` shows what it can't do.
+//!
 //! [`Worker::sync_fn_triggers`] keeps a branch's databases in step with its table triggers
 //! (`function_triggers`, source `table`), as the superuser (`cloud_admin`):
 //!
 //! - **The role**: [`OWNER`], made once per compute by [`role_sql`] (NOLOGIN NOINHERIT
 //!   CONNECTION LIMIT 0, by the superuser, so it never has members). Every check and install
 //!   that follows requires that very role.
+//! - **The dispatch login** (m13b): [`DISPATCH`], made by [`role_sql`] beside the owner when
+//!   a trigger is wanted, for the functions service's dispatcher (`services/functions/src/events`).
 //! - **The foreign check** ([`check_sql`], in every database of the compute, before anything
 //!   is installed anywhere, and again at the top of each install): the role and the schema
 //!   `chelabase_functions` must be exactly what the install makes. That means no attribute,
@@ -103,7 +117,8 @@
 //! are recorded in `function_trigger_drops`, which keeps the branch in the reconcile sweep
 //! until a complete sync ([`Worker::sync_fn_triggers`] answers `Ok(true)`) has dropped them
 //! ("drop, then forget"). `enqueue()` also records the transaction id (`txid`). The events are
-//! delivered by [`crate::fn_events`].
+//! delivered by the functions service (m13b, `services/functions/src/events`), as the login
+//! [`DISPATCH`].
 //!
 //! When: after a branch create (the child's rows are copies, `pending_install`, and its
 //! database still has the parent's triggers and outbox); after a reset or restore (the switch
@@ -135,6 +150,27 @@ use crate::review::review_databases_sql;
 
 /// The NOLOGIN role owning the schema, the outbox and the trigger function.
 pub const OWNER: &str = "chelabase_functions_owner";
+
+/// m13b: the functions service's dispatcher login (LOGIN NOINHERIT, no other attribute or
+/// membership), granted exactly [`DISPATCH_GRANTS`].
+pub const DISPATCH: &str = "chelabase_functions_dispatch";
+
+/// m13b: the dispatch login's connection limit. The dispatcher holds one connection per
+/// branch database with an installed trigger; during a rolling deploy two replicas may each.
+pub const DISPATCH_CONNECTION_LIMIT: u32 = 40;
+
+/// m13b: everything the dispatch login holds, as the foreign check and the revoke read it:
+/// `USAGE` on the schema and `SELECT, UPDATE, DELETE` on the outbox, granted by the owner
+/// without grant option. Not the sequence (it inserts nothing), not `enqueue()`.
+pub const DISPATCH_GRANTS: &str = "USAGE on chelabase_functions; SELECT, UPDATE, DELETE on chelabase_functions.outbox";
+
+/// m13b: the dispatch login's settings, sorted as the foreign check compares them: no event
+/// trigger (a login one included) fires for its sessions, and names resolve in `pg_catalog`.
+const DISPATCH_SETTINGS: [&str; 2] = ["event_triggers=off", "search_path=pg_catalog, pg_temp"];
+
+/// m13b (B2): `last_error` on a trigger on a reserved schema
+/// (`chelabase_schema::exclusions::function_trigger_schema_refused`): never installed.
+pub const RESERVED_SCHEMA: &str = "function triggers can't go on a reserved schema";
 
 /// The channel `enqueue()` notifies after each insert (the dispatcher listens, m13).
 pub const NOTIFY_CHANNEL: &str = "chelabase_functions";
@@ -200,8 +236,15 @@ const PRELUDE: &str = "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET
 /// so nobody else is ever its member), and answers `fn_owner <oid>` when it exists. The
 /// checks and installs that follow require that very OID: a role made by anyone in between is
 /// refused.
-pub fn role_sql(create: bool) -> String {
-    let create = if create {
+///
+/// m13b: with `dispatch_verifier` (the branch's dispatch password's SCRAM verifier), it also
+/// makes [`DISPATCH`] when missing (LOGIN NOINHERIT, [`DISPATCH_CONNECTION_LIMIT`], the
+/// verifier, [`DISPATCH_SETTINGS`]), and sets the verifier on one that carries another (a
+/// child's copy of its parent's, a restored one) while the role has no membership either way
+/// (a role someone else made is the foreign check's to refuse, never handed a password). It
+/// answers `fn_dispatch <oid>` too, which the checks require likewise.
+pub fn role_sql(create: bool, dispatch_verifier: Option<&str>) -> String {
+    let mut make = if create {
         format!(
             "DO $chelabase_fn$ BEGIN\n  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}') THEN\n    \
              CREATE ROLE {OWNER} NOLOGIN NOINHERIT CONNECTION LIMIT 0;\n  END IF;\nEND $chelabase_fn$;\n"
@@ -209,15 +252,46 @@ pub fn role_sql(create: bool) -> String {
     } else {
         String::new()
     };
+    if let (true, Some(verifier)) = (create, dispatch_verifier) {
+        let verifier = literal(verifier);
+        make.push_str(&format!(
+            r#"DO $chelabase_fn$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{DISPATCH}') THEN
+    CREATE ROLE {DISPATCH} LOGIN NOINHERIT CONNECTION LIMIT {DISPATCH_CONNECTION_LIMIT} PASSWORD {verifier};
+    ALTER ROLE {DISPATCH} SET search_path = pg_catalog, pg_temp;
+    ALTER ROLE {DISPATCH} SET event_triggers = off;
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_authid d WHERE d.rolname = '{DISPATCH}' AND d.rolpassword IS DISTINCT FROM {verifier}
+      AND NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members m WHERE m.roleid = d.oid OR m.member = d.oid)) THEN
+    ALTER ROLE {DISPATCH} PASSWORD {verifier};
+  END IF;
+END $chelabase_fn$;
+"#
+        ));
+    }
     format!(
-        "{SYNC_MARK} role\n{PRELUDE}{create}SELECT 'fn_owner ' || oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}';\nCOMMIT;\n"
+        "{SYNC_MARK} role\n{PRELUDE}{make}SELECT 'fn_owner ' || oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}';\n\
+         SELECT 'fn_dispatch ' || oid FROM pg_catalog.pg_roles WHERE rolname = '{DISPATCH}';\nCOMMIT;\n"
     )
 }
 
+/// The OIDs [`role_sql`] read: [`OWNER`]'s and (m13b) [`DISPATCH`]'s. The checks and installs
+/// that follow require exactly these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Roles {
+    pub owner: Option<u32>,
+    pub dispatch: Option<u32>,
+}
+
 /// The answer of [`role_sql`].
-pub fn parse_role(out: &str) -> Option<u32> {
-    out.lines()
-        .find_map(|l| l.trim().strip_prefix("fn_owner ")?.parse().ok())
+pub fn parse_role(out: &str) -> Roles {
+    let oid = |prefix: &str| {
+        out.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix)?.parse().ok())
+    };
+    Roles {
+        owner: oid("fn_owner "),
+        dispatch: oid("fn_dispatch "),
+    }
 }
 
 /// The foreign check (the invariant's "never adopts"), for the database it runs in: raises
@@ -229,11 +303,24 @@ pub fn parse_role(out: &str) -> Option<u32> {
 /// doesn't make. Refused, never repaired. An entry that only names the role as a grantee or a
 /// policy's target (any role can make one) gives nobody its rights and never refuses
 /// ([`revoke_sql`] takes the grants back).
-fn foreign_check_sql(role: Option<u32>) -> String {
-    let expected = role.map_or_else(|| "NULL".to_string(), |r| r.to_string());
+///
+/// m13b: likewise for [`DISPATCH`], whose allowlist is exact: the OID `roles` names, LOGIN
+/// NOINHERIT with [`DISPATCH_CONNECTION_LIMIT`] and no other attribute (no expiry), exactly
+/// [`DISPATCH_SETTINGS`], no member or membership, and nothing owned anywhere. Its grants are
+/// [`revoke_sql`]'s to keep exact.
+fn foreign_check_sql(roles: Roles) -> String {
+    let oid = |r: Option<u32>| r.map_or_else(|| "NULL".to_string(), |r| r.to_string());
+    let (expected, dexpected) = (oid(roles.owner), oid(roles.dispatch));
+    let settings = DISPATCH_SETTINGS
+        .iter()
+        .map(|s| literal(s))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"DO $chelabase_fn$ DECLARE
   expected pg_catalog.oid := {expected};
+  dexpected pg_catalog.oid := {dexpected};
+  drole pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{DISPATCH}');
   role pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}');
   ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '{FUNCTIONS_SCHEMA}');
   box pg_catalog.oid;
@@ -275,6 +362,21 @@ BEGIN
         OR (d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
           AND d.objid IN (SELECT t.oid FROM pg_catalog.pg_type t WHERE t.typnamespace = ns AND t.typname IN ('outbox', '_outbox'))))) THEN
     why := 'the schema {FUNCTIONS_SCHEMA} holds objects Chelabase didn''t make';
+  ELSIF drole IS DISTINCT FROM dexpected THEN
+    why := 'the role {DISPATCH} was made by someone else';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = drole AND (a.rolsuper OR a.rolinherit OR a.rolcreaterole
+      OR a.rolcreatedb OR NOT a.rolcanlogin OR a.rolreplication OR a.rolbypassrls OR a.rolconnlimit <> {DISPATCH_CONNECTION_LIMIT}
+      OR (a.rolvaliduntil IS NOT NULL AND a.rolvaliduntil <> 'infinity'))) THEN
+    why := 'the role {DISPATCH} has attributes Chelabase never gives it';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_auth_members m WHERE m.roleid = drole OR m.member = drole) THEN
+    why := 'the role {DISPATCH} has members or memberships';
+  ELSIF drole IS NOT NULL AND (EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole = drole AND s.setdatabase <> 0)
+      OR (SELECT pg_catalog.array_agg(c ORDER BY c) FROM pg_catalog.pg_db_role_setting s CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) c
+        WHERE s.setrole = drole AND s.setdatabase = 0) IS DISTINCT FROM ARRAY[{settings}]::pg_catalog.text[]) THEN
+    why := 'the role {DISPATCH} has settings Chelabase never gives it';
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_shdepend d WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+      AND d.refobjid = drole AND d.deptype = 'o') THEN
+    why := 'the role {DISPATCH} owns objects';
   END IF;
   IF why IS NOT NULL THEN
     RAISE EXCEPTION '{FOREIGN_MARK}: %; nothing was installed', why;
@@ -286,10 +388,10 @@ END $chelabase_fn$;
 
 /// The foreign check alone, read-only, for one database (the worker runs it in every
 /// database of the compute before any install).
-pub fn check_sql(role: Option<u32>) -> String {
+pub fn check_sql(roles: Roles) -> String {
     format!(
         "{SYNC_MARK} check\n{PRELUDE}{}ROLLBACK;\n",
-        foreign_check_sql(role)
+        foreign_check_sql(roles)
     )
 }
 
@@ -379,7 +481,7 @@ pub fn trigger_events(events: &[String]) -> Option<(String, i16)> {
 /// A failed row is never wanted (its database trigger is dropped, never installed), nor is a
 /// disabled one (m13: its database trigger is dropped and the cleanup deletes its queued
 /// events, so a disabled trigger queues nothing; a disabled *function*'s triggers stay and
-/// queue, `fn_events`).
+/// queue, delivered by the functions service).
 pub fn wanted_in(triggers: &[TriggerRecord], db: &str) -> Vec<Wanted> {
     triggers
         .iter()
@@ -395,9 +497,22 @@ pub fn wanted_in(triggers: &[TriggerRecord], db: &str) -> Vec<Wanted> {
         .collect()
 }
 
-/// A table trigger row whose database trigger should be in place: enabled and not failed.
+/// A table trigger row whose database trigger should be in place: enabled, not failed and
+/// (m13b) not on a reserved schema.
 fn wanted(t: &TriggerRecord) -> bool {
-    t.source == TriggerSource::Table && t.enabled && t.state != TriggerState::Failed
+    t.source == TriggerSource::Table
+        && t.enabled
+        && t.state != TriggerState::Failed
+        && refusal(t).is_none()
+}
+
+/// m13b (B2): why a table trigger row is never installed whatever the database holds: on a
+/// reserved schema ([`RESERVED_SCHEMA`]), which the trigger API refuses too.
+pub fn refusal(t: &TriggerRecord) -> Option<&'static str> {
+    t.schema_name
+        .as_deref()
+        .is_some_and(chelabase_schema::exclusions::function_trigger_schema_refused)
+        .then_some(RESERVED_SCHEMA)
 }
 
 /// The predicate "trigger `tg` on `c` in `n` is exactly the wanted `w`", for the script.
@@ -587,25 +702,41 @@ END $chelabase_fn$;
 /// role's rights, and the foreign check let it pass. A policy naming the role is left as it
 /// is (taking the role out of it would change the table owner's row security), as is any
 /// other entry this doesn't know.
+///
+/// m13b: [`DISPATCH`]'s grants are an exact allowlist ([`DISPATCH_GRANTS`]). Its entries on
+/// the schema and the outbox are left to the exact step: when they aren't exactly those
+/// privileges, granted by the owner without grant option, every privilege it holds there is
+/// revoked and exactly those are granted (DDL only when the catalog differs, as the install).
+/// Every other grant to it, anywhere (the outbox's columns, the sequence, `enqueue()`, any
+/// tenant object), is revoked like the owner's.
 fn revoke_sql() -> String {
     let ours = ours_sql();
+    let owner_grants = grants_to_sql(OWNER, "");
+    let dispatch_grants = grants_to_sql(
+        DISPATCH,
+        "\n      AND NOT ((d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = ours)\n        OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objsubid = 0 AND d.objid = box))",
+    );
     format!(
         r#"DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
+  drole pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{DISPATCH}');
+  box pg_catalog.oid;
   g record;
   da record;
 BEGIN
   IF ours IS NULL THEN
     RETURN;
   END IF;
+  box := (SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ours AND c.relname = 'outbox' AND c.relkind = 'r');
   FOR g IN
     SELECT 'SCHEMA {FUNCTIONS_SCHEMA}' AS obj, a.grantee
       FROM pg_catalog.pg_namespace n CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a
-      WHERE n.oid = ours AND a.grantee <> n.nspowner
+      WHERE n.oid = ours AND a.grantee <> n.nspowner AND a.grantee IS DISTINCT FROM drole
     UNION
     SELECT CASE c.relkind WHEN 'S' THEN 'SEQUENCE ' ELSE 'TABLE ' END || c.oid::pg_catalog.regclass::pg_catalog.text, a.grantee
       FROM pg_catalog.pg_class c CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
       WHERE c.relnamespace = ours AND c.relkind IN ('r', 'S') AND a.grantee <> c.relowner
+        AND NOT (c.oid = box AND a.grantee IS NOT DISTINCT FROM drole)
     UNION
     SELECT 'ROUTINE ' || p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantee
       FROM pg_catalog.pg_proc p CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) a
@@ -614,38 +745,66 @@ BEGIN
     EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s CASCADE', g.obj,
       CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(g.grantee)) END);
   END LOOP;
-  -- Grants *to* the owner role on other objects (any role's, on what it owns): the foreign
-  -- check lets them pass (nobody can act as the role, and enqueue() reads no table), and
-  -- they are revoked here. An entry of a class this doesn't know is left alone.
+  -- m13b: the dispatch login's exact grants on the schema and the outbox.
+  IF drole IS NOT NULL THEN
+    IF (SELECT pg_catalog.array_agg(a.privilege_type || ':' || a.is_grantable || ':' || (a.grantor = n.nspowner)
+          ORDER BY a.privilege_type)
+        FROM pg_catalog.pg_namespace n CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a
+        WHERE n.oid = ours AND a.grantee = drole) IS DISTINCT FROM ARRAY['USAGE:false:true']::pg_catalog.text[] THEN
+      REVOKE ALL ON SCHEMA {FUNCTIONS_SCHEMA} FROM {DISPATCH} CASCADE;
+      GRANT USAGE ON SCHEMA {FUNCTIONS_SCHEMA} TO {DISPATCH};
+    END IF;
+    IF box IS NOT NULL AND (SELECT pg_catalog.array_agg(a.privilege_type || ':' || a.is_grantable || ':' || (a.grantor = c.relowner)
+          ORDER BY a.privilege_type)
+        FROM pg_catalog.pg_class c CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
+        WHERE c.oid = box AND a.grantee = drole)
+        IS DISTINCT FROM ARRAY['DELETE:false:true', 'SELECT:false:true', 'UPDATE:false:true']::pg_catalog.text[] THEN
+      REVOKE ALL ON TABLE {FUNCTIONS_SCHEMA}.outbox FROM {DISPATCH} CASCADE;
+      GRANT SELECT, UPDATE, DELETE ON TABLE {FUNCTIONS_SCHEMA}.outbox TO {DISPATCH};
+    END IF;
+  END IF;
+{owner_grants}{dispatch_grants}END $chelabase_fn$;
+"#
+    )
+}
+
+/// The loop that revokes every grant *to* `role` outside the schema (see [`revoke_sql`]):
+/// `pg_shdepend` grantee entries of this database, and of the shared catalogs a grant can
+/// name, each of a class it knows, except the entries `keep` (an SQL condition on `d`, with
+/// `ours` and `box` in scope) leaves out. An entry of a class this doesn't know is left alone.
+fn grants_to_sql(role: &str, keep: &str) -> String {
+    const LOOP: &str = r#"  -- Grants *to* {ROLE} on other objects (any role's, on what it owns): the foreign check
+  -- lets them pass (they give nobody the role's rights), and they are revoked here. An entry
+  -- of a class this doesn't know is left alone.
   FOR g IN SELECT d.classid, d.objid, d.objsubid FROM pg_catalog.pg_shdepend d
     WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
-      AND d.refobjid = (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = '{OWNER}') AND d.deptype = 'a'
+      AND d.refobjid = (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = '{ROLE}') AND d.deptype = 'a'{KEEP}
       AND (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
         OR (d.dbid = 0 AND d.classid IN ('pg_catalog.pg_database'::pg_catalog.regclass,
           'pg_catalog.pg_tablespace'::pg_catalog.regclass, 'pg_catalog.pg_parameter_acl'::pg_catalog.regclass)))
   LOOP
     IF g.classid = 'pg_catalog.pg_class'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL %s ON %s %s FROM {OWNER} CASCADE',
+      EXECUTE pg_catalog.format('REVOKE ALL %s ON %s %s FROM {ROLE} CASCADE',
         CASE WHEN g.objsubid = 0 THEN '' ELSE pg_catalog.format('(%I)', (SELECT a.attname FROM pg_catalog.pg_attribute a
           WHERE a.attrelid = g.objid AND a.attnum = g.objsubid)) END,
         CASE WHEN (SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = g.objid) = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
         g.objid::pg_catalog.regclass);
     ELSIF g.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON ROUTINE %s FROM {OWNER} CASCADE', g.objid::pg_catalog.regprocedure);
+      EXECUTE pg_catalog.format('REVOKE ALL ON ROUTINE %s FROM {ROLE} CASCADE', g.objid::pg_catalog.regprocedure);
     ELSIF g.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON SCHEMA %I FROM {OWNER} CASCADE', (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON SCHEMA %I FROM {ROLE} CASCADE', (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_type'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON %s %s FROM {OWNER} CASCADE',
+      EXECUTE pg_catalog.format('REVOKE ALL ON %s %s FROM {ROLE} CASCADE',
         CASE WHEN (SELECT t.typtype FROM pg_catalog.pg_type t WHERE t.oid = g.objid) = 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
         g.objid::pg_catalog.regtype);
     ELSIF g.classid = 'pg_catalog.pg_database'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON DATABASE %I FROM {OWNER} CASCADE', (SELECT d.datname FROM pg_catalog.pg_database d WHERE d.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON DATABASE %I FROM {ROLE} CASCADE', (SELECT d.datname FROM pg_catalog.pg_database d WHERE d.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_largeobject'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON LARGE OBJECT %s FROM {OWNER} CASCADE', g.objid);
+      EXECUTE pg_catalog.format('REVOKE ALL ON LARGE OBJECT %s FROM {ROLE} CASCADE', g.objid);
     ELSIF g.classid = 'pg_catalog.pg_default_acl'::pg_catalog.regclass THEN
       SELECT a.defaclrole, a.defaclnamespace, a.defaclobjtype INTO da FROM pg_catalog.pg_default_acl a WHERE a.oid = g.objid;
       IF FOUND THEN
-        EXECUTE pg_catalog.format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL ON %s FROM {OWNER} CASCADE',
+        EXECUTE pg_catalog.format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL ON %s FROM {ROLE} CASCADE',
           pg_catalog.pg_get_userbyid(da.defaclrole),
           CASE WHEN da.defaclnamespace = 0 THEN '' ELSE pg_catalog.format(' IN SCHEMA %I',
             (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = da.defaclnamespace)) END,
@@ -653,26 +812,25 @@ BEGIN
             WHEN 'T' THEN 'TYPES' WHEN 'n' THEN 'SCHEMAS' END);
       END IF;
     ELSIF g.classid = 'pg_catalog.pg_language'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON LANGUAGE %I FROM {OWNER} CASCADE', (SELECT l.lanname FROM pg_catalog.pg_language l WHERE l.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON LANGUAGE %I FROM {ROLE} CASCADE', (SELECT l.lanname FROM pg_catalog.pg_language l WHERE l.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_foreign_data_wrapper'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN DATA WRAPPER %I FROM {OWNER} CASCADE', (SELECT w.fdwname FROM pg_catalog.pg_foreign_data_wrapper w WHERE w.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN DATA WRAPPER %I FROM {ROLE} CASCADE', (SELECT w.fdwname FROM pg_catalog.pg_foreign_data_wrapper w WHERE w.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_foreign_server'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN SERVER %I FROM {OWNER} CASCADE', (SELECT s.srvname FROM pg_catalog.pg_foreign_server s WHERE s.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN SERVER %I FROM {ROLE} CASCADE', (SELECT s.srvname FROM pg_catalog.pg_foreign_server s WHERE s.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_tablespace'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON TABLESPACE %I FROM {OWNER} CASCADE', (SELECT t.spcname FROM pg_catalog.pg_tablespace t WHERE t.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON TABLESPACE %I FROM {ROLE} CASCADE', (SELECT t.spcname FROM pg_catalog.pg_tablespace t WHERE t.oid = g.objid));
     ELSIF g.classid = 'pg_catalog.pg_parameter_acl'::pg_catalog.regclass THEN
-      EXECUTE pg_catalog.format('REVOKE ALL ON PARAMETER %s FROM {OWNER} CASCADE', (SELECT p.parname FROM pg_catalog.pg_parameter_acl p WHERE p.oid = g.objid));
+      EXECUTE pg_catalog.format('REVOKE ALL ON PARAMETER %s FROM {ROLE} CASCADE', (SELECT p.parname FROM pg_catalog.pg_parameter_acl p WHERE p.oid = g.objid));
     END IF;
   END LOOP;
-END $chelabase_fn$;
-"#
-    )
+"#;
+    LOOP.replace("{ROLE}", role).replace("{KEEP}", keep)
 }
 
 /// The script that brings one database in step with `wanted` (see the module docs);
 /// `truncate` empties the outbox first. Without wanted triggers it installs nothing, and only
 /// repairs, drops leftovers and cleans the outbox of a schema [`OWNER`] owns.
-pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String {
+pub fn sync_sql(wanted: &[Wanted], truncate: bool, roles: Roles) -> String {
     let rows: Vec<String> = wanted
         .iter()
         .filter_map(|w| {
@@ -700,7 +858,7 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String 
     } else {
         install_objects_sql()
     };
-    let check = foreign_check_sql(role);
+    let check = foreign_check_sql(roles);
     let (repair, revoke, ours) = (repair_sql(), revoke_sql(), ours_sql());
     let truncate = if truncate {
         format!(
@@ -815,6 +973,12 @@ pub fn parse_sync(out: &str) -> Vec<(Uuid, Option<String>)> {
         .collect()
 }
 
+/// m13b: the [`DISPATCH`] verifier of `password` with its stored `salt` (SCRAM, Postgres's
+/// default iteration count), so the install sets exactly it.
+pub fn dispatch_verifier(password: &str, salt: &[u8]) -> String {
+    chelabase_neon::scram::verifier_with_salt(password, salt, 4096)
+}
+
 /// What psql says when the database isn't there.
 fn database_missing(err: &str, db: &str) -> bool {
     err.contains(&format!("database \"{db}\" does not exist"))
@@ -875,9 +1039,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .iter()
                 .any(|t| t.state == TriggerState::PendingInstall);
         let wanted_any = triggers.iter().any(wanted);
+        // m13b: the dispatch login's verifier, made and stored once per branch.
+        let verifier = if wanted_any {
+            Some(self.dispatch_verifier(meta, branch).await?)
+        } else {
+            None
+        };
         let role = self
             .computes
-            .admin_sql(&ep, SYSTEM_DATABASE, &role_sql(wanted_any))
+            .admin_sql(
+                &ep,
+                SYSTEM_DATABASE,
+                &role_sql(wanted_any, verifier.as_deref()),
+            )
             .await
             .map(|out| parse_role(&out))
             .map_err(|e| format!("reading the function triggers' role: {e:#}"))?;
@@ -969,6 +1143,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         }
         self.settle(meta, branch, &triggers, |t| {
+            if let Some(why) = refusal(t) {
+                return Some(Some(why.to_string()));
+            }
             match answers.iter().find(|(id, _)| *id == t.id) {
                 Some((_, error)) => Some(error.as_deref().map(install_error)),
                 // Bad events never reach the script (the schema's CHECK refuses them).
@@ -978,6 +1155,59 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         })
         .await?;
         failure.map_or(Ok(complete), Err)
+    }
+
+    /// m13b: the SCRAM verifier of the branch's [`DISPATCH`] password. A new password (sealed
+    /// `Purpose::FunctionsDispatch`, AAD = branch id, with a random 16-byte salt) is stored when
+    /// the branch has none; like the storage login's, it is read back, so a racing run's wins.
+    /// The orchestrator hands the password to the functions service only
+    /// (`/internal/functions/branches/{id}/connection`).
+    async fn dispatch_verifier(
+        &self,
+        meta: &MetadataClient,
+        branch: BranchId,
+    ) -> Result<String, String> {
+        use chelabase_secrets::{Purpose, open_credential, seal_credential};
+        let stored = || async {
+            let row = meta
+                .branch_connection(branch)
+                .await
+                .map_err(|e| format!("reading the dispatch login: {e}"))?;
+            row.and_then(|r| r.functions_password_enc.zip(r.functions_password_salt))
+                .map(|(sealed, salt)| {
+                    open_credential(
+                        &self.key,
+                        &branch.to_string(),
+                        Purpose::FunctionsDispatch,
+                        &sealed,
+                    )
+                    .map(|password| (password, salt))
+                    .map_err(|e| format!("opening the dispatch login's password: {e}"))
+                })
+                .transpose()
+        };
+        let login = match stored().await? {
+            Some(login) => login,
+            None => {
+                let password = crate::credentials::generate_password();
+                let salt: [u8; 16] = rand::random();
+                let sealed = seal_credential(
+                    &self.key,
+                    &branch.to_string(),
+                    Purpose::FunctionsDispatch,
+                    &password,
+                );
+                meta.set_functions_password(branch, &sealed, &salt)
+                    .await
+                    .map_err(|e| format!("storing the dispatch login's password: {e}"))?;
+                info!(branch_id = %branch, "made the branch's {DISPATCH} login");
+                stored().await?.ok_or_else(|| {
+                    "the dispatch login's password wasn't stored (is the branch being deleted?)"
+                        .to_string()
+                })?
+            }
+        };
+        Ok(dispatch_verifier(&login.0, &login.1))
     }
 
     /// Settles each row read that `outcome` answers for (`Some(None)`: in the database;
@@ -1288,6 +1518,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 mod tests {
     use super::*;
 
+    const ROLES: Roles = Roles {
+        owner: Some(4242),
+        dispatch: Some(4343),
+    };
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:AAAA$BBBB:CCCC";
+
     fn wanted(table: &str, events: &[&str]) -> Wanted {
         Wanted {
             id: Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap(),
@@ -1330,7 +1566,7 @@ mod tests {
     #[test]
     fn fn_triggers_identifiers_only_as_literals() {
         let nasty = r#"or"d's $chelabase_fn$ \x; DROP TABLE t; --"#;
-        let sql = sync_sql(&[wanted(nasty, &["insert"])], false, Some(4242));
+        let sql = sync_sql(&[wanted(nasty, &["insert"])], false, ROLES);
         let row = sql
             .lines()
             .find(|l| l.contains("chelabase_fn_0123"))
@@ -1347,7 +1583,7 @@ mod tests {
         assert!(sql.contains("pg_catalog.format('DROP TRIGGER %I ON %I.%I'"));
         // Rows with events the schema refuses never reach the script.
         assert!(
-            !sync_sql(&[wanted("t", &["truncate"])], false, Some(4242))
+            !sync_sql(&[wanted("t", &["truncate"])], false, ROLES)
                 .contains("INSERT INTO pg_temp")
         );
     }
@@ -1355,7 +1591,7 @@ mod tests {
     /// The function's privileges and search path, the event triggers off, the outbox cleaned.
     #[test]
     fn fn_triggers_script_is_locked_down() {
-        let sql = sync_sql(&[wanted("orders", &["insert"])], true, Some(4242));
+        let sql = sync_sql(&[wanted("orders", &["insert"])], true, ROLES);
         assert!(sql.starts_with(&format!("{SYNC_MARK}\nBEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\n")));
         assert!(sql.trim_end().ends_with("COMMIT;"));
         for needle in [
@@ -1375,7 +1611,7 @@ mod tests {
             assert!(sql.contains(needle), "{needle}");
         }
         assert!(
-            !sync_sql(&[wanted("orders", &["insert"])], false, Some(4242)).contains("TRUNCATE")
+            !sync_sql(&[wanted("orders", &["insert"])], false, ROLES).contains("TRUNCATE")
         );
         // Audit B1: the row is never handed to to_jsonb whole (a user's cast would run as the
         // owner); the cleanup runs as the owner, after the repair, never as the superuser.
@@ -1401,7 +1637,7 @@ mod tests {
         assert!(role < sql.find("TRUNCATE chelabase_functions.outbox;").unwrap());
         assert!(role < sql.find("DELETE FROM chelabase_functions.outbox").unwrap());
         // Nothing wanted: no install, only the cleanup of a schema that is ours.
-        let cleanup = sync_sql(&[], true, Some(4242));
+        let cleanup = sync_sql(&[], true, ROLES);
         assert!(!cleanup.contains("CREATE SCHEMA") && !cleanup.contains("CREATE ROLE"));
         assert!(cleanup.contains("IF ours IS NULL THEN\n    RETURN;"));
     }
@@ -1463,7 +1699,7 @@ mod tests {
     /// the revoke covers default privileges and large objects.
     #[test]
     fn fn_triggers_sweep_is_gentle_on_tenants() {
-        let sql = sync_sql(&[wanted("orders", &["insert"])], false, Some(4242));
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, ROLES);
         let at = |needle: &str| sql.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(sql.contains("SET LOCAL lock_timeout = '2s';"), "a short lock_timeout");
         assert!(!sql.contains("lock_timeout = '20s'"));
@@ -1504,7 +1740,7 @@ mod tests {
         assert!(!retry_later("ERROR:  canceling statement due to statement timeout"));
         assert!(!retry_later(&format!("ERROR:  {FOREIGN_MARK}: the schema is not ours")));
         assert!(PRELUDE.contains(&format!("SET LOCAL lock_timeout = '{SWEEP_LOCK_TIMEOUT}';")));
-        for script in [role_sql(true), check_sql(Some(1)), drop_triggers_sql()] {
+        for script in [role_sql(true, Some(VERIFIER)), check_sql(ROLES), drop_triggers_sql()] {
             assert!(script.contains("SET LOCAL lock_timeout = '2s';"), "{script}");
         }
     }
@@ -1526,6 +1762,7 @@ mod tests {
             events: vec!["insert".into()],
             last_error: None,
             dead_count: 0,
+            dropped_count: 0,
             last_delivery_error: None,
             last_delivered_at: None,
         }
@@ -1551,7 +1788,7 @@ mod tests {
     /// Round 2 (B1, B2): plain tables only; the install adopts nothing it didn't make.
     #[test]
     fn fn_triggers_plain_tables_and_no_adoption() {
-        let sql = sync_sql(&[wanted("orders", &["insert"])], false, Some(4242));
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, ROLES);
         assert!(sql.contains("c.relkind = 'r'"), "plain tables only");
         assert!(!sql.contains("IN ('r', 'p')"));
         assert!(sql.contains("' not_a_plain_table'"));
@@ -1575,9 +1812,95 @@ mod tests {
             !sql.contains("REVOKE chelabase_functions_owner FROM"),
             "never repaired: refused"
         );
-        assert!(check_sql(Some(4242)).contains(FOREIGN_MARK));
-        assert!(role_sql(true).contains(
+        assert!(check_sql(ROLES).contains(FOREIGN_MARK));
+        assert!(role_sql(true, Some(VERIFIER)).contains(
             "CREATE ROLE chelabase_functions_owner NOLOGIN NOINHERIT CONNECTION LIMIT 0"
         ));
+    }
+
+    /// m13b: the dispatch login is made once per compute (LOGIN NOINHERIT, its connection
+    /// limit, the branch's verifier, `search_path` and `event_triggers` pinned) and its
+    /// password follows the branch's only while it has no membership; the foreign check takes
+    /// exactly that role (the OID read, those attributes and settings, no membership, nothing
+    /// owned); the revoke keeps exactly its grants (USAGE on the schema; SELECT, UPDATE and
+    /// DELETE on the outbox, from the owner) and takes back everything else granted to it.
+    #[test]
+    fn fn_triggers_dispatch_role_is_an_exact_allowlist() {
+        let role = role_sql(true, Some(VERIFIER));
+        for needle in [
+            &format!("CREATE ROLE chelabase_functions_dispatch LOGIN NOINHERIT CONNECTION LIMIT {DISPATCH_CONNECTION_LIMIT} PASSWORD '{VERIFIER}';"),
+            "ALTER ROLE chelabase_functions_dispatch SET search_path = pg_catalog, pg_temp;",
+            "ALTER ROLE chelabase_functions_dispatch SET event_triggers = off;",
+            &format!("ALTER ROLE chelabase_functions_dispatch PASSWORD '{VERIFIER}';"),
+            "SELECT 'fn_dispatch ' || oid FROM pg_catalog.pg_roles WHERE rolname = 'chelabase_functions_dispatch';",
+        ] {
+            assert!(role.contains(needle), "{needle}\n{role}");
+        }
+        let alter = role.find("ALTER ROLE chelabase_functions_dispatch PASSWORD").unwrap();
+        assert!(role[..alter].contains("NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members m WHERE m.roleid = d.oid OR m.member = d.oid)"));
+        let plain = role_sql(false, None);
+        assert!(!plain.contains("CREATE ROLE") && !plain.contains("ALTER ROLE"), "{plain}");
+        assert!(plain.contains("'fn_dispatch '"));
+        assert_eq!(
+            parse_role("x\nfn_owner 11\nfn_dispatch 12\n"),
+            Roles { owner: Some(11), dispatch: Some(12) }
+        );
+        assert_eq!(parse_role("fn_owner 11\n"), Roles { owner: Some(11), dispatch: None });
+
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, ROLES);
+        for needle in [
+            "dexpected pg_catalog.oid := 4343;",
+            "the role chelabase_functions_dispatch was made by someone else",
+            &format!("OR NOT a.rolcanlogin OR a.rolreplication OR a.rolbypassrls OR a.rolconnlimit <> {DISPATCH_CONNECTION_LIMIT}"),
+            "the role chelabase_functions_dispatch has attributes Chelabase never gives it",
+            "the role chelabase_functions_dispatch has members or memberships",
+            "the role chelabase_functions_dispatch has settings Chelabase never gives it",
+            "ARRAY['event_triggers=off', 'search_path=pg_catalog, pg_temp']::pg_catalog.text[]",
+            "the role chelabase_functions_dispatch owns objects",
+            "GRANT USAGE ON SCHEMA chelabase_functions TO chelabase_functions_dispatch;",
+            "GRANT SELECT, UPDATE, DELETE ON TABLE chelabase_functions.outbox TO chelabase_functions_dispatch;",
+            "IS DISTINCT FROM ARRAY['USAGE:false:true']::pg_catalog.text[]",
+            "IS DISTINCT FROM ARRAY['DELETE:false:true', 'SELECT:false:true', 'UPDATE:false:true']::pg_catalog.text[]",
+            "REVOKE ALL ON SCHEMA chelabase_functions FROM chelabase_functions_dispatch CASCADE;",
+            "REVOKE ALL ON TABLE chelabase_functions.outbox FROM chelabase_functions_dispatch CASCADE;",
+            "REVOKE ALL ON ROUTINE %s FROM chelabase_functions_dispatch CASCADE",
+            "REVOKE ALL ON LARGE OBJECT %s FROM chelabase_functions_dispatch CASCADE",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL ON %s FROM chelabase_functions_dispatch CASCADE",
+        ] {
+            assert!(sql.contains(needle), "{needle}");
+        }
+        // Nothing beyond the allowlist: no INSERT, no sequence, no enqueue(), no membership.
+        for never in [
+            "INSERT ON TABLE chelabase_functions.outbox TO chelabase_functions_dispatch",
+            "ON SEQUENCE chelabase_functions.outbox_id_seq TO chelabase_functions_dispatch",
+            "EXECUTE ON FUNCTION chelabase_functions.enqueue() TO chelabase_functions_dispatch",
+            "GRANT chelabase_functions_owner TO chelabase_functions_dispatch",
+            "TO chelabase_functions_dispatch WITH GRANT OPTION",
+        ] {
+            assert!(!sql.contains(never), "{never}");
+        }
+        // The grants are made only where the catalog differs, after the install.
+        let grant = sql.find("GRANT USAGE ON SCHEMA chelabase_functions TO chelabase_functions_dispatch;").unwrap();
+        assert!(sql.find("CREATE SCHEMA").unwrap() < grant);
+        assert!(sql.find("IS DISTINCT FROM ARRAY['USAGE:false:true']").unwrap() < grant);
+        // The owner's grant revokes keep their text: the dispatch role's own loop is beside it.
+        assert!(sql.contains("REVOKE ALL ON ROUTINE %s FROM chelabase_functions_owner CASCADE"));
+    }
+
+    /// m13b (B2): a trigger on a reserved schema is never wanted (its database trigger, if
+    /// any, is dropped) and its row settles failed with [`RESERVED_SCHEMA`].
+    #[test]
+    fn fn_triggers_reserved_schemas_are_never_wanted() {
+        let mut outbox = record(true, TriggerState::PendingInstall);
+        outbox.schema_name = Some("chelabase_functions".into());
+        outbox.table_name = Some("outbox".into());
+        let mut storage = record(true, TriggerState::Installed);
+        storage.schema_name = Some("storage".into());
+        let fine = record(true, TriggerState::PendingInstall);
+        let wanted = wanted_in(&[outbox.clone(), storage.clone(), fine.clone()], "app");
+        assert_eq!(wanted.iter().map(|w| w.id).collect::<Vec<_>>(), vec![fine.id]);
+        assert_eq!(refusal(&outbox), Some(RESERVED_SCHEMA));
+        assert_eq!(refusal(&storage), Some(RESERVED_SCHEMA));
+        assert_eq!(refusal(&fine), None);
     }
 }
