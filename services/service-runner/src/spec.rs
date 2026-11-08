@@ -278,7 +278,9 @@ fn valid_name(name: &str) -> bool {
             .is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
         // The engine pulls from the host's network namespace: no loopback or `localhost` name,
         // and no IP literal (a numeric last label is never a real top-level domain, so `127.1`
-        // and `2130706433` count too).
+        // and `2130706433` count too). A name that resolves somewhere local is caught at ensure
+        // time ([`crate::runner`]'s registry check). Both narrow pull-side SSRF; neither closes
+        // it (a registry can redirect the engine through its token realm).
         let lower = h.to_ascii_lowercase();
         let local = lower == "localhost"
             || lower.ends_with(".localhost")
@@ -317,6 +319,19 @@ fn valid_component(p: &str) -> bool {
 
 fn is_alnum(c: u8) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit()
+}
+
+/// The registry host and port an image is pulled from, when the reference names one (`None`:
+/// Docker Hub).
+pub fn registry_host(image: &ImageRef) -> Option<(String, u16)> {
+    let (first, _) = image.name.split_once('/')?;
+    if !(first.contains(['.', ':']) || first.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+    match first.split_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
+        None => Some((first.to_string(), 443)),
+    }
 }
 
 /// The container's environment: the caller's entries (names `[A-Za-z_][A-Za-z0-9_]*`, no NUL,
@@ -503,6 +518,25 @@ mod tests {
         assert!(parse_image("ghcr.io/acme/echo:1").is_ok());
         assert!(parse_image("registry.example.com:5000/echo:1").is_ok());
         assert!(parse_image("my-registry.internal.example:443/a/b:1").is_ok());
+    }
+
+    #[test]
+    fn registry_hosts() {
+        let host = |r: &str| registry_host(&parse_image(r).unwrap());
+        assert_eq!(
+            host("ghcr.io/acme/echo:1"),
+            Some(("ghcr.io".to_string(), 443))
+        );
+        assert_eq!(
+            host("registry.example.com:5000/a:1"),
+            Some(("registry.example.com".to_string(), 5000))
+        );
+        assert_eq!(
+            host("localtest.me:4500/echo:1"),
+            Some(("localtest.me".to_string(), 4500))
+        );
+        assert_eq!(host("busybox:1"), None, "Docker Hub");
+        assert_eq!(host("acme/echo:1"), None, "Docker Hub");
     }
 
     #[test]
