@@ -3,10 +3,15 @@
 //! (an unlabelled container such as `metadata-db`, a compute, another stack's service) is
 //! [`RunnerError::NotFound`], whatever id or name the caller gives, and is never touched.
 //!
-//! Each service's container (one per service per branch) runs on its own private network,
+//! Each service's container runs on its own private network (one per service per branch),
 //! labelled like the container, which only the stack's functions service joins: containers can't
 //! reach each other, and the functions service listens on none of these networks (it binds
 //! fixed addresses only), so traffic flows functions → container alone.
+//!
+//! m11: a container is per deployment ([`deployment_container_name`]), so a rollover runs the
+//! new deployment's container beside the old one until the new one is healthy; ensure leaves the
+//! slot's other deployments alone, and reconcile removes whichever isn't active once it's older
+//! than its grace ([`crate::reconcile::PENDING_GRACE_SECS`]).
 //!
 //! Only [`Runner::ensure`] creates a container (the functions service calls it with the branch's
 //! secrets); reconcile only starts, stops and removes. A container carries a keyed digest of its
@@ -98,6 +103,16 @@ pub fn container_name(stack: &str, service_id: Uuid, branch_id: Uuid) -> String 
     )
 }
 
+/// m11: `<container_name>-<deployment>`: one container per deployment, so the old and the new
+/// deployment's run side by side through a rollover.
+pub fn deployment_container_name(stack: &str, key: &Key) -> String {
+    format!(
+        "{}-{}",
+        container_name(stack, key.service_id, key.branch_id),
+        key.deployment_id.simple()
+    )
+}
+
 /// HMAC-SHA256 under `key` of the environment, each name and value length-prefixed (so no two
 /// environments encode alike), hex.
 pub fn env_digest(key: &[u8; 32], env: &BTreeMap<String, String>) -> String {
@@ -181,7 +196,7 @@ pub fn plan(
     labels.insert(PORT_LABEL.to_string(), spec.port.to_string());
     labels.insert(ENV_DIGEST_LABEL.to_string(), digest.to_string());
     Ok(ContainerPlan {
-        name: container_name(stack, key.service_id, key.branch_id),
+        name: deployment_container_name(stack, key),
         image: spec.image.clone(),
         image_id: image.id.clone(),
         user: run_as(image.user.as_deref()),
@@ -278,6 +293,8 @@ pub struct Status {
     pub branch_id: Option<String>,
     pub deployment_id: Option<String>,
     pub port: Option<u16>,
+    /// m11: its address on its service's network, where the functions service dials it.
+    pub address: Option<String>,
 }
 
 impl From<&Container> for Status {
@@ -289,6 +306,7 @@ impl From<&Container> for Status {
             branch_id: c.label(BRANCH_LABEL).map(str::to_string),
             deployment_id: c.label(DEPLOYMENT_LABEL).map(str::to_string),
             port: c.label(PORT_LABEL).and_then(|p| p.parse().ok()),
+            address: None,
         }
     }
 }
@@ -381,6 +399,44 @@ impl Runner {
     /// The (service, branch) lock if nothing holds it: reconcile skips a slot otherwise.
     pub fn try_lock(&self, slot: (Uuid, Uuid)) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.slot_lock(slot).try_lock_owned().ok()
+    }
+
+    /// What status reports of one of its containers: [`Status`] with its address on its
+    /// service's network.
+    pub fn status_of(&self, c: &Container) -> Status {
+        let mut status = Status::from(c);
+        status.address = key_of(c).and_then(|k| {
+            c.addresses
+                .get(&container_name(&self.stack, k.service_id, k.branch_id))
+                .cloned()
+        });
+        status
+    }
+
+    /// m11: the image's registry digest reference (`name@sha256:…`), what a deploy stores. A
+    /// digest reference comes back as it is; a tag is pulled (always: a moved tag is seen) and
+    /// its digest taken from the engine's registry digests. Refused: a reference the runner
+    /// wouldn't run, a registry on a non-public address, and an image no registry knows.
+    pub async fn resolve_image(&self, raw: &str) -> Result<String, RunnerError> {
+        let image = spec::parse_image(raw)?;
+        self.check_registry(&image).await?;
+        if let spec::Reference::Digest(_) = image.reference {
+            return Ok(image.to_string());
+        }
+        let digests = self.backend.repo_digests(&image).await?;
+        let digest = digests
+            .iter()
+            .find(|d| d.split_once('@').is_some_and(|(n, _)| n == image.name))
+            .or_else(|| digests.first())
+            .and_then(|d| d.split_once('@').map(|(_, digest)| digest))
+            .ok_or_else(|| {
+                SpecError(format!(
+                    "{image} has no registry digest; push it to a registry and deploy that"
+                ))
+            })?;
+        let resolved = format!("{}@{digest}", image.name);
+        // What comes back must itself be a reference the runner runs.
+        Ok(spec::parse_image(&resolved)?.to_string())
     }
 
     /// The container `id` names, only when it is ours. Every later call uses the engine's full
@@ -514,7 +570,9 @@ impl Runner {
         let (mut keep, mut stale) = (None, Vec::new());
         for c in self.ours().await? {
             let Some(k) = key_of(&c) else { continue };
-            if k.slot() != key.slot() {
+            // Another deployment's container stays: it serves until a rollover's switch, and
+            // reconcile removes it once it's neither active nor new.
+            if k.slot() != key.slot() || k.deployment_id != key.deployment_id {
                 continue;
             }
             if k == key && c.label(ENV_DIGEST_LABEL) == Some(digest.as_str()) && keep.is_none() {
@@ -607,14 +665,14 @@ impl Runner {
     pub async fn start_unlocked(&self, id: &str) -> Result<Status, RunnerError> {
         let c = self.guarded(id).await?;
         self.backend.start(&c.id).await?;
-        Ok(Status::from(&self.guarded(&c.id).await?))
+        Ok(self.status_of(&self.guarded(&c.id).await?))
     }
 
     /// [`Runner::stop`] for a caller already holding the slot's lock (reconcile).
     pub async fn stop_unlocked(&self, id: &str) -> Result<Status, RunnerError> {
         let c = self.guarded(id).await?;
         self.backend.stop(&c.id).await?;
-        Ok(Status::from(&self.guarded(&c.id).await?))
+        Ok(self.status_of(&self.guarded(&c.id).await?))
     }
 
     /// [`Runner::remove`] for a caller already holding the slot's lock (reconcile).
@@ -629,7 +687,7 @@ impl Runner {
     }
 
     pub async fn status(&self, id: &str) -> Result<Status, RunnerError> {
-        Ok(Status::from(&self.guarded(id).await?))
+        Ok(self.status_of(&self.guarded(id).await?))
     }
 
     pub async fn logs(&self, id: &str) -> Result<String, RunnerError> {
@@ -658,6 +716,9 @@ pub mod fake {
         pub functions: Mutex<Vec<String>>,
         /// When set, `image` waits for a permit (to hold an ensure mid-call).
         pub image_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        /// What `repo_digests` answers (and the references it was asked for).
+        pub repo_digests: Mutex<Vec<String>>,
+        pub pulled: Mutex<Vec<String>>,
         next: Mutex<u32>,
     }
 
@@ -704,6 +765,7 @@ pub mod fake {
                     id: id.clone(),
                     labels: l,
                     state: state.into(),
+                    ..Default::default()
                 },
                 None,
             ));
@@ -781,6 +843,10 @@ pub mod fake {
             }
             Ok(facts)
         }
+        async fn repo_digests(&self, image: &ImageRef) -> anyhow::Result<Vec<String>> {
+            self.pulled.lock().unwrap().push(image.to_string());
+            Ok(self.repo_digests.lock().unwrap().clone())
+        }
         async fn create(&self, plan: &ContainerPlan, network: &str) -> anyhow::Result<String> {
             anyhow::ensure!(self.network(network).is_some(), "no network {network}");
             anyhow::ensure!(self.get(&plan.name).is_none(), "name {} taken", plan.name);
@@ -790,7 +856,14 @@ pub mod fake {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             let id = self.add(&plan.name, &labels, "created");
-            self.containers.lock().unwrap().last_mut().unwrap().1 = Some(plan.clone());
+            {
+                let mut containers = self.containers.lock().unwrap();
+                let last = containers.last_mut().unwrap();
+                last.1 = Some(plan.clone());
+                let n = containers.len();
+                containers.last_mut().unwrap().0.addresses =
+                    HashMap::from([(network.to_string(), format!("10.9.0.{n}"))]);
+            }
             for n in self.networks.lock().unwrap().iter_mut() {
                 if n.name == network {
                     n.containers.push(id.clone());
@@ -1036,7 +1109,11 @@ mod tests {
         let plans = fake.plans();
         assert_eq!(plans.len(), 1);
         let p = &plans[0];
-        assert_eq!(p.name, container_name("a", key.service_id, key.branch_id));
+        assert_eq!(p.name, deployment_container_name("a", &key));
+        assert!(
+            p.name
+                .starts_with(&container_name("a", key.service_id, key.branch_id))
+        );
         assert_eq!(p.user, FALLBACK_USER);
         assert_eq!(p.env, ["SECRET=s3cret", "PORT=8080"]);
         assert_eq!(p.labels[STACK_LABEL], "a");
@@ -1056,14 +1133,18 @@ mod tests {
         assert_eq!(fake.plans().len(), 1);
     }
 
+    /// m11: a new deployment's container runs beside the old one (a rollover switches only once
+    /// it's healthy); ensuring a deployment again keeps its container and starts it if stopped.
     #[tokio::test]
-    async fn ensure_replaces_another_deployment_and_starts_a_stopped_one() {
+    async fn ensure_keeps_another_deployments_container_and_starts_a_stopped_one() {
         let fake = Arc::new(Fake::default());
         let r = runner(&fake, "a");
         let key = new_key();
         let first = r.ensure(&request(&key)).await.unwrap();
         r.stop(&first.id).await.unwrap();
-        assert!(r.ensure(&request(&key)).await.unwrap().running());
+        let again = r.ensure(&request(&key)).await.unwrap();
+        assert!(again.running());
+        assert_eq!(again.id, first.id);
         let next = Key {
             deployment_id: Uuid::new_v4(),
             ..key
@@ -1071,10 +1152,77 @@ mod tests {
         let second = r.ensure(&request(&next)).await.unwrap();
         assert_ne!(second.id, first.id);
         assert!(
-            fake.get(&first.id).is_none(),
-            "the old deployment's container is gone"
+            fake.get(&first.id).is_some_and(|c| c.running()),
+            "the old deployment's container still serves"
         );
-        assert_eq!(r.ours().await.unwrap().len(), 1);
+        assert_eq!(r.ours().await.unwrap().len(), 2);
+        // Each is ensured again on its own, and neither replaces the other.
+        assert_eq!(r.ensure(&request(&key)).await.unwrap().id, first.id);
+        assert_eq!(r.ensure(&request(&next)).await.unwrap().id, second.id);
+        assert_eq!(r.ours().await.unwrap().len(), 2);
+    }
+
+    /// m11: status (and ensure's answer over the API) gives the container's address on its
+    /// service's network, nothing from another network.
+    #[tokio::test]
+    async fn status_reports_the_address_on_the_service_network() {
+        let fake = Arc::new(Fake::default());
+        let r = runner(&fake, "a");
+        let key = new_key();
+        let c = r.ensure(&request(&key)).await.unwrap();
+        let st = r.status(&c.id).await.unwrap();
+        assert_eq!(st.address.as_deref(), Some("10.9.0.1"));
+        assert_eq!(st.port, Some(8080));
+        assert_eq!(st.deployment_id, Some(key.deployment_id.to_string()));
+        for (ctr, _) in fake.containers.lock().unwrap().iter_mut() {
+            ctr.addresses = HashMap::from([("bridge".into(), "172.17.0.9".into())]);
+        }
+        assert_eq!(r.status(&c.id).await.unwrap().address, None);
+    }
+
+    /// m11: a digest reference resolves to itself without a pull; a tag is pulled and resolves
+    /// to its registry digest (the one under its own name first); an image no registry knows,
+    /// a bad reference and a local registry are refused.
+    #[tokio::test]
+    async fn images_resolve_to_registry_digests() {
+        let fake = Arc::new(Fake::default());
+        let r = runner(&fake, "a");
+        let d1 = format!("sha256:{}", "1".repeat(64));
+        let d2 = format!("sha256:{}", "2".repeat(64));
+        let pinned = format!("ghcr.io/acme/echo@{d1}");
+        assert_eq!(r.resolve_image(&pinned).await.unwrap(), pinned);
+        assert!(fake.pulled.lock().unwrap().is_empty());
+        *fake.repo_digests.lock().unwrap() = vec![
+            format!("mirror.example/echo@{d2}"),
+            format!("ghcr.io/acme/echo@{d1}"),
+        ];
+        assert_eq!(
+            r.resolve_image("ghcr.io/acme/echo:1").await.unwrap(),
+            format!("ghcr.io/acme/echo@{d1}")
+        );
+        assert_eq!(*fake.pulled.lock().unwrap(), ["ghcr.io/acme/echo:1"]);
+        *fake.repo_digests.lock().unwrap() = vec![format!("mirror.example/echo@{d2}")];
+        assert_eq!(
+            r.resolve_image("ghcr.io/acme/echo:2").await.unwrap(),
+            format!("ghcr.io/acme/echo@{d2}")
+        );
+        fake.repo_digests.lock().unwrap().clear();
+        assert!(matches!(
+            r.resolve_image("ghcr.io/acme/echo:local").await,
+            Err(RunnerError::Invalid(_))
+        ));
+        *fake.repo_digests.lock().unwrap() = vec!["ghcr.io/acme/echo@sha256:short".into()];
+        assert!(matches!(
+            r.resolve_image("ghcr.io/acme/echo:1").await,
+            Err(RunnerError::Invalid(_))
+        ));
+        for bad in ["", "ghcr.io/acme/echo", "UPPER/x:1", "localhost:5000/x:1"] {
+            assert!(
+                matches!(r.resolve_image(bad).await, Err(RunnerError::Invalid(_))),
+                "{bad}"
+            );
+        }
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
     /// Audit B3: each service's container gets its own labelled network, created first, with the
@@ -1107,9 +1255,14 @@ mod tests {
         let c1b = r.ensure(&request(&next)).await.unwrap();
         assert_eq!(
             fake.network(&n1.id).unwrap().containers,
-            ["functions-ctr".to_string(), c1b.id.clone()]
+            ["functions-ctr".to_string(), c1.id.clone(), c1b.id.clone()]
         );
         r.remove(&c1b.id).await.unwrap();
+        assert!(
+            fake.network(&n1.id).is_some(),
+            "the network stays while the slot has a container"
+        );
+        r.remove(&c1.id).await.unwrap();
         assert!(
             fake.network(&n1.id).is_none(),
             "the network goes with its last container"

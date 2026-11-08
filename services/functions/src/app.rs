@@ -135,6 +135,13 @@ pub fn control_router(state: Shared) -> Router {
     Router::new()
         .route("/internal/bundles/{database_id}/{sha256}", axum::routing::put(put_bundle))
         .route("/internal/invoke/{branch_id}/{name}", axum::routing::post(invoke_internal))
+        // m11: container services ([`crate::services::control`]), the orchestrator's bearer.
+        .route("/internal/services/images/resolve", axum::routing::post(crate::services::control::resolve_image))
+        .route("/internal/services/rollout", axum::routing::post(crate::services::control::rollout_deployment))
+        .route(
+            "/internal/services/logs/{branch_id}/{function_id}/{deployment_id}",
+            get(crate::services::control::logs),
+        )
         .method_not_allowed_fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found", "no route") })
         .with_state(state)
@@ -597,13 +604,13 @@ fn record_error(s: &AppState, branch: Uuid, r: &Resolution, why: String) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Peer {
+pub(crate) enum Peer {
     Orchestrator,
     Worker,
 }
 
 /// The bearer must be `want`'s: no or an unknown bearer is 401, the other peer's 403.
-fn require(s: &AppState, headers: &HeaderMap, want: Peer) -> Result<(), Box<Response<Body>>> {
+pub(crate) fn require(s: &AppState, headers: &HeaderMap, want: Peer) -> Result<(), Box<Response<Body>>> {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

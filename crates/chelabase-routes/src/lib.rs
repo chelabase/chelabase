@@ -1251,6 +1251,13 @@ pub mod orchestrator {
         FUNCTION_DEPLOYMENTS,
         Access::Project(Viewer),
     );
+    /// Edge functions m11: a container service's logs need Developer (what it prints).
+    pub const GET_SERVICE_LOGS: Endpoint = key_endpoint(
+        "orchestrator.get_service_logs",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/functions/{name}/logs",
+        Access::Project(Developer),
+    );
     pub const LIST_FUNCTION_SECRETS: Endpoint =
         key_endpoint("orchestrator.list_function_secrets", Method::Get, FUNCTION_SECRETS, Access::Project(Viewer));
     pub const PUT_FUNCTION_SECRET: Endpoint =
@@ -1828,6 +1835,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_FUNCTION_SCHEDULE,
     orchestrator::DELETE_FUNCTION_SCHEDULE,
     orchestrator::LIST_FUNCTION_TRIGGERS,
+    orchestrator::GET_SERVICE_LOGS,
     orchestrator::CREATE_FUNCTION_TRIGGER,
     orchestrator::UPDATE_FUNCTION_TRIGGER,
     orchestrator::DELETE_FUNCTION_TRIGGER,
@@ -2820,6 +2828,7 @@ mod tests {
             ("orchestrator.update_function_schedule", BRANCH),
             ("orchestrator.delete_function_schedule", BRANCH),
             ("orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("orchestrator.get_service_logs", Access::Project(Developer)),
             ("orchestrator.create_function_trigger", BRANCH),
             ("orchestrator.update_function_trigger", BRANCH),
             ("orchestrator.delete_function_trigger", BRANCH),
@@ -3226,6 +3235,7 @@ mod tests {
             ("PATCH", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_schedule", branch),
             ("DELETE", "/hello/schedules/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_schedule", branch),
             ("GET", "/hello/triggers", "orchestrator.list_function_triggers", Access::Project(Viewer)),
+            ("GET", "/hello/logs", "orchestrator.get_service_logs", Access::Project(Developer)),
             ("POST", "/hello/triggers", "orchestrator.create_function_trigger", branch),
             ("PATCH", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.update_function_trigger", branch),
             ("DELETE", "/hello/triggers/8b1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10", "orchestrator.delete_function_trigger", branch),

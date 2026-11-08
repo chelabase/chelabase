@@ -42,11 +42,16 @@ async fn main() -> anyhow::Result<()> {
     // `last_error`, so it connects lazily and starts while the database is coming up.
     let client =
         MetadataClient::connect_lazy(&MetadataConfig { database_url })?.with_secrets_key(key);
-    let resolver = Arc::new(Resolver::new(
-        Arc::new(Metadata { client: client.clone() }),
-        config.public_url.clone(),
-        TTL,
-    ));
+    // m11: change events wake the container keeper.
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let resolver = Arc::new(
+        Resolver::new(
+            Arc::new(Metadata { client: client.clone(), public_url: config.public_url.clone() }),
+            config.public_url.clone(),
+            TTL,
+        )
+        .with_changes(wake.clone()),
+    );
     spawn_listener(
         resolver.clone(),
         chelabase_nats::NatsConfig::from_env().map_err(anyhow::Error::msg)?,
@@ -56,7 +61,13 @@ async fn main() -> anyhow::Result<()> {
     for entry in outbound.allow_hosts_with_port() {
         tracing::warn!(entry, "CHELABASE_SERVICES_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
     }
-    let services = functions::services::Services::new(&outbound)?;
+    let runner = functions::services::runner::HttpRunner::new(config.runner_url.clone(), config.runner_token.clone())?;
+    if config.runner_url.is_none() || config.runner_token.is_none() {
+        tracing::info!("no service runner configured: container services answer runner_unavailable");
+    }
+    let services = functions::services::Services::new(&outbound)?.with_runner(Arc::new(runner), wake);
+    // m11: container services are ensured (with their branch's secrets) and checked.
+    Arc::new(services.keeper(resolver.directory().clone())).spawn();
     functions::services::health::spawn(
         resolver.directory().clone(),
         services.client.clone(),

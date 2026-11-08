@@ -2198,6 +2198,56 @@ mod functions {
         s.finish().await;
     }
 
+    /// m11: container targets are the enabled container services, one row per live branch;
+    /// external services, disabled ones and deleted branches are left out.
+    #[tokio::test]
+    #[ignore]
+    async fn container_targets_are_per_enabled_branch() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let c = &s.client;
+        let svc = c.create_function(db, "echo", FunctionKind::Service).await.unwrap().id;
+        let ext = c.create_function(db, "ext", FunctionKind::Service).await.unwrap().id;
+        let deploy = |f: Uuid, spec: serde_json::Value| async move {
+            c.create_deployment(&NewDeployment {
+                id: Uuid::new_v4(),
+                function_id: f,
+                bundle_sha256: None,
+                bundle_size: None,
+                spec: &spec,
+                compatibility_date: date(),
+                created_by: "member-1",
+                note: None,
+            })
+            .await
+            .unwrap()
+            .id
+        };
+        let spec = serde_json::json!({"backend": "container", "image": format!("ghcr.io/acme/echo@sha256:{}", "a".repeat(64)), "port": 8080, "health_path": "/"});
+        let d = deploy(svc, spec.clone()).await;
+        let e = deploy(ext, serde_json::json!({"backend": "external", "url": "https://svc.example", "health_path": "/"})).await;
+        c.set_active_deployment(main, svc, d).await.unwrap();
+        c.set_active_deployment(main, ext, e).await.unwrap();
+        let mine = |db_branches: Vec<BranchId>| async move {
+            c.list_container_targets()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|t| db_branches.contains(&t.branch_id))
+                .collect::<Vec<_>>()
+        };
+        assert!(mine(vec![main]).await.is_empty(), "disabled");
+        assert!(c.set_enabled(main, svc, true).await.unwrap());
+        assert!(c.set_enabled(main, ext, true).await.unwrap());
+        let child = s.branch(db, main, "dev").await;
+        let targets = mine(vec![main, child]).await;
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert!(targets.iter().all(|t| t.function_id == svc && t.deployment_id == d && t.spec == spec));
+        c.mark_branch_deleted(child).await.unwrap();
+        assert_eq!(mine(vec![main, child]).await.len(), 1);
+        s.finish().await;
+    }
+
 
     /// m8 round 2 (S3): a child's run-as key is retried from state alone (a role and no key on
     /// a live normal branch), whatever its `last_error` says (an invocation error, say).

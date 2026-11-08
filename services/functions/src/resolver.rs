@@ -37,6 +37,8 @@ pub struct Resolver {
     epoch: AtomicU64,
     /// Bumped by `forget_branch` for the branch's stripe.
     generations: Box<[AtomicU64]>,
+    /// m11: notified on every change event (the container keeper's wake).
+    changes: Arc<tokio::sync::Notify>,
 }
 
 impl Resolver {
@@ -51,7 +53,14 @@ impl Resolver {
                 .build(),
             epoch: AtomicU64::new(0),
             generations: (0..STRIPES).map(|_| AtomicU64::new(0)).collect(),
+            changes: Arc::default(),
         }
+    }
+
+    /// m11: what each change event notifies.
+    pub fn with_changes(mut self, changes: Arc<tokio::sync::Notify>) -> Self {
+        self.changes = changes;
+        self
     }
 
     fn stripe(&self, branch: Uuid) -> &AtomicU64 {
@@ -148,7 +157,10 @@ async fn listen(resolver: &Resolver, config: &NatsConfig) -> anyhow::Result<()> 
     tracing::info!("listening for functions change events");
     while let Some(msg) = sub.next().await {
         match changed_branch(msg.subject.as_str(), &msg.payload) {
-            Some(branch) => resolver.forget_branch(branch),
+            Some(branch) => {
+                resolver.forget_branch(branch);
+                resolver.changes.notify_one();
+            }
             None => tracing::debug!(subject = %msg.subject, "ignoring an unreadable change event"),
         }
     }

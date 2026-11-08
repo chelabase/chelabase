@@ -206,6 +206,16 @@ pub struct ServiceTarget {
     pub spec: serde_json::Value,
 }
 
+/// m11: a container service enabled on a live branch, with its active deployment: what the
+/// functions service ensures (with the branch's secrets) and health-checks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerTarget {
+    pub branch_id: BranchId,
+    pub function_id: Uuid,
+    pub deployment_id: Uuid,
+    pub spec: serde_json::Value,
+}
+
 /// What serving a function on a branch needs: its active deployment and how it's called.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedFunction {
@@ -1590,6 +1600,32 @@ impl MetadataClient {
         .await?
         .into_iter()
         .map(|(deployment_id, spec)| ServiceTarget { deployment_id, spec })
+        .collect())
+    }
+
+    /// m11: every container service enabled on a live branch (one row per branch).
+    pub async fn list_container_targets(&self) -> Result<Vec<ContainerTarget>, MetadataError> {
+        Ok(sqlx::query_as::<_, (Uuid, Uuid, Uuid, serde_json::Value)>(
+            "SELECT bf.branch_id, bf.function_id, d.id, d.spec
+             FROM branch_functions bf
+             JOIN functions f ON f.id = bf.function_id
+             JOIN function_deployments d ON d.id = bf.deployment_id
+             JOIN branches b ON b.id = bf.branch_id
+             JOIN databases db ON db.id = b.database_id
+             WHERE bf.enabled AND f.kind = 'service' AND d.spec->>'backend' = 'container'
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND db.status NOT IN ('deleting', 'deleted')
+             ORDER BY bf.branch_id, bf.function_id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(branch, function_id, deployment_id, spec)| ContainerTarget {
+            branch_id: BranchId(branch),
+            function_id,
+            deployment_id,
+            spec,
+        })
         .collect())
     }
 

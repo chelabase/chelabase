@@ -6,6 +6,8 @@
 //! - `POST /internal/containers/ensure` `{service_id, branch_id, deployment_id, spec, env}`
 //! - `POST /internal/containers/{start|stop|remove}` `{container}` (an id or a name)
 //! - `GET /internal/containers/{container}/status`, `GET /internal/containers/{container}/logs`
+//! - `POST /internal/images/resolve` `{image}` → `{image}`, its registry digest reference (m11;
+//!   the functions service's bearer only: it pulls)
 //! - `GET /health` (no bearer)
 
 use std::sync::Arc;
@@ -45,6 +47,7 @@ pub fn router(state: Shared) -> Router {
         .route("/internal/containers/remove", post(remove))
         .route("/internal/containers/{container}/status", get(status))
         .route("/internal/containers/{container}/logs", get(logs))
+        .route("/internal/images/resolve", post(resolve_image))
         .method_not_allowed_fallback(|| async {
             error(StatusCode::NOT_FOUND, "not_found", "no route")
         })
@@ -142,7 +145,27 @@ async fn ensure(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
         Err(r) => return *r,
     };
     match s.runner.ensure(&req).await {
-        Ok(c) => status_response(Status::from(&c)),
+        Ok(c) => status_response(s.runner.status_of(&c)),
+        Err(e) => refusal(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Image {
+    image: String,
+}
+
+async fn resolve_image(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+    if let Err(r) = require(&s, &headers, &[Caller::Functions]) {
+        return *r;
+    }
+    let Image { image } = match json_body(&body) {
+        Ok(i) => i,
+        Err(r) => return *r,
+    };
+    match s.runner.resolve_image(&image).await {
+        Ok(image) => axum::Json(json!({ "image": image })).into_response(),
         Err(e) => refusal(e),
     }
 }
@@ -341,6 +364,49 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{body}");
         assert_eq!(body["state"], "running");
         assert_eq!(body["port"], 8080);
+        assert!(body["address"].is_string(), "{body}");
+        // m11: resolving an image pulls, so it's the functions service's call alone.
+        let resolve = json!({"image": format!("ghcr.io/acme/echo@sha256:{}", "a".repeat(64))});
+        for w in &wrong {
+            let (st, _) = call(
+                &app,
+                "POST",
+                "/internal/images/resolve",
+                w.as_deref(),
+                Some(resolve.clone()),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{w:?}");
+        }
+        let (st, _) = call(
+            &app,
+            "POST",
+            "/internal/images/resolve",
+            Some(&format!("Bearer {WK}")),
+            Some(resolve.clone()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/internal/images/resolve",
+            Some(&format!("Bearer {FN}")),
+            Some(resolve.clone()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["image"], resolve["image"]);
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/internal/images/resolve",
+            Some(&format!("Bearer {FN}")),
+            Some(json!({"image": "localhost/x:1"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"]["code"], "invalid_spec");
         let (st, _) = call(&app, "GET", "/health", None, None).await;
         assert_eq!(st, StatusCode::OK);
     }

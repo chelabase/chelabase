@@ -2312,6 +2312,124 @@ export const useCreateFunctionDeployment = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getCreateFunctionDeploymentMutationOptions(options), queryClient);
     }
 
+export const getGetServiceLogsUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/logs`
+}
+
+/**
+ * Stdout and stderr of the container that runs the service's active deployment on the branch. Container services only; needs Developer (logs can hold what a service prints).
+ * @summary A container service's last 200 log lines on the branch
+ */
+export const getServiceLogs = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<string> => {
+
+  return customFetch<string>(getGetServiceLogsUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetServiceLogsQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/logs`
+    ] as const;
+    }
+
+
+export const getGetServiceLogsQueryOptions = <TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetServiceLogsQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getServiceLogs>>> = ({ signal }) => getServiceLogs(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetServiceLogsQueryResult = NonNullable<Awaited<ReturnType<typeof getServiceLogs>>>
+export type GetServiceLogsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getServiceLogs>>,
+          TError,
+          Awaited<ReturnType<typeof getServiceLogs>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getServiceLogs>>,
+          TError,
+          Awaited<ReturnType<typeof getServiceLogs>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary A container service's last 200 log lines on the branch
+ */
+
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetServiceLogsQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getListFunctionSchedulesUrl = (id: string,
     branchId: string,
     name: string,) => {

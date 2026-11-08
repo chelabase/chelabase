@@ -52,10 +52,16 @@ impl Action {
     }
 }
 
+/// m11: a container of a deployment that isn't its slot's active one is left alone this long
+/// after it was created: a rollover runs the new deployment beside the old one and switches
+/// only once it's healthy (up to 60 s). Past it, it's removed like any stale container.
+pub const PENDING_GRACE_SECS: i64 = 120;
+
 /// What to do, given the desired rows (already checked: an invalid spec is left out, so its
 /// container goes), this stack's containers and networks, and the functions containers:
 /// - a container whose service and branch have no row, or whose deployment isn't the row's, or
-///   a second one for the same row, is removed;
+///   a second one for the same row, is removed, unless it's another deployment's created less
+///   than [`PENDING_GRACE_SECS`] before `now` (a rollover's new container: left alone);
 /// - an enabled row's stopped container is started; a disabled row's running one is stopped;
 /// - a network whose slot keeps no container is removed; one that keeps a container and lacks a
 ///   functions container gets it attached.
@@ -64,6 +70,7 @@ pub fn plan(
     actual: &[Container],
     networks: &[Network],
     functions: &[String],
+    now: i64,
 ) -> Vec<Action> {
     let rows: HashMap<(Uuid, Uuid), &Desired> = desired.iter().map(|d| (d.key.slot(), d)).collect();
     let mut kept: HashSet<(Uuid, Uuid)> = HashSet::new();
@@ -82,6 +89,10 @@ pub fn plan(
                     _ => {}
                 }
             }
+            Some(d) if d.key.deployment_id == k.deployment_id => {
+                actions.push(Action::Remove(c.id.clone()));
+            }
+            _ if c.created > 0 && now.saturating_sub(c.created) < PENDING_GRACE_SECS => {}
             _ => actions.push(Action::Remove(c.id.clone())),
         }
     }
@@ -186,7 +197,10 @@ pub async fn reconcile_once(
             .filter_map(|n| Some((n.id.clone(), slot_of(n)?))),
     );
     let mut applied = Vec::new();
-    for action in plan(&desired, &actual, &networks, &functions) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    for action in plan(&desired, &actual, &networks, &functions, now) {
         let guard = match action.slot(&slots) {
             Some(slot) => match runner.try_lock(slot) {
                 Some(g) => Some(g),
@@ -280,6 +294,7 @@ mod tests {
             id: id.into(),
             labels: labels(key),
             state: state.into(),
+            ..Default::default()
         }
     }
 
@@ -339,7 +354,7 @@ mod tests {
             network("n-gone", &gone, &["functions", "gone"]),
             network("n-orphan", &orphan, &["functions"]),
         ];
-        let actions = plan(&rows, &actual, &networks, std::slice::from_ref(&f));
+        let actions = plan(&rows, &actual, &networks, std::slice::from_ref(&f), NOW);
         let k = |k: &Key| (k.service_id, k.branch_id);
         assert_eq!(
             actions,
@@ -363,7 +378,7 @@ mod tests {
         let mut unlabelled = container("half", &on, "running");
         unlabelled.labels.remove(DEPLOYMENT_LABEL);
         assert_eq!(
-            plan(&[], &[unlabelled], &[], &[]),
+            plan(&[], &[unlabelled], &[], &[], NOW),
             [Action::Remove("half".into())]
         );
         assert!(
@@ -371,15 +386,67 @@ mod tests {
                 &[desired(on, true)],
                 &[container("x", &on, "running")],
                 &[],
-                &[]
+                &[],
+                NOW
             )
             .is_empty()
         );
         assert!(
-            plan(&[desired(fresh, true)], &[], &[], &[]).is_empty(),
+            plan(&[desired(fresh, true)], &[], &[], &[], NOW).is_empty(),
             "never a create"
         );
     }
+
+    /// m11: another deployment's container younger than the grace (a rollover's new one) is left
+    /// alone, with or without a row, and its slot's network stays; past the grace, or with no
+    /// creation time, it goes. A same-deployment duplicate goes however young.
+    #[test]
+    fn a_rollovers_new_container_has_a_grace() {
+        let active = key();
+        let pending = Key {
+            deployment_id: Uuid::new_v4(),
+            ..active
+        };
+        let young = |id: &str, k: &Key, age: i64| Container {
+            created: NOW - age,
+            ..container(id, k, "running")
+        };
+        let net = network("n", &active, &["functions", "old", "new"]);
+        let f = ["functions".to_string()];
+        let rows = [desired(active, true)];
+        let actual = [young("old", &active, 3600), young("new", &pending, 30)];
+        assert!(plan(&rows, &actual, std::slice::from_ref(&net), &f, NOW).is_empty());
+        let actual = [
+            young("old", &active, 3600),
+            young("new", &pending, PENDING_GRACE_SECS),
+        ];
+        assert_eq!(
+            plan(&rows, &actual, std::slice::from_ref(&net), &f, NOW),
+            [Action::Remove("new".into())]
+        );
+        // A first deploy: no row yet while it's checked.
+        assert!(
+            plan(
+                &[],
+                &[young("new", &pending, 5)],
+                std::slice::from_ref(&net),
+                &f,
+                NOW
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            plan(&[], &[container("new", &pending, "running")], &[], &f, NOW),
+            [Action::Remove("new".into())]
+        );
+        let actual = [young("old", &active, 3600), young("dup", &active, 1)];
+        assert_eq!(
+            plan(&rows, &actual, &[], &f, NOW),
+            [Action::Remove("dup".into())]
+        );
+    }
+
+    const NOW: i64 = 1_800_000_000;
 
     struct Rows(Mutex<anyhow::Result<Vec<Desired>>>);
 

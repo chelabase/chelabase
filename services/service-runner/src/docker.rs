@@ -35,6 +35,15 @@ const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 /// The most log bytes one call returns.
 const LOG_LIMIT: usize = 512 * 1024;
 
+/// Each network's address of a container, by network name (unaddressed ones left out).
+fn addresses(networks: Option<HashMap<String, EndpointSettings>>) -> HashMap<String, String> {
+    networks
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, e)| Some((name, e.ip_address.filter(|ip| !ip.is_empty())?)))
+        .collect()
+}
+
 /// The create body for `plan` on `network`. Everything that could reach the host is set off or
 /// left empty explicitly: privileged, binds, volumes, devices, host namespaces, published ports,
 /// extra capabilities. Mounts are tmpfs only. Memory has no swap on top.
@@ -152,6 +161,8 @@ impl ContainerBackend for DockerBackend {
                     .and_then(|s| s.status)
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
+                created: 0,
+                addresses: addresses(c.network_settings.and_then(|n| n.networks)),
             })),
             Err(e) if is_not_found(&e) => Ok(None),
             Err(e) => Err(anyhow::Error::new(e).context(format!("inspecting container {id}"))),
@@ -178,6 +189,8 @@ impl ContainerBackend for DockerBackend {
                 id: c.id.unwrap_or_default(),
                 labels: c.labels.unwrap_or_default(),
                 state: c.state.map(|s| s.to_string()).unwrap_or_default(),
+                created: c.created.unwrap_or_default(),
+                addresses: addresses(c.network_settings.and_then(|n| n.networks)),
             })
             .collect())
     }
@@ -217,6 +230,32 @@ impl ContainerBackend for DockerBackend {
             volumes: config.volumes.unwrap_or_default(),
             labels: config.labels.unwrap_or_default(),
         })
+    }
+
+    async fn repo_digests(&self, image: &ImageRef) -> anyhow::Result<Vec<String>> {
+        let reference = image.to_string();
+        let options = CreateImageOptions {
+            from_image: Some(image.name.clone()),
+            // Never empty: an empty tag pulls every tag.
+            tag: Some(image.tag_or_digest().to_string()),
+            ..Default::default()
+        };
+        let pull = async {
+            let mut stream = self.docker.create_image(Some(options), None, None);
+            while let Some(step) = stream.next().await {
+                step.with_context(|| format!("pulling {reference}"))?;
+            }
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(PULL_TIMEOUT, pull)
+            .await
+            .map_err(|_| anyhow::anyhow!("pulling {reference} timed out"))??;
+        let found = self
+            .docker
+            .inspect_image(&reference)
+            .await
+            .with_context(|| format!("inspecting {reference} after the pull"))?;
+        Ok(found.repo_digests.unwrap_or_default())
     }
 
     async fn create(&self, plan: &ContainerPlan, network: &str) -> anyhow::Result<String> {

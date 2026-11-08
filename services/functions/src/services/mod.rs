@@ -13,8 +13,14 @@
 //!   `chelabase-*` and `x-chelabase-*` and `content-digest` from the client are dropped; the
 //!   service gets `chelabase-branch`, `chelabase-role`, `chelabase-user` (the app user's
 //!   subject, else empty), a fresh `chelabase-request-id` and the [`signature`].
+//! - m11: a container service goes to the address the service runner reported for the branch's
+//!   container ([`container`]) through the containers' own client; before the keeper has placed
+//!   it, 503 `service_starting`.
 
+pub mod container;
+pub mod control;
 pub mod health;
+pub mod runner;
 pub mod signature;
 pub mod target;
 
@@ -44,6 +50,14 @@ pub const INTERNAL_SUBNETS: &str = "CHELABASE_INTERNAL_SUBNETS";
 pub struct Services {
     pub client: PublicClient,
     pub health: Arc<Health>,
+    /// m11: container services: their client, where each is, their health, the runner and the
+    /// keeper's wake.
+    pub direct: chelabase_http::Client,
+    pub containers: Arc<container::Containers>,
+    pub container_health: Arc<Health>,
+    pub runner: Arc<dyn runner::RunnerApi>,
+    pub probe: Arc<dyn container::Probe>,
+    pub wake: Arc<tokio::sync::Notify>,
 }
 
 /// Where services may be: `CHELABASE_SERVICES_*`, with the stack's hard deny over
@@ -60,10 +74,40 @@ pub fn outbound_from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Res
 
 impl Services {
     pub fn new(outbound: &Outbound) -> reqwest::Result<Self> {
+        let direct = container::client(CONNECT_TIMEOUT, IDLE_TIMEOUT)?;
         Ok(Self {
             client: outbound.streaming_client(CONNECT_TIMEOUT, IDLE_TIMEOUT)?,
             health: Arc::new(Health::default()),
+            probe: Arc::new(container::HttpProbe(direct.clone())),
+            direct,
+            containers: Arc::default(),
+            container_health: Arc::default(),
+            runner: Arc::new(runner::HttpRunner::new(None, None)?),
+            wake: Arc::default(),
         })
+    }
+
+    /// m11: container services through `runner`, the keeper woken by `wake`.
+    pub fn with_runner(
+        mut self,
+        runner: Arc<dyn runner::RunnerApi>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.runner = runner;
+        self.wake = wake;
+        self
+    }
+
+    /// The keeper over these services' state.
+    pub fn keeper(&self, directory: Arc<dyn crate::directory::Directory>) -> container::Keeper {
+        container::Keeper {
+            directory,
+            runner: self.runner.clone(),
+            probe: self.probe.clone(),
+            containers: self.containers.clone(),
+            health: self.container_health.clone(),
+            wake: self.wake.clone(),
+        }
     }
 }
 
@@ -167,7 +211,33 @@ pub(crate) async fn call(
             "the service is disabled",
         );
     }
-    if services.health.status(external.deployment_id) == Status::Unhealthy {
+    // m11: a container service's base is where its branch's container is.
+    let placed = match external.container {
+        Some(_) => {
+            match services
+                .containers
+                .get(branch, resolution.function_id, external.deployment_id)
+            {
+                Some(p) => Some(p),
+                None => {
+                    services.wake.notify_one();
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_starting",
+                        "the service's container is starting; retry shortly",
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let health = match &placed {
+        Some(_) => services
+            .container_health
+            .status(container::health_key(external.deployment_id, branch)),
+        None => services.health.status(external.deployment_id),
+    };
+    if health == Status::Unhealthy {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unhealthy",
@@ -182,7 +252,8 @@ pub(crate) async fn call(
             "the service has no signing secret",
         );
     };
-    let Some(upstream) = target::upstream(&external.url, &req.path, req.query.as_deref()) else {
+    let base = placed.as_ref().map_or(&external.url, |p| &p.base);
+    let Some(upstream) = target::upstream(base, &req.path, req.query.as_deref()) else {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
@@ -252,12 +323,19 @@ pub(crate) async fn call(
     if digest.is_none() {
         headers.insert(BODY, HeaderValue::from_static("unsigned"));
     }
-    let Ok(builder) = services.client.request(req.method, upstream.url.as_str()) else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "service_refused",
-            "the service's address is refused",
-        );
+    let builder = match &placed {
+        // The runner-reported address: the one target the containers' client dials.
+        Some(_) => services.direct.request(req.method, upstream.url.as_str()),
+        None => match services.client.request(req.method, upstream.url.as_str()) {
+            Ok(b) => b,
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "service_refused",
+                    "the service's address is refused",
+                );
+            }
+        },
     };
     let builder = builder.headers(headers);
     let builder = match body {
