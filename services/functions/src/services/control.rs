@@ -188,7 +188,8 @@ pub(crate) async fn rollout_deployment(
 pub(crate) async fn logs(
     State(s): State<Shared>,
     headers: HeaderMap,
-    Path((branch, function, deployment)): Path<(Uuid, Uuid, Uuid)>,
+    // Strings, parsed after the bearer check: a caller without it gets 401, never a parse error.
+    Path((branch, function, deployment)): Path<(String, String, String)>,
 ) -> Response<Body> {
     if let Err(r) = require(&s, &headers, Peer::Orchestrator) {
         return *r;
@@ -196,7 +197,16 @@ pub(crate) async fn logs(
     let Some(services) = s.services.as_ref() else {
         return unavailable();
     };
-    let Some(placed) = services.containers.get(branch, function, deployment) else {
+    let ids = (
+        Uuid::parse_str(&branch),
+        Uuid::parse_str(&function),
+        Uuid::parse_str(&deployment),
+    );
+    let placed = match ids {
+        (Ok(b), Ok(f), Ok(d)) => services.containers.get(b, f, d),
+        _ => None,
+    };
+    let Some(placed) = placed else {
         return error(
             StatusCode::NOT_FOUND,
             "no_container",

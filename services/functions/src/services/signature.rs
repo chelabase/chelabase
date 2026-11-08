@@ -7,7 +7,7 @@
 //! <METHOD> <request-target>
 //! <chelabase-branch>
 //! <chelabase-role>
-//! <chelabase-user>
+//! <chelabase-user-id>
 //! <Content-Digest>          (only when the body is signed)
 //! ```
 //!
@@ -36,7 +36,8 @@ pub const SIGNATURE: &str = "chelabase-signature";
 pub const REQUEST_ID: &str = "chelabase-request-id";
 pub const BRANCH: &str = "chelabase-branch";
 pub const ROLE: &str = "chelabase-role";
-pub const USER: &str = "chelabase-user";
+/// The app user's subject (else empty). Not `chelabase-user`: that is the token at the gateway.
+pub const USER: &str = "chelabase-user-id";
 /// `unsigned` when the body streamed and isn't covered by the signature.
 pub const BODY: &str = "chelabase-body";
 pub const DIGEST: &str = "content-digest";

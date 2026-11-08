@@ -50,7 +50,10 @@ pub const STACK_HOSTS: &[&str] = &[
     "register-safekeepers", "proxy-tls", "proxy", "identity", "orchestrator", "worker", "gateway",
     "gateway-functions", "auth", "rest", "realtime", "storage", "studio", "functions",
     "functions-public", "functions-internal", "functions-control", "functions-runtime",
-    "service-runner", "init-secrets", "init-bootstrap", "mailpit", "control", "secrets",
+    "service-runner", "service-runner-control", "init-secrets", "init-bootstrap", "mailpit", "control",
+    "secrets",
+    // The workbench's own: its docs and landing sites and the test runner.
+    "docs", "landing", "runner",
 ];
 
 /// Always denied by [`Outbound::deny_stack`]: "this network", loopback and link-local.
@@ -665,6 +668,39 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// Review (a second missing name, so an invariant): every Compose service name and every
+    /// fixed network alias in the stack's files is in [`STACK_HOSTS`]. The host-name aliases
+    /// (`${CHELABASE_*_HOST_NAME}`) are the operator's public names, not a stack-only target.
+    #[test]
+    fn every_compose_service_and_alias_is_a_stack_host() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/compose/");
+        let mut missing = Vec::new();
+        for file in ["docker-compose.yml", "docker-compose.workbench.yml"] {
+            let text = std::fs::read_to_string(format!("{root}{file}")).unwrap();
+            let mut names = Vec::new();
+            let mut in_services = false;
+            for line in text.lines() {
+                if !line.starts_with(' ') && !line.starts_with('#') && !line.is_empty() {
+                    in_services = line.trim_end() == "services:";
+                    continue;
+                }
+                // A service: a two-space-indented key in `services:`.
+                if in_services
+                    && let Some(key) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+                    && !key.starts_with([' ', '#'])
+                {
+                    names.push(key.to_string());
+                }
+                if let Some(list) = line.trim().strip_prefix("aliases: [").and_then(|l| l.strip_suffix(']')) {
+                    names.extend(list.split(',').map(|a| a.trim().to_string()));
+                }
+            }
+            assert!(names.len() > 3, "{file}: no services found");
+            missing.extend(names.into_iter().filter(|n| !STACK_HOSTS.contains(&n.as_str())).map(|n| format!("{file}: {n}")));
+        }
+        assert!(missing.is_empty(), "not in STACK_HOSTS: {missing:?}");
     }
 
     /// Every refused range, at its edges, and public addresses next to them.

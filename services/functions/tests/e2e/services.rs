@@ -124,7 +124,8 @@ async fn flow(s: &Stack, stub: &str) {
         headers.get("chelabase-branch").unwrap(),
         s.branch.to_string().as_str()
     );
-    assert_eq!(headers.get("chelabase-user").unwrap(), "");
+    assert_eq!(headers.get("chelabase-user-id").unwrap(), "");
+    assert!(headers.get("chelabase-user").is_none());
     let id = headers
         .get("chelabase-request-id")
         .unwrap()

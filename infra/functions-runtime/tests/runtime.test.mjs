@@ -110,6 +110,27 @@ describe("functions runtime", () => {
     }
   });
 
+  // Review: the supervisor caps the env header at 256 KiB (its base64 length). workerd itself
+  // takes a request header of that size (it answers 431 only somewhere past 300 KiB), so an env
+  // just under the cap runs, and one just over gets the supervisor's 400 naming why.
+  test("an env header just under the 256 KiB cap runs; just over is 400 with the reason", async () => {
+    const e = store.add(DB, manifest("echo"));
+    const cap = 256 << 10;
+    // The value's length that makes the base64 header exactly `len` (a multiple of 4).
+    const envOf = (len) => ({ BIG: "x".repeat((len / 4) * 3 - JSON.stringify({ BIG: "" }).length) });
+    const header = (env) => Buffer.from(JSON.stringify(env)).toString("base64").length;
+    const under = envOf(cap);
+    assert.equal(header(under), cap);
+    const ok = await invoke(rt, DB, e, { env: under });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).env.BIG.length, under.BIG.length);
+    const over = envOf(cap + 4);
+    assert.equal(header(over), cap + 4);
+    const res = await invoke(rt, DB, e, { env: over });
+    assert.equal(res.status, 400);
+    assert.equal(res.headers.get("x-chelabase-error"), "x-chelabase-env is too large");
+  });
+
   test("egress: every private target is refused", async () => {
     const g = store.add(DB, manifest("egress"));
     const targets = [

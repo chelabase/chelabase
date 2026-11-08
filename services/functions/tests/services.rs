@@ -8,7 +8,7 @@
 
 mod services {
     use std::collections::HashMap;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -128,7 +128,7 @@ mod services {
             Box<dyn std::future::Future<Output = std::io::Result<Vec<IpAddr>>> + Send + 'a>,
         > {
             let out = match host {
-                "svc.test" => Ok(vec!["127.0.0.1".parse().unwrap()]),
+                "svc.test" => Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
                 "inside.test" => Ok(vec!["10.0.0.5".parse().unwrap()]),
                 "lan.test" => Ok(vec!["192.168.1.5".parse().unwrap()]),
                 _ => Err(std::io::Error::other("no such host")),
@@ -177,7 +177,7 @@ mod services {
                 state: "running".into(),
                 deployment_id: Some(req.deployment_id.to_string()),
                 port: req.spec["port"].as_u64().map(|p| p as u16),
-                address: Some("127.0.0.1".into()),
+                address: Some(Ipv4Addr::LOCALHOST.to_string()),
             })
         }
         async fn remove(&self, _: &str) -> Result<(), RunnerError> {
@@ -508,7 +508,7 @@ mod services {
                 "/services/v1/users/a/b?x=1",
                 Cred::User,
             )
-            .header("chelabase-user", "admin")
+            .header("chelabase-user-id", "admin")
             .header("chelabase-role", "service_role")
             .header("chelabase-branch", Uuid::new_v4().to_string())
             .header("content-digest", "sha-256=:forged:")
@@ -529,7 +529,9 @@ mod services {
             (seen.method.as_str(), seen.uri.as_str(), &seen.body[..]),
             ("POST", "/a/b?x=1", &b"payload"[..])
         );
-        assert_eq!(seen.header("chelabase-user"), Some("user-1"));
+        // The subject is `chelabase-user-id`: `chelabase-user` is the token at the gateway.
+        assert_eq!(seen.header("chelabase-user-id"), Some("user-1"));
+        assert_eq!(seen.header("chelabase-user"), None);
         assert_eq!(seen.header("chelabase-role"), Some("authenticated"));
         assert_eq!(
             seen.header("chelabase-branch"),
@@ -559,7 +561,7 @@ mod services {
         // A public key: no user, whatever the client claims.
         let resp = h
             .call(reqwest::Method::GET, "/services/v1/stub", Cred::Public)
-            .header("chelabase-user", "admin")
+            .header("chelabase-user-id", "admin")
             .send()
             .await
             .unwrap();
@@ -568,7 +570,7 @@ mod services {
         assert_eq!(
             (
                 seen.uri.as_str(),
-                seen.header("chelabase-user"),
+                seen.header("chelabase-user-id"),
                 seen.header("chelabase-role")
             ),
             ("/", Some(""), Some("anon"))
@@ -831,13 +833,13 @@ mod services {
         let o = outbound_from_lookup(env(&[
             (
                 "CHELABASE_SERVICES_ALLOW_HOSTS",
-                "metadata-db,host.docker.internal,172.30.0.9",
+                "metadata-db,dev-host.internal,172.30.0.9",
             ),
             ("CHELABASE_SERVICES_ALLOW_HTTP", "true"),
             ("CHELABASE_INTERNAL_SUBNETS", "172.30.0.0/16"),
         ]))
         .unwrap();
-        assert!(o.check_url("http://host.docker.internal:18099/").is_ok());
+        assert!(o.check_url("http://dev-host.internal:18099/").is_ok());
         for url in [
             "http://127.0.0.1",
             "http://[::1]",
@@ -976,6 +978,14 @@ mod services {
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
+        // Review: the bearer is checked before the ids are parsed, so a caller without it learns
+        // nothing from a malformed id; with it, a malformed id names no container (JSON 404).
+        let bad = format!("{}/internal/services/logs/{}/not-a-uuid/{next}", h.control, h.branch);
+        let resp = h.http.get(&bad).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = h.http.get(&bad).bearer_auth(ORCHESTRATOR).send().await.unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["error"]["code"], "no_container");
         let resp = post(
             "/internal/services/rollout",
             ORCHESTRATOR,

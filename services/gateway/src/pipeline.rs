@@ -331,13 +331,19 @@ impl Pipeline {
             return None;
         };
         if endpoint.policy.cors == Cors::Any {
+            // A function or service reads headers of its own choosing, so its routes allow what
+            // the browser asks for; the other routes allow the client library's fixed list.
+            let allow_headers = match header_str(req.headers, "access-control-request-headers") {
+                Some(asked) if endpoint.service == Service::Functions => asked,
+                _ => CORS_ANY_ALLOW_HEADERS,
+            };
             // Exactly the matched endpoint's method: the route table, not a hand list.
             return Some(GatewayResponse {
                 status: 204,
                 headers: vec![
                     ("access-control-allow-origin", "*".to_string()),
                     ("access-control-allow-methods", endpoint.method.as_str().to_string()),
-                    ("access-control-allow-headers", CORS_ANY_ALLOW_HEADERS.to_string()),
+                    ("access-control-allow-headers", allow_headers.to_string()),
                     ("access-control-max-age", CORS_MAX_AGE_SECS.to_string()),
                 ],
                 body: None,
@@ -1604,6 +1610,50 @@ mod tests {
         );
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some("*"));
         assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), Some("etag, content-range"));
+    }
+
+    /// Review: a function or service reads its own request headers, so the preflight for those
+    /// routes allows what the browser asks for; other any-origin routes keep the fixed list.
+    #[tokio::test]
+    async fn a_functions_preflight_allows_the_requested_headers() {
+        let h = data_harness().await;
+        let public = format!("/functions/v1/public/{}/hello", TestUuid::new_v4());
+        for path in ["/functions/v1/hello", "/functions/v1/hello/a", public.as_str(), "/services/v1/box/x"] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", "PATCH"),
+                        ("access-control-request-headers", "x-custom, content-type"),
+                    ],
+                )
+                .await
+                .outcome,
+            );
+            assert_eq!(resp.status, 204, "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"), "{path}");
+            assert_eq!(header(&resp.headers, "access-control-allow-headers"), Some("x-custom, content-type"), "{path}");
+        }
+        let resp = expect_response(
+            run(
+                &h.pipeline,
+                "OPTIONS",
+                "/data/v1/query",
+                None,
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "POST"),
+                    ("access-control-request-headers", "x-custom"),
+                ],
+            )
+            .await
+            .outcome,
+        );
+        assert_eq!(header(&resp.headers, "access-control-allow-headers"), Some(CORS_ANY_ALLOW_HEADERS));
     }
 
     #[tokio::test]
