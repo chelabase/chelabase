@@ -6,6 +6,7 @@ mod generate;
 mod login;
 mod neon;
 mod paths;
+mod services;
 mod workbench;
 
 use clap::{Parser, Subcommand};
@@ -51,6 +52,13 @@ enum Commands {
         target: functions::Target,
         #[command(subcommand)]
         command: functions::Command,
+    },
+    /// Deploy and manage container services on a branch
+    Services {
+        #[command(flatten)]
+        target: functions::Target,
+        #[command(subcommand)]
+        command: services::Command,
     },
     /// This checkout's isolated stack: up, test, run, down (W2)
     Workbench {
@@ -380,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Login { url, email } => login::run(&url, email).await,
         Commands::Functions { target, command } => functions::run(target, command).await,
+        Commands::Services { target, command } => services::run(target, command).await,
         Commands::Workbench { command } => {
             use workbench::commands as wb;
             match command {

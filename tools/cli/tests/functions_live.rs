@@ -179,9 +179,14 @@ impl Stack {
     }
 
     async fn call(&self, name: &str) -> (u16, String) {
+        self.get(&format!("/functions/v1/{name}")).await
+    }
+
+    /// A GET of `path` through the gateway with the branch's public key.
+    async fn get(&self, path: &str) -> (u16, String) {
         let resp = self
             .http
-            .get(format!("{}/functions/v1/{name}", self.api))
+            .get(format!("{}{path}", self.api))
             .bearer_auth(&self.key)
             .send()
             .await
@@ -415,6 +420,7 @@ async fn flow(s: &Stack) {
     assert!(ok && out.trim() == "GREETING", "{out}");
     let (ok, _, _) = s.run(&["functions", "secrets", "unset", "hello", "GREETING"], "");
     assert!(ok);
+    schedules_and_triggers(s);
     let (ok, _, err) = s.run(&["functions", "disable", "hello"], "");
     assert!(ok, "disable: {err}");
     let (status, _) = s.until("hello", "-", Instant::now(), WITHIN).await;
@@ -428,6 +434,207 @@ async fn flow(s: &Stack) {
     std::fs::write(&creds, kept.to_string()).unwrap();
     let (ok, out, err) = s.run(&["functions", "list"], "");
     assert!(!ok && err.contains("chelabase login --url"), "{out}{err}");
+}
+
+/// m11: `functions schedule` and `functions trigger` add, list and rm (`hello` is deployed).
+fn schedules_and_triggers(s: &Stack) {
+    let (ok, out, err) = s.run(
+        &[
+            "functions",
+            "schedule",
+            "add",
+            "hello",
+            "--cron",
+            "*/15 * * * *",
+            "--timezone",
+            "Europe/London",
+        ],
+        "",
+    );
+    assert!(ok, "schedule add: {out}{err}");
+    let schedule = out.trim().to_owned();
+    let (ok, out, err) = s.run(&["functions", "schedule", "list", "hello"], "");
+    assert!(ok, "schedule list: {err}");
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(&schedule))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        line.contains("*/15 * * * *\tEurope/London\tenabled\tnext=2"),
+        "{line}"
+    );
+    let (ok, _, err) = s.run(&["functions", "schedule", "rm", "hello", &schedule], "");
+    assert!(ok, "schedule rm: {err}");
+    let (_, out, _) = s.run(&["functions", "schedule", "list", "hello"], "");
+    assert!(!out.contains(&schedule), "removed: {out}");
+
+    let add = |args: &[&str]| {
+        let mut argv = vec!["functions", "trigger", "add", "hello"];
+        argv.extend_from_slice(args);
+        let (ok, out, err) = s.run(&argv, "");
+        assert!(ok, "trigger add {args:?}: {out}{err}");
+        out.trim().to_owned()
+    };
+    let table = add(&[
+        "--table",
+        "public.orders",
+        "--pg-database",
+        "app",
+        "--events",
+        "insert,update",
+    ]);
+    let storage = add(&[
+        "--storage",
+        "--pg-database",
+        "app",
+        "--bucket",
+        "avatars",
+        "--prefix",
+        "in/",
+        "--events",
+        "object.created",
+    ]);
+    let (ok, out, err) = s.run(&["functions", "trigger", "list", "hello"], "");
+    assert!(ok, "trigger list: {err}");
+    let line = |id: &str| {
+        out.lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or_else(|| panic!("{id}: {out}"))
+            .to_owned()
+    };
+    let t = line(&table);
+    assert!(t.contains("\ttable public.orders\tinsert,update\t"), "{t}");
+    assert!(t.contains("\tdead=0\tdropped=0\tdelivered=-"), "{t}");
+    let st = line(&storage);
+    assert!(
+        st.contains("\tstorage avatars/in/\tobject.created\t"),
+        "{st}"
+    );
+    for id in [&table, &storage] {
+        let (ok, _, err) = s.run(&["functions", "trigger", "rm", "hello", id], "");
+        assert!(ok, "trigger rm: {err}");
+    }
+    let (_, out, _) = s.run(&["functions", "trigger", "list", "hello"], "");
+    assert!(out.trim().is_empty(), "removed: {out}");
+}
+
+/// go-httpbin, as the functions e2e's container test uses it (`CHELABASE_E2E_CONTAINER_IMAGE`
+/// overrides it).
+const IMAGE: &str = "mccutchen/go-httpbin:2.26.0";
+
+/// m11: `services deploy` (created and enabled), a refused unhealthy rollover, `list`, `logs`
+/// and `disable`. Needs the stack's `services` profile; without the runner it reports itself
+/// skipped.
+async fn services_flow(s: &Stack) {
+    let (email, password) = dev_member();
+    let (ok, out, err) = s.run(
+        &["login", "--url", &s.api, "--email", &email],
+        &format!("{password}\n"),
+    );
+    assert!(ok, "login: {out}{err}");
+    let image = std::env::var("CHELABASE_E2E_CONTAINER_IMAGE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| IMAGE.to_owned());
+    let db = s.db.to_string();
+    let svc = |args: &[&str]| {
+        let mut argv = vec!["services", "--database", db.as_str()];
+        argv.extend_from_slice(args);
+        s.run(&argv, "")
+    };
+    let (ok, out, err) = svc(&[
+        "deploy",
+        "box",
+        "--image",
+        &image,
+        "--port",
+        "8080",
+        "--health",
+        "/status/200",
+    ]);
+    // No runner (the `services` profile is off), or a stack older than container services.
+    if !ok && (err.contains("runner") || err.contains("unknown field `image`")) {
+        eprintln!("SKIPPED: the stack can't run container services: {err}");
+        return;
+    }
+    assert!(ok, "services deploy: {out}{err}");
+    assert!(
+        out.contains("box: signing secret "),
+        "the secret is shown once: {out}"
+    );
+    let first = out
+        .lines()
+        .find_map(|l| l.strip_prefix("box: deployed "))
+        .expect("the id")
+        .to_owned();
+
+    // Created and enabled: answers within 60 s, signed.
+    let since = Instant::now();
+    let (status, body) = loop {
+        let got = s.get("/services/v1/box/anything/hi").await;
+        if got.0 == 200 || since.elapsed() > Duration::from_secs(60) {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Chelabase-Signature"), "{body}");
+    let (_, out, _) = svc(&["list"]);
+    assert!(
+        out.contains("box\tenabled\t") && out.contains(&first),
+        "{out}"
+    );
+
+    // A rollover that never passes health: non-zero, the reason and the new id; traffic stays.
+    let (ok, out, err) = svc(&[
+        "deploy",
+        "box",
+        "--image",
+        &image,
+        "--port",
+        "8080",
+        "--health",
+        "/status/500",
+    ]);
+    assert!(!ok, "an unhealthy rollover fails: {out}{err}");
+    assert!(
+        err.contains("never passed its health check")
+            && err.contains("previous deployment stays live"),
+        "{err}"
+    );
+    let (_, out, _) = svc(&["list"]);
+    assert!(
+        out.contains(&first),
+        "the old deployment stays active: {out}"
+    );
+    assert_eq!(s.get("/services/v1/box/anything/still").await.0, 200);
+
+    let (ok, out, err) = svc(&["logs", "box"]);
+    assert!(ok && !out.trim().is_empty(), "logs: {out}{err}");
+
+    let (ok, _, err) = svc(&["disable", "box"]);
+    assert!(ok, "disable: {err}");
+    let since = Instant::now();
+    let (status, body) = loop {
+        let got = s.get("/services/v1/box/anything").await;
+        if got.1.contains("service_disabled") || since.elapsed() > WITHIN {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(status, 503, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack with the services profile"]
+async fn services_deploy_rollover_logs_disable() {
+    let stack = std::sync::Arc::new(Stack::new().await);
+    let run = stack.clone();
+    let result = tokio::spawn(async move { services_flow(&run).await }).await;
+    stack.cleanup().await;
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
 }
 
 #[tokio::test]

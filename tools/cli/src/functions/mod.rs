@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod config;
+pub mod events;
 pub mod watch;
 
 use anyhow::{Context, Result, bail};
@@ -51,6 +52,16 @@ pub enum Command {
         #[command(subcommand)]
         command: SecretsCommand,
     },
+    /// A function's cron schedules on the branch
+    Schedule {
+        #[command(subcommand)]
+        command: events::ScheduleCommand,
+    },
+    /// A function's table and storage triggers on the branch
+    Trigger {
+        #[command(subcommand)]
+        command: events::TriggerCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,19 +74,35 @@ pub enum SecretsCommand {
     List { function: String },
 }
 
-struct Api {
+pub(crate) struct Api {
     http: chelabase_http::Client,
     url: String,
     base: String,
 }
 
+/// What a failed management call says: the API's message, and for a rollover refused as
+/// unhealthy (409 `unhealthy`) the new deployment's id and that the previous one stays live.
+pub(crate) fn error_message(method: &str, path: &str, status: u16, body: &Value) -> String {
+    let error = &body["error"];
+    let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| body.to_string());
+    if status == 409 && error["reason"] == "unhealthy" {
+        let id = error["deployment_id"].as_str().unwrap_or("(unknown)");
+        return format!(
+            "the new deployment {id} never passed its health check, so the previous deployment \
+             stays live: {message}"
+        );
+    }
+    format!("{method} {path}: {status} {message}")
+}
+
 impl Api {
-    async fn send(
+    /// The answer's text on a 2xx status.
+    pub(crate) async fn text(
         &self,
         method: reqwest::Method,
         tail: &str,
         body: Option<Vec<u8>>,
-    ) -> Result<Value> {
+    ) -> Result<String> {
         let token = crate::login::bearer(&self.http, &self.url).await?;
         let path = format!("{}{tail}", self.base);
         let mut req = self
@@ -89,26 +116,50 @@ impl Api {
             .send()
             .await
             .with_context(|| format!("{method} {path}"))?;
-        let status = resp.status();
+        let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        match status.as_u16() {
-            200..=299 => Ok(value),
+        match status {
+            200..=299 => Ok(text),
             401 => bail!(
                 "{} refused the session: run `chelabase login --url {}`",
                 self.url,
                 self.url
             ),
-            _ => bail!(
-                "{method} {path}: {status} {}",
-                value["error"]["message"]
-                    .as_str()
-                    .unwrap_or(&value.to_string())
-            ),
+            _ => {
+                let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
+                bail!("{}", error_message(method.as_str(), &path, status, &value))
+            }
         }
     }
 
-    async fn json(&self, method: reqwest::Method, tail: &str, body: Value) -> Result<Value> {
+    /// The answer as JSON (null when empty) on a 2xx status.
+    pub(crate) async fn send(
+        &self,
+        method: reqwest::Method,
+        tail: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<Value> {
+        let text = self.text(method, tail, body).await?;
+        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+    }
+
+    /// Turns a function or service on or off on the branch.
+    pub(crate) async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        self.json(reqwest::Method::PATCH, &format!("/{name}"), json!({ "enabled": enabled }))
+            .await?;
+        eprintln!("{name}: {}", if enabled { "enabled" } else { "disabled" });
+        Ok(())
+    }
+
+    /// Makes an earlier deployment the active one (a service rolls over to it).
+    pub(crate) async fn rollback(&self, name: &str, deployment: &str) -> Result<()> {
+        let body = json!({ "active_deployment_id": deployment });
+        self.json(reqwest::Method::PATCH, &format!("/{name}"), body).await?;
+        eprintln!("{name}: {deployment} is active");
+        Ok(())
+    }
+
+    pub(crate) async fn json(&self, method: reqwest::Method, tail: &str, body: Value) -> Result<Value> {
         self.send(method, tail, Some(body.to_string().into_bytes()))
             .await
     }
@@ -177,15 +228,9 @@ fn read_secret(input: &mut dyn std::io::BufRead, terminal: bool) -> Result<Strin
     Ok(value.to_string())
 }
 
-pub async fn run(target: Target, command: Command) -> Result<()> {
-    let found = Config::find(&std::env::current_dir()?);
-    let (root, config) = match (&command, found) {
-        (_, Ok((root, c))) => (root.canonicalize()?, c),
-        // Only these need the project; the others work without one, but not with a broken one.
-        (Command::Deploy { .. } | Command::Dev { .. }, Err(e)) => return Err(e),
-        (_, Err(e)) if !e.to_string().starts_with("no chelabase.toml") => return Err(e),
-        (_, Err(_)) => (PathBuf::new(), Config::default()),
-    };
+/// The management API's functions of the target branch: flags and env first, then the project's
+/// `chelabase.toml`.
+pub(crate) fn connect(target: Target, config: &Config) -> Result<Api> {
     let url = crate::login::instance(target.url.as_deref(), config.project.url.as_deref())?;
     let database = target
         .database
@@ -195,13 +240,25 @@ pub async fn run(target: Target, command: Command) -> Result<()> {
         .branch
         .or(config.project.branch.clone())
         .unwrap_or_else(|| database.clone());
-    let api = Api {
+    Ok(Api {
         http: chelabase_http::client_builder()
             .build()
             .context("an HTTP client")?,
         base: format!("/v1/databases/{database}/branches/{branch}/functions"),
         url,
+    })
+}
+
+pub async fn run(target: Target, command: Command) -> Result<()> {
+    let found = Config::find(&std::env::current_dir()?);
+    let (root, config) = match (&command, found) {
+        (_, Ok((root, c))) => (root.canonicalize()?, c),
+        // Only these need the project; the others work without one, but not with a broken one.
+        (Command::Deploy { .. } | Command::Dev { .. }, Err(e)) => return Err(e),
+        (_, Err(e)) if !e.to_string().starts_with("no chelabase.toml") => return Err(e),
+        (_, Err(_)) => (PathBuf::new(), Config::default()),
     };
+    let api = connect(target, &config)?;
     use reqwest::Method;
     match command {
         Command::Deploy { names } => {
@@ -248,33 +305,11 @@ pub async fn run(target: Target, command: Command) -> Result<()> {
                 );
             }
         }
-        Command::Enable { name } => {
-            api.json(
-                Method::PATCH,
-                &format!("/{name}"),
-                json!({ "enabled": true }),
-            )
-            .await?;
-            eprintln!("{name}: enabled");
-        }
-        Command::Disable { name } => {
-            api.json(
-                Method::PATCH,
-                &format!("/{name}"),
-                json!({ "enabled": false }),
-            )
-            .await?;
-            eprintln!("{name}: disabled");
-        }
-        Command::Rollback { name, deployment } => {
-            api.json(
-                Method::PATCH,
-                &format!("/{name}"),
-                json!({ "active_deployment_id": deployment }),
-            )
-            .await?;
-            eprintln!("{name}: {deployment} is active");
-        }
+        Command::Enable { name } => api.set_enabled(&name, true).await?,
+        Command::Disable { name } => api.set_enabled(&name, false).await?,
+        Command::Rollback { name, deployment } => api.rollback(&name, &deployment).await?,
+        Command::Schedule { command } => events::schedule(&api, command).await?,
+        Command::Trigger { command } => events::trigger(&api, command).await?,
         Command::Secrets { command } => match command {
             SecretsCommand::Set { function, secret } => {
                 let terminal = std::io::stdin().is_terminal();
