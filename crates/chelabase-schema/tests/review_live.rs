@@ -229,3 +229,44 @@ async fn the_scan_follows_operators_domains_ranges_and_definer_callers() {
     meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
     meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
 }
+
+// #185 audit B1: `storage` is skipped only when it is object storage's (owned by
+// `chelabase_admin`). A `storage` schema the owner made, where another role can create, is
+// reviewed like any other: a planted SECURITY DEFINER function and a trigger are listed.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_user_owned_storage_schema_is_reviewed() {
+    let meta = connect(&url()).await;
+    let mut random = [0u8; 6];
+    getrandom::fill(&mut random).unwrap();
+    let name = format!("rv_{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let (owner, dev) = (format!("{name}_owner"), format!("{name}_dev"));
+    meta.batch_execute(&format!("CREATE ROLE {owner} LOGIN; CREATE ROLE {dev};")).await.unwrap();
+    meta.batch_execute(&format!("CREATE DATABASE {name} OWNER {owner}")).await.unwrap();
+    let db = connect(&url_for(&name)).await;
+    db.batch_execute(&format!(
+        "SET ROLE {owner};
+         CREATE SCHEMA storage;
+         GRANT USAGE, CREATE ON SCHEMA storage TO {dev};
+         RESET ROLE;
+         SET ROLE {dev};
+         CREATE FUNCTION storage.f_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         CREATE FUNCTION storage.f_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE storage.t (a int);
+         CREATE TRIGGER tg BEFORE INSERT ON storage.t FOR EACH ROW EXECUTE FUNCTION storage.f_trg();
+         RESET ROLE;"
+    ))
+    .await
+    .unwrap();
+
+    let keys: Vec<String> = scan(&db, &owner).await.into_iter().map(|i| i.key).collect();
+    assert_eq!(
+        keys,
+        ["app/function/storage.f_planted()", "app/function/storage.f_trg()", "app/trigger/storage.tg(storage.t)"],
+        "a storage schema that isn't chelabase_admin's is reviewed"
+    );
+
+    drop(db);
+    meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
+    meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
+}

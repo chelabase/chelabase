@@ -18,7 +18,12 @@
 //! - rules (not a view's `_RETURN`) on a relation owned by a non-Admin role.
 //!
 //! Skipped: extension members and objects in `pg_catalog`, `information_schema`, `pg_toast`,
-//! `pg_temp_*`, `pg_toast_temp_*` and `chelabase_guard`.
+//! `pg_temp_*`, `pg_toast_temp_*`, `chelabase_guard`, and `storage` when `chelabase_admin`
+//! owns it (object storage's own schema). That skip rests on the owner: no other role can
+//! join `chelabase_admin` (the data API bootstrap revokes every membership) or give it a
+//! schema, and the storage install grants no one but `chelabase_admin` CREATE there. A
+//! `storage` schema anyone else owns (one the owner made, or a database no bootstrap reached)
+//! is reviewed like any other.
 //!
 //! Every name part of a key, a `via` and a hash line is quoted as an identifier, so no name
 //! can make two items share a key or forge a hash line. Each item carries the md5 hex of its
@@ -56,6 +61,9 @@ skipped AS (
      OR n.nspname OPERATOR(pg_catalog.=) 'information_schema'
      OR n.nspname OPERATOR(pg_catalog.=) 'pg_toast'
      OR n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
+     OR (n.nspname OPERATOR(pg_catalog.=) 'storage'
+         AND n.nspowner OPERATOR(pg_catalog.=) (SELECT r.oid FROM pg_catalog.pg_roles r
+           WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'))
      OR pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_temp_')
      OR pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_toast_temp_')
 ),
