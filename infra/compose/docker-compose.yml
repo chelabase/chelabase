@@ -1385,9 +1385,9 @@ services:
     read_only: true
     environment:
       <<: *app-env
-      # The public listener on the default network (the gateway) and on `services` (m10: the
-      # service containers' only peer), never the internal one.
-      CHELABASE_FUNCTIONS_ADDR: functions-public:8091,functions-services:8091,127.0.0.1:8091
+      # Fixed addresses only: the service runner attaches this container to each service's own
+      # network (m10), where it must listen on nothing, so traffic flows functions → service.
+      CHELABASE_FUNCTIONS_ADDR: functions-public:8091,127.0.0.1:8091
       # The internal listener in two sides (#181): bundle GETs for the runtime, uploads and
       # invocations for the orchestrator and the worker.
       CHELABASE_FUNCTIONS_INTERNAL_ADDR: functions-internal:8080
@@ -1415,8 +1415,6 @@ services:
         aliases: [functions-internal]
       functions-control:
         aliases: [functions-control]
-      services:
-        aliases: [functions-services]
       services-control: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
@@ -1446,7 +1444,8 @@ services:
   # hold it for computes; functions, the runtime and service containers never). Profile
   # `services`, off by default. It acts only on containers labelled with this stack and a
   # service, hardens every one it creates (non-root, read-only, no capability, no host mount,
-  # device or namespace, limits) and puts them on `services` alone. Its API binds its alias on
+  # device or namespace, limits) and puts each on a private network of its own, which only this
+  # project's functions container joins (the runner attaches it). Its API binds its alias on
   # the internal `services-control` network (the functions service and the worker, each with its
   # own bearer) and loopback; it reads the metadata (desired state) on the default network.
   service-runner:
@@ -1460,7 +1459,8 @@ services:
     environment:
       <<: *app-env
       CHELABASE_SERVICE_RUNNER_ADDR: service-runner-control:8094,127.0.0.1:8094
-      CHELABASE_SERVICES_NETWORK: ${COMPOSE_PROJECT_NAME}_services
+      # Whose `functions` container it attaches to each service network.
+      CHELABASE_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
       CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
       CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/functions-service-runner.token
       CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-service-runner.token
@@ -1549,10 +1549,6 @@ networks:
     internal: true
   # The runtime's only way out (workerd allows public addresses only); nothing else is on it.
   functions-egress: {}
-  # Edge functions (m10): the service containers' network (the runner puts each container on
-  # it and nothing else) and the functions service's public listener (alias
-  # `functions-services`). Not internal: services reach the internet. No other service is on it.
-  services: {}
   # Edge functions (m10): the functions service and the worker to the service runner's API; no
   # route out.
   services-control:
