@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Deploy a container image (creating and enabling the service the first time); prints the
-    /// deployment's id. A running service switches once the new container is healthy
+    /// deployment's id. A running service switches once the new container is healthy: the
+    /// command waits for that and exits non-zero when it never is
     Deploy(Deploy),
     /// The branch's services
     List,
@@ -112,6 +113,11 @@ async fn deploy(api: &Api, d: &Deploy) -> Result<()> {
         .await?;
     let id = made["id"].as_str().context("the deployment's id")?;
     println!("{name}: deployed {id}");
+    // A running service rolls over in the background; wait for its outcome.
+    if made["rollout"] == "pending" {
+        api.await_rollout(name, id).await?;
+        eprintln!("{name}: {id} is live");
+    }
     if service["deployment_id"].is_null() {
         api.set_enabled(name, true).await?;
     }
@@ -261,6 +267,22 @@ mod tests {
         };
         assert_eq!((name.as_str(), deployment.as_str()), ("echo", "d1"));
         assert!(cmd(&["rollback", "echo"]).is_err());
+    }
+
+    /// A rollover is pending until the service shows the deployment active with no rollover, and
+    /// fails with the reason (non-zero exit) when it failed or a newer one replaced it.
+    #[test]
+    fn rollover_outcomes() {
+        use crate::functions::rollout_outcome;
+        let pending = json!({"deployment_id": "d1", "rollout": {"deployment_id": "d2", "state": "pending", "error": null}});
+        assert_eq!(rollout_outcome(&pending, "d2"), None);
+        assert_eq!(rollout_outcome(&json!({"deployment_id": "d2", "rollout": null}), "d2"), Some(Ok(())));
+        let failed = json!({"deployment_id": "d1", "rollout": {"deployment_id": "d2", "state": "failed",
+                                                               "error": "never passed GET /status/500"}});
+        let Some(Err(why)) = rollout_outcome(&failed, "d2") else { panic!() };
+        assert!(why.contains("d2") && why.contains("never passed GET /status/500") && why.contains("previous deployment stays live"), "{why}");
+        assert!(matches!(rollout_outcome(&pending, "d3"), Some(Err(_))), "replaced");
+        assert!(matches!(rollout_outcome(&json!({"deployment_id": "d1", "rollout": null}), "d2"), Some(Err(_))));
     }
 
     #[test]
