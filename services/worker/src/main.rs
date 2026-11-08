@@ -179,10 +179,16 @@ async fn main() -> anyhow::Result<()> {
             // m13b: database events are the functions service's (its own login, LISTEN).
             tokio::spawn(worker::fn_schedules::schedule_loop(
                 worker.metadata.inner().clone(),
+                invoker.clone(),
+            ));
+            // m14: storage events, one consumer per enabled storage trigger.
+            tokio::spawn(worker::fn_storage_triggers::run(
+                worker.metadata.inner().clone(),
+                js.clone(),
                 invoker,
             ));
         }
-        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules don't run"),
+        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules and storage triggers don't run"),
     }
     match &functions.bundles {
         Some(config) => {
