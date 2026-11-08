@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 666" width="440" height="666" role="img" aria-labelledby="title desc">
   <title id="title">Chelabase architecture</title>
-  <desc id="desc">Your app and Studio reach the Gateway over HTTPS. The Gateway forwards to Realtime, Auth, the Orchestrator, Rest and Storage. Auth keeps every account, Studio members and app users alike, in the internal Identity service. The Orchestrator hands jobs to the Worker, which provisions Postgres computes. Rest queries a compute, and psql, ORMs and migration tools connect over the Postgres protocol through the Neon proxy. Storage keeps each file's metadata in the branch's Postgres and the file in an S3 bucket. Each branch has its own compute on Neon's storage: pageserver, safekeepers and object store.</desc>
+  <desc id="desc">Your app and Studio reach the Gateway over HTTPS. The Gateway forwards to Realtime, Auth, the Orchestrator, Rest, Storage and Functions. Auth keeps every account, Studio members and app users alike, in the internal Identity service. The Orchestrator hands jobs to the Worker, which provisions Postgres computes. Rest queries a compute, and psql, ORMs and migration tools connect over the Postgres protocol through the Neon proxy. Storage keeps each file's metadata in the branch's Postgres and the file in an S3 bucket. Functions runs your own code per branch. Each branch has its own compute on Neon's storage: pageserver, safekeepers and object store.</desc>
   <style>
     .card { fill: #f7f3ee; }
     .box { fill: #ffffff; stroke: #d8cfc5; stroke-width: 1.25; }
@@ -75,6 +75,10 @@
   <text class="t" x="238.5" y="359" text-anchor="middle">Rest</text>
   <text class="s" x="238.5" y="378" text-anchor="middle">data API</text>
   <path class="wire" d="M157 445 H174" marker-end="url(#arrow)"/>
+  <path class="wire" d="M157 445 H140" marker-end="url(#arrow)"/>
+  <rect class="box" x="44" y="418" width="95" height="54" rx="8"/>
+  <text class="t" x="91.5" y="441" text-anchor="middle">Functions</text>
+  <text class="s" x="91.5" y="460" text-anchor="middle">your code</text>
   <rect class="box" x="175" y="418" width="100" height="54" rx="8"/>
   <text class="t" x="225" y="441" text-anchor="middle">Storage</text>
   <text class="s" x="225" y="460" text-anchor="middle">files, URLs</text>
@@ -85,8 +89,8 @@
   <text class="s" x="373" y="378" text-anchor="middle">login roles</text>
   <rect class="group" x="12" y="502" width="416" height="152" rx="10"/>
   <text class="g" x="110" y="523" text-anchor="middle">Neon storage engine</text>
-  <path class="wire" d="M75.5 390 V535" marker-end="url(#arrow)"/>
-  <text class="e" x="83" y="410">provisions</text>
+  <path class="wire" d="M34 390 V535" marker-end="url(#arrow)"/>
+  <text class="e" x="44" y="409">provisions</text>
   <path class="wire" d="M373 390 V535" marker-end="url(#arrow)"/>
   <path class="wire" d="M289 390 V535" marker-end="url(#arrow)"/>
   <path class="wire" d="M225 472 V535" marker-end="url(#arrow)"/>
