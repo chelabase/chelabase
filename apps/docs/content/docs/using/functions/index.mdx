@@ -1,0 +1,54 @@
+---
+title: Functions
+description: Run your own code next to a database, on HTTP calls, cron schedules and database or storage events.
+---
+
+<AlphaNotice />
+
+A **function** is a Workers-style JavaScript module that Chelabase runs for you, per branch. You write it with the same `fetch` and `scheduled` handlers Cloudflare Workers use, deploy it from the CLI, and call it through the gateway with a [data API key](/using/data-api/keys). The same function can also run on a [cron schedule](/using/functions/schedules) and on [database or storage events](/using/functions/triggers).
+
+Functions are self-hosted only for now. In platform mode every functions route answers 403 `not_available_in_platform_mode` and Studio hides the **Functions** tab; a Cloudflare deployer is planned as a later epic.
+
+## What you get
+
+| | |
+|---|---|
+| Handlers | `export default { fetch, scheduled }`: see [Handlers](/using/functions/handlers) |
+| Deploy | `chelabase functions deploy` / `dev --watch`: see the [quickstart](/using/functions/quickstart) and the [CLI and project file](/using/functions/project-file) |
+| Bundles | esbuild output, with core WebAssembly modules: see [Bundling and WebAssembly](/using/functions/bundling) |
+| Secrets and env | Per-function secrets, the data API binding, run-as keys: see [Secrets, env and the data API](/using/functions/environment) |
+| Who may call | `key`, `app_user` or `public`, and the limits: see [Auth modes and limits](/using/functions/auth-and-limits) |
+| Schedules | 5-field cron with a time zone: see [Schedules](/using/functions/schedules) |
+| Events | Table triggers and storage triggers, delivered at least once: see [Triggers](/using/functions/triggers) |
+| Branches | A new branch inherits its parent's functions: see [Branches](#branches) |
+
+## Calling a function
+
+```bash
+curl -H "Authorization: Bearer $CHELABASE_PUBLIC_KEY" \
+  "http://api.chelabase.localhost:8000/functions/v1/hello?name=Ada"
+```
+
+`/functions/v1/{name}` and `/functions/v1/{name}/{rest}` take any method. The gateway checks the key (and an app user's token, when sent) and forwards the call to the function service, which runs the branch's active deployment of `{name}` in a locked-down [workerd](https://github.com/cloudflare/workerd) runtime. The key picks the branch. A function with `auth = "public"` can also be called with no key at `/functions/v1/public/{branch_id}/{name}`.
+
+The function sees the request as the caller sent it, minus `Authorization`, `Host` and every `chelabase-*` header, plus a `chelabase-caller` header that says who called. See [Handlers](/using/functions/handlers#who-called).
+
+## Branches
+
+Functions belong to the database, and their state belongs to each branch: which deployment is active, whether the function is enabled, its auth mode, secrets, schedules and triggers.
+
+- **A new branch copies its parent's state** at the moment it is created: the active deployment, the enabled flag, the secrets (re-encrypted for the child), the schedules and the triggers. After that the two are independent: deploying to or disabling the child never touches the parent.
+- A copied **run-as role** is kept, but the key behind it is not shared: the child gets its own key, bound to the same role identity. See [run-as](/using/functions/environment#acting-as-the-function).
+- A copied **table trigger** starts as `pending_install` and installs into the child's own database. A copied **schedule** fires for the child only when the function is enabled on it.
+- A **reset to parent** or **restore** puts every table trigger of the branch back to `pending_install`, because the database came from another timeline.
+- A **backup branch** made by a restore gets no function state, so a branch created from a backup inherits none.
+
+## Who may do what
+
+Reading functions needs Viewer access to the project. Deploying, enabling, rolling back, secrets, schedules and triggers need Developer access on an unprotected branch and Admin on a protected one. Deleting a function and changing its kind need Admin. See the [access table](/reference/access). The management routes are in the [Management API reference](/reference/management/functions/listFunctions).
+
+## Studio
+
+The **Functions** tab lists a branch's functions with their enabled switch, auth mode, active deployment and last error. A function's drawer shows its invoke URL and a curl command, its run-as role, its deployments (with a button to make an earlier one active) and its secrets. Schedules and triggers are managed with the API for now, and from the CLI and Studio once #173 lands.
+
+{/* TODO(#173): confirm against landed code: Studio's Schedules and Triggers sections in the function drawer, and the services list in the same tab. */}

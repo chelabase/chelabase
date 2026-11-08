@@ -1,0 +1,74 @@
+---
+title: CLI and project file
+description: chelabase.toml, and every chelabase login and chelabase functions command and flag.
+---
+
+A functions project is a folder with a `chelabase.toml` at its root. The CLI looks for the nearest one from the current folder upwards.
+
+## chelabase.toml
+
+```toml
+[project]
+url = "https://api.example.com"   # optional
+database = "<database id>"        # optional
+branch = "<branch id>"            # optional
+
+[functions.hello]
+entry = "functions/hello/index.ts"
+auth = "key"                      # key | app_user | public (optional)
+compatibility_date = "2026-10-01" # optional
+compatibility_flags = []          # optional
+```
+
+Unknown keys are errors, so a typo is caught instead of ignored.
+
+| Key | Meaning |
+|---|---|
+| `[project] url` | The instance's API URL. Without it the CLI uses `--url`, `CHELABASE_URL`, or the only instance you are signed in to. |
+| `[project] database` | The Chelabase database id. Without it: `--database` or `CHELABASE_DATABASE`. |
+| `[project] branch` | The branch id. Without it: `--branch`, `CHELABASE_BRANCH`, or the database's main branch. |
+| `[functions.<name>]` | One function. The name is a lowercase letter, then up to 62 of `a-z`, `0-9` and `-`. `public` is reserved (it is the keyless invoke prefix). |
+| `entry` | Required. The entry module, a path relative to the project's root. |
+| `auth` | Who may call it: `key`, `app_user` or `public` (see [Auth modes](/using/functions/auth-and-limits#auth-modes)). Applied on deploy when it differs from the branch's setting; unset leaves the setting alone, and a new function starts as `key`. |
+| `compatibility_date` | A `YYYY-MM-DD` [compatibility date](https://developers.cloudflare.com/workers/configuration/compatibility-dates/). Default `2026-10-01`. The runtime pins a workerd release, and a date later than that release supports makes the function fail to start (the call answers 502 `bundle failed to start`). |
+| `compatibility_flags` | A list of compatibility flags. |
+
+## Settings every command takes
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--url <URL>` | `CHELABASE_URL` | `chelabase.toml`'s `url`, else the only login |
+| `--database <ID>` | `CHELABASE_DATABASE` | `chelabase.toml`'s `database` |
+| `--branch <ID>` | `CHELABASE_BRANCH` | `chelabase.toml`'s `branch`, else the database's main branch |
+
+## chelabase login
+
+```text
+chelabase login --url <URL> [--email <EMAIL>]
+```
+
+Signs in to an instance with an email and password. The email is prompted for when missing; the password is always prompted for or read from stdin. The session is stored per instance URL in `~/.config/chelabase/credentials.json` (mode 0600). When it expires the CLI asks you to sign in again; it never prints the token.
+
+## chelabase functions
+
+| Command | What it does |
+|---|---|
+| `deploy [NAMES…]` | Bundles and deploys the named functions (all of `chelabase.toml` when none is named) and makes each deployment active. The first deploy creates the function and turns it on. Prints `<name>: deployed <deployment id>`. |
+| `dev [--watch] [NAMES…]` | Deploys, then with `--watch` redeploys each function whose input files change (all of them when `chelabase.toml` changes). Changes are debounced by 150 ms. A failed build prints its error and leaves the previous deployment live. |
+| `list [NAME]` | Without a name: the branch's functions with state, auth mode, active deployment and last error. With a name: that function's deployments (id, time, compatibility date, note). |
+| `enable NAME` | Turns the function on for this branch. |
+| `disable NAME` | Turns it off: calls answer 404, schedules skip their runs, and event deliveries wait. |
+| `rollback NAME DEPLOYMENT` | Makes an earlier deployment the active one. |
+| `secrets set FUNCTION SECRET` | Sets a secret on a function. See below. |
+| `secrets unset FUNCTION SECRET` | Removes a secret. |
+| `secrets list FUNCTION` | The secrets' names. Values never come back. |
+
+A secret's value is read from stdin when it is not a terminal (one trailing newline is dropped), else from a prompt that doesn't echo. It is never taken from the command line.
+
+```bash
+printf %s "$STRIPE_KEY" | chelabase functions secrets set billing STRIPE_KEY
+```
+
+{/* TODO(#173): confirm against landed code: `chelabase functions schedule add|rm|list`, `functions trigger add|rm|list` (`--table` or `--storage --bucket --prefix`), and `chelabase services deploy|list|enable|disable|logs|rollback`. */}
+
+Schedules, triggers and run-as roles can be managed today with the [Management API](/reference/management/functions/listFunctions). The commands for them are described in [Schedules](/using/functions/schedules) and [Triggers](/using/functions/triggers).

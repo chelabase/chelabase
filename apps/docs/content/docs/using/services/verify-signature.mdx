@@ -1,0 +1,250 @@
+---
+title: Verify the signature
+description: Check Chelabase-Signature on every request a service receives, with samples in TypeScript and Rust.
+---
+
+Every request Chelabase proxies to a service carries a `Chelabase-Signature` header. It is the scheme of [storage webhooks](/using/storage/webhooks#verify-the-signature), keyed with the service's `whsec_…` signing secret (the secret as UTF-8 text), over a string that covers the request's identity and, when it is small enough, its body.
+
+## The scheme
+
+```text
+Chelabase-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<signed string>">
+```
+
+The signed string is these lines joined by a line feed (`\n`), with no trailing newline:
+
+```text
+<chelabase-request-id>
+<METHOD> <request-target>
+<chelabase-branch>
+<chelabase-role>
+<chelabase-user>
+<Content-Digest>          (only when the body is signed)
+```
+
+- `request-target` is the exact path and query the service **receives**, the base URL's path prefix included (`/api/a/b?x=1`, not `/services/v1/echo/a/b?x=1`). Take it from the request line, not from a re-serialised URL.
+- `chelabase-user` is empty for a caller that is not an app user (the line is still there, empty).
+- A body of **up to 1 MiB** (an empty body included) is buffered and signed: the request carries `Content-Digest: sha-256=:<base64 of the SHA-256 of the body>:` (RFC 9530), and the digest is the last line. A larger body streams through; the request says `chelabase-body: unsigned` and the signed string has **no** digest line, so the body is not covered. Chelabase sets the marker only above 1 MiB, so a route that never takes large bodies can refuse any request marked `unsigned`.
+- No part may hold CR or LF; Chelabase refuses to sign such a request.
+
+A verifier must:
+
+1. parse `t` and `v1` (there may be several `v1`; one match is enough) and refuse a missing header;
+2. refuse a `t` more than **300 seconds** from now, in either direction;
+3. unless `chelabase-body: unsigned`, check `Content-Digest` against the SHA-256 of the raw body;
+4. compute the HMAC over `<t>.<signed string>` and compare in constant time;
+5. **refuse a `chelabase-request-id` it has already accepted**, remembering each one until `t + 300`. Without this a captured request can be replayed, unchanged, for five minutes.
+
+Keep the remembered ids in memory per process; across several replicas of a service use a shared store with a TTL.
+
+## TypeScript
+
+Runs on Node 18+ (and any runtime with `node:crypto`). `target` is the request line's path and query, `body` the raw bytes before any parsing.
+
+```ts
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+
+const TOLERANCE = 300; // seconds
+
+export class Rejected extends Error {}
+
+function fail(why: string): never {
+  throw new Rejected(why);
+}
+
+/**
+ * `secret` is the service's whsec_… signing secret. The returned function throws `Rejected`
+ * unless the request is fresh and untampered. `target` is the request-target exactly as
+ * received (path and query, from the request line); `body` is the raw body.
+ */
+export function createVerifier(secret: string) {
+  const seen = new Map<string, number>(); // request id -> when it may be forgotten
+
+  return function verify(
+    method: string,
+    target: string,
+    headers: Headers,
+    body: Uint8Array,
+    now = Math.floor(Date.now() / 1000),
+  ): void {
+    const get = (name: string) => headers.get(name) ?? undefined;
+    const need = (name: string) => get(name) ?? fail(`missing ${name}`);
+
+    // Chelabase-Signature: t=<unix seconds>,v1=<hex>
+    let t: number | undefined;
+    const tags: Buffer[] = [];
+    for (const part of need("chelabase-signature").split(",")) {
+      const [key, value] = part.trim().split("=", 2);
+      if (key === "t") t = Number(value);
+      if (key === "v1" && value) tags.push(Buffer.from(value, "hex"));
+    }
+    if (t === undefined || !Number.isInteger(t) || tags.length === 0) fail("malformed signature");
+    const signedAt = t as number;
+    if (Math.abs(now - signedAt) > TOLERANCE) fail("expired");
+
+    // The body is covered by Content-Digest unless Chelabase streamed it (over 1 MiB).
+    let digest: string | undefined;
+    if (get("chelabase-body") !== "unsigned") {
+      digest = need("content-digest");
+      const expected = `sha-256=:${createHash("sha256").update(body).digest("base64")}:`;
+      if (digest !== expected) fail("body does not match Content-Digest");
+    }
+
+    const requestId = need("chelabase-request-id");
+    const lines = [
+      requestId,
+      `${method} ${target}`,
+      need("chelabase-branch"),
+      need("chelabase-role"),
+      need("chelabase-user"), // empty unless the caller is an app user
+      ...(digest === undefined ? [] : [digest]),
+    ];
+    const mac = createHmac("sha256", secret).update(`${signedAt}.${lines.join("\n")}`).digest();
+    if (!tags.some((tag) => tag.length === mac.length && timingSafeEqual(tag, mac))) {
+      fail("bad signature");
+    }
+
+    // Refuse a request id already accepted, for as long as its signature could still pass.
+    for (const [id, until] of seen) if (now > until) seen.delete(id);
+    if (seen.has(requestId)) fail("replayed");
+    seen.set(requestId, signedAt + TOLERANCE);
+  };
+}
+```
+
+```ts
+const verify = createVerifier(process.env.CHELABASE_SIGNING_SECRET!);
+
+// In a handler that has the raw request line, headers and body:
+try {
+  verify(req.method, req.url /* "/api/a/b?x=1" */, new Headers(req.headers as any), rawBody);
+} catch (e) {
+  if (e instanceof Rejected) return reply(401, e.message);
+  throw e;
+}
+```
+
+## Rust
+
+With `base64`, `hex`, `hmac`, `sha2` and `http` (the versions the repository uses are `base64 0.23`, `hmac 0.13` and `sha2 0.11`):
+
+```rust
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use hmac::{Hmac, KeyInit, Mac};
+use http::HeaderMap;
+use sha2::{Digest, Sha256};
+
+const TOLERANCE: i64 = 300; // seconds
+
+#[derive(Debug, PartialEq)]
+pub enum Rejected {
+    Malformed,
+    Expired,
+    Digest,
+    Signature,
+    Replayed,
+}
+
+pub struct Verifier {
+    secret: String, // the service's whsec_… signing secret
+    seen: Mutex<HashMap<String, i64>>, // request id -> when it may be forgotten
+}
+
+impl Verifier {
+    pub fn new(secret: &str) -> Self {
+        Self { secret: secret.to_owned(), seen: Mutex::new(HashMap::new()) }
+    }
+
+    /// `target` is the request-target exactly as received (path and query, from the request
+    /// line); `body` is the raw body; `now` is the current unix time in seconds.
+    pub fn verify(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        now: i64,
+    ) -> Result<(), Rejected> {
+        let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let need = |name: &str| get(name).ok_or(Rejected::Malformed);
+
+        // Chelabase-Signature: t=<unix seconds>,v1=<hex>
+        let (mut t, mut tags) = (None, Vec::new());
+        for part in need("chelabase-signature")?.split(',') {
+            match part.trim().split_once('=') {
+                Some(("t", v)) => t = v.parse::<i64>().ok(),
+                Some(("v1", v)) => tags.extend(hex::decode(v).ok()),
+                _ => {}
+            }
+        }
+        let (Some(t), false) = (t, tags.is_empty()) else {
+            return Err(Rejected::Malformed);
+        };
+        if (now - t).abs() > TOLERANCE {
+            return Err(Rejected::Expired);
+        }
+
+        // The body is covered by Content-Digest unless Chelabase streamed it (over 1 MiB).
+        let digest = if get("chelabase-body") == Some("unsigned") {
+            None
+        } else {
+            let digest = need("content-digest")?;
+            let expected = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(body)));
+            if digest != expected {
+                return Err(Rejected::Digest);
+            }
+            Some(digest)
+        };
+
+        let request_id = need("chelabase-request-id")?;
+        let mut lines = vec![
+            request_id.to_owned(),
+            format!("{method} {target}"),
+            need("chelabase-branch")?.to_owned(),
+            need("chelabase-role")?.to_owned(),
+            need("chelabase-user")?.to_owned(), // empty unless the caller is an app user
+        ];
+        lines.extend(digest.map(str::to_owned));
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes()).expect("any key size");
+        mac.update(format!("{t}.{}", lines.join("\n")).as_bytes());
+        if !tags.iter().any(|tag| mac.clone().verify_slice(tag).is_ok()) {
+            return Err(Rejected::Signature);
+        }
+
+        // Refuse a request id already accepted, for as long as its signature could still pass.
+        let mut seen = self.seen.lock().unwrap();
+        seen.retain(|_, until| now <= *until);
+        if seen.contains_key(request_id) {
+            return Err(Rejected::Replayed);
+        }
+        seen.insert(request_id.to_owned(), t + TOLERANCE);
+        Ok(())
+    }
+}
+```
+
+```rust
+let verifier = Verifier::new(&std::env::var("CHELABASE_SIGNING_SECRET")?);
+
+// In a handler with the method, the request line's target, the headers and the raw body:
+let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+if let Err(why) = verifier.verify("POST", "/api/a/b?x=1", &headers, &body, now) {
+    return Err(unauthorized(why));
+}
+```
+
+## Test vectors
+
+Both samples are checked against signatures produced by Chelabase's own signer. With the secret `whsec_0123456789abcdef`:
+
+| | |
+|---|---|
+| Request | `POST /api/orders?x=1`, body `{"hello":"world"}`, request id `7c9e6679-7425-40de-944b-e07fc1f90ae7`, branch `b3f1c2d4-0000-4000-8000-000000000001`, role `anon`, user empty |
+| `Content-Digest` | `sha-256=:k6I5cakU5erL8KjSUVTNownDwccvu5kU1Hxg88toFYg=:` |
+| `Chelabase-Signature` | `t=1700000000,v1=78459d8d621964ea689b5c3126c91f79bc400cbbfba05e22119a2814d1695962` |
+| Unsigned-body request | `GET /`, role `authenticated`, user `u-1`, same id and branch, `chelabase-body: unsigned`: `t=1700000000,v1=72b5ab5661ab9ac8510a51eb199a633a9d8502ec3d00a615374b96640c95273d` |
+
+Verify them with `now` between `1699999700` and `1700000300`.
