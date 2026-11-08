@@ -1170,6 +1170,20 @@ async fn function_trigger_exclusions_leave_the_model_and_digest_alone() {
     ))
     .await;
     let (model_after, after, items_after) = (s.model().await, digest(&s).await, review(&s).await);
+    // The review skips `chelabase_functions` only when `chelabase_functions_owner` owns it (the
+    // owner check from #185/#188): owned by this run's role, the function triggers are reviewed.
+    let flagged: Vec<String> = items_after.iter().map(|i| i.key.clone()).collect();
+    // Handed to the real owner (a cluster-wide role the catalog never reads; made if missing and
+    // kept, since other runs share it), they reach the review no more.
+    s.sql(
+        "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'chelabase_functions_owner')
+           THEN CREATE ROLE chelabase_functions_owner NOLOGIN; END IF; END$$;
+         ALTER SCHEMA chelabase_functions OWNER TO chelabase_functions_owner;
+         ALTER TABLE chelabase_functions.outbox OWNER TO chelabase_functions_owner;
+         ALTER FUNCTION chelabase_functions.enqueue() OWNER TO chelabase_functions_owner;"
+    )
+    .await;
+    let items_owned = review(&s).await;
     // A user's trigger with the prefix on their own function stays in the model.
     s.sql(
         "CREATE FUNCTION public.mine() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;
@@ -1180,6 +1194,11 @@ async fn function_trigger_exclusions_leave_the_model_and_digest_alone() {
     s.finish().await;
     assert_eq!(model_after, model, "the function triggers changed the model");
     assert_eq!(after, before, "the function triggers changed the digest");
-    assert_eq!(items_after, items, "the function triggers reached the review");
+    assert!(
+        flagged.iter().any(|k| k.contains("chelabase_functions.enqueue()"))
+            && flagged.iter().any(|k| k.contains("chelabase_fn_0123456789abcdef0123456789abcdef")),
+        "a chelabase_functions schema owned by someone else is reviewed: {flagged:?}"
+    );
+    assert_eq!(items_owned, items, "the function triggers reached the review");
     assert_ne!(with_mine, model, "a user's chelabase_fn_ trigger on their own function is read");
 }
