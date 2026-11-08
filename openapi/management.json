@@ -2441,6 +2441,16 @@
               }
             }
           },
+          "202": {
+            "description": "A container service's rollback: its rollover runs in the background (`rollout` pending) and the switch follows once the container is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            }
+          },
           "400": {
             "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
             "content": {
@@ -2709,6 +2719,16 @@
         "responses": {
           "201": {
             "description": "The deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionDeployment"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The deployment, with `rollout: pending`: a container service enabled on the branch rolls over to it in the background, switching once its container is healthy; the function's `rollout` reports the outcome",
             "content": {
               "application/json": {
                 "schema": {
@@ -25891,7 +25911,8 @@
           "run_as_active",
           "last_error",
           "updated_at",
-          "health"
+          "health",
+          "rollout"
         ],
         "properties": {
           "auth": {
@@ -25946,6 +25967,17 @@
           },
           "name": {
             "type": "string"
+          },
+          "rollout": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceRollout",
+                "description": "m11: a container service's rollover on the branch, pending or failed (the previous\ndeployment serves meanwhile); null when none is pending and the last one succeeded."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "run_as_active": {
             "type": "boolean",
@@ -26031,6 +26063,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "rollout": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceRolloutState",
+                "description": "m11: `pending` only in a deploy's 202 answer: the service's rollover to it runs in the\nbackground (see the function's `rollout`)."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "spec": {
@@ -30366,6 +30409,45 @@
           }
         },
         "additionalProperties": false
+      },
+      "ServiceRollout": {
+        "type": "object",
+        "description": "m11: a container service's rollover on the branch.",
+        "required": [
+          "deployment_id",
+          "state",
+          "error",
+          "started_at"
+        ],
+        "properties": {
+          "deployment_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The deployment being rolled over to."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed (the previous deployment still serves)."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ServiceRolloutState"
+          }
+        }
+      },
+      "ServiceRolloutState": {
+        "type": "string",
+        "description": "`pending` while the new container is started and checked; `failed` when it never passed.",
+        "enum": [
+          "pending",
+          "failed"
+        ]
       },
       "ServiceSpec": {
         "type": "object",

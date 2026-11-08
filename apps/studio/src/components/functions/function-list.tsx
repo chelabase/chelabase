@@ -12,7 +12,8 @@ import {
 import { CopyIconButton } from "@/components/copy-button";
 import { Switch } from "@/components/ui/switch";
 import { useProjectCaps } from "@/lib/capabilities";
-import { effectiveEnabled, functionErrorText, initialToggles, isPlatformModeRefusal, togglesReducer } from "@/lib/functions";
+import { effectiveEnabled, functionErrorText, initialToggles, isPlatformModeRefusal, rolloutPending, togglesReducer } from "@/lib/functions";
+import { pollWhile } from "@/lib/query";
 import { serviceSpecOf, serviceStatus, type StatusTone } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
 import { FunctionDrawer } from "./function-drawer";
@@ -75,7 +76,8 @@ function ActiveDeployment({ databaseId, branchId, fn }: { databaseId: string; br
 export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps) {
   const queryClient = useQueryClient();
   const canChange = useProjectCaps().atLeast("developer");
-  const list = useListFunctions(databaseId, branchId);
+  // m11: a container service's rollover runs in the background; poll until it settles.
+  const list = useListFunctions(databaseId, branchId, { query: { refetchInterval: pollWhile<FunctionInfo[]>(rolloutPending) } });
   const scope = `${databaseId}/${branchId}`;
   const [toggles, dispatch] = useReducer(togglesReducer, scope, initialToggles);
   const [open, setOpen] = useState<string | null>(null);
@@ -189,7 +191,9 @@ export function FunctionList({ databaseId, branchId, apiUrl }: FunctionListProps
                   </td>
                   <td className="px-3 py-2">{fn.kind === "service" ? AUTH_LABEL.key : fn.auth ? AUTH_LABEL[fn.auth] : <span className="text-chalk-dim">Not set</span>}</td>
                   <td className="max-w-64 px-3 py-2">
-                    {fn.last_error ? (
+                    {fn.rollout?.state === "pending" ? (
+                      <span className="text-xs text-chalk-dim">Rolling over…</span>
+                    ) : fn.last_error ? (
                       <span title={fn.last_error} className="line-clamp-2 font-mono text-xs break-all text-coral">
                         {fn.last_error}
                       </span>

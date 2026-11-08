@@ -95,7 +95,60 @@ pub(crate) fn error_message(method: &str, path: &str, status: u16, body: &Value)
     format!("{method} {path}: {status} {message}")
 }
 
+/// A service rollover's outcome from the service's listing: `None` while it's pending, `Ok`
+/// once `deployment` is active with no rollover left, `Err` with why when it failed or a newer
+/// rollover replaced it.
+pub(crate) fn rollout_outcome(service: &Value, deployment: &str) -> Option<Result<(), String>> {
+    let rollout = &service["rollout"];
+    if rollout.is_null() {
+        return Some(if service["deployment_id"] == deployment {
+            Ok(())
+        } else {
+            Err(format!("deployment {deployment} isn't active; another change replaced it"))
+        });
+    }
+    if rollout["deployment_id"] != deployment {
+        return Some(Err(format!(
+            "a newer rollover (to {}) replaced the one to {deployment}",
+            rollout["deployment_id"].as_str().unwrap_or("?")
+        )));
+    }
+    match rollout["state"].as_str() {
+        Some("failed") => Some(Err(format!(
+            "the new deployment {deployment} never passed its health check, so the previous deployment stays live: {}",
+            rollout["error"].as_str().unwrap_or("no reason given")
+        ))),
+        _ => None,
+    }
+}
+
+/// How long the CLI waits for a rollover (the health wait is 60 s, after a pull).
+const ROLLOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 impl Api {
+    /// Waits for `name`'s rollover to `deployment` to end; an error when it failed.
+    pub(crate) async fn await_rollout(&self, name: &str, deployment: &str) -> Result<()> {
+        eprintln!("{name}: rolling over to {deployment} (waiting for its container to be healthy)");
+        let start = std::time::Instant::now();
+        loop {
+            let list = self.send(reqwest::Method::GET, "", None).await?;
+            let service = list
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|f| f["name"] == name)
+                .with_context(|| format!("{name} is gone"))?;
+            match rollout_outcome(service, deployment) {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(why)) => bail!("{why}"),
+                None if start.elapsed() > ROLLOUT_WAIT => {
+                    bail!("{name}: the rollover to {deployment} is still pending after {} s", ROLLOUT_WAIT.as_secs())
+                }
+                None => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+            }
+        }
+    }
+
     /// The answer's text on a 2xx status.
     pub(crate) async fn text(
         &self,
@@ -154,7 +207,10 @@ impl Api {
     /// Makes an earlier deployment the active one (a service rolls over to it).
     pub(crate) async fn rollback(&self, name: &str, deployment: &str) -> Result<()> {
         let body = json!({ "active_deployment_id": deployment });
-        self.json(reqwest::Method::PATCH, &format!("/{name}"), body).await?;
+        let answer = self.json(reqwest::Method::PATCH, &format!("/{name}"), body).await?;
+        if answer["rollout"]["state"] == "pending" {
+            self.await_rollout(name, deployment).await?;
+        }
         eprintln!("{name}: {deployment} is active");
         Ok(())
     }

@@ -1,5 +1,5 @@
 import { useEffect, useReducer } from "react";
-import { ApiError, type FunctionAuth, type FunctionKind } from "@chelabase/management-client";
+import { ApiError, type Function as FunctionInfo, type FunctionAuth, type FunctionKind, type ServiceRollout } from "@chelabase/management-client";
 import { errorText } from "./errors";
 import { actAsReserved } from "./role-rules";
 
@@ -83,6 +83,24 @@ export function curlFor(apiUrl: string, auth: FunctionAuth | null, branchId: str
   const url = invokeUrl(apiUrl, auth, branchId, name, kind);
   if (kind === "service") return `curl ${url} \\\n  ${KEY_HEADER}`;
   return auth === "public" ? `curl -X POST ${url}` : `curl -X POST ${url} \\\n  ${KEY_HEADER}`;
+}
+
+/**
+ * A container service's rollover, said plainly: pending while the new container is started and
+ * checked (the previous deployment serves meanwhile), failed with the reason. `null` when none.
+ */
+export function rolloutNotice(rollout: ServiceRollout | null): { tone: "pending" | "failed"; text: string } | null {
+  if (!rollout) return null;
+  const id = rollout.deployment_id.slice(0, 8);
+  if (rollout.state === "pending") {
+    return { tone: "pending", text: `Rolling over to ${id}: waiting for its container to pass its health check. The previous deployment serves meanwhile.` };
+  }
+  return { tone: "failed", text: `The rollover to ${id} failed, so the previous deployment still serves: ${rollout.error ?? "no reason given"}` };
+}
+
+/** Whether any function's rollover is pending (the list polls until none is). */
+export function rolloutPending(functions: Pick<FunctionInfo, "rollout">[]): boolean {
+  return functions.some((f) => f.rollout?.state === "pending");
 }
 
 export function isPlatformModeRefusal(err: unknown): boolean {

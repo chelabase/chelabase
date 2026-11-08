@@ -1185,6 +1185,18 @@ mod functions {
         fn rollouts(&self) -> Vec<(BranchId, uuid::Uuid, uuid::Uuid)> {
             self.w.app.bundles.rollouts.lock().unwrap().clone()
         }
+        /// `echo`'s state once its background rollover has settled (no `rollout`, or a failed
+        /// one), for at most 5 s.
+        async fn settled(&self) -> Value {
+            for _ in 0..100 {
+                let st = self.state("echo").await;
+                if st["rollout"].is_null() || st["rollout"]["state"] == "failed" {
+                    return st;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("the rollover never settled: {}", self.state("echo").await);
+        }
     }
 
     /// AC 1: a tenant admin deploys an image: its tag is resolved to a digest before it's stored,
@@ -1208,12 +1220,17 @@ mod functions {
         let mut body = container("ghcr.io/acme/echo:2");
         body["spec"]["health_path"] = json!("/healthz");
         body["spec"]["resources"] = json!({"memory_mb": 256, "cpus": 0.5});
+        // A running service rolls over in the background: 202 with the new deployment, pending.
         let (status, second) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(body)).await;
-        assert_eq!(status, 201, "{second}");
+        assert_eq!(status, 202, "{second}");
+        assert_eq!(second["rollout"], "pending", "{second}");
         assert_eq!(second["spec"]["resources"], json!({"memory_mb": 256, "cpus": 0.5}));
         let id: uuid::Uuid = second["id"].as_str().unwrap().parse().unwrap();
+        let st = w.settled().await;
         assert_eq!(w.rollouts().iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(w.w.dev, id)]);
-        assert_eq!(w.state("echo").await["deployment_id"], second["id"]);
+        assert_eq!(st["deployment_id"], second["id"]);
+        assert!(st["rollout"].is_null(), "{st}");
+        assert!(w.published().iter().filter(|(b, n)| *b == w.w.dev && n == "echo").count() >= 3);
     }
 
     /// AC 2: a new image that never passes its health check: 409 `unhealthy` with the reason
@@ -1230,11 +1247,11 @@ mod functions {
             message: "the new container didn't pass GET / within 60 s".into(),
         });
         let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:2"))).await;
-        assert_eq!(status, 409, "{body}");
-        assert_eq!(body["error"]["reason"], "unhealthy", "{body}");
-        assert!(body["error"]["message"].as_str().unwrap().contains("didn't pass"));
-        assert!(body["error"]["deployment_id"].is_string(), "{body}");
-        let st = w.state("echo").await;
+        assert_eq!(status, 202, "{body}");
+        let st = w.settled().await;
+        assert_eq!(st["rollout"]["state"], "failed", "{st}");
+        assert_eq!(st["rollout"]["deployment_id"], body["id"], "{st}");
+        assert!(st["rollout"]["error"].as_str().unwrap().contains("didn't pass"), "{st}");
         assert_eq!(st["deployment_id"], first["id"], "the old deployment still serves");
         assert!(st["last_error"].as_str().unwrap().contains("didn't pass"), "{st}");
         let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, "/echo/deployments"), None).await;
@@ -1336,6 +1353,7 @@ mod functions {
         let (_, first) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
         w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"enabled": true}))).await;
         let (_, second) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:2"))).await;
+        assert_eq!(w.settled().await["deployment_id"], second["id"]);
         *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
             status: 409,
             code: "unhealthy".into(),
@@ -1343,12 +1361,17 @@ mod functions {
         });
         let back = Some(json!({"active_deployment_id": first["id"]}));
         let (status, body) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), back.clone()).await;
-        assert_eq!(status, 409, "{body}");
-        assert_eq!(w.state("echo").await["deployment_id"], second["id"]);
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(body["rollout"]["state"], "pending", "{body}");
+        let st = w.settled().await;
+        assert_eq!(st["rollout"]["state"], "failed");
+        assert_eq!(st["deployment_id"], second["id"]);
         *w.w.app.bundles.control_error.lock().unwrap() = None;
         let (status, _) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), back).await;
-        assert_eq!(status, 200);
-        assert_eq!(w.state("echo").await["deployment_id"], first["id"]);
+        assert_eq!(status, 202);
+        let st = w.settled().await;
+        assert!(st["rollout"].is_null(), "a new rollover clears the failed one: {st}");
+        assert_eq!(st["deployment_id"], first["id"]);
         let first_id: uuid::Uuid = first["id"].as_str().unwrap().parse().unwrap();
         assert_eq!(w.rollouts().last().unwrap().2, first_id);
     }

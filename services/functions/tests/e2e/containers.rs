@@ -38,6 +38,21 @@ impl Stack {
         }
     }
 
+    /// `box` once its rollover to `deployment` has ended (switched, or failed), for at most
+    /// 3 minutes (a pull and the 60 s health wait).
+    async fn rolled_over(&self, deployment: &str) -> Value {
+        let start = Instant::now();
+        loop {
+            let st = self.listed("box").await;
+            let pending =
+                st["rollout"]["deployment_id"] == deployment && st["rollout"]["state"] == "pending";
+            if !pending || start.elapsed() > Duration::from_secs(180) {
+                return st;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
     async fn deploy_container(&self, image: &str, health: &str) -> (u16, Value) {
         self.mgmt
             .call(
@@ -91,24 +106,44 @@ async fn flow(s: &Stack, image: &str) {
     );
     assert!(echo["headers"]["Chelabase-Signature"].is_array(), "{echo}");
 
-    // AC 2: an image that never passes its health check: refused, traffic stays.
+    // AC 2: an image that never passes its health check: the deploy answers 202 at once (the
+    // rollover runs in the background), then the rollover fails after the 60 s wait and traffic
+    // stays on the old container.
     let started = Instant::now();
     let (status, body) = s.deploy_container(image, "/status/500").await;
-    assert_eq!(status, 409, "{body}");
-    assert_eq!(body["error"]["reason"], "unhealthy", "{body}");
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["rollout"], "pending", "{body}");
+    let failed = s.rolled_over(body["id"].as_str().unwrap()).await;
+    assert_eq!(failed["rollout"]["state"], "failed", "{failed}");
+    assert!(
+        failed["rollout"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("/status/500"),
+        "{failed}"
+    );
     assert!(
         started.elapsed() >= Duration::from_secs(55),
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(s.listed("box").await["deployment_id"], first["id"]);
+    assert_eq!(failed["deployment_id"], first["id"]);
+    assert!(
+        failed["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("wasn't switched"),
+        "{failed}"
+    );
     let (status, body) = s.call("/services/v1/box/anything/still", true).await;
     assert_eq!(status, 200, "{body}");
 
-    // A healthy new deployment switches.
+    // A healthy new deployment switches once its container passes.
     let (status, second) = s.deploy_container(image, "/status/204").await;
-    assert_eq!(status, 201, "{second}");
-    assert_eq!(s.listed("box").await["deployment_id"], second["id"]);
+    assert_eq!(status, 202, "{second}");
+    let done = s.rolled_over(second["id"].as_str().unwrap()).await;
+    assert!(done["rollout"].is_null(), "{done}");
+    assert_eq!(done["deployment_id"], second["id"]);
     let (status, body) = s
         .until(
             "/services/v1/box/anything/next",

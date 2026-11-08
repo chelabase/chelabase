@@ -564,6 +564,10 @@ struct Function {
     /// A service's signing secret: only in the answer that made the service or rotated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     signing_secret: Option<String>,
+    /// m11: a container service's rollover on the branch, pending or failed (the previous
+    /// deployment serves meanwhile); null when none is pending and the last one succeeded.
+    #[schema(required = true)]
+    rollout: Option<Rollout>,
 }
 
 /// An immutable deployment of a function.
@@ -585,6 +589,10 @@ struct Deployment {
     /// A service's spec (`{backend: "external", url, health_path}`); null for a function.
     #[schema(required = true, value_type = Option<Object>)]
     spec: Option<serde_json::Value>,
+    /// m11: `pending` only in a deploy's 202 answer: the service's rollover to it runs in the
+    /// background (see the function's `rollout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout: Option<RolloutState>,
 }
 
 impl From<DeploymentRecord> for Deployment {
@@ -599,6 +607,7 @@ impl From<DeploymentRecord> for Deployment {
             created_at: d.created_at,
             note: d.note,
             spec,
+            rollout: None,
         }
     }
 }
@@ -1013,6 +1022,7 @@ where
                     _ => None,
                 }),
                 signing_secret: None,
+                rollout: state.rollouts.get(branch, f.id),
             }
         })
         .collect())
@@ -1222,6 +1232,7 @@ fn admin_needed() -> ApiError {
     request_body = PatchFunctionRequest,
     responses(
         (status = 200, description = "The function on the branch", body = Function),
+        (status = 202, description = "A container service's rollback: its rollover runs in the background (`rollout` pending) and the switch follows once the container is healthy", body = Function),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
@@ -1245,7 +1256,7 @@ where
 {
     respond(async {
         let (authorized, record, branch) = begin(&state, &principal, ep::UPDATE_FUNCTION.policy.access, id, branch_id).await?;
-        let request: PatchFunctionRequest = parse_body(&body)?;
+        let mut request: PatchFunctionRequest = parse_body(&body)?;
         let function = find(&state, &record, &name).await?;
         let rotate = request.rotate_signing_secret == Some(true);
         if rotate && !is_tenant_admin(&principal) {
@@ -1284,12 +1295,17 @@ where
             Some(None) => Some(None),
             None => None,
         };
-        // m11: a container service's rollback rolls over like a deploy.
+        // m11: a container service's rollback rolls over like a deploy: in the background (202),
+        // switching once the older deployment's container is healthy.
+        let mut rolling = false;
         if let (Some(target), FunctionKind::Service) = (request.active_deployment_id, function.kind) {
             let deployments = state.metadata.list_deployments(function.id).await.map_err(|e| metadata_error("list deployments", e))?;
             if let Some(d) = deployments.iter().find(|d| d.id == target) {
-                roll_over(&state, branch.id, function.id, target, &d.spec).await?;
+                rolling = start_rollover(&state, branch.id, function.id, &name, target, &d.spec).await?;
             }
+        }
+        if rolling {
+            request.active_deployment_id = None;
         }
         let mut wrote = false;
         let result = apply_patch(&state, branch.id, function.id, &request, run_as.as_ref(), &mut wrote).await;
@@ -1308,28 +1324,100 @@ where
             }
             info!(request_id = %principal.request_id, function = %name, "service signing secret rotated");
         }
-        Ok(Json(answer).into_response())
+        let status = if rolling { StatusCode::ACCEPTED } else { StatusCode::OK };
+        Ok((status, Json(answer)).into_response())
     }
     .await)
 }
 
+/// m11: container rollovers, run in the background: the health wait (up to 60 s, after a pull)
+/// outlasts what a request through the gateway may take. One per (branch, service); a newer one
+/// replaces it, and an older one that ends later changes nothing. Kept in this process: a
+/// rollover cut short by a restart leaves the old deployment active (the runner removes the new
+/// container after its grace) and is forgotten.
+#[derive(Default)]
+pub struct Rollouts {
+    inner: std::sync::Mutex<std::collections::HashMap<(BranchId, Uuid), Rollout>>,
+}
+
+impl Rollouts {
+    fn get(&self, branch: BranchId, function: Uuid) -> Option<Rollout> {
+        self.inner.lock().expect("not poisoned").get(&(branch, function)).cloned()
+    }
+
+    fn begin(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> Rollout {
+        let r = Rollout { deployment_id: deployment, state: RolloutState::Pending, error: None, started_at: Utc::now() };
+        self.inner.lock().expect("not poisoned").insert((branch, function), r.clone());
+        r
+    }
+
+    /// Ends `deployment`'s rollover when it's still the current one: forgotten on success,
+    /// kept as failed otherwise. False when a newer one replaced it.
+    fn finish(&self, branch: BranchId, function: Uuid, deployment: Uuid, error: Option<String>) -> bool {
+        let mut inner = self.inner.lock().expect("not poisoned");
+        let current = inner
+            .get(&(branch, function))
+            .is_some_and(|r| r.deployment_id == deployment && r.state == RolloutState::Pending);
+        if !current {
+            return false;
+        }
+        match error {
+            None => {
+                inner.remove(&(branch, function));
+            }
+            Some(e) => {
+                if let Some(r) = inner.get_mut(&(branch, function)) {
+                    r.state = RolloutState::Failed;
+                    r.error = Some(e);
+                }
+            }
+        }
+        true
+    }
+}
+
+/// m11: a container service's rollover on the branch.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[schema(as = ServiceRollout)]
+struct Rollout {
+    /// The deployment being rolled over to.
+    deployment_id: Uuid,
+    state: RolloutState,
+    /// Why it failed (the previous deployment still serves).
+    #[schema(required = true)]
+    error: Option<String>,
+    started_at: DateTime<Utc>,
+}
+
+/// `pending` while the new container is started and checked; `failed` when it never passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = ServiceRolloutState)]
+enum RolloutState {
+    Pending,
+    Failed,
+}
+
 /// m11: before `deployment` becomes a container service's active deployment on `branch`, the
-/// functions service ensures its container and waits for it to pass its health check. Nothing
-/// to do for another spec, a service not enabled on the branch (its container starts when it's
-/// enabled), or the deployment already active. A failure is the service's `last_error`.
-async fn roll_over<M, J>(
-    state: &AppState<M, J>,
+/// functions service ensures its container and waits for it to pass its health check, in the
+/// background ([`Rollouts`]). True when that started: the switch then happens there, once the
+/// new container is healthy. False (nothing to roll over: the caller switches now) for another
+/// spec, a service not enabled on the branch (its container starts when it's enabled), or the
+/// deployment already active.
+async fn start_rollover<M, J>(
+    state: &Arc<AppState<M, J>>,
     branch: BranchId,
     function: Uuid,
+    name: &str,
     deployment: Uuid,
     spec: &serde_json::Value,
-) -> Result<(), ApiError>
+) -> Result<bool, ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
     if spec.get("backend").and_then(|b| b.as_str()) != Some("container") {
-        return Ok(());
+        return Ok(false);
     }
     let serving = state
         .metadata
@@ -1340,18 +1428,44 @@ where
         .find(|s| s.function_id == function)
         .filter(|s| s.enabled && s.deployment_id != deployment);
     if serving.is_none() {
-        return Ok(());
+        return Ok(false);
     }
-    let Err(err) = state.bundles.rollout(branch, function, deployment).await else {
-        return Ok(());
-    };
-    if let ControlError::Status { status: 409 | 422, message, .. } = &err {
-        let note = format!("deployment {deployment} wasn't switched to: {message}");
-        if let Err(e) = state.metadata.set_function_last_error(branch, function, Some(&note)).await {
-            warn!(branch_id = %branch, %function, "record a rollover's failure: {e}");
+    state.rollouts.begin(branch, function, deployment);
+    let (state, name) = (state.clone(), name.to_owned());
+    tokio::spawn(async move {
+        let result = state.bundles.rollout(branch, function, deployment).await;
+        let error = match &result {
+            Ok(()) => None,
+            Err(ControlError::Status { message, .. }) if !message.is_empty() => Some(message.clone()),
+            Err(e) => {
+                warn!(branch_id = %branch, %function, %deployment, "rollover: {e:?}");
+                Some("the service runner couldn't start or check the new container; the previous deployment still serves".to_owned())
+            }
+        };
+        // Switch (or record the failure) only while this is still the service's rollover.
+        if result.is_ok() {
+            if !state.rollouts.get(branch, function).is_some_and(|r| r.deployment_id == deployment && r.state == RolloutState::Pending) {
+                return;
+            }
+            if let Err(e) = state.metadata.set_active_deployment(branch, function, deployment).await {
+                warn!(branch_id = %branch, %function, %deployment, "switch to a rolled-over deployment: {e}");
+                state.rollouts.finish(branch, function, deployment, Some("the switch to the new deployment failed; retry".into()));
+                return;
+            }
+            state.rollouts.finish(branch, function, deployment, None);
+            info!(branch_id = %branch, function = %name, %deployment, "rolled over");
+        } else if let Some(why) = &error {
+            if !state.rollouts.finish(branch, function, deployment, Some(why.clone())) {
+                return;
+            }
+            let note = format!("deployment {deployment} wasn't switched to: {why}");
+            if let Err(e) = state.metadata.set_function_last_error(branch, function, Some(&note)).await {
+                warn!(branch_id = %branch, %function, "record a rollover's failure: {e}");
+            }
         }
-    }
-    Err(control_error(err))
+        changed(&state, branch, &name).await;
+    });
+    Ok(true)
 }
 
 /// The PATCH's writes, in order; `wrote` tells which committed (a later one may fail).
@@ -1591,6 +1705,7 @@ where
     request_body = CreateDeploymentRequest,
     responses(
         (status = 201, description = "The deployment", body = Deployment),
+        (status = 202, description = "The deployment, with `rollout: pending`: a container service enabled on the branch rolls over to it in the background, switching once its container is healthy; the function's `rollout` reports the outcome", body = Deployment),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
@@ -1648,24 +1763,29 @@ where
             })
             .await
             .map_err(|e| metadata_error("create deployment", e))?;
+        // m11: a container service that serves on the branch switches only once the new
+        // deployment's container is healthy, in the background (202 `rollout: pending`); until
+        // then (and when it never is) the old one serves, and the new deployment stays recorded.
+        let mut rolling = false;
         if request.activate.unwrap_or(true) {
-            // m11: a container service that serves on the branch switches only once the new
-            // deployment's container is healthy; until then (and when it never is) the old one
-            // serves, and the new deployment stays recorded, inactive.
-            if let Err(e) = roll_over(&state, branch.id, function.id, deployment.id, &spec).await {
-                changed(&state, branch.id, &name).await;
-                return Err(e.with_extra("deployment_id", serde_json::Value::String(deployment.id.to_string())));
+            rolling = start_rollover(&state, branch.id, function.id, &name, deployment.id, &spec).await?;
+            if !rolling {
+                state
+                    .metadata
+                    .set_active_deployment(branch.id, function.id, deployment.id)
+                    .await
+                    .map_err(|e| metadata_error("activate deployment", e))?;
             }
-            state
-                .metadata
-                .set_active_deployment(branch.id, function.id, deployment.id)
-                .await
-                .map_err(|e| metadata_error("activate deployment", e))?;
         }
         // A new deployment, active or not: listings change.
         changed(&state, branch.id, &name).await;
         info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, deployment_id = %deployment.id, "function deployed");
-        Ok((StatusCode::CREATED, Json(Deployment::from(deployment))).into_response())
+        let mut answer = Deployment::from(deployment);
+        if rolling {
+            answer.rollout = Some(RolloutState::Pending);
+            return Ok((StatusCode::ACCEPTED, Json(answer)).into_response());
+        }
+        Ok((StatusCode::CREATED, Json(answer)).into_response())
     }
     .await)
 }
