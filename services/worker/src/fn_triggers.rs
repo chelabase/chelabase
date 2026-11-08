@@ -15,6 +15,24 @@
 //! `audit_run_as_mint_never_overrides_a_concurrent_change` and
 //! `audit_child_run_as_key_needs_the_approved_oid` test it.
 //!
+//! **Invariant (tenants).** No action by a role without the owner's or Admin's rights can
+//! fail, disable or stall the install, and the sweep never blocks tenant writes for more than
+//! its lock_timeout ([`SWEEP_LOCK_TIMEOUT`]). So: only what could hand someone the owner
+//! role's rights refuses (its attributes, memberships, settings, what it *owns* outside the
+//! schema, a role or schema the install didn't make); whatever merely names the role as a
+//! grantee or a policy's target is revoked or ignored. The sweep runs DDL only when the
+//! catalog shows something missing or wrong, waits at most the lock_timeout for any lock, and a
+//! lock timeout or another sync holding the database is a retry on the next pass, never a
+//! failure ([`retry_later`]). A session squatting on the sync's advisory key (any role may)
+//! is ignored unless it is a superuser's, which is another sync. The owner role is reserved
+//! by name everywhere a role can be chosen (`data_api::refuse_by_name`, rest's per-request
+//! gate), so no key or run-as role is ever bound to it. One qualification: a transaction that
+//! holds a lock on a triggered table itself delays that table's `CREATE TRIGGER` until it
+//! ends (the sweep gives up after the lock_timeout and comes back), as any DDL would.
+//! `audit_sweep_never_blocks_tenant_writes`, `audit_unprivileged_role_cannot_disable_the_triggers`,
+//! `audit_owner_role_never_backs_a_key` and `audit_squatted_advisory_lock_never_stalls_the_install`
+//! test it, and the attack matrix carries each move.
+//!
 //! [`Worker::sync_fn_triggers`] keeps a branch's databases in step with its table triggers
 //! (`function_triggers`, source `table`), as the superuser (`cloud_admin`):
 //!
@@ -24,17 +42,21 @@
 //! - **The foreign check** ([`check_sql`], in every database of the compute, before anything
 //!   is installed anywhere, and again at the top of each install): the role and the schema
 //!   `chelabase_functions` must be exactly what the install makes. That means no attribute,
-//!   membership or setting on the role; nothing it owns or holds rights on outside the schema
-//!   (`pg_shdepend`: shared objects, and each database's own). A grant *to* the role on a
-//!   table, routine, schema, type or database is let through and revoked: nobody can act as
-//!   the role, and `enqueue()` reads nothing. The schema must be its own, with nothing in
+//!   membership or setting on the role, and nothing it *owns* outside the schema
+//!   (`pg_shdepend` ownership entries: shared objects, and each database's own). Entries that
+//!   only name the role as a grantee (a grant on any object, a default privilege, a large
+//!   object) or as a policy's target give nobody the role's rights (nobody can act as it, and
+//!   `enqueue()` reads nothing): they pass the check; the grants are revoked ([`revoke_sql`])
+//!   and a policy is left to its table's owner. The schema must be its own, with nothing in
 //!   the schema but the outbox, its sequence, index and row type, and `enqueue()`. Anything
 //!   else is refused with [`FOREIGN_MARK`], never repaired. Every `chelabase_fn_*` trigger
 //!   running `enqueue()` is dropped ([`drop_triggers_sql`]), and every row read settles
 //!   `failed` (terminal until the trigger is changed or pended again). A `failed` row is never
 //!   wanted, so its database trigger is dropped, never installed.
-//! - **The machinery**, made or put back each run while the database has a trigger to install:
-//!   the schema (no rights for PUBLIC, so no data API role reaches it), the outbox
+//! - **The machinery**, checked each run while the database has a trigger to install and made
+//!   or put back only where the catalog shows it missing or wrong (so a pass over a database
+//!   in good order runs no DDL and takes no lock a tenant write conflicts with): the schema
+//!   (no rights for PUBLIC, so no data API role reaches it), the outbox
 //!   `chelabase_functions.outbox` and the trigger function `chelabase_functions.enqueue()`,
 //!   all [`OWNER`]'s. Every grant on them to anyone but the owner is revoked on every run.
 //!   The function is `SECURITY DEFINER` with `search_path = pg_catalog, chelabase_functions,
@@ -65,7 +87,11 @@
 //!   Then each wanted one whose table exists is created. Names reach the SQL only as literals,
 //!   and the statements are built by `format('%I')`.
 //! - Event triggers are off for every transaction (`SET LOCAL event_triggers = off`), so no
-//!   tenant code runs as the superuser.
+//!   tenant code runs as the superuser. Every transaction waits at most [`SWEEP_LOCK_TIMEOUT`]
+//!   for a lock, and two syncs of one database serialize on the advisory key
+//!   [`SYNC_LOCK_KEY`] without waiting: the second finds a superuser's session holding it and
+//!   yields ([`BUSY_MARK`], retried); any other holder is a tenant squatting on the key and is
+//!   ignored.
 //!
 //! The script answers one line per wanted trigger: `fn_trigger <id> ok`, `… table_missing` or
 //! `… not_a_plain_table`. The worker settles the rows it read, by the `enabled_since` it read
@@ -95,7 +121,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::Worker;
-use crate::data_api::{LOCK_TIMEOUT_SECS, RoleCheck};
+use crate::data_api::RoleCheck;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::resync::SYSTEM_DATABASE;
 use crate::review::review_databases_sql;
@@ -113,8 +139,23 @@ pub const SYNC_MARK: &str = "-- chelabase: function triggers";
 pub const FOREIGN_MARK: &str = "chelabase_functions_foreign";
 
 /// The transaction-scoped advisory lock two syncs of one database serialize on: the bytes of
-/// "chelabase" followed by 0x08 (the bootstrap's is 0x01).
+/// "chelabase" followed by 0x08 (the bootstrap's is 0x01). Never waited on: a superuser's
+/// session holding it is another sync ([`BUSY_MARK`]); any other holder is ignored.
 pub const SYNC_LOCK_KEY: i64 = 0x6368_656c_6164_6208;
+
+/// The error a sync raises when another sync (a superuser's session) holds [`SYNC_LOCK_KEY`]:
+/// retried on the next pass ([`retry_later`]).
+pub const BUSY_MARK: &str = "chelabase_fn_busy";
+
+/// How long any statement of a sync waits for a lock (the third invariant: a tenant write
+/// queues behind the sweep for at most this long). A timeout is a retry, never a failure.
+pub const SWEEP_LOCK_TIMEOUT: &str = "2s";
+
+/// A sync error that means "try again on the next pass": a lock timeout (a tenant held what
+/// the sync needed), or another sync of the database ([`BUSY_MARK`]).
+pub fn retry_later(error: &str) -> bool {
+    error.contains("canceling statement due to lock timeout") || error.contains(BUSY_MARK)
+}
 
 /// `last_error` on a child's function whose run-as role its catalog doesn't have.
 pub const RUN_AS_ROLE_MISSING: &str = "run_as_role_missing";
@@ -143,9 +184,9 @@ pub fn install_error(answer: &str) -> String {
     }
 }
 
-/// The settings every script starts with.
-const PRELUDE: &str =
-    "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\n";
+/// The settings every script starts with: the search path, event triggers off, and the
+/// short lock wait ([`SWEEP_LOCK_TIMEOUT`]).
+const PRELUDE: &str = "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL event_triggers = off;\nSET LOCAL lock_timeout = '2s';\n";
 
 /// Run once per sync in the compute's system database, before any check: makes [`OWNER`]
 /// when `create` and it's missing (`NOLOGIN NOINHERIT CONNECTION LIMIT 0`, by the superuser,
@@ -174,11 +215,13 @@ pub fn parse_role(out: &str) -> Option<u32> {
 
 /// The foreign check (the invariant's "never adopts"), for the database it runs in: raises
 /// [`FOREIGN_MARK`] with the reason when [`OWNER`] isn't the role `role` names (made by
-/// [`role_sql`]), when the schema isn't its, when the role has any attribute, membership,
-/// setting, ownership or right beyond what the install gives it (`pg_shdepend`: shared
-/// objects, and this database's objects outside the schema; the worker runs the check in
-/// every database of the compute), or when the schema holds anything the install doesn't
-/// make. Refused, never repaired.
+/// [`role_sql`]), when the schema isn't its, when the role has any attribute, membership or
+/// setting, when it owns anything beyond what the install gives it (`pg_shdepend` ownership
+/// entries: shared objects, and this database's objects outside the schema; the worker runs
+/// the check in every database of the compute), or when the schema holds anything the install
+/// doesn't make. Refused, never repaired. An entry that only names the role as a grantee or a
+/// policy's target (any role can make one) gives nobody its rights and never refuses
+/// ([`revoke_sql`] takes the grants back).
 fn foreign_check_sql(role: Option<u32>) -> String {
     let expected = role.map_or_else(|| "NULL".to_string(), |r| r.to_string());
     format!(
@@ -208,16 +251,15 @@ BEGIN
     why := 'the role {OWNER} has members or memberships';
   ELSIF EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole = role) THEN
     why := 'the role {OWNER} has settings';
-  ELSIF EXISTS (SELECT FROM pg_catalog.pg_shdepend d WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND d.refobjid = role
-      AND NOT (d.deptype = 'a' AND d.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_proc'::pg_catalog.regclass,
-        'pg_catalog.pg_namespace'::pg_catalog.regclass, 'pg_catalog.pg_type'::pg_catalog.regclass, 'pg_catalog.pg_database'::pg_catalog.regclass))
+  ELSIF EXISTS (SELECT FROM pg_catalog.pg_shdepend d WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+      AND d.refobjid = role AND d.deptype = 'o'
       AND (d.dbid = 0 OR (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
-        AND NOT (d.deptype = 'o' AND (
+        AND NOT (
           (d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.objid = ns)
           OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = ANY (ours))
           OR (d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
-            AND d.objid = (SELECT p.oid FROM pg_catalog.pg_proc p WHERE p.pronamespace = ns AND p.proname = 'enqueue' AND p.pronargs = 0))))))) THEN
-    why := 'the role {OWNER} owns or holds rights on objects outside {FUNCTIONS_SCHEMA}';
+            AND d.objid = (SELECT p.oid FROM pg_catalog.pg_proc p WHERE p.pronamespace = ns AND p.proname = 'enqueue' AND p.pronargs = 0)))))) THEN
+    why := 'the role {OWNER} owns objects outside {FUNCTIONS_SCHEMA}';
   ELSIF EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND d.refobjid = ns
       AND NOT ((d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
           AND d.objid IN (SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname IN ('outbox', 'outbox_id_seq', 'outbox_pkey')))
@@ -416,7 +458,8 @@ END $chelabase_fn$;
     )
 }
 
-/// The schema, the outbox and the trigger function (install only).
+/// The body of `enqueue()` as the catalog stores it (`prosrc`): the install compares it on
+/// every run and replaces the function only when it differs.
 ///
 /// `enqueue()` is `SECURITY DEFINER` (only it writes the outbox) and evaluates no user code:
 /// a column goes through `to_jsonb` only when its type (or a domain's base type) is built in
@@ -428,25 +471,9 @@ END $chelabase_fn$;
 /// built-in ones; reading a value checks no domain constraint). The column list comes from the
 /// catalog and is quoted by `%I`; every function and operator in the generated SELECT is
 /// `pg_catalog`'s.
-fn install_objects_sql() -> String {
+fn enqueue_body() -> String {
     format!(
-        r#"CREATE SCHEMA IF NOT EXISTS {FUNCTIONS_SCHEMA} AUTHORIZATION {OWNER};
-REVOKE ALL ON SCHEMA {FUNCTIONS_SCHEMA} FROM PUBLIC;
-CREATE TABLE IF NOT EXISTS {FUNCTIONS_SCHEMA}.outbox (
-  id bigserial PRIMARY KEY,
-  trigger_id uuid NOT NULL,
-  payload jsonb NOT NULL,
-  attempts integer NOT NULL DEFAULT 0,
-  next_attempt_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
-  status text NOT NULL DEFAULT 'pending',
-  timeline_id text,
-  created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
-);
-ALTER TABLE {FUNCTIONS_SCHEMA}.outbox OWNER TO {OWNER};
-REVOKE ALL ON TABLE {FUNCTIONS_SCHEMA}.outbox FROM PUBLIC;
-REVOKE ALL ON SEQUENCE {FUNCTIONS_SCHEMA}.outbox_id_seq FROM PUBLIC;
-CREATE OR REPLACE FUNCTION {FUNCTIONS_SCHEMA}.enqueue() RETURNS trigger
-  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, {FUNCTIONS_SCHEMA}, pg_temp AS $chelabase_fn$
+        r#"
 DECLARE
   expr pg_catalog.text;
   rec pg_catalog.jsonb;
@@ -474,22 +501,88 @@ BEGIN
     pg_catalog.current_setting('neon.timeline_id', true));
   PERFORM pg_catalog.pg_notify('{NOTIFY_CHANNEL}', '');
   RETURN NULL;
+END"#
+    )
+}
+
+/// The `search_path` `enqueue()` is created with, as `pg_proc.proconfig` stores it.
+const ENQUEUE_SEARCH_PATH: &str = "pg_catalog, chelabase_functions, pg_temp";
+
+/// The schema, the outbox and the trigger function, each made or put back only when the
+/// catalog shows it missing or wrong (the third invariant: a pass over a database in good
+/// order runs no DDL, so it takes no lock a tenant write conflicts with; `ALTER TABLE …
+/// OWNER` alone would take an `ACCESS EXCLUSIVE` lock on the outbox every pass). The repair
+/// ran first, so an outbox that is there has the right shape and owner. `enqueue()` is
+/// replaced when its body ([`enqueue_body`]), security, `search_path`, owner, language or
+/// return type differ; a function whose ACL is still the default (`PUBLIC` may execute) gets
+/// the revoke. Every other grant is [`revoke_sql`]'s.
+fn install_objects_sql() -> String {
+    let body = enqueue_body();
+    let expected_body = literal(&body);
+    let search_path = literal(&format!("search_path={ENQUEUE_SEARCH_PATH}"));
+    format!(
+        r#"DO $chelabase_fn$ DECLARE
+  role pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '{OWNER}');
+  ns pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '{FUNCTIONS_SCHEMA}');
+  box pg_catalog.oid;
+  fn record;
+BEGIN
+  IF ns IS NULL THEN
+    CREATE SCHEMA {FUNCTIONS_SCHEMA} AUTHORIZATION {OWNER};
+    REVOKE ALL ON SCHEMA {FUNCTIONS_SCHEMA} FROM PUBLIC;
+    ns := (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = '{FUNCTIONS_SCHEMA}');
+  END IF;
+  box := (SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = ns AND c.relname = 'outbox');
+  IF box IS NULL THEN
+    CREATE TABLE {FUNCTIONS_SCHEMA}.outbox (
+      id bigserial PRIMARY KEY,
+      trigger_id uuid NOT NULL,
+      payload jsonb NOT NULL,
+      attempts integer NOT NULL DEFAULT 0,
+      next_attempt_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+      status text NOT NULL DEFAULT 'pending',
+      timeline_id text,
+      created_at timestamptz NOT NULL DEFAULT pg_catalog.now()
+    );
+    ALTER TABLE {FUNCTIONS_SCHEMA}.outbox OWNER TO {OWNER};
+    REVOKE ALL ON TABLE {FUNCTIONS_SCHEMA}.outbox FROM PUBLIC;
+    REVOKE ALL ON SEQUENCE {FUNCTIONS_SCHEMA}.outbox_id_seq FROM PUBLIC;
+  END IF;
+  SELECT p.prosrc, p.prosecdef, p.proconfig, p.proowner, p.proacl, p.prolang, p.prorettype, p.prokind INTO fn
+    FROM pg_catalog.pg_proc p WHERE p.pronamespace = ns AND p.proname = 'enqueue' AND p.pronargs = 0;
+  IF NOT FOUND OR fn.prosrc <> {expected_body} OR NOT fn.prosecdef
+      OR fn.proconfig IS DISTINCT FROM ARRAY[{search_path}]::pg_catalog.text[]
+      OR fn.proowner <> role OR fn.prokind <> 'f'
+      OR fn.prolang <> (SELECT l.oid FROM pg_catalog.pg_language l WHERE l.lanname = 'plpgsql')
+      OR fn.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype THEN
+    EXECUTE $chelabase_fn_ddl$CREATE OR REPLACE FUNCTION {FUNCTIONS_SCHEMA}.enqueue() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = {ENQUEUE_SEARCH_PATH} AS $chelabase_fn_body${body}$chelabase_fn_body$$chelabase_fn_ddl$;
+    ALTER FUNCTION {FUNCTIONS_SCHEMA}.enqueue() OWNER TO {OWNER};
+    REVOKE ALL ON FUNCTION {FUNCTIONS_SCHEMA}.enqueue() FROM PUBLIC;
+  ELSIF fn.proacl IS NULL THEN
+    REVOKE ALL ON FUNCTION {FUNCTIONS_SCHEMA}.enqueue() FROM PUBLIC;
+  END IF;
 END $chelabase_fn$;
-ALTER FUNCTION {FUNCTIONS_SCHEMA}.enqueue() OWNER TO {OWNER};
-REVOKE ALL ON FUNCTION {FUNCTIONS_SCHEMA}.enqueue() FROM PUBLIC;
 "#
     )
 }
 
 /// Every grant on the schema, its tables and sequences and its routines to anyone but the
 /// object's owner is revoked, `CASCADE` (as the superuser, the revoke acts for the owner, so
-/// every grant chain from the owner goes; the owner is the only one who granted first).
+/// every grant chain from the owner goes; the owner is the only one who granted first). Then
+/// every grant *to* [`OWNER`] elsewhere (`pg_shdepend` grantee entries: on a table, column,
+/// sequence, routine, schema, type, database, large object, default privilege, language,
+/// foreign-data wrapper or server, tablespace or parameter) is revoked: it gives nobody the
+/// role's rights, and the foreign check let it pass. A policy naming the role is left as it
+/// is (taking the role out of it would change the table owner's row security), as is any
+/// other entry this doesn't know.
 fn revoke_sql() -> String {
     let ours = ours_sql();
     format!(
         r#"DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
   g record;
+  da record;
 BEGIN
   IF ours IS NULL THEN
     RETURN;
@@ -510,14 +603,15 @@ BEGIN
     EXECUTE pg_catalog.format('REVOKE ALL ON %s FROM %s CASCADE', g.obj,
       CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(g.grantee)) END);
   END LOOP;
-  -- Grants *to* the owner role on other objects (a table owner's, on their own table): the
-  -- foreign check lets them pass (nobody can act as the role, and enqueue() reads no
-  -- table), and they are revoked here.
+  -- Grants *to* the owner role on other objects (any role's, on what it owns): the foreign
+  -- check lets them pass (nobody can act as the role, and enqueue() reads no table), and
+  -- they are revoked here. An entry of a class this doesn't know is left alone.
   FOR g IN SELECT d.classid, d.objid, d.objsubid FROM pg_catalog.pg_shdepend d
     WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
       AND d.refobjid = (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = '{OWNER}') AND d.deptype = 'a'
       AND (d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
-        OR (d.dbid = 0 AND d.classid = 'pg_catalog.pg_database'::pg_catalog.regclass))
+        OR (d.dbid = 0 AND d.classid IN ('pg_catalog.pg_database'::pg_catalog.regclass,
+          'pg_catalog.pg_tablespace'::pg_catalog.regclass, 'pg_catalog.pg_parameter_acl'::pg_catalog.regclass)))
   LOOP
     IF g.classid = 'pg_catalog.pg_class'::pg_catalog.regclass THEN
       EXECUTE pg_catalog.format('REVOKE ALL %s ON %s %s FROM {OWNER} CASCADE',
@@ -535,6 +629,28 @@ BEGIN
         g.objid::pg_catalog.regtype);
     ELSIF g.classid = 'pg_catalog.pg_database'::pg_catalog.regclass THEN
       EXECUTE pg_catalog.format('REVOKE ALL ON DATABASE %I FROM {OWNER} CASCADE', (SELECT d.datname FROM pg_catalog.pg_database d WHERE d.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_largeobject'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON LARGE OBJECT %s FROM {OWNER} CASCADE', g.objid);
+    ELSIF g.classid = 'pg_catalog.pg_default_acl'::pg_catalog.regclass THEN
+      SELECT a.defaclrole, a.defaclnamespace, a.defaclobjtype INTO da FROM pg_catalog.pg_default_acl a WHERE a.oid = g.objid;
+      IF FOUND THEN
+        EXECUTE pg_catalog.format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL ON %s FROM {OWNER} CASCADE',
+          pg_catalog.pg_get_userbyid(da.defaclrole),
+          CASE WHEN da.defaclnamespace = 0 THEN '' ELSE pg_catalog.format(' IN SCHEMA %I',
+            (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = da.defaclnamespace)) END,
+          CASE da.defaclobjtype WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS'
+            WHEN 'T' THEN 'TYPES' WHEN 'n' THEN 'SCHEMAS' END);
+      END IF;
+    ELSIF g.classid = 'pg_catalog.pg_language'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON LANGUAGE %I FROM {OWNER} CASCADE', (SELECT l.lanname FROM pg_catalog.pg_language l WHERE l.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_foreign_data_wrapper'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN DATA WRAPPER %I FROM {OWNER} CASCADE', (SELECT w.fdwname FROM pg_catalog.pg_foreign_data_wrapper w WHERE w.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_foreign_server'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON FOREIGN SERVER %I FROM {OWNER} CASCADE', (SELECT s.srvname FROM pg_catalog.pg_foreign_server s WHERE s.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_tablespace'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON TABLESPACE %I FROM {OWNER} CASCADE', (SELECT t.spcname FROM pg_catalog.pg_tablespace t WHERE t.oid = g.objid));
+    ELSIF g.classid = 'pg_catalog.pg_parameter_acl'::pg_catalog.regclass THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON PARAMETER %s FROM {OWNER} CASCADE', (SELECT p.parname FROM pg_catalog.pg_parameter_acl p WHERE p.oid = g.objid));
     END IF;
   END LOOP;
 END $chelabase_fn$;
@@ -588,10 +704,22 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool, role: Option<u32>) -> String 
         .map(|w| format!("'{}'", w.id))
         .collect::<Vec<_>>()
         .join(", ");
+    // The advisory key as `pg_locks` shows it: the high and low 32 bits.
+    let (key_hi, key_lo) = ((SYNC_LOCK_KEY >> 32) as u32, (SYNC_LOCK_KEY & 0xffff_ffff) as u32);
     format!(
         r#"{SYNC_MARK}
-{PRELUDE}SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
-SELECT pg_catalog.pg_advisory_xact_lock({SYNC_LOCK_KEY}) IS NULL;
+{PRELUDE}-- Two syncs of one database never run at once, and nobody waits on the key: a superuser's
+-- session holding it is another sync (busy, retried); any other holder squats on it and is ignored.
+DO $chelabase_fn$ BEGIN
+  IF NOT pg_catalog.pg_try_advisory_xact_lock({SYNC_LOCK_KEY}) AND EXISTS (
+      SELECT FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity s ON s.pid = l.pid
+        JOIN pg_catalog.pg_roles r ON r.oid = s.usesysid
+      WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1 AND l.classid = {key_hi} AND l.objid = {key_lo}
+        AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
+        AND r.rolsuper) THEN
+    RAISE EXCEPTION '{BUSY_MARK}: another sync of this database holds the lock';
+  END IF;
+END $chelabase_fn$;
 CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2) ON COMMIT DROP;
 {insert}-- After the lock: a database where a wanted trigger is already exactly in place was synced on
 -- this timeline (a sweep got there first), so the truncate is skipped.
@@ -807,6 +935,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     match why {
                         Some(why) => {
                             answers.extend(wanted.iter().map(|w| (w.id, Some(why.clone()))))
+                        }
+                        // A lock a tenant held, or another sync of the database: the rows
+                        // stay as they are and the next pass comes back. Not a failure.
+                        None if retry_later(&e) => {
+                            info!(branch_id = %branch, database = %db, "function triggers' sync yields: {}", e.lines().find(|l| l.contains("ERROR")).unwrap_or(&e));
                         }
                         None => {
                             warn!(branch_id = %branch, database = %db, "syncing the function triggers: {e}");
@@ -1215,7 +1348,8 @@ mod tests {
         assert!(!sql.contains("to_jsonb(NEW)") && !sql.contains("to_jsonb(OLD)"));
         // Round 3 (N1, S2): the truncate is decided after the lock; grants to the role revoked.
         assert!(
-            sql.find("pg_advisory_xact_lock").unwrap() < sql.find("'chelabase_fn.fresh'").unwrap()
+            sql.find("pg_try_advisory_xact_lock").unwrap()
+                < sql.find("'chelabase_fn.fresh'").unwrap()
         );
         assert!(
             sql.contains("IF pg_catalog.current_setting('chelabase_fn.fresh', true) = 'true' THEN")
@@ -1286,6 +1420,59 @@ mod tests {
             sweep_order(&candidates, &attempts, 27).last(),
             Some(&checked.0)
         );
+    }
+
+    /// Round 4 (B1, B2) and the third invariant: the sweep's script takes no lock a tenant
+    /// write conflicts with while the machinery is in place (DDL only behind catalog checks),
+    /// waits at most [`SWEEP_LOCK_TIMEOUT`] for any lock, never waits on the advisory key, and
+    /// a lock timeout or a busy sync is a retry; the foreign check refuses ownership only, and
+    /// the revoke covers default privileges and large objects.
+    #[test]
+    fn fn_triggers_sweep_is_gentle_on_tenants() {
+        let sql = sync_sql(&[wanted("orders", &["insert"])], false, Some(4242));
+        let at = |needle: &str| sql.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(sql.contains("SET LOCAL lock_timeout = '2s';"), "a short lock_timeout");
+        assert!(!sql.contains("lock_timeout = '20s'"));
+        assert!(sql.contains("pg_catalog.pg_try_advisory_xact_lock("), "never waits on the key");
+        assert!(!sql.contains("pg_advisory_xact_lock("));
+        // Every install statement sits behind a catalog check.
+        let create_schema = at("CREATE SCHEMA chelabase_functions AUTHORIZATION chelabase_functions_owner;");
+        assert!(at("IF ns IS NULL THEN") < create_schema);
+        let owner = at("ALTER TABLE chelabase_functions.outbox OWNER TO chelabase_functions_owner;");
+        assert!(at("IF box IS NULL THEN") < owner && owner < at("END IF;\n  SELECT p.prosrc"));
+        assert!(at("IF NOT FOUND OR fn.prosrc <> ") < at("CREATE OR REPLACE FUNCTION chelabase_functions.enqueue()"));
+        assert!(!sql.contains("CREATE TABLE IF NOT EXISTS") && !sql.contains("CREATE SCHEMA IF NOT EXISTS"));
+        // B2: only ownership outside the schema refuses; grantee-only entries are revoked.
+        assert!(sql.contains("AND d.refobjid = role AND d.deptype = 'o'"));
+        assert!(!sql.contains("NOT (d.deptype = 'a'"));
+        assert!(sql.contains("owns objects outside chelabase_functions"));
+        for needle in [
+            "REVOKE ALL ON LARGE OBJECT %s FROM chelabase_functions_owner CASCADE",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE ALL ON %s FROM chelabase_functions_owner CASCADE",
+            "'pg_catalog.pg_largeobject'::pg_catalog.regclass",
+            "'pg_catalog.pg_default_acl'::pg_catalog.regclass",
+        ] {
+            assert!(sql.contains(needle), "{needle}");
+        }
+    }
+
+    /// The third invariant: a lock a tenant held, or another sync of the database, is a retry
+    /// on the next pass, never a failure; anything else still is one.
+    #[test]
+    fn fn_triggers_lock_waits_are_retried() {
+        assert!(retry_later(
+            "psql in compute ep-x exited with 3: ERROR:  canceling statement due to lock timeout\nCONTEXT: SQL statement"
+        ));
+        assert!(retry_later(&format!(
+            "ERROR:  {BUSY_MARK}: another sync of this database holds the lock"
+        )));
+        assert!(!retry_later("ERROR:  syntax error at or near \"x\""));
+        assert!(!retry_later("ERROR:  canceling statement due to statement timeout"));
+        assert!(!retry_later(&format!("ERROR:  {FOREIGN_MARK}: the schema is not ours")));
+        assert!(PRELUDE.contains(&format!("SET LOCAL lock_timeout = '{SWEEP_LOCK_TIMEOUT}';")));
+        for script in [role_sql(true), check_sql(Some(1)), drop_triggers_sql()] {
+            assert!(script.contains("SET LOCAL lock_timeout = '2s';"), "{script}");
+        }
     }
 
     /// Round 2 (B1, B2): plain tables only; the install adopts nothing it didn't make.

@@ -526,13 +526,15 @@ pub fn reserved_default_schema(schema: &str) -> bool {
         || schema == "information_schema"
 }
 
-/// Roles Chelabase owns; never a secret key's.
-const RESERVED_ROLES: [&str; 5] = [
+/// Roles Chelabase owns; never a secret key's. Beyond these names, every `chelabase_…` and
+/// `cb_m_…` role (any case) is reserved too ([`refuse_by_name`]).
+const RESERVED_ROLES: [&str; 6] = [
     AUTHENTICATOR,
     "chelabase_admin",
     crate::storage_schema::STORAGE_ROLE,
     crate::app_users_sql::USERS_SYNC_ROLE,
     crate::realtime::REALTIME_ROLE,
+    crate::fn_triggers::OWNER,
 ];
 
 /// What [`Worker::check_data_role`] found.
@@ -1252,15 +1254,18 @@ fn timeline_verdict(before: Option<String>, after: Option<String>) -> Result<Str
     }
 }
 
-/// The refusals that need no SQL: an invalid name, a reserved role, a built-in `pg_*` role
-/// (matched case-insensitively).
+/// The refusals that need no SQL: an invalid name, a reserved role ([`RESERVED_ROLES`], and
+/// any `chelabase_…` or `cb_m_…` name in any case: Chelabase's own roles, among them the
+/// function triggers' owner, which nothing may ever act as), a built-in `pg_*` role (matched
+/// case-insensitively). Rest's per-request gate refuses the same names
+/// (`chelabase_pgsession::owner_level`).
 fn refuse_by_name(role: &str) -> Option<RoleCheck> {
     if !valid_role_name(role) {
         return Some(RoleCheck::Refused(format!(
             "{role:?} is not a valid role name"
         )));
     }
-    if RESERVED_ROLES.contains(&role) {
+    if RESERVED_ROLES.contains(&role) || chelabase_types::role_name::has_reserved_prefix(role) {
         return Some(RoleCheck::Refused(format!("the role {role} is reserved")));
     }
     if role.len() >= 3 && role[..3].eq_ignore_ascii_case("pg_") {
@@ -2896,6 +2901,31 @@ END $$;
             refuse_by_name("chelabase_auth_sync"),
             Some(RoleCheck::Refused("the role chelabase_auth_sync is reserved".into()))
         );
+    }
+
+    /// Round 4 (B3): the function triggers' owner role, and every other `chelabase_…` or
+    /// `cb_m_…` role in any case, never backs a secret key or a run-as role; the check refuses
+    /// them by name before any SQL, as the roles routes do.
+    #[test]
+    fn reserved_roles_include_the_function_triggers_owner_and_the_prefixes() {
+        assert!(RESERVED_ROLES.contains(&crate::fn_triggers::OWNER));
+        for role in [
+            crate::fn_triggers::OWNER,
+            "Chelabase_Functions_Owner",
+            "chelabase_anything",
+            "CHELABASE_x",
+            "cb_m_0123456789abcdef0123456789abcdef",
+            "CB_M_x",
+        ] {
+            assert_eq!(
+                refuse_by_name(role),
+                Some(RoleCheck::Refused(format!("the role {role} is reserved"))),
+                "{role}"
+            );
+        }
+        for role in ["chelabase", "chelabasex", "cb_mx", "reporter", "app_user"] {
+            assert_eq!(refuse_by_name(role), None, "{role}");
+        }
     }
 
     /// The app users scripts start with their own marker line, so the data API script
