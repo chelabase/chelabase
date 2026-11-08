@@ -1,0 +1,43 @@
+---
+title: Auth modes and limits
+description: Who may call a function (key, app_user, public), the platform limits, and what a busy loop costs.
+---
+
+## Auth modes
+
+A function's `auth` is set per branch (in [`chelabase.toml`](/using/functions/project-file), or by `PATCH …/functions/{name}`). The default is `key`.
+
+| `auth` | Public key | Secret key | Public key + user token | No key |
+|---|---|---|---|---|
+| `key` | yes | yes | yes | 401 |
+| `app_user` | 401 | yes | yes | 401 |
+| `public` | yes | yes | yes | yes, on the `/public/` form only |
+
+- A call that needs another credential answers 401 `unauthorized`.
+- The keyless form `/functions/v1/public/{branch_id}/{name}` reaches **`public` functions only**; for any other function it answers 404, as if it didn't exist.
+- A function that isn't deployed on the branch, or is disabled, answers 404 `function_not_found`.
+- Schedules and event deliveries pass every mode. They are internal calls, marked `chelabase-caller` `internal`.
+- A service is called at `/services/v1/{name}`, never at `/functions/v1`: see [Services](/using/services).
+
+The mode only decides **who may call**. What the function may do to the database is what its key or run-as role may do: see [Secrets, env and the data API](/using/functions/environment).
+
+## Limits
+
+| | |
+|---|---|
+| Wall clock per invocation | 30 s by default; past it, 504 `function_timeout`. An operator sets `CHELABASE_FUNCTIONS_TIMEOUT_MS`. |
+| Request body | 6 MiB (413 `payload_too_large`) |
+| Bundle | 10 MiB; a deploy request at most 12 MiB |
+| Secret | 64 KiB each |
+| Compatibility date | Capped by the runtime's pinned workerd release |
+| Outbound `fetch` | Public addresses only |
+
+A 5xx from the function, a timeout, or a runtime that doesn't answer is recorded as the function's `last_error` on the branch (shown in the CLI and Studio). A function whose bundle can't start (a bad compatibility date, an unknown flag) answers 502 `bundle failed to start`.
+
+### A busy loop stalls every function
+
+All functions of an install run in **one runtime, on one thread**. A function that never yields (`while (true) {}`) stalls every other function until a watchdog notices: the runtime is probed every 2 s and restarted after three failures in a row, so the stall lasts about 6 to 9 seconds, and **it can be repeated** by calling the function again. The 30 s timeout does not cut a loop short, because the loop blocks the thread that would enforce it. Per-invocation CPU and memory limits are not available in this runtime. Treat deploying a function as trusting it with the availability of every other function on the instance, and deploy only code you trust.
+
+### What the sandbox keeps in
+
+The runtime runs without secrets mounted, as a non-root user with a read-only file system and no capabilities, on networks shared only with the functions service and the gateway alias. Function code never sees Chelabase's headers (every `x-chelabase-*` header is removed), and two deployments that share a bundle never share an env.

@@ -1,0 +1,40 @@
+---
+title: Schedules
+description: Run a function's scheduled handler on a 5-field cron expression in an IANA time zone.
+---
+
+A function can run on **cron schedules** per branch. At each due time the function's `scheduled(controller, env, ctx)` handler runs once, with `controller.cron` and `controller.scheduledTime`. See [Handlers](/using/functions/handlers#scheduled-cron).
+
+## Manage schedules
+
+Schedules are managed with the [Management API](/reference/management/functions/listFunctionSchedules) (Developer access on an unprotected branch, Admin on a protected one; Viewer may list):
+
+```bash
+BASE="$API/v1/databases/$DB/branches/$BRANCH/functions/cleanup/schedules"
+
+curl -X POST "$BASE" -H "Authorization: Bearer $MEMBER_TOKEN" -H 'content-type: application/json' \
+  -d '{"cron": "*/15 * * * *", "timezone": "Europe/London"}'
+curl "$BASE" -H "Authorization: Bearer $MEMBER_TOKEN"
+curl -X PATCH "$BASE/$SCHEDULE_ID" -H "Authorization: Bearer $MEMBER_TOKEN" \
+  -H 'content-type: application/json' -d '{"enabled": false}'
+curl -X DELETE "$BASE/$SCHEDULE_ID" -H "Authorization: Bearer $MEMBER_TOKEN"
+```
+
+- `cron`: five fields (minute, hour, day of month, month, day of week), so the finest grain is a minute.
+- `timezone`: an IANA name such as `Europe/London`. Default `UTC`. The cron is read in that zone, including its daylight-saving changes.
+- `enabled`: a disabled schedule never runs. A schedule lists its `next_run_at`.
+- An invalid cron or time zone answers 422 naming the field.
+
+{/* TODO(#173): confirm against landed code: `chelabase functions schedule add|rm|list`, and the Schedules section of Studio's function drawer. */}
+
+The CLI commands `chelabase functions schedule add|rm|list` and a **Schedules** section in Studio's function drawer manage the same schedules.
+
+## How runs happen
+
+- The worker looks for due schedules every 5 seconds. Several worker replicas never run the same tick twice.
+- **Missed ticks coalesce.** If the worker was down for five minutes, it runs the function once when it returns, not five times.
+- **A disabled function skips the run**, and the schedule's `next_run_at` still advances, so enabling it later doesn't replay what it missed.
+- A run is an internal call: the function's [auth mode](/using/functions/auth-and-limits) doesn't apply. If the function has a [run-as role](/using/functions/environment#acting-as-the-function), the handler's `env.CHELABASE_SERVICE_KEY` acts as that role; if not, the run still happens, without a key.
+- A new branch copies its parent's schedules. They fire for the child only while the function is enabled on it. Deleting a branch or database stops its schedules within one loop.
+- A handler that is missing or throws records `scheduled handler: <outcome>` as the function's `last_error`. Runs are not retried; the next tick is the next run.
+- The 30 s [wall-clock limit](/using/functions/auth-and-limits#limits) applies.
