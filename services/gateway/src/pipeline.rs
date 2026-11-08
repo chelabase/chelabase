@@ -1339,11 +1339,14 @@ mod tests {
         let (sessions_url, sessions) = ut::start().await;
         let (app, app_verifier) = ut::keys();
         let (private_pem, public_pem) = generate_keypair_pem();
+        let frozen = std::time::Instant::now();
         let pipeline = Pipeline::new(
             Arc::new(SharedRegistry::new(Registry::new([API]))),
             STUDIO.to_string(),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
-            Arc::new(DataKeyResolver::new(&url, dk::BEARER)),
+            // A frozen limiter clock: a drained miss bucket stays drained however slow the run
+            // (CI saw a token refill before a test's final 429 check).
+            Arc::new(DataKeyResolver::new(&url, dk::BEARER).with_clock(move || frozen)),
             Arc::new(UserTokens::new(Some(app_verifier), &sessions_url, ut::BEARER)),
         );
         DataHarness {
