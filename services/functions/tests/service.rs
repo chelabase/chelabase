@@ -92,6 +92,12 @@ async fn runtime(seen: Arc<Mutex<Vec<Seen>>>) -> String {
                     "bundle failed to start\n",
                 )
                     .into_response(),
+                "bigenv" => (
+                    StatusCode::BAD_REQUEST,
+                    [("x-chelabase-error", "x-chelabase-env is too large")],
+                    "x-chelabase-env is too large\n",
+                )
+                    .into_response(),
                 _ => (
                     [
                         ("x-chelabase-leak", "1"),
@@ -197,6 +203,7 @@ async fn harness_with(runtime_url: Option<String>) -> H {
         ("slow", FunctionAuth::Key),
         ("boom", FunctionAuth::Key),
         ("nostart", FunctionAuth::Key),
+        ("bigenv", FunctionAuth::Key),
         ("users", FunctionAuth::AppUser),
         ("open", FunctionAuth::Public),
     ] {
@@ -679,6 +686,23 @@ async fn a_5xx_is_passed_on_and_recorded_with_the_runtimes_reason() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(h.errors().len(), 2);
+}
+
+/// Review: the supervisor refuses a request it can't run with a 4xx (an env header over its cap
+/// is 400) and names why in `x-chelabase-error`. That is the function failing, whatever the
+/// status, so it is recorded too (and still stripped from the caller's answer).
+#[tokio::test]
+async fn the_runtimes_reason_is_recorded_on_a_4xx_too() {
+    let h = harness().await;
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/bigenv", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.headers().get("x-chelabase-error").is_none());
+    wait_for(|| !h.errors().is_empty()).await;
+    assert_eq!(h.errors(), vec!["x-chelabase-env is too large"]);
 }
 
 #[tokio::test]

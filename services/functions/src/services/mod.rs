@@ -11,7 +11,7 @@
 //!   [`HEADERS_TIMEOUT`] for the response's headers and [`IDLE_TIMEOUT`] between reads.
 //! - Hop-by-hop headers (and those `Connection` names), `host`, `authorization`, every
 //!   `chelabase-*` and `x-chelabase-*` and `content-digest` from the client are dropped; the
-//!   service gets `chelabase-branch`, `chelabase-role`, `chelabase-user` (the app user's
+//!   service gets `chelabase-branch`, `chelabase-role`, `chelabase-user-id` (the app user's
 //!   subject, else empty), a fresh `chelabase-request-id` and the [`signature`].
 //! - m11: a container service goes to the address the service runner reported for the branch's
 //!   container ([`container`]) through the containers' own client; before the keeper has placed

@@ -2883,7 +2883,8 @@ async fn functions_connection_opens_the_dispatch_password() {
     let (code, body) = app.get(&path, Some(FUNCTIONS_TOKEN)).await;
     assert_eq!(code, 200, "{body}");
     assert_eq!((&body["user"], &body["password"]), (&json!("chelabase_functions_dispatch"), &json!("dispatch-pw")));
-    assert_eq!((&body["host"], &body["port"], &body["server_name"]), (&json!("127.0.0.1"), &json!(55432), &json!("ep-1.compute.chelabase.internal")));
+    assert_eq!(body["host"], "127.0.0.1", "{body}");
+    assert_eq!((&body["port"], &body["server_name"]), (&json!(55432), &json!("ep-1.compute.chelabase.internal")));
     assert!(body.get("replication_host").is_none(), "{body}");
     for (route, token) in [("data", STORAGE_TOKEN), ("storage", STORAGE_TOKEN)] {
         let other = format!("/internal/{route}/branches/{}/connection", row.branch_id.as_uuid());

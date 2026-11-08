@@ -8,10 +8,13 @@
 //!
 //! Internal, in two sides on two networks (#181, audit S1): the runtime's side serves only
 //! `GET /internal/bundles/{database_id}/{sha256}` (no bearer: the runtime has none); the
-//! control side serves only `PUT` the same (the orchestrator's bearer) and `POST
+//! control side serves only `PUT` the same (the orchestrator's bearer), `POST
 //! /internal/invoke/{branch_id}/{name}` (the worker's bearer; a `{"type": "scheduled"}` body
 //! reaches the runtime marked `x-chelabase-event: scheduled`, m7; a `{"type": "storage"}` one
-//! `x-chelabase-event: storage`, m14). A database event (m13) is
+//! `x-chelabase-event: storage`, m14) and the container-service calls (m11, the orchestrator's
+//! bearer, [`crate::services::control`]): `POST /internal/services/images/resolve`, `POST
+//! /internal/services/rollout` and `GET
+//! /internal/services/logs/{branch_id}/{function_id}/{deployment_id}`. A database event (m13) is
 //! marked `chelabase-event: db` only by this process's dispatcher ([`crate::events`], m13b):
 //! the header is stripped from every HTTP call, the worker's included.
 
@@ -130,7 +133,8 @@ pub fn runtime_router(state: Shared) -> Router {
 }
 
 /// Its control side (the orchestrator's and the worker's `functions-control` network): bundle
-/// PUTs (the orchestrator's bearer) and invocations (the worker's), nothing else.
+/// PUTs and the container-service calls (the orchestrator's bearer) and invocations (the
+/// worker's), nothing else.
 pub fn control_router(state: Shared) -> Router {
     Router::new()
         .route("/internal/bundles/{database_id}/{sha256}", axum::routing::put(put_bundle))
@@ -452,13 +456,20 @@ async fn invoke(
     };
     match s.host.invoke(&resolution, inv).await {
         Ok(mut resp) => {
-            if resp.status().is_server_error() {
-                let why = resp
-                    .headers()
-                    .get(ERROR_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("the function answered {}", resp.status().as_u16()));
+            // The runtime's reason, whatever the status (the supervisor refuses an env header
+            // over its cap with a 400): only the supervisor sets the header, it strips a
+            // function's copy. A 5xx without one is the function's own.
+            let reason = resp
+                .headers()
+                .get(ERROR_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let why = reason.or_else(|| {
+                resp.status()
+                    .is_server_error()
+                    .then(|| format!("the function answered {}", resp.status().as_u16()))
+            });
+            if let Some(why) = why {
                 record_error(s, branch, &resolution, why);
             }
             strip(resp.headers_mut(), false);
