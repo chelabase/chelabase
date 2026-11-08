@@ -45,7 +45,7 @@ pub use storage_webhooks::{
 };
 pub use ddl::DdlTx;
 pub use functions::{
-    Advance, BranchFunction, ClaimedSchedule, DeploymentRecord, FunctionAuth, FunctionKind,
+    Advance, BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
     ServiceTarget, RunAsMint, RunAsUnmintable, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
