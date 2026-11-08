@@ -20,8 +20,9 @@ pub struct Config {
     pub addr: String,
     /// `CHELABASE_STACK` (default `main`): the only stack whose containers it touches.
     pub stack: String,
-    /// `CHELABASE_SERVICES_NETWORK` (required): the one network its containers join.
-    pub network: String,
+    /// `CHELABASE_COMPOSE_PROJECT` (required): the compose project whose `functions` service
+    /// the runner attaches to each service's network.
+    pub project: String,
     pub functions_token: String,
     pub worker_token: String,
     pub caps: Caps,
@@ -66,17 +67,17 @@ impl Config {
             stack_ok,
             "CHELABASE_STACK {stack:?} is not [a-z0-9][a-z0-9-]*, at most {MAX_STACK_LEN} characters"
         );
-        let network = non_blank("CHELABASE_SERVICES_NETWORK")
-            .ok_or_else(|| anyhow::anyhow!("CHELABASE_SERVICES_NETWORK is required"))?;
-        let network_ok = network.len() <= 128
-            && network.starts_with(|c: char| c.is_ascii_alphanumeric())
-            && network
+        let project = non_blank("CHELABASE_COMPOSE_PROJECT")
+            .ok_or_else(|| anyhow::anyhow!("CHELABASE_COMPOSE_PROJECT is required"))?;
+        // Compose's own rule for project names.
+        let project_ok = project.len() <= 128
+            && project.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && project
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-            && !["host", "none", "bridge", "default"].contains(&network.as_str());
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b));
         anyhow::ensure!(
-            network_ok,
-            "CHELABASE_SERVICES_NETWORK {network:?} must name a user-defined network (never host, none, bridge, default or a container)"
+            project_ok,
+            "CHELABASE_COMPOSE_PROJECT {project:?} is not a compose project name ([a-z0-9][a-z0-9_-]*)"
         );
         let memory_mb: u32 = match non_blank("CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB") {
             None => DEFAULT_MEMORY_MB,
@@ -108,7 +109,7 @@ impl Config {
             addr: non_blank("CHELABASE_SERVICE_RUNNER_ADDR")
                 .unwrap_or_else(|| "127.0.0.1:8094".into()),
             stack,
-            network,
+            project,
             functions_token,
             worker_token,
             caps: Caps { memory_mb, cpus },
@@ -134,7 +135,7 @@ mod tests {
     const OK: [(&str, &str); 3] = [
         (FUNCTIONS_TOKEN, "functions-0123456789abcdef0123456789ab"),
         (WORKER_TOKEN, "worker-0123456789abcdef0123456789abcdef"),
-        ("CHELABASE_SERVICES_NETWORK", "chelabase_services"),
+        ("CHELABASE_COMPOSE_PROJECT", "chelabase-feat-x"),
     ];
 
     #[test]
@@ -158,16 +159,8 @@ mod tests {
             with(WORKER_TOKEN, OK[0].1).is_err(),
             "one value for both bearers"
         );
-        for n in [
-            "host",
-            "none",
-            "bridge",
-            "default",
-            "container:abc",
-            "a/b",
-            "",
-        ] {
-            assert!(with("CHELABASE_SERVICES_NETWORK", n).is_err(), "{n}");
+        for n in ["Chelabase", "-x", "a/b", "a.b", "container:abc", ""] {
+            assert!(with("CHELABASE_COMPOSE_PROJECT", n).is_err(), "{n}");
         }
         assert!(with("CHELABASE_STACK", "Main").is_err());
         assert!(with("CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB", "8").is_err());

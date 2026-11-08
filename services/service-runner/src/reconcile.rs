@@ -1,8 +1,13 @@
 //! Reconcile: every 30 s, converge this stack's service containers on the metadata's desired
 //! state (each branch's `kind = service` function whose active deployment is a container spec,
-//! and whether it is enabled there). Only the runner's own containers are ever compared or
-//! touched ([`Runner::ours`]), so another stack's containers and anything unlabelled are
-//! invisible to it. A pass whose desired state can't be read changes nothing.
+//! and whether it is enabled there). It never creates a container: only the functions service's
+//! ensure does, with the branch's secrets. It starts, stops and removes, removes networks left
+//! without a container, and attaches the functions service to the networks that have one.
+//!
+//! Only the runner's own containers and networks are ever compared or touched
+//! ([`Runner::ours`]), so another stack's and anything unlabelled are invisible to it. A pass
+//! whose desired state can't be read changes nothing, and a slot with an ensure in flight is left
+//! for the next pass.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,8 +17,8 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::backend::Container;
-use crate::runner::{EnsureRequest, Key, Runner, key_of};
+use crate::backend::{Container, Network};
+use crate::runner::{Key, Runner, key_of, slot_of};
 use crate::spec;
 
 /// One branch's container service, as the metadata has it.
@@ -26,36 +31,51 @@ pub struct Desired {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// No container for an enabled service: create it (with no secrets: the functions service
-    /// passes them with its own ensure, m11).
-    Create(Desired),
     Start(String),
     Stop(String),
     Remove(String),
+    /// A service network with no container: detach the functions service and remove it.
+    RemoveNetwork(Uuid, Uuid),
+    /// A service network the functions service isn't on (its container was recreated).
+    Attach(String),
+}
+
+impl Action {
+    /// The (service, branch) the action touches, whose lock it needs.
+    fn slot(&self, slots: &HashMap<String, (Uuid, Uuid)>) -> Option<(Uuid, Uuid)> {
+        match self {
+            Action::Start(id) | Action::Stop(id) | Action::Remove(id) | Action::Attach(id) => {
+                slots.get(id).copied()
+            }
+            Action::RemoveNetwork(s, b) => Some((*s, *b)),
+        }
+    }
 }
 
 /// What to do, given the desired rows (already checked: an invalid spec is left out, so its
-/// container goes) and this stack's containers:
+/// container goes), this stack's containers and networks, and the functions containers:
 /// - a container whose service and branch have no row, or whose deployment isn't the row's, or
 ///   a second one for the same row, is removed;
-/// - an enabled row with no container is created, with a stopped one is started;
-/// - a disabled row's running container is stopped.
-pub fn plan(desired: &[Desired], actual: &[Container]) -> Vec<Action> {
-    let rows: HashMap<(Uuid, Uuid), &Desired> = desired
-        .iter()
-        .map(|d| ((d.key.service_id, d.key.branch_id), d))
-        .collect();
-    let mut matched: HashSet<(Uuid, Uuid)> = HashSet::new();
+/// - an enabled row's stopped container is started; a disabled row's running one is stopped;
+/// - a network whose slot keeps no container is removed; one that keeps a container and lacks a
+///   functions container gets it attached.
+pub fn plan(
+    desired: &[Desired],
+    actual: &[Container],
+    networks: &[Network],
+    functions: &[String],
+) -> Vec<Action> {
+    let rows: HashMap<(Uuid, Uuid), &Desired> = desired.iter().map(|d| (d.key.slot(), d)).collect();
+    let mut kept: HashSet<(Uuid, Uuid)> = HashSet::new();
     let mut actions = Vec::new();
     for c in actual {
         let Some(k) = key_of(c) else {
             actions.push(Action::Remove(c.id.clone()));
             continue;
         };
-        let slot = (k.service_id, k.branch_id);
-        match rows.get(&slot) {
-            Some(d) if d.key.deployment_id == k.deployment_id && !matched.contains(&slot) => {
-                matched.insert(slot);
+        match rows.get(&k.slot()) {
+            Some(d) if d.key.deployment_id == k.deployment_id && !kept.contains(&k.slot()) => {
+                kept.insert(k.slot());
                 match (d.enabled, c.running()) {
                     (true, false) => actions.push(Action::Start(c.id.clone())),
                     (false, true) => actions.push(Action::Stop(c.id.clone())),
@@ -65,9 +85,17 @@ pub fn plan(desired: &[Desired], actual: &[Container]) -> Vec<Action> {
             _ => actions.push(Action::Remove(c.id.clone())),
         }
     }
-    for d in desired {
-        if d.enabled && !matched.contains(&(d.key.service_id, d.key.branch_id)) {
-            actions.push(Action::Create(d.clone()));
+    let present: HashSet<(Uuid, Uuid)> =
+        actual.iter().filter_map(key_of).map(|k| k.slot()).collect();
+    for n in networks {
+        let Some(slot) = slot_of(n) else { continue };
+        if kept.contains(&slot) {
+            if functions.iter().any(|f| !n.containers.contains(f)) {
+                actions.push(Action::Attach(n.id.clone()));
+            }
+        } else if !present.contains(&slot) {
+            // A slot whose containers are all being removed loses its network with the last one.
+            actions.push(Action::RemoveNetwork(slot.0, slot.1));
         }
     }
     actions
@@ -120,13 +148,18 @@ impl DesiredSource for MetadataDesired {
     }
 }
 
-/// One pass: read the desired state (an error ends the pass before anything is touched), drop
-/// rows whose spec the runner refuses, plan, and apply. Returns what it did; one action's
-/// failure is logged and the rest still run.
+/// One pass: list this stack's containers and networks, then read the desired state (in that
+/// order, so a container ensured for a new deployment before the listing meets metadata that
+/// already names it; an error ends the pass before anything is touched), drop rows whose spec
+/// the runner refuses, plan, and apply each action under its slot's lock, skipping a slot an
+/// ensure holds. Returns what it applied; one action's failure is logged and the rest still run.
 pub async fn reconcile_once(
     runner: &Runner,
     source: &dyn DesiredSource,
 ) -> anyhow::Result<Vec<Action>> {
+    let actual = runner.ours().await?;
+    let networks = runner.our_networks().await?;
+    let functions = runner.functions().await?;
     let desired: Vec<Desired> = source
         .desired()
         .await?
@@ -143,30 +176,44 @@ pub async fn reconcile_once(
             }
         })
         .collect();
-    let actual = runner.ours().await?;
-    let actions = plan(&desired, &actual);
-    for action in &actions {
-        let result = match action {
-            Action::Create(d) => runner
-                .ensure(&EnsureRequest {
-                    service_id: d.key.service_id,
-                    branch_id: d.key.branch_id,
-                    deployment_id: d.key.deployment_id,
-                    spec: d.spec.clone(),
-                    env: Default::default(),
-                })
-                .await
-                .map(drop),
+    let mut slots: HashMap<String, (Uuid, Uuid)> = actual
+        .iter()
+        .filter_map(|c| Some((c.id.clone(), key_of(c)?.slot())))
+        .collect();
+    slots.extend(
+        networks
+            .iter()
+            .filter_map(|n| Some((n.id.clone(), slot_of(n)?))),
+    );
+    let mut applied = Vec::new();
+    for action in plan(&desired, &actual, &networks, &functions) {
+        let guard = match action.slot(&slots) {
+            Some(slot) => match runner.try_lock(slot) {
+                Some(g) => Some(g),
+                None => {
+                    tracing::info!("reconcile: {action:?} skipped: an ensure is in flight");
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let result = match &action {
             Action::Start(id) => runner.start(id).await.map(drop),
             Action::Stop(id) => runner.stop(id).await.map(drop),
             Action::Remove(id) => runner.remove(id).await,
+            Action::RemoveNetwork(s, b) => runner.remove_network(*s, *b).await,
+            Action::Attach(id) => runner.attach_functions(id).await,
         };
+        drop(guard);
         match result {
-            Ok(()) => tracing::info!("reconcile: {action:?}"),
+            Ok(()) => {
+                tracing::info!("reconcile: {action:?}");
+                applied.push(action);
+            }
             Err(e) => tracing::warn!("reconcile: {action:?} failed: {e:#}"),
         }
     }
-    Ok(actions)
+    Ok(applied)
 }
 
 /// Runs [`reconcile_once`] every `every`, forever.
@@ -191,8 +238,9 @@ mod tests {
 
     use super::*;
     use crate::runner::fake::Fake;
+    use crate::runner::{EnsureRequest, container_name};
     use crate::spec::Caps;
-    use crate::{SERVICE_LABEL, STACK_LABEL};
+    use crate::{BRANCH_LABEL, DEPLOYMENT_LABEL, SERVICE_LABEL, STACK_LABEL};
 
     fn spec() -> serde_json::Value {
         json!({"backend": "container", "image": "ghcr.io/acme/echo:1", "port": 8080})
@@ -214,25 +262,56 @@ mod tests {
         }
     }
 
+    fn labels(key: &Key) -> HashMap<String, String> {
+        [
+            (STACK_LABEL, "a".to_string()),
+            (SERVICE_LABEL, key.service_id.to_string()),
+            (BRANCH_LABEL, key.branch_id.to_string()),
+            (DEPLOYMENT_LABEL, key.deployment_id.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
     fn container(id: &str, key: &Key, state: &str) -> Container {
         Container {
             id: id.into(),
-            labels: [
-                (STACK_LABEL, "a".to_string()),
-                (SERVICE_LABEL, key.service_id.to_string()),
-                (crate::BRANCH_LABEL, key.branch_id.to_string()),
-                (crate::DEPLOYMENT_LABEL, key.deployment_id.to_string()),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
+            labels: labels(key),
             state: state.into(),
         }
     }
 
+    fn network(id: &str, key: &Key, attached: &[&str]) -> Network {
+        let mut l = labels(key);
+        l.remove(DEPLOYMENT_LABEL);
+        Network {
+            id: id.into(),
+            name: container_name("a", key.service_id, key.branch_id),
+            labels: l,
+            containers: attached.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    fn ensure_req(k: &Key, env: &[(&str, &str)]) -> EnsureRequest {
+        EnsureRequest {
+            service_id: k.service_id,
+            branch_id: k.branch_id,
+            deployment_id: k.deployment_id,
+            spec: spec(),
+            env: env
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Audit B1 (human decision): reconcile never creates; an enabled row with no container is
+    /// left for the functions service's ensure.
     #[test]
     fn the_diff() {
         let (on, off, gone, moved, idle, fresh) = (key(), key(), key(), key(), key(), key());
+        let orphan = key();
         let moved_now = Key {
             deployment_id: Uuid::new_v4(),
             ..moved
@@ -252,7 +331,15 @@ mod tests {
             container("moved", &moved, "running"),
             container("idle", &idle, "exited"),
         ];
-        let actions = plan(&rows, &actual);
+        let f = "functions".to_string();
+        let networks = [
+            network("n-on", &on, &["functions", "on-stopped"]),
+            network("n-off", &off, &["off-running"]),
+            network("n-gone", &gone, &["functions", "gone"]),
+            network("n-orphan", &orphan, &["functions"]),
+        ];
+        let actions = plan(&rows, &actual, &networks, std::slice::from_ref(&f));
+        let k = |k: &Key| (k.service_id, k.branch_id);
         assert_eq!(
             actions,
             [
@@ -261,16 +348,36 @@ mod tests {
                 Action::Stop("off-running".into()),
                 Action::Remove("gone".into()),
                 Action::Remove("moved".into()),
-                Action::Create(desired(moved_now, true)),
-                Action::Create(desired(fresh, true)),
+                // The functions container was recreated: attached again.
+                Action::Attach("n-off".into()),
+                // An orphan network (no container at all) goes; `gone`'s goes with its container.
+                Action::RemoveNetwork(orphan.service_id, orphan.branch_id),
             ]
         );
-        // Converged: nothing to do.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RemoveNetwork(s, b) if (*s, *b) == k(&gone)))
+        );
         let mut unlabelled = container("half", &on, "running");
-        unlabelled.labels.remove(crate::DEPLOYMENT_LABEL);
-        assert_eq!(plan(&[], &[unlabelled]), [Action::Remove("half".into())]);
-        assert!(plan(&[desired(on, true)], &[container("x", &on, "running")]).is_empty());
-        assert!(plan(&[desired(off, false)], &[]).is_empty());
+        unlabelled.labels.remove(DEPLOYMENT_LABEL);
+        assert_eq!(
+            plan(&[], &[unlabelled], &[], &[]),
+            [Action::Remove("half".into())]
+        );
+        assert!(
+            plan(
+                &[desired(on, true)],
+                &[container("x", &on, "running")],
+                &[],
+                &[]
+            )
+            .is_empty()
+        );
+        assert!(
+            plan(&[desired(fresh, true)], &[], &[], &[]).is_empty(),
+            "never a create"
+        );
     }
 
     struct Rows(Mutex<anyhow::Result<Vec<Desired>>>);
@@ -318,26 +425,138 @@ mod tests {
         assert!(fake.get(&a).is_some());
     }
 
-    /// Enabled → created and running; disabled → stopped; row gone → removed; an invalid spec
-    /// is treated as no row.
+    /// Audit B1: an enabled row and then the functions service's ensure with the branch's
+    /// secrets: the running container has them.
     #[tokio::test]
-    async fn passes_converge() {
+    async fn ensure_after_a_pass_applies_the_callers_env() {
         let fake = Arc::new(Fake::default());
         let runner = Runner::new(fake.clone(), "a", "net", Caps::default());
         let k = key();
         let rows = Rows(Mutex::new(Ok(vec![desired(k, true)])));
         reconcile_once(&runner, &rows).await.unwrap();
-        let ours = runner.ours().await.unwrap();
-        assert_eq!(ours.len(), 1);
-        assert!(ours[0].running());
+        runner
+            .ensure(&ensure_req(&k, &[("API_KEY", "s3cret")]))
+            .await
+            .unwrap();
+        let live = fake.plans().last().unwrap().clone();
+        assert!(
+            live.env.contains(&"API_KEY=s3cret".to_string()),
+            "{:?}",
+            live.env
+        );
+        assert_eq!(runner.ours().await.unwrap().len(), 1);
+    }
+
+    /// Ensured → kept; disabled → stopped; enabled again → started; row gone → container and
+    /// network removed; an invalid spec counts as no row.
+    #[tokio::test]
+    async fn passes_converge() {
+        let fake = Arc::new(Fake::default());
+        fake.functions.lock().unwrap().push("functions-ctr".into());
+        let runner = Runner::new(fake.clone(), "a", "net", Caps::default());
+        let k = key();
+        let rows = Rows(Mutex::new(Ok(vec![desired(k, true)])));
+        assert!(reconcile_once(&runner, &rows).await.unwrap().is_empty());
+        assert!(
+            runner.ours().await.unwrap().is_empty(),
+            "reconcile never creates"
+        );
+        runner.ensure(&ensure_req(&k, &[])).await.unwrap();
         assert!(reconcile_once(&runner, &rows).await.unwrap().is_empty());
         *rows.0.lock().unwrap() = Ok(vec![desired(k, false)]);
         reconcile_once(&runner, &rows).await.unwrap();
         assert!(!runner.ours().await.unwrap()[0].running());
+        *rows.0.lock().unwrap() = Ok(vec![desired(k, true)]);
+        reconcile_once(&runner, &rows).await.unwrap();
+        assert!(runner.ours().await.unwrap()[0].running());
+        // The functions container was recreated (detached): the next pass attaches it again.
+        let net = container_name("a", k.service_id, k.branch_id);
+        for n in fake.networks.lock().unwrap().iter_mut() {
+            n.containers.retain(|c| c != "functions-ctr");
+        }
+        reconcile_once(&runner, &rows).await.unwrap();
+        assert!(
+            fake.network(&net)
+                .unwrap()
+                .containers
+                .contains(&"functions-ctr".to_string())
+        );
         let mut bad = desired(k, true);
         bad.spec["privileged"] = json!(true);
         *rows.0.lock().unwrap() = Ok(vec![bad]);
         reconcile_once(&runner, &rows).await.unwrap();
         assert!(runner.ours().await.unwrap().is_empty());
+        assert!(
+            fake.network(&net).is_none(),
+            "the network went with the container"
+        );
+    }
+
+    /// An orphaned service network (its container gone by other means) is detached and removed.
+    #[tokio::test]
+    async fn orphan_networks_are_removed() {
+        let fake = Arc::new(Fake::default());
+        fake.functions.lock().unwrap().push("functions-ctr".into());
+        let runner = Runner::new(fake.clone(), "a", "net", Caps::default());
+        let k = key();
+        let c = runner.ensure(&ensure_req(&k, &[])).await.unwrap();
+        fake.containers
+            .lock()
+            .unwrap()
+            .retain(|(x, _)| x.id != c.id);
+        let other = network("n-b", &key(), &["functions-ctr"]);
+        let mut foreign = other.clone();
+        foreign.labels.insert(STACK_LABEL.into(), "b".into());
+        fake.networks.lock().unwrap().push(foreign);
+        let done = reconcile_once(&runner, &Rows(Mutex::new(Ok(vec![]))))
+            .await
+            .unwrap();
+        assert_eq!(done, [Action::RemoveNetwork(k.service_id, k.branch_id)]);
+        assert!(
+            fake.network(&container_name("a", k.service_id, k.branch_id))
+                .is_none()
+        );
+        assert!(
+            fake.network("n-b").is_some(),
+            "another stack's network is never touched"
+        );
+    }
+
+    /// Audit S1: a slot whose lock an ensure holds is skipped by the pass, which would otherwise
+    /// remove the container ensure is working on.
+    #[tokio::test]
+    async fn a_pass_skips_a_slot_with_an_ensure_in_flight() {
+        let fake = Arc::new(Fake::default());
+        let runner = Runner::new(fake.clone(), "a", "net", Caps::default());
+        let k = key();
+        let c = runner.ensure(&ensure_req(&k, &[])).await.unwrap();
+        let held = runner.lock(k.slot()).await;
+        let done = reconcile_once(&runner, &Rows(Mutex::new(Ok(vec![]))))
+            .await
+            .unwrap();
+        assert!(done.is_empty(), "{done:?}");
+        assert!(fake.get(&c.id).is_some());
+        drop(held);
+        let done = reconcile_once(&runner, &Rows(Mutex::new(Ok(vec![]))))
+            .await
+            .unwrap();
+        assert_eq!(done, [Action::Remove(c.id.clone())]);
+    }
+
+    /// Audit S1: ensure waits for the slot's lock (a pass or another ensure holding it).
+    #[tokio::test]
+    async fn ensure_waits_for_the_slot() {
+        let fake = Arc::new(Fake::default());
+        let runner = Arc::new(Runner::new(fake.clone(), "a", "net", Caps::default()));
+        let k = key();
+        let held = runner.lock(k.slot()).await;
+        let r = runner.clone();
+        let task = tokio::spawn(async move { r.ensure(&ensure_req(&k, &[])).await.map(|c| c.id) });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(fake.plans().is_empty(), "ensure must wait for the slot");
+        drop(held);
+        task.await.unwrap().unwrap();
+        assert_eq!(fake.plans().len(), 1);
     }
 }

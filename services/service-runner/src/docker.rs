@@ -10,15 +10,16 @@ use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::models::{
     ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, HostConfigLogConfig, Mount,
-    MountTmpfsOptions, MountType, RestartPolicy, RestartPolicyNameEnum,
+    MountTmpfsOptions, MountType, NetworkConnectRequest, NetworkCreateRequest,
+    NetworkDisconnectRequest, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, ListContainersOptions, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+    CreateContainerOptions, CreateImageOptions, ListContainersOptions, ListNetworksOptions,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use futures_util::StreamExt as _;
 
-use crate::backend::{Container, ContainerBackend, ContainerPlan, ImageFacts};
+use crate::backend::{Container, ContainerBackend, ContainerPlan, ImageFacts, Network};
 use crate::spec::ImageRef;
 use crate::{SERVICE_LABEL, STACK_LABEL};
 
@@ -54,7 +55,8 @@ pub fn create_body(plan: &ContainerPlan, network: &str) -> ContainerCreateBody {
         })
         .collect();
     ContainerCreateBody {
-        image: Some(plan.image.to_string()),
+        // The inspected content id, never the tag again (S2).
+        image: Some(plan.image_id.clone()),
         user: Some(plan.user.clone()),
         env: Some(plan.env.clone()),
         labels: Some(plan.labels.clone()),
@@ -210,8 +212,10 @@ impl ContainerBackend for DockerBackend {
         };
         let config = found.config.unwrap_or_default();
         Ok(ImageFacts {
+            id: found.id.unwrap_or_default(),
             user: config.user.filter(|u| !u.trim().is_empty()),
             volumes: config.volumes.unwrap_or_default(),
+            labels: config.labels.unwrap_or_default(),
         })
     }
 
@@ -293,6 +297,140 @@ impl ContainerBackend for DockerBackend {
             }
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    async fn list_networks(&self, stack: &str) -> anyhow::Result<Vec<Network>> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{STACK_LABEL}={stack}"), SERVICE_LABEL.to_string()],
+        )]);
+        let list = self
+            .docker
+            .list_networks(Some(ListNetworksOptions {
+                filters: Some(filters),
+            }))
+            .await
+            .context("listing service networks")?;
+        let mut out = Vec::new();
+        // The listing has no endpoints: each is inspected (one per service, few).
+        for n in list {
+            if let Some(n) = self.inspect_network(&n.id.unwrap_or_default()).await? {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn inspect_network(&self, name: &str) -> anyhow::Result<Option<Network>> {
+        if name.is_empty() {
+            return Ok(None);
+        }
+        match self.docker.inspect_network(name, None).await {
+            Ok(n) => Ok(Some(Network {
+                id: n.id.unwrap_or_default(),
+                name: n.name.unwrap_or_default(),
+                labels: n.labels.unwrap_or_default(),
+                containers: n.containers.unwrap_or_default().into_keys().collect(),
+            })),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("inspecting network {name}"))),
+        }
+    }
+
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let created = self
+            .docker
+            .create_network(NetworkCreateRequest {
+                name: name.to_string(),
+                driver: Some("bridge".to_string()),
+                // Not internal: services reach the internet. Not attachable by others.
+                internal: Some(false),
+                attachable: Some(false),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("creating network {name}"))?;
+        Ok(created.id)
+    }
+
+    async fn remove_network(&self, id: &str) -> anyhow::Result<()> {
+        match self.docker.remove_network(id).await {
+            Ok(()) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("removing network {id}"))),
+        }
+    }
+
+    async fn connect(&self, network: &str, container: &str) -> anyhow::Result<()> {
+        let attached = self
+            .inspect_network(network)
+            .await?
+            .is_some_and(|n| n.containers.iter().any(|c| c == container));
+        if attached {
+            return Ok(());
+        }
+        self.docker
+            .connect_network(
+                network,
+                NetworkConnectRequest {
+                    container: container.to_string(),
+                    endpoint_config: None,
+                },
+            )
+            .await
+            .with_context(|| format!("attaching {container} to network {network}"))
+    }
+
+    async fn disconnect(&self, network: &str, container: &str) -> anyhow::Result<()> {
+        match self
+            .docker
+            .disconnect_network(
+                network,
+                NetworkDisconnectRequest {
+                    container: container.to_string(),
+                    force: Some(true),
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("detaching {container} from network {network}"))),
+        }
+    }
+
+    async fn functions_containers(&self, project: &str) -> anyhow::Result<Vec<String>> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![
+                format!("com.docker.compose.project={project}"),
+                "com.docker.compose.service=functions".to_string(),
+            ],
+        )]);
+        let list = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .context("listing the functions containers")?;
+        // Never one of the runner's own (an image can't carry these labels: plan refuses it).
+        Ok(list
+            .into_iter()
+            .filter(|c| {
+                !c.labels
+                    .as_ref()
+                    .is_some_and(|l| l.contains_key(SERVICE_LABEL))
+            })
+            .filter_map(|c| c.id)
+            .collect())
     }
 }
 
@@ -388,13 +526,21 @@ mod tests {
         )
         .unwrap();
         let facts = ImageFacts {
+            id: format!("sha256:{}", "b".repeat(64)),
             user: None,
             volumes: vec!["/data".into()],
+            labels: HashMap::from([("org.opencontainers.image.title".into(), "echo".into())]),
         };
-        let p = plan("feat-x", &key(), &v, &facts, &BTreeMap::new()).unwrap();
+        let p = plan("feat-x", &key(), &v, &facts, &BTreeMap::new(), "digest").unwrap();
         let body = create_body(&p, NET);
         assert_hardened(&body, &caps);
         assert_eq!(body.user.as_deref(), Some("65532:65532"));
+        // Audit S2: created from the inspected image id, never the tag.
+        assert_eq!(body.image.as_deref(), Some(facts.id.as_str()));
+        assert_eq!(
+            body.labels.unwrap()[crate::runner::ENV_DIGEST_LABEL],
+            "digest"
+        );
         let targets: Vec<_> = body
             .host_config
             .unwrap()
@@ -450,6 +596,12 @@ mod tests {
             user in image_user(),
             volumes in proptest::collection::vec(volume(), 0..20),
             env in env_map(),
+            labels in proptest::collection::hash_map(prop_oneof![
+                "[a-z.]{1,12}",
+                Just("chelabase.dev/endpoint-id".to_string()),
+                Just("Chelabase.Dev/stack".to_string()),
+                Just("com.docker.compose.service".to_string()),
+            ], ".{0,8}", 0..4),
         ) {
             let caps = Caps { memory_mb: cap_memory, cpus: cap_cpus };
             let spec = ContainerSpec {
@@ -462,8 +614,13 @@ mod tests {
             if let Ok(v) = validate(&spec, &caps) {
                 prop_assert!(memory.is_none_or(|m| m <= cap_memory));
                 prop_assert!(cpus.is_none_or(|c| c <= cap_cpus));
-                let facts = ImageFacts { user, volumes };
-                if let Ok(p) = plan("feat-x", &key(), &v, &facts, &env) {
+                let reserved = labels.keys().any(|k| {
+                    let k = k.to_ascii_lowercase();
+                    k.starts_with("chelabase.dev/") || k.starts_with("com.docker.compose.")
+                });
+                let facts = ImageFacts { id: "sha256:x".into(), user, volumes, labels };
+                if let Ok(p) = plan("feat-x", &key(), &v, &facts, &env, "d") {
+                    prop_assert!(!reserved, "an image with a reserved label is refused");
                     assert_hardened(&create_body(&p, NET), &caps);
                 }
             }

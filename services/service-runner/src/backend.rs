@@ -32,10 +32,25 @@ impl Container {
 /// What the runner reads from an image before it runs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageFacts {
+    /// The image's content id (`sha256:…`): the container is created from it, never from the
+    /// tag again (a tag re-pointed in between could bring volumes the runner never covered).
+    pub id: String,
     /// The image's `USER`, if any.
     pub user: Option<String>,
     /// The image's `VOLUME` paths: each gets a tmpfs, never an anonymous volume on the host.
     pub volumes: Vec<String>,
+    /// The image's `LABEL`s, which the engine copies onto the container.
+    pub labels: HashMap<String, String>,
+}
+
+/// A network as the runner sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Network {
+    pub id: String,
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    /// The ids of the containers attached to it.
+    pub containers: Vec<String>,
 }
 
 /// A container to create, already decided by the runner: every field here is the runner's,
@@ -43,7 +58,9 @@ pub struct ImageFacts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerPlan {
     pub name: String,
+    /// The reference the caller gave (for logs), and the content id it is created from.
     pub image: ImageRef,
+    pub image_id: String,
     /// `uid` or `uid:gid`, never 0.
     pub user: String,
     pub env: Vec<String>,
@@ -64,6 +81,25 @@ pub trait ContainerBackend: Send + Sync + 'static {
     async fn image(&self, image: &ImageRef) -> anyhow::Result<ImageFacts>;
     /// Creates the container on `network` and returns its id; it isn't started.
     async fn create(&self, plan: &ContainerPlan, network: &str) -> anyhow::Result<String>;
+    /// Every network labelled with `stack` and with a service label (labels checked again by
+    /// the runner).
+    async fn list_networks(&self, stack: &str) -> anyhow::Result<Vec<Network>>;
+    /// The network `name`, if there is one.
+    async fn inspect_network(&self, name: &str) -> anyhow::Result<Option<Network>>;
+    /// Creates a private, non-internal bridge network with `labels`; returns its id.
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: &HashMap<String, String>,
+    ) -> anyhow::Result<String>;
+    async fn remove_network(&self, id: &str) -> anyhow::Result<()>;
+    /// Attaches `container` to `network` (already attached counts as done).
+    async fn connect(&self, network: &str, container: &str) -> anyhow::Result<()>;
+    /// Detaches it (not attached counts as done).
+    async fn disconnect(&self, network: &str, container: &str) -> anyhow::Result<()>;
+    /// The ids of the stack's functions service containers: compose project `project`, compose
+    /// service `functions`.
+    async fn functions_containers(&self, project: &str) -> anyhow::Result<Vec<String>>;
     async fn start(&self, id: &str) -> anyhow::Result<()>;
     async fn stop(&self, id: &str) -> anyhow::Result<()>;
     async fn remove(&self, id: &str) -> anyhow::Result<()>;

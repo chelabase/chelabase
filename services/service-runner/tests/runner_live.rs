@@ -8,18 +8,20 @@
 //! just workbench test -p chelabase-service-runner --test runner_live -- --run-ignored only
 //! ```
 //!
-//! `service_containers_reach_only_the_public_listener` needs the stack recreated with this
-//! milestone's compose files (the `services` network and the functions service on it).
+//! Each test also starts a stand-in for the stack's functions container (busybox labelled with
+//! the test's compose project and `com.docker.compose.service=functions`), which the runner
+//! attaches to each service network. `service_containers_reach_nothing_but_their_own_port` uses
+//! the stack's real functions container instead (attached, then detached, by the runner).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bollard::Docker;
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
+use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    CommitContainerOptions, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    RemoveImageOptions,
+    CommitContainerOptions, CreateContainerOptions, ListContainersOptions, ListNetworksOptions,
+    RemoveContainerOptions, RemoveImageOptions,
 };
 use futures_util::StreamExt as _;
 use serde_json::json;
@@ -27,7 +29,7 @@ use service_runner::app::{AppState, router};
 use service_runner::backend::ContainerBackend;
 use service_runner::docker::DockerBackend;
 use service_runner::reconcile::{Action, Desired, DesiredSource, MetadataDesired, reconcile_once};
-use service_runner::runner::{EnsureRequest, Key, Runner};
+use service_runner::runner::{EnsureRequest, Key, Runner, container_name};
 use service_runner::spec::Caps;
 use service_runner::{BRANCH_LABEL, DEPLOYMENT_LABEL, SERVICE_LABEL, STACK_LABEL};
 use uuid::Uuid;
@@ -43,23 +45,17 @@ fn docker() -> Docker {
 /// A throwaway stack: its label, its own (non-internal) network, and the test image.
 struct Fixture {
     docker: Docker,
+    /// The throwaway stack label, also the stand-in compose project.
     stack: String,
-    network: String,
     image: String,
+    /// The stand-in functions container.
+    functions: String,
 }
 
 impl Fixture {
     async fn new() -> Fixture {
         let docker = docker();
         let stack = format!("m10t-{}", hex());
-        let network = format!("{stack}_services");
-        docker
-            .create_network(NetworkCreateRequest {
-                name: network.clone(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
         // busybox + httpd on 8080 + VOLUME /data, no USER.
         let seed = docker
             .create_container(
@@ -94,21 +90,47 @@ impl Fixture {
             .await
             .unwrap();
         remove(&docker, &seed.id).await;
-        Fixture {
+        let mut f = Fixture {
             docker,
             stack,
-            network,
             image,
-        }
+            functions: String::new(),
+        };
+        let project = f.stack.clone();
+        // On the default bridge (a container in `none` mode can't join other networks).
+        f.functions = f
+            .container(
+                "functions",
+                &[
+                    ("com.docker.compose.project", &project),
+                    ("com.docker.compose.service", "functions"),
+                ],
+                "bridge",
+            )
+            .await;
+        f
     }
 
     fn runner(&self) -> Runner {
         Runner::new(
             Arc::new(DockerBackend::connect().unwrap()),
             &self.stack,
-            &self.network,
+            &self.stack,
             Caps::default(),
         )
+    }
+
+    /// The container's address on its service network.
+    async fn address(&self, id: &str) -> String {
+        self.docker
+            .inspect_container(id, None)
+            .await
+            .unwrap()
+            .network_settings
+            .and_then(|n| n.networks)
+            .and_then(|n| n.into_values().next())
+            .and_then(|e| e.ip_address)
+            .expect("an address")
     }
 
     fn spec(&self) -> serde_json::Value {
@@ -116,8 +138,12 @@ impl Fixture {
                "resources": {"memory_mb": 128, "cpus": 0.5}})
     }
 
-    /// A container that sleeps, with `labels` (none: like any compose service).
+    /// A container that sleeps, with `labels` (none: like any compose service), on no network.
     async fn plain(&self, name: &str, labels: &[(&str, &str)]) -> String {
+        self.container(name, labels, "none").await
+    }
+
+    async fn container(&self, name: &str, labels: &[(&str, &str)], network: &str) -> String {
         let c = self
             .docker
             .create_container(
@@ -135,7 +161,7 @@ impl Fixture {
                             .collect(),
                     ),
                     host_config: Some(HostConfig {
-                        network_mode: Some("none".into()),
+                        network_mode: Some(network.into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -181,7 +207,34 @@ impl Fixture {
                 remove(&self.docker, c.id.as_deref().unwrap()).await;
             }
         }
-        self.docker.remove_network(&self.network).await.ok();
+        // The runner's networks of this stack (and its `-b`/`-other` variants), detached first:
+        // a real functions container may still be on one after a failed test.
+        let nets = self
+            .docker
+            .list_networks(None::<ListNetworksOptions>)
+            .await
+            .unwrap();
+        for n in nets {
+            let name = n.name.unwrap_or_default();
+            if !name.contains(&self.stack) {
+                continue;
+            }
+            if let Ok(i) = self.docker.inspect_network(&name, None).await {
+                for c in i.containers.unwrap_or_default().into_keys() {
+                    self.docker
+                        .disconnect_network(
+                            &name,
+                            bollard::models::NetworkDisconnectRequest {
+                                container: c,
+                                force: Some(true),
+                            },
+                        )
+                        .await
+                        .ok();
+                }
+            }
+            self.docker.remove_network(&name).await.ok();
+        }
         self.docker
             .remove_image(
                 &self.image,
@@ -283,7 +336,9 @@ async fn ensure_stop_remove_and_hardening() {
     assert_eq!(h.memory_swap, Some(128 * 1024 * 1024));
     assert_eq!(h.nano_cpus, Some(500_000_000));
     assert_eq!(h.pids_limit, Some(256));
-    assert_eq!(h.network_mode.as_deref(), Some(f.network.as_str()));
+    // Its own network (audit B3), named and labelled like the container.
+    let net = container_name(&f.stack, k.service_id, k.branch_id);
+    assert_eq!(h.network_mode.as_deref(), Some(net.as_str()));
     assert!(h.binds.unwrap_or_default().is_empty());
     assert!(h.devices.unwrap_or_default().is_empty());
     assert_eq!(h.privileged, Some(false));
@@ -311,7 +366,26 @@ async fn ensure_stop_remove_and_hardening() {
         .unwrap_or_default()
         .into_keys()
         .collect();
-    assert_eq!(networks, std::slice::from_ref(&f.network));
+    assert_eq!(networks, std::slice::from_ref(&net));
+    let n = f.docker.inspect_network(&net, None).await.unwrap();
+    assert_eq!(n.internal, Some(false), "services reach the internet");
+    let nl = n.labels.unwrap_or_default();
+    assert_eq!(nl[STACK_LABEL], f.stack);
+    assert_eq!(nl[SERVICE_LABEL], k.service_id.to_string());
+    let mut attached: Vec<String> = n.containers.unwrap_or_default().into_keys().collect();
+    attached.sort();
+    let mut want = vec![c.id.clone(), f.functions.clone()];
+    want.sort();
+    assert_eq!(
+        attached, want,
+        "the container and the functions service, nothing else"
+    );
+    // Created from the inspected image id (audit S2), with a keyed env digest.
+    let image_id = f.docker.inspect_image(&f.image).await.unwrap().id.unwrap();
+    assert_eq!(i.image.as_deref(), Some(image_id.as_str()));
+    let digest = &labels[service_runner::runner::ENV_DIGEST_LABEL];
+    assert_eq!(digest.len(), 64);
+    assert!(!labels.values().any(|v| v.contains("hello")));
     let (code, out) = exec(&f.docker, &c.id, &["id", "-u"]).await;
     assert_eq!((code, out.trim()), (0, "65532"));
     let (code, _) = exec(&f.docker, &c.id, &["touch", "/root-write"]).await;
@@ -337,6 +411,10 @@ async fn ensure_stop_remove_and_hardening() {
     assert!(runner.logs(&c.id).await.is_ok());
     runner.remove(&c.id).await.unwrap();
     assert_eq!(f.state(&c.id).await, None);
+    assert!(
+        f.docker.inspect_network(&net, None).await.is_err(),
+        "the network goes with it"
+    );
     f.finish().await;
 }
 
@@ -472,7 +550,7 @@ async fn two_stacks_reconcile_apart() {
     let rb = Runner::new(
         Arc::new(DockerBackend::connect().unwrap()),
         &b_stack,
-        &f.network,
+        &f.stack,
         Caps::default(),
     );
     let spec = f.spec();
@@ -602,10 +680,27 @@ async fn reconcile_follows_the_metadata() {
         }
     );
     let runner = f.runner();
-    reconcile_once(&runner, &source).await.unwrap();
+    // Reconcile never creates (audit B1): only the functions service's ensure does.
+    assert!(reconcile_once(&runner, &source).await.unwrap().is_empty());
+    assert!(runner.ours().await.unwrap().is_empty());
+    runner
+        .ensure(&EnsureRequest {
+            service_id: svc.id,
+            branch_id: branch.as_uuid(),
+            deployment_id: deployments[0],
+            spec: spec.clone(),
+            env: [("API_KEY".to_string(), "s3cret".to_string())].into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        reconcile_once(&runner, &source).await.unwrap().is_empty(),
+        "converged"
+    );
     let ours = runner.ours().await.unwrap();
     assert_eq!(ours.len(), 1);
     assert!(ours[0].running());
+    let net = container_name(&f.stack, svc.id, branch.as_uuid());
     client.set_enabled(branch, svc.id, false).await.unwrap();
     reconcile_once(&runner, &source).await.unwrap();
     assert_eq!(f.state(&ours[0].id).await.as_deref(), Some("exited"));
@@ -616,6 +711,10 @@ async fn reconcile_follows_the_metadata() {
     reconcile_once(&runner, &source).await.unwrap();
     assert_eq!(f.state(&ours[0].id).await, None);
     assert!(runner.ours().await.unwrap().is_empty());
+    assert!(
+        f.docker.inspect_network(&net, None).await.is_err(),
+        "its network went too"
+    );
 
     f.finish().await;
     client.pool().close().await;
@@ -625,57 +724,279 @@ async fn reconcile_follows_the_metadata() {
         .unwrap();
 }
 
-/// From a runner-made container on the stack's `services` network: the functions service's
-/// public listener answers; its internal listener, the metadata database, NATS, SeaweedFS and
-/// the orchestrator don't. Needs the stack recreated with this milestone's compose files.
+/// AC 9 on the stack itself: from a runner-made container, every listener of the stack's real
+/// functions container (attached to the container's network by the runner), the metadata
+/// database, NATS, SeaweedFS, the orchestrator, the runner's API and a second service's container
+/// are all unreachable; the functions container reaches the service. The test's containers carry
+/// a throwaway stack label; the runner detaches the functions container when it removes them.
 #[tokio::test]
-#[ignore = "needs a workbench stack running this milestone's compose files"]
-async fn service_containers_reach_only_the_public_listener() {
+#[ignore = "needs the workbench stack (its real functions container)"]
+async fn service_containers_reach_nothing_but_their_own_port() {
     let project =
         std::env::var("CHELABASE_COMPOSE_PROJECT").expect("CHELABASE_COMPOSE_PROJECT (stack.env)");
-    let network = format!("{project}_services");
-    let d = docker();
-    d.inspect_network(&network, None).await.unwrap_or_else(|e| {
-        panic!("{network}: recreate the stack with this milestone's compose files ({e})")
-    });
     let f = Fixture::new().await;
-    let runner = Runner::new(
-        Arc::new(DockerBackend::connect().unwrap()),
-        &f.stack,
-        &network,
-        Caps::default(),
+    let backend = Arc::new(DockerBackend::connect().unwrap());
+    let functions = backend.functions_containers(&project).await.unwrap();
+    assert_eq!(
+        functions.len(),
+        1,
+        "the stack's functions container: {functions:?}"
     );
-    let c = runner.ensure(&request(&key(), f.spec())).await.unwrap();
-    let probe = |target: &'static str| {
-        let (d, id) = (d.clone(), c.id.clone());
+    let runner = Runner::new(backend, &f.stack, &project, Caps::default());
+    let attacker = runner.ensure(&request(&key(), f.spec())).await.unwrap();
+    let victim = runner.ensure(&request(&key(), f.spec())).await.unwrap();
+    let net = attacker.label(BRANCH_LABEL).map(|b| {
+        container_name(
+            &f.stack,
+            attacker.label(SERVICE_LABEL).unwrap().parse().unwrap(),
+            b.parse().unwrap(),
+        )
+    });
+    let net = net.unwrap();
+    let fn_ip = f
+        .docker
+        .inspect_network(&net, None)
+        .await
+        .unwrap()
+        .containers
+        .unwrap_or_default()
+        .remove(&functions[0])
+        .and_then(|e| e.ipv4_address)
+        .expect("the functions container on the attacker's network")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    let victim_ip = f.address(&victim.id).await;
+    let attacker_ip = f.address(&attacker.id).await;
+    let probe = |target: String| {
+        let (d, id) = (f.docker.clone(), attacker.id.clone());
         async move {
             exec(
                 &d,
                 &id,
-                &["wget", "-q", "-T", "3", "-O", "/dev/null", target],
+                &["wget", "-q", "-T", "3", "-O", "/dev/null", &target],
             )
             .await
             .0
         }
     };
-    assert_eq!(
-        probe("http://functions:8091/health").await,
-        0,
-        "the public listener"
+    let mut denied: Vec<String> = [8091, 8080, 8092, 8093]
+        .iter()
+        .map(|p| format!("http://{fn_ip}:{p}/health"))
+        .collect();
+    denied.extend(
+        [
+            "http://functions:8091/health",
+            "http://functions-public:8091/health",
+            "http://functions-internal:8080/",
+            "http://functions-control:8080/internal/invoke/x/y",
+            "http://metadata-db:5432/",
+            "http://nats:8222/",
+            "http://seaweedfs:8333/",
+            "http://orchestrator:8081/health",
+            "http://service-runner-control:8094/health",
+        ]
+        .map(String::from),
     );
-    for denied in [
-        "http://functions:8080/internal/bundles/x/y",
-        "http://functions-internal:8080/",
-        "http://functions-control:8080/internal/invoke/x/y",
-        "http://metadata-db:5432/",
-        "http://nats:8222/",
-        "http://seaweedfs:8333/",
-        "http://orchestrator:8081/health",
-        "http://service-runner-control:8094/health",
-    ] {
-        assert_ne!(probe(denied).await, 0, "{denied} must be unreachable");
+    denied.push(format!("http://{victim_ip}:8080/sh"));
+    let mut reached = Vec::new();
+    for target in &denied {
+        if probe(target.clone()).await == 0 {
+            reached.push(target.clone());
+        }
     }
-    runner.remove(&c.id).await.unwrap();
-    // Removes the test's own network and image; the stack's network stays.
+    // The functions container reaches the service (traffic flows functions → container).
+    let (fn_code, fn_out) = exec(
+        &f.docker,
+        &functions[0],
+        &[
+            "curl",
+            "-fsS",
+            "-m",
+            "3",
+            "-o",
+            "/dev/null",
+            &format!("http://{attacker_ip}:8080/sh"),
+        ],
+    )
+    .await;
+    runner.remove(&attacker.id).await.unwrap();
+    runner.remove(&victim.id).await.unwrap();
+    let still: Vec<String> = f
+        .docker
+        .inspect_container(&functions[0], None)
+        .await
+        .unwrap()
+        .network_settings
+        .and_then(|n| n.networks)
+        .unwrap_or_default()
+        .into_keys()
+        .filter(|n| n.contains(&f.stack))
+        .collect();
     f.finish().await;
+    assert!(
+        reached.is_empty(),
+        "a service container reached {reached:?}"
+    );
+    assert_eq!(
+        fn_code, 0,
+        "the functions container must reach the service: {fn_out}"
+    );
+    assert!(
+        still.is_empty(),
+        "the functions container is detached afterwards: {still:?}"
+    );
+}
+
+/// A busybox image committed with `changes` (Dockerfile lines), removed by the test.
+async fn commit_image(docker: &Docker, stack: &str, changes: &str) -> String {
+    let seed = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: Some(format!("{stack}-seed-{}", hex())),
+                ..Default::default()
+            }),
+            ContainerCreateBody {
+                image: Some("busybox:latest".into()),
+                cmd: Some(vec!["true".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let image = format!("m10t-img:{}", hex());
+    let (repo, tag) = image.split_once(':').unwrap();
+    docker
+        .commit_container(
+            CommitContainerOptions {
+                container: Some(seed.id.clone()),
+                repo: Some(repo.into()),
+                tag: Some(tag.into()),
+                changes: Some(changes.into()),
+                ..Default::default()
+            },
+            bollard::models::ContainerConfig::default(),
+        )
+        .await
+        .unwrap();
+    remove(docker, &seed.id).await;
+    image
+}
+
+/// Audit B2: an image's own `chelabase.dev/*` and `com.docker.compose.*` labels never reach a
+/// runner container (they would make it a compute, or a compose service, to every other socket
+/// holder): ensure refuses such an image and creates nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's Docker engine"]
+async fn image_labels_never_reach_the_container() {
+    let f = Fixture::new().await;
+    let image = commit_image(
+        &f.docker,
+        &f.stack,
+        "CMD [\"httpd\", \"-f\", \"-p\", \"8080\", \"-h\", \"/bin\"]\n\
+         LABEL chelabase.dev/endpoint-id=ep-victim000001\n\
+         LABEL com.docker.compose.project=chelabase-epic-edge-functions\n\
+         LABEL com.docker.compose.service=metadata-db",
+    )
+    .await;
+    let mut spec = f.spec();
+    spec["image"] = json!(image);
+    let result = f.runner().ensure(&request(&key(), spec)).await;
+    let computes = f
+        .docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![
+                    "chelabase.dev/endpoint-id".to_string(),
+                    format!("{STACK_LABEL}={}", f.stack),
+                ],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    f.docker
+        .remove_image(
+            &image,
+            Some(RemoveImageOptions {
+                force: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .ok();
+    let listed = computes.len();
+    f.finish().await;
+    assert_eq!(listed, 0, "a member image's labels reached a container");
+    assert!(
+        matches!(result, Err(service_runner::runner::RunnerError::Invalid(_))),
+        "ensure must refuse the image: {result:?}"
+    );
+}
+
+/// Audit B3: one service's container can't reach another's port.
+#[tokio::test]
+#[ignore = "needs the workbench stack's Docker engine"]
+async fn service_containers_cannot_reach_each_other() {
+    let f = Fixture::new().await;
+    let runner = f.runner();
+    let attacker = runner.ensure(&request(&key(), f.spec())).await.unwrap();
+    let victim = runner.ensure(&request(&key(), f.spec())).await.unwrap();
+    let ip = f
+        .docker
+        .inspect_container(&victim.id, None)
+        .await
+        .unwrap()
+        .network_settings
+        .and_then(|n| n.networks)
+        .and_then(|n| n.into_values().next())
+        .and_then(|e| e.ip_address)
+        .expect("the victim's address");
+    let (code, _) = exec(
+        &f.docker,
+        &attacker.id,
+        &[
+            "wget",
+            "-q",
+            "-T",
+            "3",
+            "-O",
+            "/dev/null",
+            &format!("http://{ip}:8080/sh"),
+        ],
+    )
+    .await;
+    // The (stand-in) functions container reaches both.
+    let mut from_functions = Vec::new();
+    for c in [&attacker, &victim] {
+        let ip = f.address(&c.id).await;
+        from_functions.push(
+            exec(
+                &f.docker,
+                &f.functions,
+                &[
+                    "wget",
+                    "-q",
+                    "-T",
+                    "3",
+                    "-O",
+                    "/dev/null",
+                    &format!("http://{ip}:8080/sh"),
+                ],
+            )
+            .await
+            .0,
+        );
+    }
+    f.finish().await;
+    assert_ne!(code, 0, "the attacker reached the victim's port directly");
+    assert_eq!(
+        from_functions,
+        [0, 0],
+        "the functions service reaches each service"
+    );
 }

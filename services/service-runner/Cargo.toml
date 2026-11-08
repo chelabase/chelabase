@@ -23,8 +23,14 @@ bytes = { workspace = true }
 chelabase-types = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
+# A random digest key when none is derived (tests).
+getrandom = { workspace = true }
+hex = { workspace = true }
+# The keyed digest of a container's environment (its label).
+hmac = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 # Desired state: the metadata's container services (read only).
 sqlx = { workspace = true }
 # The callers' bearers, compared in constant time.
