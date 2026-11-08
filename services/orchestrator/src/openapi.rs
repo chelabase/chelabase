@@ -895,6 +895,9 @@ impl functions::FunctionsPort for Doc {
     async fn secret_names(&self, branch: BranchId, function: Uuid) -> Result<Vec<String>, MetadataError> {
         match *self {}
     }
+    async fn set_function_last_error(&self, branch: BranchId, function: Uuid, error: Option<&str>) -> Result<(), MetadataError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -1329,6 +1332,7 @@ mod tests {
             ),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions", "listFunctions"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "listFunctionDeployments"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/logs", "getServiceLogs"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "listFunctionSchedules"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers", "listFunctionTriggers"),
             ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets", "listFunctionSecrets"),
@@ -1920,6 +1924,9 @@ mod tests {
             "SchemaPrivileges",
             "SequenceParams",
             "SequencePrivilege",
+            "ServiceHealth",
+            "ServiceResources",
+            "ServiceSpec",
             "SkipReason",
             "StatementResult",
             "StorageRefDesc",

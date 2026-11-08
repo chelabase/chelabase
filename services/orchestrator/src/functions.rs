@@ -115,6 +115,13 @@ pub trait FunctionsPort: Send + Sync {
         branch: BranchId,
         function: Uuid,
     ) -> impl Future<Output = Result<Vec<String>, MetadataError>> + Send;
+    /// m11: a container rollover that failed sets the service's `last_error` on the branch.
+    fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
 }
 
 impl FunctionsPort for MetadataClient {
@@ -229,6 +236,14 @@ impl FunctionsPort for MetadataClient {
     ) -> Result<Vec<String>, MetadataError> {
         MetadataClient::secret_names(self, branch, function).await
     }
+    async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_function_last_error(self, branch, function, error).await
+    }
 }
 
 /// Why the functions service didn't store a bundle.
@@ -243,8 +258,26 @@ pub enum SinkError {
 
 pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send + 'a>>;
 
+/// m11: why the functions service's control side didn't do a container-service call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlError {
+    /// It answered this status with this error code and message.
+    Status { status: u16, code: String, message: String },
+    /// It couldn't be reached, or isn't configured.
+    Unavailable(String),
+}
+
+pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
+
+fn control_unavailable<'a, T: Send + 'a>() -> ControlFuture<'a, T> {
+    Box::pin(async { Err(ControlError::Unavailable("container services aren't configured".into())) })
+}
+
 /// Where a deployment's bundle goes before its row is written: the functions service's
 /// `PUT /internal/bundles/{database_id}/{sha256}`, the manifest's bytes as the body.
+///
+/// m11: and the same control side's container-service calls (`/internal/services/*`), which the
+/// functions service makes to the service runner with the branch's secrets.
 pub trait BundleSink: Send + Sync {
     fn put<'a>(
         &'a self,
@@ -252,6 +285,18 @@ pub trait BundleSink: Send + Sync {
         sha256: &'a str,
         manifest: bytes::Bytes,
     ) -> SinkFuture<'a>;
+    /// The image's registry digest reference (`name@sha256:…`).
+    fn resolve_image<'a>(&'a self, _image: &'a str) -> ControlFuture<'a, String> {
+        control_unavailable()
+    }
+    /// Ensures the deployment's container on the branch and waits until it's healthy.
+    fn rollout(&self, _branch: BranchId, _function: Uuid, _deployment: Uuid) -> ControlFuture<'_, ()> {
+        control_unavailable()
+    }
+    /// The deployment's container's last 200 log lines on the branch.
+    fn service_logs(&self, _branch: BranchId, _function: Uuid, _deployment: Uuid) -> ControlFuture<'_, String> {
+        control_unavailable()
+    }
 }
 
 /// The functions service's internal listener (`CHELABASE_FUNCTIONS_INTERNAL_URL`), with the
@@ -307,6 +352,70 @@ impl BundleSink for HttpBundleSink {
             }
         })
     }
+
+    fn resolve_image<'a>(&'a self, image: &'a str) -> ControlFuture<'a, String> {
+        self.resolve_image_http(image)
+    }
+
+    fn rollout(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> ControlFuture<'_, ()> {
+        Box::pin(async move {
+            let body = serde_json::json!({"branch_id": branch, "function_id": function, "deployment_id": deployment});
+            self.control(reqwest::Method::POST, "/internal/services/rollout", Some(body), ROLLOUT_WAIT).await.map(drop)
+        })
+    }
+
+    fn service_logs(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> ControlFuture<'_, String> {
+        Box::pin(async move {
+            let path = format!("/internal/services/logs/{branch}/{function}/{deployment}");
+            let resp = self.control(reqwest::Method::GET, &path, None, std::time::Duration::from_secs(30)).await?;
+            resp.text().await.map_err(|e| ControlError::Unavailable(e.to_string()))
+        })
+    }
+}
+
+impl HttpBundleSink {
+    /// One control-side call; its answer's body when 2xx.
+    async fn control(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Response, ControlError> {
+        let Some(url) = &self.url else {
+            return Err(ControlError::Unavailable("CHELABASE_FUNCTIONS_INTERNAL_URL is unset".into()));
+        };
+        let mut req = self.http.request(method, format!("{url}{path}")).bearer_auth(&self.token).timeout(timeout);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.map_err(|e| ControlError::Unavailable(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(resp);
+        }
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        Err(ControlError::Status {
+            status,
+            code: v["error"]["code"].as_str().unwrap_or_default().to_owned(),
+            message: v["error"]["message"].as_str().unwrap_or_default().to_owned(),
+        })
+    }
+}
+
+/// A rollover waits up to 60 s for health, after a pull.
+const ROLLOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(720);
+
+impl HttpBundleSink {
+    fn resolve_image_http<'a>(&'a self, image: &'a str) -> ControlFuture<'a, String> {
+        Box::pin(async move {
+            let resp = self
+                .control(reqwest::Method::POST, "/internal/services/images/resolve", Some(serde_json::json!({"image": image})), ROLLOUT_WAIT)
+                .await?;
+            let v: serde_json::Value = resp.json().await.map_err(|e| ControlError::Unavailable(e.to_string()))?;
+            v["image"].as_str().map(str::to_owned).ok_or_else(|| ControlError::Unavailable("no image in the answer".into()))
+        })
+    }
 }
 
 /// A shared sink.
@@ -351,6 +460,7 @@ where
         .routes(routes!(list_functions))
         .routes(routes!(put_function, update_function, delete_function))
         .routes(routes!(create_deployment, list_deployments))
+        .routes(routes!(service_logs))
         .routes(routes!(list_secrets))
         .routes(routes!(put_secret, delete_secret))
 }
@@ -544,18 +654,101 @@ struct CreateDeploymentRequest {
     activate: Option<bool>,
 }
 
-/// An external service: requests to `/services/v1/{name}/{rest}` go to `url` with the rest
-/// under its path; `health_path` (under it too) is polled every 15 s.
+/// A service's target. `external`: requests to `/services/v1/{name}/{rest}` go to `url` with
+/// the rest under its path; `health_path` (under it too) is polled every 15 s. `container` (m11):
+/// the platform runs `image` (a tag is resolved to its registry digest when deployed) and
+/// requests go to its `port`; a new deployment rolls over once the new container is healthy.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct ServiceSpec {
-    /// `external`.
+    /// `external` or `container`.
     backend: String,
-    /// `https` (or `http` where the operator allows it), no credentials, query or fragment; a
-    /// public address, or an allowlisted host outside the platform.
-    url: String,
-    /// Starts with `/`, at most 256 printable ASCII characters, no `#`.
-    health_path: String,
+    /// `external`: `https` (or `http` where the operator allows it), no credentials, query or
+    /// fragment; a public address, or an allowlisted host outside the platform.
+    url: Option<String>,
+    /// `external`: starts with `/`, at most 256 printable ASCII characters, no `#`.
+    /// `container` (default `/`): starts with `/`, at most 256 of `A-Z a-z 0-9 / . _ ~ -`.
+    health_path: Option<String>,
+    /// `container`: `name:tag` or `name@sha256:<64 hex>` from a public registry.
+    image: Option<String>,
+    /// `container`: the port the image listens on (1-65535); it gets it as `PORT`.
+    port: Option<u16>,
+    /// `container`: limits below the platform's caps (512 MiB and 1 CPU by default).
+    resources: Option<ServiceResources>,
+}
+
+/// A container's limits (never above the platform's caps).
+#[derive(Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ServiceResources {
+    /// At least 16.
+    memory_mb: Option<u32>,
+    /// At least 0.01.
+    cpus: Option<f64>,
+}
+
+/// An error from the functions service's container-service calls, as the API answers it.
+pub(crate) fn control_error(err: ControlError) -> ApiError {
+    match err {
+        ControlError::Status { status: 422, message, .. } => unprocessable(&message),
+        ControlError::Status { status: 409, code, message } if code == "unhealthy" => refused("unhealthy", &message),
+        ControlError::Status { status: 404, code, .. } if code == "no_container" => {
+            ApiError::not_found("the service has no running container on this branch")
+        }
+        ControlError::Status { code, .. } if code == "runner_unavailable" => runner_unavailable(),
+        ControlError::Unavailable(why) => {
+            warn!("functions control side unavailable: {why}");
+            runner_unavailable()
+        }
+        ControlError::Status { status, code, message } => {
+            warn!("functions control side answered {status} {code}: {message}");
+            ApiError::new(502, ErrorCode::Unavailable, "the functions service refused the call")
+        }
+    }
+}
+
+fn runner_unavailable() -> ApiError {
+    ApiError::new(503, ErrorCode::RunnerUnavailable, "container services are unavailable (the service runner isn't running)")
+}
+
+/// A container spec as stored, or why it's refused: its image resolved to a digest.
+async fn checked_container<M, J>(state: &AppState<M, J>, spec: &ServiceSpec) -> Result<serde_json::Value, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if spec.url.is_some() {
+        return Err(unprocessable("a container service has no url"));
+    }
+    let (Some(image), Some(port)) = (&spec.image, spec.port) else {
+        return Err(unprocessable("a container service has an image and a port"));
+    };
+    if port == 0 {
+        return Err(unprocessable("port must be 1-65535"));
+    }
+    let path = spec.health_path.as_deref().unwrap_or("/");
+    if !path.starts_with('/') || path.len() > 256 || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._~-".contains(&b)) {
+        return Err(unprocessable("health_path starts with / and is at most 256 characters from A-Z a-z 0-9 / . _ ~ -"));
+    }
+    let mut out = serde_json::json!({"backend": "container", "port": port, "health_path": path});
+    if let Some(r) = &spec.resources {
+        if r.memory_mb.is_some_and(|m| m < 16) {
+            return Err(unprocessable("resources.memory_mb must be at least 16"));
+        }
+        if r.cpus.is_some_and(|c| !c.is_finite() || c < 0.01) {
+            return Err(unprocessable("resources.cpus must be at least 0.01"));
+        }
+        let mut res = serde_json::Map::new();
+        if let Some(m) = r.memory_mb {
+            res.insert("memory_mb".into(), m.into());
+        }
+        if let Some(c) = r.cpus {
+            res.insert("cpus".into(), c.into());
+        }
+        out["resources"] = res.into();
+    }
+    out["image"] = state.bundles.resolve_image(image).await.map_err(control_error)?.into();
+    Ok(out)
 }
 
 /// The spec as stored, or why it's refused (422).
@@ -564,18 +757,25 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    if spec.backend != "external" {
-        return Err(unprocessable("backend must be `external`"));
+    match spec.backend.as_str() {
+        "external" => {}
+        "container" => return checked_container(state, spec).await,
+        _ => return Err(unprocessable("backend must be `external` or `container`")),
     }
+    if spec.image.is_some() || spec.port.is_some() || spec.resources.is_some() {
+        return Err(unprocessable("an external service has a url and a health path only"));
+    }
+    let (Some(spec_url), Some(path)) = (&spec.url, &spec.health_path) else {
+        return Err(unprocessable("an external service has a url and a health_path"));
+    };
     let url = state
         .services
-        .check_resolved(&spec.url)
+        .check_resolved(spec_url)
         .await
         .map_err(|refused| unprocessable(&format!("url: {refused}")))?;
     if url.query().is_some() || url.fragment().is_some() {
         return Err(unprocessable("url: no query or fragment"));
     }
-    let path = &spec.health_path;
     if !path.starts_with('/') || path.len() > 256 || path.contains('#') || !path.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(unprocessable("health_path starts with / and is at most 256 printable ASCII characters, no #"));
     }
@@ -1084,6 +1284,13 @@ where
             Some(None) => Some(None),
             None => None,
         };
+        // m11: a container service's rollback rolls over like a deploy.
+        if let (Some(target), FunctionKind::Service) = (request.active_deployment_id, function.kind) {
+            let deployments = state.metadata.list_deployments(function.id).await.map_err(|e| metadata_error("list deployments", e))?;
+            if let Some(d) = deployments.iter().find(|d| d.id == target) {
+                roll_over(&state, branch.id, function.id, target, &d.spec).await?;
+            }
+        }
         let mut wrote = false;
         let result = apply_patch(&state, branch.id, function.id, &request, run_as.as_ref(), &mut wrote).await;
         if wrote {
@@ -1104,6 +1311,47 @@ where
         Ok(Json(answer).into_response())
     }
     .await)
+}
+
+/// m11: before `deployment` becomes a container service's active deployment on `branch`, the
+/// functions service ensures its container and waits for it to pass its health check. Nothing
+/// to do for another spec, a service not enabled on the branch (its container starts when it's
+/// enabled), or the deployment already active. A failure is the service's `last_error`.
+async fn roll_over<M, J>(
+    state: &AppState<M, J>,
+    branch: BranchId,
+    function: Uuid,
+    deployment: Uuid,
+    spec: &serde_json::Value,
+) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if spec.get("backend").and_then(|b| b.as_str()) != Some("container") {
+        return Ok(());
+    }
+    let serving = state
+        .metadata
+        .list_for_branch(branch)
+        .await
+        .map_err(|e| metadata_error("list branch functions", e))?
+        .into_iter()
+        .find(|s| s.function_id == function)
+        .filter(|s| s.enabled && s.deployment_id != deployment);
+    if serving.is_none() {
+        return Ok(());
+    }
+    let Err(err) = state.bundles.rollout(branch, function, deployment).await else {
+        return Ok(());
+    };
+    if let ControlError::Status { status: 409 | 422, message, .. } = &err {
+        let note = format!("deployment {deployment} wasn't switched to: {message}");
+        if let Err(e) = state.metadata.set_function_last_error(branch, function, Some(&note)).await {
+            warn!(branch_id = %branch, %function, "record a rollover's failure: {e}");
+        }
+    }
+    Err(control_error(err))
 }
 
 /// The PATCH's writes, in order; `wrote` tells which committed (a later one may fail).
@@ -1401,6 +1649,13 @@ where
             .await
             .map_err(|e| metadata_error("create deployment", e))?;
         if request.activate.unwrap_or(true) {
+            // m11: a container service that serves on the branch switches only once the new
+            // deployment's container is healthy; until then (and when it never is) the old one
+            // serves, and the new deployment stays recorded, inactive.
+            if let Err(e) = roll_over(&state, branch.id, function.id, deployment.id, &spec).await {
+                changed(&state, branch.id, &name).await;
+                return Err(e.with_extra("deployment_id", serde_json::Value::String(deployment.id.to_string())));
+            }
             state
                 .metadata
                 .set_active_deployment(branch.id, function.id, deployment.id)
@@ -1460,6 +1715,74 @@ where
                 .await
                 .map_err(|e| metadata_error("list deployments", e))?;
             Ok(Json(list.into_iter().map(Deployment::from).collect::<Vec<_>>()).into_response())
+        }
+        .await,
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/databases/{id}/branches/{branch_id}/functions/{name}/logs",
+    operation_id = "getServiceLogs",
+    tag = "functions",
+    summary = "A container service's last 200 log lines on the branch",
+    description = "Stdout and stderr of the container that runs the service's active deployment on the branch. Container services only; needs Developer (logs can hold what a service prints).",
+    params(
+        ("id" = Uuid, Path, description = "Database id"),
+        ("branch_id" = Uuid, Path, description = "Branch id"),
+        ("name" = String, Path, description = "Service name"),
+    ),
+    responses(
+        (status = 200, description = "The last 200 lines", body = String, content_type = "text/plain"),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: below Developer", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the service doesn't exist, or it has no running container on the branch", body = ErrorEnvelope),
+        (status = 409, description = "`conflict` with `reason` `not_deployed`: no deployment on the branch", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: not a container service", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`runner_unavailable`: the service runner isn't running", body = ErrorEnvelope),
+    ),
+)]
+async fn service_logs<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath((id, branch_id, name)): ApiPath<(Uuid, Uuid, String)>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    respond(
+        async {
+            let (_, record, branch) = begin(&state, &principal, ep::GET_SERVICE_LOGS.policy.access, id, branch_id).await?;
+            let function = find(&state, &record, &name).await?;
+            let st = state
+                .metadata
+                .list_for_branch(branch.id)
+                .await
+                .map_err(|e| metadata_error("list branch functions", e))?
+                .into_iter()
+                .find(|s| s.function_id == function.id)
+                .ok_or_else(|| refused("not_deployed", "the service has no deployment on this branch"))?;
+            let deployments = state
+                .metadata
+                .list_deployments(function.id)
+                .await
+                .map_err(|e| metadata_error("list deployments", e))?;
+            let container = deployments
+                .iter()
+                .find(|d| d.id == st.deployment_id)
+                .is_some_and(|d| d.spec.get("backend").and_then(|b| b.as_str()) == Some("container"));
+            if function.kind != FunctionKind::Service || !container {
+                return Err(unprocessable("logs are kept for container services only"));
+            }
+            let text = state
+                .bundles
+                .service_logs(branch.id, function.id, st.deployment_id)
+                .await
+                .map_err(control_error)?;
+            Ok(([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
         }
         .await,
     )

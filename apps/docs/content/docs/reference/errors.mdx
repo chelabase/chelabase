@@ -170,6 +170,7 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 422 | `unknown_column` | Sign-up `data` names a column the users table doesn't have or sign-up can't set. |
 | 422 | `constraint_violation` | The users table refused the row. `error.constraint` names the constraint. |
 | 503 | `identity_unavailable` | The identity service that holds the project's users can't be reached. Try again. When a deactivate or delete answers this, the user's sessions were already revoked. |
+| 503 | `runner_unavailable` | The service runner isn't running (the `services` Compose profile is off), so container services can't be deployed, rolled over or read. External services still work. |
 
 ### SQL editor
 

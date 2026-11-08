@@ -117,4 +117,5 @@ export const ErrorCode = {
   invalid_successor: 'invalid_successor',
   exposure_unconfirmed: 'exposure_unconfirmed',
   identity_unavailable: 'identity_unavailable',
+  runner_unavailable: 'runner_unavailable',
 } as const;

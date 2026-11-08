@@ -2871,6 +2871,10 @@ struct FakeBundles {
     status: Arc<Mutex<Option<u16>>>,
     /// While set, an upload signals the first and waits for the second before it answers.
     gate: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    /// m11: the control side's container-service calls: each rollout as (branch, function,
+    /// deployment), and the error every call answers with while set.
+    pub rollouts: Arc<Mutex<Vec<(BranchId, uuid::Uuid, uuid::Uuid)>>>,
+    pub control_error: Arc<Mutex<Option<orchestrator::functions::ControlError>>>,
 }
 
 impl orchestrator::functions::BundleSink for FakeBundles {
@@ -2895,6 +2899,34 @@ impl orchestrator::functions::BundleSink for FakeBundles {
                 _ => Ok(()),
             }
         })
+    }
+
+    fn resolve_image<'a>(&'a self, image: &'a str) -> orchestrator::functions::ControlFuture<'a, String> {
+        // A rollover's failure (409) is the rollout's alone.
+        let err = self
+            .control_error
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|e| !matches!(e, orchestrator::functions::ControlError::Status { status: 409, .. }));
+        let name = image.split([':', '@']).next().unwrap_or_default().to_owned();
+        Box::pin(async move {
+            match err {
+                Some(e) => Err(e),
+                None => Ok(format!("{name}@sha256:{}", "d".repeat(64))),
+            }
+        })
+    }
+
+    fn rollout(&self, branch: BranchId, function: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, ()> {
+        self.rollouts.lock().unwrap().push((branch, function, deployment));
+        let err = self.control_error.lock().unwrap().clone();
+        Box::pin(async move { err.map_or(Ok(()), Err) })
+    }
+
+    fn service_logs(&self, _: BranchId, _: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, String> {
+        let err = self.control_error.lock().unwrap().clone();
+        Box::pin(async move { err.map_or(Ok(format!("logs of {deployment}\n")), Err) })
     }
 }
 
@@ -5585,6 +5617,15 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             .filter(|(b, f, _)| *b == branch.as_uuid() && *f == function)
             .map(|(_, _, n)| n.clone())
             .collect())
+    }
+
+    async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        self.fn_state(branch, function, |st| st.last_error = error.map(str::to_owned)).map(drop)
     }
 }
 

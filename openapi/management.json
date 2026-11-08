@@ -2815,6 +2815,144 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/logs": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "A container service's last 200 log lines on the branch",
+        "description": "Stdout and stderr of the container that runs the service's active deployment on the branch. Container services only; needs Developer (logs can hold what a service prints).",
+        "operationId": "getServiceLogs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The last 200 lines",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Developer; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the service doesn't exist, or it has no running container on the branch; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict` with `reason` `not_deployed`: no deployment on the branch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: not a container service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`runner_unavailable`: the service runner isn't running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules": {
       "get": {
         "tags": [
@@ -25628,7 +25766,8 @@
           "member_offboarded",
           "invalid_successor",
           "exposure_unconfirmed",
-          "identity_unavailable"
+          "identity_unavailable",
+          "runner_unavailable"
         ]
       },
       "ErrorEnvelope": {
@@ -30204,26 +30343,81 @@
           "unhealthy"
         ]
       },
+      "ServiceResources": {
+        "type": "object",
+        "description": "A container's limits (never above the platform's caps).",
+        "properties": {
+          "cpus": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "At least 0.01."
+          },
+          "memory_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "At least 16.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ServiceSpec": {
         "type": "object",
-        "description": "An external service: requests to `/services/v1/{name}/{rest}` go to `url` with the rest\nunder its path; `health_path` (under it too) is polled every 15 s.",
+        "description": "A service's target. `external`: requests to `/services/v1/{name}/{rest}` go to `url` with\nthe rest under its path; `health_path` (under it too) is polled every 15 s. `container` (m11):\nthe platform runs `image` (a tag is resolved to its registry digest when deployed) and\nrequests go to its `port`; a new deployment rolls over once the new container is healthy.",
         "required": [
-          "backend",
-          "url",
-          "health_path"
+          "backend"
         ],
         "properties": {
           "backend": {
             "type": "string",
-            "description": "`external`."
+            "description": "`external` or `container`."
           },
           "health_path": {
-            "type": "string",
-            "description": "Starts with `/`, at most 256 printable ASCII characters, no `#`."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`external`: starts with `/`, at most 256 printable ASCII characters, no `#`.\n`container` (default `/`): starts with `/`, at most 256 of `A-Z a-z 0-9 / . _ ~ -`."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`container`: `name:tag` or `name@sha256:<64 hex>` from a public registry."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`container`: the port the image listens on (1-65535); it gets it as `PORT`.",
+            "minimum": 0
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceResources",
+                "description": "`container`: limits below the platform's caps (512 MiB and 1 CPU by default)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "url": {
-            "type": "string",
-            "description": "`https` (or `http` where the operator allows it), no credentials, query or fragment; a\npublic address, or an allowlisted host outside the platform."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`external`: `https` (or `http` where the operator allows it), no credentials, query or\nfragment; a public address, or an allowlisted host outside the platform."
           }
         },
         "additionalProperties": false

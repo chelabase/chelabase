@@ -1162,4 +1162,194 @@ mod functions {
         let (_, deployments) = w.json("tom", "GET", &w.path(w.w.dev, "/stub/deployments"), None).await;
         assert!(deployments.as_array().unwrap().is_empty());
     }
+
+    // --- m11: container services --------------------------------------------------------------
+
+    fn container(image: &str) -> Value {
+        json!({"spec": {"backend": "container", "image": image, "port": 8080}})
+    }
+
+    /// `echo`, a container service made by `tom` on `dev`.
+    async fn echo_world() -> World {
+        let w = service_world().await;
+        let (status, body) = w.json("tom", "PUT", &w.path(w.w.dev, "/echo"), Some(json!({"kind": "service"}))).await;
+        assert_eq!(status, 201, "{body}");
+        w
+    }
+
+    impl World {
+        async fn state(&self, name: &str) -> Value {
+            let (_, list) = self.json("dee", "GET", &self.path(self.w.dev, ""), None).await;
+            list.as_array().unwrap().iter().find(|f| f["name"] == name).unwrap().clone()
+        }
+        fn rollouts(&self) -> Vec<(BranchId, uuid::Uuid, uuid::Uuid)> {
+            self.w.app.bundles.rollouts.lock().unwrap().clone()
+        }
+    }
+
+    /// AC 1: a tenant admin deploys an image: its tag is resolved to a digest before it's stored,
+    /// the health path defaults to `/`; a service not yet enabled switches at once (nothing to
+    /// roll over); once enabled, a new image rolls over before it's active.
+    #[tokio::test]
+    async fn functions_container_deploy_resolves_and_rolls_over() {
+        let w = echo_world().await;
+        let (status, first) = w
+            .json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1")))
+            .await;
+        assert_eq!(status, 201, "{first}");
+        assert_eq!(
+            first["spec"],
+            json!({"backend": "container", "image": format!("ghcr.io/acme/echo@sha256:{}", "d".repeat(64)), "port": 8080, "health_path": "/"})
+        );
+        assert!(w.rollouts().is_empty(), "not serving yet: nothing to roll over");
+        assert_eq!(w.state("echo").await["deployment_id"], first["id"]);
+        let (status, _) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"enabled": true}))).await;
+        assert_eq!(status, 200);
+        let mut body = container("ghcr.io/acme/echo:2");
+        body["spec"]["health_path"] = json!("/healthz");
+        body["spec"]["resources"] = json!({"memory_mb": 256, "cpus": 0.5});
+        let (status, second) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(body)).await;
+        assert_eq!(status, 201, "{second}");
+        assert_eq!(second["spec"]["resources"], json!({"memory_mb": 256, "cpus": 0.5}));
+        let id: uuid::Uuid = second["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(w.rollouts().iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(w.w.dev, id)]);
+        assert_eq!(w.state("echo").await["deployment_id"], second["id"]);
+    }
+
+    /// AC 2: a new image that never passes its health check: 409 `unhealthy` with the reason
+    /// and the recorded (inactive) deployment; the old deployment stays active, and the reason
+    /// is the service's `last_error`.
+    #[tokio::test]
+    async fn functions_container_unhealthy_keeps_the_old_deployment() {
+        let w = echo_world().await;
+        let (_, first) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"enabled": true}))).await;
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
+            status: 409,
+            code: "unhealthy".into(),
+            message: "the new container didn't pass GET / within 60 s".into(),
+        });
+        let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:2"))).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["reason"], "unhealthy", "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("didn't pass"));
+        assert!(body["error"]["deployment_id"].is_string(), "{body}");
+        let st = w.state("echo").await;
+        assert_eq!(st["deployment_id"], first["id"], "the old deployment still serves");
+        assert!(st["last_error"].as_str().unwrap().contains("didn't pass"), "{st}");
+        let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, "/echo/deployments"), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 2);
+    }
+
+    /// AC 5: without the runner a container deploy is 503 `runner_unavailable` and records
+    /// nothing; external services still deploy.
+    #[tokio::test]
+    async fn functions_container_without_the_runner_is_refused() {
+        let w = echo_world().await;
+        *w.w.app.bundles.control_error.lock().unwrap() =
+            Some(orchestrator::functions::ControlError::Unavailable("no route to host".into()));
+        let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"]["code"], "runner_unavailable");
+        let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, "/echo/deployments"), None).await;
+        assert!(list.as_array().unwrap().is_empty());
+        w.json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"}))).await;
+        let (status, body) = w
+            .json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://hooks.example.test/api")))
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    /// Container deploys are tenant-admin only (pulling an image opens a network path), and
+    /// malformed container specs are 422 with nothing resolved or recorded.
+    #[tokio::test]
+    async fn functions_container_specs_are_checked() {
+        let w = echo_world().await;
+        for sub in ["dee", "ada"] {
+            let (status, body) = w.json(sub, "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+            assert_eq!(status, 403, "{sub}: {body}");
+        }
+        let img = "ghcr.io/acme/echo:1";
+        for spec in [
+            json!({"backend": "container", "image": img}),
+            json!({"backend": "container", "port": 8080}),
+            json!({"backend": "container", "image": img, "port": 0}),
+            json!({"backend": "container", "image": img, "port": 70000}),
+            json!({"backend": "container", "image": img, "port": 8080, "url": "https://hooks.example.test/"}),
+            json!({"backend": "container", "image": img, "port": 8080, "health_path": "health"}),
+            json!({"backend": "container", "image": img, "port": 8080, "health_path": "/h?x=1"}),
+            json!({"backend": "container", "image": img, "port": 8080, "resources": {"memory_mb": 1}}),
+            json!({"backend": "container", "image": img, "port": 8080, "resources": {"cpus": 0}}),
+            json!({"backend": "container", "image": img, "port": 8080, "resources": {"gpus": 1}}),
+            json!({"backend": "container", "image": img, "port": 8080, "privileged": true}),
+            json!({"backend": "external", "url": "https://hooks.example.test/", "health_path": "/", "image": img}),
+            json!({"backend": "k8s", "image": img, "port": 8080}),
+        ] {
+            let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(json!({"spec": spec}))).await;
+            assert!(status == 422 || status == 400, "{spec}: {status} {body}");
+        }
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
+            status: 422,
+            code: "invalid_image".into(),
+            message: "registry localhost is local".into(),
+        });
+        let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("localhost/x:1"))).await;
+        assert_eq!(status, 422);
+        assert!(body["error"]["message"].as_str().unwrap().contains("localhost"));
+        let (_, list) = w.json("dee", "GET", &w.path(w.w.dev, "/echo/deployments"), None).await;
+        assert!(list.as_array().unwrap().is_empty());
+    }
+
+    /// AC 4: logs are Developer's: a Viewer is 403, a Developer reads the container's last
+    /// lines; an external service has none (422), a service with no deployment here is 409, and
+    /// another project's member hears 404.
+    #[tokio::test]
+    async fn functions_service_logs_need_developer() {
+        let w = echo_world().await;
+        let logs = w.path(w.w.dev, "/echo/logs");
+        let (status, _) = w.call("dee", "GET", &logs, None).await;
+        assert_eq!(status, 409, "not deployed");
+        let (_, d) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        let (status, _) = w.call("vic", "GET", &logs, None).await;
+        assert_eq!(status, 403);
+        let (status, text) = w.call("dee", "GET", &logs, None).await;
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(text, format!("logs of {}\n", d["id"].as_str().unwrap()));
+        let (status, _) = w.call("out", "GET", &logs, None).await;
+        assert_eq!(status, 404);
+        w.json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"}))).await;
+        w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external("https://hooks.example.test/api"))).await;
+        let (status, _) = w.call("dee", "GET", &w.path(w.w.dev, "/stub/logs"), None).await;
+        assert_eq!(status, 422);
+        *w.w.app.bundles.control_error.lock().unwrap() =
+            Some(orchestrator::functions::ControlError::Unavailable("down".into()));
+        let (status, body) = w.json("dee", "GET", &logs, None).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "runner_unavailable");
+    }
+
+    /// A container service's rollback rolls over too: the older deployment's container must be
+    /// healthy before it's active again.
+    #[tokio::test]
+    async fn functions_container_rollback_rolls_over() {
+        let w = echo_world().await;
+        let (_, first) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:1"))).await;
+        w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), Some(json!({"enabled": true}))).await;
+        let (_, second) = w.json("tom", "POST", &w.path(w.w.dev, "/echo/deployments"), Some(container("ghcr.io/acme/echo:2"))).await;
+        *w.w.app.bundles.control_error.lock().unwrap() = Some(orchestrator::functions::ControlError::Status {
+            status: 409,
+            code: "unhealthy".into(),
+            message: "never healthy".into(),
+        });
+        let back = Some(json!({"active_deployment_id": first["id"]}));
+        let (status, body) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), back.clone()).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(w.state("echo").await["deployment_id"], second["id"]);
+        *w.w.app.bundles.control_error.lock().unwrap() = None;
+        let (status, _) = w.json("dee", "PATCH", &w.path(w.w.dev, "/echo"), back).await;
+        assert_eq!(status, 200);
+        assert_eq!(w.state("echo").await["deployment_id"], first["id"]);
+        let first_id: uuid::Uuid = first["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(w.rollouts().last().unwrap().2, first_id);
+    }
 }

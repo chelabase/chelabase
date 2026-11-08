@@ -259,6 +259,7 @@ export * from './schemaPrivileges.ts';
 export * from './sequenceParams.ts';
 export * from './sequencePrivilege.ts';
 export * from './serviceHealth.ts';
+export * from './serviceResources.ts';
 export * from './serviceSpec.ts';
 export * from './skipReason.ts';
 export * from './statementResult.ts';
