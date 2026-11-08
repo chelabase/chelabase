@@ -211,6 +211,10 @@ pub struct BranchConnectionRow {
     /// salt: both or neither.
     pub storage_password_enc: Option<String>,
     pub storage_password_salt: Option<Vec<u8>>,
+    /// m13b: the `chelabase_functions_dispatch` login's sealed password
+    /// (`Purpose::FunctionsDispatch`) and its SCRAM salt: both or neither.
+    pub functions_password_enc: Option<String>,
+    pub functions_password_salt: Option<Vec<u8>>,
     pub settings: DataApiSettings,
     /// The branch's databases in state `on`, main first.
     pub databases: Vec<ServedDatabase>,
@@ -685,6 +689,28 @@ impl MetadataClient {
         Ok(())
     }
 
+    /// m13b: records the sealed `chelabase_functions_dispatch` password of a live branch that
+    /// has none, with its verifier's SCRAM salt; the first one stored stays, as
+    /// [`Self::set_storage_password`].
+    pub async fn set_functions_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE branches SET functions_password_enc = $2, functions_password_salt = $3, updated_at = now()
+             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
+               AND functions_password_enc IS NULL",
+        )
+        .bind(branch.as_uuid())
+        .bind(sealed)
+        .bind(salt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Everything the REST and storage services need to connect to `branch`, whatever its status.
     pub async fn branch_connection(
         &self,
@@ -693,6 +719,7 @@ impl MetadataClient {
         let row = sqlx::query(
             "SELECT b.id, b.database_id, b.status, b.endpoint_id, b.authenticator_password_enc,
                     b.storage_password_enc, b.storage_password_salt,
+                    b.functions_password_enc, b.functions_password_salt,
                     d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
                     d.storage_max_connections
              FROM branches b
@@ -715,6 +742,8 @@ impl MetadataClient {
             authenticator_password_enc: r.get("authenticator_password_enc"),
             storage_password_enc: r.get("storage_password_enc"),
             storage_password_salt: r.get("storage_password_salt"),
+            functions_password_enc: r.get("functions_password_enc"),
+            functions_password_salt: r.get("functions_password_salt"),
             settings: DataApiSettings {
                 max_rows: r.get("max_rows"),
                 statement_timeout_ms: r.get("statement_timeout_ms"),

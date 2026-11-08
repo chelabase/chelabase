@@ -32,6 +32,15 @@ pub const FUNCTION_TRIGGER_PREFIX: &str = "chelabase_fn_";
 /// temporary schemas (`pg_temp_<n>`).
 pub const EXCLUDED_SCHEMA_PREFIXES: [&str; 2] = ["pg_toast", "pg_temp_"];
 
+/// Edge functions m13b (B2): whether a table trigger on `schema` is refused (the trigger API
+/// answers 422 and the worker's install fails the row): every [`EXCLUDED_SCHEMAS`] entry and
+/// every name starting `chelabase` or `pg_` (Chelabase's own schemas and Postgres's, temporary
+/// and TOAST ones included). A trigger on `chelabase_functions.outbox` would recurse into
+/// `enqueue()` on every event.
+pub fn function_trigger_schema_refused(schema: &str) -> bool {
+    EXCLUDED_SCHEMAS.contains(&schema) || schema.starts_with("chelabase") || schema.starts_with("pg_")
+}
+
 /// Roles never read as roles (besides every `pg_*` role, [`RESERVED_ROLE_PREFIX`]): the data
 /// API's (`services/worker/src/provision.rs` `bootstrap_sql`: `anon`, `authenticated`,
 /// `authenticator`; `services/worker/src/data_api.rs` `data_api_script`: `chelabase_admin`), app
@@ -165,5 +174,27 @@ mod tests {
             "{review}"
         );
         assert!(review.contains(&format!("n.nspname OPERATOR(pg_catalog.=) {quoted}")), "{review}");
+    }
+
+    /// Edge functions m13b (B2): a table trigger is refused on every excluded schema and on
+    /// the reserved prefixes (`chelabase*`, `pg_*`), and allowed on any user schema.
+    #[test]
+    fn function_triggers_refuse_reserved_schemas() {
+        for schema in EXCLUDED_SCHEMAS.iter().copied().chain([
+            "chelabase_functions",
+            "chelabase_anything",
+            "chelabase",
+            "storage",
+            "information_schema",
+            "pg_catalog",
+            "pg_temp_3",
+            "pg_toast_temp_1",
+            "pg_whatever",
+        ]) {
+            assert!(function_trigger_schema_refused(schema), "{schema}");
+        }
+        for schema in ["public", "app", "Chelabase", "storage2", "my_pg_stuff", "x_chelabase"] {
+            assert!(!function_trigger_schema_refused(schema), "{schema}");
+        }
     }
 }
