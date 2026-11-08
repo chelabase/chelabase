@@ -42,7 +42,7 @@ done
 
 # 2 and 3. The rendered base config.
 json="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-no-fixed \
-  --project-directory "$dir" -f "$dir/docker-compose.yml" --env-file "$dir/.env.example" \
+  --project-directory "$dir" -f "$dir/docker-compose.yml" --profile services --profile functions --env-file "$dir/.env.example" \
   config --format json)" || { echo "compose-no-fixed-secrets: rendering the base file failed" >&2; exit 1; }
 bad_env="$(jq -r '.services | to_entries[] | .key as $s | (.value.environment // {}) | to_entries[]
   | select(.key | test("(^|_)(PASSWORD|SECRET|TOKEN|KEY|PAT|MASTERKEY|ACCESS_KEY_ID)$"))

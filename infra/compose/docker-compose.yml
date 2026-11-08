@@ -1008,6 +1008,10 @@ services:
       # https to public addresses only.
       CHELABASE_WEBHOOKS_ALLOW_HOSTS: ${CHELABASE_WEBHOOKS_ALLOW_HOSTS:-}
       CHELABASE_WEBHOOKS_ALLOW_HTTP: ${CHELABASE_WEBHOOKS_ALLOW_HTTP:-}
+      # Edge functions m9: where external service URLs may point (checked when one is saved; the
+      # functions service checks every connection). Blank: https to public addresses only.
+      CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      CHELABASE_SERVICES_ALLOW_HTTP: ${CHELABASE_SERVICES_ALLOW_HTTP:-}
     # The default network for the apps, `control` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute` (P4): computes call its hooks listener
     # (8083) as `orchestrator`. `functions-control` (m4b): the functions service's internal
@@ -1378,9 +1382,13 @@ services:
   # Each listener binds the service's alias on its networks only (plus loopback for the
   # healthcheck), never 0.0.0.0. It reads the metadata database (resolutions, secrets, the
   # run-as key) and the bundles bucket as the `functions` S3 identity, and listens for
-  # `chelabase.fn.changed.*` as its own NATS user.
+  # `chelabase.fn.changed.*` as its own NATS user. Profile `functions` (with the runtime) until
+  # its image's first pin: `COMPOSE_PROFILES=functions` with a locally built image
+  # (docker-compose.build.yml). Without it the gateway's /functions/v1 and the orchestrator's
+  # deployments answer as unavailable; the worker's invocations fail and retry.
   functions:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["functions"]
     restart: unless-stopped
     read_only: true
     environment:
@@ -1409,6 +1417,10 @@ services:
       CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/functions-s3/secret-key
       # .env's tunables (blank = the service's default).
       CHELABASE_FUNCTIONS_TIMEOUT_MS: ${CHELABASE_FUNCTIONS_TIMEOUT_MS:-}
+      # External services: hosts allowed to resolve to private addresses, and http (both blank =
+      # public https only). The orchestrator checks the same at save time.
+      CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      CHELABASE_SERVICES_ALLOW_HTTP: ${CHELABASE_SERVICES_ALLOW_HTTP:-}
     networks:
       default:
         aliases: [functions-public]
@@ -1473,6 +1485,7 @@ services:
       # .env's tunables (blank = the service's default).
       CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB: ${CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB:-}
       CHELABASE_SERVICE_RUNNER_CPU_CAP: ${CHELABASE_SERVICE_RUNNER_CPU_CAP:-}
+      CHELABASE_SERVICE_RUNNER_RECONCILE_SECS: ${CHELABASE_SERVICE_RUNNER_RECONCILE_SECS:-}
     networks:
       default: {}
       services-control:
@@ -1499,11 +1512,14 @@ services:
   # the worker. No secret, no published port, no volume; non-root on a read-only root with every
   # capability dropped. workerd runs all isolates on one thread, so a bundle in a busy loop stalls
   # the others: the image's watchdog probes a trivial worker every 2s and after 3 failures ends
-  # the container, which `always` restarts. Its image isn't published yet: build it with
-  # `docker buildx bake -f infra/images/docker-bake.hcl functions-runtime` and set
-  # CHELABASE_IMAGE_REPO=chelabase and CHELABASE_IMAGE_TAG=latest.
+  # the container, which `always` restarts. Profile `functions`, with the functions service: its
+  # image isn't published yet, so run both from a build of the clone (docker-compose.build.yml:
+  # `COMPOSE_PROFILES=functions docker compose -f docker-compose.yml -f docker-compose.build.yml
+  # up -d --build`). Setting CHELABASE_IMAGE_REPO or CHELABASE_IMAGE_TAG instead would retag
+  # every app image, not just these two.
   functions-runtime:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["functions"]
     # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
     # its listening port, always on the API host.
     command: ["/usr/local/bin/workerd", "serve", "--experimental",

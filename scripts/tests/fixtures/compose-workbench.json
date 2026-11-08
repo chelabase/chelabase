@@ -483,6 +483,8 @@
         "CHELABASE_NATS_PASSWORD_FILE": "/m/.chelabase/nats/functions.password",
         "CHELABASE_NATS_USER": "functions",
         "CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/orchestrator-functions.token",
+        "CHELABASE_SERVICES_ALLOW_HOSTS": "",
+        "CHELABASE_SERVICES_ALLOW_HTTP": "",
         "CHELABASE_STORAGE_BACKEND": "seaweedfs",
         "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/functions-s3/access-key",
         "CHELABASE_STORAGE_S3_BUCKET": "chelabase-functions",
@@ -1044,6 +1046,8 @@
         "CHELABASE_REALTIME_INTERNAL_TOKEN_FILE": "/m/.chelabase/realtime/internal.token",
         "CHELABASE_REALTIME_LOGIN_CIDRS": "10.213.4.12/32,10.213.4.11/32",
         "CHELABASE_REST_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/rest-internal.token",
+        "CHELABASE_SERVICES_ALLOW_HOSTS": "",
+        "CHELABASE_SERVICES_ALLOW_HTTP": "",
         "CHELABASE_SETUP_CODE_FILE": "/m/.chelabase/stacks/feat-x/setup/setup.code",
         "CHELABASE_STORAGE_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/storage-internal.token",
         "CHELABASE_STORCON_HOOK_TOKEN_FILE": "/m/.chelabase/tokens/storcon-hook.token",
@@ -2150,6 +2154,9 @@
         "CHELABASE_COMPOSE_PROJECT": "chelabase-feat-x",
         "CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/functions-service-runner.token",
         "CHELABASE_SERVICE_RUNNER_ADDR": "service-runner-control:8094,127.0.0.1:8094",
+        "CHELABASE_SERVICE_RUNNER_CPU_CAP": "",
+        "CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB": "",
+        "CHELABASE_SERVICE_RUNNER_RECONCILE_SECS": "",
         "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token"
       },
       "group_add": [

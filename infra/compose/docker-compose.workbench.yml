@@ -209,9 +209,12 @@ services:
 
   # Edge functions (m1): the image `chelabase workbench up` builds locally from
   # infra/images/functions-runtime.Dockerfile, tagged by its inputs' hash (m4b).
+  # The base file's profile `functions` (until its images' first pin) is always on here: the
+  # workbench builds both images itself.
   functions-runtime:
     image: chelabase/functions-runtime:${CHELABASE_FUNCTIONS_RUNTIME_TAG:-latest}
     pull_policy: never
+    profiles: !reset []
 
   safekeeper1:
     user: "0"
@@ -457,6 +460,9 @@ services:
       - CHELABASE_BRANCH_DATABASE_CAP
       # Who may log in as chelabase_realtime (the compute spec's hba): realtime and the runner.
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
+      # Edge functions m9: where external service URLs may point (blank: public https only).
+      - CHELABASE_SERVICES_ALLOW_HOSTS=${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      - CHELABASE_SERVICES_ALLOW_HTTP=${CHELABASE_SERVICES_ALLOW_HTTP:-}
     group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
     # Its static address on `control`, for its TLS connections to computes.
     networks:
@@ -724,6 +730,8 @@ services:
   functions:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/functions"]
+    # The base file's profile `functions` is always on here (see functions-runtime).
+    profiles: !reset []
     read_only: !reset null
     env_file:
       - *stack-env
@@ -744,6 +752,8 @@ services:
       - CHELABASE_STORAGE_S3_ACCESS_KEY_FILE=/run/chelabase/secrets/functions-s3/access-key
       - CHELABASE_STORAGE_S3_SECRET_KEY_FILE=/run/chelabase/secrets/functions-s3/secret-key
       - CHELABASE_FUNCTIONS_TIMEOUT_MS=${CHELABASE_FUNCTIONS_TIMEOUT_MS:-}
+      - CHELABASE_SERVICES_ALLOW_HOSTS=${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      - CHELABASE_SERVICES_ALLOW_HTTP=${CHELABASE_SERVICES_ALLOW_HTTP:-}
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -785,6 +795,9 @@ services:
       - CHELABASE_COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME}
       - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
       - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
+      - CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB=${CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB:-}
+      - CHELABASE_SERVICE_RUNNER_CPU_CAP=${CHELABASE_SERVICE_RUNNER_CPU_CAP:-}
+      - CHELABASE_SERVICE_RUNNER_RECONCILE_SECS=${CHELABASE_SERVICE_RUNNER_RECONCILE_SECS:-}
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes: !override
       - *checkout-ro

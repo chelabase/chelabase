@@ -39,7 +39,8 @@
 #      Docker socket holder, each caller's bearer, and no shared network for service containers
 #      (the runner gives each its own at run time, audit B3; the functions service binds none of
 #      them).
-# Every render takes every profile (sites, runner, services), so profile services are checked.
+# Every render takes every profile (sites, runner, services, functions), so profiled services
+# are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -57,10 +58,10 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile functions >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services --profile functions \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -491,8 +492,14 @@ for render in base wb; do
 done
 grep -qF '(name = "bundles", external = (address = "functions-internal:8080"' "$root/infra/functions-runtime/config.capnp" ||
   err "the runtime's bundle store must be functions-internal:8080, the internal listener's runtime-side address"
-[[ "$(jq -r '.services["functions-runtime"].profiles // [] | length' "$tmp/base.json")" == 0 ]] ||
-  err "functions-runtime runs in every install (no profile)"
+# Profile `functions` in the base file until the images' first pin (scripts/tests/
+# compose-image-pins.sh), always on in the workbench, which builds both images itself.
+for svc in functions functions-runtime; do
+  [[ "$(jq -c --arg s "$svc" '.services[$s].profiles // []' "$tmp/base.json")" == '["functions"]' ]] ||
+    err "base: $svc runs in profile functions only (its image isn't published)"
+  [[ "$(jq -r --arg s "$svc" '.services[$s].profiles // [] | length' "$tmp/wb.json")" == 0 ]] ||
+    err "wb: $svc runs in every workbench stack (no profile)"
+done
 
 # 8. The service runner (edge functions m10), in both renders.
 for render in base wb; do

@@ -9,7 +9,9 @@
 #
 # An image in `unpublished` below (one added before its first release) may instead have the
 # default tag `unpublished` and no .env.example pin, never one without the other; its first
-# `pin-images.sh` run pins it like the rest, and that pin PR drops it from the list.
+# `pin-images.sh` run pins it like the rest, and that pin PR drops it from the list. Every service
+# that runs an unpublished image must sit behind a compose profile, so a plain
+# `docker compose up` (no profile) of a fully pinned install never pulls a tag that isn't there.
 #
 #   scripts/tests/compose-image-pins.sh [digests-file]
 #
@@ -29,8 +31,11 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
 done
 digests="${1:-}"
 images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner)
-# Edge functions (m4b): the functions service and its runtime, until their first pin.
+# Edge functions (m4b): the functions service and its runtime (profile `functions`), and the
+# service runner (profile `services`), until their first pin.
 unpublished=(functions functions-runtime service-runner)
+# Every profile of the base file, so a render sees every service.
+profiles=(--profile services --profile functions)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }
@@ -94,7 +99,7 @@ build="$root/infra/compose/docker-compose.build.yml"
 render_images() { # render_images <-f args…>: "service image built" per line
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE -u CHELABASE_IMAGE_REPO -u CHELABASE_IMAGE_TAG \
     docker compose -p chelabase-image-pins \
-    --project-directory "$root/infra/compose" "$@" --profile services --env-file "$envex" config --format json |
+    --project-directory "$root/infra/compose" "$@" "${profiles[@]}" --env-file "$envex" config --format json |
     jq -r '.services | to_entries[]
       | "\(.key) \(.value.image // "-") \(.value.build != null and .value.pull_policy == "build")"'
 }
@@ -112,6 +117,18 @@ if base_images="$(render_images -f "$compose")" && built_images="$(render_images
   done
 else
   err "rendering the base file with docker-compose.build.yml failed"
+fi
+
+# An unpublished image runs only behind a profile: off in a plain `docker compose up`.
+if profiled="$(env -u CHELABASE_IMAGE_REPO -u CHELABASE_IMAGE_TAG docker compose -p chelabase-image-pins \
+  --project-directory "$root/infra/compose" -f "$compose" "${profiles[@]}" --env-file "$envex" config --format json |
+  jq -r '.services | to_entries[] | "\(.key) \(.value.image // "-") \((.value.profiles // []) | length)"')"; then
+  while read -r svc img n; do
+    [[ "$img" == *:unpublished ]] || continue
+    [[ "$n" -gt 0 ]] || err "docker-compose.yml: $svc runs the unpublished $img with no profile (a plain \`up\` would pull it)"
+  done <<<"$profiled"
+else
+  err "rendering the base file with every profile failed"
 fi
 
 if [[ -n "$digests" ]]; then
