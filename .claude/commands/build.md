@@ -12,6 +12,22 @@ Task: `$ARGUMENTS`
 
 Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md`, `issue-spec` and `pr-body`.
 
+## Local epics
+
+If `.claude/.cache/epics/<slug>/state.json` (in the main checkout) has `"local": true`, the
+epic came from `/epic-security` and nothing about it may reach GitHub before the advisory:
+
+- Milestones are `<cache>/m<n>.md`. Status, claims and the checklist live in `state.json`.
+  Don't call `gh issue`, `gh pr` or `gh label`.
+- Builders and fix rounds **never push**. Brief each builder with the absolute cache path
+  and this rule. Merge milestone branches into `epic/<slug>` locally.
+- Commit messages are fix-only (see the writing rule in `/epic-security`).
+- The whole-epic review goes to `<cache>/review.md` and the gate output to `<cache>/gate.md`.
+  Finish step 3 becomes "write the Test plan and Review record into `review.md`". The next
+  step is `/epic-security PUBLISH <slug>`, not a ready PR.
+
+Everything else below applies as written.
+
 ## Setup
 
 1. Find the epic: `gh issue list --label "epic:<slug>" --state open`, and the draft PR for
