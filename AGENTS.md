@@ -118,6 +118,9 @@ Each milestone issue declares one review level with a one-line reason:
 3. **Close.** Whole-epic review, one `just check`, one live pass → mark the PR ready.
    Human merges.
 4. **Small change.** `/quick <change|#issue>`: one worktree, one PR, affected tests, squash.
+5. **Security fixes.** `/epic-security` instead of `/epic` for unfixed vulnerabilities: plan,
+   build and audit stay local (no issues, PRs or pushes); fixes ship through a GitHub
+   security advisory's private fork. Write fixes and acceptance criteria, never exploits.
 
 | Command | Args | What it does |
 |---|---|---|
@@ -125,6 +128,7 @@ Each milestone issue declares one review level with a one-line reason:
 | `/build` | `<slug> [n]` | Build ready milestones; audit whiteroom; finish with epic review + gate |
 | `/audit` | `<slug> <n>` | White-room audit of a landed milestone (issue + diff only) |
 | `/quick` | `<change>` \| `#<issue>` | Small change → one conventional PR |
+| `/epic-security` | `<goal>` \| `<slug>` \| `APPROVED <slug>` \| `PUBLISH <slug>` | Local-only security epic → squash → advisory private fork PR |
 
 Issue bodies follow the `issue-spec` skill; PR bodies follow `pr-body`. Labels:
 `epic:<slug>`, `type:*`, `area:*`, `status:{ready,blocked,building,landed,audited,changes-requested}`,

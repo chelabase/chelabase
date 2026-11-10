@@ -68,7 +68,7 @@ service can see. Two to five lines. No task list.
 ## Review
 
 Level: whiteroom|standard|none — <why>
-Focus: <what the auditor should attack first, when whiteroom>
+Focus: <which guarantees the auditor should check first, when whiteroom>
 
 ## Notes
 
@@ -90,6 +90,9 @@ only if they belong to one.
   state other runs on the stack see (the same branch, role or database, or an app restart
   or rebuild).
 - **Review is decided at planning time** per `AGENTS.md` (white-room rule).
+- **Security issues are written as fixes.** Problem names the location and the missing
+  guarantee; Outcome, Acceptance criteria and Tests to write state the behaviour that must
+  hold. No exploit steps, payloads or proof-of-concept walkthroughs anywhere in the body.
 
 ## Labels
 
