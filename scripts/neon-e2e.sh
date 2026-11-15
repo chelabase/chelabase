@@ -169,7 +169,10 @@ side_proxy() {
   local name="$1" pem="$2" image user argv=()
   image="$(docker inspect -f '{{.Config.Image}}' "$proxy_c")"
   user="$(docker inspect -f '{{.Config.User}}' "$proxy_c")"
-  mapfile -t argv < <(docker inspect "$proxy_c" | jq -r '.[0].Config | (.Entrypoint // []) + (.Cmd // []) | .[]')
+  # One element per line, base64: the entrypoint's script spans lines.
+  local b64
+  while IFS= read -r b64; do argv+=("$(base64 -d <<<"$b64")"); done < <(
+    docker inspect "$proxy_c" | jq -r '.[0].Config | (.Entrypoint // []) + (.Cmd // []) | .[] | @base64')
   [[ "${argv[0]:-}" == /bin/sh ]] || die "the proxy's entrypoint isn't /bin/sh: ${argv[*]}"
   docker create -q --name "$name" --user "$user" --volumes-from "$proxy_c" --network "${project}_default" \
     -e SIDE_CA_PEM="$pem" -e NEON_INTERNAL_CA_FILE=/tmp/side-ca.crt --entrypoint /bin/sh "$image" \
@@ -216,8 +219,13 @@ if side_sql "$bad_ip" -c 'select 1' >/dev/null 2>"$tmp/err"; then
   die "a proxy trusting another CA logged in to the compute"
 fi
 grep -q "Couldn't connect to compute node" "$tmp/err" || die "unexpected refusal through a proxy with another CA: $(cat "$tmp/err")"
-docker logs "$bad" 2>&1 | grep -qiE 'certificate|UnknownIssuer' ||
-  die "the proxy with another CA failed, but not at the compute's certificate: $(docker logs --tail 20 "$bad" 2>&1)"
+# The proxy logs the cause after it answers the client: wait for the line.
+for i in $(seq 20); do
+  docker logs "$bad" 2>&1 | grep -q 'invalid peer certificate' && break
+  [[ $i -lt 20 ]] || die "the proxy with another CA failed, but not at the compute's certificate: $(
+    docker logs "$bad" 2>&1 | grep -v parquet | jq -c '{level, message}' 2>/dev/null | tail -10)"
+  sleep 0.5
+done
 side_cleanup
 side_proxies=()
 pass "a proxy trusting another CA can't log in (the compute's certificate is refused, no plaintext fallback)"
