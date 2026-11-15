@@ -557,7 +557,7 @@ impl Profile {
 }
 
 /// An absolute path with no empty, `.` or `..` segment and no trailing `/` (and not `/`).
-fn is_exact_path(p: &str) -> bool {
+pub(crate) fn is_exact_path(p: &str) -> bool {
     p.len() > 1
         && p.starts_with('/')
         && !p.chars().any(char::is_control)
