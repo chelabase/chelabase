@@ -316,7 +316,9 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// `branch_function_secrets.ciphertext` (orchestrator function secrets and branch create,
 /// `seal` with AAD `fn-secret:{branch}:{function}:{name}`); `functions.signing_secret` (a
 /// service's signing secret, orchestrator, [`MetadataClient::set_service_signing_secret`]:
-/// `seal` with AAD `{function}:service-signing`).
+/// `seal` with AAD `{function}:service-signing`); `storage_webhooks.secret_enc` (a storage
+/// webhook's signing secret, orchestrator create and rotate: `seal_webhook_secret`,
+/// `Purpose::Webhook` bound to the endpoint id).
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
@@ -329,6 +331,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
     ("branch_function_secrets", "ciphertext", None),
     ("functions", "signing_secret", None),
+    ("storage_webhooks", "secret_enc", None),
 ];
 
 /// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
