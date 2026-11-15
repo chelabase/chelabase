@@ -39,10 +39,36 @@ mod fn_sql_logins {
         database: String,
     }
 
+    /// Panics, saying to rebuild, unless the shared metadata database has every migration of
+    /// this checkout: this suite's in-process worker runs this checkout's queries, and the suite
+    /// never migrates the shared database itself.
+    async fn stack_is_migrated(metadata: &MetadataClient) {
+        let dir = crate::common::workspace_root().join("crates/chelabase-metadata/migrations");
+        let newest: i64 = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .filter_map(|f| {
+                let name = f.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".sql")?.split('_').next()?.parse().ok()
+            })
+            .max()
+            .expect("a metadata migration");
+        let applied: Option<i64> =
+            sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+                .fetch_one(metadata.pool())
+                .await
+                .expect("reading the metadata database's migrations");
+        assert!(
+            applied.is_some_and(|v| v >= newest),
+            "the stack is behind this checkout: its metadata database's newest migration is \
+             {applied:?}, this checkout's {newest}. Rebuild it (`just workbench up`)."
+        );
+    }
+
     impl Fx {
         async fn provision() -> Fx {
             let (worker, metadata, _config) = setup().await;
             let metadata = metadata.with_secrets_key(worker.key.clone());
+            stack_is_migrated(&metadata).await;
             let id = DatabaseId::new();
             let name = format!("fs-{}", &id.to_string()[..8]);
             let project = metadata

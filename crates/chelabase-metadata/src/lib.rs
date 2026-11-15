@@ -488,7 +488,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261108000003).
+        // this file when adding one (last: 20261116000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
