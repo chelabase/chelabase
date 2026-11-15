@@ -2,6 +2,8 @@
 # Live check of roadmap step 4, through the public API (needs the stack: just workbench up):
 # - creates a database and waits until it is ready;
 # - psql, SQL over HTTP and the serverless driver answer through Neon's proxy;
+# - each of those sessions reaches the compute over TLS (pg_stat_ssl), and a side proxy trusting
+#   another CA is refused at the compute (needs a proxy recreated with compute-hop-tls);
 # - a wrong password is refused, and query cancel works;
 # - a password reset takes effect at once (the old password is refused, on the Postgres port and /sql);
 # - deleting the database removes the compute and the storage-controller tenant.
@@ -143,6 +145,82 @@ pass "SQL over HTTP on $PROXY_HTTP_PORT read the rows back"
 DATABASE_URL="postgresql://postgres:$old@$host/$dbname" NODE_EXTRA_CA_CERTS="$ca" EXPECT=3 \
   CHELABASE_PROXY_HTTP_PORT="$PROXY_HTTP_PORT" \
   pnpm --filter @chelabase/neon-e2e --silent check || die "@neondatabase/serverless"
+
+# compute-hop-tls m1: the proxy's session to the compute runs over TLS, on the Postgres port
+# and on /sql (the WebSocket session is checked by the driver above).
+got="$(sql "$old" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')"
+[[ "$got" == t ]] || die "the proxy's Postgres session to the compute is not TLS (pg_stat_ssl.ssl = '$got')"
+status="$(http_sql "$old" 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')"
+[[ "$status" == 200 && "$(jq -r '.rows[0].ssl' "$tmp/body")" == true ]] ||
+  die "the proxy's /sql session to the compute is not TLS: $status $(cat "$tmp/body")"
+pass "the proxy reaches the compute over TLS ($PROXY_PG_PORT and /sql)"
+
+# A proxy that trusts another CA is refused by every compute, and doesn't fall back to
+# plaintext. A side proxy is the stack's own (its image, user, mounts, entrypoint and command)
+# with NEON_INTERNAL_CA_FILE pointing at a file written at start. With the compute CA it logs in
+# (the harness works); with a throwaway CA the login fails at the compute's certificate.
+project="${CHELABASE_COMPOSE_PROJECT:?run through just workbench run}"
+proxy_c="$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=proxy" | head -n1)"
+[[ -n "$proxy_c" ]] || die "no running proxy container in $project"
+side_proxies=()
+# side_proxy <name> <CA PEM>: starts it; prints its address on the default network. It runs in
+# a command substitution: the caller adds <name> to side_proxies first, for the cleanup.
+side_proxy() {
+  local name="$1" pem="$2" image user argv=()
+  image="$(docker inspect -f '{{.Config.Image}}' "$proxy_c")"
+  user="$(docker inspect -f '{{.Config.User}}' "$proxy_c")"
+  mapfile -t argv < <(docker inspect "$proxy_c" | jq -r '.[0].Config | (.Entrypoint // []) + (.Cmd // []) | .[]')
+  [[ "${argv[0]:-}" == /bin/sh ]] || die "the proxy's entrypoint isn't /bin/sh: ${argv[*]}"
+  docker create -q --name "$name" --user "$user" --volumes-from "$proxy_c" --network "${project}_default" \
+    -e SIDE_CA_PEM="$pem" -e NEON_INTERNAL_CA_FILE=/tmp/side-ca.crt --entrypoint /bin/sh "$image" \
+    -c 'printf "%s\n" "$SIDE_CA_PEM" >/tmp/side-ca.crt && exec "$@"' side "${argv[@]}" >/dev/null ||
+    die "could not create the side proxy $name"
+  docker network connect "${project}_compute" "$name"
+  docker start "$name" >/dev/null
+  local ip
+  ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_default\"}}{{.IPAddress}}{{end}}" "$name")"
+  for i in $(seq 30); do
+    timeout 2 bash -c "</dev/tcp/$ip/4432" 2>/dev/null && break
+    [[ $i -lt 30 ]] || die "the side proxy $name never listened: $(docker logs --tail 20 "$name" 2>&1)"
+    sleep 1
+  done
+  echo "$ip"
+}
+side_cleanup() {
+  for c in "${side_proxies[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+}
+trap 'side_cleanup; cleanup' EXIT
+# side_sql <address> <psql args…>: the owner's login through that proxy.
+side_sql() {
+  local addr="$1"
+  shift
+  PGPASSWORD="$old" PGCONNECT_TIMEOUT=30 psql \
+    "host=$host hostaddr=$addr port=4432 user=postgres dbname=$dbname sslmode=verify-full sslrootcert=$ca" \
+    -v ON_ERROR_STOP=1 -qtA "$@"
+}
+suffix="$(hex 3)"
+compute_ca_pem="$(docker exec "$proxy_c" cat /run/chelabase/secrets/compute-ca/ca.crt)" ||
+  die "the proxy has no compute CA at /run/chelabase/secrets/compute-ca/ca.crt (recreate it: the stack predates compute-hop-tls)"
+good="neon-e2e-ca-good-$suffix"
+side_proxies+=("$good")
+good_ip="$(side_proxy "$good" "$compute_ca_pem")"
+got="$(side_sql "$good_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" ||
+  die "a side proxy with the compute CA could not log in: $(cat "$tmp/err")"
+[[ "$got" == t ]] || die "a side proxy with the compute CA reached the compute without TLS"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$tmp/other-ca.key" \
+  -out "$tmp/other-ca.crt" -days 1 -subj "/CN=neon-e2e throwaway CA" 2>/dev/null || die "openssl could not make a CA"
+bad="neon-e2e-ca-bad-$suffix"
+side_proxies+=("$bad")
+bad_ip="$(side_proxy "$bad" "$(cat "$tmp/other-ca.crt")")"
+if side_sql "$bad_ip" -c 'select 1' >/dev/null 2>"$tmp/err"; then
+  die "a proxy trusting another CA logged in to the compute"
+fi
+grep -q "Couldn't connect to compute node" "$tmp/err" || die "unexpected refusal through a proxy with another CA: $(cat "$tmp/err")"
+docker logs "$bad" 2>&1 | grep -qiE 'certificate|UnknownIssuer' ||
+  die "the proxy with another CA failed, but not at the compute's certificate: $(docker logs --tail 20 "$bad" 2>&1)"
+side_cleanup
+side_proxies=()
+pass "a proxy trusting another CA can't log in (the compute's certificate is refused, no plaintext fallback)"
 
 # A wrong password is refused, over Postgres wire and over HTTP.
 if sql wrong-password -c 'select 1' >/dev/null 2>"$tmp/err"; then die "a wrong password connected"; fi
