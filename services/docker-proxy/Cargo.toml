@@ -1,0 +1,20 @@
+[package]
+name = "chelabase-docker-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase workbench Docker API proxy: per-client endpoint allowlists, scoped to one stack"
+
+[lib]
+name = "docker_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# Request paths and queries are percent-decoded once, as the engine's Go router does.
+percent-encoding = { workspace = true }
+serde = { workspace = true }
+# Profiles and list `filters` are JSON.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
