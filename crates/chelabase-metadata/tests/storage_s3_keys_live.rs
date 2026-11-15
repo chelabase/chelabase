@@ -8,7 +8,7 @@
 
 use chelabase_metadata::{
     BranchStatus, DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus, MetadataClient, MetadataConfig,
-    MetadataError, NewS3Key, STORAGE_S3_KEY_CAP,
+    MetadataError, NewEndpoint, NewS3Key, STORAGE_S3_KEY_CAP,
 };
 use chelabase_secrets::SecretKey;
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId, s3_key};
@@ -414,8 +414,10 @@ async fn live_key_needs_role_identity() {
             "{oid:?} {timeline:?}: {err}"
         );
     }
-    // A zero or negative OID, or an empty timeline, is no identity either.
+    // A zero, negative or past-u32 OID, or an empty timeline, is no identity either.
     assert!(check_violation(&insert(Some(0), Some("t")).await.unwrap_err()).is_some());
+    assert!(check_violation(&insert(Some(1 << 32), Some("t")).await.unwrap_err()).is_some());
+    insert(Some(u32::MAX.into()), Some("t")).await.unwrap();
     assert!(check_violation(&insert(Some(16_384), Some("")).await.unwrap_err()).is_some());
 
     let made = s.create(branch, "k").await.unwrap();
@@ -518,5 +520,148 @@ async fn branch_delete_cascades() {
             .unwrap()
             .is_none()
     );
+    s.finish().await;
+}
+
+/// Links a fresh endpoint to `branch`, as provisioning does; returns its id.
+async fn link_endpoint(s: &Scratch, branch: BranchId) -> String {
+    let hex = || Uuid::new_v4().simple().to_string();
+    let ep = format!("ep-{}", &hex()[..12]);
+    let (tenant, timeline) = (hex(), hex());
+    let endpoint = NewEndpoint {
+        id: &ep,
+        tenant_id: &tenant,
+        timeline_id: &timeline,
+        compute_token_sha256: "cd",
+        owner_role: "postgres",
+        owner_verifier: "SCRAM-SHA-256$v1",
+        database_name: "app",
+        role_copies: &[],
+        routable: true,
+        static_lsn: None,
+    };
+    assert!(
+        s.client
+            .create_endpoint_for_branch(branch, &timeline, &endpoint, false)
+            .await
+            .unwrap()
+    );
+    ep
+}
+
+/// The DDL receiver's transaction holds the endpoint row: a key creation waits for it (as a
+/// secret data key's does), so a `DROP ROLE` forwarded first runs first and one forwarded
+/// after the store sees the key.
+#[tokio::test]
+#[ignore]
+async fn create_waits_for_the_ddl_transaction() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+
+    let client = s.client.clone();
+    let pair = s3_key::generate();
+    let mut creating = tokio::spawn(async move {
+        client
+            .create_s3_key(&NewS3Key {
+                id: Uuid::new_v4(),
+                branch_id: branch,
+                database: "app",
+                role: "app_writer",
+                name: "late",
+                access_key_id: &pair.access_key_id,
+                secret: &pair.secret,
+                role_oid: 16_384,
+                role_timeline: "0123456789abcdef0123456789abcdef",
+            })
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(400), &mut creating).await;
+    assert!(
+        waited.is_err(),
+        "key creation must wait for the DDL transaction"
+    );
+    let during = s.client.list_live_s3_keys(branch).await.unwrap().len();
+    ddl.commit().await.unwrap();
+    let result = creating.await.unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(during, 0);
+    assert_eq!(s.client.list_live_s3_keys(branch).await.unwrap().len(), 1);
+    s.finish().await;
+}
+
+/// The endpoint row itself is in the lock order (`FOR SHARE`, after the branch row), as for a
+/// secret data key: a creation waits for any transaction holding the endpoint `FOR UPDATE`,
+/// not only for one that also holds the branch row.
+#[tokio::test]
+#[ignore]
+async fn create_waits_for_the_endpoint_row() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let mut holder = s.client.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM neon_endpoints WHERE id = $1 FOR UPDATE")
+        .bind(&ep)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let client = s.client.clone();
+    let pair = s3_key::generate();
+    let mut creating = tokio::spawn(async move {
+        client
+            .create_s3_key(&NewS3Key {
+                id: Uuid::new_v4(),
+                branch_id: branch,
+                database: "app",
+                role: "app_writer",
+                name: "held",
+                access_key_id: &pair.access_key_id,
+                secret: &pair.secret,
+                role_oid: 16_384,
+                role_timeline: "0123456789abcdef0123456789abcdef",
+            })
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(400), &mut creating).await;
+    assert!(
+        waited.is_err(),
+        "key creation must wait for the endpoint row"
+    );
+    holder.commit().await.unwrap();
+    let result = creating.await.unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    s.finish().await;
+}
+
+/// A `backup` or `rehearsal` branch takes no key (lookup never serves one): `RowNotFound`,
+/// nothing written.
+#[tokio::test]
+#[ignore]
+async fn create_refuses_backup_and_rehearsal_branches() {
+    let s = Scratch::new().await;
+    for kind in ["backup", "rehearsal"] {
+        let branch = s.branch().await;
+        sqlx::query("UPDATE branches SET kind = $2 WHERE id = $1")
+            .bind(branch.as_uuid())
+            .bind(kind)
+            .execute(s.client.pool())
+            .await
+            .unwrap();
+        let made = s.create(branch, "refused").await;
+        assert!(
+            matches!(made, Err(MetadataError::Database(sqlx::Error::RowNotFound))),
+            "{kind}: {:?}",
+            made.map(|m| m.id)
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM storage_s3_keys WHERE branch_id = $1")
+                .bind(branch.as_uuid())
+                .fetch_one(s.client.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "{kind}");
+    }
     s.finish().await;
 }

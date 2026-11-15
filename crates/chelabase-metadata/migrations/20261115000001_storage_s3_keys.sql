@@ -14,7 +14,7 @@ CREATE TABLE storage_s3_keys (
     name          text NOT NULL CHECK (length(name) BETWEEN 1 AND 63),
     access_key_id text NOT NULL UNIQUE CHECK (access_key_id ~ '^CBAK[A-Z2-7]{16}$'),
     secret_enc    text,
-    role_oid      bigint CHECK (role_oid IS NULL OR role_oid > 0),
+    role_oid      bigint CHECK (role_oid IS NULL OR role_oid BETWEEN 1 AND 4294967295),
     role_timeline text CHECK (role_timeline IS NULL OR role_timeline <> ''),
     created_at    timestamptz NOT NULL DEFAULT now(),
     last_used_at  timestamptz,

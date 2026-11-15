@@ -127,19 +127,25 @@ impl MetadataClient {
 
     /// Stores a key, its secret sealed for its id. A branch with [`STORAGE_S3_KEY_CAP`] live
     /// keys already is [`MetadataError::Conflict`] (counted under the branch row's lock, so two
-    /// creates can't both pass it); a missing, deleting or deleted branch is `RowNotFound`.
-    /// Nothing is written either way.
+    /// creates can't both pass it); a missing, deleting or deleted branch, or one that isn't
+    /// `normal` (a backup or rehearsal, which lookup never serves), is `RowNotFound`. Nothing is
+    /// written either way.
     ///
-    /// Lock order: the branch row (`FOR NO KEY UPDATE`), as data key creation takes it.
+    /// Lock order: the branch row (`FOR NO KEY UPDATE`), then its endpoint row (`FOR SHARE`),
+    /// as secret data key creation takes them. The DDL receiver holds the endpoint row, so a
+    /// `DROP ROLE` forwarded after the store sees the key.
     pub async fn create_s3_key(&self, key: &NewS3Key<'_>) -> Result<(), MetadataError> {
         let sealed = chelabase_secrets::seal_s3_secret(self.s3_secrets_key()?, key.id, key.secret);
         let mut tx = self.pool.begin().await?;
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM branches WHERE id = $1 FOR NO KEY UPDATE")
-                .bind(key.branch_id.as_uuid())
-                .fetch_optional(&mut *tx)
-                .await?;
-        if !status.is_some_and(|s| s != "deleting" && s != "deleted") {
+        crate::data_api::lock_endpoint_of_branch(&mut tx, key.branch_id).await?;
+        let usable: bool = sqlx::query_scalar(
+            "SELECT kind = 'normal' AND status NOT IN ('deleting', 'deleted')
+             FROM branches WHERE id = $1",
+        )
+        .bind(key.branch_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !usable {
             return Err(sqlx::Error::RowNotFound.into());
         }
         let live: i64 = sqlx::query_scalar(

@@ -273,7 +273,7 @@ const ENDPOINT_WAIT: &str = "5s";
 
 /// Takes the branch row (`FOR NO KEY UPDATE`) and then its endpoint row (`FOR SHARE`), with a
 /// `lock_timeout`. A missing branch is `RowNotFound`.
-async fn lock_endpoint_of_branch(
+pub(crate) async fn lock_endpoint_of_branch(
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
     branch: BranchId,
 ) -> Result<(), MetadataError> {
