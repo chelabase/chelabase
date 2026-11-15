@@ -4926,11 +4926,11 @@ async fn review(fx: &Fx) {
 /// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
 /// ACL, body), the event triggers (owner, state, function, comment) and the schema itself.
 const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
-  SELECT c.relname || ':' || c.relkind || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
+  SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
     FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
   UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(p.prosrc)
     FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
-  UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
+  UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
     FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
   UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '')
     FROM pg_namespace n WHERE n.nspname = 'chelabase'
