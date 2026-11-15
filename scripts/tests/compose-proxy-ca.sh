@@ -10,7 +10,9 @@
 #      read-only (base: the `secrets` volume's compute-ca/ca.crt; workbench: the keys dir's);
 #   2. the rendered entrypoint, run with a stub `proxy`, refuses to exec it when the variable
 #      is unset or empty, or names a missing, empty or certificate-less file, and execs it
-#      (with the command's arguments) when the file holds a certificate.
+#      (with the command's arguments) when the file holds a certificate;
+#   3. the proxy waits for a healthy orchestrator (and, in the base file, init-secrets), and its
+#      node-info cache has an absolute ttl of at most 10 minutes (checked before 2).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -54,6 +56,36 @@ for render in base wb; do
     jq -e --arg s "$keys/compute-ca/ca.crt" 'length == 1 and .[0].type == "bind"
       and .[0].source == $s and .[0].read_only == true' <<<"$m" >/dev/null ||
       err "wb: NEON_INTERNAL_CA_FILE ($ca) is not a read-only mount of $keys/compute-ca/ca.crt: $m"
+  fi
+done
+
+# 3. No plaintext route outlives an upgrade (the #224 audit, B1). An orchestrator from before
+# compute-hop-tls answers wake_compute with server_name null, and the proxy caches that compute
+# as plaintext. So the proxy starts only once the orchestrator is healthy (a new proxy never asks
+# the old one), the orchestrator has a healthcheck to wait on, and the node-info cache
+# (--wake-compute-cache) has an absolute ttl of at most 10 minutes (an endpoint used more often
+# than its idle ttl would otherwise keep a stale entry for good). In the base file the proxy
+# also waits for init-secrets directly, which makes compute-ca/ca.crt (the workbench's keys dir
+# has it before the stack starts).
+for render in base wb; do
+  file="$tmp/$render.json"
+  jq -e '.services.proxy.depends_on.orchestrator.condition == "service_healthy"' "$file" >/dev/null ||
+    err "$render: the proxy doesn't wait for a healthy orchestrator: $(jq -c '.services.proxy.depends_on' "$file")"
+  jq -e '.services.orchestrator.healthcheck.test | length > 0' "$file" >/dev/null ||
+    err "$render: the orchestrator has no healthcheck for the proxy to wait on"
+  if [[ "$render" == base ]]; then
+    jq -e '.services.proxy.depends_on["init-secrets"].condition == "service_completed_successfully"' "$file" >/dev/null ||
+      err "base: the proxy doesn't wait for init-secrets (the compute CA): $(jq -c '.services.proxy.depends_on' "$file")"
+  fi
+  opts="$(jq -r '[.services.proxy.command[]? | select(startswith("--wake-compute-cache=")) | ltrimstr("--wake-compute-cache=")] | if length == 1 then .[0] else "" end' "$file")"
+  ttl="$(tr ',' '\n' <<<"$opts" | sed -n 's/^\(ttl\|absolute_ttl\)=//p' | tail -n1)"
+  secs=""
+  case "$ttl" in
+    *[0-9]s) secs="${ttl%s}" ;;
+    *[0-9]m) secs="$((${ttl%m} * 60))" ;;
+  esac
+  if [[ ! "$secs" =~ ^[0-9]+$ ]] || ((secs == 0 || secs > 600)); then
+    err "$render: --wake-compute-cache needs one flag with an absolute ttl of 1s to 10m (got [$opts])"
   fi
 done
 

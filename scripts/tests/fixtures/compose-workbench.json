@@ -1261,9 +1261,14 @@
         "--tls-cert=/tls/tls.crt",
         "--tls-key=/tls/tls.key",
         "--project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m",
+        "--wake-compute-cache=size=4000,idle_ttl=4m,ttl=10m",
         "--redis-auth-type=plain"
       ],
       "depends_on": {
+        "orchestrator": {
+          "condition": "service_healthy",
+          "required": true
+        },
         "proxy-tls": {
           "condition": "service_completed_successfully",
           "required": true
