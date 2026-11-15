@@ -4924,11 +4924,11 @@ async fn review(fx: &Fx) {
 // --- data-api-schema-stamp m1 (#198): the chelabase data API schema's stamp -----------------
 
 /// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
-/// ACL, body), the event triggers (owner, state, function, comment) and the schema itself.
+/// ACL, whole definition: `prosrc` is empty for the `BEGIN ATOMIC` claim helpers), the event triggers (owner, state, function, comment) and the schema itself.
 const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
   SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
     FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
-  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(p.prosrc)
+  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(pg_catalog.pg_get_functiondef(p.oid))
     FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
   UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
     FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
@@ -5186,12 +5186,14 @@ async fn app_users_newer_schema(fx: &Fx) {
     // bootstrap superuser's, so no tamper). Each script errors naming both versions and
     // changes nothing: not chelabase, not the role, not the helpers.
     fx.admin(MAKE_NEWER_SQL).await;
+    let unrewritten = fx.value(CHELABASE_SHAPE_SQL).await;
     fx.admin(
         "CREATE OR REPLACE FUNCTION chelabase.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT 'v99'; END;
 CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT '{\"v\": 99}'::jsonb; END;",
     )
     .await;
     let shape = fx.value(CHELABASE_SHAPE_SQL).await;
+    assert_ne!(shape, unrewritten, "the shape hash sees a BEGIN ATOMIC helper's body");
     let auth_sync = fx.value(AUTH_SYNC_SQL).await;
     let prosrc = fx.value(HELPERS_PROSRC_SQL).await;
     let why = format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}");
