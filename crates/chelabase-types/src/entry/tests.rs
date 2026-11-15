@@ -273,7 +273,6 @@ fn platform_mode_refuses_an_http_entry() {
     assert!(https.check_mode(Mode::Platform).is_ok());
 }
 
-
 // s3-endpoint m1: CHELABASE_S3_HOST is optional (unset or blank: the S3 endpoint is off),
 // validated and normalized like the docs host, and must differ from every other host.
 #[test]

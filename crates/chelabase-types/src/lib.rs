@@ -1,21 +1,21 @@
 //! Shared domain identifiers for Chelabase control plane.
 
+pub mod access;
+pub mod api_error;
 pub mod cli;
 pub mod data_api_schema;
 pub mod data_key;
-pub mod role_name;
-pub mod s3_key;
-pub mod role_password;
-pub mod role_settings;
+pub mod dev_defaults;
+pub mod entry;
+pub mod file_value;
 pub mod mode_policy;
 pub mod protection;
-pub mod access;
-pub mod api_error;
-pub mod table_api;
-pub mod entry;
+pub mod role_name;
+pub mod role_password;
+pub mod role_settings;
+pub mod s3_key;
 pub mod secret_env;
-pub mod file_value;
-pub mod dev_defaults;
+pub mod table_api;
 #[cfg(feature = "axum")]
 pub mod api_extract;
 pub use api_error::{ErrorBody, ErrorCode, ErrorEnvelope};
