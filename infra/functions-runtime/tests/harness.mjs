@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -17,7 +18,7 @@ export const IMAGE = process.env.FUNCTIONS_RUNTIME_IMAGE ?? "chelabase/functions
 export const FIXTURES = new URL("../fixtures/", import.meta.url).pathname;
 export const COMPAT_DATE = "2026-10-01";
 // Names user code must not reach; each resolves to the host running the stub store.
-export const INTERNAL_NAMES = ["functions", "functions-internal", "functions-control", "gateway-functions", "metadata-db", "nats", "orchestrator"];
+export const INTERNAL_NAMES = ["functions", "functions-internal", "functions-control", "functions-sql", "gateway-functions", "metadata-db", "nats", "orchestrator", "proxy"];
 
 const TYPES = { ".js": "js", ".wasm": "wasm", ".txt": "text", ".bin": "data" };
 
@@ -78,14 +79,40 @@ export async function startBundleStore() {
   };
 }
 
+// A stand-in for the SQL relay behind PG_RELAY: records each connection's first line (the
+// preamble) and the bytes after it, and echoes only those bytes, never the preamble.
+export async function startRelay() {
+  const conns = [];
+  const server = createTcpServer((sock) => {
+    const conn = { preamble: null, data: Buffer.alloc(0) };
+    conns.push(conn);
+    let head = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      if (conn.preamble === null) {
+        head = Buffer.concat([head, chunk]);
+        const nl = head.indexOf(0x0a);
+        if (nl < 0) return;
+        conn.preamble = head.subarray(0, nl + 1).toString("latin1");
+        chunk = head.subarray(nl + 1);
+      }
+      conn.data = Buffer.concat([conn.data, chunk]);
+      if (chunk.length > 0) sock.write(chunk);
+    });
+    sock.on("error", () => {});
+  });
+  await new Promise((resolve) => server.listen(0, "0.0.0.0", resolve));
+  return { port: server.address().port, conns, close: () => new Promise((resolve) => server.close(resolve)) };
+}
+
 async function docker(...args) {
   const { stdout } = await run("docker", args, { maxBuffer: 16 << 20 });
   return stdout.trim();
 }
 
 // Starts the runtime pointed at the stub store and, with `gateway` (a port on the host), the
-// gateway binding at that stub as the API host `apiHost`. Returns its base URL and helpers.
-export async function startRuntime(store, { restart = "no", gateway, apiHost = "api.chelabase.test:8000" } = {}) {
+// gateway binding at that stub as the API host `apiHost`, and with `relay` (a port on the host),
+// PG_RELAY at that port. Returns its base URL and helpers.
+export async function startRuntime(store, { restart = "no", gateway, relay, apiHost = "api.chelabase.test:8000" } = {}) {
   const hosts = INTERNAL_NAMES.flatMap((n) => ["--add-host", `${n}:host-gateway`]);
   const id = await docker(
     "run", "-d", "--restart", restart,
@@ -97,6 +124,7 @@ export async function startRuntime(store, { restart = "no", gateway, apiHost = "
     "/usr/local/bin/workerd", "serve", "--experimental",
     "--external-addr", `bundles=functions:${store.port}`,
     ...(gateway ? ["--external-addr", `chelabase-api=gateway-functions:${gateway}`] : []),
+    ...(relay ? ["--external-addr", `pg-relay=functions-sql:${relay}`] : []),
     "/etc/functions-runtime/config.capnp",
   );
   const hostPort = async () => (await docker("port", id, "8080/tcp")).split("\n")[0].split(":").pop();
