@@ -3,7 +3,8 @@
 # - creates a database and waits until it is ready;
 # - psql, SQL over HTTP and the serverless driver answer through Neon's proxy;
 # - each of those sessions reaches the compute over TLS (pg_stat_ssl), and a side proxy trusting
-#   another CA is refused at the compute (needs a proxy recreated with compute-hop-tls);
+#   another CA is refused at the compute (needs a proxy recreated with compute-hop-tls), and a
+#   plaintext route cached from a pre-upgrade orchestrator (server_name null) expires to TLS;
 # - a wrong password is refused, and query cancel works;
 # - a password reset takes effect at once (the old password is refused, on the Postgres port and /sql);
 # - deleting the database removes the compute and the storage-controller tenant.
@@ -163,10 +164,12 @@ project="${CHELABASE_COMPOSE_PROJECT:?run through just workbench run}"
 proxy_c="$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=proxy" | head -n1)"
 [[ -n "$proxy_c" ]] || die "no running proxy container in $project"
 side_proxies=()
-# side_proxy <name> <CA PEM>: starts it; prints its address on the default network. It runs in
-# a command substitution: the caller adds <name> to side_proxies first, for the cleanup.
+# side_proxy <name> <CA PEM> [--flag=value…]: starts it; prints its address on the default
+# network. Each --flag=value replaces the stack proxy's argument of that flag (or is added). It
+# runs in a command substitution: the caller adds <name> to side_proxies first, for the cleanup.
 side_proxy() {
   local name="$1" pem="$2" image user argv=()
+  shift 2
   image="$(docker inspect -f '{{.Config.Image}}' "$proxy_c")"
   user="$(docker inspect -f '{{.Config.User}}' "$proxy_c")"
   # One element per line, base64: the entrypoint's script spans lines.
@@ -174,6 +177,14 @@ side_proxy() {
   while IFS= read -r b64; do argv+=("$(base64 -d <<<"$b64")"); done < <(
     docker inspect "$proxy_c" | jq -r '.[0].Config | (.Entrypoint // []) + (.Cmd // []) | .[] | @base64')
   [[ "${argv[0]:-}" == /bin/sh ]] || die "the proxy's entrypoint isn't /bin/sh: ${argv[*]}"
+  local arg i replaced
+  for arg in "$@"; do
+    replaced=0
+    for i in "${!argv[@]}"; do
+      if [[ "${argv[$i]}" == "${arg%%=*}="* ]]; then argv[i]="$arg"; replaced=1; fi
+    done
+    ((replaced)) || argv+=("$arg")
+  done
   docker create -q --name "$name" --user "$user" --volumes-from "$proxy_c" --network "${project}_default" \
     -e SIDE_CA_PEM="$pem" -e NEON_INTERNAL_CA_FILE=/tmp/side-ca.crt --entrypoint /bin/sh "$image" \
     -c 'printf "%s\n" "$SIDE_CA_PEM" >/tmp/side-ca.crt && exec "$@"' side "${argv[@]}" >/dev/null ||
@@ -189,8 +200,10 @@ side_proxy() {
   done
   echo "$ip"
 }
+relay_pid=""
 side_cleanup() {
   for c in "${side_proxies[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  [[ -z "$relay_pid" ]] || kill "$relay_pid" 2>/dev/null || true
 }
 trap 'side_cleanup; cleanup' EXIT
 # side_sql <address> <psql args…>: the owner's login through that proxy.
@@ -226,9 +239,90 @@ for i in $(seq 20); do
     docker logs "$bad" 2>&1 | grep -v parquet | jq -c '{level, message}' 2>/dev/null | tail -10)"
   sleep 0.5
 done
+pass "a proxy trusting another CA can't log in (the compute's certificate is refused, no plaintext fallback)"
+
+# An upgrade can't leave a plaintext hop for good (the #224 audit, B1). An orchestrator from
+# before compute-hop-tls answers wake_compute with server_name null, and the proxy caches that
+# compute as plaintext. Compose starts the proxy only after a healthy orchestrator, and the
+# node-info cache has an absolute ttl (10m in the compose file), so the entry is dropped even
+# for an endpoint in constant use. Here a relay in front of the orchestrator plays the old one
+# (server_name null) and then the new one (its real answers), and a side proxy with a 5 s ttl
+# must switch to TLS soon after. (The compute takes plaintext from the proxy today, so the old
+# answer logs in with ssl = f; see the compute-spec follow-up.)
+echo old >"$tmp/relay-mode"
+: >"$tmp/relay-log"
+# shellcheck disable=SC2016 # JavaScript, not shell.
+node -e '
+const http = require("http"), net = require("net"), fs = require("fs");
+const [mode, log] = process.argv.slice(1);
+const server = http.createServer((req, res) => {
+  const body = [];
+  req.on("data", (c) => body.push(c));
+  req.on("end", () => {
+    const headers = { ...req.headers, host: "orchestrator:8083" };
+    const up = http.request({ host: "orchestrator", port: 8083, method: req.method, path: req.url, headers }, (r) => {
+      const chunks = [];
+      r.on("data", (c) => chunks.push(c));
+      r.on("end", () => {
+        let out = Buffer.concat(chunks);
+        if (req.url.includes("wake_compute") && r.statusCode === 200) {
+          const old = fs.readFileSync(mode, "utf8").trim() === "old";
+          if (old) {
+            const j = JSON.parse(out);
+            j.server_name = null;
+            out = Buffer.from(JSON.stringify(j));
+          }
+          fs.appendFileSync(log, (old ? "old" : "new") + "\n");
+        }
+        const h = { ...r.headers, "content-length": out.length };
+        delete h["transfer-encoding"];
+        res.writeHead(r.statusCode, h);
+        res.end(out);
+      });
+    });
+    up.on("error", (e) => { res.writeHead(502); res.end(String(e)); });
+    up.end(Buffer.concat(body));
+  });
+});
+server.listen(0, "0.0.0.0", () => {
+  // Our address on the stack network: the local end of a connection to the orchestrator.
+  const s = net.connect(8083, "orchestrator", () => {
+    console.log(`${s.localAddress}:${server.address().port}`);
+    s.destroy();
+  });
+});
+' "$tmp/relay-mode" "$tmp/relay-log" >"$tmp/relay-addr" 2>"$tmp/relay-err" &
+relay_pid=$!
+for i in $(seq 50); do
+  [[ -s "$tmp/relay-addr" ]] && break
+  kill -0 "$relay_pid" 2>/dev/null || die "the wake_compute relay exited: $(cat "$tmp/relay-err")"
+  [[ $i -lt 50 ]] || die "the wake_compute relay never listened"
+  sleep 0.2
+done
+relay="$(head -n1 "$tmp/relay-addr")"
+upg="neon-e2e-upgrade-$suffix"
+side_proxies+=("$upg")
+upg_ip="$(side_proxy "$upg" "$compute_ca_pem" "--auth-endpoint=http://$relay/proxy/api/v1" \
+  "--wake-compute-cache=size=4000,idle_ttl=4m,ttl=5s")"
+got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" ||
+  die "a side proxy behind a pre-upgrade orchestrator could not log in: $(cat "$tmp/err")"
+grep -qx old "$tmp/relay-log" || die "the side proxy never asked the relay for the compute (wake_compute)"
+[[ "$got" == f ]] || die "a server_name null answer didn't give a plaintext hop (ssl = '$got'): the relay doesn't play the old orchestrator"
+echo new >"$tmp/relay-mode"
+started=$SECONDS
+got=""
+for i in $(seq 30); do
+  got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" ||
+    die "a side proxy after the orchestrator upgrade could not log in: $(cat "$tmp/err")"
+  [[ "$got" == t ]] && break
+  [[ $i -lt 30 ]] || die "the plaintext hop outlived the orchestrator upgrade by $((SECONDS - started)) s with a 5 s cache ttl"
+  sleep 1
+done
+grep -qx new "$tmp/relay-log" || die "the side proxy reached the compute over TLS without asking the upgraded orchestrator"
+pass "a plaintext hop cached from a pre-upgrade orchestrator switches to TLS within the cache ttl ($((SECONDS - started)) s, ttl 5 s)"
 side_cleanup
 side_proxies=()
-pass "a proxy trusting another CA can't log in (the compute's certificate is refused, no plaintext fallback)"
+relay_pid=""
 
 # A wrong password is refused, over Postgres wire and over HTTP.
 if sql wrong-password -c 'select 1' >/dev/null 2>"$tmp/err"; then die "a wrong password connected"; fi

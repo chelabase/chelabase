@@ -832,8 +832,13 @@ services:
   # certificate (<endpoint>.compute.chelabase.internal) in its wake_compute answer, and the proxy
   # verifies it against the compute CA (NEON_INTERNAL_CA_FILE). The proxy accepts an unset
   # variable, so the entrypoint refuses to start without a CA file holding a certificate.
-  # Upgrading: recreate the proxy (`docker compose up -d --force-recreate proxy`); a restart
-  # keeps the old container's environment and mounts, and its cached plaintext compute entries.
+  # An orchestrator from before compute-hop-tls names no certificate (server_name null), and the
+  # proxy would cache that compute as plaintext. So the proxy starts only once the orchestrator
+  # is healthy (`up` never pairs a new proxy with the old orchestrator), and its node-info cache
+  # (--wake-compute-cache) keeps an entry for at most 10 minutes, however often it is used.
+  # Upgrading: `docker compose up -d` recreates the proxy. A restart (`docker compose restart`)
+  # keeps the old container's environment and mounts: without NEON_INTERNAL_CA_FILE every compute
+  # login fails until it is recreated (its in-memory caches don't survive the restart).
   proxy:
     image: *neon-image
     restart: unless-stopped
@@ -860,6 +865,9 @@ services:
       - --tls-cert=/tls/tls.crt
       - --tls-key=/tls/tls.key
       - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
+      # Compute addresses (and whether to verify a certificate): the fork's default plus an
+      # absolute ttl, so no entry outlives 10 minutes.
+      - --wake-compute-cache=size=4000,idle_ttl=4m,ttl=10m
       - --redis-auth-type=plain
     # 5432, the Postgres default, so clients need no port; it is free beside a workbench (4432,
     # 4500-4599). Move it when the host runs its own Postgres.
@@ -881,9 +889,14 @@ services:
     depends_on:
       proxy-tls:
         condition: service_completed_successfully
-      # The proxy exits if it can't reach Redis at startup. Valkey waits for init-secrets, which
-      # also makes compute-ca/ca.crt.
+      # compute-ca/ca.crt (NEON_INTERNAL_CA_FILE).
+      init-secrets:
+        condition: service_completed_successfully
+      # The proxy exits if it can't reach Redis at startup.
       valkey:
+        condition: service_healthy
+      # Its wake_compute answers name each compute's certificate (see above).
+      orchestrator:
         condition: service_healthy
 
   # --- The app tier ---------------------------------------------------------------------------

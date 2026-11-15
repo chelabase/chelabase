@@ -373,6 +373,14 @@ services:
     ports: !override
       - "127.0.0.1:${CHELABASE_PROXY_PORT:?set by chelabase workbench (stack.env)}:4432"
       - "[::1]:${CHELABASE_PROXY_PORT}:4432"
+    # The base's, without init-secrets (the keys dir holds the compute CA before the stack starts).
+    depends_on: !override
+      proxy-tls:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
 
   # --- The app tier: the checkout's host-built debug binaries in the workbench image ---------
 
