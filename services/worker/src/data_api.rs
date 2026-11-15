@@ -20,45 +20,64 @@ use crate::{OWNER_ROLE, Worker, credentials};
 
 /// The login role the data API connects as; never a secret key's role.
 const AUTHENTICATOR: &str = "authenticator";
-/// Whether a branch's data API machinery is intact (psql prints `t` or `f`): the `chelabase`
-/// schema, `authenticator` able to log in with `USAGE` on it and `SELECT` on
-/// `schema_version`, the three event triggers present and enabled, and the guard functions
-/// `assert_schema_version(uuid)` and `cap_response(text,bigint)`. Anything else is
-/// what the bootstrap repairs. Operators are schema-qualified (it runs as the superuser in
-/// a database the owner controls). Reconcile runs it through [`schema_check_sql`], which
-/// adds the database's default schema.
-pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version') IS NOT NULL \
+/// Whether `authenticator` can log in and the three event triggers are present and enabled:
+/// what this worker repairs whatever the `chelabase` schema's version.
+const MACHINERY_CHECK_SQL: &str = "EXISTS (SELECT FROM pg_catalog.pg_roles r \
+       WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin) \
+     AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger \
+       WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', \
+         'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) \
+         AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
+
+/// Whether this worker's version of the `chelabase` schema is installed: the schema,
+/// `authenticator` with `USAGE` on it and `SELECT` on `schema_version`, the guard functions
+/// `assert_schema_version(uuid)` and `cap_response(text,bigint)`, and this worker's stamp.
+fn installed_check_sql() -> String {
+    format!(
+        "to_regclass('chelabase.schema_version') IS NOT NULL \
      AND EXISTS (SELECT FROM pg_catalog.pg_roles r \
        JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) 'chelabase' \
        JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid \
          AND c.relname OPERATOR(pg_catalog.=) 'schema_version' \
-       WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin \
+       WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
          AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE') \
          AND pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT')) \
-     AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger \
-       WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', \
-         'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) \
-         AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3 \
      AND pg_catalog.to_regprocedure('chelabase.assert_schema_version(uuid)') IS NOT NULL \
-     AND pg_catalog.to_regprocedure('chelabase.cap_response(text,bigint)') IS NOT NULL";
+     AND pg_catalog.to_regprocedure('chelabase.cap_response(text,bigint)') IS NOT NULL \
+     AND {}",
+        current_stamp_sql()
+    )
+}
 
-/// [`SCHEMA_CHECK_SQL`] for a database whose default schema is `schema`: also
-/// `authenticator`'s `USAGE` on it. The data API prepares its statements as `authenticator`
-/// (NOINHERIT) before it switches role, and Postgres checks `USAGE` on every schema a
-/// statement names while parsing it, so without it every pipelined request falls back to
-/// the sequential path. A default schema that doesn't exist passes: the bootstrap skips it
-/// too. The literal is the quoted identifier (`to_regnamespace` parses identifier syntax).
-/// The search path is pinned first (`cloud_admin` is a superuser; `to_regclass` is unqualified).
-/// `storage_verifier`: the branch's `chelabase_storage` verifier ([`crate::storage_schema::storage_check_sql`]).
+/// Whether a branch's data API machinery is intact in a database whose default schema is
+/// `schema` (psql prints `t` or `f`). Anything else is what the bootstrap repairs:
+///
+/// - `authenticator` able to log in, and the three event triggers present and enabled;
+/// - `authenticator`'s `USAGE` on the default schema. The data API prepares its statements
+///   as `authenticator` (NOINHERIT) before it switches role, and Postgres checks `USAGE` on
+///   every schema a statement names while parsing it, so without it every pipelined request
+///   falls back to the sequential path. A default schema that doesn't exist passes: the
+///   bootstrap skips it too. The literal is the quoted identifier (`to_regnamespace` parses
+///   identifier syntax);
+/// - and either a valid stamp newer than this worker's (a newer worker's schema, which this
+///   one leaves alone) or this worker's version, stamped [`DATA_API_SCHEMA_STAMP`].
+///
+/// Operators are schema-qualified and the search path is pinned first (it runs as the
+/// superuser `cloud_admin` in a database the owner controls; `to_regclass` is unqualified).
+/// `storage_verifier`: the branch's `chelabase_storage` verifier
+/// ([`crate::storage_schema::storage_check_sql`]).
 pub fn schema_check_sql(schema: &str, storage_verifier: Option<&str>) -> String {
     let schema_literal = quote_literal(&quote_ident(schema));
     let storage = crate::storage_schema::storage_check_sql(crate::OWNER_ROLE, storage_verifier);
     format!(
-        "SET search_path = pg_catalog, pg_temp; {SCHEMA_CHECK_SQL} \
+        "SET search_path = pg_catalog, pg_temp; SELECT {MACHINERY_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
        JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
        WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace({schema_literal})::pg_catalog.oid \
-         AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')){storage}"
+         AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')) \
+     AND (COALESCE({newer}, false) OR ({installed})){storage}",
+        newer = valid_newer_sql(),
+        installed = installed_check_sql(),
     )
 }
 
@@ -67,6 +86,81 @@ pub fn schema_check_sql(schema: &str, storage_verifier: Option<&str>) -> String 
 /// "chelabase" followed by 0x01 (the bootstrap); other Chelabase advisory locks must use
 /// another key.
 pub const BOOTSTRAP_LOCK_KEY: i64 = 0x6368_656c_6164_6201;
+
+/// Which version of the `chelabase` schema [`data_api_sql`] installs. Bump it (and
+/// [`DATA_API_SCHEMA_STAMP`]) whenever the script changes what it installs in `chelabase`. A
+/// schema stamped with a higher version is a newer worker's: this one leaves its DDL and ACLs
+/// alone (mixed versions during a deploy never downgrade it), while a real tamper is still
+/// quarantined.
+pub const DATA_API_SCHEMA_VERSION: u32 = 1;
+
+/// The stamp: the comment on the event trigger `chelabase_schema_version_ddl`, written right
+/// after the bootstrap creates it. Every bootstrap (this one and the ones released before the
+/// stamp) drops and re-creates that trigger, so a worker that predates the stamp erases it.
+pub const DATA_API_SCHEMA_STAMP: &str = "chelabase data api schema 1";
+
+/// The stamp's form, as a POSIX regex whose one group is the version
+/// ([`data_api_stamp_version`]). Nine digits keep the cast to `int4` in range.
+pub const DATA_API_STAMP_PATTERN: &str = "^chelabase data api schema ([0-9]{1,9})$";
+
+/// The start of the output line the bootstrap prints when it left a newer schema alone.
+pub const NEWER_DATA_API_MARK: &str = "chelabase_data_api_newer";
+
+/// The version a stamp names, as [`DATA_API_STAMP_PATTERN`] reads it in SQL: `None` for
+/// anything but exactly `chelabase data api schema <1 to 9 digits>`.
+pub fn data_api_stamp_version(stamp: &str) -> Option<u32> {
+    let digits = stamp.strip_prefix("chelabase data api schema ")?;
+    (!digits.is_empty() && digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Where the stamp is read from: `chelabase_schema_version_ddl`, only when a superuser owns
+/// it and its function is a superuser's `chelabase.bump_schema_version()` (so `chelabase`
+/// exists). The owner may create event triggers of their own on Neon, owned by them and
+/// running their own function; theirs never matches, and reads as no stamp. `evtname` is
+/// unique, so this is one row or none.
+const STAMP_TRIGGER_SQL: &str = "FROM pg_catalog.pg_event_trigger e \
+JOIN pg_catalog.pg_roles eo ON eo.oid OPERATOR(pg_catalog.=) e.evtowner AND eo.rolsuper \
+JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid \
+AND p.proname OPERATOR(pg_catalog.=) 'bump_schema_version' AND p.pronargs OPERATOR(pg_catalog.=) 0 \
+JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace AND n.nspname OPERATOR(pg_catalog.=) 'chelabase' \
+JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.rolsuper \
+WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl'";
+
+/// The version the stamp names (NULL when there's no valid stamp: see [`STAMP_TRIGGER_SQL`]).
+fn stamp_version_sql() -> String {
+    format!(
+        "(SELECT pg_catalog.substring(pg_catalog.obj_description(e.oid, 'pg_event_trigger'), '{DATA_API_STAMP_PATTERN}')::pg_catalog.int4 {STAMP_TRIGGER_SQL})"
+    )
+}
+
+/// Whether the `chelabase` schema carries a valid stamp newer than this worker's (NULL when
+/// there's none or it doesn't parse; every use is `COALESCE(…, false)`).
+fn valid_newer_sql() -> String {
+    format!(
+        "({} OPERATOR(pg_catalog.>) {DATA_API_SCHEMA_VERSION})",
+        stamp_version_sql()
+    )
+}
+
+/// Whether the `chelabase` schema carries this worker's stamp, under the same rules.
+fn current_stamp_sql() -> String {
+    format!(
+        "EXISTS (SELECT {STAMP_TRIGGER_SQL} AND pg_catalog.obj_description(e.oid, 'pg_event_trigger') OPERATOR(pg_catalog.=) '{DATA_API_SCHEMA_STAMP}')"
+    )
+}
+
+/// Whether the bootstrap left a newer schema alone: the warning to log (the text after
+/// [`NEWER_DATA_API_MARK`] on the line that starts with it, naming both versions). A line
+/// that only contains the marker (a `CONTEXT:` line) doesn't count.
+pub fn newer_data_api_schema(output: &str) -> Option<&str> {
+    let marker = format!("{NEWER_DATA_API_MARK}: ");
+    output
+        .lines()
+        .find_map(|l| l.strip_prefix(&marker))
+        .map(str::trim_end)
+}
 
 /// How long either script waits for a lock (the advisory lock above, or a table lock such as
 /// `ALTER TABLE … OWNER` on `chelabase.schema_version`) before it fails, in seconds. It sits
@@ -253,6 +347,8 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
     let schema_literal = quote_literal(&schema_ident);
     let owner = quote_literal(owner_role);
     let claim_helpers = crate::app_users_sql::claim_helpers_body();
+    let newer = valid_newer_sql();
+    let stamp_version = stamp_version_sql();
     // A reserved default schema gets neither default privileges nor grants.
     let schema_present = if reserved_default_schema(schema) {
         "false".to_string()
@@ -277,6 +373,9 @@ DO $$ DECLARE
     AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls
       OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) ALL (ARRAY[-1, 0])))
     OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting WHERE setrole OPERATOR(pg_catalog.=) admin);
+  newer boolean := COALESCE({newer}, false);
+  untrusted boolean;
+  misshapen boolean;
   m record;
   aside pg_catalog.text;
 BEGIN
@@ -298,15 +397,26 @@ BEGIN
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
     WHERE (a.usesysid OPERATOR(pg_catalog.=) admin OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
       AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
-  IF ns IS NOT NULL AND (joined OR tampered
+  untrusted := joined OR tampered
     OR (SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid OPERATOR(pg_catalog.=) ns) OPERATOR(pg_catalog.<>) admin
     OR EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
-      AND (c.relowner OPERATOR(pg_catalog.<>) ALL (trusted) OR c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+      AND c.relowner OPERATOR(pg_catalog.<>) ALL (trusted))
+    OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
+      AND p.proowner OPERATOR(pg_catalog.<>) ALL (trusted))
+    OR EXISTS (SELECT FROM pg_catalog.pg_extension x WHERE x.extnamespace OPERATOR(pg_catalog.=) ns)
+    OR EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.deptype OPERATOR(pg_catalog.=) 'e'
+      AND ((d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) d.objid AND c.relnamespace OPERATOR(pg_catalog.=) ns))
+        OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.oid OPERATOR(pg_catalog.=) d.objid AND p.pronamespace OPERATOR(pg_catalog.=) ns))
+        OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid OPERATOR(pg_catalog.=) d.objid AND t.typnamespace OPERATOR(pg_catalog.=) ns))));
+  misshapen := EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
+      AND (c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
         OR c.relkind OPERATOR(pg_catalog.<>) ALL (ARRAY['r', 'i']::pg_catalog.\"char\"[])
         OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
-      AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[])))
+      AND p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[]))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -325,8 +435,8 @@ BEGIN
     OR EXISTS (SELECT FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) i.indrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL
         OR EXISTS (SELECT FROM pg_catalog.pg_opclass o WHERE o.oid OPERATOR(pg_catalog.=) ANY (i.indclass)
-          AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace))))
-  THEN
+          AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace)));
+  IF ns IS NOT NULL AND (untrusted OR (NOT COALESCE(newer, false) AND misshapen)) THEN
     DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
     DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
     DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
@@ -334,6 +444,8 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER SCHEMA chelabase RENAME TO %I', aside);
     PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);
   END IF;
+  PERFORM pg_catalog.set_config('chelabase.leave_alone', (ns IS NOT NULL AND untrusted IS FALSE AND COALESCE(newer, false))::pg_catalog.text, true);
+  PERFORM pg_catalog.set_config('chelabase.newer_version', COALESCE({stamp_version}::pg_catalog.text, ''), true);
 END $$;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
@@ -342,6 +454,8 @@ DO $$ BEGIN
         (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
+SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<>) 'true' AS chelabase_install \\gset
+\\if :chelabase_install
 CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
 REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
 GRANT USAGE ON SCHEMA chelabase TO authenticator;
@@ -409,6 +523,8 @@ DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
 CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();
 CREATE EVENT TRIGGER chelabase_schema_version_drop ON sql_drop EXECUTE FUNCTION chelabase.bump_schema_version();
 CREATE EVENT TRIGGER chelabase_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION chelabase.grant_extension_functions();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS '{DATA_API_SCHEMA_STAMP}';
+\\endif
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD {password};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 DO $$ BEGIN
@@ -435,6 +551,9 @@ DO $$ DECLARE r record; BEGIN
     INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true){record_grant};
   END IF;
 END $$;
+SELECT pg_catalog.format('{NEWER_DATA_API_MARK}: the chelabase schema is version %s, newer than this worker''s {DATA_API_SCHEMA_VERSION}; it was left alone',
+    pg_catalog.current_setting('chelabase.newer_version'))
+  WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true';
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
@@ -667,6 +786,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let output = self.computes.admin_sql(ep, database_name, &script).await?;
         if missing_schema(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, schema, "the default schema doesn't exist; its default privileges and grants were skipped (the machinery is installed)");
+        }
+        if let Some(why) = newer_data_api_schema(&output) {
+            warn!(branch_id = %branch, %ep, database = %database_name, "{why}");
         }
         if let Some(aside) = quarantined(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, "a chelabase schema Chelabase didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
@@ -926,7 +1048,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .with_context(|| format!("endpoint {ep} has no database"))
     }
 
-    /// Whether `ep`'s main database has its data API machinery intact ([`SCHEMA_CHECK_SQL`]).
+    /// Whether `ep`'s main database has its data API machinery intact ([`schema_check_sql`]).
     pub async fn data_api_healthy(&self, branch: BranchId, ep: &str) -> anyhow::Result<bool> {
         let database_name = self.database_of(ep).await?;
         let schema = self
@@ -1359,6 +1481,9 @@ DO $$ DECLARE
     AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls
       OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) ALL (ARRAY[-1, 0])))
     OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting WHERE setrole OPERATOR(pg_catalog.=) admin);
+  newer boolean := COALESCE(((SELECT pg_catalog.substring(pg_catalog.obj_description(e.oid, 'pg_event_trigger'), '^chelabase data api schema ([0-9]{1,9})$')::pg_catalog.int4 FROM pg_catalog.pg_event_trigger e JOIN pg_catalog.pg_roles eo ON eo.oid OPERATOR(pg_catalog.=) e.evtowner AND eo.rolsuper JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid AND p.proname OPERATOR(pg_catalog.=) 'bump_schema_version' AND p.pronargs OPERATOR(pg_catalog.=) 0 JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace AND n.nspname OPERATOR(pg_catalog.=) 'chelabase' JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.rolsuper WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl') OPERATOR(pg_catalog.>) 1), false);
+  untrusted boolean;
+  misshapen boolean;
   m record;
   aside pg_catalog.text;
 BEGIN
@@ -1380,15 +1505,26 @@ BEGIN
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
     WHERE (a.usesysid OPERATOR(pg_catalog.=) admin OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
       AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
-  IF ns IS NOT NULL AND (joined OR tampered
+  untrusted := joined OR tampered
     OR (SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid OPERATOR(pg_catalog.=) ns) OPERATOR(pg_catalog.<>) admin
     OR EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
-      AND (c.relowner OPERATOR(pg_catalog.<>) ALL (trusted) OR c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+      AND c.relowner OPERATOR(pg_catalog.<>) ALL (trusted))
+    OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
+      AND p.proowner OPERATOR(pg_catalog.<>) ALL (trusted))
+    OR EXISTS (SELECT FROM pg_catalog.pg_extension x WHERE x.extnamespace OPERATOR(pg_catalog.=) ns)
+    OR EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.deptype OPERATOR(pg_catalog.=) 'e'
+      AND ((d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) d.objid AND c.relnamespace OPERATOR(pg_catalog.=) ns))
+        OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.oid OPERATOR(pg_catalog.=) d.objid AND p.pronamespace OPERATOR(pg_catalog.=) ns))
+        OR (d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass
+          AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid OPERATOR(pg_catalog.=) d.objid AND t.typnamespace OPERATOR(pg_catalog.=) ns))));
+  misshapen := EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) ns
+      AND (c.reloftype OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
         OR c.relkind OPERATOR(pg_catalog.<>) ALL (ARRAY['r', 'i']::pg_catalog.\"char\"[])
         OR c.relname OPERATOR(pg_catalog.<>) ALL (ARRAY['schema_version', 'schema_version_pkey', 'bootstrap', 'bootstrap_pkey', 'app_users_table', 'app_users_table_pkey']::pg_catalog.name[])))
     OR EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) ns
-      AND (p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)
-        OR p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[])))
+      AND p.proname OPERATOR(pg_catalog.<>) ALL (ARRAY['bump_schema_version', 'grant_extension_functions', 'claims', 'user_id', 'user_email', 'users_guard', 'users_protect', 'app_users_upsert', 'app_users_gone', 'app_users_rows', 'assert_schema_version', 'cap_response']::pg_catalog.name[]))
     OR EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND NOT t.tgisinternal)
     OR EXISTS (SELECT FROM pg_catalog.pg_rewrite w JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class
@@ -1407,8 +1543,8 @@ BEGIN
     OR EXISTS (SELECT FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) i.indrelid
       WHERE c.relnamespace OPERATOR(pg_catalog.=) ns AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL
         OR EXISTS (SELECT FROM pg_catalog.pg_opclass o WHERE o.oid OPERATOR(pg_catalog.=) ANY (i.indclass)
-          AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace))))
-  THEN
+          AND o.opcnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace)));
+  IF ns IS NOT NULL AND (untrusted OR (NOT COALESCE(newer, false) AND misshapen)) THEN
     DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;
     DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;
     DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
@@ -1416,6 +1552,8 @@ BEGIN
     EXECUTE pg_catalog.format('ALTER SCHEMA chelabase RENAME TO %I', aside);
     PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);
   END IF;
+  PERFORM pg_catalog.set_config('chelabase.leave_alone', (ns IS NOT NULL AND untrusted IS FALSE AND COALESCE(newer, false))::pg_catalog.text, true);
+  PERFORM pg_catalog.set_config('chelabase.newer_version', COALESCE((SELECT pg_catalog.substring(pg_catalog.obj_description(e.oid, 'pg_event_trigger'), '^chelabase data api schema ([0-9]{1,9})$')::pg_catalog.int4 FROM pg_catalog.pg_event_trigger e JOIN pg_catalog.pg_roles eo ON eo.oid OPERATOR(pg_catalog.=) e.evtowner AND eo.rolsuper JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid AND p.proname OPERATOR(pg_catalog.=) 'bump_schema_version' AND p.pronargs OPERATOR(pg_catalog.=) 0 JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace AND n.nspname OPERATOR(pg_catalog.=) 'chelabase' JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.rolsuper WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl')::pg_catalog.text, ''), true);
 END $$;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
@@ -1424,6 +1562,8 @@ DO $$ BEGIN
         (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
+SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<>) 'true' AS chelabase_install \\gset
+\\if :chelabase_install
 CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
 REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
 GRANT USAGE ON SCHEMA chelabase TO authenticator;
@@ -1508,6 +1648,8 @@ DROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;
 CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();
 CREATE EVENT TRIGGER chelabase_schema_version_drop ON sql_drop EXECUTE FUNCTION chelabase.bump_schema_version();
 CREATE EVENT TRIGGER chelabase_extension_functions ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION', 'ALTER EXTENSION') EXECUTE FUNCTION chelabase.grant_extension_functions();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 1';
+\\endif
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD 's3cretPassw0rd';
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 DO $$ BEGIN
@@ -1535,6 +1677,9 @@ DO $$ DECLARE r record; BEGIN
     INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true);
   END IF;
 END $$;
+SELECT pg_catalog.format('chelabase_data_api_newer: the chelabase schema is version %s, newer than this worker''s 1; it was left alone',
+    pg_catalog.current_setting('chelabase.newer_version'))
+  WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true';
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
@@ -1568,6 +1713,10 @@ COMMIT;
             assert_eq!(sql.matches("COMMIT;").count(), 1);
             let drop = sql.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;\n").unwrap();
             assert!(sql.find("BEGIN;").unwrap() < lock_at && lock_at < drop && drop < sql.rfind("COMMIT;").unwrap());
+            // The psql gate around the chelabase DDL sits inside the one transaction.
+            let gate = sql.find("\\if :chelabase_install\n").expect("the gate");
+            assert!(lock_at < gate && gate < sql.find("CREATE EVENT TRIGGER").unwrap(), "{sql}");
+            assert!(sql.find("\\endif\n").unwrap() < sql.rfind("COMMIT;").unwrap(), "{sql}");
             for forbidden in ["CREATE DATABASE", "DROP DATABASE", "VACUUM", "CONCURRENTLY", "ROLLBACK"] {
                 assert!(!sql.contains(forbidden), "{forbidden}");
             }
@@ -1584,6 +1733,8 @@ COMMIT;
         let rename = sql.find("ALTER SCHEMA chelabase RENAME TO %I").expect("the rename aside");
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(rename < create);
+        // The vet decides before the gate reads its verdict.
+        assert!(rename < sql.find("\\gset").unwrap(), "{sql}");
         assert!(sql.contains("REVOKE chelabase_admin FROM %I GRANTED BY %I CASCADE"));
         for check in ["pg_trigger", "pg_rewrite", "pg_policy", "pg_attrdef", "pg_opclass", "relowner", "proowner"] {
             assert!(sql.contains(check), "{check}");
@@ -1608,7 +1759,8 @@ COMMIT;
         let ended = sql.find("pg_catalog.pg_terminate_backend(a.pid)").expect("sessions ended");
         assert!(sql.contains("a.rolcanlogin OR a.rolsuper"), "a tampered role is detected");
         assert!(sql.contains("a.rolpassword IS NOT NULL"));
-        assert!(sql.contains("IF ns IS NOT NULL AND (joined OR tampered"));
+        assert!(sql.contains("  untrusted := joined OR tampered\n"));
+        assert!(sql.contains("IF ns IS NOT NULL AND (untrusted OR"));
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(locked < create && ended < create);
     }
@@ -1831,9 +1983,11 @@ COMMIT;
     }
 
     /// Reconcile's check fails on anything the bootstrap repairs: the schema, the login, the
-    /// grants that let `authenticator` read the version, and the event triggers.
+    /// grants that let `authenticator` read the version, the event triggers and the stamp.
     #[test]
     fn the_health_check_covers_the_login_grants_and_triggers() {
+        let check = schema_check_sql("public", Some("v"));
+        let stamp = format!("'{DATA_API_SCHEMA_STAMP}'");
         for part in [
             "to_regclass('chelabase.schema_version')",
             "rolcanlogin",
@@ -1847,8 +2001,9 @@ COMMIT;
             "chelabase_extension_functions",
             "to_regprocedure('chelabase.assert_schema_version(uuid)')",
             "to_regprocedure('chelabase.cap_response(text,bigint)')",
+            &stamp,
         ] {
-            assert!(SCHEMA_CHECK_SQL.contains(part), "{part}: {SCHEMA_CHECK_SQL}");
+            assert!(check.contains(part), "{part}: {check}");
         }
     }
 
@@ -1863,8 +2018,8 @@ COMMIT;
         let sql = sql
             .strip_prefix("SET search_path = pg_catalog, pg_temp; ")
             .unwrap_or_else(|| panic!("the search path is pinned first: {sql}"));
-        assert!(sql.starts_with(SCHEMA_CHECK_SQL), "{sql}");
-        let rest = &sql[SCHEMA_CHECK_SQL.len()..];
+        assert!(sql.starts_with(&format!("SELECT {MACHINERY_CHECK_SQL} AND NOT EXISTS")), "{sql}");
+        let rest = &sql[MACHINERY_CHECK_SQL.len()..];
         for part in [
             "pg_catalog.to_regnamespace('\"my\"\"schema\"')",
             "r.rolname OPERATOR(pg_catalog.=) 'authenticator'",
@@ -3151,5 +3306,381 @@ END $$;
         // Main is bootstrapped again with the copied schema (the early run used `public`).
         let scripts = scripts_in(&w, &ep, "app");
         assert!(scripts.last().unwrap().contains("to_regnamespace('\"gone\"')"), "{}", scripts.len());
+    }
+
+    // --- Schema stamp (#198) -------------------------------------------------------------
+
+    /// The text from `open` (an index of `(`) to its matching `)`, inclusive.
+    fn group(sql: &str, open: usize) -> &str {
+        assert_eq!(&sql[open..open + 1], "(", "{}", &sql[open..]);
+        let mut depth = 0;
+        for (i, b) in sql.bytes().enumerate().skip(open) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &sql[open..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced: {}", &sql[open..]);
+    }
+
+    /// The vet `DO` block (the one that decides the quarantine).
+    fn vet_block(sql: &str) -> &str {
+        let start = sql.find("DO $$ DECLARE\n  admin pg_catalog.oid").expect("the vet block");
+        let end = start + sql[start..].find("END $$;\n").unwrap();
+        &sql[start..end]
+    }
+
+    fn both_scripts() -> [String; 2] {
+        [
+            data_api_sql("postgres", "pw", "public"),
+            data_api_sql_granting_existing("postgres", "pw", "public"),
+        ]
+    }
+
+    /// AC 1, 5: the stamp is the version number; a stamp parses only in exactly that form.
+    #[test]
+    fn data_api_schema_stamp_versions_parse() {
+        assert_eq!(DATA_API_SCHEMA_STAMP, format!("chelabase data api schema {DATA_API_SCHEMA_VERSION}"));
+        assert_eq!(data_api_stamp_version(DATA_API_SCHEMA_STAMP), Some(DATA_API_SCHEMA_VERSION));
+        assert_eq!(data_api_stamp_version("chelabase data api schema 3"), Some(3));
+        assert_eq!(data_api_stamp_version("chelabase data api schema 99"), Some(99));
+        assert_eq!(data_api_stamp_version("chelabase data api schema 999999999"), Some(999_999_999));
+        for garbage in [
+            "",
+            "chelabase data api schema",
+            "chelabase data api schema ",
+            "chelabase data api schema x",
+            "chelabase data api schema 1 ",
+            " chelabase data api schema 1",
+            "chelabase data api schema -1",
+            "chelabase data api schema +1",
+            "chelabase data api schema 1234567890",
+            crate::storage_schema::STORAGE_SCHEMA_STAMP,
+        ] {
+            assert_eq!(data_api_stamp_version(garbage), None, "{garbage:?}");
+        }
+        assert_eq!(DATA_API_STAMP_PATTERN, "^chelabase data api schema ([0-9]{1,9})$");
+    }
+
+    /// AC 3, 4: the stamp counts only on a superuser's `chelabase_schema_version_ddl` whose
+    /// function is the superuser's `chelabase.bump_schema_version()`; the owner can make
+    /// event triggers of their own (Neon), and theirs reads as no stamp.
+    #[test]
+    fn the_stamp_counts_only_on_the_superusers_trigger_and_function() {
+        let newer = valid_newer_sql();
+        for part in [
+            "FROM pg_catalog.pg_event_trigger e",
+            "e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl'",
+            "JOIN pg_catalog.pg_roles eo ON eo.oid OPERATOR(pg_catalog.=) e.evtowner AND eo.rolsuper",
+            "JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid",
+            "p.proname OPERATOR(pg_catalog.=) 'bump_schema_version'",
+            "p.pronargs OPERATOR(pg_catalog.=) 0",
+            "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace AND n.nspname OPERATOR(pg_catalog.=) 'chelabase'",
+            "JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.rolsuper",
+            &format!("OPERATOR(pg_catalog.>) {DATA_API_SCHEMA_VERSION}"),
+            &format!("'{DATA_API_STAMP_PATTERN}'"),
+        ] {
+            assert!(newer.contains(part), "{part}: {newer}");
+        }
+        for sql in both_scripts() {
+            assert!(sql.contains(&newer), "{sql}");
+        }
+        let check = schema_check_sql("public", Some("v"));
+        assert!(check.contains(&newer), "{check}");
+        // The current-stamp test in the check reads the same trigger, under the same rules.
+        let current = current_stamp_sql();
+        for part in ["eo.rolsuper", "po.rolsuper", "e.evtfoid", "'bump_schema_version'", "'chelabase'"] {
+            assert!(current.contains(part), "{part}: {current}");
+        }
+        assert!(current.contains(&format!("OPERATOR(pg_catalog.=) '{DATA_API_SCHEMA_STAMP}'")), "{current}");
+        assert!(check.contains(&current), "{check}");
+    }
+
+    /// Superuser SQL in a database the owner controls: every name and operator qualified.
+    #[test]
+    fn the_newer_fragment_is_qualified() {
+        let newer = valid_newer_sql();
+        for part in [
+            "pg_catalog.substring(",
+            "pg_catalog.obj_description(e.oid, 'pg_event_trigger')",
+            "OPERATOR(pg_catalog.>)",
+            "::pg_catalog.int4",
+        ] {
+            assert!(newer.contains(part), "{part}: {newer}");
+        }
+        let [plain, granting] = both_scripts();
+        // The data API's part of the check (storage's carries its functions' bodies).
+        let check = schema_check_sql("public", Some("v"));
+        let storage = crate::storage_schema::storage_check_sql(OWNER_ROLE, Some("v"));
+        let check = check.strip_suffix(&storage).unwrap().to_string();
+        for sql in [newer.clone(), plain, granting, check] {
+            for name in ["substring(", "obj_description(", "int4"] {
+                for (at, _) in sql.match_indices(name) {
+                    assert!(sql[..at].ends_with("pg_catalog."), "bare {name} in {sql}");
+                }
+            }
+            for bare in [" > ", " < ", " <> ", " >= ", " <= "] {
+                assert!(!sql.contains(bare), "bare {bare:?} in {sql}");
+            }
+        }
+    }
+
+    /// AC 5: a missing, unparseable or forged stamp is NULL or false, and NULL never skips the
+    /// quarantine nor leaves the schema alone.
+    #[test]
+    fn a_missing_stamp_never_skips_the_quarantine() {
+        let newer = valid_newer_sql();
+        let wrapped = format!("COALESCE({newer}, false)");
+        for sql in both_scripts() {
+            assert_eq!(sql.matches(&newer).count(), 1, "{sql}");
+            assert_eq!(sql.matches(&wrapped).count(), 1, "{sql}");
+            let vet = vet_block(&sql);
+            assert!(vet.contains(&format!("newer boolean := {wrapped};")), "{vet}");
+            assert!(
+                vet.contains("IF ns IS NOT NULL AND (untrusted OR (NOT COALESCE(newer, false) AND misshapen)) THEN"),
+                "{vet}"
+            );
+            assert!(
+                vet.contains("PERFORM pg_catalog.set_config('chelabase.leave_alone', (ns IS NOT NULL AND untrusted IS FALSE AND COALESCE(newer, false))::pg_catalog.text, true);"),
+                "{vet}"
+            );
+            // Neither flag is used anywhere without its COALESCE.
+            let uses = vet.matches("newer").count();
+            let guarded = vet.matches("COALESCE(newer, false)").count();
+            // `newer boolean := …` and the set_config of the version are the other two.
+            assert_eq!(uses, guarded + 2, "{vet}");
+        }
+        let check = schema_check_sql("public", Some("v"));
+        assert_eq!(check.matches(&newer).count(), 1, "{check}");
+        assert!(check.contains(&wrapped), "{check}");
+    }
+
+    /// AC 6, 7, 8: a newer stamp relaxes the allowlists and the shape checks only. A member of
+    /// `chelabase_admin`, a drifted role, an untrusted owner or an extension member in
+    /// `chelabase` quarantines whatever the stamp says.
+    #[test]
+    fn the_newer_stamp_relaxes_only_the_shape_checks() {
+        for sql in both_scripts() {
+            let vet = vet_block(&sql);
+            let untrusted_at = vet.find("  untrusted := ").expect("the real tamper");
+            let misshapen_at = vet.find("  misshapen := ").expect("the shape checks");
+            let if_at = vet.find("IF ns IS NOT NULL AND (untrusted").unwrap();
+            assert!(untrusted_at < misshapen_at && misshapen_at < if_at, "{vet}");
+            let untrusted = &vet[untrusted_at..misshapen_at];
+            let misshapen = &vet[misshapen_at..if_at];
+            for part in [
+                "joined",
+                "tampered",
+                "nspowner",
+                "c.relowner OPERATOR(pg_catalog.<>) ALL (trusted)",
+                "p.proowner OPERATOR(pg_catalog.<>) ALL (trusted)",
+                "pg_catalog.pg_extension x WHERE x.extnamespace OPERATOR(pg_catalog.=) ns",
+                "d.deptype OPERATOR(pg_catalog.=) 'e'",
+                "'pg_catalog.pg_class'::pg_catalog.regclass",
+                "'pg_catalog.pg_proc'::pg_catalog.regclass",
+                "'pg_catalog.pg_type'::pg_catalog.regclass",
+                "t.typnamespace OPERATOR(pg_catalog.=) ns",
+            ] {
+                assert!(untrusted.contains(part), "{part} is a real tamper: {untrusted}");
+                assert!(!misshapen.contains(part), "{part} is not shape: {misshapen}");
+            }
+            for part in [
+                "'schema_version', 'schema_version_pkey'",
+                "'bump_schema_version', 'grant_extension_functions'",
+                "c.reloftype",
+                "c.relkind",
+                "pg_catalog.pg_trigger",
+                "pg_catalog.pg_rewrite",
+                "pg_catalog.pg_policy",
+                "pg_catalog.pg_attribute",
+                "pg_catalog.pg_attrdef",
+                "pg_catalog.pg_constraint",
+                "pg_catalog.pg_index",
+            ] {
+                assert!(misshapen.contains(part), "{part} is shape: {misshapen}");
+                assert!(!untrusted.contains(part), "{part} is not a real tamper: {untrusted}");
+            }
+        }
+    }
+
+    /// AC 1, 2: everything that changes `chelabase` runs only when the schema isn't a newer
+    /// worker's; `authenticator`'s login and the default schema's grants run either way, in
+    /// the same transaction (raising would roll them back).
+    #[test]
+    fn the_chelabase_ddl_is_gated_and_the_rest_is_not() {
+        for sql in both_scripts() {
+            let gset = "SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<>) 'true' AS chelabase_install \\gset\n";
+            assert_eq!(sql.matches("\\gset").count(), 1, "{sql}");
+            assert_eq!(sql.matches(gset).count(), 1, "{sql}");
+            assert_eq!(sql.matches("\\if").count(), 1, "{sql}");
+            assert_eq!(sql.matches("\n\\if :chelabase_install\n").count(), 1, "{sql}");
+            assert_eq!(sql.matches("\\endif").count(), 1, "{sql}");
+            assert_eq!(sql.matches("\n\\endif\n").count(), 1, "{sql}");
+            assert!(!sql.contains("\\else") && !sql.contains("\\elif"), "{sql}");
+            let gset_at = sql.find(gset).unwrap();
+            let if_at = sql.find("\\if :chelabase_install").unwrap();
+            let endif_at = sql.find("\\endif").unwrap();
+            let vet_end = sql.find("PERFORM pg_catalog.set_config('chelabase.leave_alone'").unwrap();
+            let again = sql.find("current_setting('chelabase.former_members', true)").unwrap();
+            let lock = sql.find("pg_advisory_xact_lock").unwrap();
+            let commit = sql.find("COMMIT;").unwrap();
+            assert!(lock < vet_end && vet_end < again && again < gset_at, "{sql}");
+            assert!(gset_at < if_at && if_at < endif_at && endif_at < commit, "{sql}");
+            let (before, gated, after) = (&sql[..gset_at], &sql[if_at..endif_at], &sql[endif_at..]);
+            // Every chelabase statement is inside.
+            for part in [
+                "CREATE SCHEMA IF NOT EXISTS chelabase",
+                "REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;",
+                "GRANT USAGE ON SCHEMA chelabase TO authenticator;",
+                "CREATE TABLE IF NOT EXISTS chelabase.schema_version",
+                "CREATE TABLE IF NOT EXISTS chelabase.bootstrap",
+                "ALTER TABLE chelabase.schema_version OWNER TO chelabase_admin;",
+                "GRANT SELECT ON chelabase.schema_version TO authenticator;",
+                "GRANT USAGE ON SCHEMA chelabase TO postgres;",
+                "CREATE OR REPLACE FUNCTION chelabase.claims()",
+                "ALTER FUNCTION chelabase.cap_response(text, bigint) OWNER TO CURRENT_USER;",
+                "GRANT EXECUTE ON FUNCTION chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint) TO PUBLIC;",
+                "DROP EVENT TRIGGER IF EXISTS chelabase_schema_version_ddl;\nDROP EVENT TRIGGER IF EXISTS chelabase_schema_version_drop;\nDROP EVENT TRIGGER IF EXISTS chelabase_extension_functions;\nCREATE EVENT TRIGGER",
+                "CREATE EVENT TRIGGER chelabase_extension_functions",
+                &format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS '{DATA_API_SCHEMA_STAMP}';"),
+            ] {
+                assert!(gated.contains(part), "{part} is gated: {gated}");
+            }
+            for every in ["CREATE OR REPLACE FUNCTION", "ALTER FUNCTION", "CREATE EVENT TRIGGER", "CREATE TABLE", "CREATE SCHEMA", "COMMENT ON", "ALTER TABLE"] {
+                assert_eq!(gated.matches(every).count(), sql.matches(every).count(), "{every} outside the gate");
+            }
+            // Before the gate, only the vet block's quarantine touches chelabase.
+            for part in ["GRANT ", "REVOKE ALL", "ALTER ROLE authenticator", "ALTER DEFAULT PRIVILEGES", "chelabase.bootstrap"] {
+                assert!(!before.contains(part), "{part} before the gate");
+            }
+            // After it: authenticator, the default schema and the first grants, and nothing
+            // that changes chelabase.
+            for part in [
+                "ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD 'pw';",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT SELECT ON TABLES TO anon;",
+                "GRANT USAGE ON SCHEMA \"public\" TO anon, authenticated, authenticator;",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA \"public\" TO anon;",
+                "INSERT INTO chelabase.bootstrap (existing_granted) VALUES (true)",
+            ] {
+                assert!(after.contains(part), "{part} is outside the gate: {after}");
+                assert!(!gated.contains(part), "{part} is not gated");
+            }
+            let rest = after
+                .replace("chelabase.bootstrap", "")
+                .replace("'chelabase.quarantined'", "")
+                .replace("'chelabase.leave_alone'", "")
+                .replace("'chelabase.newer_version'", "");
+            for part in ["chelabase.", "SCHEMA chelabase", "EVENT TRIGGER"] {
+                assert!(!rest.contains(part), "{part} after the gate: {after}");
+            }
+        }
+    }
+
+    /// AC 10: the install stamps `chelabase_schema_version_ddl` right after creating it.
+    #[test]
+    fn the_install_stamps_the_ddl_trigger() {
+        for sql in both_scripts() {
+            let comment = format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS '{DATA_API_SCHEMA_STAMP}';\n");
+            assert_eq!(sql.matches(&comment).count(), 1, "{sql}");
+            assert_eq!(sql.matches("COMMENT ON").count(), 1, "{sql}");
+            let create = sql.find("CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();\n").unwrap();
+            assert!(create < sql.find(&comment).unwrap(), "{sql}");
+        }
+    }
+
+    /// AC 1, 2, 5: a valid newer stamp is healthy for the `chelabase` part, never for what this
+    /// worker still repairs (the login, the three triggers, the default schema's `USAGE`); the
+    /// current version needs this worker's stamp.
+    #[test]
+    fn the_health_check_counts_a_newer_stamp_healthy_and_requires_the_current_one() {
+        let check = schema_check_sql("public", Some("v"));
+        let branch = format!("COALESCE({}, false) OR (", valid_newer_sql());
+        let branch_at = check.find(&branch).unwrap_or_else(|| panic!("{check}"));
+        let open = check[..branch_at].rfind('(').unwrap();
+        let group_text = group(&check, open);
+        let group_end = open + group_text.len();
+        assert!(group_text.starts_with(&format!("({branch}")), "{group_text}");
+        for outside in [
+            "r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin",
+            "evtenabled OPERATOR(pg_catalog.<>) 'D'",
+            "'chelabase_schema_version_ddl'",
+            "'chelabase_schema_version_drop'",
+            "'chelabase_extension_functions'",
+            "pg_catalog.to_regnamespace('\"public\"')",
+        ] {
+            let at = check.find(outside).unwrap_or_else(|| panic!("{outside}: {check}"));
+            assert!(at < open, "{outside} is outside the newer branch: {check}");
+        }
+        for inside in [
+            "to_regclass('chelabase.schema_version')",
+            "has_table_privilege",
+            "to_regprocedure('chelabase.assert_schema_version(uuid)')",
+            "to_regprocedure('chelabase.cap_response(text,bigint)')",
+            &current_stamp_sql(),
+        ] {
+            assert!(group_text[branch.len()..].contains(inside), "{inside} needs the current version: {group_text}");
+        }
+        let storage = crate::storage_schema::storage_check_sql(OWNER_ROLE, Some("v"));
+        assert!(check.ends_with(&storage), "{check}");
+        assert!(check.len() - storage.len() >= group_end, "storage after the data API: {check}");
+    }
+
+    /// AC 1: the warning comes from the line that starts with the marker, nothing else.
+    #[test]
+    fn newer_data_api_schema_is_read_from_a_whole_line() {
+        let line = format!("{NEWER_DATA_API_MARK}: the chelabase schema is version 99, newer than this worker's 1; it was left alone");
+        assert_eq!(
+            newer_data_api_schema(&format!("\n{line}\n\n")),
+            Some("the chelabase schema is version 99, newer than this worker's 1; it was left alone")
+        );
+        assert_eq!(
+            newer_data_api_schema(&format!("{line}\nchelabase_quarantine_1\n")),
+            Some("the chelabase schema is version 99, newer than this worker's 1; it was left alone")
+        );
+        for other in [
+            String::new(),
+            "\n".to_string(),
+            "chelabase_quarantine_1\n".to_string(),
+            format!("CONTEXT:  {line}\n"),
+            format!("x {line}\n"),
+            format!(" {line}\n"),
+            format!("{NEWER_DATA_API_MARK}\n"),
+            format!("{NEWER_DATA_API_MARK}:x\n"),
+            format!("{}: the storage schema is version 99\n", crate::storage_schema::NEWER_SCHEMA_MARK),
+        ] {
+            assert_eq!(newer_data_api_schema(&other), None, "{other:?}");
+        }
+    }
+
+    /// AC 1: a schema left alone is a success, and the storage script still runs after it.
+    #[tokio::test]
+    async fn a_newer_data_api_schema_does_not_fail_the_bootstrap() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        w.computes.sql.lock().unwrap().clear();
+        w.computes.answers.lock().unwrap().push((
+            "chelabase.leave_alone".into(),
+            format!("\n{NEWER_DATA_API_MARK}: the chelabase schema is version 99, newer than this worker's 1; it was left alone\n\n"),
+        ));
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        let scripts = data_api_scripts(&w, &ep);
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("chelabase.leave_alone"), "{}", scripts[0]);
+        let sql = w.computes.sql.lock().unwrap().clone();
+        let data_api_at = sql.iter().position(|(_, _, s)| s == &scripts[0]).unwrap();
+        let storage_at = sql
+            .iter()
+            .position(|(_, _, s)| s.contains("COMMENT ON SCHEMA storage IS"))
+            .expect("the storage script ran");
+        assert!(data_api_at < storage_at);
     }
 }
