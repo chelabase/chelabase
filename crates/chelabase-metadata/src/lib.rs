@@ -70,7 +70,8 @@ pub use neon::{
     RoleLevel, RoleOrigin, RoleRow, SealedChange,
 };
 pub use neon::{
-    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleCopyDeleted, RoleWriteOutcome,
+    SecretChange,
 };
 
 /// Fixed seed tenant for local demos (`slug = demo`).

@@ -477,11 +477,13 @@ pub enum RoleWriteOutcome {
 /// How [`MetadataClient::rename_role_copy`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameCopyOutcome {
-    /// The row (`row: true`) and the branch's data keys moved to the new name; a role without
-    /// a row moves only its keys. `was_unreadable`: the row's `password_unreadable` before the
-    /// move (a move back passes it to restore it).
-    Renamed { row: bool, was_unreadable: bool },
-    /// The new name has a row, or live secret keys of a role dropped earlier: nothing moved.
+    /// The row (`row: true`) and the branch's data keys and S3 keys moved to the new name; a
+    /// role without a row moves only its keys. `was_unreadable`: the row's
+    /// `password_unreadable` before the move (a move back passes it to restore it). `s3_keys`:
+    /// the live S3 keys that moved, for the caller to tell storage about (m6).
+    Renamed { row: bool, was_unreadable: bool, s3_keys: Vec<uuid::Uuid> },
+    /// The new name has a row, or live secret keys or S3 keys of a role dropped earlier:
+    /// nothing moved.
     Taken,
     /// T3-M1: `old` is a personal login's row, which belongs to its record (S1): refused,
     /// nothing moved, keys included.
@@ -508,11 +510,22 @@ impl std::fmt::Debug for SealedChange {
     }
 }
 
+/// How [`MetadataClient::delete_role_copy_revoking`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCopyDeleted {
+    /// The row was deleted (false: there was none, and nothing else was written).
+    pub row: bool,
+    /// The live S3 keys bound to the name that were revoked with it (m6), for the caller to
+    /// tell storage about.
+    pub revoked_s3_keys: Vec<uuid::Uuid>,
+}
+
 /// How [`MetadataClient::apply_resync`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResyncApplied {
-    /// `changed` names the role rows inserted, updated or removed.
-    Applied { changed: Vec<String> },
+    /// `changed` names the role rows inserted, updated or removed; `s3_keys` the live S3 keys
+    /// revoked because their database is gone from the catalog (m6).
+    Applied { changed: Vec<String>, s3_keys: Vec<uuid::Uuid> },
     /// `roles_version` moved since it was read: nothing was written.
     VersionMoved,
 }
@@ -1596,9 +1609,21 @@ impl MetadataClient {
         endpoint_id: &str,
         name: &str,
     ) -> Result<bool, MetadataError> {
+        Ok(self.delete_role_copy_revoking(endpoint_id, name).await?.row)
+    }
+
+    /// [`Self::delete_role_copy`], also revoking the live S3 keys bound to the name on the
+    /// endpoint's branch in the same transaction (secret cleared; after the data keys, as
+    /// everywhere), and returning their ids for the caller to tell storage about (m6).
+    pub async fn delete_role_copy_revoking(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<RoleCopyDeleted, MetadataError> {
+        let nothing = RoleCopyDeleted { row: false, revoked_s3_keys: Vec::new() };
         let mut tx = self.pool.begin().await?;
         if !lock_endpoint_row(&mut tx, endpoint_id).await? {
-            return Ok(false);
+            return Ok(nothing);
         }
         let deleted = sqlx::query(
             "DELETE FROM neon_roles
@@ -1610,7 +1635,7 @@ impl MetadataClient {
         .await?
         .rows_affected();
         if deleted != 1 {
-            return Ok(false);
+            return Ok(nothing);
         }
         sqlx::query(
             "UPDATE data_api_keys k SET revoked_at = now(), sealed = NULL
@@ -1622,17 +1647,20 @@ impl MetadataClient {
         .bind(name)
         .execute(&mut *tx)
         .await?;
+        let revoked_s3_keys =
+            crate::storage_s3_keys::revoke_role_on_endpoint(&mut tx, endpoint_id, name).await?;
         bump_roles_version_only(&mut tx, endpoint_id).await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(RoleCopyDeleted { row: true, revoked_s3_keys })
     }
 
     /// One transaction (E29, a role renamed through the control plane with forwarding off, so
     /// the DDL receiver never sees it): locks the endpoint row; `Taken` (nothing written) when
-    /// `new` has a row or names live secret keys of `branch` (a role dropped earlier whose keys
-    /// aren't revoked yet); otherwise the non-owner row of `old`, if any, takes the name `new`
-    /// (keeping its origin, level, attributes and verifier) with `resealed` as its sealed
-    /// password, and every data key of `branch` with role `old`, live or revoked, follows. A
+    /// `new` has a row or names live secret keys or S3 keys of `branch` (a role dropped earlier
+    /// whose keys aren't revoked yet); otherwise the non-owner row of `old`, if any, takes the
+    /// name `new` (keeping its origin, level, attributes and verifier) with `resealed` as its
+    /// sealed password, and every data key, then every S3 key, of `branch` with role `old`,
+    /// live or revoked, follows. A
     /// key keeps its role OID and timeline (a rename keeps the OID). `password_unreadable`
     /// becomes `unreadable` when given (a move back restores the flag the forward move
     /// reported); otherwise a row that had a sealed password and gets `None` is marked
@@ -1655,7 +1683,9 @@ impl MetadataClient {
             "SELECT EXISTS (SELECT 1 FROM neon_roles WHERE endpoint_id = $1 AND name = $2)
                  OR EXISTS (SELECT 1 FROM data_api_keys
                             WHERE branch_id = $3 AND role = $2 AND kind = 'secret'
-                              AND revoked_at IS NULL)",
+                              AND revoked_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM storage_s3_keys
+                            WHERE branch_id = $3 AND role = $2 AND revoked_at IS NULL)",
         )
         .bind(endpoint_id)
         .bind(new)
@@ -1708,11 +1738,13 @@ impl MetadataClient {
             .bind(new)
             .execute(&mut *tx)
             .await?;
+        let s3_keys = crate::storage_s3_keys::follow_role_rename(&mut tx, branch, old, new).await?;
         bump_roles_version_only(&mut tx, endpoint_id).await?;
         tx.commit().await?;
         Ok(RenameCopyOutcome::Renamed {
             row: moved == 1,
             was_unreadable: was_unreadable.unwrap_or(false),
+            s3_keys,
         })
     }
 
@@ -1895,7 +1927,8 @@ impl MetadataClient {
             .await?;
             changed.extend(removed);
         }
-        let databases_changed = set_databases(&mut tx, endpoint_id, branch, &write.databases).await?;
+        let (databases_changed, s3_keys) =
+            set_databases(&mut tx, endpoint_id, branch, &write.databases).await?;
         if !changed.is_empty() || databases_changed {
             sqlx::query("UPDATE neon_endpoints SET roles_version = roles_version + 1 WHERE id = $1")
                 .bind(endpoint_id)
@@ -1903,7 +1936,7 @@ impl MetadataClient {
                 .await?;
         }
         tx.commit().await?;
-        Ok(ResyncApplied::Applied { changed })
+        Ok(ResyncApplied::Applied { changed, s3_keys })
     }
 
     /// Clears the flag and the owner row's `pending` (the other rows' go through
@@ -2043,14 +2076,15 @@ pub(crate) async fn copy_count(
     .await?)
 }
 
-/// Sets the branch's `branch_databases` to exactly `observed`. True when anything changed.
-/// Does nothing while the endpoint's `dbs_forwarded_at` is under 10 s old.
+/// Sets the branch's `branch_databases` to exactly `observed`. True when anything changed, with
+/// the live S3 keys revoked because their database went (m6). Does nothing while the
+/// endpoint's `dbs_forwarded_at` is under 10 s old.
 async fn set_databases(
     tx: &mut Transaction<'_, Postgres>,
     endpoint_id: &str,
     branch: BranchId,
     observed: &[ObservedDatabase],
-) -> Result<bool, MetadataError> {
+) -> Result<(bool, Vec<uuid::Uuid>), MetadataError> {
     // A database DDL the receiver answered stamps the endpoint; the catalog read may not have
     // seen its commit (and a drop leaves no row to stamp), so leave the rows alone for 10 s.
     let recent: bool = sqlx::query_scalar(
@@ -2061,7 +2095,7 @@ async fn set_databases(
     .fetch_one(&mut **tx)
     .await?;
     if recent {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
     let main: Option<String> = sqlx::query_scalar(
         "SELECT name FROM neon_databases WHERE endpoint_id = $1 ORDER BY name LIMIT 1",
@@ -2099,8 +2133,9 @@ async fn set_databases(
     .fetch_all(&mut **tx)
     .await?;
     changed |= !removed.is_empty();
+    let mut s3_keys = Vec::new();
     for name in &removed {
-        crate::ddl::drop_name_from_key_lists(tx, branch, name).await?;
+        s3_keys.extend(crate::ddl::drop_name_from_key_lists(tx, branch, name).await?);
     }
     for (name, owner, origin) in desired {
         let same = existing
@@ -2130,5 +2165,5 @@ async fn set_databases(
         .await?;
         changed = true;
     }
-    Ok(changed)
+    Ok((changed, s3_keys))
 }

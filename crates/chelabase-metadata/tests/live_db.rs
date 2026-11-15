@@ -4129,7 +4129,7 @@ async fn resync_skips_recently_forwarded_rows() {
     let after_again = version(&client, &ep).await;
     cleanup(&client, id).await;
 
-    let ResyncApplied::Applied { mut changed } = applied else { panic!("{applied:?}") };
+    let ResyncApplied::Applied { mut changed, .. } = applied else { panic!("{applied:?}") };
     changed.sort();
     assert_eq!(changed, ["fresh", "gone_old", "up_old"]);
     assert_eq!(after, v + 1);
@@ -4138,7 +4138,7 @@ async fn resync_skips_recently_forwarded_rows() {
     assert_eq!(verifier("up_old"), Some(Some("SCRAM-SHA-256$after".to_string())));
     assert!(verifier("gone_recent").is_some());
     assert_eq!(verifier("gone_old"), None);
-    assert_eq!(again, ResyncApplied::Applied { changed: vec![] });
+    assert_eq!(again, ResyncApplied::Applied { changed: vec![], s3_keys: vec![] });
     assert_eq!(after_again, after);
 }
 
@@ -4183,7 +4183,7 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
     let (copies, _) = client.role_copies(&ep).await.unwrap();
     cleanup(&client, id).await;
     let app = copies.iter().find(|c| c.name == "app").unwrap();
-    assert_eq!(applied, ResyncApplied::Applied { changed: vec!["app".into()] });
+    assert_eq!(applied, ResyncApplied::Applied { changed: vec!["app".into()], s3_keys: vec![] });
     assert_eq!(app.level, RoleLevel::OwnerLevel, "level follows the catalog");
     assert!(!app.pending, "pending follows the catalog");
     assert_eq!(app.scram_verifier.as_deref(), Some("SCRAM-SHA-256$forwarded"));
@@ -8449,13 +8449,13 @@ async fn rename_role_copy_moves_the_row_and_keys() {
     let keys = client.list_data_keys(branch).await.unwrap();
     cleanup(&client, id).await;
     assert_eq!(unknown, RenameCopyOutcome::NotFound, "an unknown endpoint isn't a taken name");
-    assert_eq!(lost, RenameCopyOutcome::Renamed { row: true, was_unreadable: false });
+    assert_eq!(lost, RenameCopyOutcome::Renamed { row: true, was_unreadable: false, s3_keys: vec![] });
     assert_eq!(marked, PasswordState::Unreadable);
-    assert_eq!(back, RenameCopyOutcome::Renamed { row: true, was_unreadable: true });
+    assert_eq!(back, RenameCopyOutcome::Renamed { row: true, was_unreadable: true, s3_keys: vec![] });
     assert_eq!(restored, PasswordState::Generated);
     assert_eq!((onto_row, onto_keys), (RenameCopyOutcome::Taken, RenameCopyOutcome::Taken));
-    assert_eq!(renamed, RenameCopyOutcome::Renamed { row: true, was_unreadable: false });
-    assert_eq!(rowless, RenameCopyOutcome::Renamed { row: false, was_unreadable: false });
+    assert_eq!(renamed, RenameCopyOutcome::Renamed { row: true, was_unreadable: false, s3_keys: vec![] });
+    assert_eq!(rowless, RenameCopyOutcome::Renamed { row: false, was_unreadable: false, s3_keys: vec![] });
     assert_eq!(after, v + 1);
     let app2 = copies.iter().find(|c| c.name == "app2").unwrap();
     assert_eq!((app2.origin, app2.scram_verifier.as_deref(), app2.password_enc.as_deref()), (RoleOrigin::Api, Some("SCRAM-SHA-256$a"), Some("v1:app2")));

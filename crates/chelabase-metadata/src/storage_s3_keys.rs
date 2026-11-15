@@ -6,6 +6,12 @@
 //! [`MetadataClient::lookup_s3_key`] opens it. A value copied from another row never opens.
 //! Revoking clears it in the same statement; the table's CHECKs refuse a revoked key that keeps
 //! a secret, a live key without one, and a live key without a role identity.
+//!
+//! s3-endpoint m6: a key follows or dies with its role and database exactly where a secret
+//! data key does (the DDL receiver, role delete and rename, a dropped or renamed database, the
+//! resync's [`MetadataClient::fix_s3_key_roles`]). Each of those writes returns the ids of the
+//! live S3 keys it changed, so the caller tells storage after the commit. Inside one
+//! transaction the lock order is data keys first, then S3 keys, at every site.
 
 use std::fmt;
 
@@ -15,7 +21,7 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
-use crate::{BranchStatus, DatabaseStatus, MetadataClient, MetadataError};
+use crate::{BranchStatus, DatabaseStatus, KeyRoleFix, MetadataClient, MetadataError};
 
 /// Live keys one branch may have.
 pub const STORAGE_S3_KEY_CAP: i64 = 100;
@@ -121,6 +127,111 @@ fn record_from_row(r: &PgRow) -> S3KeyRecord {
     }
 }
 
+/// The branch's live keys bound to `role`: `(id, name)`, oldest first.
+pub(crate) async fn live_s3_keys_of_role(
+    conn: &mut sqlx::PgConnection,
+    branch: BranchId,
+    role: &str,
+) -> Result<Vec<(Uuid, String)>, MetadataError> {
+    Ok(sqlx::query_as(
+        "SELECT id, name FROM storage_s3_keys
+         WHERE branch_id = $1 AND role = $2 AND revoked_at IS NULL
+         ORDER BY created_at, id",
+    )
+    .bind(branch.as_uuid())
+    .bind(role)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// A role renamed `old` -> `new`: the branch's keys of `old` follow, live and revoked alike
+/// (as data keys do). Returns the live ones' ids.
+pub(crate) async fn follow_role_rename(
+    conn: &mut sqlx::PgConnection,
+    branch: BranchId,
+    old: &str,
+    new: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH moved AS (
+             UPDATE storage_s3_keys SET role = $3 WHERE branch_id = $1 AND role = $2
+             RETURNING id, revoked_at
+         )
+         SELECT id FROM moved WHERE revoked_at IS NULL ORDER BY id",
+    )
+    .bind(branch.as_uuid())
+    .bind(old)
+    .bind(new)
+    .fetch_all(conn)
+    .await
+}
+
+/// A database renamed `old` -> `new` on the branch: its keys follow, live and revoked alike.
+/// Returns the live ones' ids.
+pub(crate) async fn follow_database_rename(
+    conn: &mut sqlx::PgConnection,
+    branch: BranchId,
+    old: &str,
+    new: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH moved AS (
+             UPDATE storage_s3_keys SET database = $3 WHERE branch_id = $1 AND database = $2
+             RETURNING id, revoked_at
+         )
+         SELECT id FROM moved WHERE revoked_at IS NULL ORDER BY id",
+    )
+    .bind(branch.as_uuid())
+    .bind(old)
+    .bind(new)
+    .fetch_all(conn)
+    .await
+}
+
+/// A database dropped on the branch: its live keys are revoked, secrets cleared. Returns their
+/// ids.
+pub(crate) async fn revoke_for_dropped_database(
+    conn: &mut sqlx::PgConnection,
+    branch: BranchId,
+    name: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH revoked AS (
+             UPDATE storage_s3_keys SET revoked_at = now(), secret_enc = NULL
+             WHERE branch_id = $1 AND database = $2 AND revoked_at IS NULL
+             RETURNING id
+         )
+         SELECT id FROM revoked ORDER BY id",
+    )
+    .bind(branch.as_uuid())
+    .bind(name)
+    .fetch_all(conn)
+    .await
+}
+
+/// A role dropped through the API: the live keys bound to `role` on the branch linked to
+/// `endpoint_id` are revoked, secrets cleared. Returns their ids.
+pub(crate) async fn revoke_role_on_endpoint(
+    conn: &mut sqlx::PgConnection,
+    endpoint_id: &str,
+    role: &str,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH revoked AS (
+             UPDATE storage_s3_keys k SET revoked_at = now(), secret_enc = NULL
+             FROM branches b
+             WHERE b.endpoint_id = $1 AND k.branch_id = b.id
+               AND k.role = $2 AND k.revoked_at IS NULL
+             RETURNING k.id
+         )
+         SELECT id FROM revoked ORDER BY id",
+    )
+    .bind(endpoint_id)
+    .bind(role)
+    .fetch_all(conn)
+    .await
+}
+
 impl MetadataClient {
     fn s3_secrets_key(&self) -> Result<&chelabase_secrets::SecretKey, MetadataError> {
         self.secrets_key
@@ -195,6 +306,75 @@ impl MetadataClient {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(record_from_row).collect())
+    }
+
+    /// Applies the resync's [`KeyRoleFix`]es to the branch's live S3 keys in one transaction,
+    /// each only while the row still has the role, OID and timeline the plan saw (a key
+    /// renamed, re-stamped or revoked meanwhile is left alone). An S3 key always has an OID,
+    /// so a `Backfill` is never planned for one; if one comes, the key is revoked. `Bypass`
+    /// doesn't apply to S3 keys and is skipped. Returns the ids of the keys changed.
+    pub async fn fix_s3_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[KeyRoleFix],
+    ) -> Result<Vec<Uuid>, MetadataError> {
+        if fixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut changed = Vec::new();
+        for fix in fixes {
+            let query = match fix {
+                KeyRoleFix::Revoke { id, role, oid } => sqlx::query_scalar(
+                    "UPDATE storage_s3_keys SET revoked_at = now(), secret_enc = NULL
+                     WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+                       AND role = $3 AND role_oid IS NOT DISTINCT FROM $4
+                     RETURNING id",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role)
+                .bind(*oid),
+                KeyRoleFix::Follow { id, from, to, oid, timeline } => sqlx::query_scalar(
+                    "UPDATE storage_s3_keys SET role = $4
+                     WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+                       AND role = $3 AND role_oid = $5 AND role_timeline = $6
+                     RETURNING id",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(from)
+                .bind(to)
+                .bind(*oid)
+                .bind(timeline),
+                KeyRoleFix::Restamp { id, role, oid, from, timeline } => sqlx::query_scalar(
+                    "UPDATE storage_s3_keys SET role_timeline = $5
+                     WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+                       AND role = $3 AND role_oid = $4
+                       AND role_timeline IS NOT DISTINCT FROM $6
+                     RETURNING id",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role)
+                .bind(*oid)
+                .bind(timeline)
+                .bind(from.as_deref()),
+                KeyRoleFix::Backfill { id, role, .. } => sqlx::query_scalar(
+                    "UPDATE storage_s3_keys SET revoked_at = now(), secret_enc = NULL
+                     WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL AND role = $3
+                     RETURNING id",
+                )
+                .bind(*id)
+                .bind(branch.as_uuid())
+                .bind(role),
+                KeyRoleFix::Bypass { .. } => continue,
+            };
+            let id: Option<Uuid> = query.fetch_optional(&mut *tx).await?;
+            changed.extend(id);
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Revokes a live key of the branch: `revoked_at` set and the sealed secret erased in one

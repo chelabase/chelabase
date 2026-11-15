@@ -665,3 +665,313 @@ async fn create_refuses_backup_and_rehearsal_branches() {
     }
     s.finish().await;
 }
+
+// ---- m6: S3 keys follow or are revoked with their role and database ----
+
+const TIMELINE: &str = "0123456789abcdef0123456789abcdef";
+
+impl Scratch {
+    /// A key bound to `role` (OID `oid`) and `database` on `branch`.
+    async fn create_for(&self, branch: BranchId, name: &str, role: &str, database: &str, oid: i64) -> Uuid {
+        let pair = s3_key::generate();
+        let id = Uuid::new_v4();
+        self.client
+            .create_s3_key(&NewS3Key {
+                id,
+                branch_id: branch,
+                database,
+                role,
+                name,
+                access_key_id: &pair.access_key_id,
+                secret: &pair.secret,
+                role_oid: oid,
+                role_timeline: TIMELINE,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    /// `(role, database, revoked, secret cleared)` of a key, read from the row.
+    async fn row(&self, id: Uuid) -> (String, String, bool, bool) {
+        sqlx::query_as(
+            "SELECT role, database, revoked_at IS NOT NULL, secret_enc IS NULL
+             FROM storage_s3_keys WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(self.client.pool())
+        .await
+        .unwrap()
+    }
+
+    /// An `sql` row named `name` on the endpoint.
+    async fn sql_row(&self, ep: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin)
+             VALUES ($1, $2, 'SCRAM-SHA-256$v', 'sql')",
+        )
+        .bind(ep)
+        .bind(name)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+    }
+}
+
+/// AC 1 (metadata side): the DDL transaction's `live_s3_keys` lists the branch's live S3 keys
+/// bound to the role, by name, and nothing revoked or of another role.
+#[tokio::test]
+#[ignore]
+async fn ddl_lists_live_s3_keys_of_a_role() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let live = s.create_for(branch, "ci", "writer", "app", 16_400).await;
+    let gone = s.create_for(branch, "old", "writer", "app", 16_400).await;
+    s.create_for(branch, "other", "reader", "app", 16_401).await;
+    assert!(s.client.revoke_s3_key(branch, gone).await.unwrap());
+    let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert_eq!(ddl.live_s3_keys("writer").await.unwrap(), vec![(live, "ci".to_string())]);
+    assert!(ddl.live_s3_keys("nobody").await.unwrap().is_empty());
+    drop(ddl);
+    s.finish().await;
+}
+
+/// AC 2: deleting a role's row through the roles API revokes the branch's live S3 keys bound to
+/// the name in the same transaction (secret cleared) and returns their ids for publishing.
+/// Other roles' keys and other branches' keys stay.
+#[tokio::test]
+#[ignore]
+async fn role_delete_revokes_s3_keys() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let other_branch = s.branch().await;
+    link_endpoint(&s, other_branch).await;
+    s.sql_row(&ep, "writer").await;
+    let bound = s.create_for(branch, "ci", "writer", "app", 16_400).await;
+    let other_role = s.create_for(branch, "r", "reader", "app", 16_401).await;
+    let other_branch_key = s.create_for(other_branch, "ci", "writer", "app", 16_400).await;
+
+    let deleted = s.client.delete_role_copy_revoking(&ep, "writer").await.unwrap();
+    assert!(deleted.row);
+    assert_eq!(deleted.revoked_s3_keys, vec![bound]);
+    assert_eq!(s.row(bound).await, ("writer".into(), "app".into(), true, true));
+    assert!(!s.row(other_role).await.2);
+    assert!(!s.row(other_branch_key).await.2);
+
+    // No row: nothing deleted, nothing revoked (as for data keys).
+    let again = s.client.delete_role_copy_revoking(&ep, "writer").await.unwrap();
+    assert!(!again.row);
+    assert!(again.revoked_s3_keys.is_empty());
+    s.finish().await;
+}
+
+/// AC 3: a dropped database revokes the S3 keys pinned to it (DDL receiver and resync alike);
+/// a renamed one takes them along. Each returns the ids it changed.
+#[tokio::test]
+#[ignore]
+async fn database_drop_and_rename() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    ddl.upsert_database("d", "postgres").await.unwrap();
+    ddl.upsert_database("gone", "postgres").await.unwrap();
+    ddl.commit().await.unwrap();
+    let on_d = s.create_for(branch, "d-key", "writer", "d", 16_400).await;
+    let on_app = s.create_for(branch, "app-key", "writer", "app", 16_400).await;
+    let on_gone = s.create_for(branch, "gone-key", "writer", "gone", 16_400).await;
+
+    // Rename d -> e: the key follows.
+    let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(ddl.rename_database("d", "e").await.unwrap());
+    assert_eq!(ddl.s3_keys_changed(), vec![on_d]);
+    ddl.commit().await.unwrap();
+    assert_eq!(s.row(on_d).await, ("writer".into(), "e".into(), false, false));
+
+    // Drop e: revoked, secret cleared.
+    let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(ddl.remove_database("e").await.unwrap());
+    assert_eq!(ddl.s3_keys_changed(), vec![on_d]);
+    ddl.commit().await.unwrap();
+    assert_eq!(s.row(on_d).await, ("writer".into(), "e".into(), true, true));
+    assert!(!s.row(on_app).await.2);
+
+    // The resync sees `gone` missing from the catalog: revoked there too.
+    sqlx::query("UPDATE neon_endpoints SET dbs_forwarded_at = NULL WHERE id = $1")
+        .bind(&ep)
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    let (_, version) = s.client.role_copies(&ep).await.unwrap();
+    let write = chelabase_metadata::ResyncWrite {
+        upserts: vec![],
+        removals: vec![],
+        databases: vec![chelabase_metadata::ObservedDatabase {
+            name: "app".into(),
+            owner: "postgres".into(),
+            system: false,
+        }],
+    };
+    let applied = s.client.apply_resync(&ep, branch, version, &write).await.unwrap();
+    let chelabase_metadata::ResyncApplied::Applied { s3_keys, .. } = applied else {
+        panic!("{applied:?}")
+    };
+    assert_eq!(s3_keys, vec![on_gone]);
+    assert_eq!(s.row(on_gone).await, ("writer".into(), "gone".into(), true, true));
+    assert!(!s.row(on_app).await.2);
+    s.finish().await;
+}
+
+/// Renames of a role move its S3 keys, as they move its data keys: through the DDL receiver
+/// (`rename_copy`, row or no row) and the control plane (`rename_role_copy`, which refuses a
+/// new name that still backs live S3 keys).
+#[tokio::test]
+#[ignore]
+async fn role_rename_moves_s3_keys() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    let key = s.create_for(branch, "ci", "writer", "app", 16_400).await;
+
+    let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+    assert!(!ddl.rename_copy("writer", "w2", None).await.unwrap(), "no row moved");
+    assert_eq!(ddl.s3_keys_changed(), vec![key]);
+    ddl.commit().await.unwrap();
+    assert_eq!(s.row(key).await.0, "w2");
+
+    let renamed = s
+        .client
+        .rename_role_copy(&ep, branch, "w2", "w3", None, None)
+        .await
+        .unwrap();
+    let chelabase_metadata::RenameCopyOutcome::Renamed { s3_keys, .. } = renamed else {
+        panic!("{renamed:?}")
+    };
+    assert_eq!(s3_keys, vec![key]);
+    assert_eq!(s.row(key).await.0, "w3");
+
+    // A name a live S3 key still names is taken.
+    s.create_for(branch, "other", "reader", "app", 16_401).await;
+    let taken = s
+        .client
+        .rename_role_copy(&ep, branch, "w3", "reader", None, None)
+        .await
+        .unwrap();
+    assert_eq!(taken, chelabase_metadata::RenameCopyOutcome::Taken);
+    assert_eq!(s.row(key).await.0, "w3");
+    s.finish().await;
+}
+
+/// The resync's repairs on S3 keys: each applies only while the row still looks as the plan
+/// saw it, and the ids it changed come back. A backfill (never planned for an S3 key, whose
+/// OID is always set) revokes.
+#[tokio::test]
+#[ignore]
+async fn fix_s3_key_roles_applies_guarded_repairs() {
+    use chelabase_metadata::KeyRoleFix;
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let gone = s.create_for(branch, "gone", "dropped", "app", 16_400).await;
+    let moved = s.create_for(branch, "moved", "old", "app", 16_401).await;
+    let restamped = s.create_for(branch, "re", "app", "app", 16_402).await;
+    let stale = s.create_for(branch, "stale", "app", "app", 16_403).await;
+    let odd = s.create_for(branch, "odd", "x", "app", 16_404).await;
+    let next = "fedcba9876543210fedcba9876543210";
+    let fixes = vec![
+        KeyRoleFix::Revoke { id: gone, role: "dropped".into(), oid: Some(16_400) },
+        KeyRoleFix::Follow { id: moved, from: "old".into(), to: "new".into(), oid: 16_401, timeline: TIMELINE.into() },
+        KeyRoleFix::Restamp { id: restamped, role: "app".into(), oid: 16_402, from: Some(TIMELINE.into()), timeline: next.into() },
+        // Saw another OID: left alone.
+        KeyRoleFix::Revoke { id: stale, role: "app".into(), oid: Some(1) },
+        KeyRoleFix::Backfill { id: odd, role: "x".into(), oid: 16_404, timeline: TIMELINE.into() },
+        KeyRoleFix::Bypass { id: stale, oid: 16_403, bypass_rls: true },
+    ];
+    let mut changed = s.client.fix_s3_key_roles(branch, &fixes).await.unwrap();
+    changed.sort();
+    let mut want = vec![gone, moved, restamped, odd];
+    want.sort();
+    assert_eq!(changed, want);
+    assert_eq!(s.row(gone).await, ("dropped".into(), "app".into(), true, true));
+    assert_eq!(s.row(moved).await, ("new".into(), "app".into(), false, false));
+    let timeline: String = sqlx::query_scalar("SELECT role_timeline FROM storage_s3_keys WHERE id = $1")
+        .bind(restamped)
+        .fetch_one(s.client.pool())
+        .await
+        .unwrap();
+    assert_eq!(timeline, next);
+    assert!(!s.row(stale).await.2);
+    assert!(s.row(odd).await.2);
+    // Applied again: the rows no longer match, nothing changes.
+    assert!(s.client.fix_s3_key_roles(branch, &fixes[..3]).await.unwrap().is_empty());
+    s.finish().await;
+}
+
+/// AC 7: a role delete and a database drop on one branch, each revoking data keys and S3 keys,
+/// run concurrently many times without a deadlock (data keys first, then S3 keys, everywhere,
+/// after the endpoint row).
+#[tokio::test]
+#[ignore]
+async fn concurrent_role_delete_and_db_drop() {
+    let s = Scratch::new().await;
+    let branch = s.branch().await;
+    let ep = link_endpoint(&s, branch).await;
+    for round in 0..20 {
+        let db = format!("db{round}");
+        let role = format!("r{round}");
+        let mut ddl = s.client.begin_ddl(&ep).await.unwrap().expect("endpoint");
+        ddl.upsert_database(&db, "postgres").await.unwrap();
+        ddl.commit().await.unwrap();
+        s.sql_row(&ep, &role).await;
+        // One key on the role and the database, so both transactions touch it.
+        let key = s.create_for(branch, "both", &role, &db, 16_400).await;
+        let mut sha256 = [0u8; 32];
+        sha256[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        let data_key = Uuid::new_v4();
+        s.client
+            .create_secret_key(&chelabase_metadata::NewDataKey {
+                id: data_key,
+                branch_id: branch,
+                kind: chelabase_types::data_key::DataKeyKind::Secret,
+                role: role.clone(),
+                name: "dk".into(),
+                prefix: "cb_sk_x".into(),
+                sha256,
+                sealed: None,
+                databases: Some(vec![db.clone()]),
+                role_oid: Some(16_400),
+                role_timeline: Some(TIMELINE.into()),
+                role_bypass_rls: false,
+            })
+            .await
+            .unwrap();
+        let (a, b) = (s.client.clone(), s.client.clone());
+        let (ep_a, ep_b, role_a, db_b) = (ep.clone(), ep.clone(), role.clone(), db.clone());
+        let deleting = tokio::spawn(async move { a.delete_role_copy_revoking(&ep_a, &role_a).await });
+        let dropping = tokio::spawn(async move {
+            let mut ddl = b.begin_ddl(&ep_b).await?.expect("endpoint");
+            ddl.remove_database(&db_b).await?;
+            let changed = ddl.s3_keys_changed();
+            ddl.commit().await?;
+            Ok::<_, MetadataError>(changed)
+        });
+        let deleted = deleting.await.unwrap().expect("role delete, no deadlock");
+        let dropped = dropping.await.unwrap().expect("database drop, no deadlock");
+        // Exactly one of them revoked the key.
+        assert_eq!(
+            deleted.revoked_s3_keys.len() + dropped.len(),
+            1,
+            "round {round}: {deleted:?} {dropped:?}"
+        );
+        assert!(s.row(key).await.2);
+        let data_revoked: bool =
+            sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM data_api_keys WHERE id = $1")
+                .bind(data_key)
+                .fetch_one(s.client.pool())
+                .await
+                .unwrap();
+        assert!(data_revoked, "round {round}");
+    }
+    s.finish().await;
+}

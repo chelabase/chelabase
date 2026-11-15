@@ -28,6 +28,9 @@ pub struct DdlTx {
     main_database: Option<String>,
     /// Something was written: `commit` bumps `roles_version`.
     wrote: bool,
+    /// The live S3 keys this transaction moved or revoked (m6), for the caller to tell
+    /// storage about once it commits.
+    s3_keys: Vec<Uuid>,
 }
 
 /// A lock timeout becomes [`MetadataError::EndpointLockTimeout`]; other errors pass through.
@@ -122,6 +125,7 @@ impl MetadataClient {
             owner,
             main_database,
             wrote: false,
+            s3_keys: Vec::new(),
         }))
     }
 }
@@ -181,6 +185,22 @@ impl DdlTx {
         .bind(role)
         .fetch_all(&mut *self.tx)
         .await?)
+    }
+
+    /// The branch's live S3 keys whose role is `role`: `(id, name)`. The receiver's guard
+    /// counts them with [`Self::live_secret_keys`] (m6).
+    pub async fn live_s3_keys(&mut self, role: &str) -> Result<Vec<(Uuid, String)>, MetadataError> {
+        let Some(branch) = self.branch_id else {
+            return Ok(Vec::new());
+        };
+        crate::storage_s3_keys::live_s3_keys_of_role(&mut self.tx, branch, role).await
+    }
+
+    /// The live S3 keys this transaction moved or revoked so far, each once, in the order
+    /// first touched: the caller publishes them after [`Self::commit`].
+    pub fn s3_keys_changed(&self) -> Vec<Uuid> {
+        let mut seen = std::collections::HashSet::new();
+        self.s3_keys.iter().copied().filter(|id| seen.insert(*id)).collect()
     }
 
     /// Inserts a copy (origin `sql`, login true, level plain) or, for an existing row,
@@ -309,7 +329,8 @@ impl DdlTx {
     /// must not stay under a name the next `CREATE ROLE` will take. Revoked keys are inert
     /// and unlisted; moving them keeps their history with the role. They can still stay
     /// under a name that is dropped and created again (`DROP b; CREATE b`), or onto which a
-    /// rename lands when all its keys are revoked: audit noise only.
+    /// rename lands when all its keys are revoked: audit noise only. The branch's S3 keys of
+    /// `old` follow the same way, after the data keys (m6).
     /// True when a row moved.
     pub async fn rename_copy(
         &mut self,
@@ -342,6 +363,11 @@ impl DdlTx {
             .await
             .map_err(|e| lock_timeout(e, &self.endpoint_id))?
             .rows_affected();
+            let s3 = crate::storage_s3_keys::follow_role_rename(&mut self.tx, branch, old, new)
+                .await
+                .map_err(|e| lock_timeout(e, &self.endpoint_id))?;
+            keys_moved += s3.len() as u64;
+            self.s3_keys.extend(s3);
         }
         self.wrote |= moved > 0 || keys_moved > 0;
         Ok(moved > 0)
@@ -414,7 +440,8 @@ impl DdlTx {
         Ok(())
     }
 
-    /// Renames a row, keeping its origin. False when there was none.
+    /// Renames a row, keeping its origin, and the keys that name the database follow it (data
+    /// keys' lists, then S3 keys). False when there was none.
     pub async fn rename_database(&mut self, old: &str, new: &str) -> Result<bool, MetadataError> {
         let Some(branch) = self.branch_id else {
             return Ok(false);
@@ -438,6 +465,10 @@ impl DdlTx {
             .bind(new)
             .execute(&mut *self.tx)
             .await?;
+            let s3 =
+                crate::storage_s3_keys::follow_database_rename(&mut self.tx, branch, old, new)
+                    .await?;
+            self.s3_keys.extend(s3);
         }
         self.stamp_databases().await?;
         self.wrote |= moved > 0;
@@ -457,7 +488,8 @@ impl DdlTx {
                 .await?
                 .rows_affected();
         if deleted > 0 {
-            drop_name_from_key_lists(&mut self.tx, branch, name).await?;
+            let s3 = drop_name_from_key_lists(&mut self.tx, branch, name).await?;
+            self.s3_keys.extend(s3);
         }
         self.stamp_databases().await?;
         self.wrote |= deleted > 0;
@@ -481,12 +513,14 @@ impl DdlTx {
 }
 
 /// A dropped database's name leaves every live key's list of the branch; a key left with none is
-/// revoked (an empty list can't be stored, and NULL would mean every database).
+/// revoked (an empty list can't be stored, and NULL would mean every database). Then the live
+/// S3 keys pinned to it are revoked (m6; data keys first, then S3 keys, as everywhere). Returns
+/// the S3 keys' ids.
 pub(crate) async fn drop_name_from_key_lists(
     conn: &mut sqlx::PgConnection,
     branch: BranchId,
     name: &str,
-) -> Result<(), MetadataError> {
+) -> Result<Vec<Uuid>, MetadataError> {
     sqlx::query(
         "UPDATE data_api_keys
          SET revoked_at = CASE WHEN cardinality(array_remove(databases, $2)) = 0
@@ -500,7 +534,7 @@ pub(crate) async fn drop_name_from_key_lists(
     )
     .bind(branch.as_uuid())
     .bind(name)
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
-    Ok(())
+    Ok(crate::storage_s3_keys::revoke_for_dropped_database(conn, branch, name).await?)
 }
