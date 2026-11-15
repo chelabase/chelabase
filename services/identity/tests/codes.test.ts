@@ -12,7 +12,7 @@ import {
 } from "./harness.ts";
 
 const MINUTE = 60_000;
-const DAY = 24 * 60 * MINUTE;
+const HOUR = 60 * MINUTE;
 
 describeDb("codes", () => {
   let h: Harness;
@@ -237,16 +237,21 @@ describeDb("codes", () => {
     const verifyCode = await issue(a.id, "verify");
     const inviteA = await issue(a.id, "invite");
     const inviteB = await issue(b.id, "invite");
+    const c = await createUser();
+    const inviteC = await issue(c.id, "invite");
     expect(Date.parse(reset.expires_at)).toBe(t0 + 15 * MINUTE);
     expect(Date.parse(verifyCode.expires_at)).toBe(t0 + 15 * MINUTE);
-    expect(Date.parse(inviteA.expires_at)).toBe(t0 + 7 * DAY);
+    expect(Date.parse(inviteA.expires_at)).toBe(t0 + 72 * HOUR);
 
     vi.setSystemTime(t0 + 15 * MINUTE + 1000);
     expect((await verify(a.id, "reset", reset.code, { new_password: "password-ttl-1" })).status).toBe(400);
     expect((await verify(a.id, "verify", verifyCode.code)).status).toBe(400);
     expect((await verify(a.id, "invite", inviteA.code, { new_password: "password-ttl-1" })).status).toBe(200);
 
-    vi.setSystemTime(t0 + 7 * DAY + 1000);
+    // Still good just before 72 hours, refused just after.
+    vi.setSystemTime(t0 + 72 * HOUR - 1000);
+    expect((await verify(c.id, "invite", inviteC.code, { new_password: "password-ttl-3" })).status).toBe(200);
+    vi.setSystemTime(t0 + 72 * HOUR + 1000);
     expect((await verify(b.id, "invite", inviteB.code, { new_password: "password-ttl-2" })).status).toBe(400);
   });
 

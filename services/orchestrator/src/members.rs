@@ -705,8 +705,9 @@ impl MemberRolesQueue for NatsPorts {
     }
 }
 
-/// How long an invite lives. The identity service's invite code lives 7 days; the invite's own
-/// `expires_at` is the shorter bound, and accept-invite checks it.
+/// How long an invite lives. The identity service's invite code lives as long (72 hours, its
+/// `CODE_TTL_MS.invite`; a test there pins the two together), and accept-invite checks the
+/// invite's own `expires_at`.
 const INVITE_LIFETIME_HOURS: i64 = 72;
 
 /// Invite mails and codes per person per hour, first invites and resends together, in this
