@@ -188,12 +188,16 @@ reported_rows (kind, oid, schema, name, parent, arguments, definition) AS (
   FROM pg_proc p JOIN ns n ON n.oid = p.pronamespace
   WHERE NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid)
   UNION ALL
-  -- Triggers (not internal ones; not the users table's guard triggers).
+  -- Triggers (not internal ones; not the users table's guard triggers; not the function
+  -- triggers, `chelabase_fn_*` running a function in `chelabase_functions`).
   SELECT 'trigger', tg.oid, n.nspname, tg.tgname, c.relname, NULL, pg_get_triggerdef(tg.oid, true)
   FROM pg_trigger tg
   JOIN pg_class c ON c.oid = tg.tgrelid
   JOIN ns n ON n.oid = c.relnamespace
+  JOIN pg_proc tp ON tp.oid = tg.tgfoid
+  JOIN pg_namespace tn ON tn.oid = tp.pronamespace
   WHERE NOT tg.tgisinternal
+    AND NOT (tg.tgname LIKE 'chelabase\_fn\_%' AND tn.nspname = 'chelabase_functions')
     AND NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_class'::regclass AND e.objid = c.oid)
     AND NOT ((c.oid = (SELECT oid FROM users_tab)) IS TRUE
              AND tg.tgname IN ('chelabase_users_guard', 'chelabase_users_guard_truncate'))

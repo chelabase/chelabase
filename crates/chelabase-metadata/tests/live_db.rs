@@ -542,11 +542,12 @@ impl SealedFixture {
                     .await
                     .unwrap();
             }
-            // The storage login's password always has its salt beside it.
-            ("branches", "storage_password_enc") => {
-                sqlx::query(
-                    "UPDATE branches SET storage_password_enc = 'v1:x', storage_password_salt = '\\x00000000000000000000000000000000' WHERE id = $1",
-                )
+            // The storage and functions logins' passwords always have their salt beside them.
+            ("branches", "storage_password_enc" | "functions_password_enc") => {
+                let salt = column.replace("_enc", "_salt");
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE branches SET {column} = 'v1:x', {salt} = '\\x00000000000000000000000000000000' WHERE id = $1"
+                )))
                 .bind(branch)
                 .execute(pool)
                 .await
@@ -609,6 +610,30 @@ impl SealedFixture {
             ("app_sessions", "grace_refresh_sealed") => {
                 // Within its grace window: it can still be opened.
                 fixture.session = Some(insert_grace_session(client, 3600.0).await);
+            }
+            ("branch_function_secrets", "ciphertext") => {
+                sqlx::query(
+                    "WITH f AS (INSERT INTO functions (id, database_id, name, kind)
+                                VALUES (gen_random_uuid(), $1, 'key-check', 'function')
+                                RETURNING id)
+                     INSERT INTO branch_function_secrets (branch_id, function_id, name, ciphertext)
+                     SELECT $2, id, 'KEY_CHECK', 'v1:x' FROM f",
+                )
+                .bind(database.as_uuid())
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("functions", "signing_secret") => {
+                sqlx::query(
+                    "INSERT INTO functions (id, database_id, name, kind, signing_secret)
+                     VALUES (gen_random_uuid(), $1, 'key-check', 'service', 'v1:x')",
+                )
+                .bind(database.as_uuid())
+                .execute(pool)
+                .await
+                .unwrap();
             }
             other => panic!("no fixture for sealed column {other:?}: add one here"),
         }
@@ -779,9 +804,20 @@ async fn key_check_waits_for_an_inflight_sealed_write() {
 }
 
 /// Metadata columns named like sealed ones that don't hold a secrets-key value, each with why.
-const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[];
+const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[
+    ("branches", "storage_password_salt", "the storage login's SCRAM salt, not secret"),
+    ("branches", "functions_password_salt", "the dispatch login's SCRAM salt, not secret"),
+    ("control_settings", "key", "a setting's name"),
+    ("invites", "token_hash", "a SHA-256 of the invite token, never opened"),
+    ("neon_endpoints", "compute_token_sha256", "a SHA-256 of the compute token, never opened"),
+    // TODO(#178): sealed with the secrets key (`Purpose::Webhook`) but not yet in
+    // SECRETS_KEY_SEALED; #178 adds it (and its fixture) and removes this entry.
+    ("storage_webhooks", "secret_enc", "TODO(#178)"),
+];
 
-// #38: a new sealed column must join the key check (or be excluded here, with a reason).
+// #38: a new sealed column must join the key check (or be excluded here, with a reason). Edge
+// functions review: discovered from the schema by any secret-looking name, not only `_enc` and
+// `sealed` (`functions.signing_secret` slipped through those), among text and bytea columns.
 #[tokio::test]
 #[ignore]
 async fn every_sealed_column_is_checked() {
@@ -789,7 +825,8 @@ async fn every_sealed_column_is_checked() {
     let columns: Vec<(String, String)> = sqlx::query_as(
         r"SELECT table_name::text, column_name::text FROM information_schema.columns
           WHERE table_schema = current_schema()
-            AND (column_name LIKE '%\_enc' OR column_name LIKE '%sealed%')
+            AND data_type IN ('text', 'bytea', 'character varying', 'jsonb')
+            AND column_name ~ '(secret|_enc$|sealed|cipher|password|token|^key$|_key$)'
           ORDER BY 1, 2",
     )
     .fetch_all(client.pool())
@@ -808,6 +845,13 @@ async fn every_sealed_column_is_checked() {
         missing.is_empty(),
         "sealed-looking columns neither in SECRETS_KEY_SEALED nor excluded: {missing:?}"
     );
+    // The exclusions name only columns that exist (a stale one would hide a new column).
+    for (table, column, _) in NOT_SECRETS_KEY_SEALED {
+        assert!(
+            columns.iter().any(|(t, c)| (t.as_str(), c.as_str()) == (*table, *column)),
+            "NOT_SECRETS_KEY_SEALED names {table}.{column}, which doesn't exist or no longer matches"
+        );
+    }
     // The list names only columns that exist.
     for (table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         assert!(
@@ -3056,6 +3100,9 @@ async fn branch_connection_returns_settings() {
     // The storage login's password and salt are stored together, once.
     client.set_storage_password(main_of(id), "v1:storage", &[7; 16]).await.unwrap();
     client.set_storage_password(main_of(id), "v1:later", &[8; 16]).await.unwrap();
+    // m13b: the functions dispatcher's login, the same way.
+    client.set_functions_password(main_of(id), "v1:functions", &[5; 16]).await.unwrap();
+    client.set_functions_password(main_of(id), "v1:later", &[6; 16]).await.unwrap();
     let with_storage = client.branch_connection(main_of(id)).await.unwrap().expect("row");
     let missing = client.branch_connection(BranchId::new()).await.unwrap();
     let record = main_branch(&client, id).await;
@@ -3073,6 +3120,9 @@ async fn branch_connection_returns_settings() {
     assert_eq!(with_storage.settings.storage_max_connections, 7);
     assert_eq!(with_storage.storage_password_enc.as_deref(), Some("v1:storage"));
     assert_eq!(with_storage.storage_password_salt.as_deref(), Some(&[7u8; 16][..]));
+    assert_eq!((ready.functions_password_enc.as_deref(), ready.functions_password_salt.as_deref()), (None, None));
+    assert_eq!(with_storage.functions_password_enc.as_deref(), Some("v1:functions"));
+    assert_eq!(with_storage.functions_password_salt.as_deref(), Some(&[5u8; 16][..]));
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
     assert!(missing.is_none());

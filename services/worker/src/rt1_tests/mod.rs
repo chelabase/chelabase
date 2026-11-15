@@ -162,6 +162,7 @@ pub(crate) fn rt_worker() -> Rt {
         schema_check_cursor: w.schema_check_cursor,
         enabling_seen: w.enabling_seen,
         recreate_backoff: w.recreate_backoff,
+        fn_sweeps: w.fn_sweeps,
         identity: w.identity,
         app_users_reconcile_every: w.app_users_reconcile_every,
         member_roles_sweep_every: w.member_roles_sweep_every,

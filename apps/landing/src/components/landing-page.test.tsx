@@ -81,17 +81,27 @@ describe("LandingPage", () => {
     const section = screen.getByRole("region", { name: "Everything in one place." });
     const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace(/Coming soon|Soon/g, ""));
     expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
-    expect(names.slice(-2)).toEqual(["Object storage", "CLI"]);
+    expect(names.slice(-2)).toEqual(["Object storage", "Edge functions"]);
     const gateway = within(section).getByRole("link", { name: /^Gateway/ });
     expect(gateway.getAttribute("href")).toBe(`${DOCS}/architecture/gateway`);
-    expect(within(section).getAllByRole("link")).toHaveLength(names.length - 1);
+    expect(within(section).getAllByRole("link")).toHaveLength(names.length);
   });
 
-  it("labels_the_cli_coming_soon_without_a_link", () => {
+  it("links_edge_functions_to_their_docs_and_says_what_shipped", () => {
     renderPage();
-    const card = screen.getByRole("heading", { level: 3, name: /^CLI/ }).parentElement!;
-    expect(card.tagName).not.toBe("A");
-    expect(card).toHaveTextContent(/coming soon/i);
+    const section = screen.getByRole("region", { name: "Everything in one place." });
+    const card = within(section).getByRole("link", { name: /^Edge functions/ });
+    expect(card.getAttribute("href")).toBe(`${DOCS}/using/functions`);
+    expect(card).not.toHaveTextContent(/coming soon|not available/i);
+    for (const shipped of [/TypeScript/, /WebAssembly/, /per branch/, /HTTP/, /schedule/, /table and storage events/]) {
+      expect(card).toHaveTextContent(shipped);
+    }
+  });
+
+  it("no_longer_lists_the_cli_as_a_platform_piece", () => {
+    renderPage();
+    const section = screen.getByRole("region", { name: "Everything in one place." });
+    expect(within(section).queryByRole("heading", { level: 3, name: /^CLI/ })).toBeNull();
   });
 
   it("links_object_storage_to_its_docs_and_says_what_shipped", () => {
@@ -123,13 +133,21 @@ describe("LandingPage", () => {
       .map((h) => h.querySelector(".sr-only")?.textContent ?? h.textContent);
     expect(headers).toEqual(COLUMNS);
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows).toHaveLength(13);
+    expect(rows).toHaveLength(14);
     for (const r of rows) expect(within(r).getAllByRole("cell")).toHaveLength(COLUMNS.length);
     expect(table.textContent).not.toMatch(/to survey/i);
     const merge = rows.find((r) => within(r).getByRole("rowheader").textContent === "Schema merge between branches")!;
     expect(within(merge).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Partly", "No", "No", "No", "Yes"]);
     const storage = rows.find((r) => within(r).getByRole("rowheader").textContent === "Object storage")!;
     expect(within(storage).getAllByRole("cell")[0]).toHaveTextContent("Yes");
+  });
+
+  it("edge_functions_row_matches_the_survey", () => {
+    renderPage();
+    const table = screen.getByRole("table", { name: /comparison preview/i });
+    const rows = within(table).getAllByRole("row").slice(1);
+    const fns = rows.find((r) => within(r).getByRole("rowheader").textContent === "Serverless functions")!;
+    expect(within(fns).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Yes", "Yes", "Yes", "No", "No"]);
   });
 
   it("labels_the_branching_drawings_as_illustrations", () => {

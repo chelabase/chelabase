@@ -88,13 +88,13 @@ pub async fn token(dir: &Path) -> Result<String> {
     Ok(t)
 }
 
-struct Site {
-    api: String,
-    studio: String,
+pub(crate) struct Site {
+    pub(crate) api: String,
+    pub(crate) studio: String,
 }
 
 impl Site {
-    fn post(&self, http: &chelabase_http::Client, path: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn post(&self, http: &chelabase_http::Client, path: &str) -> reqwest::RequestBuilder {
         http.post(format!("{}{path}", self.api))
             .header("origin", &self.studio)
             .header("x-chelabase-studio", "1")
@@ -122,7 +122,7 @@ impl Site {
     }
 
     /// A token for the session, or `None` once the session has ended (401).
-    async fn token(&self, http: &chelabase_http::Client, session: &str) -> Result<Option<String>> {
+    pub(crate) async fn token(&self, http: &chelabase_http::Client, session: &str) -> Result<Option<String>> {
         let resp = self
             .post(http, "/auth/v1/token")
             .header(reqwest::header::COOKIE, format!("{SESSION_COOKIE}={session}"))
@@ -141,7 +141,7 @@ impl Site {
 }
 
 /// The session cookie's value among `Set-Cookie` headers.
-fn session_cookie<'a>(headers: impl Iterator<Item = &'a reqwest::header::HeaderValue>) -> Option<String> {
+pub(crate) fn session_cookie<'a>(headers: impl Iterator<Item = &'a reqwest::header::HeaderValue>) -> Option<String> {
     headers.filter_map(|h| h.to_str().ok()).find_map(|h| {
         let (pair, _) = h.split_once(';').unwrap_or((h, ""));
         let (name, value) = pair.split_once('=')?;
@@ -151,7 +151,7 @@ fn session_cookie<'a>(headers: impl Iterator<Item = &'a reqwest::header::HeaderV
 
 /// Seconds until the JWT's `exp` (0 when it has passed or can't be read). Unverified: it only
 /// decides whether to ask for a new one.
-fn seconds_left(jwt: &str, now: u64) -> u64 {
+pub(crate) fn seconds_left(jwt: &str, now: u64) -> u64 {
     let exp = jwt
         .split('.')
         .nth(1)
@@ -167,7 +167,7 @@ fn now() -> u64 {
 }
 
 /// Writes `kept` owner-only: a temporary file made `O_EXCL` at 0600, then renamed into place.
-fn save(path: &Path, kept: &Kept) -> Result<()> {
+pub(crate) fn save<T: Serialize>(path: &Path, kept: &T) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp: PathBuf = path.with_extension(format!("tmp-{}", std::process::id()));

@@ -142,6 +142,8 @@ fn the_orchestrator_gets_exactly_the_events_publish_and_stream_rights() {
             "$JS.API.STREAM.INFO.CHELABASE_STORAGE_EVENTS",
             "$JS.API.STREAM.CREATE.CHELABASE_STORAGE_EVENTS",
             "$JS.API.STREAM.UPDATE.CHELABASE_STORAGE_EVENTS",
+            // Edge functions m4b: a branch's functions changed (one branch token).
+            "chelabase.fn.changed.*",
         ])
     );
     assert!(list(&text, "orchestrator", "publish", "deny").is_empty());
@@ -470,5 +472,38 @@ fn storage_only_listens_to_its_cache_events() {
     }
     for refused in ["$JS.API.STREAM.DELETE.CHELABASE_STORAGE_EVENTS", "$JS.API.STREAM.PURGE.CHELABASE_STORAGE_EVENTS"] {
         assert!(!may_publish(&text, "runner", refused), "{refused}");
+    }
+}
+
+// Edge functions m4b: the functions service's NATS user subscribes to the change events (one
+// branch token deep) and nothing else; it publishes nothing at all (a deny-all list: an empty
+// allow list would be no restriction). The orchestrator publishes them.
+#[test]
+fn functions_only_listens_to_change_events() {
+    let text = rendered();
+    let changed = "chelabase.fn.changed.0b6c2f0e-1111-4c3e-9a3e-000000000001";
+    assert!(list(&text, "functions", "publish", "allow").is_empty());
+    assert_eq!(as_set(list(&text, "functions", "publish", "deny")), set(&[">"]));
+    for subject in [changed, "chelabase.provision", "_INBOX_functions.x", "chelabase.fn.changed"] {
+        assert!(!may_publish(&text, "functions", subject), "{subject}");
+    }
+    assert_eq!(as_set(list(&text, "functions", "subscribe", "allow")), set(&["chelabase.fn.changed.*"]));
+    assert!(may_subscribe(&text, "functions", changed));
+    for subject in [
+        "chelabase.fn.changed",
+        "chelabase.fn.changed.a.b",
+        "chelabase.fn.other.x",
+        "chelabase.rpc.check_data_role",
+        "chelabase.rt.project.p",
+        "_INBOX_orchestrator.x",
+        "_INBOX_functions.x",
+    ] {
+        assert!(!may_subscribe(&text, "functions", subject), "{subject}");
+    }
+    assert!(may_publish(&text, "orchestrator", changed));
+    assert!(!may_publish(&text, "orchestrator", "chelabase.fn.changed.a.b"));
+    for user in ["worker", "realtime", "storage"] {
+        assert!(!may_publish(&text, user, changed), "{user}");
+        assert!(!may_subscribe(&text, user, changed), "{user}");
     }
 }

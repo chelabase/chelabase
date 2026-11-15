@@ -203,6 +203,20 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
       refused GET http://storage:8090/storage/v1/bucket "storage's console bucket list (a forged caller)" -H "$caller"
       refused POST http://storage:8090/storage/v1/object/files/x.txt "storage's console upload" -H "$caller" -H 'Content-Type: text/plain' -d x
       refused POST http://storage:8090/storage/v1/object/sign/files/x.txt "storage's console signing" -H "$caller" -H 'Content-Type: application/json' -d '{"expires_in":60}' ;;
+    # The functions service joins the compute network only to dial computes as its dispatch login
+    # (edge functions m13b, #186). Its listeners bind addresses on other networks (public 8091 on
+    # the default network, the internal 8080 on `functions` and `functions-control`), so from the
+    # compute network nothing answers: prove it with a connection to its compute address.
+    functions:8080 | functions:8091)
+      local fip
+      fip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"$compute_net\"}}{{.IPAddress}}{{end}}" "$name")"
+      if [[ -z "$fip" ]]; then
+        fail "functions has no address on the compute network"
+      elif tcp_open "$fip" "$port"; then
+        fail "functions:$port answers on its compute-network address $fip"
+      else
+        ok "functions:$port isn't reachable from the compute network (bound on other networks only)"
+      fi ;;
     compute:5432) ok "compute:5432 is public by design (password logins)" ;;
     # compute_ctl's external API answers 401 (with WWW-Authenticate: Bearer) to a request without
     # a bearer, on every route, /metrics and /autoscaling_metrics included (K3/K4). Its internal

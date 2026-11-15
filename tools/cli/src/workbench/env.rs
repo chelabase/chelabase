@@ -172,6 +172,13 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_STORAGE_URL", "http://storage:8089"),
     // m9: the orchestrator's way to storage's console listener (Studio's storage routes).
     ("CHELABASE_STORAGE_INTERNAL_URL", "http://storage:8090"),
+    // Edge functions m4b: the gateway's functions upstream (the public listener's alias), and the
+    // internal listener the orchestrator and the worker reach on `functions-control`.
+    ("CHELABASE_FUNCTIONS_URL", "http://functions-public:8091"),
+    ("CHELABASE_FUNCTIONS_INTERNAL_URL", "http://functions-control:8080"),
+    // Edge functions m11: the service runner (profile `services`); without it the name doesn't
+    // resolve and container services answer `runner_unavailable`.
+    ("CHELABASE_SERVICE_RUNNER_URL", "http://service-runner-control:8094"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),

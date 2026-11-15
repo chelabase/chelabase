@@ -99,8 +99,8 @@ function send<T>(path: string, options: RequestInit, parse?: (text: string) => u
   return requestJson<T>(fetchImpl, `${config.baseUrl}${path}`, { ...options, headers }, config.onUnauthorized, parse);
 }
 
-/** Answers that are text, not JSON: the merge plan's SQL. */
-const TEXT_ANSWER = /\/plan\.sql$/;
+/** Answers that are text, not JSON: the merge plan's SQL and a container service's logs. */
+const TEXT_ANSWER = /(\/plan\.sql|\/functions\/[^/]+\/logs)$/;
 
 /** Orval mutator for the Management API. */
 export const customFetch = async <T>(url: string, options: RequestInit): Promise<T> =>

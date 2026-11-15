@@ -122,7 +122,7 @@ fn internal(err: impl std::fmt::Display) -> ApiError {
 }
 
 /// A new signing secret: `whsec_` and 32 random bytes in hex.
-fn new_secret() -> String {
+pub(crate) fn new_secret() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("OS random number generator");
     format!("whsec_{}", hex::encode(bytes))

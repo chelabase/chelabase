@@ -491,6 +491,9 @@ pub(crate) async fn drop_name_from_key_lists(
         "UPDATE data_api_keys
          SET revoked_at = CASE WHEN cardinality(array_remove(databases, $2)) = 0
                                THEN now() END,
+             sealed = CASE WHEN cardinality(array_remove(databases, $2)) = 0
+                                AND kind = 'secret'
+                           THEN NULL ELSE sealed END,
              databases = CASE WHEN cardinality(array_remove(databases, $2)) = 0
                               THEN databases ELSE array_remove(databases, $2) END
          WHERE branch_id = $1 AND revoked_at IS NULL AND databases @> ARRAY[$2]::text[]",

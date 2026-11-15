@@ -53,6 +53,7 @@ async fn fetch_owner_level(
 fn refused(e: RoleRefused<ApiError>) -> ApiError {
     match e {
         RoleRefused::OwnerLevel(role) => ApiError::role_not_allowed(&role),
+        RoleRefused::Reserved(role) => ApiError::role_reserved(&role),
         RoleRefused::UnknownRole(role) => ApiError::unknown_role(&role),
         RoleRefused::Check(e) => e,
     }

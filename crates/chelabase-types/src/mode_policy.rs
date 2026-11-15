@@ -33,6 +33,7 @@ impl ModePolicy {
         ("prehashed_passwords_allowed", "Whether role passwords may be supplied pre-hashed."),
         ("ca_file_on_reveal", "Whether revealing connection details includes the dev CA path."),
         ("default_internal_token_allowed", "Whether the services may start with the development internal bearer (a platform instance refuses to start with it)."),
+        ("functions_available", "Whether members may manage and run edge functions (platform mode answers 403 until its own design)."),
     ];
 
     pub fn new(mode: Mode) -> Self {
@@ -97,6 +98,12 @@ impl ModePolicy {
         self.self_hosted()
     }
 
+    /// Edge functions: self-hosted only. Platform mode refuses every functions management route
+    /// (403 `not_available_in_platform_mode`) until it has its own isolation design.
+    pub fn functions_available(&self) -> bool {
+        self.self_hosted()
+    }
+
     /// `Err` (a message for the startup error) when `token` is the development bearer and this
     /// mode doesn't allow it. The message never repeats the token.
     pub fn check_internal_token(&self, token: &str) -> Result<(), String> {
@@ -147,6 +154,7 @@ impl ModePolicy {
             "prehashed_passwords_allowed" => b(self.prehashed_passwords_allowed()),
             "ca_file_on_reveal" => b(self.ca_file_on_reveal()),
             "default_internal_token_allowed" => b(self.default_internal_token_allowed()),
+            "functions_available" => b(self.functions_available()),
             other => unreachable!("rule {other} is in RULES but has no value"),
         }
     }
@@ -159,7 +167,8 @@ mod tests {
     #[test]
     fn every_rule_per_mode() {
         type Rule = fn(&ModePolicy) -> bool;
-        let table: [(&str, Rule, bool, bool); 7] = [
+        let table: [(&str, Rule, bool, bool); 8] = [
+            ("functions_available", ModePolicy::functions_available, true, false),
             ("default_internal_token_allowed", ModePolicy::default_internal_token_allowed, true, false),
             ("open_signup_switchable", ModePolicy::open_signup_switchable, true, false),
             ("email_verification_default", ModePolicy::email_verification_default, false, true),

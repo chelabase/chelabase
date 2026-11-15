@@ -1233,6 +1233,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         info!(branch_id = %target.id, "branch ready on its new timeline");
         self.member_role_requests.request(target.id);
+        // Edge functions m8: the switch pended the table triggers; the outbox came from the
+        // old timeline. Best effort: the reconcile sweep retries pending rows.
+        if let Err(e) = self.sync_fn_triggers(target.id, true).await {
+            warn!(branch_id = %target.id, "reinstalling the function triggers: {e}");
+        }
         Ok(())
     }
 

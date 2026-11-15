@@ -81,6 +81,9 @@ const STORAGE_OBJECT_CONSUMER_API: [&str; 5] = [
     "$JS.API.CONSUMER.DELETE.CHELABASE_STORAGE_EVENTS.*",
     "$JS.ACK.CHELABASE_STORAGE_EVENTS.>",
 ];
+/// Edge functions m4b: a branch's functions changed (`chelabase-nats`'s `fn_events`, one branch
+/// token): the orchestrator publishes, the functions service drops its cached resolutions.
+const FN_CHANGED: &str = "chelabase.fn.changed.*";
 /// The tenant-attached events (carried gaps T4, P9): the subjects the orchestrator publishes.
 const NEON_EVENTS: &str = "chelabase.neon.attached.*";
 /// Creating or fixing the events stream (`ensure_neon_events_stream`): the orchestrator only
@@ -134,6 +137,7 @@ fn orchestrator() -> NatsPermissions {
     publish.push(NEON_EVENTS);
     publish.extend(NEON_EVENTS_STREAM_API);
     publish.extend(STORAGE_OBJECT_STREAM_API);
+    publish.push(FN_CHANGED);
     NatsPermissions {
         publish,
         publish_deny: vec![],
@@ -191,6 +195,17 @@ fn storage() -> NatsPermissions {
             "chelabase.storage.events",
             "_INBOX_storage.>",
         ],
+    }
+}
+
+/// Edge functions m4b: the functions service only listens to the change events. It publishes
+/// nothing (a deny-all list: an empty allow list would be no restriction) and makes no
+/// requests, so it needs no inbox.
+fn functions() -> NatsPermissions {
+    NatsPermissions {
+        publish: vec![],
+        publish_deny: vec![">"],
+        subscribe: vec![FN_CHANGED],
     }
 }
 
@@ -255,6 +270,7 @@ fn permissions(user: &str) -> NatsPermissions {
         "realtime" => realtime(),
         "runner" => runner(),
         "storage" => storage(),
+        "functions" => functions(),
         other => unreachable!("no NATS user {other}"),
     }
 }

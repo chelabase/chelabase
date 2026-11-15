@@ -1,0 +1,97 @@
+---
+title: Secrets, env and the data API
+description: A function's secrets and env values, calling the data API through env.CHELABASE as the caller or as a run-as role, and the binding's limits.
+---
+
+## Secrets
+
+A function's secrets are per branch, encrypted at rest, and arrive in `env` by name. Set them with the CLI (the value is read from stdin or a prompt, never from the command line) or the [Management API](/reference/management/functions/putFunctionSecret):
+
+```bash
+printf %s "$API_KEY" | chelabase functions secrets set billing API_KEY
+chelabase functions secrets list billing   # names only; values never come back
+chelabase functions secrets unset billing API_KEY
+```
+
+A secret name is a letter or `_`, then up to 127 of `A-Z`, `a-z`, `0-9` and `_`. A value is at most 64 KiB. A change reaches the function within about two seconds. A new branch gets a copy of its parent's secrets; after that each branch's are its own.
+
+## What `env` holds
+
+| Name | Value |
+|---|---|
+| Your secrets | By name. |
+| `CHELABASE_URL` | The API's public base URL (`CHELABASE_PUBLIC_SCHEME` and `CHELABASE_API_HOST`). It overrides a secret of the same name. |
+| `CHELABASE_BRANCH_ID` | The branch the function is running on. It overrides a secret of the same name. |
+| `CHELABASE_SERVICE_KEY` | A secret data key for the function's [run-as role](#acting-as-the-function). Present only when the function has a live run-as key; a secret with this name is never passed through. |
+| `CHELABASE` | The binding to the data API: see [below](#calling-the-data-api). |
+
+A function's outbound `fetch` reaches **public addresses only**. Loopback, private, link-local and the platform's own networks (the metadata database, NATS, the orchestrator, the Docker host) are refused. The one way in to Chelabase itself is the `env.CHELABASE` binding.
+
+## Calling the data API
+
+On a self-hosted install the API host often resolves to a private or loopback address, which the function's egress would refuse. `env.CHELABASE` is a binding that reaches **only the gateway, on the API host**, whatever the install's addressing. It is shaped like a Cloudflare service binding, so function code stays portable.
+
+```ts
+const res = await env.CHELABASE.fetch(new URL("/data/v1/query", env.CHELABASE_URL), {
+  method: "POST",
+  headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+  body: JSON.stringify({ v: 1, op: "select", from: "notes" }),
+});
+```
+
+- **Use an absolute URL.** A relative path such as `"/data/v1/query"` throws `Invalid URL`, as it does on a Cloudflare service binding. The URL's host is always replaced with the API host, and so is a `Host` header you set; Studio, auth and identity routes are not reachable through it.
+- **The binding has no credentials of its own.** It carries what you send, so every call needs a key. It strips client-address headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, …).
+- **With the TypeScript client**, pass the binding as `fetch`: `createBrowserClient({ url: env.CHELABASE_URL, key, fetch: (r, i) => env.CHELABASE.fetch(r, i) })` (a public key), or `createClient` with a secret key. See [the client](/using/client).
+
+### Acting as the caller
+
+To run a query as whoever called the function, forward the caller's public key and, for an app user, the user's token:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${request.headers.get("chelabase-caller-key") ?? "none"}`,
+      "content-type": "application/json",
+    };
+    const token = request.headers.get("chelabase-caller-token");
+    if (token) headers["chelabase-user"] = token;
+
+    const res = await env.CHELABASE.fetch(new URL("/data/v1/query", env.CHELABASE_URL), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ v: 1, op: "select", from: "notes" }),
+    });
+    return new Response(await res.text(), { status: res.status });
+  },
+};
+```
+
+Row-level security then sees the caller, so an app user gets only their own rows. `chelabase-caller-key` is a **public key only**: a function never receives a caller's secret key, so a call made with a secret key has no key to forward (use the run-as key, or a secret of your own).
+
+### Acting as the function
+
+Set a **run-as role** on the function and it gets a key of its own, `env.CHELABASE_SERVICE_KEY`, that acts as that role. Use it for work that isn't on anyone's behalf: scheduled runs, event handlers and background jobs.
+
+```bash
+curl -X PATCH "$API/v1/databases/$DB/branches/$BRANCH/functions/billing" \
+  -H "Authorization: Bearer $MEMBER_TOKEN" -H 'content-type: application/json' \
+  -d '{"run_as_role": "billing_worker"}'
+```
+
+(Studio's function drawer has a **Run as** section for the same.) Setting it makes a function-managed secret key for the role and revokes the previous one; `null` clears both.
+
+- The role is checked like a [secret key's](/using/data-api/keys#secret-keys): it must exist and may not be owner-level. A role with `BYPASSRLS` needs **Admin**.
+- The key follows the role if it is renamed, and is revoked if the role is dropped.
+- A child branch gets **its own key**, bound to the same role identity as the parent's (the role the member approved, by OID). If the role is missing on the child, or a different role has taken its name, no key is made and the function runs without `CHELABASE_SERVICE_KEY`.
+- `GET …/functions` reports `run_as_role` and `run_as_active` (whether a live key backs it).
+
+<Callout type="warn">
+A custom run-as role can't use the [storage API](/using/storage) yet: the storage tables are granted only to `anon` and `authenticated`, so the key gets 403 from storage whatever storage policies you write for its role. The data API is not affected. Letting custom roles use storage under RLS is tracked in [#187](https://github.com/chelabase/chelabase/issues/187).
+</Callout>
+
+### Limits of the binding
+
+- **A function can call itself** through the binding (and so any function, including in a loop) with no hop limit. Guard against recursion in your own code.
+- **All function traffic shares one per-IP bucket at the gateway.** Calls through the binding all come from the runtime's address, so per-IP limits (sign-up, sign-in, key misses) are shared by every function of every tenant on the instance. A caller that vouches for its end user's address does so with the gateway's `chelabase-server-key` and `chelabase-client-ip` headers.
+- **The binding bypasses any reverse proxy** in front of the API host, so filters, allow-lists and rate limits at that proxy do not apply to function traffic.

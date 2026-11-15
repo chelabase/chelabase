@@ -14,6 +14,13 @@
 //! unless `allow_http` is set (local development), and URLs carrying credentials are refused.
 //! An operator's allowlist names hosts (exact host names or IP literals, case-insensitive) that
 //! skip the address check, for self-hosted targets inside their own network.
+//!
+//! A **hard deny** (edge functions m9) overrides the allowlist: host names
+//! ([`Outbound::deny_hosts`], compared without case or a trailing dot, container names
+//! `<project>-<name>-<n>` included) and networks ([`Outbound::deny_nets`]) checked against
+//! every resolved address at connect time. [`Outbound::deny_stack`] denies the stack's own
+//! services ([`STACK_HOSTS`]), loopback, link-local and the given networks: an allowlisted name
+//! that resolves to a stack container is still refused.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeSet;
@@ -30,6 +37,27 @@ pub const ENV_ALLOW_HTTP: &str = "CHELABASE_WEBHOOKS_ALLOW_HTTP";
 /// `CHELABASE_WEBHOOKS_ALLOW_HOSTS`: comma-separated host names or IP literals that may resolve
 /// to non-public addresses (self-hosted targets).
 pub const ENV_ALLOW_HOSTS: &str = "CHELABASE_WEBHOOKS_ALLOW_HOSTS";
+
+/// The settings' prefix for storage webhooks (`CHELABASE_WEBHOOKS_ALLOW_HTTP`, `_ALLOW_HOSTS`).
+pub const WEBHOOKS_ENV: &str = "CHELABASE_WEBHOOKS";
+/// The settings' prefix for external services (`CHELABASE_SERVICES_ALLOW_HTTP`, `_ALLOW_HOSTS`).
+pub const SERVICES_ENV: &str = "CHELABASE_SERVICES";
+
+/// The stack's own service names and aliases: never a target, allowlisted or not.
+pub const STACK_HOSTS: &[&str] = &[
+    "localhost", "metadata-db", "nats", "valkey", "seaweedfs", "create-bucket", "storage-broker",
+    "safekeeper1", "safekeeper2", "safekeeper3", "storcon-db", "storage-controller", "pageserver",
+    "register-safekeepers", "proxy-tls", "proxy", "identity", "orchestrator", "worker", "gateway",
+    "gateway-functions", "auth", "rest", "realtime", "storage", "studio", "functions",
+    "functions-public", "functions-internal", "functions-control", "functions-runtime",
+    "service-runner", "service-runner-control", "init-secrets", "init-bootstrap", "mailpit", "control",
+    "secrets",
+    // The workbench's own: its docs and landing sites and the test runner.
+    "docs", "landing", "runner",
+];
+
+/// Always denied by [`Outbound::deny_stack`]: "this network", loopback and link-local.
+const STACK_NETS: &[&str] = &["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "::/128", "::1/128", "fe80::/10"];
 
 /// The longest URL accepted.
 pub const MAX_URL_LEN: usize = 2048;
@@ -53,6 +81,9 @@ pub enum Refused {
     NotPublic { host: String, addr: IpAddr },
     /// The host didn't resolve.
     Unresolved { host: String },
+    /// The host is one of the platform's own (by name), or resolves into its networks: the
+    /// hard deny, which the allowlist doesn't lift.
+    Internal { host: String },
 }
 
 impl std::fmt::Display for Refused {
@@ -71,6 +102,7 @@ impl std::fmt::Display for Refused {
                 write!(f, "{host} resolves to a non-public address")
             }
             Refused::Unresolved { host } => write!(f, "{host} does not resolve"),
+            Refused::Internal { host } => write!(f, "{host} is part of the platform"),
         }
     }
 }
@@ -109,13 +141,17 @@ impl HostLookup for SystemLookup {
     }
 }
 
-/// Who may be called: the scheme rule, the operator's allowlist and the resolver.
+/// Who may be called: the scheme rule, the operator's allowlist, the hard deny and the
+/// resolver.
 #[derive(Clone)]
 pub struct Outbound {
     allow_http: bool,
     allow_hosts: Arc<BTreeSet<String>>,
     /// Allowlist entries with a port (kept only to warn about).
     allow_hosts_ported: Arc<Vec<String>>,
+    /// Denied names, normalized ([`deny_name`]).
+    deny_hosts: Arc<BTreeSet<String>>,
+    deny_nets: Arc<Vec<Net>>,
     lookup: Arc<dyn HostLookup>,
 }
 
@@ -124,17 +160,112 @@ impl std::fmt::Debug for Outbound {
         f.debug_struct("Outbound")
             .field("allow_http", &self.allow_http)
             .field("allow_hosts", &self.allow_hosts)
+            .field("deny_nets", &self.deny_nets)
             .finish()
     }
 }
 
+/// An IP network, `addr/prefix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Net {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl Net {
+    pub fn new(addr: IpAddr, prefix: u8) -> Option<Self> {
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        (prefix <= max).then_some(Net { addr, prefix })
+    }
+
+    /// Whether `ip` is in the network (an IPv4-mapped IPv6 address as its IPv4 address).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        let bits = |a: IpAddr| -> (u128, u32) {
+            match a {
+                IpAddr::V4(v4) => (u32::from(v4) as u128, 32),
+                IpAddr::V6(v6) => (u128::from(v6), 128),
+            }
+        };
+        let ((net, width), (addr, other)) = (bits(self.addr), bits(ip));
+        if width != other {
+            return false;
+        }
+        let shift = width - u32::from(self.prefix);
+        shift >= width || (net >> shift) == (addr >> shift)
+    }
+}
+
+impl std::str::FromStr for Net {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s:?} is not a network (addr/prefix)");
+        let (addr, prefix) = s.trim().split_once('/').ok_or_else(bad)?;
+        let addr: IpAddr = addr.parse().map_err(|_| bad())?;
+        Net::new(addr, prefix.parse().map_err(|_| bad())?).ok_or_else(bad)
+    }
+}
+
+/// Comma-separated networks (`CHELABASE_INTERNAL_SUBNETS`); blank entries are skipped.
+pub fn parse_nets(list: &str) -> Result<Vec<Net>, String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::parse)
+        .collect()
+}
+
+/// The networks this host is directly attached to: the IPv4 (`/proc/net/route`) and IPv6
+/// (`/proc/net/ipv6_route`) routes without a gateway, a container's compose networks. A table
+/// that can't be read adds none.
+pub fn attached_nets() -> Vec<Net> {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let mut nets = parse_route_table(&read("/proc/net/route"));
+    nets.extend(parse_ipv6_route_table(&read("/proc/net/ipv6_route")));
+    nets
+}
+
+/// `ipv6_route` lines: destination, prefix length, source, source prefix, next hop (hex), …
+fn parse_ipv6_route_table(table: &str) -> Vec<Net> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let dest = u128::from_str_radix(f.first()?, 16).ok()?;
+            let prefix = u8::from_str_radix(f.get(1)?, 16).ok()?;
+            let next_hop = u128::from_str_radix(f.get(4)?, 16).ok()?;
+            (next_hop == 0 && prefix > 0).then(|| Net::new(IpAddr::V6(Ipv6Addr::from(dest)), prefix))?
+        })
+        .collect()
+}
+
+fn parse_route_table(table: &str) -> Vec<Net> {
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok().map(|v| Ipv4Addr::from(v.swap_bytes()));
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (dest, gateway, mask) = (hex(f.get(1)?)?, hex(f.get(2)?)?, hex(f.get(7)?)?);
+            let prefix = u32::from(mask).leading_ones() as u8;
+            (gateway.is_unspecified() && prefix > 0).then(|| Net::new(IpAddr::V4(dest), prefix))?
+        })
+        .collect()
+}
+
 impl Outbound {
-    /// `https` only, no allowlist, the system resolver.
+    /// `https` only, no allowlist, no deny, the system resolver.
     pub fn new() -> Self {
         Self {
             allow_http: false,
             allow_hosts: Arc::new(BTreeSet::new()),
             allow_hosts_ported: Arc::new(Vec::new()),
+            deny_hosts: Arc::new(BTreeSet::new()),
+            deny_nets: Arc::new(Vec::new()),
             lookup: Arc::new(SystemLookup),
         }
     }
@@ -157,21 +288,47 @@ impl Outbound {
         self
     }
 
+    /// Host names that are always refused, allowlisted or not (see [`Self::denied_name`]).
+    pub fn deny_hosts<I: IntoIterator<Item = S>, S: AsRef<str>>(mut self, hosts: I) -> Self {
+        self.deny_hosts = Arc::new(hosts.into_iter().map(|h| deny_name(h.as_ref())).collect());
+        self
+    }
+
+    /// Networks no connection may reach, allowlisted or not.
+    pub fn deny_nets(mut self, nets: impl IntoIterator<Item = Net>) -> Self {
+        self.deny_nets = Arc::new(nets.into_iter().collect());
+        self
+    }
+
+    /// The stack's hard deny: [`STACK_HOSTS`], loopback, link-local and `internal` (the stack's
+    /// own networks).
+    pub fn deny_stack(self, internal: impl IntoIterator<Item = Net>) -> Self {
+        let mut nets: Vec<Net> = STACK_NETS.iter().map(|n| n.parse().expect("a network")).collect();
+        nets.extend(internal);
+        self.deny_hosts(STACK_HOSTS).deny_nets(nets)
+    }
+
     /// Resolve with `lookup` instead of the system resolver.
     pub fn with_lookup(mut self, lookup: Arc<dyn HostLookup>) -> Self {
         self.lookup = lookup;
         self
     }
 
-    /// From [`ENV_ALLOW_HTTP`] (`true` or `false`, blank is `false`) and [`ENV_ALLOW_HOSTS`].
-    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let allow_http = match lookup(ENV_ALLOW_HTTP).map(|v| v.trim().to_ascii_lowercase()) {
+    /// From `{prefix}_ALLOW_HTTP` (`true` or `false`, blank is `false`) and
+    /// `{prefix}_ALLOW_HOSTS` ([`WEBHOOKS_ENV`], [`SERVICES_ENV`]): each user of outbound
+    /// requests has its own settings.
+    pub fn from_lookup(
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        let (http_var, hosts_var) = (format!("{prefix}_ALLOW_HTTP"), format!("{prefix}_ALLOW_HOSTS"));
+        let allow_http = match lookup(&http_var).map(|v| v.trim().to_ascii_lowercase()) {
             None => false,
             Some(v) if v.is_empty() || v == "false" => false,
             Some(v) if v == "true" => true,
-            Some(v) => return Err(format!("{ENV_ALLOW_HTTP}={v:?}: expected true or false")),
+            Some(v) => return Err(format!("{http_var}={v:?}: expected true or false")),
         };
-        let hosts = lookup(ENV_ALLOW_HOSTS).unwrap_or_default();
+        let hosts = lookup(&hosts_var).unwrap_or_default();
         Ok(Self::new()
             .allow_http(allow_http)
             .allow_hosts(hosts.split(',').map(str::trim)))
@@ -187,9 +344,36 @@ impl Outbound {
         self.allow_hosts.contains(&normalize_host(host))
     }
 
+    /// Whether `host` is a denied name: equal to one without case or a trailing dot, or a
+    /// one-label container name for one (`<project>-<name>-<n>`, `<project>_<name>_<n>`).
+    pub fn denied_name(&self, host: &str) -> bool {
+        let host = deny_name(host);
+        if self.deny_hosts.contains(&host) {
+            return true;
+        }
+        if host.contains('.') {
+            return false;
+        }
+        let base = host.trim_end_matches(|c: char| c.is_ascii_digit());
+        let Some(base) = base.strip_suffix(['-', '_']).filter(|_| base.len() < host.len()) else {
+            return false;
+        };
+        self.deny_hosts.iter().any(|d| {
+            base == d
+                || base
+                    .strip_suffix(d.as_str())
+                    .is_some_and(|p| p.ends_with(['-', '_']))
+        })
+    }
+
+    fn denied_addr(&self, addr: IpAddr) -> bool {
+        self.deny_nets.iter().any(|n| n.contains(addr))
+    }
+
     /// The URL, parsed, if its form may be called: a valid absolute URL of an accepted scheme,
-    /// without credentials, whose host, when an IP literal, is public (or allowlisted). A host
-    /// name is checked when it is resolved ([`Self::check_resolved`], and at connect time).
+    /// without credentials, whose host isn't denied and, when an IP literal, is public (or
+    /// allowlisted) and outside the denied networks. A host name is checked when it is
+    /// resolved ([`Self::check_resolved`], and at connect time).
     pub fn check_url(&self, raw: &str) -> Result<Url, Refused> {
         if raw.len() > MAX_URL_LEN {
             return Err(Refused::Invalid);
@@ -211,18 +395,24 @@ impl Outbound {
             .host_str()
             .filter(|h| !h.is_empty())
             .ok_or(Refused::NoHost)?;
-        if self.allowlisted(host) {
-            return Ok(url);
+        let internal = || Refused::Internal {
+            host: host.to_string(),
+        };
+        if self.denied_name(host) {
+            return Err(internal());
         }
         // The parser has already normalized every IPv4 spelling (decimal, octal, hex, short
         // forms) to dotted decimal, and an IPv6 host comes bracketed: either parses here.
-        if let Some(addr) = literal(host)
-            && !is_public(addr)
-        {
-            return Err(Refused::NotPublic {
-                host: host.to_string(),
-                addr,
-            });
+        if let Some(addr) = literal(host) {
+            if self.denied_addr(addr) {
+                return Err(internal());
+            }
+            if !self.allowlisted(host) && !is_public(addr) {
+                return Err(Refused::NotPublic {
+                    host: host.to_string(),
+                    addr,
+                });
+            }
         }
         Ok(url)
     }
@@ -233,29 +423,76 @@ impl Outbound {
         let url = self.check_url(raw)?;
         let host = url.host_str().unwrap_or_default();
         if literal(host).is_none() {
-            checked_lookup(&self.allow_hosts, self.lookup.as_ref(), host).await?;
+            self.checked_lookup(host).await?;
         }
         Ok(url)
     }
 
     /// A client for this policy: no redirects, no proxy, `timeout` per request, and a resolver
-    /// that refuses any host resolving to a non-public address (unless allowlisted).
+    /// that refuses any host resolving to a non-public address (unless allowlisted) or into a
+    /// denied network.
     pub fn client(&self, timeout: Duration) -> reqwest::Result<PublicClient> {
-        let resolver = Guarded {
-            allow_hosts: self.allow_hosts.clone(),
-            lookup: self.lookup.clone(),
-        };
-        let inner = reqwest::Client::builder()
+        self.build(self.builder().timeout(timeout))
+    }
+
+    /// [`Self::client`] for streamed bodies: no whole-request timeout, only `connect` to
+    /// connect and `idle` between reads. The caller bounds the wait for the response's
+    /// headers ([`PublicClient::send_within`]).
+    pub fn streaming_client(&self, connect: Duration, idle: Duration) -> reqwest::Result<PublicClient> {
+        self.build(self.builder().connect_timeout(connect).read_timeout(idle))
+    }
+
+    fn builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .timeout(timeout)
-            .dns_resolver(resolver)
-            .build()?;
+            .dns_resolver(Guarded {
+                policy: self.clone(),
+            })
+    }
+
+    fn build(&self, builder: reqwest::ClientBuilder) -> reqwest::Result<PublicClient> {
         Ok(PublicClient {
-            inner,
+            inner: builder.build()?,
             policy: self.clone(),
         })
     }
+
+    /// `host`'s addresses, or why it is refused: a denied name, unresolvable, any address in a
+    /// denied network, or any address not public (unless the host is allowlisted).
+    async fn checked_lookup(&self, host: &str) -> Result<Vec<IpAddr>, Refused> {
+        if self.denied_name(host) {
+            return Err(Refused::Internal {
+                host: host.to_string(),
+            });
+        }
+        let unresolved = || Refused::Unresolved {
+            host: host.to_string(),
+        };
+        let addrs = self.lookup.lookup(host).await.map_err(|_| unresolved())?;
+        if addrs.is_empty() {
+            return Err(unresolved());
+        }
+        if addrs.iter().any(|a| self.denied_addr(*a)) {
+            return Err(Refused::Internal {
+                host: host.to_string(),
+            });
+        }
+        if !self.allowlisted(host)
+            && let Some(addr) = addrs.iter().copied().find(|a| !is_public(*a))
+        {
+            return Err(Refused::NotPublic {
+                host: host.to_string(),
+                addr,
+            });
+        }
+        Ok(addrs)
+    }
+}
+
+/// A name as the deny list compares it: lower case, no trailing dot, IPv6 brackets dropped.
+fn deny_name(host: &str) -> String {
+    normalize_host(host).trim_end_matches('.').to_string()
 }
 
 impl Default for Outbound {
@@ -351,42 +588,16 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     )
 }
 
-/// `host`'s addresses, or why it is refused: unresolvable, or any address not public (unless
-/// the host is allowlisted).
-async fn checked_lookup(
-    allow_hosts: &BTreeSet<String>,
-    lookup: &dyn HostLookup,
-    host: &str,
-) -> Result<Vec<IpAddr>, Refused> {
-    let unresolved = || Refused::Unresolved {
-        host: host.to_string(),
-    };
-    let addrs = lookup.lookup(host).await.map_err(|_| unresolved())?;
-    if addrs.is_empty() {
-        return Err(unresolved());
-    }
-    if !allow_hosts.contains(&normalize_host(host))
-        && let Some(addr) = addrs.iter().copied().find(|a| !is_public(*a))
-    {
-        return Err(Refused::NotPublic {
-            host: host.to_string(),
-            addr,
-        });
-    }
-    Ok(addrs)
-}
-
-/// The client's resolver: resolves, then refuses the whole host if any address isn't public.
+/// The client's resolver: resolves, then refuses the whole host if any address is refused.
 struct Guarded {
-    allow_hosts: Arc<BTreeSet<String>>,
-    lookup: Arc<dyn HostLookup>,
+    policy: Outbound,
 }
 
 impl reqwest::dns::Resolve for Guarded {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let (allow_hosts, lookup) = (self.allow_hosts.clone(), self.lookup.clone());
+        let policy = self.policy.clone();
         Box::pin(async move {
-            let addrs = checked_lookup(&allow_hosts, lookup.as_ref(), name.as_str()).await?;
+            let addrs = policy.checked_lookup(name.as_str()).await?;
             let addrs: reqwest::dns::Addrs =
                 Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 0)));
             Ok(addrs)
@@ -395,7 +606,7 @@ impl reqwest::dns::Resolve for Guarded {
 }
 
 /// A client that only reaches public addresses (see the module docs). Built by
-/// [`Outbound::client`]; every request starts with [`Self::post`], which checks the URL's form
+/// [`Outbound::client`]; every request starts with [`Self::request`], which checks the URL's form
 /// and an IP-literal host before anything is sent (the resolver never sees a literal).
 #[derive(Clone)]
 pub struct PublicClient {
@@ -414,8 +625,22 @@ impl std::fmt::Debug for PublicClient {
 impl PublicClient {
     /// A `POST` to `url`, or why it may not be sent.
     pub fn post(&self, url: &str) -> Result<reqwest::RequestBuilder, Refused> {
+        self.request(reqwest::Method::POST, url)
+    }
+
+    /// A request of any method to `url`, or why it may not be sent.
+    pub fn request(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder, Refused> {
         let url = self.policy.check_url(url)?;
-        Ok(self.inner.post(url))
+        Ok(self.inner.request(method, url))
+    }
+
+    /// Sends `request`, waiting at most `headers` for the response's headers (its body then
+    /// streams, bounded only by the client's idle timeout). `None` when the wait ran out.
+    pub async fn send_within(
+        request: reqwest::RequestBuilder,
+        headers: Duration,
+    ) -> Option<reqwest::Result<reqwest::Response>> {
+        tokio::time::timeout(headers, request.send()).await.ok()
     }
 }
 
@@ -443,6 +668,39 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// Review (a second missing name, so an invariant): every Compose service name and every
+    /// fixed network alias in the stack's files is in [`STACK_HOSTS`]. The host-name aliases
+    /// (`${CHELABASE_*_HOST_NAME}`) are the operator's public names, not a stack-only target.
+    #[test]
+    fn every_compose_service_and_alias_is_a_stack_host() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../infra/compose/");
+        let mut missing = Vec::new();
+        for file in ["docker-compose.yml", "docker-compose.workbench.yml"] {
+            let text = std::fs::read_to_string(format!("{root}{file}")).unwrap();
+            let mut names = Vec::new();
+            let mut in_services = false;
+            for line in text.lines() {
+                if !line.starts_with(' ') && !line.starts_with('#') && !line.is_empty() {
+                    in_services = line.trim_end() == "services:";
+                    continue;
+                }
+                // A service: a two-space-indented key in `services:`.
+                if in_services
+                    && let Some(key) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
+                    && !key.starts_with([' ', '#'])
+                {
+                    names.push(key.to_string());
+                }
+                if let Some(list) = line.trim().strip_prefix("aliases: [").and_then(|l| l.strip_suffix(']')) {
+                    names.extend(list.split(',').map(|a| a.trim().to_string()));
+                }
+            }
+            assert!(names.len() > 3, "{file}: no services found");
+            missing.extend(names.into_iter().filter(|n| !STACK_HOSTS.contains(&n.as_str())).map(|n| format!("{file}: {n}")));
+        }
+        assert!(missing.is_empty(), "not in STACK_HOSTS: {missing:?}");
     }
 
     /// Every refused range, at its edges, and public addresses next to them.
@@ -912,9 +1170,9 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        let o = Outbound::from_lookup(env(&[])).unwrap();
+        let o = Outbound::from_lookup(WEBHOOKS_ENV, env(&[])).unwrap();
         assert!(!o.allow_http && o.allow_hosts.is_empty());
-        let o = Outbound::from_lookup(env(&[
+        let o = Outbound::from_lookup(WEBHOOKS_ENV, env(&[
             (ENV_ALLOW_HTTP, "true"),
             (ENV_ALLOW_HOSTS, " Runner , [::1],,10.0.0.5 "),
         ]))
@@ -924,11 +1182,209 @@ mod tests {
             o.allow_hosts.iter().cloned().collect::<Vec<_>>(),
             ["10.0.0.5", "::1", "runner"]
         );
-        assert!(Outbound::from_lookup(env(&[(ENV_ALLOW_HTTP, "yes")])).is_err());
+        assert!(Outbound::from_lookup(WEBHOOKS_ENV, env(&[(ENV_ALLOW_HTTP, "yes")])).is_err());
         assert!(
-            !Outbound::from_lookup(env(&[(ENV_ALLOW_HTTP, "")]))
+            !Outbound::from_lookup(WEBHOOKS_ENV, env(&[(ENV_ALLOW_HTTP, "")]))
                 .unwrap()
                 .allow_http
         );
+    }
+
+    /// m9: services and webhooks read their own settings; one never applies to the other.
+    #[test]
+    fn each_prefix_reads_its_own_settings() {
+        let pairs = [
+            ("CHELABASE_WEBHOOKS_ALLOW_HOSTS", "hooks.internal"),
+            ("CHELABASE_WEBHOOKS_ALLOW_HTTP", "true"),
+            ("CHELABASE_SERVICES_ALLOW_HOSTS", "svc.internal"),
+        ];
+        let env = |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        let services = Outbound::from_lookup(SERVICES_ENV, env).unwrap();
+        assert!(!services.allow_http);
+        assert_eq!(services.allow_hosts.iter().cloned().collect::<Vec<_>>(), ["svc.internal"]);
+        let webhooks = Outbound::from_lookup(WEBHOOKS_ENV, env).unwrap();
+        assert!(webhooks.allow_http);
+        assert_eq!(webhooks.allow_hosts.iter().cloned().collect::<Vec<_>>(), ["hooks.internal"]);
+        let err = Outbound::from_lookup(SERVICES_ENV, |k| (k == "CHELABASE_SERVICES_ALLOW_HTTP").then(|| "yes".into()))
+            .unwrap_err();
+        assert!(err.contains("CHELABASE_SERVICES_ALLOW_HTTP"), "{err}");
+    }
+
+    #[test]
+    fn networks_parse_and_contain() {
+        let n: Net = "172.18.0.0/16".parse().unwrap();
+        assert!(n.contains(ip("172.18.3.4")) && n.contains(ip("::ffff:172.18.0.9")));
+        assert!(!n.contains(ip("172.19.0.1")) && !n.contains(ip("fd00::1")));
+        let v6: Net = "fd00:1::/32".parse().unwrap();
+        assert!(v6.contains(ip("fd00:1::5")) && !v6.contains(ip("fd00:2::5")));
+        assert!("0.0.0.0/0".parse::<Net>().unwrap().contains(ip("8.8.8.8")));
+        for bad in ["10.0.0.0", "10.0.0.0/33", "nope/8", "::/129"] {
+            assert!(bad.parse::<Net>().is_err(), "{bad}");
+        }
+        assert_eq!(parse_nets(" 10.1.0.0/16, ,192.168.5.0/24").unwrap().len(), 2);
+        assert!(parse_nets("10.1.0.0/16,x").is_err());
+    }
+
+    /// The attached networks are the routes without a gateway (the default route is not one).
+    #[test]
+    fn attached_networks_come_from_the_route_table() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            eth0\t00000000\t010012AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+            eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+            eth1\t0010A8C0\t00000000\t0001\t0\t0\t0\t00F0FFFF\t0\t0\t0\n";
+        assert_eq!(
+            parse_route_table(table),
+            vec![
+                Net::new(ip("172.18.0.0"), 16).unwrap(),
+                Net::new(ip("192.168.16.0"), 20).unwrap()
+            ]
+        );
+    }
+
+    /// Audit S1: the IPv6 attached networks are the routes without a next hop (the default
+    /// route is not one).
+    #[test]
+    fn attached_ipv6_networks_come_from_the_route_table() {
+        let table = "\
+fd00000000000000000000000000ab00 78 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fd0000000000000000000000000000ab 00000400 00000001 00000000 00000003     eth0
+20010db8000000000000000000000000 40 00000000000000000000000000000000 00 fd0000000000000000000000000000ab 00000400 00000001 00000000 00000003     eth0
+";
+        assert_eq!(
+            parse_ipv6_route_table(table),
+            vec![
+                Net::new(ip("fd00::ab00"), 120).unwrap(),
+                Net::new(ip("fe80::"), 64).unwrap()
+            ]
+        );
+        let nets = parse_ipv6_route_table(table);
+        assert!(nets[0].contains(ip("fd00::abff")) && !nets[0].contains(ip("fd00::ac00")));
+    }
+
+    /// m9's hard deny: the stack's names in any case, with a trailing dot or as container
+    /// names, refused even when allowlisted; names that only look alike pass.
+    #[tokio::test]
+    async fn the_stack_hosts_are_denied_even_when_allowlisted() {
+        let o = Outbound::new()
+            .allow_http(true)
+            .allow_hosts(["metadata-db", "nats", "chelabase-metadata-db-1", "ok.example"])
+            .deny_stack([])
+            .with_lookup(Fake::with(&[("ok.example", &[&["93.184.216.34"]])]));
+        for url in [
+            "http://metadata-db:5432",
+            "http://nats:4222",
+            "http://METADATA-DB./",
+            "http://metadata-db./",
+            "http://chelabase-metadata-db-1/",
+            "http://feat-x-orchestrator-12:8080/",
+            "http://stack_worker_1/",
+            "http://localhost/",
+        ] {
+            assert!(
+                matches!(o.check_url(url), Err(Refused::Internal { .. })),
+                "{url}: {:?}",
+                o.check_url(url)
+            );
+            assert!(matches!(o.check_resolved(url).await, Err(Refused::Internal { .. })), "{url}");
+        }
+        for name in ["metadata-db.example.com", "mymetadata-db", "metadata-dbx", "ok.example"] {
+            assert!(!o.denied_name(name), "{name}");
+        }
+        assert!(o.check_resolved("http://ok.example/").await.is_ok());
+        // Loopback and link-local literals are denied even when allowlisted.
+        let listed = Outbound::new()
+            .allow_http(true)
+            .allow_hosts(["127.0.0.1", "[::1]", "169.254.169.254"])
+            .deny_stack([]);
+        for url in ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/", "http://[::ffff:127.0.0.1]/"] {
+            assert!(matches!(listed.check_url(url), Err(Refused::Internal { .. })), "{url}");
+        }
+    }
+
+    /// An allowlisted name resolving into a denied network is refused at registration and at
+    /// connect time (no connection made), and so is a literal in it.
+    #[tokio::test]
+    async fn an_allowlisted_name_resolving_into_the_stack_is_refused() {
+        let (port, hits) = server(ok_reply()).await;
+        let stack: Net = "172.18.0.0/16".parse().unwrap();
+        let fake = Fake::with(&[
+            ("host.docker.internal", &[&["172.18.0.3"]]),
+            ("rebind.test", &[&["93.184.216.34"], &["172.18.0.3"]]),
+            ("loop.test", &[&["127.0.0.1"]]),
+        ]);
+        let o = Outbound::new()
+            .allow_http(true)
+            .allow_hosts(["host.docker.internal", "rebind.test", "loop.test", "172.18.0.3"])
+            .deny_stack([stack])
+            .with_lookup(fake);
+        assert!(matches!(
+            o.check_resolved("http://host.docker.internal/").await,
+            Err(Refused::Internal { .. })
+        ));
+        assert!(matches!(o.check_url("http://172.18.0.3/"), Err(Refused::Internal { .. })));
+        assert!(o.check_resolved("http://rebind.test/").await.is_ok(), "public at save time");
+        let client = o.streaming_client(Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+        for host in ["rebind.test", "loop.test"] {
+            let err = client
+                .request(reqwest::Method::GET, &format!("http://{host}:{port}/"))
+                .unwrap()
+                .send()
+                .await
+                .unwrap_err();
+            assert!(matches!(refused_by_guard(&err), Some(Refused::Internal { .. })), "{host}: {err:?}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// `request` sends any method; the streaming client outlives a body slower than its idle
+    /// timeout in total, and `send_within` bounds only the wait for headers.
+    #[tokio::test]
+    async fn the_streaming_client_has_no_total_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let seen = methods.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let method = head.split(' ').next().unwrap_or_default().to_string();
+                    seen.lock().unwrap().push(method.clone());
+                    if method == "PUT" {
+                        // Never answers.
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n")
+                        .await;
+                    for _ in 0..4 {
+                        tokio::time::sleep(Duration::from_millis(700)).await;
+                        let _ = sock.write_all(b"1\r\nx\r\n").await;
+                    }
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+        let o = Outbound::new()
+            .allow_http(true)
+            .allow_hosts(["svc.test"])
+            .with_lookup(Fake::with(&[("svc.test", &[&["127.0.0.1"]])]));
+        let client = o.streaming_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let url = format!("http://svc.test:{port}/");
+        let req = client.request(reqwest::Method::DELETE, &url).unwrap();
+        let resp = PublicClient::send_within(req, Duration::from_secs(1)).await.unwrap().unwrap();
+        assert_eq!(resp.text().await.unwrap(), "xxxx", "2.8 s of body, past every timeout");
+        let req = client.request(reqwest::Method::PUT, &url).unwrap();
+        assert!(PublicClient::send_within(req, Duration::from_millis(300)).await.is_none());
+        assert_eq!(*methods.lock().unwrap(), ["DELETE", "PUT"]);
+        assert!(matches!(
+            client.request(reqwest::Method::GET, "http://10.0.0.1/"),
+            Err(Refused::NotPublic { .. })
+        ));
     }
 }

@@ -22,6 +22,8 @@ for e2e in neon-e2e branch-e2e storage-leak-e2e app-users-e2e data-e2e console-e
   merge-e2e role-e2e members-e2e personal-logins-e2e teams-e2e auth-e2e neon-smoke; do
   just --show "$e2e" | gq "workbench run scripts/$e2e.sh" || fail "$e2e runs in the stack's runner"
 done
+just --show functions-e2e | gq 'workbench test -p chelabase-functions --test e2e -- --run-ignored only' ||
+  fail "functions-e2e runs the functions crate's e2e test in the stack's runner"
 just --show bench-data-api | gq 'workbench run --env CHELABASE_BENCH_TEST_BIN=' ||
   fail "the benchmark passes its prebuilt test binary"
 just --show sweep-dbs | gq 'workbench run scripts/sweep-dbs.sh' || fail "sweep-dbs runs in the runner"

@@ -155,11 +155,17 @@ pub enum ErrorCode {
     ExposureUnconfirmed,
     /// 503: the identity service (app users' pools) can't be reached or refused Chelabase's call.
     IdentityUnavailable,
+    /// 503: edge functions m11: the service runner (the `services` profile) can't be reached,
+    /// so container services can't be deployed or started. The functions service reports it.
+    RunnerUnavailable,
+    /// 503: the functions service (the `functions` profile) can't be reached: edge functions
+    /// aren't running on this instance.
+    FunctionsUnavailable,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 105] = [
+    pub const ALL: [ErrorCode; 107] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantRequired,
@@ -265,6 +271,8 @@ impl ErrorCode {
         Self::InvalidSuccessor,
         Self::ExposureUnconfirmed,
         Self::IdentityUnavailable,
+        Self::RunnerUnavailable,
+        Self::FunctionsUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -374,6 +382,8 @@ impl ErrorCode {
             Self::InvalidSuccessor => "invalid_successor",
             Self::ExposureUnconfirmed => "exposure_unconfirmed",
             Self::IdentityUnavailable => "identity_unavailable",
+            Self::RunnerUnavailable => "runner_unavailable",
+            Self::FunctionsUnavailable => "functions_unavailable",
         }
     }
 }
@@ -476,7 +486,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 105] = [
+    const ALL: [(ErrorCode, &str); 107] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantRequired, "tenant_required"),
@@ -587,6 +597,8 @@ mod tests {
         // T10 fix: 409, a role delete's exposures weren't confirmed with the preview's token.
         (ErrorCode::ExposureUnconfirmed, "exposure_unconfirmed"),
         (ErrorCode::IdentityUnavailable, "identity_unavailable"),
+        (ErrorCode::RunnerUnavailable, "runner_unavailable"),
+        (ErrorCode::FunctionsUnavailable, "functions_unavailable"),
     ];
 
     #[test]

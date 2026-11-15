@@ -188,7 +188,8 @@ services:
   # SeaweedFS runs the base file's command: its identities and its gRPC TLS files come from key
   # files, here Compose secrets from the stack's state dir (the CLI writes the fixed dev values of
   # `storage` and a per-stack CA with server and client certificates there, beside Neon's `s3/`
-  # pair), so none of them is in `docker inspect`. create-bucket is the base file's one-shot.
+  # pair), so none of them is in `docker inspect`. The `functions` identity's fixed dev values
+  # are Compose configs below (edge-functions m1). create-bucket is the base file's one-shot.
   seaweedfs:
     volumes: !override
       - neon_seaweedfs_data:/data
@@ -202,7 +203,15 @@ services:
       - {source: grpc-tls-server-key, target: /run/chelabase/secrets/grpc-tls/server.key}
       - {source: grpc-tls-client-crt, target: /run/chelabase/secrets/grpc-tls/client.crt}
       - {source: grpc-tls-client-key, target: /run/chelabase/secrets/grpc-tls/client.key}
+      - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
+      - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
     depends_on: !reset {}
+
+  # Edge functions (m1): the image `chelabase workbench up` builds locally from
+  # infra/images/functions-runtime.Dockerfile, tagged by its inputs' hash (m4b).
+  functions-runtime:
+    image: chelabase/functions-runtime:${CHELABASE_FUNCTIONS_RUNTIME_TAG:-latest}
+    pull_policy: never
 
   safekeeper1:
     user: "0"
@@ -433,6 +442,7 @@ services:
       - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
       - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
       - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
+      - CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token
       - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       - CHELABASE_IDENTITY_URL=http://identity:8080
@@ -447,6 +457,9 @@ services:
       - CHELABASE_BRANCH_DATABASE_CAP
       # Who may log in as chelabase_realtime (the compute spec's hba): realtime and the runner.
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
+      # Edge functions m9: where external service URLs may point (blank: public https only).
+      - CHELABASE_SERVICES_ALLOW_HOSTS=${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      - CHELABASE_SERVICES_ALLOW_HTTP=${CHELABASE_SERVICES_ALLOW_HTTP:-}
     group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
     # Its static address on `control`, for its TLS connections to computes.
     networks:
@@ -471,6 +484,7 @@ services:
       - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
       - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
+      - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
       - {source: stack-setup-code, target: "${CHELABASE_STACK_DIR}/setup/setup.code"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
@@ -513,8 +527,16 @@ services:
       - CHELABASE_STORAGE_SWEEP_GRACE_SECS=${CHELABASE_STORAGE_SWEEP_GRACE_SECS:-}
       - CHELABASE_STORAGE_SWEEP_SECS=${CHELABASE_STORAGE_SWEEP_SECS:-}
       - CHELABASE_STORAGE_SWEEP_DRY_RUN=${CHELABASE_STORAGE_SWEEP_DRY_RUN:-}
+      # Edge functions m7: the bundle sweep as the `functions` identity, the stack's generated pair.
+      - CHELABASE_FUNCTIONS_S3_BUCKET=chelabase-functions
+      - CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE=/run/chelabase/secrets/functions-s3/access-key
+      - CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE=/run/chelabase/secrets/functions-s3/secret-key
       - CHELABASE_IDENTITY_URL=http://identity:8080
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      # Edge functions (m4b): its bearer for the functions service's invocations.
+      - CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-functions.token
+      # Edge functions (m10): its bearer for the service runner.
+      - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
       # object-storage m18, dev only: storage webhooks may reach the live test's local receiver in
       # the runner (`runner`, its alias on the default network: `chelabase workbench test` runs it
       # with --use-aliases), over http. Exactly that host; every other one stays public-only.
@@ -538,7 +560,11 @@ services:
       - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
       - {source: s3-storage-access-key, target: /run/chelabase/secrets/storage-s3/access-key}
       - {source: s3-storage-secret-key, target: /run/chelabase/secrets/storage-s3/secret-key}
+      - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
+      - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
       - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
+      - {source: token-worker-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
+      - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
     depends_on: !override
       metadata-db:
         condition: service_healthy
@@ -583,6 +609,9 @@ services:
           - ${CHELABASE_MAIL_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_DOCS_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_LANDING_HOST_NAME:?set by chelabase workbench (stack.env)}
+      # #183: the functions' `env.CHELABASE` binding, as in the base file.
+      functions:
+        aliases: [gateway-functions]
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -692,6 +721,93 @@ services:
         condition: service_healthy
       seaweedfs:
         condition: service_started
+
+  # Edge functions (m4b): the host-built binary, its listeners on the base file's aliases. The
+  # bundles bucket as the `functions` S3 identity, with the stack's generated pair.
+  functions:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/functions"]
+    read_only: !reset null
+    env_file:
+      - *stack-env
+    environment: !override
+      - CHELABASE_FUNCTIONS_ADDR=functions-public:8091,127.0.0.1:8091
+      - CHELABASE_FUNCTIONS_INTERNAL_ADDR=functions-internal:8080
+      - CHELABASE_FUNCTIONS_CONTROL_ADDR=functions-control:8080
+      - CHELABASE_FUNCTIONS_RUNTIME_URL=http://functions-runtime:8080
+      - CHELABASE_NATS_USER=functions
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/functions.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_functions
+      - CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token
+      - CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-functions.token
+      - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
+      - CHELABASE_STORAGE_BACKEND=seaweedfs
+      - CHELABASE_STORAGE_S3_ENDPOINT=http://seaweedfs:8333
+      - CHELABASE_STORAGE_S3_BUCKET=chelabase-functions
+      - CHELABASE_STORAGE_S3_ACCESS_KEY_FILE=/run/chelabase/secrets/functions-s3/access-key
+      - CHELABASE_STORAGE_S3_SECRET_KEY_FILE=/run/chelabase/secrets/functions-s3/secret-key
+      - CHELABASE_FUNCTIONS_TIMEOUT_MS=${CHELABASE_FUNCTIONS_TIMEOUT_MS:-}
+      - CHELABASE_SERVICES_ALLOW_HOSTS=${CHELABASE_SERVICES_ALLOW_HOSTS:-}
+      - CHELABASE_SERVICES_ALLOW_HTTP=${CHELABASE_SERVICES_ALLOW_HTTP:-}
+    volumes: !override
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+    secrets:
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      # m13b: the dispatcher verifies computes (the network is the base file's `compute`).
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: nats-functions, target: "${CHELABASE_KEYS_DIR}/nats/functions.password"}
+      - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
+      - {source: token-worker-functions, target: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
+      - {source: token-functions-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
+      - {source: s3-functions-access-key, target: /run/chelabase/secrets/functions-s3/access-key}
+      - {source: s3-functions-secret-key, target: /run/chelabase/secrets/functions-s3/secret-key}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8091/health"]
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+
+  # Edge functions (m10): the host-built binary in the base file's profile `services`, on its
+  # aliases there, in the Docker group like the orchestrator and the worker. The metadata URL in
+  # stack.env carries the password.
+  service-runner:
+    <<: *workbench
+    entrypoint: !reset []
+    command: ["${CHELABASE_CHECKOUT}/target/debug/service-runner"]
+    read_only: !reset null
+    env_file:
+      - *stack-env
+    environment: !override
+      - CHELABASE_SERVICE_RUNNER_ADDR=service-runner-control:8094,127.0.0.1:8094
+      - CHELABASE_COMPOSE_PROJECT=${COMPOSE_PROJECT_NAME}
+      - CHELABASE_FUNCTIONS_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token
+      - CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token
+      - CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB=${CHELABASE_SERVICE_RUNNER_MEMORY_CAP_MB:-}
+      - CHELABASE_SERVICE_RUNNER_CPU_CAP=${CHELABASE_SERVICE_RUNNER_CPU_CAP:-}
+      - CHELABASE_SERVICE_RUNNER_RECONCILE_SECS=${CHELABASE_SERVICE_RUNNER_RECONCILE_SECS:-}
+    group_add: ["${CHELABASE_DOCKER_GID}"]
+    volumes: !override
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+      - *docker-sock
+    secrets:
+      - {source: token-functions-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
+      - {source: token-worker-service-runner, target: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8094/health"]
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
 
   # Its static address on `control` is outside the computes' range and in the chelabase_realtime
   # login rule.
@@ -809,6 +925,8 @@ services:
       - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
+      # Edge functions (m4b): the e2e uploads bundles as the orchestrator does.
+      - CHELABASE_ORCHESTRATOR_FUNCTIONS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
       - CHELABASE_IDENTITY_URL=http://identity:8080
@@ -818,12 +936,14 @@ services:
       - CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
     group_add: ["${CHELABASE_DOCKER_GID}"]
     # The static address is in the member-login rule's address list. On the compute network:
-    # live tests dial computes like the services do.
+    # live tests dial computes like the services do. On `functions-control` (m4b): the functions
+    # e2e uploads bundles to the functions service's internal listener.
     networks:
       default: {}
       control:
         ipv4_address: ${CHELABASE_RUNNER_CONTROL_IP:?set by chelabase workbench (stack.env)}
       compute: {}
+      functions-control: {}
     volumes:
       - *checkout-rw
       - *keys-mask
@@ -863,6 +983,7 @@ services:
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
       - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
+      - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
       - {source: storage-pem, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem"}
       - {source: storage-pageserver-api, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt"}
       - {source: storage-safekeeper-data, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt"}
@@ -902,6 +1023,10 @@ secrets:
   s3-neon-secret-key: {file: "${CHELABASE_STACK_DIR}/s3/secret-key"}
   s3-storage-access-key: {file: "${CHELABASE_STACK_DIR}/storage-s3/access-key"}
   s3-storage-secret-key: {file: "${CHELABASE_STACK_DIR}/storage-s3/secret-key"}
+  # Edge functions (m4b): the `functions` S3 identity's pair, generated per stack by `chelabase
+  # workbench up` (bucket chelabase-functions only).
+  s3-functions-access-key: {file: "${CHELABASE_STACK_DIR}/functions-s3/access-key"}
+  s3-functions-secret-key: {file: "${CHELABASE_STACK_DIR}/functions-s3/secret-key"}
   grpc-tls-ca: {file: "${CHELABASE_STACK_DIR}/grpc-tls/ca.crt"}
   grpc-tls-server-crt: {file: "${CHELABASE_STACK_DIR}/grpc-tls/server.crt"}
   grpc-tls-server-key: {file: "${CHELABASE_STACK_DIR}/grpc-tls/server.key"}
@@ -933,6 +1058,7 @@ secrets:
   nats-realtime: {file: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
   nats-runner: {file: "${CHELABASE_KEYS_DIR}/nats/runner.password"}
   nats-storage: {file: "${CHELABASE_KEYS_DIR}/nats/storage.password"}
+  nats-functions: {file: "${CHELABASE_KEYS_DIR}/nats/functions.password"}
   valkey-proxy: {file: "${CHELABASE_KEYS_DIR}/valkey/proxy.password"}
   valkey-control: {file: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
   valkey-realtime: {file: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
@@ -946,6 +1072,11 @@ secrets:
   token-app-auth: {file: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
   token-app-sessions: {file: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
   token-storage-internal: {file: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
+  token-orchestrator-functions: {file: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
+  token-worker-functions: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-functions.token"}
+  # Edge functions (m10): the service runner's callers.
+  token-functions-service-runner: {file: "${CHELABASE_KEYS_DIR}/tokens/functions-service-runner.token"}
+  token-worker-service-runner: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-service-runner.token"}
   token-proxy-api: {file: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
   token-storcon-hook: {file: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
   # Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped

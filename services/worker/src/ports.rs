@@ -30,6 +30,12 @@ use crate::safekeepers::SafekeeperSet;
 
 /// The metadata calls the worker makes. See [`MetadataClient`] for each one's guards.
 pub trait WorkerMetadata: Send + Sync + 'static {
+    /// Edge functions m8: the metadata client the function-trigger installs and the child's
+    /// run-as keys use (`crate::fn_triggers`); `None` (the fakes) skips them.
+    fn functions(&self) -> Option<&MetadataClient> {
+        None
+    }
+
     /// Held while one endpoint's pending password is applied; dropping it releases the lock.
     type EndpointLock: Send;
 
@@ -725,6 +731,10 @@ pub trait WorkerMetadata: Send + Sync + 'static {
 // Each method calls the inherent one by its full path: a bare `self.method()` would recurse
 // into this impl if the inherent method were ever renamed.
 impl WorkerMetadata for MetadataClient {
+    fn functions(&self) -> Option<&MetadataClient> {
+        Some(self)
+    }
+
     type EndpointLock = EndpointLock;
 
     async fn lock_endpoint(&self, endpoint_id: &str) -> Result<EndpointLock, MetadataError> {

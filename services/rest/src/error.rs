@@ -68,6 +68,16 @@ impl ApiError {
         )
     }
 
+    /// 403: a key (or console session) whose role is one of Chelabase's own (`chelabase_…`,
+    /// `cb_m_…`): nothing runs as it, whatever its attributes say (edge functions m8).
+    pub fn role_reserved(role: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "role_not_allowed",
+            format!("the role `{role}` of this key is reserved for Chelabase; use a role of your own"),
+        )
+    }
+
     /// 404: a database that doesn't exist, isn't served or isn't on the key's list (one
     /// text for all three, so a key can't discover database names).
     pub fn unknown_database() -> Self {

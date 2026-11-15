@@ -1,0 +1,52 @@
+---
+title: Bundling and WebAssembly
+description: How the CLI bundles a function with esbuild, how WebAssembly modules and WASI components are handled, and the bundle limits.
+---
+
+`chelabase functions deploy` and `dev` build each function into one **bundle**: a JSON manifest of modules (JavaScript, WebAssembly, text and data) with the compatibility date and flags, uploaded to the branch and identified by its SHA-256. Deployments are immutable; a deploy adds one and makes it active, and `rollback` makes an earlier one active again.
+
+## esbuild
+
+The CLI runs esbuild from the project (`node_modules/.bin/esbuild`), else from `PATH`. If neither exists the command exits non-zero and says to run:
+
+```bash
+npm install --save-dev esbuild
+```
+
+It bundles the entry as an ES module (`--format=esm --bundle --platform=neutral --conditions=workerd,worker,browser`), so packages resolve the way they do for Cloudflare Workers. The runtime offers Workers' standard APIs, not Node's.
+
+## WebAssembly
+
+Import a core WebAssembly module with a **`./` path**; the CLI keeps the import external and ships the file as a `wasm` module:
+
+```ts
+import add from "./add.wasm";
+
+export default {
+  async fetch(): Promise<Response> {
+    const { exports } = new WebAssembly.Instance(add);
+    return Response.json({ sum: (exports.add as (a: number, b: number) => number)(2, 3) });
+  },
+};
+```
+
+- **Core modules only.** `import x from "./x.wasm"` gives a compiled `WebAssembly.Module`; instantiate it with `new WebAssembly.Instance(module, imports)`.
+- **`WebAssembly.instantiate(bytes)` is refused** ("Wasm code generation disallowed by embedder"): the runtime does not compile raw bytes. Ship the file as a module import.
+- **WASI components** (a `.wasm` whose header marks it a component) are converted first with `jco transpile`, and the transpiled output is bundled. This needs jco and the preview2 shim; without them the command stops and says to run:
+
+  ```bash
+  npm install --save-dev @bytecodealliance/jco @bytecodealliance/preview2-shim
+  ```
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Bundle (manifest) size | 10 MiB |
+| Deploy request body | 12 MiB |
+| Request body to a function | 6 MiB |
+| One secret | 64 KiB |
+| Invocation wall clock | 30 s (`CHELABASE_FUNCTIONS_TIMEOUT_MS`) |
+| Compatibility date | At most what the runtime's pinned workerd release supports |
+
+Unused bundles are cleaned up hourly: a bundle that no deployment of any branch refers to (rollback deployments count) and that is older than an hour is deleted, and a deleted database's bundles go with it.

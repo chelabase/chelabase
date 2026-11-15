@@ -17,6 +17,12 @@ code, that is itself a finding.
 
 Follow root `AGENTS.md`. Use `gh -R chelabase/chelabase`.
 
+**Local epics.** If the prompt gives a cache path instead of an issue number (the epic was
+planned with `/epic-security`), the issue is `<cache>/m<n>.md` and status lives in
+`<cache>/state.json`. Make no GitHub calls and never push. Step 11 writes the report to
+`<cache>/audit-m<n>.md` and sets `milestones.<n>.status` and `.audit` in `state.json`.
+Out-of-diff problems go to `<cache>/backlog.md`, not to issues.
+
 ## Workflow
 
 1. **Load.** Read the issue (`gh issue view <n> --json title,body,labels`). Take Outcome,
@@ -37,7 +43,8 @@ Follow root `AGENTS.md`. Use `gh -R chelabase/chelabase`.
    bypass, missing authorization, injection, TOCTOU/races, fail-open errors, migrations that
    can't roll back, contract drift. Write adversarial tests in the worktree for the riskiest
    cases; **don't commit them**. A failing adversarial test is blocking — paste it into the
-   finding. For Studio: states, keyboard/focus; open a browser only when nothing else shows
+   finding. Write each finding as the guarantee that doesn't hold plus the fix, with the
+   failing test as evidence. No attack narratives or payload write-ups. For Studio: states, keyboard/focus; open a browser only when nothing else shows
    the finding.
 9. **Only now** read comments / handoff claims; mismatch with the code is a finding.
 10. **Verdict.** Findings are **blocking**, **should-fix**, or **nit** (file:line, what's

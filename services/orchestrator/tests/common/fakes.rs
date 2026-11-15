@@ -96,6 +96,8 @@ struct FakeMetadata {
     saved_queries: Arc<Mutex<Vec<(uuid::Uuid, String, SavedQuery)>>>,
     /// m18: storage webhooks with their sealed secrets, and attempts by webhook.
     storage_webhooks: Arc<Mutex<Vec<(StorageWebhook, String)>>>,
+    /// Edge functions m9: services' signing secrets by function.
+    signing_secrets: Arc<Mutex<HashMap<uuid::Uuid, String>>>,
     storage_webhook_attempts: Arc<Mutex<Vec<(uuid::Uuid, StorageWebhookAttempt)>>>,
     /// Merge rows and their events.
     merges: Arc<Mutex<Vec<MergeRecord>>>,
@@ -166,6 +168,75 @@ struct FakeMetadata {
     /// or approval's teams (`teams_seen_hold`), apart from `race_before_write` so a checked
     /// grant write's `settle` never takes it.
     race_before_teams_seen: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
+    /// Edge functions m3: functions, deployments, branch state and secrets.
+    functions: Arc<Mutex<FakeFunctions>>,
+}
+
+impl orchestrator::functions_triggers::TriggersPort for FakeMetadata {
+    async fn add_trigger(&self, t: &chelabase_metadata::NewTrigger<'_>) -> Result<uuid::Uuid, MetadataError> {
+        self.fn_scope(t.branch_id, t.function_id)?;
+        let id = uuid::Uuid::new_v4();
+        let table = t.source == chelabase_metadata::TriggerSource::Table;
+        self.functions.lock().unwrap().triggers.push(chelabase_metadata::TriggerRecord {
+            id,
+            branch_id: t.branch_id,
+            function_id: t.function_id,
+            source: t.source,
+            enabled: true,
+            state: if table { chelabase_metadata::TriggerState::PendingInstall } else { chelabase_metadata::TriggerState::Installed },
+            enabled_since: chrono::Utc::now(),
+            pg_database: t.pg_database.to_string(),
+            schema_name: t.schema_name.map(str::to_string),
+            table_name: t.table_name.map(str::to_string),
+            bucket: t.bucket.map(str::to_string),
+            prefix: t.prefix.map(str::to_string),
+            events: t.events.iter().map(|e| e.to_string()).collect(),
+            last_error: None,
+            dead_count: 0,
+            dropped_count: 0,
+            last_delivery_error: None,
+            last_delivered_at: None,
+        });
+        Ok(id)
+    }
+
+    async fn list_triggers(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::TriggerRecord>, MetadataError> {
+        Ok(self.functions.lock().unwrap().triggers.iter().filter(|t| t.branch_id == branch).cloned().collect())
+    }
+
+    async fn update_trigger(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid, enabled: bool) -> Result<Option<chelabase_metadata::TriggerRecord>, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let Some(t) = fs.triggers.iter_mut().find(|t| t.id == id && t.branch_id == branch && t.function_id == function) else {
+            return Ok(None);
+        };
+        t.enabled = enabled;
+        Ok(Some(t.clone()))
+    }
+
+    async fn delete_trigger(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let before = fs.triggers.len();
+        fs.triggers.retain(|t| !(t.id == id && t.branch_id == branch && t.function_id == function));
+        Ok(fs.triggers.len() < before)
+    }
+}
+
+/// Edge functions m3: what the metadata's functions tables hold.
+#[derive(Default)]
+struct FakeFunctions {
+    functions: Vec<chelabase_metadata::FunctionRecord>,
+    deployments: Vec<chelabase_metadata::DeploymentRecord>,
+    /// Each branch's state of a function.
+    states: Vec<(BranchId, chelabase_metadata::BranchFunction)>,
+    secrets: std::collections::BTreeMap<(uuid::Uuid, uuid::Uuid, String), String>,
+    /// Edge functions m7: every branch's schedules, oldest first.
+    schedules: Vec<chelabase_metadata::ScheduleRecord>,
+    /// Edge functions m13: every branch's triggers, oldest first.
+    triggers: Vec<chelabase_metadata::TriggerRecord>,
+    /// Review fix: each branch state's `deployment_generation` (missing: 0).
+    generations: HashMap<(BranchId, uuid::Uuid), i64>,
 }
 
 /// Members hub step 2 (T23): one team as the fake keeps it.
@@ -2191,6 +2262,7 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             role_oid: key.role_oid,
             role_timeline: key.role_timeline.clone(),
             role_bypass_rls: key.kind == DataKeyKind::Secret && key.role_bypass_rls,
+            managed_by_function: None,
         },
         key.sha256,
     ));
@@ -2211,8 +2283,15 @@ enum FakeReset {
     Unavailable,
 }
 
+/// A test's look at the metadata at a `chelabase.fn.changed` publish.
+type OnFnChanged = Arc<dyn Fn(BranchId, &str) + Send + Sync>;
+
 #[derive(Clone, Default)]
 struct FakeJobs {
+    /// Edge functions m3: each `chelabase.fn.changed` publish, as (branch, function).
+    fn_changed: Arc<Mutex<Vec<(BranchId, String)>>>,
+    /// Called at each `chelabase.fn.changed` publish (to look at the metadata then).
+    on_fn_changed: Arc<Mutex<Option<OnFnChanged>>>,
     /// Object storage m9: the storage cache events published.
     storage_events: Arc<Mutex<Vec<chelabase_nats::StorageEvent>>>,
     published: Arc<Mutex<Vec<JobEnvelope<ProvisionDatabaseJob>>>>,
@@ -2300,6 +2379,19 @@ impl FakeJobs {
 }
 
 impl JobPort for FakeJobs {
+    async fn publish_fn_changed(
+        &self,
+        branch: BranchId,
+        function: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let hook = self.on_fn_changed.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(branch, function);
+        }
+        self.fn_changed.lock().unwrap().push((branch, function.to_string()));
+        Ok(())
+    }
+
     async fn publish_provision(
         &self,
         job: &JobEnvelope<ProvisionDatabaseJob>,
@@ -2770,6 +2862,94 @@ struct TestApp {
     /// Members hub T8 (P4): the app's `proxy_cache`.
     #[allow(dead_code)]
     cache: FakeCache,
+    /// Edge functions m3: the bundle uploads the orchestrator made.
+    #[allow(dead_code)]
+    bundles: FakeBundles,
+}
+
+/// A test's hold on a call: the call signals the first and waits for the second.
+type Gate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+/// A bundle upload as (database, sha256, the bytes sent).
+type BundlePut = (DatabaseId, String, Vec<u8>);
+/// A container rollout as (branch, function, deployment).
+type RolloutCall = (BranchId, uuid::Uuid, uuid::Uuid);
+
+/// Edge functions m3: the functions service's bundle store, as the orchestrator sees it.
+#[derive(Clone, Default)]
+struct FakeBundles {
+    /// Each upload as (database, sha256, the bytes sent).
+    puts: Arc<Mutex<Vec<BundlePut>>>,
+    /// Answer every upload with this status (2xx when unset).
+    status: Arc<Mutex<Option<u16>>>,
+    /// While set, an upload signals the first and waits for the second before it answers.
+    gate: Gate,
+    /// Review fix: while set, a rollout signals the first and waits for the second before it
+    /// answers.
+    pub rollout_gate: Gate,
+    /// m11: the control side's container-service calls: each rollout as (branch, function,
+    /// deployment), and the error every call answers with while set.
+    pub rollouts: Arc<Mutex<Vec<RolloutCall>>>,
+    pub control_error: Arc<Mutex<Option<orchestrator::functions::ControlError>>>,
+}
+
+impl orchestrator::functions::BundleSink for FakeBundles {
+    fn put<'a>(
+        &'a self,
+        database: DatabaseId,
+        sha256: &'a str,
+        manifest: bytes::Bytes,
+    ) -> orchestrator::functions::SinkFuture<'a> {
+        self.puts.lock().unwrap().push((database, sha256.to_string(), manifest.to_vec()));
+        let status = *self.status.lock().unwrap();
+        let gate = self.gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            match status {
+                Some(code) if !(200..300).contains(&code) => {
+                    Err(orchestrator::functions::SinkError::Status(code))
+                }
+                _ => Ok(()),
+            }
+        })
+    }
+
+    fn resolve_image<'a>(&'a self, image: &'a str) -> orchestrator::functions::ControlFuture<'a, String> {
+        // A rollover's failure (409) is the rollout's alone.
+        let err = self
+            .control_error
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|e| !matches!(e, orchestrator::functions::ControlError::Status { status: 409, .. }));
+        let name = image.split([':', '@']).next().unwrap_or_default().to_owned();
+        Box::pin(async move {
+            match err {
+                Some(e) => Err(e),
+                None => Ok(format!("{name}@sha256:{}", "d".repeat(64))),
+            }
+        })
+    }
+
+    fn rollout(&self, branch: BranchId, function: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, ()> {
+        self.rollouts.lock().unwrap().push((branch, function, deployment));
+        let err = self.control_error.lock().unwrap().clone();
+        let gate = self.rollout_gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            err.map_or(Ok(()), Err)
+        })
+    }
+
+    fn service_logs(&self, _: BranchId, _: uuid::Uuid, deployment: uuid::Uuid) -> orchestrator::functions::ControlFuture<'_, String> {
+        let err = self.control_error.lock().unwrap().clone();
+        Box::pin(async move { err.map_or(Ok(format!("logs of {deployment}\n")), Err) })
+    }
 }
 
 impl TestApp {
@@ -3058,6 +3238,7 @@ async fn spawn_app_core_with(
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let locator = FakeLocator::default();
+    let bundles = FakeBundles::default();
     let state = Arc::new(AppState {
         metadata,
         js: jobs,
@@ -3096,6 +3277,10 @@ async fn spawn_app_core_with(
         rt_events: Arc::new(rt_events.clone()),
         proxy_cache: Arc::new(cache.clone()),
         webhooks: webhook_outbound(),
+        // m9: the same resolver, http allowed so the hard deny is what refuses a stack host.
+        services: webhook_outbound().allow_http(true).deny_stack([]),
+        bundles: Arc::new(bundles.clone()),
+        rollouts: Default::default(),
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))
@@ -3116,6 +3301,7 @@ async fn spawn_app_core_with(
         state,
         rt_events,
         cache,
+        bundles,
     }
 }
 
@@ -5125,4 +5311,447 @@ fn signed_member_token(
     claims.email = format!("{sub}@mail.test");
     claims.name = format!("Name of {sub}");
     keys.sign(&claims)
+}
+
+/// Edge functions m3: the functions tables, as `chelabase_metadata`'s functions API answers them.
+impl FakeMetadata {
+    /// `FunctionNotFound` unless `branch` is a live branch of the function's database.
+    fn fn_scope(&self, branch: BranchId, function: uuid::Uuid) -> Result<(), MetadataError> {
+        let branch_db = self
+            .branches
+            .lock()
+            .unwrap()
+            .get(&branch)
+            .filter(|b| !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted))
+            .map(|b| b.database_id);
+        let fs = self.functions.lock().unwrap();
+        match fs.functions.iter().find(|f| f.id == function) {
+            Some(f) if Some(f.database_id) == branch_db => Ok(()),
+            _ => Err(MetadataError::FunctionNotFound),
+        }
+    }
+
+    /// Whether a live protected branch has the function active.
+    fn fn_active_on_protected(&self, function: uuid::Uuid) -> bool {
+        let branches = self.branches.lock().unwrap();
+        self.functions.lock().unwrap().states.iter().any(|(b, st)| {
+            st.function_id == function
+                && branches.get(b).is_some_and(|b| {
+                    b.protected && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
+                })
+        })
+    }
+
+    /// Revokes the live keys `function` manages (on `branch`, or everywhere).
+    fn fn_revoke_managed(&self, branch: Option<BranchId>, function: uuid::Uuid) {
+        for (k, _) in self.keys.lock().unwrap().iter_mut() {
+            if k.revoked_at.is_none()
+                && k.managed_by_function.as_ref().is_some_and(|(id, _)| *id == function)
+                && branch.is_none_or(|b| k.branch_id == b)
+            {
+                k.revoked_at = Some(chrono::Utc::now());
+                k.sealed = None;
+            }
+        }
+    }
+
+    /// `change` on the function's state on the branch; false when it has none.
+    fn fn_state(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        change: impl FnOnce(&mut chelabase_metadata::BranchFunction),
+    ) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        match fs.states.iter_mut().find(|(b, st)| *b == branch && st.function_id == function) {
+            Some((_, st)) => {
+                change(st);
+                st.updated_at = chrono::Utc::now();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+impl orchestrator::functions::FunctionsPort for FakeMetadata {
+    async fn set_service_signing_secret(
+        &self,
+        database: DatabaseId,
+        function: uuid::Uuid,
+        secret: &str,
+    ) -> Result<bool, MetadataError> {
+        let found = self.functions.lock().unwrap().functions.iter().any(|f| f.id == function && f.database_id == database);
+        if found {
+            self.signing_secrets.lock().unwrap().insert(function, secret.to_owned());
+        }
+        Ok(found)
+    }
+
+    async fn create_function(
+        &self,
+        database: DatabaseId,
+        name: &str,
+        kind: chelabase_metadata::FunctionKind,
+    ) -> Result<chelabase_metadata::FunctionRecord, MetadataError> {
+        if !chelabase_metadata::valid_function_name(name) {
+            return Err(MetadataError::InvalidFunction("bad name".into()));
+        }
+        let mut fs = self.functions.lock().unwrap();
+        if fs.functions.iter().any(|f| f.database_id == database && f.name == name) {
+            return Err(MetadataError::Conflict);
+        }
+        let record = chelabase_metadata::FunctionRecord {
+            id: uuid::Uuid::new_v4(),
+            database_id: database,
+            name: name.to_string(),
+            kind,
+            created_at: chrono::Utc::now(),
+        };
+        fs.functions.push(record.clone());
+        Ok(record)
+    }
+
+    async fn list_functions(&self, database: DatabaseId) -> Result<Vec<chelabase_metadata::FunctionRecord>, MetadataError> {
+        let mut out: Vec<_> = self
+            .functions
+            .lock()
+            .unwrap()
+            .functions
+            .iter()
+            .filter(|f| f.database_id == database)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn set_function_kind(
+        &self,
+        database: DatabaseId,
+        function: uuid::Uuid,
+        kind: chelabase_metadata::FunctionKind,
+    ) -> Result<bool, MetadataError> {
+        let current = {
+            let fs = self.functions.lock().unwrap();
+            fs.functions.iter().find(|f| f.id == function && f.database_id == database).map(|f| f.kind)
+        };
+        let Some(current) = current else { return Ok(false) };
+        if self.fn_active_on_protected(function) {
+            return Err(MetadataError::FunctionActiveOnProtectedBranch);
+        }
+        if current == kind {
+            return Ok(true);
+        }
+        let mut fs = self.functions.lock().unwrap();
+        if fs.deployments.iter().any(|d| d.function_id == function) {
+            return Err(MetadataError::InvalidFunction("a function with deployments keeps its kind".into()));
+        }
+        fs.functions.iter_mut().find(|f| f.id == function).unwrap().kind = kind;
+        Ok(true)
+    }
+
+    async fn delete_function_unprotected(&self, database: DatabaseId, function: uuid::Uuid) -> Result<bool, MetadataError> {
+        let found = self
+            .functions
+            .lock()
+            .unwrap()
+            .functions
+            .iter()
+            .any(|f| f.id == function && f.database_id == database);
+        if !found {
+            return Ok(false);
+        }
+        if self.fn_active_on_protected(function) {
+            return Err(MetadataError::FunctionActiveOnProtectedBranch);
+        }
+        self.fn_revoke_managed(None, function);
+        let mut fs = self.functions.lock().unwrap();
+        fs.functions.retain(|f| f.id != function);
+        fs.deployments.retain(|d| d.function_id != function);
+        fs.states.retain(|(_, st)| st.function_id != function);
+        fs.secrets.retain(|(_, f, _), _| *f != function);
+        Ok(true)
+    }
+
+    async fn create_deployment(
+        &self,
+        d: &chelabase_metadata::NewDeployment<'_>,
+    ) -> Result<chelabase_metadata::DeploymentRecord, MetadataError> {
+        let mut fs = self.functions.lock().unwrap();
+        if !fs.functions.iter().any(|f| f.id == d.function_id) {
+            return Err(MetadataError::FunctionNotFound);
+        }
+        let record = chelabase_metadata::DeploymentRecord {
+            id: d.id,
+            function_id: d.function_id,
+            bundle_sha256: d.bundle_sha256.map(str::to_string),
+            bundle_size: d.bundle_size,
+            spec: d.spec.clone(),
+            compatibility_date: d.compatibility_date,
+            created_by: d.created_by.to_string(),
+            created_at: chrono::Utc::now(),
+            note: d.note.map(str::to_string),
+        };
+        fs.deployments.push(record.clone());
+        Ok(record)
+    }
+
+    async fn list_deployments(&self, function: uuid::Uuid) -> Result<Vec<chelabase_metadata::DeploymentRecord>, MetadataError> {
+        let mut out: Vec<_> = self
+            .functions
+            .lock()
+            .unwrap()
+            .deployments
+            .iter()
+            .filter(|d| d.function_id == function)
+            .cloned()
+            .collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    async fn set_active_deployment(&self, branch: BranchId, function: uuid::Uuid, deployment: uuid::Uuid) -> Result<(), MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        if !fs.deployments.iter().any(|d| d.id == deployment && d.function_id == function) {
+            return Err(MetadataError::InvalidFunction("the deployment belongs to another function".into()));
+        }
+        let f = fs.functions.iter().find(|f| f.id == function).cloned().unwrap();
+        match fs.states.iter_mut().find(|(b, st)| *b == branch && st.function_id == function) {
+            Some((_, st)) => {
+                st.deployment_id = deployment;
+                st.last_error = None;
+                st.updated_at = chrono::Utc::now();
+                *fs.generations.entry((branch, function)).or_default() += 1;
+            }
+            None => fs.states.push((
+                branch,
+                chelabase_metadata::BranchFunction {
+                    function_id: function,
+                    name: f.name,
+                    kind: f.kind,
+                    deployment_id: deployment,
+                    enabled: false,
+                    auth: chelabase_metadata::FunctionAuth::Key,
+                    run_as_role: None,
+                    run_as_key_id: None,
+                    run_as_role_oid: None,
+                    run_as_unmintable: None,
+                    last_error: None,
+                    updated_at: chrono::Utc::now(),
+                    health: None,
+                },
+            )),
+        }
+        Ok(())
+    }
+
+    async fn active_deployment_generation(&self, branch: BranchId, function: uuid::Uuid) -> Result<Option<(uuid::Uuid, i64)>, MetadataError> {
+        let fs = self.functions.lock().unwrap();
+        Ok(fs
+            .states
+            .iter()
+            .find(|(b, st)| *b == branch && st.function_id == function)
+            .map(|(_, st)| (st.deployment_id, fs.generations.get(&(branch, function)).copied().unwrap_or_default())))
+    }
+
+    async fn switch_active_deployment(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        generation: i64,
+        deployment: uuid::Uuid,
+    ) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        if !fs.deployments.iter().any(|d| d.id == deployment && d.function_id == function) {
+            return Err(MetadataError::InvalidFunction("the deployment belongs to another function".into()));
+        }
+        let current = fs.generations.get(&(branch, function)).copied().unwrap_or_default();
+        let Some((_, st)) = fs.states.iter_mut().find(|(b, st)| *b == branch && st.function_id == function) else {
+            return Ok(false);
+        };
+        if current != generation {
+            return Ok(false);
+        }
+        st.deployment_id = deployment;
+        st.last_error = None;
+        st.updated_at = chrono::Utc::now();
+        fs.generations.insert((branch, function), current + 1);
+        Ok(true)
+    }
+
+    async fn set_enabled(&self, branch: BranchId, function: uuid::Uuid, enabled: bool) -> Result<bool, MetadataError> {
+        self.fn_state(branch, function, |st| st.enabled = enabled)
+    }
+
+    async fn set_function_auth(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        auth: chelabase_metadata::FunctionAuth,
+    ) -> Result<bool, MetadataError> {
+        self.fn_state(branch, function, |st| st.auth = auth)
+    }
+
+    async fn set_run_as(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        run_as: Option<&chelabase_metadata::RunAs>,
+    ) -> Result<bool, MetadataError> {
+        if !self.fn_state(branch, function, |_| {})? {
+            return Ok(false);
+        }
+        self.fn_revoke_managed(Some(branch), function);
+        let name = self.functions.lock().unwrap().functions.iter().find(|f| f.id == function).unwrap().name.clone();
+        if let Some(r) = run_as {
+            self.keys.lock().unwrap().push((
+                DataKeyRecord {
+                    id: r.key_id,
+                    branch_id: branch,
+                    kind: DataKeyKind::Secret,
+                    role: r.role.clone(),
+                    name: name.clone(),
+                    prefix: r.prefix.clone(),
+                    sealed: Some("sealed".into()),
+                    created_at: chrono::Utc::now(),
+                    last_used_at: None,
+                    revoked_at: None,
+                    databases: None,
+                    role_oid: Some(r.role_oid),
+                    role_timeline: r.role_timeline.clone(),
+                    role_bypass_rls: r.role_bypass_rls,
+                    managed_by_function: Some((function, name)),
+                },
+                r.sha256,
+            ));
+        }
+        self.fn_state(branch, function, |st| {
+            st.run_as_role = run_as.map(|r| r.role.clone());
+            st.run_as_key_id = run_as.map(|r| r.key_id);
+        })
+    }
+
+    async fn list_for_branch(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::BranchFunction>, MetadataError> {
+        let mut out: Vec<_> = self
+            .functions
+            .lock()
+            .unwrap()
+            .states
+            .iter()
+            .filter(|(b, _)| *b == branch)
+            .map(|(_, st)| st.clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn put_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str, value: &str) -> Result<(), MetadataError> {
+        if !chelabase_metadata::valid_secret_name(name) {
+            return Err(MetadataError::InvalidFunction("a secret name is a letter or _, then A-Z, a-z, 0-9 and _".into()));
+        }
+        if value.len() > chelabase_metadata::MAX_SECRET_BYTES {
+            return Err(MetadataError::InvalidFunction("a secret is at most 65536 bytes".into()));
+        }
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let total = chelabase_metadata::secrets_env_bytes(
+            fs.secrets
+                .iter()
+                .filter(|((b, f, n), _)| *b == branch.as_uuid() && *f == function && n != name)
+                .map(|((_, _, n), v)| (n.as_str(), v.as_str()))
+                .chain([(name, value)]),
+        );
+        if total > chelabase_metadata::MAX_SECRETS_ENV_BYTES {
+            return Err(MetadataError::InvalidFunction(format!(
+                "a function's secrets on a branch are at most {} bytes together",
+                chelabase_metadata::MAX_SECRETS_ENV_BYTES
+            )));
+        }
+        fs.secrets.insert((branch.as_uuid(), function, name.to_string()), value.to_string());
+        Ok(())
+    }
+
+    async fn delete_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        Ok(self.functions.lock().unwrap().secrets.remove(&(branch.as_uuid(), function, name.to_string())).is_some())
+    }
+
+    async fn secret_names(&self, branch: BranchId, function: uuid::Uuid) -> Result<Vec<String>, MetadataError> {
+        Ok(self
+            .functions
+            .lock()
+            .unwrap()
+            .secrets
+            .keys()
+            .filter(|(b, f, _)| *b == branch.as_uuid() && *f == function)
+            .map(|(_, _, n)| n.clone())
+            .collect())
+    }
+
+    async fn set_function_last_error(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        self.fn_state(branch, function, |st| st.last_error = error.map(str::to_owned)).map(drop)
+    }
+}
+
+impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
+    async fn add_schedule(&self, s: &chelabase_metadata::NewSchedule<'_>) -> Result<uuid::Uuid, MetadataError> {
+        self.fn_scope(s.branch_id, s.function_id)?;
+        let id = uuid::Uuid::new_v4();
+        self.functions.lock().unwrap().schedules.push(chelabase_metadata::ScheduleRecord {
+            id,
+            branch_id: s.branch_id,
+            function_id: s.function_id,
+            cron: s.cron.to_string(),
+            timezone: s.timezone.to_string(),
+            next_run_at: s.next_run_at,
+            enabled: true,
+        });
+        Ok(id)
+    }
+
+    async fn list_schedules(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        Ok(self.functions.lock().unwrap().schedules.iter().filter(|s| s.branch_id == branch).cloned().collect())
+    }
+
+    async fn update_schedule(
+        &self,
+        branch: BranchId,
+        function: uuid::Uuid,
+        id: uuid::Uuid,
+        cron: Option<&str>,
+        timezone: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let Some(s) = fs.schedules.iter_mut().find(|s| s.id == id && s.branch_id == branch && s.function_id == function) else {
+            return Ok(None);
+        };
+        let (new_cron, new_tz) = (cron.unwrap_or(&s.cron).to_string(), timezone.unwrap_or(&s.timezone).to_string());
+        let parsed = chelabase_metadata::Schedule::parse(&new_cron, &new_tz)
+            .map_err(|e| MetadataError::InvalidFunction(e.to_string()))?;
+        let new_enabled = enabled.unwrap_or(s.enabled);
+        if new_cron != s.cron || new_tz != s.timezone || (new_enabled && !s.enabled) {
+            s.next_run_at = parsed.next_after(chrono::Utc::now());
+        }
+        (s.cron, s.timezone, s.enabled) = (new_cron, new_tz, new_enabled);
+        Ok(Some(s.clone()))
+    }
+
+    async fn delete_schedule(&self, branch: BranchId, function: uuid::Uuid, id: uuid::Uuid) -> Result<bool, MetadataError> {
+        self.fn_scope(branch, function)?;
+        let mut fs = self.functions.lock().unwrap();
+        let before = fs.schedules.len();
+        fs.schedules.retain(|s| !(s.id == id && s.branch_id == branch && s.function_id == function));
+        Ok(fs.schedules.len() < before)
+    }
 }

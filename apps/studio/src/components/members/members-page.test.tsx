@@ -17,7 +17,7 @@ const adminMe: Me = {
   name: "Ana",
   tenant_id: "t1",
   member: { id: "ana", status: "active", tenant_admin: true },
-  instance_admin: true, tenant_admins: [],
+  instance_admin: true, functions_available: true, tenant_admins: [],
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
   user: { sub: "u1" },
   tenant: {
@@ -32,7 +32,7 @@ const memberMe: Me = {
   sub: "u2",
   email: "bo@example.test",
   member: { id: "bo", status: "active", tenant_admin: false },
-  instance_admin: false,
+  instance_admin: false, functions_available: true,
   projects: [],
 };
 

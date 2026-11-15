@@ -23,7 +23,7 @@ compute on Neon's storage engine, so branches are copy-on-write and can be made 
 point in time.
 
 <p align="center">
-  <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator, Rest and Storage; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; Storage keeps each file's metadata in the branch's Postgres; psql and ORMs connect over Postgres through the Neon proxy.">
+  <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator, Rest, Storage and Functions; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; Storage keeps each file's metadata in the branch's Postgres; Functions runs your own code per branch; psql and ORMs connect over Postgres through the Neon proxy.">
 </p>
 
 - **[Gateway](https://docs.chelabase.com/architecture/gateway/)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.

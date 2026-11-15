@@ -47,6 +47,9 @@ mod data_api_types;
 mod app_user_admin;
 mod app_users;
 mod data_keys;
+pub mod functions;
+pub mod functions_schedules;
+pub mod functions_triggers;
 pub mod internal;
 pub mod members;
 pub mod member_sessions;
@@ -127,7 +130,9 @@ pub(crate) fn proxy_host(endpoint_id: &str, domain: &str) -> String {
 /// Abstraction over tenant/database metadata lookups, so tests can inject an
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`. The member API's reads
 /// and writes are [`members::MembersPort`].
-pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
+pub trait MetadataPort:
+    members::MembersPort + functions::FunctionsPort + functions_schedules::SchedulesPort + functions_triggers::TriggersPort + Send + Sync + 'static
+{
     /// Whether the tenant exists (#119: a member token's `tid` names one that may be gone).
     fn tenant_exists(&self, tenant: TenantId) -> impl Future<Output = Result<bool, MetadataError>> + Send {
         async move {
@@ -1448,6 +1453,14 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         event: &chelabase_nats::StorageEvent,
     ) -> impl Future<Output = Result<(), BoxError>> + Send;
 
+    /// Edge functions m3: `chelabase.fn.changed.<branch>` after a function write committed
+    /// (core NATS, best effort).
+    fn publish_fn_changed(
+        &self,
+        branch: BranchId,
+        function: &str,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+
     /// Asks the worker whether a secret key may use `role` on the branch (and grants it to
     /// `authenticator`).
     fn check_data_role(
@@ -1694,6 +1707,12 @@ impl JobPort for NatsPorts {
 
     async fn publish_merge(&self, job: &JobEnvelope<MergeJob>) -> Result<(), BoxError> {
         chelabase_nats::publish_merge(&self.js, job)
+            .await
+            .map_err(|e| Box::new(e) as BoxError)
+    }
+
+    async fn publish_fn_changed(&self, branch: BranchId, function: &str) -> Result<(), BoxError> {
+        chelabase_nats::fn_events::publish_changed(&self.client, branch.as_uuid(), function)
             .await
             .map_err(|e| Box::new(e) as BoxError)
     }
@@ -1953,6 +1972,21 @@ pub struct AppState<M, J> {
     /// `CHELABASE_WEBHOOKS_ALLOW_HOSTS`): checked at registration; the worker checks again at
     /// every connection.
     pub webhooks: chelabase_http::outbound::Outbound,
+    /// Edge functions m9: where external services' URLs may point (`CHELABASE_SERVICES_*`, and
+    /// the stack's hard deny), checked when a deployment is saved.
+    pub services: chelabase_http::outbound::Outbound,
+    /// Edge functions m3: where deployments' bundles are stored (the functions service).
+    pub bundles: functions::Bundles,
+    /// Edge functions m11: container rollovers in flight or failed, per branch and service.
+    pub rollouts: Arc<functions::Rollouts>,
+}
+
+/// The metadata client with the orchestrator's secrets key (edge functions m2/m3): function
+/// secrets are sealed and opened with it, and a branch create re-seals its parent's. Without
+/// it `put_secret` and `decrypt_secrets` fail, and so does creating a branch of a parent with
+/// function secrets.
+pub fn with_function_secrets(metadata: MetadataClient, secrets: &SecretKey) -> MetadataClient {
+    metadata.with_secrets_key(secrets.clone())
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -2405,6 +2439,9 @@ struct MeResponse {
     /// Whether the caller may use instance routes (self-hosted: an active tenant admin;
     /// platform: a member of the operator tenant).
     instance_admin: bool,
+    /// Whether members may manage and run edge functions on this instance (false in platform
+    /// mode, where every functions route answers 403 `not_available_in_platform_mode`).
+    functions_available: bool,
     /// Each project the caller may use, with their platform role and the Postgres roles they
     /// may act as there. A tenant admin is Admin with every role on every project.
     projects: Vec<MeProject>,
@@ -2639,6 +2676,9 @@ where
         .merge(members::routes())
         .merge(personal_logins::routes())
         .merge(teams::routes())
+        .merge(functions::routes())
+        .merge(functions_schedules::routes())
+        .merge(functions_triggers::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -2848,6 +2888,7 @@ where
         tenant_id,
         member: member.as_ref().map(|m| MeMember { id: m.id, status: m.status.into(), tenant_admin: m.tenant_admin }),
         instance_admin,
+        functions_available: state.policy.functions_available(),
         projects,
         user: MeUser { sub: caller.sub },
         tenant,
@@ -3600,6 +3641,33 @@ mod proxy_address_tests {
         }
         let blank = ProxyAddress::from_lookup(lookup(&[("CHELABASE_PROXY_HTTP_PORT", " ")]));
         assert_eq!(blank.unwrap().http_port, 4444);
+    }
+}
+
+#[cfg(test)]
+mod function_secrets_key_tests {
+    use super::*;
+    use chelabase_metadata::{MetadataConfig, MetadataError};
+
+    /// Edge functions m3: the orchestrator's metadata client carries its secrets key, so
+    /// function secrets seal and open (and a branch of a parent with secrets can be made).
+    /// Without the key, `put_secret` fails at once with a config error, before any query.
+    #[tokio::test]
+    async fn the_metadata_client_seals_function_secrets_with_the_orchestrator_key() {
+        let config = MetadataConfig { database_url: "postgres://u:p@127.0.0.1:1/none".into() };
+        let put = |client: MetadataClient| async move {
+            let branch = BranchId(Uuid::new_v4());
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client.put_secret(branch, Uuid::new_v4(), "API_KEY", "value"),
+            )
+            .await
+        };
+        let bare = MetadataClient::connect_lazy(&config).unwrap();
+        assert!(matches!(put(bare).await, Ok(Err(MetadataError::Config(_)))));
+        let keyed = with_function_secrets(MetadataClient::connect_lazy(&config).unwrap(), &SecretKey::generate());
+        // Sealed, then waiting on (or refused by) the database: anything but the config error.
+        assert!(!matches!(put(keyed).await, Ok(Err(MetadataError::Config(_)))));
     }
 }
 

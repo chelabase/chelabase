@@ -15,7 +15,7 @@ function meAs(platform_role: PlatformRole, roles: string[] = []): Me {
     name: "Bo",
     tenant_id: "t1",
     member: { id: "m-self", status: "active", tenant_admin: false },
-    instance_admin: false, tenant_admins: [],
+    instance_admin: false, functions_available: true, tenant_admins: [],
     projects: [{ project_id: "p1", platform_role, roles, databases: [] }],
     user: { sub: "u2" },
     tenant: {

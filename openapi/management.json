@@ -2015,6 +2015,2326 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/functions": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "List the database's functions with their state on the branch",
+        "operationId": "listFunctions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The database's functions by name; the state fields are null where the function has no deployment active on the branch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Function"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}": {
+      "put": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Create a function, or change its kind or its auth on the branch",
+        "description": "Creates the function when the database has none of this name (201), else changes what the body names (200). A name is a lowercase letter, then up to 62 of a-z, 0-9 and `-`; `public` is reserved (the keyless invoke prefix). Changing the kind needs Admin and is refused while a protected branch has the function active.",
+        "operationId": "putFunction",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutFunctionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The function, changed as asked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The function, created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden` (`required` names what's missing): Developer on the branch (Admin when it's protected), Admin to change the kind, a tenant admin to make a service or turn a function into one; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: `reason` `function_active_on_protected_branch` (a kind change), `not_deployed` (auth for a function with no deployment on the branch), or a concurrent create took the name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a bad or reserved name, a kind change for a function with deployments, or to a service for a function with schedules or triggers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Delete a function from the database",
+        "description": "Deletes the function with its deployments and every branch's state and secrets, and revokes its run-as keys. A function is the database's, so this needs Admin, and it's refused while a protected branch has the function active.",
+        "operationId": "deleteFunction",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id (any branch of the database)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict` with `reason` `function_active_on_protected_branch`: nothing was deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Enable, disable, roll back, or set the auth or run-as role on the branch",
+        "description": "Applies the named fields in this order: `active_deployment_id`, `enabled`, `auth`, `run_as_role`. The run-as role is checked first (as for a secret key: you must be able to use the role; BYPASSRLS needs Admin), before anything is written.",
+        "operationId": "updateFunction",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFunctionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The function on the branch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A container service's rollback: its rollover runs in the background (`rollout` pending) and the switch follows once the container is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Function"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict` with `reason` `not_deployed`: the function has no deployment on the branch; `backup_branch` or `branch_not_ready` for a run-as role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a deployment of another function; `role_refused`: the worker refused the run-as role; `exposes_data_api`: the role reaches an \"all rows\" role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable` or `unavailable`: the run-as role couldn't be checked; nothing was written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "List a function's deployments",
+        "operationId": "listFunctionDeployments",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The function's deployments, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FunctionDeployment"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Deploy a bundle, or a service's spec",
+        "description": "A function: stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service. A service: checks the `spec`'s URL (a tenant admin only). Then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.",
+        "operationId": "createFunctionDeployment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFunctionDeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionDeployment"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The deployment, with `rollout: pending`: a container service enabled on the branch rolls over to it in the background, switching once its container is healthy; the function's `rollout` reports the outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionDeployment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: a service's spec needs a tenant admin; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over 12 MiB or the manifest over 10 MiB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the manifest doesn't hash to `sha256`, no compatibility date, a bundle for a service or a spec for a function, or a refused URL or health path",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`unavailable`: the functions service refused the bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`functions_unavailable`: the functions service can't be reached (edge functions aren't running on this instance); `runner_unavailable`: a container spec, and the service runner isn't running; `unavailable`: the functions service couldn't store the bundle. Nothing was recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/logs": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "A container service's last 200 log lines on the branch",
+        "description": "Stdout and stderr of the container that runs the service's active deployment on the branch. Container services only; needs Developer (logs can hold what a service prints).",
+        "operationId": "getServiceLogs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The last 200 lines",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Developer; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the service doesn't exist, or it has no running container on the branch; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict` with `reason` `not_deployed`: no deployment on the branch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: not a container service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`functions_unavailable`: the functions service can't be reached; `runner_unavailable`: the service runner isn't running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "List a function's schedules on the branch",
+        "operationId": "listFunctionSchedules",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The schedules, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FunctionSchedule"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Add a schedule to a function on the branch",
+        "description": "At each due time the function's `scheduled(controller, env, ctx)` handler runs once, with `controller.cron` and `controller.scheduledTime`, while the function is enabled on the branch. A cron has 5 fields (minute granularity); ticks missed while the worker was down run once. A new branch inherits the schedules.",
+        "operationId": "createFunctionSchedule",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFunctionScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The schedule, enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionSchedule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a bad cron or time zone (`field` names it), an unknown field, or a schedule for a service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}": {
+      "delete": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Delete a function's schedule on the branch",
+        "operationId": "deleteFunctionSchedule",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "description": "Schedule id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the function or its schedule doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Change a function's schedule on the branch",
+        "description": "Changes what the body names. A new cron or time zone, or turning the schedule on, sets its next run from now.",
+        "operationId": "updateFunctionSchedule",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "description": "Schedule id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFunctionScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The schedule, changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionSchedule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the function or its schedule doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a bad cron or time zone (`field` names it), or an unknown field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "List the names of a function's secrets on the branch",
+        "operationId": "listFunctionSecrets",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The secrets' names, sorted; values never come back",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}": {
+      "put": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Set a function's secret on the branch",
+        "description": "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.",
+        "operationId": "putFunctionSecret",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "path",
+            "description": "Secret name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutFunctionSecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't `{\"value\": string}`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a bad name, a value over 64 KiB, or the function's secrets on the branch over 128 KiB together (as the JSON env they travel in)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Delete a function's secret on the branch",
+        "operationId": "deleteFunctionSecret",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "secret",
+            "in": "path",
+            "description": "Secret name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the function or the secret doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers": {
+      "get": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "List a function's triggers on the branch",
+        "operationId": "listFunctionTriggers",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The triggers, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FunctionTrigger"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Add a trigger to a function on the branch",
+        "description": "A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled; a pending event is never dropped, and dead events past 10,000 per database or 7 days are removed and counted (`dropped_count`). The database's compute stays awake while it has an installed table trigger. A `storage` trigger starts `installed`. A new branch inherits the triggers.",
+        "operationId": "createFunctionTrigger",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFunctionTriggerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The trigger, enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionTrigger"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the function doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: events of the other source or mixed, a repeat, no events, columns that don't go with the source, an unknown field, a table trigger on a reserved schema (`chelabase*`, `pg_*`, `storage`, `information_schema`), or any trigger on a service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}": {
+      "delete": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Delete a function's trigger on the branch",
+        "description": "No event is delivered for it from now on; the worker drops its database trigger and queued events.",
+        "operationId": "deleteFunctionTrigger",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "trigger_id",
+            "in": "path",
+            "description": "Trigger id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the function or its trigger doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "functions"
+        ],
+        "summary": "Turn a function's trigger on the branch on or off",
+        "description": "Turning a table trigger off uninstalls it from the database and drops its queued events; turning it on installs it again (`pending_install`).",
+        "operationId": "updateFunctionTrigger",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Function name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "trigger_id",
+            "in": "path",
+            "description": "Trigger id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFunctionTriggerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The trigger, changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionTrigger"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`; `forbidden`: your role on the project is below `developer`, or `admin` on a protected branch (for a merge, the branch merged into; `required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch, the function or its trigger doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: `enabled` is missing, or an unknown field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/guard-exemptions": {
       "get": {
         "tags": [
@@ -2709,7 +5029,7 @@
             }
           },
           "409": {
-            "description": "`public_key_not_revocable`: a public key can only be rotated",
+            "description": "`public_key_not_revocable`: a public key can only be rotated; `conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2827,6 +5147,16 @@
           },
           "404": {
             "description": "`not_found`: the database (or another tenant's), the branch or the key doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2964,7 +5294,7 @@
             }
           },
           "409": {
-            "description": "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready",
+            "description": "`public_key_exists`: the branch already has a public key; `branch_not_ready`: a secret key's role can't be checked while the branch isn't ready; `conflict` with `reason` `managed_key`: the key is a function's run-as key (change the function's run-as role instead)",
             "content": {
               "application/json": {
                 "schema": {
@@ -22248,6 +24578,132 @@
           }
         }
       },
+      "CreateFunctionDeploymentRequest": {
+        "type": "object",
+        "description": "A deployment: a function's bundle manifest (the runtime's format) and its hash, or a\nservice's `spec`.",
+        "properties": {
+          "activate": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Make it the active deployment on the branch (default true). The function stays enabled\nor disabled as it was; a new one starts disabled."
+          },
+          "compatibility_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "description": "Defaults to the manifest's `compatibilityDate`."
+          },
+          "manifest": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A function's bundle manifest, as the runtime loads it. Stored byte for byte as sent."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 of the manifest's bytes as sent, lowercase hex."
+          },
+          "spec": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceSpec",
+                "description": "A service's target (needs a tenant admin)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateFunctionScheduleRequest": {
+        "type": "object",
+        "required": [
+          "cron"
+        ],
+        "properties": {
+          "cron": {
+            "type": "string",
+            "description": "5 fields (minute granularity), e.g. `*/15 * * * *`."
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA time zone, e.g. `Europe/London`; defaults to `UTC`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CreateFunctionTriggerRequest": {
+        "type": "object",
+        "required": [
+          "source",
+          "pg_database",
+          "events"
+        ],
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`storage` only; every bucket when absent."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`table`: `insert`, `update`, `delete`. `storage`: `object.created`, `object.updated`,\n`object.deleted`, `object.moved`. Each once, never mixed."
+          },
+          "pg_database": {
+            "type": "string",
+            "description": "The branch's Postgres database the table (or, for storage, the bucket's project) is in."
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`storage` only; every key when absent."
+          },
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`table` only."
+          },
+          "source": {
+            "$ref": "#/components/schemas/FunctionTriggerSource"
+          },
+          "table": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`table` only."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateInviteRequest": {
         "type": "object",
         "required": [
@@ -22743,6 +25199,13 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "managed_by_function": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The function whose run-as key this is (edge functions m3): it can't be rotated,\nrevoked or narrowed here. Absent for every other key."
           },
           "name": {
             "type": "string"
@@ -23323,7 +25786,9 @@
           "member_offboarded",
           "invalid_successor",
           "exposure_unconfirmed",
-          "identity_unavailable"
+          "identity_unavailable",
+          "runner_unavailable",
+          "functions_unavailable"
         ]
       },
       "ErrorEnvelope": {
@@ -23432,6 +25897,195 @@
           }
         }
       },
+      "Function": {
+        "type": "object",
+        "description": "A function of the database, with its state on this branch (null fields when it has no\ndeployment active here).",
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "created_at",
+          "deployment_id",
+          "enabled",
+          "auth",
+          "run_as_role",
+          "run_as_active",
+          "last_error",
+          "updated_at",
+          "health",
+          "rollout"
+        ],
+        "properties": {
+          "auth": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FunctionAuth"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "deployment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The deployment active on the branch."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "health": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceHealth",
+                "description": "A service's health on the branch (checked every 15 s); null before the first check, and\nfor a function."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FunctionKind"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last invocation error on the branch."
+          },
+          "name": {
+            "type": "string"
+          },
+          "rollout": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceRollout",
+                "description": "m11: a container service's rollover on the branch, pending or failed (the previous\ndeployment serves meanwhile); null when none is pending and the last one succeeded."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "run_as_active": {
+            "type": "boolean",
+            "description": "Whether a live function-managed key backs `run_as_role` on the branch."
+          },
+          "run_as_role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The role the function runs as on the branch: its live run-as key's role (which follows\na rename), else the role set; null for none."
+          },
+          "signing_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A service's signing secret: only in the answer that made the service or rotated it."
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "FunctionAuth": {
+        "type": "string",
+        "description": "Who may call the function: `key` (any data key), `app_user` (a signed-in app user, or a\nsecret key), `public` (anyone, on `/functions/v1/public/{branch_id}/{name}` only).",
+        "enum": [
+          "key",
+          "app_user",
+          "public"
+        ]
+      },
+      "FunctionDeployment": {
+        "type": "object",
+        "description": "An immutable deployment of a function.",
+        "required": [
+          "id",
+          "bundle_sha256",
+          "bundle_size",
+          "compatibility_date",
+          "created_by",
+          "created_at",
+          "note",
+          "spec"
+        ],
+        "properties": {
+          "bundle_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SHA-256 of the bundle's manifest, lowercase hex."
+          },
+          "bundle_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "compatibility_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by": {
+            "type": "string",
+            "description": "The member who deployed it."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rollout": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceRolloutState",
+                "description": "m11: `pending` only in a deploy's 202 answer: the service's rollover to it runs in the\nbackground (see the function's `rollout`)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "spec": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "A service's spec (`{backend: \"external\", url, health_path}`); null for a function."
+          }
+        }
+      },
       "FunctionDesc": {
         "type": "object",
         "required": [
@@ -23449,6 +26103,14 @@
             "$ref": "#/components/schemas/ReturnDesc"
           }
         }
+      },
+      "FunctionKind": {
+        "type": "string",
+        "description": "`function` or `service` (services come with a later milestone).",
+        "enum": [
+          "function",
+          "service"
+        ]
       },
       "FunctionRef": {
         "type": "object",
@@ -23468,6 +26130,153 @@
           }
         },
         "additionalProperties": false
+      },
+      "FunctionSchedule": {
+        "type": "object",
+        "description": "A function's schedule on a branch.",
+        "required": [
+          "id",
+          "cron",
+          "timezone",
+          "enabled",
+          "next_run_at"
+        ],
+        "properties": {
+          "cron": {
+            "type": "string",
+            "description": "5 fields: minute, hour, day of month, month, day of week."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "A disabled schedule never runs."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "next_run_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When it runs next."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA time zone the cron is read in."
+          }
+        }
+      },
+      "FunctionTrigger": {
+        "type": "object",
+        "description": "A function's trigger on a branch.",
+        "required": [
+          "id",
+          "source",
+          "enabled",
+          "state",
+          "pg_database",
+          "schema",
+          "table",
+          "bucket",
+          "prefix",
+          "events",
+          "last_error",
+          "dead_count",
+          "dropped_count",
+          "last_delivery_error",
+          "last_delivered_at"
+        ],
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dead_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Events that went dead after 10 failed deliveries."
+          },
+          "dropped_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Events the outbox bound removed undelivered: dead events past 10,000 per database or 7\ndays, and the queued events of a trigger turned off. A pending event is never removed."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "A disabled table trigger is uninstalled (its queued events are dropped); turning it on\ninstalls it again."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_delivered_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_delivery_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last failed delivery failed; cleared by a delivery."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the install failed."
+          },
+          "pg_database": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/FunctionTriggerSource"
+          },
+          "state": {
+            "type": "string",
+            "description": "`pending_install` (the worker installs it), `installed` (events are delivered) or\n`failed` (`last_error` says why)."
+          },
+          "table": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "FunctionTriggerSource": {
+        "type": "string",
+        "description": "Where a trigger's events come from.",
+        "enum": [
+          "table",
+          "storage"
+        ]
       },
       "Grant": {
         "type": "object",
@@ -24008,6 +26817,7 @@
           "tenant_id",
           "member",
           "instance_admin",
+          "functions_available",
           "projects",
           "user",
           "tenant",
@@ -24020,6 +26830,10 @@
               "null"
             ],
             "description": "The member's email (null when unknown), else the token's."
+          },
+          "functions_available": {
+            "type": "boolean",
+            "description": "Whether members may manage and run edge functions on this instance (false in platform\nmode, where every functions route answers 403 `not_available_in_platform_mode`)."
           },
           "instance_admin": {
             "type": "boolean",
@@ -26524,6 +29338,48 @@
         },
         "additionalProperties": false
       },
+      "PutFunctionRequest": {
+        "type": "object",
+        "properties": {
+          "auth": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FunctionAuth",
+                "description": "Sets how the function is called on this branch (it must have a deployment here)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FunctionKind",
+                "description": "Defaults to `function` for a new one. Changing an existing function's kind needs Admin,\nand only a function without deployments may change it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "PutFunctionSecretRequest": {
+        "type": "object",
+        "description": "A secret's value; it never comes back.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "At most 64 KiB."
+          }
+        },
+        "additionalProperties": false
+      },
       "PutGrantOverrideRequest": {
         "type": "object",
         "required": [
@@ -27523,6 +30379,132 @@
           "update"
         ]
       },
+      "ServiceHealth": {
+        "type": "string",
+        "description": "What a service's last health check saw.",
+        "enum": [
+          "healthy",
+          "unhealthy"
+        ]
+      },
+      "ServiceResources": {
+        "type": "object",
+        "description": "A container's limits (never above the platform's caps).",
+        "properties": {
+          "cpus": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "At least 0.01."
+          },
+          "memory_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "At least 16.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServiceRollout": {
+        "type": "object",
+        "description": "m11: a container service's rollover on the branch.",
+        "required": [
+          "deployment_id",
+          "state",
+          "error",
+          "started_at"
+        ],
+        "properties": {
+          "deployment_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The deployment being rolled over to."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed (the previous deployment still serves)."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ServiceRolloutState"
+          }
+        }
+      },
+      "ServiceRolloutState": {
+        "type": "string",
+        "description": "`pending` while the new container is started and checked; `failed` when it never passed.",
+        "enum": [
+          "pending",
+          "failed"
+        ]
+      },
+      "ServiceSpec": {
+        "type": "object",
+        "description": "A service's target. `external`: requests to `/services/v1/{name}/{rest}` go to `url` with\nthe rest under its path; `health_path` (under it too) is polled every 15 s. `container` (m11):\nthe platform runs `image` (a tag is resolved to its registry digest when deployed) and\nrequests go to its `port`; a new deployment rolls over once the new container is healthy.",
+        "required": [
+          "backend"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "`external` or `container`."
+          },
+          "health_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`external`: starts with `/`, at most 256 printable ASCII characters, no `#`.\n`container` (default `/`): starts with `/`, at most 256 of `A-Z a-z 0-9 / . _ ~ -`."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`container`: `name:tag` or `name@sha256:<64 hex>` from a public registry."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`container`: the port the image listens on (1-65535); it gets it as `PORT`.",
+            "minimum": 0
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceResources",
+                "description": "`container`: limits below the platform's caps (512 MiB and 1 CPU by default)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`external`: `https` (or `http` where the operator allows it), no credentials, query or\nfragment; a public address, or an allowlisted host outside the platform."
+          }
+        },
+        "additionalProperties": false
+      },
       "SkipReason": {
         "type": "string",
         "enum": [
@@ -28450,6 +31432,87 @@
             ],
             "format": "int64",
             "description": "Connections the storage service may hold to each branch, apart from `max_connections`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateFunctionRequest": {
+        "type": "object",
+        "properties": {
+          "active_deployment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Makes one of the function's deployments the active one (a rollback, or a deploy made\nwith `activate: false`)."
+          },
+          "auth": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FunctionAuth"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Turns the function on or off on the branch."
+          },
+          "rotate_signing_secret": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "A service only: `true` makes a new signing secret (in this answer only; the old one\nstops working). Needs a tenant admin."
+          },
+          "run_as_role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The role the function runs as: a function-managed secret key for it is made (and the\nprevious one revoked); null clears both. A role with BYPASSRLS needs Admin."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateFunctionScheduleRequest": {
+        "type": "object",
+        "properties": {
+          "cron": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateFunctionTriggerRequest": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false

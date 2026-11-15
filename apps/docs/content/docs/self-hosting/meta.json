@@ -1,5 +1,12 @@
 {
   "title": "Self-hosting",
   "root": true,
-  "pages": ["install", "hosts", "storage-settings", "amazon-s3", "example"]
+  "pages": [
+    "install",
+    "hosts",
+    "storage-settings",
+    "amazon-s3",
+    "functions",
+    "example"
+  ]
 }

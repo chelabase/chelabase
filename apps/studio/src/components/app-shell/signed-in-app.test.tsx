@@ -6,7 +6,7 @@ import { renderWithRouter } from "@/test/render-router";
 import { SignedInApp } from "./signed-in-app";
 
 const me = (status: "active" | "pending", tenant_admin: boolean): Me => ({
-  sub: "u1", email: "a@example.test", name: "A", tenant_id: "t1", instance_admin: false, tenant_admins: [],
+  sub: "u1", email: "a@example.test", name: "A", tenant_id: "t1", instance_admin: false, functions_available: true, tenant_admins: [],
   member: { id: "m1", status, tenant_admin }, projects: [], user: { sub: "u1" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [] },
 });

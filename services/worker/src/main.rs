@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let metadata_config = worker::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
     // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
-    let webhooks = chelabase_http::outbound::Outbound::from_lookup(|name| std::env::var(name).ok())
+    let webhooks = chelabase_http::outbound::Outbound::from_lookup(chelabase_http::outbound::WEBHOOKS_ENV, |name| std::env::var(name).ok())
         .map_err(|e| anyhow::anyhow!(e))?;
     for entry in webhooks.allow_hosts_with_port() {
         warn!(entry, "CHELABASE_WEBHOOKS_ALLOW_HOSTS: an entry with a port never matches; list the host alone");
@@ -84,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         warn!("CHELABASE_STORAGE_BACKEND is unset: the storage sweep doesn't run");
     }
+    // Edge functions m7: scheduled runs and the bundle sweep, each only when configured.
+    let functions = worker::config::functions_settings(|name| std::env::var(name).ok())?;
     let worker = Arc::new(built);
     // Only with a store: without one, no consumer would take the jobs.
     if worker.blob_store.is_some() {
@@ -169,6 +171,38 @@ async fn main() -> anyhow::Result<()> {
         webhooks.clone(),
     ));
     tokio::spawn(serve_storage_webhook_test(worker.clone(), nats.clone(), webhooks));
+
+    match &functions.invoke {
+        Some((url, token)) => {
+            let invoker: Arc<dyn worker::fn_schedules::Invoker> =
+                Arc::new(worker::fn_schedules::HttpInvoker::new(url, token.clone())?);
+            // m7: scheduled runs. (Database events aren't invoked from here: the reconcile
+            // sweep installs their triggers, `fn_triggers`, and the functions service
+            // dispatches the outbox as its own login, m13b.)
+            tokio::spawn(worker::fn_schedules::schedule_loop(
+                worker.metadata.inner().clone(),
+                invoker.clone(),
+            ));
+            // m14: storage events, one consumer per enabled storage trigger.
+            tokio::spawn(worker::fn_storage_triggers::run(
+                worker.metadata.inner().clone(),
+                js.clone(),
+                invoker,
+            ));
+        }
+        None => warn!("CHELABASE_FUNCTIONS_INTERNAL_URL or CHELABASE_WORKER_FUNCTIONS_TOKEN is unset: function schedules and storage triggers don't run"),
+    }
+    match &functions.bundles {
+        Some(config) => {
+            let store: Arc<dyn chelabase_storage::ObjectStore> =
+                Arc::new(chelabase_storage::S3Store::new(config).await);
+            tokio::spawn(worker::fn_bundle_sweep::bundle_sweep_loop(
+                store,
+                worker.metadata.inner().clone(),
+            ));
+        }
+        None => warn!("CHELABASE_FUNCTIONS_S3_BUCKET is unset: the function bundle sweep doesn't run"),
+    }
 
     if worker.blob_store.is_some() {
         tokio::spawn(storage_sweep_loop(worker.clone()));

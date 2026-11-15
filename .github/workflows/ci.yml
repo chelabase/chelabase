@@ -1,5 +1,5 @@
 # The offline checks: `just check-scripts`, `just check-rust` and `just check-web`, the recipes a
-# contributor's `just check` runs. A pull request or a push to main runs the Rust and web checks
+# contributor's `just check` runs, and `just functions-runtime-test` when the runtime changes. A pull request or a push to main runs the Rust and web checks
 # only for the packages its changes affect (scripts/ci-affected.sh); the nightly run and a manual
 # one run everything. The `ci` job is the required check.
 name: ci
@@ -39,6 +39,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
       web: ${{ steps.detect.outputs.web }}
+      runtime: ${{ steps.detect.outputs.runtime }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -74,8 +75,15 @@ jobs:
             echo "changes since $base:"
             git diff --name-only --no-renames "$base...HEAD"
             scripts/ci-affected.sh "$base" | tee -a "$GITHUB_OUTPUT"
+            # The functions runtime's tests: its sources, its image, or this workflow changed.
+            if git diff --name-only --no-renames "$base...HEAD" |
+              grep -qE '^(infra/functions-runtime/|infra/images/functions-runtime\.Dockerfile$|\.github/workflows/ci\.yml$)'; then
+              echo runtime=true | tee -a "$GITHUB_OUTPUT"
+            else
+              echo runtime=false | tee -a "$GITHUB_OUTPUT"
+            fi
           else
-            printf 'rust=full\nweb=full\n' | tee -a "$GITHUB_OUTPUT"
+            printf 'rust=full\nweb=full\nruntime=true\n' | tee -a "$GITHUB_OUTPUT"
           fi
 
   scripts:
@@ -212,10 +220,30 @@ jobs:
             just check-web $WEB
           fi
 
+  # The functions runtime (workerd and the supervisor): its node tests against the image baked
+  # here, in throwaway containers (Docker only, no stack).
+  runtime:
+    name: functions-runtime-test
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # proto reads .prototools: node and just are the ones this job uses.
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+
+      - run: just functions-runtime-test
+
   # The required check: fails unless the detector ran and every check it chose passed.
   ci:
     name: ci
-    needs: [changes, scripts, rust, web]
+    needs: [changes, scripts, rust, web, runtime]
     if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -226,9 +254,10 @@ jobs:
           SCRIPTS: ${{ needs.scripts.result }}
           RUST: ${{ needs.rust.result }}
           WEB: ${{ needs.web.result }}
+          RUNTIME: ${{ needs.runtime.result }}
         run: |
-          echo "changes=$CHANGES check-scripts=$SCRIPTS check-rust=$RUST check-web=$WEB"
+          echo "changes=$CHANGES check-scripts=$SCRIPTS check-rust=$RUST check-web=$WEB functions-runtime-test=$RUNTIME"
           [[ "$CHANGES" == success ]] || exit 1
-          for r in "$SCRIPTS" "$RUST" "$WEB"; do
+          for r in "$SCRIPTS" "$RUST" "$WEB" "$RUNTIME"; do
             [[ "$r" == success || "$r" == skipped ]] || exit 1
           done

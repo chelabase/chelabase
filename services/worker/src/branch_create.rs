@@ -175,6 +175,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
                 self.finish_branch(branch_id, &rec, &parent_timeline, lsn, started)
                     .await?;
+                // Edge functions m8: the child's run-as keys and function triggers, once ready
+                // (a branch abandoned meanwhile isn't ready and is skipped).
+                if branch.kind == BranchKind::Normal {
+                    self.fn_after_create(branch_id).await;
+                }
                 // The users that changed since the branch point (best effort; the periodic
                 // pass catches up otherwise).
                 if let Some(project) = users

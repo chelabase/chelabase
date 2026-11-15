@@ -51,7 +51,7 @@ ext AS (
 ns AS (
   SELECT n.oid, n.nspname, n.nspowner, n.nspacl
   FROM pg_catalog.pg_namespace n
-  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard', 'storage')
+  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'chelabase', 'chelabase_merge', 'chelabase_guard', 'storage', 'chelabase_functions')
     AND n.nspname NOT LIKE 'pg\_toast%'
     AND n.nspname NOT LIKE 'pg\_temp\_%'
     AND NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass AND e.objid = n.oid)

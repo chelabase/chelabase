@@ -11,7 +11,7 @@ import {
   LayoutDashboard,
   Maximize2,
   Radio,
-  SquareTerminal,
+  SquareCode,
   Waypoints,
   X,
   type LucideIcon,
@@ -397,11 +397,11 @@ const PIECES: Piece[] = [
     to: "using/storage",
   },
   {
-    id: "cli",
-    icon: SquareTerminal,
-    title: "CLI",
-    body: "A command-line tool for setup and management from the terminal: generate types, run migrations and more. Not available yet.",
-    soon: true,
+    id: "functions",
+    icon: SquareCode,
+    title: "Edge functions",
+    body: "Your own Workers-style TypeScript, with WebAssembly, run next to your database per branch and live within seconds of a save. Called over HTTP, on a schedule, or by table and storage events.",
+    to: "using/functions",
   },
 ];
 
@@ -794,6 +794,7 @@ const ROWS: Array<{ label: string; cells: Cells }> = [
   { label: "Live rows in the editor", cells: ["yes", "no", "yes", "no", "no", "no"] },
   { label: "Realtime for your app", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
   { label: "Object storage", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "Serverless functions", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
 ];
 
 function CompareCell({ cell }: { cell: Cell }) {
@@ -871,7 +872,9 @@ function Compare() {
             compares branches but doesn't merge them. Supabase merges a branch into production through a schema diff,
             and self-hosted Supabase runs one project without branching or point-in-time restore. PlanetScale merges
             schema through deploy requests on MySQL (Vitess) only. Firebase's Postgres is SQL Connect (Cloud SQL for
-            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't.
+            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't. Supabase's
+            functions are Deno Edge Functions, self-hosted Supabase included; Firebase's are Cloud Functions, which don't
+            run at the edge; Neon's run Node.js on a branch. Chelabase runs functions in self-hosted mode only.
           </p>
         </div>
       </div>

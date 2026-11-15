@@ -44,6 +44,9 @@ import type {
   CreateBranchRequest,
   CreateDatabaseAccepted,
   CreateDatabaseRequest,
+  CreateFunctionDeploymentRequest,
+  CreateFunctionScheduleRequest,
+  CreateFunctionTriggerRequest,
   CreateInviteRequest,
   CreateKeyRequest,
   CreateMergeRequest,
@@ -67,6 +70,10 @@ import type {
   DisableDataApiParams,
   ErrorEnvelope,
   FinishRequest,
+  Function,
+  FunctionDeployment,
+  FunctionSchedule,
+  FunctionTrigger,
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
@@ -102,6 +109,8 @@ import type {
   ProjectInfo,
   ProjectTeamGrantView,
   PutAppUsersRequest,
+  PutFunctionRequest,
+  PutFunctionSecretRequest,
   PutGrantOverrideRequest,
   PutGrantRequest,
   PutPersonalLoginRequest,
@@ -153,6 +162,9 @@ import type {
   UpdateAppUserRequest,
   UpdateBranchRequest,
   UpdateDatabaseRequest,
+  UpdateFunctionRequest,
+  UpdateFunctionScheduleRequest,
+  UpdateFunctionTriggerRequest,
   UpdateInstanceSettingsRequest,
   UpdateKeyRequest,
   UpdateMemberRequest,
@@ -1712,6 +1724,1779 @@ export function useListBranchDatabases<TData = Awaited<ReturnType<typeof listBra
 
 
 
+
+export const getListFunctionsUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions`
+}
+
+/**
+ * @summary List the database's functions with their state on the branch
+ */
+export const listFunctions = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<Function[]> => {
+
+  return customFetch<Function[]>(getListFunctionsUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionsQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions`
+    ] as const;
+    }
+
+
+export const getListFunctionsQueryOptions = <TData = Awaited<ReturnType<typeof listFunctions>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionsQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctions>>> = ({ signal }) => listFunctions(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionsQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctions>>>
+export type ListFunctionsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctions<TData = Awaited<ReturnType<typeof listFunctions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctions>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctions<TData = Awaited<ReturnType<typeof listFunctions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctions>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctions>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctions<TData = Awaited<ReturnType<typeof listFunctions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List the database's functions with their state on the branch
+ */
+
+export function useListFunctions<TData = Awaited<ReturnType<typeof listFunctions>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctions>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionsQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getPutFunctionUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Creates the function when the database has none of this name (201), else changes what the body names (200). A name is a lowercase letter, then up to 62 of a-z, 0-9 and `-`; `public` is reserved (the keyless invoke prefix). Changing the kind needs Admin and is refused while a protected branch has the function active.
+ * @summary Create a function, or change its kind or its auth on the branch
+ */
+export const putFunction = async (id: string,
+    branchId: string,
+    name: string,
+    putFunctionRequest: PutFunctionRequest, options?: Parameters<typeof customFetch>[1]): Promise<Function> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Function>(getPutFunctionUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(putFunctionRequest)
+  }
+);}
+
+
+
+
+
+export const getPutFunctionMutationKey = () => ['putFunction'] as const;
+
+export const getPutFunctionMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putFunction>>, TError,PutFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putFunction>>, TError,PutFunctionMutationVariables, TContext> => {
+
+const mutationKey = getPutFunctionMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putFunction>>, PutFunctionMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  putFunction(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutFunctionMutationResult = NonNullable<Awaited<ReturnType<typeof putFunction>>>
+    export type PutFunctionMutationBody = PutFunctionRequest
+    export type PutFunctionMutationError = ErrorType<ErrorEnvelope>
+    export type PutFunctionMutationVariables = {id: string;branchId: string;name: string;data: PutFunctionRequest}
+
+    /**
+ * @summary Create a function, or change its kind or its auth on the branch
+ */
+export const usePutFunction = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putFunction>>, TError,PutFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putFunction>>,
+        TError,
+        PutFunctionMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutFunctionMutationOptions(options), queryClient);
+    }
+
+export const getDeleteFunctionUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Deletes the function with its deployments and every branch's state and secrets, and revokes its run-as keys. A function is the database's, so this needs Admin, and it's refused while a protected branch has the function active.
+ * @summary Delete a function from the database
+ */
+export const deleteFunction = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteFunctionUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteFunctionMutationKey = () => ['deleteFunction'] as const;
+
+export const getDeleteFunctionMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunction>>, TError,DeleteFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteFunction>>, TError,DeleteFunctionMutationVariables, TContext> => {
+
+const mutationKey = getDeleteFunctionMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteFunction>>, DeleteFunctionMutationVariables> = (props) => {
+          const {id,branchId,name} = props ?? {};
+
+          return  deleteFunction(id,branchId,name,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteFunctionMutationResult = NonNullable<Awaited<ReturnType<typeof deleteFunction>>>
+
+    export type DeleteFunctionMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteFunctionMutationVariables = {id: string;branchId: string;name: string}
+
+    /**
+ * @summary Delete a function from the database
+ */
+export const useDeleteFunction = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunction>>, TError,DeleteFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteFunction>>,
+        TError,
+        DeleteFunctionMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteFunctionMutationOptions(options), queryClient);
+    }
+
+export const getUpdateFunctionUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}`
+}
+
+/**
+ * Applies the named fields in this order: `active_deployment_id`, `enabled`, `auth`, `run_as_role`. The run-as role is checked first (as for a secret key: you must be able to use the role; BYPASSRLS needs Admin), before anything is written.
+ * @summary Enable, disable, roll back, or set the auth or run-as role on the branch
+ */
+export const updateFunction = async (id: string,
+    branchId: string,
+    name: string,
+    updateFunctionRequest: UpdateFunctionRequest, options?: Parameters<typeof customFetch>[1]): Promise<Function> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Function>(getUpdateFunctionUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFunctionRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateFunctionMutationKey = () => ['updateFunction'] as const;
+
+export const getUpdateFunctionMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunction>>, TError,UpdateFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateFunction>>, TError,UpdateFunctionMutationVariables, TContext> => {
+
+const mutationKey = getUpdateFunctionMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateFunction>>, UpdateFunctionMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  updateFunction(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateFunctionMutationResult = NonNullable<Awaited<ReturnType<typeof updateFunction>>>
+    export type UpdateFunctionMutationBody = UpdateFunctionRequest
+    export type UpdateFunctionMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateFunctionMutationVariables = {id: string;branchId: string;name: string;data: UpdateFunctionRequest}
+
+    /**
+ * @summary Enable, disable, roll back, or set the auth or run-as role on the branch
+ */
+export const useUpdateFunction = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunction>>, TError,UpdateFunctionMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateFunction>>,
+        TError,
+        UpdateFunctionMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateFunctionMutationOptions(options), queryClient);
+    }
+
+export const getListFunctionDeploymentsUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/deployments`
+}
+
+/**
+ * @summary List a function's deployments
+ */
+export const listFunctionDeployments = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<FunctionDeployment[]> => {
+
+  return customFetch<FunctionDeployment[]>(getListFunctionDeploymentsUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionDeploymentsQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/deployments`
+    ] as const;
+    }
+
+
+export const getListFunctionDeploymentsQueryOptions = <TData = Awaited<ReturnType<typeof listFunctionDeployments>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionDeploymentsQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctionDeployments>>> = ({ signal }) => listFunctionDeployments(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionDeploymentsQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctionDeployments>>>
+export type ListFunctionDeploymentsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctionDeployments<TData = Awaited<ReturnType<typeof listFunctionDeployments>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionDeployments>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionDeployments>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionDeployments<TData = Awaited<ReturnType<typeof listFunctionDeployments>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionDeployments>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionDeployments>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionDeployments<TData = Awaited<ReturnType<typeof listFunctionDeployments>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a function's deployments
+ */
+
+export function useListFunctionDeployments<TData = Awaited<ReturnType<typeof listFunctionDeployments>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionDeployments>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionDeploymentsQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateFunctionDeploymentUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/deployments`
+}
+
+/**
+ * A function: stores the manifest (byte for byte as sent, at most 10 MiB; the body at most 12 MiB) with the functions service. A service: checks the `spec`'s URL (a tenant admin only). Then records the deployment and, unless `activate` is false, makes it the active one on the branch. The function's enabled state doesn't change.
+ * @summary Deploy a bundle, or a service's spec
+ */
+export const createFunctionDeployment = async (id: string,
+    branchId: string,
+    name: string,
+    createFunctionDeploymentRequest: CreateFunctionDeploymentRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionDeployment> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionDeployment>(getCreateFunctionDeploymentUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createFunctionDeploymentRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateFunctionDeploymentMutationKey = () => ['createFunctionDeployment'] as const;
+
+export const getCreateFunctionDeploymentMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionDeployment>>, TError,CreateFunctionDeploymentMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createFunctionDeployment>>, TError,CreateFunctionDeploymentMutationVariables, TContext> => {
+
+const mutationKey = getCreateFunctionDeploymentMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createFunctionDeployment>>, CreateFunctionDeploymentMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  createFunctionDeployment(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateFunctionDeploymentMutationResult = NonNullable<Awaited<ReturnType<typeof createFunctionDeployment>>>
+    export type CreateFunctionDeploymentMutationBody = CreateFunctionDeploymentRequest
+    export type CreateFunctionDeploymentMutationError = ErrorType<ErrorEnvelope>
+    export type CreateFunctionDeploymentMutationVariables = {id: string;branchId: string;name: string;data: CreateFunctionDeploymentRequest}
+
+    /**
+ * @summary Deploy a bundle, or a service's spec
+ */
+export const useCreateFunctionDeployment = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionDeployment>>, TError,CreateFunctionDeploymentMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createFunctionDeployment>>,
+        TError,
+        CreateFunctionDeploymentMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateFunctionDeploymentMutationOptions(options), queryClient);
+    }
+
+export const getGetServiceLogsUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/logs`
+}
+
+/**
+ * Stdout and stderr of the container that runs the service's active deployment on the branch. Container services only; needs Developer (logs can hold what a service prints).
+ * @summary A container service's last 200 log lines on the branch
+ */
+export const getServiceLogs = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<string> => {
+
+  return customFetch<string>(getGetServiceLogsUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetServiceLogsQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/logs`
+    ] as const;
+    }
+
+
+export const getGetServiceLogsQueryOptions = <TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetServiceLogsQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getServiceLogs>>> = ({ signal }) => getServiceLogs(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetServiceLogsQueryResult = NonNullable<Awaited<ReturnType<typeof getServiceLogs>>>
+export type GetServiceLogsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getServiceLogs>>,
+          TError,
+          Awaited<ReturnType<typeof getServiceLogs>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getServiceLogs>>,
+          TError,
+          Awaited<ReturnType<typeof getServiceLogs>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary A container service's last 200 log lines on the branch
+ */
+
+export function useGetServiceLogs<TData = Awaited<ReturnType<typeof getServiceLogs>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getServiceLogs>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetServiceLogsQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getListFunctionSchedulesUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules`
+}
+
+/**
+ * @summary List a function's schedules on the branch
+ */
+export const listFunctionSchedules = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule[]> => {
+
+  return customFetch<FunctionSchedule[]>(getListFunctionSchedulesUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionSchedulesQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/schedules`
+    ] as const;
+    }
+
+
+export const getListFunctionSchedulesQueryOptions = <TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionSchedulesQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctionSchedules>>> = ({ signal }) => listFunctionSchedules(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionSchedulesQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctionSchedules>>>
+export type ListFunctionSchedulesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSchedules>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSchedules>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSchedules>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSchedules>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a function's schedules on the branch
+ */
+
+export function useListFunctionSchedules<TData = Awaited<ReturnType<typeof listFunctionSchedules>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSchedules>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionSchedulesQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules`
+}
+
+/**
+ * At each due time the function's `scheduled(controller, env, ctx)` handler runs once, with `controller.cron` and `controller.scheduledTime`, while the function is enabled on the branch. A cron has 5 fields (minute granularity); ticks missed while the worker was down run once. A new branch inherits the schedules.
+ * @summary Add a schedule to a function on the branch
+ */
+export const createFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    createFunctionScheduleRequest: CreateFunctionScheduleRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionSchedule>(getCreateFunctionScheduleUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createFunctionScheduleRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateFunctionScheduleMutationKey = () => ['createFunctionSchedule'] as const;
+
+export const getCreateFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getCreateFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createFunctionSchedule>>, CreateFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  createFunctionSchedule(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof createFunctionSchedule>>>
+    export type CreateFunctionScheduleMutationBody = CreateFunctionScheduleRequest
+    export type CreateFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type CreateFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;data: CreateFunctionScheduleRequest}
+
+    /**
+ * @summary Add a schedule to a function on the branch
+ */
+export const useCreateFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionSchedule>>, TError,CreateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createFunctionSchedule>>,
+        TError,
+        CreateFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateFunctionScheduleMutationOptions(options), queryClient);
+    }
+
+export const getDeleteFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules/${encodeURIComponent(String(scheduleId))}`
+}
+
+/**
+ * @summary Delete a function's schedule on the branch
+ */
+export const deleteFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteFunctionScheduleUrl(id,branchId,name,scheduleId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteFunctionScheduleMutationKey = () => ['deleteFunctionSchedule'] as const;
+
+export const getDeleteFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getDeleteFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteFunctionSchedule>>, DeleteFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,scheduleId} = props ?? {};
+
+          return  deleteFunctionSchedule(id,branchId,name,scheduleId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof deleteFunctionSchedule>>>
+
+    export type DeleteFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;scheduleId: string}
+
+    /**
+ * @summary Delete a function's schedule on the branch
+ */
+export const useDeleteFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSchedule>>, TError,DeleteFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteFunctionSchedule>>,
+        TError,
+        DeleteFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteFunctionScheduleMutationOptions(options), queryClient);
+    }
+
+export const getUpdateFunctionScheduleUrl = (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/schedules/${encodeURIComponent(String(scheduleId))}`
+}
+
+/**
+ * Changes what the body names. A new cron or time zone, or turning the schedule on, sets its next run from now.
+ * @summary Change a function's schedule on the branch
+ */
+export const updateFunctionSchedule = async (id: string,
+    branchId: string,
+    name: string,
+    scheduleId: string,
+    updateFunctionScheduleRequest: UpdateFunctionScheduleRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionSchedule> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionSchedule>(getUpdateFunctionScheduleUrl(id,branchId,name,scheduleId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFunctionScheduleRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateFunctionScheduleMutationKey = () => ['updateFunctionSchedule'] as const;
+
+export const getUpdateFunctionScheduleMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext> => {
+
+const mutationKey = getUpdateFunctionScheduleMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateFunctionSchedule>>, UpdateFunctionScheduleMutationVariables> = (props) => {
+          const {id,branchId,name,scheduleId,data} = props ?? {};
+
+          return  updateFunctionSchedule(id,branchId,name,scheduleId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateFunctionScheduleMutationResult = NonNullable<Awaited<ReturnType<typeof updateFunctionSchedule>>>
+    export type UpdateFunctionScheduleMutationBody = UpdateFunctionScheduleRequest
+    export type UpdateFunctionScheduleMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateFunctionScheduleMutationVariables = {id: string;branchId: string;name: string;scheduleId: string;data: UpdateFunctionScheduleRequest}
+
+    /**
+ * @summary Change a function's schedule on the branch
+ */
+export const useUpdateFunctionSchedule = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionSchedule>>, TError,UpdateFunctionScheduleMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateFunctionSchedule>>,
+        TError,
+        UpdateFunctionScheduleMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateFunctionScheduleMutationOptions(options), queryClient);
+    }
+
+export const getListFunctionSecretsUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/secrets`
+}
+
+/**
+ * @summary List the names of a function's secrets on the branch
+ */
+export const listFunctionSecrets = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<string[]> => {
+
+  return customFetch<string[]>(getListFunctionSecretsUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionSecretsQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/secrets`
+    ] as const;
+    }
+
+
+export const getListFunctionSecretsQueryOptions = <TData = Awaited<ReturnType<typeof listFunctionSecrets>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionSecretsQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctionSecrets>>> = ({ signal }) => listFunctionSecrets(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionSecretsQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctionSecrets>>>
+export type ListFunctionSecretsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctionSecrets<TData = Awaited<ReturnType<typeof listFunctionSecrets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSecrets>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSecrets>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSecrets<TData = Awaited<ReturnType<typeof listFunctionSecrets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionSecrets>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionSecrets>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionSecrets<TData = Awaited<ReturnType<typeof listFunctionSecrets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List the names of a function's secrets on the branch
+ */
+
+export function useListFunctionSecrets<TData = Awaited<ReturnType<typeof listFunctionSecrets>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionSecrets>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionSecretsQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getPutFunctionSecretUrl = (id: string,
+    branchId: string,
+    name: string,
+    secret: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/secrets/${encodeURIComponent(String(secret))}`
+}
+
+/**
+ * The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.
+ * @summary Set a function's secret on the branch
+ */
+export const putFunctionSecret = async (id: string,
+    branchId: string,
+    name: string,
+    secret: string,
+    putFunctionSecretRequest: PutFunctionSecretRequest, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getPutFunctionSecretUrl(id,branchId,name,secret),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(putFunctionSecretRequest)
+  }
+);}
+
+
+
+
+
+export const getPutFunctionSecretMutationKey = () => ['putFunctionSecret'] as const;
+
+export const getPutFunctionSecretMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putFunctionSecret>>, TError,PutFunctionSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putFunctionSecret>>, TError,PutFunctionSecretMutationVariables, TContext> => {
+
+const mutationKey = getPutFunctionSecretMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putFunctionSecret>>, PutFunctionSecretMutationVariables> = (props) => {
+          const {id,branchId,name,secret,data} = props ?? {};
+
+          return  putFunctionSecret(id,branchId,name,secret,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutFunctionSecretMutationResult = NonNullable<Awaited<ReturnType<typeof putFunctionSecret>>>
+    export type PutFunctionSecretMutationBody = PutFunctionSecretRequest
+    export type PutFunctionSecretMutationError = ErrorType<ErrorEnvelope>
+    export type PutFunctionSecretMutationVariables = {id: string;branchId: string;name: string;secret: string;data: PutFunctionSecretRequest}
+
+    /**
+ * @summary Set a function's secret on the branch
+ */
+export const usePutFunctionSecret = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putFunctionSecret>>, TError,PutFunctionSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putFunctionSecret>>,
+        TError,
+        PutFunctionSecretMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutFunctionSecretMutationOptions(options), queryClient);
+    }
+
+export const getDeleteFunctionSecretUrl = (id: string,
+    branchId: string,
+    name: string,
+    secret: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/secrets/${encodeURIComponent(String(secret))}`
+}
+
+/**
+ * @summary Delete a function's secret on the branch
+ */
+export const deleteFunctionSecret = async (id: string,
+    branchId: string,
+    name: string,
+    secret: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteFunctionSecretUrl(id,branchId,name,secret),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteFunctionSecretMutationKey = () => ['deleteFunctionSecret'] as const;
+
+export const getDeleteFunctionSecretMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSecret>>, TError,DeleteFunctionSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSecret>>, TError,DeleteFunctionSecretMutationVariables, TContext> => {
+
+const mutationKey = getDeleteFunctionSecretMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteFunctionSecret>>, DeleteFunctionSecretMutationVariables> = (props) => {
+          const {id,branchId,name,secret} = props ?? {};
+
+          return  deleteFunctionSecret(id,branchId,name,secret,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteFunctionSecretMutationResult = NonNullable<Awaited<ReturnType<typeof deleteFunctionSecret>>>
+
+    export type DeleteFunctionSecretMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteFunctionSecretMutationVariables = {id: string;branchId: string;name: string;secret: string}
+
+    /**
+ * @summary Delete a function's secret on the branch
+ */
+export const useDeleteFunctionSecret = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionSecret>>, TError,DeleteFunctionSecretMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteFunctionSecret>>,
+        TError,
+        DeleteFunctionSecretMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteFunctionSecretMutationOptions(options), queryClient);
+    }
+
+export const getListFunctionTriggersUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/triggers`
+}
+
+/**
+ * @summary List a function's triggers on the branch
+ */
+export const listFunctionTriggers = async (id: string,
+    branchId: string,
+    name: string, options?: Parameters<typeof customFetch>[1]): Promise<FunctionTrigger[]> => {
+
+  return customFetch<FunctionTrigger[]>(getListFunctionTriggersUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListFunctionTriggersQueryKey = (id: string,
+    branchId: string,
+    name: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/functions/${name}/triggers`
+    ] as const;
+    }
+
+
+export const getListFunctionTriggersQueryOptions = <TData = Awaited<ReturnType<typeof listFunctionTriggers>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListFunctionTriggersQueryKey(id,branchId,name);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listFunctionTriggers>>> = ({ signal }) => listFunctionTriggers(id,branchId,name, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListFunctionTriggersQueryResult = NonNullable<Awaited<ReturnType<typeof listFunctionTriggers>>>
+export type ListFunctionTriggersQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListFunctionTriggers<TData = Awaited<ReturnType<typeof listFunctionTriggers>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionTriggers>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionTriggers>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionTriggers<TData = Awaited<ReturnType<typeof listFunctionTriggers>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listFunctionTriggers>>,
+          TError,
+          Awaited<ReturnType<typeof listFunctionTriggers>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListFunctionTriggers<TData = Awaited<ReturnType<typeof listFunctionTriggers>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a function's triggers on the branch
+ */
+
+export function useListFunctionTriggers<TData = Awaited<ReturnType<typeof listFunctionTriggers>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listFunctionTriggers>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListFunctionTriggersQueryOptions(id,branchId,name,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateFunctionTriggerUrl = (id: string,
+    branchId: string,
+    name: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/triggers`
+}
+
+/**
+ * A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled; a pending event is never dropped, and dead events past 10,000 per database or 7 days are removed and counted (`dropped_count`). The database's compute stays awake while it has an installed table trigger. A `storage` trigger starts `installed`. A new branch inherits the triggers.
+ * @summary Add a trigger to a function on the branch
+ */
+export const createFunctionTrigger = async (id: string,
+    branchId: string,
+    name: string,
+    createFunctionTriggerRequest: CreateFunctionTriggerRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionTrigger> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionTrigger>(getCreateFunctionTriggerUrl(id,branchId,name),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createFunctionTriggerRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateFunctionTriggerMutationKey = () => ['createFunctionTrigger'] as const;
+
+export const getCreateFunctionTriggerMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionTrigger>>, TError,CreateFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createFunctionTrigger>>, TError,CreateFunctionTriggerMutationVariables, TContext> => {
+
+const mutationKey = getCreateFunctionTriggerMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createFunctionTrigger>>, CreateFunctionTriggerMutationVariables> = (props) => {
+          const {id,branchId,name,data} = props ?? {};
+
+          return  createFunctionTrigger(id,branchId,name,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateFunctionTriggerMutationResult = NonNullable<Awaited<ReturnType<typeof createFunctionTrigger>>>
+    export type CreateFunctionTriggerMutationBody = CreateFunctionTriggerRequest
+    export type CreateFunctionTriggerMutationError = ErrorType<ErrorEnvelope>
+    export type CreateFunctionTriggerMutationVariables = {id: string;branchId: string;name: string;data: CreateFunctionTriggerRequest}
+
+    /**
+ * @summary Add a trigger to a function on the branch
+ */
+export const useCreateFunctionTrigger = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createFunctionTrigger>>, TError,CreateFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createFunctionTrigger>>,
+        TError,
+        CreateFunctionTriggerMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateFunctionTriggerMutationOptions(options), queryClient);
+    }
+
+export const getDeleteFunctionTriggerUrl = (id: string,
+    branchId: string,
+    name: string,
+    triggerId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/triggers/${encodeURIComponent(String(triggerId))}`
+}
+
+/**
+ * No event is delivered for it from now on; the worker drops its database trigger and queued events.
+ * @summary Delete a function's trigger on the branch
+ */
+export const deleteFunctionTrigger = async (id: string,
+    branchId: string,
+    name: string,
+    triggerId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteFunctionTriggerUrl(id,branchId,name,triggerId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteFunctionTriggerMutationKey = () => ['deleteFunctionTrigger'] as const;
+
+export const getDeleteFunctionTriggerMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionTrigger>>, TError,DeleteFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionTrigger>>, TError,DeleteFunctionTriggerMutationVariables, TContext> => {
+
+const mutationKey = getDeleteFunctionTriggerMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteFunctionTrigger>>, DeleteFunctionTriggerMutationVariables> = (props) => {
+          const {id,branchId,name,triggerId} = props ?? {};
+
+          return  deleteFunctionTrigger(id,branchId,name,triggerId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteFunctionTriggerMutationResult = NonNullable<Awaited<ReturnType<typeof deleteFunctionTrigger>>>
+
+    export type DeleteFunctionTriggerMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteFunctionTriggerMutationVariables = {id: string;branchId: string;name: string;triggerId: string}
+
+    /**
+ * @summary Delete a function's trigger on the branch
+ */
+export const useDeleteFunctionTrigger = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteFunctionTrigger>>, TError,DeleteFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteFunctionTrigger>>,
+        TError,
+        DeleteFunctionTriggerMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteFunctionTriggerMutationOptions(options), queryClient);
+    }
+
+export const getUpdateFunctionTriggerUrl = (id: string,
+    branchId: string,
+    name: string,
+    triggerId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/functions/${encodeURIComponent(String(name))}/triggers/${encodeURIComponent(String(triggerId))}`
+}
+
+/**
+ * Turning a table trigger off uninstalls it from the database and drops its queued events; turning it on installs it again (`pending_install`).
+ * @summary Turn a function's trigger on the branch on or off
+ */
+export const updateFunctionTrigger = async (id: string,
+    branchId: string,
+    name: string,
+    triggerId: string,
+    updateFunctionTriggerRequest: UpdateFunctionTriggerRequest, options?: Parameters<typeof customFetch>[1]): Promise<FunctionTrigger> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<FunctionTrigger>(getUpdateFunctionTriggerUrl(id,branchId,name,triggerId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateFunctionTriggerRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateFunctionTriggerMutationKey = () => ['updateFunctionTrigger'] as const;
+
+export const getUpdateFunctionTriggerMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionTrigger>>, TError,UpdateFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateFunctionTrigger>>, TError,UpdateFunctionTriggerMutationVariables, TContext> => {
+
+const mutationKey = getUpdateFunctionTriggerMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateFunctionTrigger>>, UpdateFunctionTriggerMutationVariables> = (props) => {
+          const {id,branchId,name,triggerId,data} = props ?? {};
+
+          return  updateFunctionTrigger(id,branchId,name,triggerId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateFunctionTriggerMutationResult = NonNullable<Awaited<ReturnType<typeof updateFunctionTrigger>>>
+    export type UpdateFunctionTriggerMutationBody = UpdateFunctionTriggerRequest
+    export type UpdateFunctionTriggerMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateFunctionTriggerMutationVariables = {id: string;branchId: string;name: string;triggerId: string;data: UpdateFunctionTriggerRequest}
+
+    /**
+ * @summary Turn a function's trigger on the branch on or off
+ */
+export const useUpdateFunctionTrigger = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateFunctionTrigger>>, TError,UpdateFunctionTriggerMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateFunctionTrigger>>,
+        TError,
+        UpdateFunctionTriggerMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateFunctionTriggerMutationOptions(options), queryClient);
+    }
 
 export const getListGuardExemptionsUrl = (id: string,
     branchId: string,) => {

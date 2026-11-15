@@ -1,7 +1,7 @@
 import { Tooltip } from "@base-ui/react/tooltip";
 import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
-import { DATA_API_ROUTE, isRailItemActive, SQL_ROUTE, STORAGE_ROUTE, TABLES_ROUTE, type RailEntry, type RailLink } from "./rail-items";
+import { DATA_API_ROUTE, FUNCTIONS_ROUTE, isRailItemActive, SQL_ROUTE, STORAGE_ROUTE, TABLES_ROUTE, type RailEntry, type RailLink } from "./rail-items";
 
 export interface RailItemProps {
   entry: RailEntry;
@@ -27,6 +27,7 @@ const BARE: Partial<Record<RailLink["to"], string>> = {
   "/app/sql": SQL_ROUTE,
   "/app/storage": STORAGE_ROUTE,
   "/app/data-api": DATA_API_ROUTE,
+  "/app/functions": FUNCTIONS_ROUTE,
 };
 
 /** Row geometry shared by links and placeholders: the 18px icon sits centred in the 56px rail. */

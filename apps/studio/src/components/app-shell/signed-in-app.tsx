@@ -3,7 +3,7 @@ import { useGetMe } from "@chelabase/management-client";
 import { usePendingRequestCount } from "@/components/members/pending-requests";
 import { PendingGate } from "@/components/waiting-for-approval";
 import { AppShell } from "./app-shell";
-import { canUseSql } from "./rail-items";
+import { hiddenRailItems } from "./rail-items";
 
 export interface SignedInAppProps {
   profile: { name?: string; email?: string };
@@ -29,7 +29,7 @@ function Shell({ profile, onSignOut, children }: SignedInAppProps) {
   const pending = usePendingRequestCount();
   const me = useGetMe();
   return (
-    <AppShell profile={profile} onSignOut={onSignOut} badges={{ members: pending }} hidden={canUseSql(me.data) ? [] : ["sql"]}>
+    <AppShell profile={profile} onSignOut={onSignOut} badges={{ members: pending }} hidden={hiddenRailItems(me.data)}>
       {children}
     </AppShell>
   );

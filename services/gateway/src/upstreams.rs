@@ -7,6 +7,7 @@ use std::collections::HashMap;
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 const DEFAULT_REALTIME: &str = "127.0.0.1:8087";
 const DEFAULT_STORAGE: &str = "127.0.0.1:8089";
+const DEFAULT_FUNCTIONS: &str = "127.0.0.1:8091";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
@@ -15,6 +16,7 @@ pub struct Upstreams {
     rest: String,
     realtime: String,
     storage: String,
+    functions: String,
     /// The pass-through sites that have an upstream.
     sites: HashMap<Site, String>,
 }
@@ -27,6 +29,7 @@ impl Upstreams {
             rest: DEFAULT_REST.to_string(),
             realtime: DEFAULT_REALTIME.to_string(),
             storage: DEFAULT_STORAGE.to_string(),
+            functions: DEFAULT_FUNCTIONS.to_string(),
             sites: HashMap::new(),
         })
     }
@@ -49,6 +52,12 @@ impl Upstreams {
         Ok(self)
     }
 
+    /// Where `functions` (edge function invocations) lives.
+    pub fn with_functions(mut self, functions_url: &str) -> Result<Self, String> {
+        self.functions = authority_from_url(functions_url)?;
+        Ok(self)
+    }
+
     /// Where `site` lives.
     pub fn with_site(mut self, site: Site, url: &str) -> Result<Self, String> {
         self.sites.insert(site, authority_from_url(url)?);
@@ -62,6 +71,7 @@ impl Upstreams {
             Service::Rest => &self.rest,
             Service::Realtime => &self.realtime,
             Service::Storage => &self.storage,
+            Service::Functions => &self.functions,
         }
     }
 
@@ -163,6 +173,17 @@ mod tests {
         assert_eq!(set.addr(Service::Rest), "127.0.0.1:8085");
         for bad in ["https://realtime:9000", "http://realtime", "http://realtime:9000/x"] {
             assert!(upstreams.clone().with_realtime(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn functions_has_its_own_upstream_checked_like_the_others() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(Service::Functions), "127.0.0.1:8091");
+        let set = upstreams.clone().with_functions("http://functions:8091/").unwrap();
+        assert_eq!(set.addr(Service::Functions), "functions:8091");
+        for bad in ["https://functions:8091", "http://functions", "http://functions:8091/x"] {
+            assert!(upstreams.clone().with_functions(bad).is_err(), "{bad}");
         }
     }
 }

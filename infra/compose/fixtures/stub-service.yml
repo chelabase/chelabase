@@ -1,0 +1,47 @@
+# Edge functions m9: a stub external service for `just functions-e2e` (go-httpbin: /anything
+# echoes the request, /status/<code>, /drip streams, /redirect-to redirects).
+#
+# The stack's own networks are hard-denied for services, allowlisted or not, so the stub runs
+# on a network of its own and is reached the way a self-hoster reaches a service on their own
+# machine: through `host.docker.internal` (the host gateway) and a port published on the
+# docker0 address (not on the LAN). The overlay allowlists that name for services only, on the
+# orchestrator (the save-time check) and the functions service (every connection).
+#
+# On a workbench stack, from the checkout the stack runs (`just workbench env` prints the
+# project and env file):
+#
+#   docker compose -p <project> -f infra/compose/docker-compose.yml \
+#     -f infra/compose/docker-compose.workbench.yml -f infra/compose/fixtures/stub-service.yml \
+#     --env-file <stack.env> up -d stub-service orchestrator functions
+#   just functions-services-e2e
+#
+# which runs `chelabase workbench test --env CHELABASE_STUB_SERVICE_URL=http://host.docker.internal:18099
+# -p chelabase-functions --test e2e -- --run-ignored only services::` (`workbench test` runs its
+# own runner, so the URL is passed with --env). Without it the e2e's service case says it is
+# skipped.
+services:
+  stub-service:
+    image: mccutchen/go-httpbin:2.26.0@sha256:873b4fdb27fe7cc66fa12cb9362574e1b0bf31df7ca8a71b2502988327a0b8a4
+    restart: unless-stopped
+    read_only: true
+    # The e2e streams /drip for 45 s; go-httpbin caps a request at 10 s by default.
+    environment:
+      - MAX_DURATION=90s
+    ports:
+      - "${CHELABASE_STUB_SERVICE_BIND:-172.17.0.1}:${CHELABASE_STUB_SERVICE_PORT:-18099}:8080"
+    networks: [stub]
+
+  orchestrator:
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      - CHELABASE_SERVICES_ALLOW_HOSTS=host.docker.internal
+      - CHELABASE_SERVICES_ALLOW_HTTP=true
+
+  functions:
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      - CHELABASE_SERVICES_ALLOW_HOSTS=host.docker.internal
+      - CHELABASE_SERVICES_ALLOW_HTTP=true
+
+networks:
+  stub: {}

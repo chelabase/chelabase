@@ -74,6 +74,8 @@ expect_has 'openapi/login.json' web= @chelabase/docs
 expect 'infra/compose/.env.example' $'rust=realtime chelabase\nweb=@chelabase/studio @chelabase/docs @chelabase/landing'
 expect 'infra/compose/nats/nats.conf' $'rust=none\nweb=none'
 expect 'scripts/neon-images.sh' $'rust=chelabase-neon chelabase\nweb=none'
+# The workbench CLI hashes the functions runtime's inputs into its image tag.
+expect $'infra/functions-runtime/supervisor.js\ninfra/images/functions-runtime.Dockerfile' $'rust=chelabase\nweb=none'
 [[ "$(CI_AFFECTED_FILES= scripts/ci-affected.sh)" == $'rust=none\nweb=none' ]] || fail "an empty list selects nothing"
 
 # --- 2. Outside-crate reads -----------------------------------------------------------------

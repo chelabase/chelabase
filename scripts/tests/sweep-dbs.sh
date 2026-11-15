@@ -28,7 +28,9 @@ admin() { psql "$CHELABASE_METADATA_DATABASE_URL" -v ON_ERROR_STOP=1 -qtA "$@"; 
 sdb() { psql "${base%/*}/$scratch$query" -v ON_ERROR_STOP=1 -qtA "$@"; }
 admin -c "CREATE DATABASE $scratch"
 trap 'admin -c "DROP DATABASE IF EXISTS $scratch WITH (FORCE)" >/dev/null 2>&1 || true' EXIT
-cat crates/chelabase-metadata/migrations/*.sql | sdb -f - >/dev/null
+# One session runs every migration, so pin search_path the way the metadata pool does: with the
+# default "$user", public, everything created after the `chelabase` schema exists would land in it.
+{ echo 'SET search_path = public;'; cat crates/chelabase-metadata/migrations/*.sql; } | sdb -f - >/dev/null
 
 # Tables whose columns hold values sealed with the secrets key (SECRETS_KEY_SEALED).
 mapfile -t sealed_tables < <(sed -n '/^pub const SECRETS_KEY_SEALED/,/^];/p' crates/chelabase-metadata/src/lib.rs |

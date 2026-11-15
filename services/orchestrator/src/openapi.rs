@@ -747,6 +747,9 @@ impl JobPort for Doc {
     ) -> Result<(), BoxError> {
         match *self {}
     }
+    async fn publish_fn_changed(&self, branch: BranchId, function: &str) -> Result<(), BoxError> {
+        match *self {}
+    }
     async fn check_data_role(
         &self,
         branch_id: BranchId,
@@ -841,6 +844,96 @@ impl JobPort for Doc {
         &self,
         request: &AppUsersCheckRequest,
     ) -> Result<AppUsersCheckReply, BoxError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
+impl functions::FunctionsPort for Doc {
+    async fn set_service_signing_secret(&self, database: DatabaseId, function: Uuid, secret: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn create_function(&self, database: DatabaseId, name: &str, kind: chelabase_metadata::FunctionKind) -> Result<chelabase_metadata::FunctionRecord, MetadataError> {
+        match *self {}
+    }
+    async fn list_functions(&self, database: DatabaseId) -> Result<Vec<chelabase_metadata::FunctionRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn set_function_kind(&self, database: DatabaseId, function: Uuid, kind: chelabase_metadata::FunctionKind) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn delete_function_unprotected(&self, database: DatabaseId, function: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn create_deployment(&self, deployment: &chelabase_metadata::NewDeployment<'_>) -> Result<chelabase_metadata::DeploymentRecord, MetadataError> {
+        match *self {}
+    }
+    async fn list_deployments(&self, function: Uuid) -> Result<Vec<chelabase_metadata::DeploymentRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn set_active_deployment(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> Result<(), MetadataError> {
+        match *self {}
+    }
+    async fn active_deployment_generation(&self, branch: BranchId, function: Uuid) -> Result<Option<(Uuid, i64)>, MetadataError> {
+        match *self {}
+    }
+    async fn switch_active_deployment(&self, branch: BranchId, function: Uuid, generation: i64, deployment: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn set_enabled(&self, branch: BranchId, function: Uuid, enabled: bool) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn set_function_auth(&self, branch: BranchId, function: Uuid, auth: chelabase_metadata::FunctionAuth) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn set_run_as(&self, branch: BranchId, function: Uuid, run_as: Option<&chelabase_metadata::RunAs>) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn list_for_branch(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::BranchFunction>, MetadataError> {
+        match *self {}
+    }
+    async fn put_secret(&self, branch: BranchId, function: Uuid, name: &str, value: &str) -> Result<(), MetadataError> {
+        match *self {}
+    }
+    async fn delete_secret(&self, branch: BranchId, function: Uuid, name: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn secret_names(&self, branch: BranchId, function: Uuid) -> Result<Vec<String>, MetadataError> {
+        match *self {}
+    }
+    async fn set_function_last_error(&self, branch: BranchId, function: Uuid, error: Option<&str>) -> Result<(), MetadataError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
+impl crate::functions_schedules::SchedulesPort for Doc {
+    async fn add_schedule(&self, schedule: &chelabase_metadata::NewSchedule<'_>) -> Result<Uuid, MetadataError> {
+        match *self {}
+    }
+    async fn list_schedules(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn update_schedule(&self, branch: BranchId, function: Uuid, id: Uuid, cron: Option<&str>, timezone: Option<&str>, enabled: Option<bool>) -> Result<Option<chelabase_metadata::ScheduleRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_schedule(&self, branch: BranchId, function: Uuid, id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+}
+
+#[allow(unused_variables)]
+impl crate::functions_triggers::TriggersPort for Doc {
+    async fn add_trigger(&self, trigger: &chelabase_metadata::NewTrigger<'_>) -> Result<Uuid, MetadataError> {
+        match *self {}
+    }
+    async fn list_triggers(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::TriggerRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn update_trigger(&self, branch: BranchId, function: Uuid, id: Uuid, enabled: bool) -> Result<Option<chelabase_metadata::TriggerRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn delete_trigger(&self, branch: BranchId, function: Uuid, id: Uuid) -> Result<bool, MetadataError> {
         match *self {}
     }
 }
@@ -1183,6 +1276,10 @@ mod tests {
                 "DELETE /v1/databases/{id}/branches/{branch_id}",
                 "deleteBranch",
             ),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}", "deleteFunction"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "deleteFunctionSchedule"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}", "deleteFunctionTrigger"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}", "deleteFunctionSecret"),
             (
                 "DELETE /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
                 "deleteGuardExemption",
@@ -1239,6 +1336,12 @@ mod tests {
                 "GET /v1/databases/{id}/branches/{branch_id}/databases",
                 "listBranchDatabases",
             ),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions", "listFunctions"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "listFunctionDeployments"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/logs", "getServiceLogs"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "listFunctionSchedules"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers", "listFunctionTriggers"),
+            ("GET /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets", "listFunctionSecrets"),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/guard-exemptions",
                 "listGuardExemptions",
@@ -1308,6 +1411,9 @@ mod tests {
                 "PATCH /v1/databases/{id}/branches/{branch_id}",
                 "updateBranch",
             ),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}", "updateFunction"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules/{schedule_id}", "updateFunctionSchedule"),
+            ("PATCH /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers/{trigger_id}", "updateFunctionTrigger"),
             (
                 "PATCH /v1/databases/{id}/branches/{branch_id}/keys/{key_id}",
                 "updateKey",
@@ -1334,6 +1440,9 @@ mod tests {
                 "POST /v1/databases/{id}/branches/{branch_id}/console/query",
                 "consoleQuery",
             ),
+            ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/deployments", "createFunctionDeployment"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/schedules", "createFunctionSchedule"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/functions/{name}/triggers", "createFunctionTrigger"),
             (
                 "POST /v1/databases/{id}/branches/{branch_id}/keys",
                 "createKey",
@@ -1415,6 +1524,8 @@ mod tests {
             ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/reactivate", "reactivateAppUser"),
             ("POST /v1/teams", "createTeam"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/functions/{name}", "putFunction"),
+            ("PUT /v1/databases/{id}/branches/{branch_id}/functions/{name}/secrets/{secret}", "putFunctionSecret"),
             (
                 "PUT /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
                 "putGuardExemption",
@@ -1477,7 +1588,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams", "storage"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams", "storage", "functions"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -1650,6 +1761,9 @@ mod tests {
             "CreateBranchRequest",
             "CreateDatabaseAccepted",
             "CreateDatabaseRequest",
+            "CreateFunctionDeploymentRequest",
+            "CreateFunctionScheduleRequest",
+            "CreateFunctionTriggerRequest",
             "CreateInviteRequest",
             "CreateKeyRequest",
             "CreateMergeRequest",
@@ -1694,8 +1808,15 @@ mod tests {
             "FixAction",
             "FkAction",
             "ForeignKeyTarget",
+            "Function",
+            "FunctionAuth",
+            "FunctionDeployment",
             "FunctionDesc",
+            "FunctionKind",
             "FunctionRef",
+            "FunctionSchedule",
+            "FunctionTrigger",
+            "FunctionTriggerSource",
             "Grant",
             "GrantOverride",
             "Grantee",
@@ -1765,6 +1886,8 @@ mod tests {
             "ProjectStatusView",
             "ProjectTeamGrantView",
             "PutAppUsersRequest",
+            "PutFunctionRequest",
+            "PutFunctionSecretRequest",
             "PutGrantOverrideRequest",
             "PutGrantRequest",
             "PutPersonalLoginRequest",
@@ -1807,6 +1930,11 @@ mod tests {
             "SchemaPrivileges",
             "SequenceParams",
             "SequencePrivilege",
+            "ServiceHealth",
+            "ServiceResources",
+            "ServiceRollout",
+            "ServiceRolloutState",
+            "ServiceSpec",
             "SkipReason",
             "StatementResult",
             "StorageRefDesc",
@@ -1834,6 +1962,9 @@ mod tests {
             "UpdateAppUserRequest",
             "UpdateBranchRequest",
             "UpdateDatabaseRequest",
+            "UpdateFunctionRequest",
+            "UpdateFunctionScheduleRequest",
+            "UpdateFunctionTriggerRequest",
             "UpdateInstanceSettingsRequest",
             "UpdateKeyRequest",
             "UpdateMemberRequest",

@@ -2682,7 +2682,9 @@
           "member_offboarded",
           "invalid_successor",
           "exposure_unconfirmed",
-          "identity_unavailable"
+          "identity_unavailable",
+          "runner_unavailable",
+          "functions_unavailable"
         ]
       },
       "ErrorEnvelope": {

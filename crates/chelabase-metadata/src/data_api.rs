@@ -118,6 +118,8 @@ pub struct DataKeyRecord {
     /// A secret key's role has BYPASSRLS (E33): the check's answer at create or rotation,
     /// kept up to date by the resync by the role's OID. False for the public key.
     pub role_bypass_rls: bool,
+    /// The function whose run-as key this is (`(id, name)`); `None` for every other key.
+    pub managed_by_function: Option<(Uuid, String)>,
 }
 
 impl fmt::Debug for DataKeyRecord {
@@ -137,6 +139,7 @@ impl fmt::Debug for DataKeyRecord {
             .field("role_oid", &self.role_oid)
             .field("role_timeline", &self.role_timeline)
             .field("role_bypass_rls", &self.role_bypass_rls)
+            .field("managed_by_function", &self.managed_by_function)
             .finish()
     }
 }
@@ -208,13 +211,19 @@ pub struct BranchConnectionRow {
     /// salt: both or neither.
     pub storage_password_enc: Option<String>,
     pub storage_password_salt: Option<Vec<u8>>,
+    /// m13b: the `chelabase_functions_dispatch` login's sealed password
+    /// (`Purpose::FunctionsDispatch`) and its SCRAM salt: both or neither.
+    pub functions_password_enc: Option<String>,
+    pub functions_password_salt: Option<Vec<u8>>,
     pub settings: DataApiSettings,
     /// The branch's databases in state `on`, main first.
     pub databases: Vec<ServedDatabase>,
 }
 
 const KEY_COLUMNS: &str = "id, branch_id, kind, role, name, prefix, sealed, created_at, \
-     last_used_at, revoked_at, databases, role_oid, role_timeline, role_bypass_rls";
+     last_used_at, revoked_at, databases, role_oid, role_timeline, role_bypass_rls, \
+     managed_by_function_id, (SELECT f.name FROM functions f \
+     WHERE f.id = data_api_keys.managed_by_function_id) AS managed_by_function_name";
 
 fn parse_kind(value: &str) -> Result<DataKeyKind, MetadataError> {
     DataKeyKind::parse(value)
@@ -237,6 +246,9 @@ fn key_from_row(r: &PgRow) -> Result<DataKeyRecord, MetadataError> {
         role_oid: r.get("role_oid"),
         role_timeline: r.get("role_timeline"),
         role_bypass_rls: r.get("role_bypass_rls"),
+        managed_by_function: r
+            .get::<Option<Uuid>, _>("managed_by_function_id")
+            .zip(r.get::<Option<String>, _>("managed_by_function_name")),
     })
 }
 
@@ -286,6 +298,25 @@ async fn lock_endpoint_of_branch(
             .map_err(|e| crate::ddl::lock_timeout(e, endpoint))?;
     }
     Ok(())
+}
+
+/// Whether `key` is a live key of `branch` that a function manages (revoke and rotate refuse
+/// it with [`MetadataError::ManagedKey`] instead of "not found").
+async fn live_managed_key<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    branch: BranchId,
+    key: Uuid,
+) -> Result<bool, MetadataError> {
+    let found: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM data_api_keys
+         WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+           AND managed_by_function_id IS NOT NULL",
+    )
+    .bind(key)
+    .bind(branch.as_uuid())
+    .fetch_optional(db)
+    .await?;
+    Ok(found.is_some())
 }
 
 impl MetadataClient {
@@ -388,7 +419,7 @@ impl MetadataClient {
         for fix in fixes {
             let query = match fix {
                 KeyRoleFix::Revoke { id, role, oid } => sqlx::query(
-                    "UPDATE data_api_keys SET revoked_at = now()
+                    "UPDATE data_api_keys SET revoked_at = now(), sealed = NULL
                      WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
                        AND role = $3 AND role_oid IS NOT DISTINCT FROM $4",
                 )
@@ -458,7 +489,8 @@ impl MetadataClient {
     }
 
     /// Revokes a live secret key of the branch. False for an unknown or already revoked key,
-    /// and for a public key (rotate it instead: a branch always has one).
+    /// and for a public key (rotate it instead: a branch always has one). A key a function
+    /// manages is [`MetadataError::ManagedKey`], untouched (its function revokes it).
     pub async fn revoke_data_key(
         &self,
         branch: BranchId,
@@ -466,13 +498,17 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE data_api_keys SET revoked_at = now()
-             WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL",
+             WHERE id = $1 AND branch_id = $2 AND kind = 'secret' AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL",
         )
         .bind(key_id)
         .bind(branch.as_uuid())
         .execute(&self.pool)
         .await?
         .rows_affected();
+        if updated == 0 && live_managed_key(&self.pool, branch, key_id).await? {
+            return Err(MetadataError::ManagedKey);
+        }
         Ok(updated == 1)
     }
 
@@ -480,7 +516,8 @@ impl MetadataClient {
     /// transaction. False, nothing written, when `old` isn't a live key of the branch. A failing
     /// insert (a second live public key: [`MetadataError::Conflict`]) rolls the revoke back.
     /// Public keys only: a secret `old` is false, as for an unknown key; secret keys go through
-    /// [`Self::rotate_secret_key`], which also holds the role in place.
+    /// [`Self::rotate_secret_key`], which also holds the role in place. A key a function
+    /// manages is [`MetadataError::ManagedKey`] (both rotations), nothing written.
     pub async fn rotate_data_key(
         &self,
         branch: BranchId,
@@ -533,6 +570,7 @@ impl MetadataClient {
         let revoked: Option<Revoked> = sqlx::query_as(
             "UPDATE data_api_keys SET revoked_at = now()
              WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL
                AND kind = CASE WHEN $3 THEN 'secret' ELSE 'public' END
              RETURNING databases, role, role_oid, role_timeline",
         )
@@ -542,6 +580,9 @@ impl MetadataClient {
         .fetch_optional(&mut *tx)
         .await?;
         let Some((databases, role, stored_oid, stored_timeline)) = revoked else {
+            if live_managed_key(&mut *tx, branch, old).await? {
+                return Err(MetadataError::ManagedKey);
+            }
             return Ok(false);
         };
         let (role_oid, role_timeline) = if secret {
@@ -580,8 +621,9 @@ impl MetadataClient {
     }
 
     /// Replaces a live key's database list (`None` is every served database). False for an
-    /// unknown or revoked key, or one of another branch. The list's bounds (1 to 20 names) are
-    /// the column's CHECK; callers validate first for a friendly message.
+    /// unknown or revoked key, or one of another branch; a key a function manages is
+    /// [`MetadataError::ManagedKey`], untouched. The list's bounds (1 to 20 names) are the
+    /// column's CHECK; callers validate first for a friendly message.
     pub async fn set_key_databases(
         &self,
         branch: BranchId,
@@ -590,7 +632,8 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE data_api_keys SET databases = $3
-             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL",
+             WHERE id = $1 AND branch_id = $2 AND revoked_at IS NULL
+               AND managed_by_function_id IS NULL",
         )
         .bind(key_id)
         .bind(branch.as_uuid())
@@ -598,6 +641,9 @@ impl MetadataClient {
         .execute(&self.pool)
         .await?
         .rows_affected();
+        if updated == 0 && live_managed_key(&self.pool, branch, key_id).await? {
+            return Err(MetadataError::ManagedKey);
+        }
         Ok(updated == 1)
     }
 
@@ -643,6 +689,28 @@ impl MetadataClient {
         Ok(())
     }
 
+    /// m13b: records the sealed `chelabase_functions_dispatch` password of a live branch that
+    /// has none, with its verifier's SCRAM salt; the first one stored stays, as
+    /// [`Self::set_storage_password`].
+    pub async fn set_functions_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE branches SET functions_password_enc = $2, functions_password_salt = $3, updated_at = now()
+             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
+               AND functions_password_enc IS NULL",
+        )
+        .bind(branch.as_uuid())
+        .bind(sealed)
+        .bind(salt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Everything the REST and storage services need to connect to `branch`, whatever its status.
     pub async fn branch_connection(
         &self,
@@ -651,6 +719,7 @@ impl MetadataClient {
         let row = sqlx::query(
             "SELECT b.id, b.database_id, b.status, b.endpoint_id, b.authenticator_password_enc,
                     b.storage_password_enc, b.storage_password_salt,
+                    b.functions_password_enc, b.functions_password_salt,
                     d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
                     d.storage_max_connections
              FROM branches b
@@ -673,6 +742,8 @@ impl MetadataClient {
             authenticator_password_enc: r.get("authenticator_password_enc"),
             storage_password_enc: r.get("storage_password_enc"),
             storage_password_salt: r.get("storage_password_salt"),
+            functions_password_enc: r.get("functions_password_enc"),
+            functions_password_salt: r.get("functions_password_salt"),
             settings: DataApiSettings {
                 max_rows: r.get("max_rows"),
                 statement_timeout_ms: r.get("statement_timeout_ms"),
@@ -827,6 +898,7 @@ mod tests {
             role_oid: None,
             role_timeline: None,
             role_bypass_rls: false,
+            managed_by_function: None,
         };
         assert!(!format!("{record:?}").contains("SECRETSEALED"));
     }

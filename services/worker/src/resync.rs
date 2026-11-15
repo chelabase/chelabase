@@ -1632,6 +1632,7 @@ mod tests {
             databases: None,
             role_oid: oid,
             role_bypass_rls: false,
+            managed_by_function: None,
         }
     }
 

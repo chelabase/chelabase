@@ -784,6 +784,35 @@ fn realtime_is_one_of_the_stacks_rust_apps() {
     assert_eq!(restart_targets(&["realtime".into()]).unwrap(), ["realtime"]);
 }
 
+// Edge functions m10: `up` builds the service runner's binary (its compose profile `services` is
+// off by default), but it is no app: never started, recorded or restarted with them.
+#[test]
+fn service_runner_is_built_but_never_started() {
+    use super::commands::{APPS, LATE_APPS, PROFILE_RUST_APPS, RUST_APPS, build_packages};
+    assert_eq!(PROFILE_RUST_APPS, ["service-runner"]);
+    for list in [&RUST_APPS[..], &APPS[..], LATE_APPS] {
+        assert!(!list.contains(&"service-runner"), "{list:?}");
+    }
+    let up = build_packages(&RUST_APPS, true);
+    assert!(up.windows(2).any(|w| w == ["-p", "chelabase-service-runner"]), "{up:?}");
+    assert!(up.windows(2).any(|w| w == ["-p", "chelabase-functions"]), "{up:?}");
+    let restart = build_packages(&["functions"], false);
+    assert_eq!(restart, ["-p", "chelabase-functions"]);
+}
+
+// Edge functions m4b: `up` builds, records and restarts the functions service with the other Rust
+// apps and starts it with the late apps; the runtime is infra (an image, no binary).
+#[test]
+fn functions_is_one_of_the_stacks_rust_apps() {
+    use super::commands::{APPS, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    assert!(RUST_APPS.contains(&"functions"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"functions"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"functions"), "{LATE_APPS:?}");
+    assert!(INFRA.contains(&"functions-runtime"), "{INFRA:?}");
+    assert!(!RUST_APPS.contains(&"functions-runtime"));
+    assert_eq!(restart_targets(&["functions".into()]).unwrap(), ["functions"]);
+}
+
 // auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be
 // healthy before the bootstrap (which creates its members pool through it); it is an app of the
 // stack (restartable, checked by `test --stack`), not a Rust app (no binary).

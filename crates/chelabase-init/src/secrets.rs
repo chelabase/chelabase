@@ -193,6 +193,7 @@ pub const LAYOUT: &[Entry] = &[
     e("nats/realtime.password", M, Gen::Text32, P),
     e("nats/runner.password", M, Gen::Text32, P),
     e("nats/storage.password", M, Gen::Text32, P),
+    e("nats/functions.password", M, Gen::Text32, P),
     e("valkey/proxy.password", M, Gen::Text32, P),
     e("valkey/control.password", M, Gen::Text32, P),
     e("valkey/realtime.password", M, Gen::Text32, P),
@@ -212,6 +213,12 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/app-auth.token", M, Gen::Text32, P),
     e("tokens/app-sessions.token", M, Gen::Text32, P),
     e("tokens/storage-internal.token", M, Gen::Text32, P),
+    // Edge functions m4b: the functions service's internal listener, one bearer per caller.
+    e("tokens/orchestrator-functions.token", M, Gen::Text32, P),
+    e("tokens/worker-functions.token", M, Gen::Text32, P),
+    // Edge functions m10: the service runner's internal API, one bearer per caller.
+    e("tokens/functions-service-runner.token", M, Gen::Text32, P),
+    e("tokens/worker-service-runner.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
     e("tokens/auth-identity.token", M, Gen::Token32, P),
@@ -1230,6 +1237,8 @@ mod tests {
                 "${CHELABASE_STACK_DIR}/s3/secret-key",
                 "${CHELABASE_STACK_DIR}/storage-s3/access-key",
                 "${CHELABASE_STACK_DIR}/storage-s3/secret-key",
+                "${CHELABASE_STACK_DIR}/functions-s3/access-key",
+                "${CHELABASE_STACK_DIR}/functions-s3/secret-key",
                 "${CHELABASE_STACK_DIR}/grpc-tls/ca.crt",
                 "${CHELABASE_STACK_DIR}/grpc-tls/server.crt",
                 "${CHELABASE_STACK_DIR}/grpc-tls/server.key",
@@ -1244,11 +1253,11 @@ mod tests {
 
     /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
     /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
-    /// makes after it (the bootstrap's outputs, and the object store's `storage` keys and gRPC
-    /// TLS set).
+    /// makes after it (the bootstrap's outputs, and the object store's `storage` and `functions`
+    /// keys and gRPC TLS set).
     fn selfhost_secret_paths() -> Vec<String> {
         const SCRIPT_DIRS: [&str; 1] = ["bootstrap"];
-        const SCRIPT_FILES: [&str; 2] = ["storage-s3", "grpc-tls"];
+        const SCRIPT_FILES: [&str; 3] = ["storage-s3", "functions-s3", "grpc-tls"];
         let text = compose_file("docker-compose.yml");
         let mut paths = Vec::new();
         let mut others = Vec::new();
@@ -1272,6 +1281,8 @@ mod tests {
             others,
             [
                 "bootstrap",
+                "functions-s3/access-key",
+                "functions-s3/secret-key",
                 "grpc-tls/ca.crt",
                 "grpc-tls/client.crt",
                 "grpc-tls/client.key",
@@ -1287,7 +1298,13 @@ mod tests {
             script.contains(&format!("for d in {}; do", SCRIPT_DIRS.join(" "))),
             "init-secrets makes {SCRIPT_DIRS:?}"
         );
-        for made in ["new_key storage-s3/access-key 20", "new_key storage-s3/secret-key 40", "T=\"$$S/grpc-tls\""] {
+        for made in [
+            "new_key storage-s3/access-key 20",
+            "new_key storage-s3/secret-key 40",
+            "new_key functions-s3/access-key 20",
+            "new_key functions-s3/secret-key 40",
+            "T=\"$$S/grpc-tls\"",
+        ] {
             assert!(script.contains(made), "init-secrets runs {made}");
         }
         assert!(paths.len() > 30, "{paths:?}");
@@ -2189,11 +2206,16 @@ mod tests {
     /// object-storage m19 (#152): the files the self-hosted `storage` service mounts from the
     /// `secrets` volume (its block in docker-compose.yml), sorted.
     fn selfhost_storage_mounts() -> Vec<String> {
+        selfhost_mounts("storage")
+    }
+
+    /// The files the self-hosted service `name` mounts from the `secrets` volume, sorted.
+    fn selfhost_mounts(name: &str) -> Vec<String> {
         let text = compose_file("docker-compose.yml");
         let block = text
-            .split("\n  storage:\n")
+            .split(&format!("\n  {name}:\n"))
             .nth(1)
-            .expect("a storage service in the self-hosted compose file");
+            .unwrap_or_else(|| panic!("a {name} service in the self-hosted compose file"));
         let mut subs: Vec<String> = block
             .lines()
             .take_while(|l| l.is_empty() || l.starts_with("    "))
@@ -2255,25 +2277,163 @@ mod tests {
         );
     }
 
+    /// Edge functions m4b: the functions service mounts exactly its own files, each made by a
+    /// fresh run (the layout's; the S3 pair by init-secrets' script), and NATS's auth file
+    /// carries its user. The orchestrator and the worker each mount their bearer. m13b: the
+    /// compute CA's certificate too (the dispatcher verifies computes).
+    #[test]
+    fn functions_service_mounts_come_from_init() {
+        let mounts = selfhost_mounts("functions");
+        assert_eq!(
+            mounts,
+            [
+                "compute-ca/ca.crt",
+                "db/metadata.password",
+                "functions-s3/access-key",
+                "functions-s3/secret-key",
+                "gateway/internal-verify.pem",
+                "nats/functions.password",
+                "secrets/secrets.key",
+                "tokens/functions-service-runner.token",
+                "tokens/orchestrator-functions.token",
+                "tokens/worker-functions.token",
+            ],
+            "functions mounts only its own secrets"
+        );
+        assert!(selfhost_mounts("orchestrator").contains(&"tokens/orchestrator-functions.token".to_string()));
+        assert!(selfhost_mounts("worker").contains(&"tokens/worker-functions.token".to_string()));
+        let t = tmp();
+        let report = ensure_secrets(t.path(), &opts()).unwrap();
+        let (uid, gid) = me();
+        for sub in mounts.iter().filter(|s| !s.starts_with("functions-s3/")) {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == sub)
+                .unwrap_or_else(|| panic!("{sub} is not in chelabase-init's layout"));
+            let p = t.path().join(sub);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert!(matches!(entry.spec.uid, Id::Writer), "{sub}: the app user owns it");
+            assert_eq!(meta.uid(), uid, "{sub}");
+            // Owner-only, except the metadata password (also its database's group).
+            if sub != "db/metadata.password" {
+                let want = if entry.spec == PUB { 0o644 } else { 0o600 };
+                assert_eq!((meta.gid(), mode(&p)), (gid, want), "{sub}");
+            }
+            assert!(report.created.contains(&p), "{sub}");
+        }
+        let auth = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&auth);
+        let pw = std::fs::read_to_string(t.path().join("nats/functions.password")).unwrap();
+        assert!(bcrypt::verify(&pw, &hashes["functions"]).unwrap(), "functions' NATS user");
+    }
+
     /// An install from before object storage (no storage secrets): the next run makes them and
     /// re-renders NATS's users, and every other file stays byte for byte, the never-overwrite
     /// ones included.
     #[test]
     fn upgrade_adds_storage_secrets_and_keeps_the_rest() {
-        const STORAGE: [&str; 2] = ["nats/storage.password", "tokens/storage-internal.token"];
+        assert_upgrade_adds(&["nats/storage.password", "tokens/storage-internal.token"], "storage");
+    }
+
+    /// Edge functions m4b: likewise an install from before the functions service.
+    #[test]
+    fn upgrade_adds_functions_secrets_and_keeps_the_rest() {
+        assert_upgrade_adds(
+            &["nats/functions.password", "tokens/orchestrator-functions.token", "tokens/worker-functions.token"],
+            "functions",
+        );
+    }
+
+    /// Edge functions m4b: the functions bearers (the orchestrator's bundle uploads, the
+    /// worker's invocations) are made by a fresh run, at least 32 characters and different,
+    /// and a second run leaves them byte for byte.
+    #[test]
+    fn functions_bearers_are_made_once_and_differ() {
         let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
-        for f in STORAGE {
+        let read = |f: &str| std::fs::read(t.path().join(f)).unwrap();
+        let (orch, worker) = (read("tokens/orchestrator-functions.token"), read("tokens/worker-functions.token"));
+        assert!(orch.len() >= 32 && worker.len() >= 32);
+        assert_ne!(orch, worker);
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
+        assert_eq!(read("tokens/orchestrator-functions.token"), orch);
+        assert_eq!(read("tokens/worker-functions.token"), worker);
+    }
+
+    /// Edge functions m10: the service runner's bearers (the functions service's, the
+    /// worker's) are made by a fresh run, at least 32 characters and different, and kept.
+    #[test]
+    fn service_runner_bearers_are_made_once_and_differ() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let read = |f: &str| std::fs::read(t.path().join(f)).unwrap();
+        let files = ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"];
+        let (functions, worker) = (read(files[0]), read(files[1]));
+        assert!(functions.len() >= 32 && worker.len() >= 32);
+        assert_ne!(functions, worker);
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
+        assert_eq!(read(files[0]), functions);
+        assert_eq!(read(files[1]), worker);
+    }
+
+    /// An install from before the service runner: the next run makes its two bearers and
+    /// leaves every other file byte for byte (no NATS or Valkey user changes).
+    #[test]
+    fn upgrade_adds_service_runner_bearers_and_keeps_the_rest() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let files = ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"];
+        for f in files {
             std::fs::remove_file(t.path().join(f)).unwrap();
         }
-        // NATS's users as such an install rendered them: no storage user.
+        let before = snapshot(t.path());
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        let mut created = r.created.clone();
+        created.sort();
+        assert_eq!(created, files.map(|f| t.path().join(f)));
+        assert!(r.rewritten.is_empty(), "{:?}", r.rewritten);
+        let after = snapshot(t.path());
+        for (path, v) in &before {
+            assert_eq!(after.get(path), Some(v), "{}", path.display());
+        }
+    }
+
+    /// The self-hosted service-runner mounts exactly its two caller bearers and the metadata
+    /// password; the functions service and the worker each mount their own bearer.
+    #[test]
+    fn service_runner_mounts_come_from_init() {
+        assert_eq!(
+            selfhost_mounts("service-runner"),
+            [
+                "db/metadata.password",
+                "tokens/functions-service-runner.token",
+                "tokens/worker-service-runner.token",
+            ]
+        );
+        assert!(selfhost_mounts("functions").contains(&"tokens/functions-service-runner.token".to_string()));
+        assert!(selfhost_mounts("worker").contains(&"tokens/worker-service-runner.token".to_string()));
+        for f in ["tokens/functions-service-runner.token", "tokens/worker-service-runner.token"] {
+            let entry = LAYOUT.iter().find(|e| e.path == f).unwrap_or_else(|| panic!("{f} in the layout"));
+            assert!(matches!(entry.spec.uid, Id::Writer), "{f}");
+        }
+    }
+
+    fn assert_upgrade_adds(files: &[&str], user: &str) {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        for f in files {
+            std::fs::remove_file(t.path().join(f)).unwrap();
+        }
+        // NATS's users as such an install rendered them: without `user`.
         let rendered = std::fs::read_to_string(t.path().join("nats/auth.conf")).unwrap();
         let start = rendered
-            .find("    {\n      user: \"storage\"\n")
-            .expect("a storage user in auth.conf");
+            .find(&format!("    {{\n      user: \"{user}\"\n"))
+            .expect("the user in auth.conf");
         let end = start + rendered[start..].find("\n    }\n").unwrap() + "\n    }\n".len();
         let auth = format!("{}{}", &rendered[..start], &rendered[end..]);
-        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key("storage"));
+        assert!(!crate::kinds::service_auth::previous_nats_hashes(&auth).contains_key(user));
         assert_eq!(
             crate::kinds::service_auth::previous_nats_hashes(&auth).len(),
             crate::kinds::stack_secrets::NATS_USERS.len() - 1
@@ -2283,7 +2443,9 @@ mod tests {
         let r = ensure_secrets(t.path(), &opts()).unwrap();
         let mut created = r.created.clone();
         created.sort();
-        assert_eq!(created, STORAGE.map(|f| t.path().join(f)));
+        let mut want: Vec<_> = files.iter().map(|f| t.path().join(f)).collect();
+        want.sort();
+        assert_eq!(created, want);
         assert_eq!(r.rewritten, [t.path().join("nats/auth.conf")]);
         assert!(r.auth_files.nats && !r.auth_files.valkey);
         let after = snapshot(t.path());
@@ -2315,7 +2477,7 @@ mod tests {
             );
             assert!(before.contains_key(Path::new(kept)), "{kept}");
         }
-        // The other users keep their passwords; storage's new one verifies.
+        // The other users keep their passwords; the new one verifies.
         let new = String::from_utf8(after[Path::new("nats/auth.conf")].0.clone()).unwrap();
         assert_ne!(new, auth);
         let hashes = crate::kinds::service_auth::previous_nats_hashes(&new);
