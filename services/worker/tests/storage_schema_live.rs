@@ -26,7 +26,7 @@ use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use worker::config::RealWorker;
-use worker::data_api::schema_check_sql;
+use worker::data_api::{DATA_API_SCHEMA_STAMP, DATA_API_SCHEMA_VERSION, newer_data_api_schema, schema_check_sql};
 use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
@@ -4918,5 +4918,229 @@ async fn review(fx: &Fx) {
         "rv_other/trigger/storage.rv_tg(storage.t)",
     ] {
         assert!(keys.contains(&key.to_string()), "{key} hidden: {keys:?}");
+    }
+}
+
+// --- data-api-schema-stamp m1 (#198): the chelabase data API schema's stamp -----------------
+
+/// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
+/// ACL, body), the event triggers (owner, state, function, comment) and the schema itself.
+const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
+  SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
+    FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(p.prosrc)
+    FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
+    FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
+  UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '')
+    FROM pg_namespace n WHERE n.nspname = 'chelabase'
+) s";
+
+/// The stamp trigger's comment (`<none>` without one), whether a superuser owns it, and its
+/// function.
+const DDL_TRIGGER_SQL: &str = "SELECT coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>') || ' ' || r.rolsuper || ' ' || e.evtfoid::regprocedure
+  FROM pg_event_trigger e JOIN pg_roles r ON r.oid = e.evtowner WHERE e.evtname = 'chelabase_schema_version_ddl'";
+
+/// A newer worker's schema: stamp 99 and a function only it makes (the bootstrap
+/// superuser's, so no tamper).
+const MAKE_NEWER_SQL: &str = "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;";
+
+impl Fx {
+    async fn data_api_check(&self, schema: &str) -> String {
+        last_line(&self.admin(&schema_check_sql(schema, Some(&self.verifier().await))).await)
+    }
+
+    async fn quarantines(&self) -> u32 {
+        self.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase\\_quarantine\\_%'")
+            .await
+            .parse()
+            .unwrap()
+    }
+
+    async fn authenticator_password(&self) -> String {
+        let main = self.metadata.get_branch(self.main).await.unwrap().unwrap();
+        open_credential(
+            &self.worker.key,
+            &main.id.to_string(),
+            Purpose::Authenticator,
+            main.authenticator_password_enc.as_deref().expect("authenticator password"),
+        )
+        .unwrap()
+    }
+
+    /// This worker's install, freshly stamped: the trigger a superuser's on its own function.
+    async fn assert_current(&self, what: &str) {
+        assert_eq!(
+            self.value(DDL_TRIGGER_SQL).await,
+            format!("{DATA_API_SCHEMA_STAMP} true chelabase.bump_schema_version()"),
+            "{what}"
+        );
+        assert_eq!(
+            self.value("SELECT to_regprocedure('chelabase.from_v99()') IS NULL AND (SELECT prosrc LIKE '%CB002%' FROM pg_proc WHERE oid = to_regprocedure('chelabase.cap_response(text,bigint)'))").await,
+            "t",
+            "{what}: this worker's functions"
+        );
+        assert_eq!(self.data_api_check("public").await, "t", "{what}");
+    }
+
+    /// A bootstrap that quarantines and installs afresh.
+    async fn assert_quarantined_by_bootstrap(&self, what: &str) {
+        let before = self.quarantines().await;
+        bootstrap(self).await;
+        assert_eq!(self.quarantines().await, before + 1, "{what}: quarantined");
+        self.assert_current(what).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn data_api_schema_versions_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { data_api_versions(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn data_api_versions(fx: &Fx) {
+    // 1. AC 10: a fresh provision is stamped.
+    fx.assert_current("fresh").await;
+    assert_eq!(fx.quarantines().await, 0);
+
+    // 2. AC 1: a valid newer stamp, a function only it has and a body this worker would
+    // rewrite: nothing in chelabase changes, nothing is quarantined, the check is healthy.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE OR REPLACE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text LANGUAGE sql AS $$ SELECT result $$")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "t", "a newer schema is healthy here");
+    let before = fx.value(CHELABASE_SHAPE_SQL).await;
+    bootstrap(fx).await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "a newer chelabase schema was changed");
+    assert_eq!(fx.quarantines().await, 0);
+    assert_eq!(
+        fx.value(DDL_TRIGGER_SQL).await,
+        "chelabase data api schema 99 true chelabase.bump_schema_version()"
+    );
+    assert_eq!(fx.data_api_check("public").await, "t");
+    // The script itself, through psql: the gate skips the DDL and the warning names both
+    // versions.
+    let out = fx
+        .admin(&worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, "public"))
+        .await;
+    assert_eq!(
+        newer_data_api_schema(&out),
+        Some(format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}; it was left alone").as_str()),
+        "{out}"
+    );
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "the script changed a newer schema");
+
+    // 3. AC 2: a newer stamp and a default schema changed meanwhile: authenticator's login
+    // and the new schema's grants are still applied, chelabase still untouched.
+    fx.admin("CREATE SCHEMA reporting AUTHORIZATION postgres; ALTER ROLE authenticator NOLOGIN;")
+        .await;
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "reporting")
+        .await
+        .expect("set default schema");
+    assert_eq!(fx.data_api_check("reporting").await, "f", "the login and USAGE still count");
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value("SELECT bool_and(has_schema_privilege(r, 'reporting', 'USAGE')) FROM unnest(ARRAY['authenticator', 'anon', 'authenticated']) r")
+            .await,
+        "t"
+    );
+    assert_eq!(
+        fx.value("SELECT string_agg(defaclobjtype::text, ',' ORDER BY defaclobjtype) FROM pg_default_acl WHERE defaclnamespace = 'reporting'::regnamespace AND defaclrole = 'postgres'::regrole")
+            .await,
+        "S,f,r"
+    );
+    fx.direct("authenticator", &fx.authenticator_password().await, "SELECT 1")
+        .await
+        .expect("authenticator logs in with the branch's password");
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "chelabase changed");
+    assert_eq!(fx.data_api_check("reporting").await, "t");
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "public")
+        .await
+        .expect("reset default schema");
+
+    // 4. AC 9: the escape hatch for a permanent rollback.
+    fx.admin("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS NULL").await;
+    assert_eq!(fx.data_api_check("public").await, "f", "no stamp");
+    fx.assert_quarantined_by_bootstrap("escape hatch").await;
+
+    // 5. AC 3, 4: a trigger the owner made, with the owner's comment, is no stamp.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl; CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    let forge = "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';";
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    assert_eq!(fx.data_api_check("public").await, "f", "owner-forged");
+    fx.assert_quarantined_by_bootstrap("owner-forged, schema present").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin(worker::data_api::REMOVE_DATA_API_SQL).await;
+    assert_eq!(fx.value("SELECT to_regnamespace('chelabase') IS NULL").await, "t");
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    let before = fx.quarantines().await;
+    bootstrap(fx).await;
+    assert_eq!(fx.quarantines().await, before, "nothing to quarantine");
+    fx.assert_current("owner-forged, schema removed").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin("CREATE FUNCTION public.other_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+DROP EVENT TRIGGER chelabase_schema_version_ddl;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.other_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "f", "another function");
+    fx.assert_quarantined_by_bootstrap("a superuser's trigger on another function").await;
+    fx.admin("DROP FUNCTION public.other_evt()").await;
+
+    // 6. AC 6, 7, 8: a real tamper quarantines whatever the stamp says.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE FUNCTION chelabase.owners() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; ALTER FUNCTION chelabase.owners() OWNER TO postgres;")
+        .await;
+    fx.assert_quarantined_by_bootstrap("newer, a function the owner owns").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE ROLE dsv_member LOGIN; GRANT chelabase_admin TO dsv_member;").await;
+    fx.assert_quarantined_by_bootstrap("newer, a member").await;
+    assert_eq!(
+        fx.value("SELECT pg_has_role('dsv_member', 'chelabase_admin', 'MEMBER')").await,
+        "f",
+        "the membership is revoked"
+    );
+    fx.admin("DROP ROLE dsv_member").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.owner("CREATE EXTENSION hstore SCHEMA chelabase")
+        .await
+        .expect("the owner installs a trusted extension in chelabase");
+    assert_eq!(
+        fx.value("SELECT extnamespace = 'chelabase'::regnamespace FROM pg_extension WHERE extname = 'hstore'").await,
+        "t"
+    );
+    fx.assert_quarantined_by_bootstrap("newer, a trusted extension").await;
+    fx.admin("DROP EXTENSION hstore").await;
+
+    // 7. AC 5: older, missing and unparseable stamps are installed over.
+    for (what, comment) in [
+        ("older", "'chelabase data api schema 0'"),
+        ("missing", "NULL"),
+        ("unparseable", "'chelabase data api schema x'"),
+    ] {
+        fx.admin(&format!(
+            "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment};
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;"
+        ))
+        .await;
+        assert_eq!(fx.data_api_check("public").await, "f", "{what}");
+        fx.assert_quarantined_by_bootstrap(what).await;
     }
 }
