@@ -1,6 +1,7 @@
 //! Object names, blob keys and the small pieces of the object routes that need no database:
 //! the upload's byte counter and streaming, `Content-Disposition`, and the list cursor.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -207,6 +208,69 @@ pub fn encode_path(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Why an S3 bucket or key has no `/storage/v1` path (m8 answers `InvalidBucketName`,
+/// `KeyTooLongError` or `InvalidArgument`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameError {
+    /// Not a [`crate::buckets::valid_bucket_name`], or a literal segment of a storage route.
+    Bucket,
+    /// Over [`MAX_NAME_BYTES`].
+    KeyTooLong,
+    /// Otherwise not a [`valid_object_name`].
+    Key,
+}
+
+/// An S3 bucket as its `/storage/v1` path segment: a [`crate::buckets::valid_bucket_name`]
+/// that no storage route uses as a literal where a bucket goes ([`bucket_route_words`]), so
+/// `/storage/v1/object/{bucket}/…` always reaches the object route and never a keyless one
+/// (`public`, `sign`, `upload`, …).
+pub fn s3_bucket_path(bucket: &str) -> Result<String, NameError> {
+    static WORDS: std::sync::LazyLock<BTreeSet<&'static str>> =
+        std::sync::LazyLock::new(|| bucket_route_words(chelabase_routes::ENDPOINTS));
+    if !crate::buckets::valid_bucket_name(bucket) || WORDS.contains(bucket) {
+        return Err(NameError::Bucket);
+    }
+    Ok(encode_path(bucket))
+}
+
+/// An S3 key (already decoded by s3s) as the `{*name}` part of a `/storage/v1` path: a
+/// [`valid_object_name`], each `/`-separated piece percent-encoded ([`encode_path`]), so
+/// axum's `Path` extracts exactly `key` (`%`, `?`, `#` and non-ASCII never reach the URL raw).
+pub fn s3_object_path(key: &str) -> Result<String, NameError> {
+    if key.len() > MAX_NAME_BYTES {
+        return Err(NameError::KeyTooLong);
+    }
+    if !valid_object_name(key) {
+        return Err(NameError::Key);
+    }
+    Ok(encode_path(key))
+}
+
+/// Every literal segment a storage route puts where another storage route has `{bucket}`
+/// (the same segments before it): the words a bucket's name would collide with. Read from the
+/// route table, so a new route's word is reserved with no edit here.
+fn bucket_route_words(endpoints: &[chelabase_routes::Endpoint]) -> BTreeSet<&'static str> {
+    let storage: Vec<Vec<&'static str>> = endpoints
+        .iter()
+        .filter(|e| e.service == chelabase_routes::Service::Storage)
+        .map(|e| e.path.split('/').collect())
+        .collect();
+    let mut words = BTreeSet::new();
+    for route in &storage {
+        for (at, _) in route.iter().enumerate().filter(|(_, s)| **s == "{bucket}") {
+            let above = &route[..at];
+            words.extend(
+                storage
+                    .iter()
+                    .filter(|other| other.len() > at && other[..at] == *above)
+                    .map(|other| other[at])
+                    .filter(|s| !s.starts_with('{')),
+            );
+        }
+    }
+    words
 }
 
 /// `"etag"`, whatever quoting the store gave it.
@@ -530,6 +594,195 @@ mod tests {
         );
         assert!(!none_match("\"abd\"", "abc"));
         assert_eq!(parse_cursor(&make_cursor("12", "a/b")), Some(("12", "a/b")));
+    }
+
+    /// Serves every storage route's path (as the routes table declares it) on a local port;
+    /// each answers its endpoint's name and what axum's `Path` extracted. The object routes
+    /// extract `(bucket, name)` as their handlers do.
+    async fn serve_storage_routes() -> String {
+        use axum::{Json, extract::Path, routing::any};
+        let mut paths = std::collections::BTreeMap::new();
+        for ep in chelabase_routes::ENDPOINTS
+            .iter()
+            .filter(|e| e.service == chelabase_routes::Service::Storage)
+        {
+            paths.entry(ep.path).or_insert(ep.name);
+        }
+        let mut router = axum::Router::new();
+        for (path, name) in paths {
+            router = if path == chelabase_routes::storage::DOWNLOAD_OBJECT.path {
+                router.route(
+                    path,
+                    any(|Path((bucket, key)): Path<(String, String)>| async move {
+                        Json((
+                            "object",
+                            vec![("bucket".to_owned(), bucket), ("name".to_owned(), key)],
+                        ))
+                    }),
+                )
+            } else {
+                router.route(
+                    path,
+                    any(
+                        move |Path(params): Path<Vec<(String, String)>>| async move {
+                            Json((name, params))
+                        },
+                    ),
+                )
+            };
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// AC 1: any key `valid_object_name` accepts, under any bucket `s3_bucket_path` accepts,
+    /// reaches the object route with exactly that bucket and key.
+    #[test]
+    fn s3_object_path_round_trips() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestCaseError, TestRunner};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let base = rt.block_on(serve_storage_routes());
+        let client = chelabase_http::client_builder().build().unwrap();
+        let fetch = |bucket: &str, key: &str| -> (String, Vec<(String, String)>) {
+            let url = format!(
+                "{base}/storage/v1/object/{}/{}",
+                s3_bucket_path(bucket).unwrap(),
+                s3_object_path(key).unwrap()
+            );
+            rt.block_on(async {
+                let res = client.get(&url).send().await.unwrap();
+                assert!(res.status().is_success(), "{url}: {}", res.status());
+                res.json().await.unwrap()
+            })
+        };
+        let expect = |bucket: &str, key: &str| {
+            (
+                "object".to_owned(),
+                vec![
+                    ("bucket".to_owned(), bucket.to_owned()),
+                    ("name".to_owned(), key.to_owned()),
+                ],
+            )
+        };
+
+        for key in [
+            "a%252Fb",
+            "a%2Fb",
+            "%2F",
+            "a?b=c",
+            "x#y",
+            "a b+c&d",
+            "..z/a..b",
+            "日本/語.txt",
+            "😀/%/?/#",
+            "sign/x",
+            "public/main/b/k",
+            &"%".repeat(MAX_NAME_BYTES),
+        ] {
+            assert_eq!(fetch("avatars", key), expect("avatars", key), "{key:?}");
+        }
+        // Refused by `valid_object_name`, so never built into a path.
+        for key in ["../z", "./z", "a/../z", "/z", "a//b", "a/"] {
+            assert_eq!(s3_object_path(key), Err(NameError::Key), "{key:?}");
+        }
+
+        let buckets = "[a-z0-9][a-z0-9._-]{0,20}"
+            .prop_filter("not a route word", |b| s3_bucket_path(b).is_ok());
+        let keys = prop_oneof![
+            "[a-z%?#/. +&=;é日😀~_-]{1,40}",
+            "\\PC{1,12}(/\\PC{1,12}){0,3}",
+            "(%[0-9A-Fa-f]{2}|%25|[a-z/]){1,30}",
+        ]
+        .prop_filter("a valid object name", |k| valid_object_name(k));
+        TestRunner::new(Config::with_cases(256))
+            .run(&(buckets, keys), |(bucket, key)| {
+                let got = fetch(&bucket, &key);
+                if got != expect(&bucket, &key) {
+                    return Err(TestCaseError::fail(format!("{bucket:?} {key:?}: {got:?}")));
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// AC 2: a literal segment of any storage route, and an invalid bucket name, are refused.
+    #[test]
+    fn s3_bucket_path_refuses_route_words_and_invalid() {
+        for word in [
+            "public", "sign", "upload", "list", "copy", "move", "resolve", "session",
+        ]
+        .into_iter()
+        .chain(crate::buckets::RESERVED_BUCKET_NAMES)
+        .chain(bucket_route_words(chelabase_routes::ENDPOINTS))
+        {
+            assert_eq!(s3_bucket_path(word), Err(NameError::Bucket), "{word}");
+        }
+        for bad in [
+            "",
+            "Bad",
+            "-x",
+            ".x",
+            "a/b",
+            "a b",
+            "a%2Fb",
+            "é",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(s3_bucket_path(bad), Err(NameError::Bucket), "{bad:?}");
+        }
+        for ok in ["avatars", "user-files.v2", "0_x", "a..b", &"a".repeat(63)] {
+            assert_eq!(s3_bucket_path(ok).as_deref(), Ok(ok), "{ok}");
+        }
+        assert_eq!(
+            s3_object_path(&"a".repeat(MAX_NAME_BYTES + 1)),
+            Err(NameError::KeyTooLong)
+        );
+        assert_eq!(s3_object_path(&"é".repeat(513)), Err(NameError::KeyTooLong));
+        for bad in ["", "a\nb", "a\u{0}b", "a/\u{ff0e}"] {
+            assert_eq!(s3_object_path(bad), Err(NameError::Key), "{bad:?}");
+        }
+        assert_eq!(s3_object_path("a?b#c%d/é").unwrap(), "a%3Fb%23c%25d/%C3%A9");
+    }
+
+    /// AC 3: a literal segment a new storage route puts where a bucket goes is reserved by
+    /// the route table alone.
+    #[test]
+    fn reserved_words_follow_the_route_table() {
+        use chelabase_routes::{ENDPOINTS, Endpoint, Service, storage};
+        let words = bucket_route_words(ENDPOINTS);
+        for word in crate::buckets::RESERVED_BUCKET_NAMES {
+            assert!(words.contains(word), "{word} in {words:?}");
+        }
+        // Parameters and the segments above the bucket are not words.
+        for not in ["{bucket}", "{name}", "storage", "v1", "object", "complete"] {
+            assert!(!words.contains(not), "{not} in {words:?}");
+        }
+        let mut table = ENDPOINTS.to_vec();
+        table.push(Endpoint {
+            path: "/storage/v1/object/info/{bucket}/{*name}",
+            ..storage::DOWNLOAD_OBJECT
+        });
+        table.push(Endpoint {
+            path: "/storage/v1/upload/batch/{id}",
+            ..storage::LIST_PARTS
+        });
+        // Another service's route is not a storage route.
+        table.push(Endpoint {
+            path: "/storage/v1/object/elsewhere",
+            service: Service::Functions,
+            ..storage::COPY_OBJECT
+        });
+        let grown = bucket_route_words(&table);
+        assert!(
+            grown.contains("info") && grown.contains("batch"),
+            "{grown:?}"
+        );
+        assert!(!grown.contains("elsewhere"), "{grown:?}");
+        assert!(words.is_subset(&grown));
     }
 
     fn body(
