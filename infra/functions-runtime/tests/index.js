@@ -6,3 +6,4 @@ require("./binding.test.mjs");
 require("./scheduled.test.mjs");
 require("./response-headers.test.mjs");
 require("./storage.test.mjs");
+require("./sql_binding.test.mjs");
