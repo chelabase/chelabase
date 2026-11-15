@@ -4924,11 +4924,11 @@ async fn review(fx: &Fx) {
 // --- data-api-schema-stamp m1 (#198): the chelabase data API schema's stamp -----------------
 
 /// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
-/// ACL, body), the event triggers (owner, state, function, comment) and the schema itself.
+/// ACL, whole definition: `prosrc` is empty for the `BEGIN ATOMIC` claim helpers), the event triggers (owner, state, function, comment) and the schema itself.
 const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
   SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
     FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
-  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(p.prosrc)
+  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(pg_catalog.pg_get_functiondef(p.oid))
     FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
   UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
     FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
@@ -5143,4 +5143,105 @@ CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$
         assert_eq!(fx.data_api_check("public").await, "f", "{what}");
         fx.assert_quarantined_by_bootstrap(what).await;
     }
+}
+
+// --- data-api-schema-stamp m2 (#199): the app users scripts refuse a newer chelabase -------
+
+/// `chelabase_auth_sync`'s attributes and password (`<none>` without the role).
+const AUTH_SYNC_SQL: &str = "SELECT coalesce((SELECT rolcanlogin || ' ' || rolinherit || ' ' || rolbypassrls || ' ' || rolconnlimit || ' ' || coalesce(rolpassword, '<none>')
+  FROM pg_authid WHERE rolname = 'chelabase_auth_sync'), '<none>')";
+
+/// The claim helpers' definitions. They're `BEGIN ATOMIC`, so `prosrc` is empty (the body is
+/// in `prosqlbody`, which [`CHELABASE_SHAPE_SQL`] doesn't hash): compare the whole definition.
+const HELPERS_PROSRC_SQL: &str = "SELECT string_agg(proname || ':' || md5(pg_get_functiondef(oid)), ',' ORDER BY proname) FROM pg_proc
+  WHERE pronamespace = 'chelabase'::regnamespace AND proname IN ('claims', 'user_id', 'user_email')";
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn app_users_newer_schema_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { app_users_newer_schema(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn app_users_newer_schema(fx: &Fx) {
+    use worker::app_users_sql::{claim_helpers_sql, newer_data_api_error, users_bootstrap_sql};
+    // The scripts as the worker runs them (admin_sql, as cloud_admin, in the auth database).
+    let enable = |password: &str| {
+        users_bootstrap_sql("public", "users", &chelabase_neon::scram::verifier(password), OWNER)
+    };
+    let helpers = claim_helpers_sql();
+
+    // 1. AC 3, current stamp: both scripts run as today.
+    fx.assert_current("fresh").await;
+    fx.admin(&enable("first-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, "<none>", "the enable made chelabase_auth_sync");
+
+    // 2. AC 1, 2: a valid newer stamp, and helper bodies this worker would rewrite (the
+    // bootstrap superuser's, so no tamper). Each script errors naming both versions and
+    // changes nothing: not chelabase, not the role, not the helpers.
+    fx.admin(MAKE_NEWER_SQL).await;
+    let unrewritten = fx.value(CHELABASE_SHAPE_SQL).await;
+    fx.admin(
+        "CREATE OR REPLACE FUNCTION chelabase.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT 'v99'; END;
+CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT '{\"v\": 99}'::jsonb; END;",
+    )
+    .await;
+    let shape = fx.value(CHELABASE_SHAPE_SQL).await;
+    assert_ne!(shape, unrewritten, "the shape hash sees a BEGIN ATOMIC helper's body");
+    let auth_sync = fx.value(AUTH_SYNC_SQL).await;
+    let prosrc = fx.value(HELPERS_PROSRC_SQL).await;
+    let why = format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}");
+    for (what, script) in [("enable", enable("second-password")), ("claim helpers", helpers.clone())] {
+        let e = fx.admin_on(&fx.ep, &script).await.expect_err(what);
+        assert_eq!(newer_data_api_error(&e), Some(why.as_str()), "{what}: {e}");
+        assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape, "{what} changed a newer chelabase");
+        assert_eq!(fx.value(AUTH_SYNC_SQL).await, auth_sync, "{what} changed chelabase_auth_sync");
+        assert_eq!(fx.value(HELPERS_PROSRC_SQL).await, prosrc, "{what} rewrote the claim helpers");
+    }
+    // The protect triggers are still there and enabled (the guard runs before their drop).
+    assert_eq!(
+        fx.value("SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_users_protect_%' AND evtenabled <> 'D'").await,
+        "2"
+    );
+    // m1 audit nit: the data API bootstrap left the newer schema alone; with one of its event
+    // triggers disabled the machinery check still fails, and the script says so.
+    let data_api = worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, "public");
+    let flagged = |out: &str| out.lines().any(|l| l.trim_end() == worker::data_api::NEWER_MACHINERY_OFF);
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && !flagged(&out), "{out}");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions DISABLE").await;
+    assert_eq!(fx.data_api_check("public").await, "f");
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && flagged(&out), "{out}");
+    assert_eq!(fx.data_api_check("public").await, "f", "left disabled: the loop the warning names");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions ENABLE").await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape);
+
+    // 3. AC 3: older and missing stamps run as today.
+    for (what, comment) in [("older", "'chelabase data api schema 0'"), ("missing", "NULL")] {
+        fx.admin(&format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment}")).await;
+        fx.admin(&enable(&format!("{what}-password"))).await;
+        fx.admin(&helpers).await;
+        assert_ne!(fx.value(HELPERS_PROSRC_SQL).await, prosrc, "{what}: the helpers are this worker's");
+    }
+
+    // 4. AC 3: an owner-forged stamp never blocks either script.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl").await;
+    fx.owner(
+        "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';",
+    )
+    .await
+    .expect("the owner makes an event trigger");
+    let before = fx.value(AUTH_SYNC_SQL).await;
+    fx.admin(&enable("forged-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, before, "the enable set the new password");
 }

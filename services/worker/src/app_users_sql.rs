@@ -5,7 +5,10 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::data_api::{BOOTSTRAP_LOCK_KEY, LOCK_TIMEOUT_SECS, quote_ident, quote_literal};
+use crate::data_api::{
+    BOOTSTRAP_LOCK_KEY, DATA_API_SCHEMA_VERSION, LOCK_TIMEOUT_SECS, NEWER_DATA_API_MARK,
+    quote_ident, quote_literal, stamp_version_sql, valid_newer_sql,
+};
 
 /// The login the sync connects as (`SET LOCAL ROLE` from the admin connection, or directly
 /// with its sealed password): the only role the guard trigger lets write the users table.
@@ -44,7 +47,10 @@ pub fn valid_identifier(s: &str) -> bool {
 /// authenticated`. The first line is a marker comment, so the script is told apart from the
 /// data API bootstrap.
 ///
-/// The protect event triggers are dropped right after the lock and re-created last, so a
+/// A `chelabase` schema a newer worker manages (a valid newer stamp) stops the script right
+/// after the lock, before anything changes ([`newer_data_api_guard`]).
+///
+/// The protect event triggers are dropped right after that and re-created last, so a
 /// broken state (the table dropped with event triggers off) can't block the run that
 /// repairs it. Every function is owned by the superuser running the script (Neon refuses a
 /// superuser running a function a non-superuser owns).
@@ -62,13 +68,14 @@ pub fn users_bootstrap_sql(
     let password = quote_literal(sync_verifier);
     let owner = quote_ident(owner_role);
     let claim_helpers = claim_helpers_body();
+    let newer_guard = newer_data_api_guard();
     format!(
         r#"-- chelabase:users-bootstrap
 BEGIN;
 SET search_path = pg_catalog, pg_temp;
 SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
 SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});
-DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
+{newer_guard}DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
 DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
 DO $$ BEGIN
   IF pg_catalog.to_regnamespace('chelabase') IS NULL THEN
@@ -408,13 +415,37 @@ GRANT EXECUTE ON FUNCTION chelabase.claims(), chelabase.user_id(), chelabase.use
     .to_string()
 }
 
-/// [`claim_helpers_body`] as its own transaction, under [`BOOTSTRAP_LOCK_KEY`].
+/// [`claim_helpers_body`] as its own transaction, under [`BOOTSTRAP_LOCK_KEY`], refusing a
+/// newer `chelabase` first ([`newer_data_api_guard`]).
 pub fn claim_helpers_sql() -> String {
     format!(
         "-- chelabase:claim-helpers\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';\n\
-         SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n{}COMMIT;\n",
+         SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n{}{}COMMIT;\n",
+        newer_data_api_guard(),
         claim_helpers_body()
     )
+}
+
+/// Refuses a `chelabase` schema a newer worker manages: runs right after the advisory lock,
+/// before anything changes. m1's fragment reads the stamp; NULL (no stamp, an owner-made
+/// trigger, one that doesn't parse) is "not newer", so only a valid newer stamp stops the
+/// script. The error names both versions and rolls the transaction back.
+fn newer_data_api_guard() -> String {
+    format!(
+        "DO $$ BEGIN\n  IF COALESCE({newer}, false) THEN\n    \
+         RAISE EXCEPTION '{NEWER_DATA_API_MARK}: the chelabase schema is version %, newer than this worker''s {DATA_API_SCHEMA_VERSION}', {version};\n  \
+         END IF;\nEND $$;\n",
+        newer = valid_newer_sql(),
+        version = stamp_version_sql(),
+    )
+}
+
+/// Whether a script stopped at [`newer_data_api_guard`]: the reason (naming both versions),
+/// from the `ERROR:` line psql printed, up to the end of that line.
+pub fn newer_data_api_error(error: &str) -> Option<&str> {
+    let marker = format!("ERROR:  {NEWER_DATA_API_MARK}: ");
+    let start = error.find(&marker)? + marker.len();
+    Some(error[start..].lines().next().unwrap_or("").trim_end())
 }
 
 /// Whether `schema.table` exists (psql prints `t` or `f`).
@@ -469,7 +500,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::data_api::BOOTSTRAP_LOCK_KEY;
+    use crate::data_api::{BOOTSTRAP_LOCK_KEY, DATA_API_SCHEMA_VERSION, NEWER_DATA_API_MARK};
 
     /// The claim helpers: usable by every role (T4: a policy without `TO` applies to PUBLIC,
     /// custom data API roles included); they only read a GUC.
@@ -492,14 +523,33 @@ ALTER FUNCTION chelabase.user_email() OWNER TO CURRENT_USER;
 GRANT EXECUTE ON FUNCTION chelabase.claims(), chelabase.user_id(), chelabase.user_email() TO PUBLIC;
 "#;
 
-    /// The users bootstrap for `public.users`, password `pw`, owner `postgres`, up to the
-    /// claim helpers.
-    const BOOTSTRAP_HEAD: &str = r#"-- chelabase:users-bootstrap
+    /// The users bootstrap's first lines, up to the advisory lock.
+    const BOOTSTRAP_LOCKED: &str = r#"-- chelabase:users-bootstrap
 BEGIN;
 SET search_path = pg_catalog, pg_temp;
 SET LOCAL lock_timeout = '20s';
 SELECT pg_catalog.pg_advisory_xact_lock(7163086723497615873);
-DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
+"#;
+
+    /// The claim helpers script's first lines, up to the advisory lock.
+    const HELPERS_LOCKED: &str = "-- chelabase:claim-helpers\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '20s';\n\
+         SELECT pg_catalog.pg_advisory_xact_lock(7163086723497615873);\n";
+
+    /// The guard both scripts run right after the lock: m1's newer-stamp fragment, NULL read
+    /// as false, raising the marked error naming both versions.
+    fn guard() -> String {
+        format!(
+            "DO $$ BEGIN\n  IF COALESCE({newer}, false) THEN\n    \
+             RAISE EXCEPTION '{NEWER_DATA_API_MARK}: the chelabase schema is version %, newer than this worker''s {DATA_API_SCHEMA_VERSION}', {version};\n  \
+             END IF;\nEND $$;\n",
+            newer = crate::data_api::valid_newer_sql(),
+            version = crate::data_api::stamp_version_sql(),
+        )
+    }
+
+    /// The users bootstrap for `public.users`, password `pw`, owner `postgres`, after the
+    /// guard and up to the claim helpers.
+    const BOOTSTRAP_HEAD: &str = r#"DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
 DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
 DO $$ BEGIN
   IF pg_catalog.to_regnamespace('chelabase') IS NULL THEN
@@ -783,7 +833,7 @@ COMMIT;
     fn users_bootstrap_sql_is_exact() {
         assert_eq!(
             bootstrap(),
-            format!("{BOOTSTRAP_HEAD}{CLAIMS}{BOOTSTRAP_TAIL}")
+            format!("{BOOTSTRAP_LOCKED}{}{BOOTSTRAP_HEAD}{CLAIMS}{BOOTSTRAP_TAIL}", guard())
         );
         assert!(bootstrap().contains(&format!("pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});")));
     }
@@ -874,25 +924,110 @@ COMMIT;
         assert_eq!(claim_helpers_body(), CLAIMS);
         assert_eq!(
             claim_helpers_sql(),
-            format!(
-                "-- chelabase:claim-helpers\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '20s';\n\
-                 SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n{CLAIMS}COMMIT;\n"
-            )
+            format!("{HELPERS_LOCKED}{}{CLAIMS}COMMIT;\n", guard())
         );
+        assert!(HELPERS_LOCKED.contains(&format!("pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});")));
+    }
+
+    /// The statements that change something, in the order a script could reach them.
+    const CHANGES: [&str; 8] = [
+        "DROP ",
+        "ALTER ",
+        "CREATE ",
+        "GRANT ",
+        "REVOKE ",
+        "INSERT ",
+        "COMMENT ",
+        "SET ROLE",
+    ];
+
+    /// The guard comes right after the lock and before every statement that changes
+    /// something, reads the stamp with m1's fragment, and treats a NULL (no stamp, a forged
+    /// one, one that doesn't parse) as "not newer".
+    fn assert_guarded_first(sql: &str, locked: &str) {
+        let guard = guard();
+        assert!(sql.starts_with(&format!("{locked}{guard}")), "{sql}");
+        assert_eq!(sql.matches(&guard).count(), 1);
+        assert!(guard.contains(&format!(
+            "IF COALESCE({}, false) THEN",
+            crate::data_api::valid_newer_sql()
+        )));
+        assert!(guard.contains(&format!(
+            "RAISE EXCEPTION '{NEWER_DATA_API_MARK}: the chelabase schema is version %, newer than this worker''s {DATA_API_SCHEMA_VERSION}'"
+        )));
+        let end = locked.len() + guard.len();
+        for change in CHANGES {
+            assert!(!sql[..end].contains(change), "{change} before the guard");
+        }
+        // The guard itself only reads.
+        assert!(!guard.contains("PERFORM"));
+    }
+
+    /// AC 1: the users bootstrap refuses a newer `chelabase` before it drops the protect
+    /// triggers, alters `chelabase_auth_sync` or replaces a function.
+    #[test]
+    fn users_bootstrap_refuses_a_newer_chelabase_first() {
+        let sql = bootstrap();
+        assert_guarded_first(&sql, BOOTSTRAP_LOCKED);
+        let guarded = BOOTSTRAP_LOCKED.len() + guard().len();
+        for first in [
+            "DROP EVENT TRIGGER",
+            "ALTER ROLE",
+            "CREATE OR REPLACE",
+            "CREATE ROLE",
+        ] {
+            assert!(sql.find(first).unwrap() >= guarded, "{first}");
+        }
+    }
+
+    /// AC 2: the claim helpers script refuses a newer `chelabase` before it replaces the
+    /// helpers. The data API bootstrap splices the body without the guard (m1 gates it there).
+    #[test]
+    fn claim_helpers_refuse_a_newer_chelabase_first() {
+        let sql = claim_helpers_sql();
+        assert_guarded_first(&sql, HELPERS_LOCKED);
+        let guarded = HELPERS_LOCKED.len() + guard().len();
+        assert!(sql.find("CREATE OR REPLACE").unwrap() >= guarded);
+        assert!(sql.find("GRANT USAGE").unwrap() >= guarded);
+        assert!(!claim_helpers_body().contains(NEWER_DATA_API_MARK));
+    }
+
+    /// The marked error is read from the `ERROR:` psql printed, up to the end of its line.
+    #[test]
+    fn newer_data_api_error_reads_the_marked_error() {
+        let why = "the chelabase schema is version 99, newer than this worker's 1";
+        assert_eq!(
+            newer_data_api_error(&format!(
+                "psql in compute ep exited with 3: psql:<stdin>:6: ERROR:  {NEWER_DATA_API_MARK}: {why}\nCONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE"
+            )),
+            Some(why)
+        );
+        assert_eq!(
+            newer_data_api_error(&format!("ERROR:  {NEWER_DATA_API_MARK}: {why}")),
+            Some(why)
+        );
+        for other in [
+            String::new(),
+            "psql:<stdin>:6: ERROR:  injected failure".to_string(),
+            format!("ERROR:  {NEWER_DATA_API_MARK}:{why}"),
+            format!("ERROR: {NEWER_DATA_API_MARK}: {why}"),
+            format!("NOTICE:  {NEWER_DATA_API_MARK}: {why}"),
+            format!("ERROR:  {}: the storage schema is version 99", crate::storage_schema::NEWER_SCHEMA_MARK),
+        ] {
+            assert_eq!(newer_data_api_error(&other), None, "{other:?}");
+        }
     }
 
     /// C2: a broken earlier state (the users table dropped with event triggers off) can't
-    /// make the protect trigger refuse the re-run that repairs it.
+    /// make the protect trigger refuse the re-run that repairs it. Only the newer-stamp guard
+    /// (which changes nothing) comes between the lock and the drops.
     #[test]
-    fn users_bootstrap_drops_protect_triggers_right_after_the_lock() {
+    fn users_bootstrap_drops_protect_triggers_right_after_the_guard() {
         let sql = bootstrap();
-        let lock = format!(
-            "SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n\
-             DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;\n\
-             DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;\n"
-        );
         assert!(sql.starts_with(&format!(
-            "-- chelabase:users-bootstrap\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '20s';\n{lock}"
+            "{BOOTSTRAP_LOCKED}{}DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;\n\
+             DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;\n",
+            guard()
         )));
         // Re-created last, just before the commit.
         let create = sql
