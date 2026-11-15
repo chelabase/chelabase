@@ -977,6 +977,10 @@ mod tests {
             ))),
             inflight: crate::limits::InFlight::new(1 << 20),
             events: crate::events::ObjectEvents::none(),
+            s3_keys: crate::s3::keys::S3Keys::new(Arc::new(crate::control::Orchestrator::new(
+                "http://127.0.0.1:9",
+                "t",
+            ))),
         };
         let data = identity("authenticated", Some(Uuid::new_v4()), Uuid::new_v4());
         let at = Located {

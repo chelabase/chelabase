@@ -33,14 +33,17 @@ async fn main() -> anyhow::Result<()> {
         server_tls,
     );
     let managed = InternalSource::storage_login(&config.internal_url, &config.internal_token);
+    let control: Arc<dyn storage::control::Control> = Arc::new(storage::control::Orchestrator::new(
+        &config.internal_url,
+        &config.internal_token,
+    ));
     let state = Arc::new(AppState {
         engine: Engine::new(pools, managed),
         verifier: InternalVerifier::from_env()?,
         store: Arc::new(chelabase_storage::S3Store::new(&config.store).await),
-        urls: storage::control::Urls::new(Arc::new(storage::control::Orchestrator::new(
-            &config.internal_url,
-            &config.internal_token,
-        ))),
+        urls: storage::control::Urls::new(control.clone()),
+        // s3-endpoint m5: S3 access keys, on the same internal listener.
+        s3_keys: storage::s3::keys::S3Keys::new(control),
         inflight: storage::limits::InFlight::new(config.max_inflight_bytes)
             .with_body_idle(config.body_idle),
         // m18: object events, published on the NATS connection `events::spawn` makes.

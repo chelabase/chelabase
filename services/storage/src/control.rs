@@ -1,6 +1,7 @@
 //! What signed URLs need from the control plane, through the orchestrator's internal routes
 //! behind storage's bearer: the URL key, whether the key that minted a URL is still live, and
-//! the one-time upload tokens (consumed there, so on every replica and across restarts).
+//! the one-time upload tokens (consumed there, so on every replica and across restarts); and
+//! an S3 access key's secret and scope (s3-endpoint m5, cached in [`crate::s3::keys`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -85,6 +86,58 @@ impl Minter {
     }
 }
 
+/// An S3 key's secret. It is wiped from memory when dropped, never printed (`Debug` and
+/// `Display` show `S3Secret(..)`), and never serialised; [`S3Secret::expose`] hands it to
+/// SigV4.
+#[derive(Clone)]
+pub struct S3Secret(zeroize::Zeroizing<String>);
+
+impl S3Secret {
+    pub fn new(secret: String) -> Self {
+        S3Secret(zeroize::Zeroizing::new(secret))
+    }
+
+    /// The secret itself, for the signature check only.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for S3Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("S3Secret(..)")
+    }
+}
+
+impl std::fmt::Display for S3Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
+impl<'de> Deserialize<'de> for S3Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d).map(S3Secret::new)
+    }
+}
+
+/// A live S3 access key, as the orchestrator's `GET /internal/storage/s3-keys/{id}` answers it:
+/// its secret and the identity its requests run as. Every field is required: an answer
+/// without the role's identity (`role_oid`, `role_timeline`) is unreadable, never a key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct S3Key {
+    pub key_id: Uuid,
+    pub access_key_id: String,
+    pub secret: S3Secret,
+    pub branch_id: Uuid,
+    pub project_id: Uuid,
+    /// The Postgres database the key works in.
+    pub database: String,
+    pub role: String,
+    pub role_oid: i64,
+    pub role_timeline: String,
+}
+
 /// The control plane couldn't answer (logged by the caller): 503.
 #[derive(Debug)]
 pub struct Unreachable(pub String);
@@ -115,6 +168,9 @@ pub trait Control: Send + Sync + 'static {
         &self,
         token_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<(LiveKey, Value)>, Unreachable>>;
+    /// The S3 key with this access key id while it is live and its branch and database can
+    /// serve; `None` otherwise.
+    fn s3_key<'a>(&'a self, access_key_id: &'a str) -> BoxFuture<'a, Result<Option<S3Key>, Unreachable>>;
 }
 
 /// The control plane, with the URL key fetched once and each key's liveness cached
@@ -231,6 +287,25 @@ impl Orchestrator {
     }
 }
 
+/// The S3 key route's 200 body, for the key `asked` for. Read straight from the bytes (no
+/// `Value` copy of the secret); an answer for another key is refused. The error never quotes
+/// the body: only a missing field's name, or the kind of fault.
+pub(crate) fn parse_s3_key(body: &[u8], asked: &str) -> Result<S3Key, Unreachable> {
+    let key: S3Key = serde_json::from_slice(body).map_err(|e| {
+        let detail = e.to_string();
+        // serde's other messages can quote a value ("invalid type: string \"...\"").
+        let detail = match detail.split_once(" at line ") {
+            Some((missing, _)) if missing.starts_with("missing field `") => missing.to_owned(),
+            _ => format!("{:?} error", e.classify()),
+        };
+        Unreachable(format!("an unreadable S3 key answer: {detail}"))
+    })?;
+    if key.access_key_id != asked {
+        return Err(Unreachable("the S3 key answer names another key".into()));
+    }
+    Ok(key)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, Unreachable> {
     serde_json::from_value(v).map_err(|e| Unreachable(format!("reading the answer: {e}")))
 }
@@ -322,6 +397,34 @@ impl Control for Orchestrator {
             }
         })
     }
+
+    fn s3_key<'a>(&'a self, access_key_id: &'a str) -> BoxFuture<'a, Result<Option<S3Key>, Unreachable>> {
+        Box::pin(async move {
+            // The id goes into the path: only the access key id's shape ever does.
+            if !chelabase_types::s3_key::is_access_key_id(access_key_id) {
+                return Ok(None);
+            }
+            let path = format!("/internal/storage/s3-keys/{access_key_id}");
+            let res = self
+                .http
+                .get(format!("{}{path}", self.base))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(|e| Unreachable(e.to_string()))?;
+            match res.status().as_u16() {
+                200 => {
+                    // Read into a buffer that is wiped when dropped, and parsed straight into
+                    // the key (no `Value` holding a copy of the secret).
+                    let body = res.bytes().await.map_err(|e| Unreachable(e.to_string()))?;
+                    let body = zeroize::Zeroizing::new(Vec::from(body));
+                    parse_s3_key(&body, access_key_id).map(Some)
+                }
+                404 => Ok(None),
+                code => Err(status(&path, code)),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +457,9 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
         fn consume_upload(&self, _: Uuid) -> BoxFuture<'_, Result<Option<(LiveKey, Value)>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn s3_key<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<S3Key>, Unreachable>> {
             Box::pin(async { Ok(None) })
         }
     }
@@ -416,6 +522,9 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
         fn consume_upload(&self, _: Uuid) -> BoxFuture<'_, Result<Option<(LiveKey, Value)>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn s3_key<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<Option<S3Key>, Unreachable>> {
             Box::pin(async { Ok(None) })
         }
     }

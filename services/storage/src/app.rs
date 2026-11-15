@@ -38,6 +38,8 @@ pub struct AppState<S, M> {
     pub inflight: crate::limits::InFlight,
     /// Object events after each committed write (m18).
     pub events: Arc<crate::events::ObjectEvents>,
+    /// S3 access keys, cached and dropped on NATS events (s3-endpoint m5).
+    pub s3_keys: crate::s3::keys::S3Keys,
 }
 
 /// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
@@ -155,6 +157,7 @@ mod tests {
             urls: Urls::new(Arc::new(crate::control::Orchestrator::new("http://127.0.0.1:9", "t"))),
             inflight: crate::limits::InFlight::new(1 << 30),
             events: crate::events::ObjectEvents::none(),
+            s3_keys: crate::s3::keys::S3Keys::new(Arc::new(crate::control::Orchestrator::new("http://127.0.0.1:9", "t"))),
         };
         let headers = |token: &str| {
             let mut h = HeaderMap::new();
@@ -241,6 +244,9 @@ mod tests {
             };
             Box::pin(async move { Ok(out) })
         }
+        fn s3_key<'a>(&'a self, _: &'a str) -> crate::control::BoxFuture<'a, Result<Option<crate::control::S3Key>, crate::control::Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
     }
 
     /// [`serve`] with `control`; also the key's identity.
@@ -255,9 +261,10 @@ mod tests {
             engine: Engine::new(Pools::new(pools, 4), managed),
             verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             store: Arc::new(chelabase_storage::MemoryStore::default()),
-            urls: Urls::new(control),
+            urls: Urls::new(control.clone()),
             inflight: crate::limits::InFlight::new(1 << 30),
             events: crate::events::ObjectEvents::none(),
+            s3_keys: crate::s3::keys::S3Keys::new(control),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -589,6 +596,7 @@ mod tests {
             urls: Urls::new(Arc::new(FakeControl::default())),
             inflight: crate::limits::InFlight::new(1 << 20),
             events: crate::events::ObjectEvents::none(),
+            s3_keys: crate::s3::keys::S3Keys::new(Arc::new(FakeControl::default())),
         };
         let claims = download_claims(&data(), crate::signed::now() + 60);
         let (datoid, version) = (claims.datoid.unwrap(), claims.version_id.unwrap());
