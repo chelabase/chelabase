@@ -4,6 +4,7 @@ pub mod cli;
 pub mod data_api_schema;
 pub mod data_key;
 pub mod role_name;
+pub mod s3_key;
 pub mod role_password;
 pub mod role_settings;
 pub mod mode_policy;

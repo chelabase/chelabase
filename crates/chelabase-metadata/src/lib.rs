@@ -20,6 +20,7 @@ pub mod personal_logins;
 mod projects;
 mod saved_queries;
 mod schema_bases;
+mod storage_s3_keys;
 mod storage_tokens;
 mod storage_webhooks;
 pub mod teams;
@@ -38,6 +39,7 @@ pub use branches::{
 pub use saved_queries::{
     SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
 };
+pub use storage_s3_keys::{NewS3Key, S3KeyLookup, S3KeyRecord, STORAGE_S3_KEY_CAP};
 pub use storage_webhooks::{
     DeliveryTarget, FailureRun, NewStorageWebhook, STORAGE_WEBHOOK_ATTEMPTS_KEPT,
     STORAGE_WEBHOOK_CAP, STORAGE_WEBHOOK_RETRY_WINDOW, StorageWebhook, StorageWebhookAttempt,
@@ -316,7 +318,8 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// `branch_function_secrets.ciphertext` (orchestrator function secrets and branch create,
 /// `seal` with AAD `fn-secret:{branch}:{function}:{name}`); `functions.signing_secret` (a
 /// service's signing secret, orchestrator, [`MetadataClient::set_service_signing_secret`]:
-/// `seal` with AAD `{function}:service-signing`).
+/// `seal` with AAD `{function}:service-signing`); `storage_s3_keys.secret_enc` (an S3 key's
+/// secret, live keys only, [`MetadataClient::create_s3_key`]: `seal_s3_secret`, AAD the key id).
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
@@ -329,6 +332,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
     ("branch_function_secrets", "ciphertext", None),
     ("functions", "signing_secret", None),
+    ("storage_s3_keys", "secret_enc", None),
 ];
 
 /// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
@@ -486,7 +490,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261108000003).
+        // this file when adding one (last: 20261115000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
