@@ -49,6 +49,25 @@ A connection failure or a timeout is a transient error: requests are retried up 
 | `CHELABASE_WEBHOOKS_ALLOW_HOSTS` | orchestrator, worker | empty | Host names or IP literals, comma separated, no port, that webhooks may reach although they resolve to private addresses |
 | `CHELABASE_WEBHOOKS_ALLOW_HTTP` | orchestrator, worker | `false` | `true` also accepts `http` webhook URLs |
 
+## Lost webhook events in the logs
+
+Storage and the worker each count the webhook events they lose, from the moment the service starts. Every 60 seconds, a service whose count grew since its last line logs one `WARN` line with the total. A service that lost nothing logs nothing. The target, message and field names stay fixed, so a log alert can match them:
+
+| Service | Target | Message | Fields |
+|---|---|---|---|
+| `storage` | `storage::events` | `object events not published` | `missed_total`: events storage couldn't publish to NATS after its retries, so no webhook gets them. `missed_since_last`: how many of those came since the previous line |
+| `worker` | `worker::storage_webhooks` | `storage webhook events dropped` | `dropped_total`: deliveries given up on after 24 hours of retries, counted once per endpoint. `dropped_since_last`: how many of those came since the previous line |
+
+For example, in `docker compose logs worker`:
+
+```text
+WARN worker::storage_webhooks: storage webhook events dropped dropped_total=3 dropped_since_last=2
+```
+
+The totals go back to zero when the service restarts, so alert on any such line, or on `*_since_last`, rather than on a total crossing a threshold. Each lost event also gets its own `WARN` line with its event id. Both lines show with the [default log filter](/self-hosting/install#logs).
+
+Events dropped because a database went past its 100,000 pending events aren't counted. NATS removes them inside the stream and doesn't report it.
+
 ## A name that isn't object storage
 
 `CHELABASE_STORAGE_TOKEN_REFRESH_SECS` (worker, default `3600`, 1 to 43200) is about Neon's storage, not object storage: how often each running compute gets a fresh token for the pageserver and safekeepers. See [Security](/architecture/security#compute-and-storage-tokens).
