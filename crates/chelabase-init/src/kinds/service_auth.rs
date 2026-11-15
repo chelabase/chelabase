@@ -58,7 +58,8 @@ const CONTROL_CONSUMER_API: [&str; 6] = [
     "$JS.ACK.CHELABASE_CONTROL.>",
 ];
 /// Object storage's cache events (m9: `chelabase-nats`'s `SUBJECT_STORAGE_EVENTS`): the
-/// orchestrator publishes them, storage listens. Exactly that subject: the object events one
+/// orchestrator publishes them, and the worker (s3-endpoint m6: an S3 key its role delete,
+/// rename or resync revoked or moved); storage listens. Exactly that subject: the object events one
 /// token deeper (m18) are storage's alone to publish.
 const STORAGE_EVENTS: &str = "chelabase.storage.events";
 /// m18: object events, one Chelabase database token deep (`storage_objects::subject`): storage
@@ -156,6 +157,7 @@ fn worker() -> NatsPermissions {
     publish.extend(["_INBOX_orchestrator.>", "_INBOX_runner.>"]);
     publish.extend(NEON_EVENTS_WAIT_API);
     publish.extend(STORAGE_OBJECT_CONSUMER_API);
+    publish.push(STORAGE_EVENTS);
     let mut subscribe = vec!["chelabase.rpc.>"];
     subscribe.extend(CORE_EVENTS);
     subscribe.push("_INBOX_worker.>");

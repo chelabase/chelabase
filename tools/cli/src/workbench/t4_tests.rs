@@ -187,6 +187,8 @@ fn the_worker_gets_exactly_the_filtered_consumer_rights() {
             "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_STORAGE_EVENTS.*",
             "$JS.API.CONSUMER.DELETE.CHELABASE_STORAGE_EVENTS.*",
             "$JS.ACK.CHELABASE_STORAGE_EVENTS.>",
+            // s3-endpoint m6: S3 key events for storage's cache (the one subject).
+            "chelabase.storage.events",
         ])
     );
     assert_eq!(
@@ -446,11 +448,11 @@ fn storage_only_listens_to_its_cache_events() {
     for subject in ["chelabase.rt.project.p.x", "chelabase.rt.access.t.member", "chelabase.storage.other"] {
         assert!(!may_subscribe(&text, "storage", subject), "{subject}");
     }
-    // Only the orchestrator (and the runner, as it) publishes the storage events.
-    for user in ["worker", "realtime"] {
-        assert!(!may_publish(&text, user, "chelabase.storage.events"), "{user}");
-    }
+    // Only the orchestrator and the worker (s3-endpoint m6: S3 key events), and the runner as
+    // either, publish the storage events.
+    assert!(!may_publish(&text, "realtime", "chelabase.storage.events"));
     assert!(may_publish(&text, "orchestrator", "chelabase.storage.events"));
+    assert!(may_publish(&text, "worker", "chelabase.storage.events"));
     // m18: nobody but storage (and the runner) publishes an object event; the worker reads them
     // only through its filtered consumers.
     let object_event = "chelabase.storage.events.0b6c2f0e-1111-4c3e-9a3e-000000000001";
