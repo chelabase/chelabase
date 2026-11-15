@@ -28,7 +28,7 @@ use chelabase_metadata::members::{Admission, MemberStatus};
 use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
     MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, PeekOutcome, ProjectAuth,
-    ProjectRecord, RefreshNext, RefreshOutcome,
+    ProjectRecord, RefreshNext, RefreshOutcome, S3KeyLookup,
 };
 use chelabase_types::{DatabaseId, ProjectId};
 use chrono::{DateTime, Utc};
@@ -156,6 +156,17 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
         &self,
         key_id: Uuid,
     ) -> impl Future<Output = Result<Option<DataKeyLookup>, MetadataError>> + Send;
+
+    /// s3-endpoint m3: the live key with this access key id, its secret opened, if its branch
+    /// is a `normal` one and neither the branch nor its database is deleting or deleted.
+    fn lookup_s3_key(
+        &self,
+        access_key_id: &str,
+    ) -> impl Future<Output = Result<Option<S3KeyLookup>, MetadataError>> + Send;
+
+    /// Stamps the S3 key's `last_used_at` (at most once a minute). Never fails: an error is
+    /// logged.
+    fn touch_s3_key_used(&self, key_id: Uuid) -> impl Future<Output = ()> + Send;
 
     /// Records a minted one-time upload token; false when the id is taken or the key is dead.
     fn insert_upload_token(
@@ -421,6 +432,15 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn live_data_key(&self, key_id: Uuid) -> Result<Option<DataKeyLookup>, MetadataError> {
         MetadataClient::live_data_key(self, key_id).await
+    }
+    async fn lookup_s3_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<S3KeyLookup>, MetadataError> {
+        MetadataClient::lookup_s3_key(self, access_key_id).await
+    }
+    async fn touch_s3_key_used(&self, key_id: Uuid) {
+        MetadataClient::touch_s3_key_used(self, key_id).await
     }
     async fn insert_upload_token(
         &self,

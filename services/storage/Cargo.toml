@@ -51,6 +51,8 @@ tracing-subscriber = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 uuid = { workspace = true }
+# S3 secrets held in memory (s3-endpoint m5) are wiped when dropped.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

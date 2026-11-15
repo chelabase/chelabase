@@ -113,6 +113,9 @@ struct FakeNeon {
     /// personal-login names of each database.
     role_rows: Arc<Mutex<HashMap<String, Vec<chelabase_metadata::RoleRow>>>>,
     personal_login_names: Arc<Mutex<std::collections::HashSet<(DatabaseId, String)>>>,
+    /// s3-endpoint m3: S3 keys as the lookup answers them, by access key id (the route's own
+    /// rules are unit tests in `internal::storage`).
+    s3_keys: Arc<Mutex<HashMap<String, chelabase_metadata::S3KeyLookup>>>,
 }
 
 /// The fake's fresh-install claim rows: a model of `claim_setup`'s rules (the real ones are
@@ -587,6 +590,16 @@ impl NeonMetadataPort for FakeNeon {
         self.check()?;
         Ok(self.data_keys.lock().unwrap().iter().find(|(_, l)| l.key_id == key_id).map(|(_, l)| l.clone()))
     }
+
+    async fn lookup_s3_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<chelabase_metadata::S3KeyLookup>, MetadataError> {
+        self.check()?;
+        Ok(self.s3_keys.lock().unwrap().get(access_key_id).cloned())
+    }
+
+    async fn touch_s3_key_used(&self, _key_id: uuid::Uuid) {}
 
     async fn insert_upload_token(
         &self,
@@ -2424,6 +2437,52 @@ async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
     assert_eq!(body["key"]["key_id"], json!(key_id));
     assert_eq!(body["claims"], json!({ "sub": "u1" }));
     assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+}
+
+/// s3-endpoint m3: an S3 key's secret goes to storage's bearer only, never rest's, realtime's,
+/// the gateway's, the functions service's or the proxy's.
+#[tokio::test]
+async fn s3_key_needs_storage_bearer() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let pair = chelabase_types::s3_key::generate();
+    let key_id = uuid::Uuid::new_v4();
+    neon.s3_keys.lock().unwrap().insert(
+        pair.access_key_id.clone(),
+        chelabase_metadata::S3KeyLookup {
+            key_id,
+            branch_id: BranchId::new(),
+            branch_status: BranchStatus::Ready,
+            database_id: DatabaseId::new(),
+            database_status: chelabase_metadata::DatabaseStatus::Ready,
+            project_id: ProjectId::new(),
+            database: "app".into(),
+            role: "app_writer".into(),
+            role_oid: Some(16_384),
+            role_timeline: Some("0123456789abcdef0123456789abcdef".into()),
+            secret: pair.secret.clone(),
+        },
+    );
+    let path = format!("/internal/storage/s3-keys/{}", pair.access_key_id);
+    for bearer in [
+        None,
+        Some(""),
+        Some("wrong"),
+        Some(REST_TOKEN),
+        Some(REALTIME_TOKEN),
+        Some(DATA_KEYS_TOKEN),
+        Some(FUNCTIONS_TOKEN),
+        Some(PROXY_TOKEN),
+        Some(STORCON_TOKEN),
+        Some(APP_AUTH_TOKEN),
+        Some(APP_SESSIONS_TOKEN),
+    ] {
+        assert_eq!(app.get(&path, bearer).await, (401, Value::Null), "{bearer:?}");
+    }
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["key_id"], json!(key_id));
+    assert_eq!(body["secret"], json!(pair.secret));
 }
 
 /// Object storage m9: a URL minted from the console names the member as its key and the role
