@@ -1,19 +1,25 @@
 //! Object storage's URL routes (m6), behind storage's bearer: the key its signed URLs are
 //! signed with, whether the key that minted one is still live (a data key, or the member who
-//! minted it from the console, m9), and the one-time upload tokens.
+//! minted it from the console, m9), and the one-time upload tokens. And s3-endpoint m3: an S3
+//! access key's secret and scope, for storage's SigV4 check.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chelabase_metadata::{BranchKind, BranchStatus, DataKeyLookup, DatabaseStatus};
+use chelabase_metadata::{
+    BranchKind, BranchStatus, DataKeyLookup, DatabaseStatus, MetadataError, S3KeyLookup,
+};
 use chelabase_types::access::{PlatformRole, Requested};
+use chelabase_types::s3_key::is_access_key_id;
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_neon::ComputeLocator;
 use chelabase_secrets::{Purpose, derive_key};
@@ -41,6 +47,10 @@ where
     Router::new()
         .route("/internal/storage/url-key", get(url_key::<M, L>))
         .route("/internal/storage/keys/{key_id}", get(live_key::<M, L>))
+        .route(
+            "/internal/storage/s3-keys/{access_key_id}",
+            get(s3_key::<M, L>),
+        )
         .route(
             "/internal/storage/upload-tokens",
             post(insert_token::<M, L>),
@@ -139,6 +149,88 @@ where
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => failed("console URL liveness", err),
     }
+}
+
+/// What the S3 key route reads: the [`NeonMetadataPort`] methods of the same names. A trait of
+/// its own so the route's rules are tested on a small fake.
+pub(super) trait S3Keys: Send + Sync + 'static {
+    fn lookup_s3_key(
+        &self,
+        access_key_id: &str,
+    ) -> impl Future<Output = Result<Option<S3KeyLookup>, MetadataError>> + Send;
+    fn touch_s3_key_used(&self, key_id: Uuid) -> impl Future<Output = ()> + Send;
+}
+
+impl<M: NeonMetadataPort, L: ComputeLocator> S3Keys for InternalState<M, L> {
+    async fn lookup_s3_key(&self, access_key_id: &str) -> Result<Option<S3KeyLookup>, MetadataError> {
+        self.metadata.lookup_s3_key(access_key_id).await
+    }
+    async fn touch_s3_key_used(&self, key_id: Uuid) {
+        self.metadata.touch_s3_key_used(key_id).await
+    }
+}
+
+async fn s3_key<M, L>(State(state): St<M, L>, Path(access_key_id): Path<String>) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    s3_key_answer(state, &access_key_id).await
+}
+
+/// s3-endpoint m3: the live S3 key with this access key id, for storage's SigV4 check. 200
+/// `{"key_id", "access_key_id", "secret", "branch_id", "project_id", "database", "role",
+/// "role_oid", "role_timeline"}` with `Cache-Control: no-store` while the key is live, its
+/// branch a `normal` one and neither the branch nor its database deleting or deleted (the
+/// lookup's SQL filters these, and they are checked again here); its use is stamped in the
+/// background. 400 for an id without the access key id's shape (nothing is looked up), 404
+/// for any other id, 500 when the secret won't open or the row has no role identity.
+///
+/// The secret is in the body only: nothing here logs the body, the secret or the lookup
+/// ([`S3KeyLookup`]'s `Debug` redacts it); errors name the key, never a value.
+async fn s3_key_answer<K: S3Keys>(keys: Arc<K>, access_key_id: &str) -> Response {
+    if !is_access_key_id(access_key_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let key = match keys.lookup_s3_key(access_key_id).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        // The metadata's error names the key's id (a secret that won't open is
+        // `MetadataError::Secret("S3 key {id}: …")`), never a value.
+        Err(err) => {
+            error!(access_key_id, "looking up an S3 key: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if matches!(key.branch_status, BranchStatus::Deleting | BranchStatus::Deleted)
+        || matches!(key.database_status, DatabaseStatus::Deleting | DatabaseStatus::Deleted)
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // The table's CHECK keeps a live key's role identity set; a key without one is never
+    // served (it would run as a role by name only).
+    let identity = match (key.role_oid, key.role_timeline.as_deref()) {
+        (Some(oid), Some(timeline)) if oid >= 1 && !timeline.is_empty() => Some((oid, timeline)),
+        _ => None,
+    };
+    let Some((role_oid, role_timeline)) = identity else {
+        error!(key_id = %key.key_id, "a live S3 key has no role identity: not served");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let body = Json(json!({
+        "key_id": key.key_id,
+        "access_key_id": access_key_id,
+        "secret": key.secret,
+        "branch_id": key.branch_id,
+        "project_id": key.project_id,
+        "database": key.database,
+        "role": key.role,
+        "role_oid": role_oid,
+        "role_timeline": role_timeline,
+    }));
+    let key_id = key.key_id;
+    tokio::spawn(async move { keys.touch_s3_key_used(key_id).await });
+    ([(CACHE_CONTROL, "no-store")], body).into_response()
 }
 
 /// Whether `member` may still use a URL they minted from the console on `branch` (#100): the
@@ -302,5 +394,280 @@ where
         },
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => failed("spending an upload token", err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use chelabase_types::DatabaseId;
+    use tokio::sync::mpsc;
+    use tracing::instrument::WithSubscriber;
+
+    use super::*;
+
+    const TIMELINE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// What the fake's lookup answers for an access key id.
+    enum Row {
+        /// The row as the metadata reads it (the SQL's own filters are tested live).
+        Found(S3KeyLookup),
+        /// A sealed value that doesn't open: the metadata's own error for key `0`.
+        WontOpen(Uuid),
+    }
+
+    /// A model of the S3 key metadata: lookups counted, touches stamped at most once a minute
+    /// (as `touch_s3_key_used`'s SQL) and reported on `touched`.
+    struct Fake {
+        rows: Mutex<HashMap<String, Row>>,
+        lookups: AtomicUsize,
+        last_used: Mutex<HashMap<Uuid, Instant>>,
+        writes: AtomicUsize,
+        touched: mpsc::UnboundedSender<Uuid>,
+    }
+
+    impl Fake {
+        fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<Uuid>) {
+            let (touched, rx) = mpsc::unbounded_channel();
+            let fake = Self {
+                rows: Mutex::default(),
+                lookups: AtomicUsize::new(0),
+                last_used: Mutex::default(),
+                writes: AtomicUsize::new(0),
+                touched,
+            };
+            (Arc::new(fake), rx)
+        }
+
+        fn insert(&self, access_key_id: &str, row: Row) {
+            self.rows.lock().unwrap().insert(access_key_id.into(), row);
+        }
+    }
+
+    impl S3Keys for Fake {
+        async fn lookup_s3_key(&self, access_key_id: &str) -> Result<Option<S3KeyLookup>, MetadataError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            match self.rows.lock().unwrap().get(access_key_id) {
+                None => Ok(None),
+                Some(Row::Found(key)) => Ok(Some(key.clone())),
+                Some(Row::WontOpen(id)) => Err(MetadataError::Secret(format!(
+                    "S3 key {id}: {}",
+                    chelabase_secrets::SecretsError::Decrypt
+                ))),
+            }
+        }
+
+        async fn touch_s3_key_used(&self, key_id: Uuid) {
+            let now = Instant::now();
+            let mut last = self.last_used.lock().unwrap();
+            if last.get(&key_id).is_none_or(|t| now.duration_since(*t) >= Duration::from_secs(60)) {
+                last.insert(key_id, now);
+                self.writes.fetch_add(1, Ordering::SeqCst);
+            }
+            drop(last);
+            let _ = self.touched.send(key_id);
+        }
+    }
+
+    fn live(secret: &str) -> S3KeyLookup {
+        S3KeyLookup {
+            key_id: Uuid::new_v4(),
+            branch_id: BranchId::new(),
+            branch_status: BranchStatus::Ready,
+            database_id: DatabaseId::new(),
+            database_status: DatabaseStatus::Ready,
+            project_id: ProjectId::new(),
+            database: "app".into(),
+            role: "app_writer".into(),
+            role_oid: Some(16_384),
+            role_timeline: Some(TIMELINE.into()),
+            secret: secret.into(),
+        }
+    }
+
+    async fn ask(fake: &Arc<Fake>, access_key_id: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let resp = s3_key_answer(fake.clone(), access_key_id).await;
+        let status = resp.status();
+        let cache = resp
+            .headers()
+            .get(CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, cache, body.to_vec())
+    }
+
+    /// A `tracing` writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish()
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_key_live_answers_scope_and_secret() {
+        let (fake, mut touched) = Fake::new();
+        let pair = chelabase_types::s3_key::generate();
+        let key = live(&pair.secret);
+        fake.insert(&pair.access_key_id, Row::Found(key.clone()));
+
+        let (status, cache, body) = ask(&fake, &pair.access_key_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "key_id": key.key_id,
+                "access_key_id": pair.access_key_id,
+                "secret": pair.secret,
+                "branch_id": key.branch_id,
+                "project_id": key.project_id,
+                "database": "app",
+                "role": "app_writer",
+                "role_oid": 16_384,
+                "role_timeline": TIMELINE,
+            })
+        );
+        // Its use is stamped, in the background.
+        assert_eq!(touched.recv().await, Some(key.key_id));
+    }
+
+    #[tokio::test]
+    async fn s3_key_dead_is_404() {
+        let (fake, mut touched) = Fake::new();
+        let unknown = chelabase_types::s3_key::generate();
+        let mut cases = Vec::new();
+        for (branch, database) in [
+            (BranchStatus::Deleting, DatabaseStatus::Ready),
+            (BranchStatus::Deleted, DatabaseStatus::Ready),
+            (BranchStatus::Ready, DatabaseStatus::Deleting),
+            (BranchStatus::Ready, DatabaseStatus::Deleted),
+        ] {
+            let pair = chelabase_types::s3_key::generate();
+            let mut key = live(&pair.secret);
+            key.branch_status = branch;
+            key.database_status = database;
+            fake.insert(&pair.access_key_id, Row::Found(key));
+            cases.push(pair.access_key_id);
+        }
+        // Unknown, or revoked (the lookup finds no live row either way).
+        cases.push(unknown.access_key_id);
+        for id in cases {
+            let (status, cache, body) = ask(&fake, &id).await;
+            assert_eq!((status, body.as_slice()), (StatusCode::NOT_FOUND, &b""[..]), "{id}");
+            assert_eq!(cache, None, "{id}");
+        }
+        assert!(touched.try_recv().is_err(), "a dead key's use is never stamped");
+    }
+
+    #[tokio::test]
+    async fn s3_key_bad_shape_is_400_without_lookup() {
+        let (fake, _touched) = Fake::new();
+        let good = chelabase_types::s3_key::generate().access_key_id;
+        for bad in [
+            "../x".to_owned(),
+            good.to_lowercase(),
+            good[..19].to_owned(),
+            // 21 characters.
+            format!("{good}A"),
+            String::new(),
+            format!("XBAK{}", &good[4..]),
+            format!("{}1", &good[..19]),
+            format!("{}=", &good[..19]),
+            format!("{}\u{e9}", &good[..18]),
+        ] {
+            fake.insert(&bad, Row::Found(live("x")));
+            let (status, _, body) = ask(&fake, &bad).await;
+            assert_eq!((status, body.as_slice()), (StatusCode::BAD_REQUEST, &b""[..]), "{bad:?}");
+        }
+        assert_eq!(fake.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn s3_key_touch_is_throttled() {
+        let (fake, mut touched) = Fake::new();
+        let pair = chelabase_types::s3_key::generate();
+        let key = live(&pair.secret);
+        fake.insert(&pair.access_key_id, Row::Found(key.clone()));
+        for _ in 0..2 {
+            assert_eq!(ask(&fake, &pair.access_key_id).await.0, StatusCode::OK);
+            assert_eq!(touched.recv().await, Some(key.key_id));
+        }
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn s3_key_without_role_identity_is_500() {
+        let (fake, mut touched) = Fake::new();
+        let logs = Logs::default();
+        let mut keys = Vec::new();
+        for (oid, timeline) in [
+            (None, Some(TIMELINE)),
+            (Some(16_384), None),
+            (None, None),
+            (Some(0), Some(TIMELINE)),
+            (Some(16_384), Some("")),
+        ] {
+            let pair = chelabase_types::s3_key::generate();
+            let mut key = live(&pair.secret);
+            key.role_oid = oid;
+            key.role_timeline = timeline.map(str::to_owned);
+            fake.insert(&pair.access_key_id, Row::Found(key.clone()));
+            keys.push((pair, key.key_id));
+        }
+        for (pair, key_id) in &keys {
+            let (status, cache, body) = ask(&fake, &pair.access_key_id)
+                .with_subscriber(logs.subscriber())
+                .await;
+            assert_eq!((status, body.as_slice()), (StatusCode::INTERNAL_SERVER_ERROR, &b""[..]));
+            assert_eq!(cache, None);
+            let text = logs.text();
+            assert!(text.contains(&key_id.to_string()), "{text}");
+            assert!(!text.contains(&pair.secret), "{text}");
+        }
+        assert!(touched.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3_key_open_failure_is_500_and_quiet() {
+        let (fake, mut touched) = Fake::new();
+        let logs = Logs::default();
+        let pair = chelabase_types::s3_key::generate();
+        let key_id = Uuid::new_v4();
+        fake.insert(&pair.access_key_id, Row::WontOpen(key_id));
+        let (status, cache, body) = ask(&fake, &pair.access_key_id)
+            .with_subscriber(logs.subscriber())
+            .await;
+        assert_eq!((status, body.as_slice()), (StatusCode::INTERNAL_SERVER_ERROR, &b""[..]));
+        assert_eq!(cache, None);
+        let text = logs.text();
+        assert!(text.contains(&key_id.to_string()), "{text}");
+        assert!(!text.contains(&pair.secret), "{text}");
+        assert!(touched.try_recv().is_err());
     }
 }

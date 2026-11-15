@@ -159,8 +159,8 @@ async fn create_lookup_round_trip() {
         (got.database.as_str(), got.role.as_str()),
         ("app", "app_writer")
     );
-    assert_eq!(got.role_oid, 16_384);
-    assert_eq!(got.role_timeline, "0123456789abcdef0123456789abcdef");
+    assert_eq!(got.role_oid, Some(16_384));
+    assert_eq!(got.role_timeline.as_deref(), Some("0123456789abcdef0123456789abcdef"));
     assert_eq!(got.secret, made.secret);
     assert_eq!(got.branch_status, BranchStatus::Pending);
     assert_eq!(got.database_status, DatabaseStatus::Pending);

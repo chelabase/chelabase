@@ -80,8 +80,11 @@ pub struct S3KeyLookup {
     /// The Postgres database on the branch the key reaches.
     pub database: String,
     pub role: String,
-    pub role_oid: i64,
-    pub role_timeline: String,
+    /// The role's identity. The table's CHECK keeps both set on a live key; they are read as
+    /// they are stored all the same, so a caller refuses a key without them instead of this
+    /// lookup panicking on a NULL.
+    pub role_oid: Option<i64>,
+    pub role_timeline: Option<String>,
     pub secret: String,
 }
 
@@ -247,8 +250,8 @@ impl MetadataClient {
             project_id: ProjectId(r.get("project_id")),
             database: r.get("database"),
             role: r.get("role"),
-            role_oid: r.get("role_oid"),
-            role_timeline: r.get("role_timeline"),
+            role_oid: r.get::<Option<i64>, _>("role_oid"),
+            role_timeline: r.get::<Option<String>, _>("role_timeline"),
             secret,
         }))
     }
