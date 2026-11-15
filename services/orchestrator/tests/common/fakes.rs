@@ -10,6 +10,7 @@ use chelabase_metadata::{
     ProjectRecord, RenameProject, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite,
     BranchBusy, MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
     NewStorageWebhook, StorageWebhook, StorageWebhookAttempt, StorageWebhookPatch,
+    NewS3Key, S3KeyRecord,
 };
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, MergeJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
@@ -68,6 +69,8 @@ struct FakeMetadata {
     endpoint_busy: Arc<Mutex<bool>>,
     /// Data API keys, live and revoked, with their hashes.
     keys: Arc<Mutex<Vec<KeyRow>>>,
+    /// s3-endpoint m2: S3 access keys, live and revoked.
+    s3_keys: Arc<Mutex<Vec<FakeS3Key>>>,
     /// Roles by endpoint id, and login roles' sealed passwords by (endpoint id, name).
     roles: Arc<Mutex<HashMap<String, Vec<RoleRow>>>>,
     role_passwords: Arc<Mutex<HashMap<(String, String), String>>>,
@@ -1186,6 +1189,67 @@ impl MetadataPort for FakeMetadata {
         Ok(list)
     }
 
+    async fn create_s3_key(&self, key: &NewS3Key<'_>) -> Result<(), MetadataError> {
+        if *self.endpoint_busy.lock().unwrap() {
+            return Err(MetadataError::EndpointLockTimeout("ep-test".into()));
+        }
+        // As the store: a missing, deleting or non-normal branch is RowNotFound.
+        let usable = self.branches.lock().unwrap().get(&key.branch_id).is_some_and(|b| {
+            b.kind == BranchKind::Normal && !matches!(b.status, BranchStatus::Deleting | BranchStatus::Deleted)
+        });
+        if !usable {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        let mut keys = self.s3_keys.lock().unwrap();
+        let live = keys.iter().filter(|k| k.record.branch_id == key.branch_id && k.secret.is_some()).count();
+        if live as i64 >= chelabase_metadata::STORAGE_S3_KEY_CAP {
+            return Err(MetadataError::Conflict);
+        }
+        keys.push(FakeS3Key {
+            record: S3KeyRecord {
+                id: key.id,
+                branch_id: key.branch_id,
+                database: key.database.into(),
+                role: key.role.into(),
+                name: key.name.into(),
+                access_key_id: key.access_key_id.into(),
+                role_oid: key.role_oid,
+                role_timeline: key.role_timeline.into(),
+                created_at: chrono::Utc::now(),
+                last_used_at: None,
+            },
+            secret: Some(key.secret.into()),
+        });
+        Ok(())
+    }
+
+    async fn list_live_s3_keys(&self, branch: BranchId) -> Result<Vec<S3KeyRecord>, MetadataError> {
+        let mut list: Vec<_> = self
+            .s3_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.record.branch_id == branch && k.secret.is_some())
+            .map(|k| k.record.clone())
+            .collect();
+        list.reverse(); // newest first
+        Ok(list)
+    }
+
+    async fn revoke_s3_key(&self, branch: BranchId, key_id: uuid::Uuid) -> Result<bool, MetadataError> {
+        let mut keys = self.s3_keys.lock().unwrap();
+        match keys
+            .iter_mut()
+            .find(|k| k.record.id == key_id && k.record.branch_id == branch && k.secret.is_some())
+        {
+            Some(k) => {
+                k.secret = None;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn revoke_data_key(&self, branch: BranchId, key_id: uuid::Uuid) -> Result<bool, MetadataError> {
         let mut keys = self.keys.lock().unwrap();
         match keys.iter_mut().find(|(k, _)| {
@@ -2283,6 +2347,14 @@ enum FakeReset {
     Unavailable,
 }
 
+/// s3-endpoint m2: an S3 access key as the fake stores it, with its plaintext secret (`None`
+/// once revoked, as the store erases it).
+#[derive(Clone, Debug)]
+struct FakeS3Key {
+    record: S3KeyRecord,
+    secret: Option<String>,
+}
+
 /// A test's look at the metadata at a `chelabase.fn.changed` publish.
 type OnFnChanged = Arc<dyn Fn(BranchId, &str) + Send + Sync>;
 
@@ -3035,6 +3107,16 @@ fn storage_url() -> String {
 fn use_storage(url: &str) {
     STORAGE_URL.with(|u| *u.borrow_mut() = url.to_owned());
 }
+thread_local! {
+    /// s3-endpoint m2: the S3 endpoint of the next app built on this thread (off by default).
+    static S3_ENDPOINT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+/// s3-endpoint m2: the next app built on this thread has the S3 endpoint at `endpoint`
+/// (`None`: off, `CHELABASE_S3_HOST` unset).
+#[allow(dead_code)]
+fn use_s3_endpoint(endpoint: Option<&str>) {
+    S3_ENDPOINT.with(|e| *e.borrow_mut() = endpoint.map(str::to_owned));
+}
 
 async fn spawn_app_with_rest(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str) -> TestApp {
     spawn_app_in_mode(metadata, jobs, rest_url, Mode::SelfHosted).await
@@ -3269,6 +3351,7 @@ async fn spawn_app_core_with(
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
         studio_url: STUDIO_URL.into(),
+        s3_endpoint: S3_ENDPOINT.with(|e| e.borrow().clone()),
         compute_tls,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: REALTIME_TOKEN.into(),

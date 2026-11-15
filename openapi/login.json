@@ -2684,7 +2684,8 @@
           "exposure_unconfirmed",
           "identity_unavailable",
           "runner_unavailable",
-          "functions_unavailable"
+          "functions_unavailable",
+          "s3_disabled"
         ]
       },
       "ErrorEnvelope": {

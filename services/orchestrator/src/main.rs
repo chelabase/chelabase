@@ -224,6 +224,14 @@ async fn main() -> anyhow::Result<()> {
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
         studio_url: entry.studio_origin(),
+        // s3-endpoint m2: the S3 endpoint is on when CHELABASE_S3_HOST is set.
+        s3_endpoint: entry.s3_host().map(|host| {
+            let scheme = match entry.scheme() {
+                chelabase_types::entry::Scheme::Http => "http",
+                chelabase_types::entry::Scheme::Https => "https",
+            };
+            format!("{scheme}://{host}")
+        }),
         webhooks,
         services,
         bundles,

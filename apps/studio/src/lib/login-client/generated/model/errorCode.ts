@@ -119,4 +119,5 @@ export const ErrorCode = {
   identity_unavailable: 'identity_unavailable',
   runner_unavailable: 'runner_unavailable',
   functions_unavailable: 'functions_unavailable',
+  s3_disabled: 's3_disabled',
 } as const;

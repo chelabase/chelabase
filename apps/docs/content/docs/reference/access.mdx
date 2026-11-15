@@ -187,6 +187,9 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Viewer and the role in your set; no role (owner mode): Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
 | PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/object/\{bucket\}/\{*name\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/s3-keys` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/s3-keys` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/s3-keys/\{key_id\}` | Member token | Project Developer |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/storage/upload/session/\{session\}/complete` | Member token | Act as: Developer and the role in your set; no role (owner mode): Admin |

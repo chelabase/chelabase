@@ -13,6 +13,7 @@ use chelabase_metadata::{
     NewProjectAuth, OnDelete, PasswordState, ProjectAuth, ProjectRecord, RenameProject, RoleRow, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQuerySummary, SavedQueryWrite, SettingsPatch, TenantOverview,
     MergeCreate, MergeDraftPatch, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,
     NewStorageWebhook, StorageWebhook, StorageWebhookAttempt, StorageWebhookPatch,
+    NewS3Key, S3KeyRecord,
 };
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob,
@@ -62,6 +63,7 @@ mod roles;
 pub mod sql_editor;
 pub mod storage_console;
 mod storage_webhooks;
+mod storage_s3_keys;
 mod privileges;
 mod table_api;
 mod teams;
@@ -315,6 +317,28 @@ pub trait MetadataPort:
 
     /// Revokes a live secret key; false for an unknown or revoked key, and for the public key.
     fn revoke_data_key(
+        &self,
+        branch: BranchId,
+        key_id: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// s3-endpoint m2: stores an S3 access key, its secret sealed for its id, under the branch's
+    /// and endpoint's locks. A branch at the cap is `Conflict`; a missing, deleting or
+    /// non-normal branch is `RowNotFound`.
+    fn create_s3_key(
+        &self,
+        key: &NewS3Key<'_>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// The branch's live S3 access keys, newest first (never a secret).
+    fn list_live_s3_keys(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<S3KeyRecord>, MetadataError>> + Send;
+
+    /// Revokes a live S3 access key of the branch (its secret erased); false for an unknown,
+    /// another branch's or an already revoked key.
+    fn revoke_s3_key(
         &self,
         branch: BranchId,
         key_id: Uuid,
@@ -944,6 +968,18 @@ impl MetadataPort for MetadataClient {
 
     async fn revoke_data_key(&self, branch: BranchId, key_id: Uuid) -> Result<bool, MetadataError> {
         MetadataClient::revoke_data_key(self, branch, key_id).await
+    }
+
+    async fn create_s3_key(&self, key: &NewS3Key<'_>) -> Result<(), MetadataError> {
+        MetadataClient::create_s3_key(self, key).await
+    }
+
+    async fn list_live_s3_keys(&self, branch: BranchId) -> Result<Vec<S3KeyRecord>, MetadataError> {
+        MetadataClient::list_live_s3_keys(self, branch).await
+    }
+
+    async fn revoke_s3_key(&self, branch: BranchId, key_id: Uuid) -> Result<bool, MetadataError> {
+        MetadataClient::revoke_s3_key(self, branch, key_id).await
     }
 
     async fn rotate_data_key(
@@ -1956,6 +1992,10 @@ pub struct AppState<M, J> {
     pub table_api_dry_run_max_bytes: i64,
     /// `CHELABASE_STUDIO_HOST` with the public scheme (no trailing `/`): invite links go to its `/accept-invite`.
     pub studio_url: String,
+    /// s3-endpoint m2: `{CHELABASE_PUBLIC_SCHEME}://{CHELABASE_S3_HOST}` (no trailing `/`), the
+    /// S3 endpoint clients use; `None` when `CHELABASE_S3_HOST` is unset (the endpoint is off:
+    /// S3 access keys can't be created).
+    pub s3_endpoint: Option<String>,
     /// The orchestrator's client pair for TLS to computes (RT3-7); `None` connects without TLS
     /// (tests only: `main` always sets it).
     pub compute_tls: Option<Arc<compute_tls::ComputeTls>>,
@@ -2666,6 +2706,7 @@ where
         .merge(console::routes())
         .merge(storage_console::routes())
         .merge(storage_webhooks::routes())
+        .merge(storage_s3_keys::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())
         .merge(privileges::routes())

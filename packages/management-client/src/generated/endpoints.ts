@@ -53,10 +53,12 @@ import type {
   CreateProjectInviteRequest,
   CreateProjectRequest,
   CreateRoleRequest,
+  CreateS3KeyRequest,
   CreateSavedQueryRequest,
   CreateStorageWebhookRequest,
   CreateTeamRequest,
   CreatedDataKey,
+  CreatedS3Key,
   DataApiSchema,
   DataKey,
   Database,
@@ -128,6 +130,7 @@ import type {
   RoleDeletePreview,
   RoleSessions,
   RunSqlRequest,
+  S3KeyList,
   SavedQuery,
   SavedQuerySummary,
   SchemaChangeRequest,
@@ -7936,6 +7939,286 @@ export const useStorageDeleteObject = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getStorageDeleteObjectMutationOptions(options), queryClient);
+    }
+
+export const getListS3KeysUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/s3-keys`
+}
+
+/**
+ * @summary List a branch's S3 access keys
+ */
+export const listS3Keys = async (id: string,
+    branchId: string, options?: Parameters<typeof customFetch>[1]): Promise<S3KeyList> => {
+
+  return customFetch<S3KeyList>(getListS3KeysUrl(id,branchId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListS3KeysQueryKey = (id: string,
+    branchId: string,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/storage/s3-keys`
+    ] as const;
+    }
+
+
+export const getListS3KeysQueryOptions = <TData = Awaited<ReturnType<typeof listS3Keys>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListS3KeysQueryKey(id,branchId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listS3Keys>>> = ({ signal }) => listS3Keys(id,branchId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListS3KeysQueryResult = NonNullable<Awaited<ReturnType<typeof listS3Keys>>>
+export type ListS3KeysQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListS3Keys<TData = Awaited<ReturnType<typeof listS3Keys>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listS3Keys>>,
+          TError,
+          Awaited<ReturnType<typeof listS3Keys>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListS3Keys<TData = Awaited<ReturnType<typeof listS3Keys>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listS3Keys>>,
+          TError,
+          Awaited<ReturnType<typeof listS3Keys>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListS3Keys<TData = Awaited<ReturnType<typeof listS3Keys>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a branch's S3 access keys
+ */
+
+export function useListS3Keys<TData = Awaited<ReturnType<typeof listS3Keys>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listS3Keys>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListS3KeysQueryOptions(id,branchId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateS3KeyUrl = (id: string,
+    branchId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/s3-keys`
+}
+
+/**
+ * A key for the S3 endpoint, acting as one role on one Postgres database of the branch. Like a secret data key: Developer for a role you may use (in your roles, or reachable through a granted role), Admin for any role; never a personal login. An owner-level role is refused even for an Admin (storage would refuse every request). The key is bound to the role's identity (its OID on the branch's timeline) as the worker reads it on the compute. The secret is in this response only (`Cache-Control: no-store`).
+ * @summary Create an S3 access key
+ */
+export const createS3Key = async (id: string,
+    branchId: string,
+    createS3KeyRequest: CreateS3KeyRequest, options?: Parameters<typeof customFetch>[1]): Promise<CreatedS3Key> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<CreatedS3Key>(getCreateS3KeyUrl(id,branchId),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createS3KeyRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateS3KeyMutationKey = () => ['createS3Key'] as const;
+
+export const getCreateS3KeyMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createS3Key>>, TError,CreateS3KeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createS3Key>>, TError,CreateS3KeyMutationVariables, TContext> => {
+
+const mutationKey = getCreateS3KeyMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createS3Key>>, CreateS3KeyMutationVariables> = (props) => {
+          const {id,branchId,data} = props ?? {};
+
+          return  createS3Key(id,branchId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateS3KeyMutationResult = NonNullable<Awaited<ReturnType<typeof createS3Key>>>
+    export type CreateS3KeyMutationBody = CreateS3KeyRequest
+    export type CreateS3KeyMutationError = ErrorType<ErrorEnvelope>
+    export type CreateS3KeyMutationVariables = {id: string;branchId: string;data: CreateS3KeyRequest}
+
+    /**
+ * @summary Create an S3 access key
+ */
+export const useCreateS3Key = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createS3Key>>, TError,CreateS3KeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createS3Key>>,
+        TError,
+        CreateS3KeyMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateS3KeyMutationOptions(options), queryClient);
+    }
+
+export const getRevokeS3KeyUrl = (id: string,
+    branchId: string,
+    keyId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/storage/s3-keys/${encodeURIComponent(String(keyId))}`
+}
+
+/**
+ * The key stops working at once: its secret is erased and storage is told to drop it from its cache. Developer for a key whose role you may use, Admin for any key. Works with the S3 endpoint off.
+ * @summary Revoke an S3 access key
+ */
+export const revokeS3Key = async (id: string,
+    branchId: string,
+    keyId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getRevokeS3KeyUrl(id,branchId,keyId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getRevokeS3KeyMutationKey = () => ['revokeS3Key'] as const;
+
+export const getRevokeS3KeyMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeS3Key>>, TError,RevokeS3KeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof revokeS3Key>>, TError,RevokeS3KeyMutationVariables, TContext> => {
+
+const mutationKey = getRevokeS3KeyMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof revokeS3Key>>, RevokeS3KeyMutationVariables> = (props) => {
+          const {id,branchId,keyId} = props ?? {};
+
+          return  revokeS3Key(id,branchId,keyId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RevokeS3KeyMutationResult = NonNullable<Awaited<ReturnType<typeof revokeS3Key>>>
+
+    export type RevokeS3KeyMutationError = ErrorType<ErrorEnvelope>
+    export type RevokeS3KeyMutationVariables = {id: string;branchId: string;keyId: string}
+
+    /**
+ * @summary Revoke an S3 access key
+ */
+export const useRevokeS3Key = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeS3Key>>, TError,RevokeS3KeyMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof revokeS3Key>>,
+        TError,
+        RevokeS3KeyMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRevokeS3KeyMutationOptions(options), queryClient);
     }
 
 export const getStorageListPartsUrl = (id: string,
