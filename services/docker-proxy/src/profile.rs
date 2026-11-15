@@ -11,7 +11,8 @@
 //!   "name": "worker",
 //!   "ops": {
 //!     "container_create": {},
-//!     "container_start": { "target_label": "chelabase.dev/endpoint-id" }
+//!     "container_start": { "target_label": "chelabase.dev/endpoint-id" },
+//!     "network_connect": { "container_labels": [{ "key": "chelabase.dev/endpoint-id" }] }
 //!   },
 //!   "networks": ["chelabase-feat-x_compute", "chelabase-feat-x_control"],
 //!   "mount_types": [],
@@ -37,6 +38,9 @@ use crate::scope::Labels;
 pub const ENDPOINT_LABEL: &str = "chelabase.dev/endpoint-id";
 /// The service containers' and networks' label (`service-runner` `SERVICE_LABEL`).
 pub const SERVICE_LABEL: &str = "chelabase.dev/service-id";
+/// Compose's service label: the service-runner attaches the stack's `functions` service to its
+/// slot networks.
+pub const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 
 /// A profile that doesn't parse or validate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +62,56 @@ pub struct OpRule {
     /// container) must carry this label with a non-empty value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
+    /// Network connect and disconnect only: the container the body names must match one of
+    /// these (checked by [`Profile::allows_connect_container`] once the server has resolved
+    /// it). Empty means any in-scope container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub container_labels: Vec<LabelMatch>,
+    /// Network connect and disconnect only: any in-scope network, not just
+    /// [`Profile::networks`] or networks carrying [`target_label`](Self::target_label).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_network: bool,
+}
+
+/// One label an object must carry: `key` with exactly `value`, or with any non-empty value
+/// when `value` is absent. Keys compare byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelMatch {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+impl LabelMatch {
+    /// `key` with any non-empty value.
+    pub fn key(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            value: None,
+        }
+    }
+
+    /// `key` with exactly `value`.
+    pub fn exact(key: &str, value: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            value: Some(value.to_string()),
+        }
+    }
+
+    pub fn matches(&self, labels: &Labels) -> bool {
+        match (labels.get(&self.key), &self.value) {
+            (Some(v), None) => !v.is_empty(),
+            (Some(v), Some(want)) => v == want,
+            (None, _) => false,
+        }
+    }
+}
+
+/// Whether `kind` connects a container to a network or disconnects it.
+fn is_connect(kind: OpKind) -> bool {
+    matches!(kind, OpKind::NetworkConnect | OpKind::NetworkDisconnect)
 }
 
 /// The mount types a create body may use (m3).
@@ -180,16 +234,39 @@ impl Profile {
         if !name_ok(&self.name) {
             return err("the name must be [A-Za-z0-9][A-Za-z0-9_.-]*".into());
         }
+        let key_ok = |label: &str| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-'))
+        };
         for (kind, rule) in &self.ops {
             if let Some(label) = &rule.target_label
-                && (label.is_empty()
-                    || !label
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-')))
+                && !key_ok(label)
             {
                 return err(format!(
                     "{kind:?}: target label {label:?} is not a label key"
                 ));
+            }
+            if !is_connect(*kind) && (!rule.container_labels.is_empty() || rule.any_network) {
+                return err(format!(
+                    "{kind:?}: container_labels and any_network apply to network connect and disconnect only"
+                ));
+            }
+            for m in &rule.container_labels {
+                if !key_ok(&m.key) {
+                    return err(format!(
+                        "{kind:?}: container label {:?} is not a label key",
+                        m.key
+                    ));
+                }
+                if let Some(v) = &m.value
+                    && (v.is_empty() || v.chars().any(char::is_control))
+                {
+                    return err(format!(
+                        "{kind:?}: container label value {v:?} is not allowed"
+                    ));
+                }
             }
         }
         if let Some(n) = self.networks.iter().find(|n| !name_ok(n)) {
@@ -228,11 +305,21 @@ impl Profile {
                         *k,
                         OpRule {
                             target_label: label.map(str::to_string),
+                            ..OpRule::default()
                         },
                     )
                 })
                 .collect()
         };
+        let with_containers =
+            |mut ops: BTreeMap<OpKind, OpRule>, kinds: &[OpKind], matches: &[LabelMatch]| {
+                for k in kinds {
+                    if let Some(rule) = ops.get_mut(k) {
+                        rule.container_labels = matches.to_vec();
+                    }
+                }
+                ops
+            };
         let ep = Some(ENDPOINT_LABEL);
         let svc = Some(SERVICE_LABEL);
         let empty = Profile {
@@ -247,34 +334,40 @@ impl Profile {
             reserved_images: config.reserved_images.clone(),
         };
         let profile = match preset {
-            // crates/chelabase-neon/src/compute.rs `DockerLocator`: `inspect` (compute status
-            // and addresses) and the compute listing filtered by `list_filters`.
+            // crates/chelabase-neon/src/compute.rs `DockerLocator`: `inspect_container`
+            // (compute status and addresses). It never lists.
             Preset::Orchestrator => Profile {
                 name: "orchestrator".into(),
-                ops: rules(&[(ContainerList, None), (ContainerInspect, None)]),
+                ops: rules(&[(ContainerInspect, None)]),
                 ..empty
             },
             // crates/chelabase-neon/src/backend.rs `DockerBackend`: `pull_image` (images/create),
             // `create` (containers/create on the compute network, no mounts; connect to the
             // control network; `upload_tls_tar` archive PUT; start), `read_file_inner` (archive
             // GET), `remove_container` (DELETE, force), `run_exec` (exec create/start/json),
-            // `list`/`list_not_running` and `status` (containers/json, {id}/json).
+            // `list`/`list_not_running` and `status` (containers/json, {id}/json). Its one
+            // connect attaches a compute to the control network: the network must be one of
+            // `networks`, and the container an endpoint.
             Preset::Worker => Profile {
                 name: "worker".into(),
-                ops: rules(&[
-                    (ImageCreate, None),
-                    (ContainerCreate, None),
-                    (ContainerStart, ep),
-                    (ContainerDelete, ep),
-                    (ArchivePut, ep),
-                    (ArchiveGet, ep),
-                    (ExecCreate, ep),
-                    (ExecStart, ep),
-                    (ExecInspect, ep),
-                    (NetworkConnect, None),
-                    (ContainerList, None),
-                    (ContainerInspect, None),
-                ]),
+                ops: with_containers(
+                    rules(&[
+                        (ImageCreate, None),
+                        (ContainerCreate, None),
+                        (ContainerStart, ep),
+                        (ContainerDelete, ep),
+                        (ArchivePut, ep),
+                        (ArchiveGet, ep),
+                        (ExecCreate, ep),
+                        (ExecStart, ep),
+                        (ExecInspect, ep),
+                        (NetworkConnect, None),
+                        (ContainerList, None),
+                        (ContainerInspect, None),
+                    ]),
+                    &[NetworkConnect],
+                    &[LabelMatch::key(ENDPOINT_LABEL)],
+                ),
                 networks: vec![
                     config.compute_network.clone(),
                     config.control_network.clone(),
@@ -285,38 +378,53 @@ impl Profile {
             // (images/{ref}/json, images/create), `list`/`inspect`, `create` (tmpfs mounts only,
             // no caps or binds, its slot network), `start`/`stop`/`remove`/`logs`, and the slot
             // networks (`list_networks`, `inspect_network`, `create_network`, `connect`,
-            // `disconnect`, `remove_network`), all labelled `chelabase.dev/service-id`.
+            // `disconnect`, `remove_network`), all labelled `chelabase.dev/service-id`. It
+            // connects and disconnects its service containers and the stack's `functions`
+            // service (runner.rs `attach_functions`, `remove_network`).
             Preset::ServiceRunner => Profile {
                 name: "service-runner".into(),
-                ops: rules(&[
-                    (ImageInspect, None),
-                    (ImageCreate, None),
-                    (ContainerList, None),
-                    (ContainerInspect, None),
-                    (ContainerCreate, None),
-                    (ContainerStart, svc),
-                    (ContainerStop, svc),
-                    (ContainerDelete, svc),
-                    (ContainerLogs, svc),
-                    (NetworkList, None),
-                    (NetworkInspect, None),
-                    (NetworkCreate, None),
-                    (NetworkConnect, svc),
-                    (NetworkDisconnect, svc),
-                    (NetworkDelete, svc),
-                ]),
+                ops: with_containers(
+                    rules(&[
+                        (ImageInspect, None),
+                        (ImageCreate, None),
+                        (ContainerList, None),
+                        (ContainerInspect, None),
+                        (ContainerCreate, None),
+                        (ContainerStart, svc),
+                        (ContainerStop, svc),
+                        (ContainerDelete, svc),
+                        (ContainerLogs, svc),
+                        (NetworkList, None),
+                        (NetworkInspect, None),
+                        (NetworkCreate, None),
+                        (NetworkConnect, svc),
+                        (NetworkDisconnect, svc),
+                        (NetworkDelete, svc),
+                    ]),
+                    &[NetworkConnect, NetworkDisconnect],
+                    &[
+                        LabelMatch::key(SERVICE_LABEL),
+                        LabelMatch::exact(COMPOSE_SERVICE_LABEL, "functions"),
+                    ],
+                ),
                 mount_types: vec![MountType::Tmpfs],
                 ..empty
             },
             // The runner: nextest archives, the e2e scripts' docker CLI calls and `docker
             // compose up/ps/cp/config` (roles_live), `--network container:<x>`, `--cap-add
             // NET_ADMIN` (bench), `-v $state/grpc-tls:/tls` (storage-iam-e2e). Every op the
-            // grammar has; m6 narrows its body rules.
+            // grammar has, on any in-scope network; m6 narrows its body rules.
             Preset::Runner => Profile {
                 name: "runner".into(),
                 ops: OpKind::ALL
                     .iter()
-                    .map(|k| (*k, OpRule::default()))
+                    .map(|k| {
+                        let rule = OpRule {
+                            any_network: is_connect(*k),
+                            ..OpRule::default()
+                        };
+                        (*k, rule)
+                    })
                     .collect(),
                 networks: config.stack_networks.clone(),
                 mount_types: vec![MountType::Bind, MountType::Volume, MountType::Tmpfs],
@@ -335,14 +443,47 @@ impl Profile {
         self.ops.get(&kind)?.target_label.as_deref()
     }
 
+    /// The labels a network connect's or disconnect's container must match one of (empty: no
+    /// rule beyond scope).
+    pub fn container_labels(&self, kind: OpKind) -> &[LabelMatch] {
+        self.ops
+            .get(&kind)
+            .map_or(&[], |r| r.container_labels.as_slice())
+    }
+
+    /// The network a connect or disconnect path names, when it is one of
+    /// [`networks`](Self::networks) by exact name.
+    fn listed_network(&self, op: &Op) -> bool {
+        match op {
+            Op::NetworkConnect(n) | Op::NetworkDisconnect(n) => self.networks.contains(n),
+            _ => false,
+        }
+    }
+
     /// Whether the op's kind is listed (and, for a pull, its reference isn't reserved). An op
     /// with a [`target_label`](Self::target_label) still needs [`allows_target`](Self::allows_target)
     /// once the server has inspected the target.
+    ///
+    /// A network connect or disconnect also needs its path's network to be one of
+    /// [`networks`](Self::networks) by exact name, unless its rule has a `target_label` (then
+    /// [`allows_target`](Self::allows_target) checks the network's label) or `any_network`.
+    /// Its body's container still needs
+    /// [`allows_connect_container`](Self::allows_connect_container).
     pub fn allows(&self, op: &Op) -> Result<(), Deny> {
-        if !self.ops.contains_key(&op.kind()) {
+        let Some(rule) = self.ops.get(&op.kind()) else {
             return Err(Deny::new(format!(
                 "{:?} is not allowed for {}",
                 op.kind(),
+                self.name
+            )));
+        };
+        if let Op::NetworkConnect(n) | Op::NetworkDisconnect(n) = op
+            && rule.target_label.is_none()
+            && !rule.any_network
+            && !self.listed_network(op)
+        {
+            return Err(Deny::new(format!(
+                "network {n} is not one of {}'s networks",
                 self.name
             )));
         }
@@ -366,14 +507,48 @@ impl Profile {
 
     /// [`allows`](Self::allows), plus the target-label rule against the target's labels. Stack
     /// scope is a separate check ([`in_scope`](crate::in_scope)).
+    /// A connect or disconnect on one of [`networks`](Self::networks) needs no target label.
     pub fn allows_target(&self, op: &Op, target: &Labels) -> Result<(), Deny> {
         self.allows(op)?;
         if let Some(label) = self.target_label(op.kind())
+            && !self.listed_network(op)
             && target.get(label).is_none_or(|v| v.is_empty())
         {
             return Err(Deny::new(format!(
                 "{:?} needs a target labelled {label} for {}",
                 op.kind(),
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Profile {
+    /// For a network connect or disconnect: [`allows`](Self::allows), plus the container the
+    /// body names (`Container`, resolved and scope-checked by the server) against the rule's
+    /// [`container_labels`](Self::container_labels). Any other op is refused.
+    pub fn allows_connect_container(&self, op: &Op, container: &Labels) -> Result<(), Deny> {
+        if !is_connect(op.kind()) {
+            return Err(Deny::new(format!(
+                "{:?} names no container to connect",
+                op.kind()
+            )));
+        }
+        self.allows(op)?;
+        let matches = self.container_labels(op.kind());
+        if !matches.is_empty() && !matches.iter().any(|m| m.matches(container)) {
+            return Err(Deny::new(format!(
+                "{:?} needs a container labelled {} for {}",
+                op.kind(),
+                matches
+                    .iter()
+                    .map(|m| match &m.value {
+                        Some(v) => format!("{}={v}", m.key),
+                        None => m.key.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" or "),
                 self.name
             )));
         }
@@ -524,6 +699,143 @@ mod tests {
     }
 
     #[test]
+    fn worker_connect_only_profile_networks_and_computes() {
+        let worker = Profile::preset(Preset::Worker, &config()).unwrap();
+        // The audit's case: a network outside the worker's list (the stack's default network,
+        // another stack's, the host's).
+        for n in [
+            "chelabase-a_default",
+            "chelabase-feat-x_default",
+            "bridge",
+            "host",
+        ] {
+            let op = classify("POST", &format!("/networks/{n}/connect"), None).unwrap();
+            assert!(worker.allows(&op).is_err(), "worker connects to {n}");
+        }
+        // Its own networks pass the path check, need no network label, and take only computes.
+        let compute = labels(&[("chelabase.dev/stack", "feat-x"), (ENDPOINT_LABEL, "ep1")]);
+        let network = labels(&[("com.docker.compose.project", "chelabase-feat-x")]);
+        for n in ["chelabase-feat-x_compute", "chelabase-feat-x_control"] {
+            let op = classify("POST", &format!("/networks/{n}/connect"), None).unwrap();
+            worker.allows(&op).unwrap();
+            worker.allows_target(&op, &network).unwrap();
+            assert_eq!(
+                worker.container_labels(op.kind()),
+                &[LabelMatch::key(ENDPOINT_LABEL)]
+            );
+            worker.allows_connect_container(&op, &compute).unwrap();
+            for bad in [
+                // An in-stack service (metadata-db, pageserver).
+                labels(&[
+                    ("com.docker.compose.project", "chelabase-feat-x"),
+                    (COMPOSE_SERVICE_LABEL, "metadata-db"),
+                ]),
+                labels(&[("chelabase.dev/stack", "feat-x"), (ENDPOINT_LABEL, "")]),
+                labels(&[
+                    ("chelabase.dev/stack", "feat-x"),
+                    ("Chelabase.dev/endpoint-id", "ep1"),
+                ]),
+                labels(&[("chelabase.dev/stack", "feat-x"), (SERVICE_LABEL, "s1")]),
+                Labels::new(),
+            ] {
+                assert!(
+                    worker.allows_connect_container(&op, &bad).is_err(),
+                    "worker connects {bad:?} to {n}"
+                );
+            }
+        }
+        // A listed network by a name it isn't (case, ID) is not listed.
+        for n in ["Chelabase-feat-x_control", "chelabase-feat-x_control2"] {
+            let op = classify("POST", &format!("/networks/{n}/connect"), None).unwrap();
+            assert!(
+                worker.allows_connect_container(&op, &compute).is_err(),
+                "{n}"
+            );
+        }
+        // The container check refuses ops that aren't connects, and the worker never
+        // disconnects.
+        let start = classify("POST", "/containers/x/start", None).unwrap();
+        assert!(worker.allows_connect_container(&start, &compute).is_err());
+        let op = classify(
+            "POST",
+            "/networks/chelabase-feat-x_control/disconnect",
+            None,
+        )
+        .unwrap();
+        assert!(worker.allows(&op).is_err());
+        assert!(worker.allows_connect_container(&op, &compute).is_err());
+    }
+
+    #[test]
+    fn service_runner_connects_only_services_and_functions() {
+        let runner = Profile::preset(Preset::ServiceRunner, &config()).unwrap();
+        let slot = labels(&[("chelabase.dev/stack", "feat-x"), (SERVICE_LABEL, "s1")]);
+        let service = slot.clone();
+        let functions = labels(&[
+            ("com.docker.compose.project", "chelabase-feat-x"),
+            (COMPOSE_SERVICE_LABEL, "functions"),
+        ]);
+        for path in ["/networks/n/connect", "/networks/n/disconnect"] {
+            let op = classify("POST", path, None).unwrap();
+            runner.allows_target(&op, &slot).unwrap();
+            runner.allows_connect_container(&op, &service).unwrap();
+            runner.allows_connect_container(&op, &functions).unwrap();
+            for bad in [
+                labels(&[
+                    ("com.docker.compose.project", "chelabase-feat-x"),
+                    (COMPOSE_SERVICE_LABEL, "pageserver"),
+                ]),
+                labels(&[
+                    ("com.docker.compose.project", "chelabase-feat-x"),
+                    (COMPOSE_SERVICE_LABEL, "Functions"),
+                ]),
+                labels(&[("chelabase.dev/stack", "feat-x"), (ENDPOINT_LABEL, "ep1")]),
+                labels(&[("chelabase.dev/stack", "feat-x"), (SERVICE_LABEL, "")]),
+            ] {
+                assert!(
+                    runner.allows_connect_container(&op, &bad).is_err(),
+                    "{path} with {bad:?}"
+                );
+            }
+            // The network still needs the service label (its `networks` list is empty).
+            let compose_net = labels(&[("com.docker.compose.project", "chelabase-feat-x")]);
+            assert!(runner.allows_target(&op, &compose_net).is_err(), "{path}");
+        }
+        // The runner may connect anything in scope to any in-scope network.
+        let all = Profile::preset(Preset::Runner, &config()).unwrap();
+        let op = classify("POST", "/networks/chelabase-feat-x_control/connect", None).unwrap();
+        all.allows_connect_container(&op, &Labels::new()).unwrap();
+    }
+
+    #[test]
+    fn connect_rules_parse_and_validate() {
+        let ok = r#"{"name":"t","ops":{"network_connect":{"container_labels":[{"key":"a.b/c"},{"key":"x","value":"y"}]},"network_disconnect":{"any_network":true}}}"#;
+        let p = Profile::from_json(ok).unwrap();
+        assert_eq!(
+            p.container_labels(OpKind::NetworkConnect),
+            &[LabelMatch::key("a.b/c"), LabelMatch::exact("x", "y")]
+        );
+        // Without `networks`, a target label or any_network, a connect is refused.
+        let p = Profile::from_json(r#"{"name":"t","ops":{"network_connect":{}}}"#).unwrap();
+        let op = classify("POST", "/networks/n/connect", None).unwrap();
+        assert!(p.allows(&op).is_err());
+        for bad in [
+            // Connect-only fields on other ops.
+            r#"{"name":"t","ops":{"container_start":{"container_labels":[{"key":"a"}]}}}"#,
+            r#"{"name":"t","ops":{"network_create":{"any_network":true}}}"#,
+            // Bad keys and values, unknown fields.
+            r#"{"name":"t","ops":{"network_connect":{"container_labels":[{"key":""}]}}}"#,
+            r#"{"name":"t","ops":{"network_connect":{"container_labels":[{"key":"a b"}]}}}"#,
+            r#"{"name":"t","ops":{"network_connect":{"container_labels":[{"key":"a","value":""}]}}}"#,
+            r#"{"name":"t","ops":{"network_connect":{"container_labels":[{"key":"a","any":1}]}}}"#,
+            r#"{"name":"t","ops":{"network_connect":{"container_labels":"a"}}}"#,
+            r#"{"name":"t","ops":{"network_connect":{"any_network":"yes"}}}"#,
+        ] {
+            assert!(Profile::from_json(bad).is_err(), "{bad} loaded");
+        }
+    }
+
+    #[test]
     fn service_runner_lifecycle_needs_service_label() {
         let runner = Profile::preset(Preset::ServiceRunner, &config()).unwrap();
         let service = labels(&[("chelabase.dev/stack", "feat-x"), (SERVICE_LABEL, "s1")]);
@@ -566,10 +878,7 @@ mod tests {
                 .collect()
         };
         use OpKind::*;
-        assert_eq!(
-            kinds(Preset::Orchestrator),
-            vec![ContainerList, ContainerInspect]
-        );
+        assert_eq!(kinds(Preset::Orchestrator), vec![ContainerInspect]);
         let mut worker = vec![
             ContainerList,
             ContainerCreate,

@@ -717,14 +717,8 @@ mod tests {
         let mut add = |p: Preset, m: &'static str, path: &str, q: Option<&str>| {
             calls.push((p, m, path.to_string(), q.map(str::to_string)));
         };
-        // orchestrator: chelabase-neon compute.rs DockerLocator.
+        // orchestrator: chelabase-neon compute.rs DockerLocator (inspect only).
         let o = Preset::Orchestrator;
-        add(
-            o,
-            "GET",
-            "/v1.53/containers/json",
-            Some("all=true&filters=%7B%22label%22%3A%5B%22chelabase.dev%2Fendpoint-id%22%5D%7D"),
-        );
         add(o, "GET", &format!("/v1.53/containers/{ep}/json"), None);
         // worker: chelabase-neon backend.rs DockerBackend.
         let w = Preset::Worker;
@@ -877,13 +871,14 @@ mod tests {
             // Under the orchestrator only its own reads pass.
             if orchestrator.allows(&op).is_ok() {
                 assert!(op.kind().is_read(), "orchestrator allowed {op:?}");
-                assert!(
-                    matches!(op.kind(), OpKind::ContainerList | OpKind::ContainerInspect),
+                assert_eq!(
+                    op.kind(),
+                    OpKind::ContainerInspect,
                     "orchestrator allowed {op:?}, outside its inventory"
                 );
             } else {
                 assert!(
-                    !matches!(op.kind(), OpKind::ContainerList | OpKind::ContainerInspect),
+                    op.kind() != OpKind::ContainerInspect,
                     "orchestrator denied its own {op:?}"
                 );
             }
