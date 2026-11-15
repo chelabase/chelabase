@@ -129,7 +129,7 @@ JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.r
 WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl'";
 
 /// The version the stamp names (NULL when there's no valid stamp: see [`STAMP_TRIGGER_SQL`]).
-fn stamp_version_sql() -> String {
+pub(crate) fn stamp_version_sql() -> String {
     format!(
         "(SELECT pg_catalog.substring(pg_catalog.obj_description(e.oid, 'pg_event_trigger'), '{DATA_API_STAMP_PATTERN}')::pg_catalog.int4 {STAMP_TRIGGER_SQL})"
     )
@@ -137,7 +137,7 @@ fn stamp_version_sql() -> String {
 
 /// Whether the `chelabase` schema carries a valid stamp newer than this worker's (NULL when
 /// there's none or it doesn't parse; every use is `COALESCE(…, false)`).
-fn valid_newer_sql() -> String {
+pub(crate) fn valid_newer_sql() -> String {
     format!(
         "({} OPERATOR(pg_catalog.>) {DATA_API_SCHEMA_VERSION})",
         stamp_version_sql()
@@ -149,6 +149,28 @@ fn current_stamp_sql() -> String {
     format!(
         "EXISTS (SELECT {STAMP_TRIGGER_SQL} AND pg_catalog.obj_description(e.oid, 'pg_event_trigger') OPERATOR(pg_catalog.=) '{DATA_API_SCHEMA_STAMP}')"
     )
+}
+
+/// The output line the bootstrap prints when it left a newer schema alone and the machinery
+/// check ([`MACHINERY_CHECK_SQL`]) still fails.
+pub const NEWER_MACHINERY_OFF: &str = "chelabase_data_api_newer_machinery_off";
+
+/// The warning a bootstrap that left a newer schema alone logs (m1's, naming both versions),
+/// or `None` when it didn't. When the machinery check still fails afterwards (an event
+/// trigger disabled or missing, which this worker leaves to the newer one), the health check
+/// stays `f` and reconcile re-bootstraps the database on every pass: that gets its own
+/// warning naming the cause, so the loop shows up in the logs.
+fn newer_schema_warning(output: &str) -> Option<String> {
+    let why = newer_data_api_schema(output)?;
+    if output.lines().any(|l| l.trim_end() == NEWER_MACHINERY_OFF) {
+        Some(format!(
+            "{why}, but its event triggers are disabled or missing and only a newer worker \
+             repairs them: the data API check keeps failing, so reconcile re-bootstraps this \
+             database on every pass until a newer worker runs"
+        ))
+    } else {
+        Some(why.to_string())
+    }
 }
 
 /// Whether the bootstrap left a newer schema alone: the warning to log (the text after
@@ -554,6 +576,8 @@ END $$;
 SELECT pg_catalog.format('{NEWER_DATA_API_MARK}: the chelabase schema is version %s, newer than this worker''s {DATA_API_SCHEMA_VERSION}; it was left alone',
     pg_catalog.current_setting('chelabase.newer_version'))
   WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true';
+SELECT '{NEWER_MACHINERY_OFF}' WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true'
+  AND NOT ({MACHINERY_CHECK_SQL});
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
@@ -787,7 +811,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if missing_schema(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, schema, "the default schema doesn't exist; its default privileges and grants were skipped (the machinery is installed)");
         }
-        if let Some(why) = newer_data_api_schema(&output) {
+        if let Some(why) = newer_schema_warning(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, "{why}");
         }
         if let Some(aside) = quarantined(&output) {
@@ -1680,6 +1704,8 @@ END $$;
 SELECT pg_catalog.format('chelabase_data_api_newer: the chelabase schema is version %s, newer than this worker''s 1; it was left alone',
     pg_catalog.current_setting('chelabase.newer_version'))
   WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true';
+SELECT 'chelabase_data_api_newer_machinery_off' WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true'
+  AND NOT (EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin) AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', 'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3);
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
@@ -3682,5 +3708,49 @@ END $$;
             .position(|(_, _, s)| s.contains("COMMENT ON SCHEMA storage IS"))
             .expect("the storage script ran");
         assert!(data_api_at < storage_at);
+    }
+
+    /// m1 audit nit: a newer schema whose event triggers are off fails the machinery check,
+    /// and this worker leaves those triggers alone, so reconcile re-bootstraps it every pass.
+    /// The script flags it after the gate, from the same check the health check counts, only
+    /// when it left the schema alone.
+    #[test]
+    fn the_script_flags_a_newer_schema_whose_machinery_check_fails() {
+        for sql in both_scripts() {
+            let line = format!(
+                "SELECT '{NEWER_MACHINERY_OFF}' WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true'\n  AND NOT ({MACHINERY_CHECK_SQL});\n"
+            );
+            assert_eq!(sql.matches(&line).count(), 1, "{sql}");
+            let at = sql.find(&line).unwrap();
+            assert!(sql.find("\\endif").unwrap() < at, "after the gate");
+            assert!(sql.find("ALTER ROLE authenticator LOGIN").unwrap() < at, "after the login's repair");
+            assert!(sql.find(&format!("SELECT pg_catalog.format('{NEWER_DATA_API_MARK}:")).unwrap() < at);
+            assert!(at < sql.find("COMMIT;").unwrap());
+        }
+        assert_eq!(NEWER_MACHINERY_OFF, "chelabase_data_api_newer_machinery_off");
+    }
+
+    /// m1 audit nit: which warning a bootstrap that left a newer schema alone logs. The
+    /// re-bootstrap loop gets its own warning naming the cause; a schema that's fine gets
+    /// m1's; nothing left alone, nothing.
+    #[test]
+    fn a_newer_schema_with_its_machinery_off_warns_of_the_loop() {
+        let why = "the chelabase schema is version 99, newer than this worker's 1; it was left alone";
+        let newer = format!("{NEWER_DATA_API_MARK}: {why}\n");
+        let off = format!("{NEWER_MACHINERY_OFF}\n");
+
+        let looping = newer_schema_warning(&format!("\n{newer}{off}\n")).unwrap();
+        assert!(looping.starts_with(why), "{looping}");
+        for part in ["event trigger", "disabled or missing", "re-bootstraps", "every pass", "newer worker"] {
+            assert!(looping.contains(part), "{part}: {looping}");
+        }
+        assert_eq!(newer_schema_warning(&format!("{newer}\n")).as_deref(), Some(why));
+        for none in [String::new(), off.clone(), "chelabase_quarantine_1\n".into()] {
+            assert_eq!(newer_schema_warning(&none), None, "{none:?}");
+        }
+        // Only a whole line counts.
+        for not_off in [format!("x {off}"), format!("{NEWER_MACHINERY_OFF}x\n"), format!("CONTEXT:  {off}")] {
+            assert_eq!(newer_schema_warning(&format!("{newer}{not_off}")).as_deref(), Some(why), "{not_off:?}");
+        }
     }
 }
