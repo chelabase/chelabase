@@ -13,7 +13,8 @@
 #   pg-relay    the functions service's SQL relay (pooled-endpoints m14b sets its address on the
 #               internal `functions-sql` network; `--external-addr pg-relay=<host:port>` moves it).
 #               Raw TCP. Only the supervisor's `chelabaseDb` connect handler dials it; loaded
-#               workers reach it as `env.CHELABASE_DB`, whatever address they pass (m12).
+#               workers reach it as `env.CHELABASE_DB.connect("chelabase-db:5432")`; any
+#               address they pass is ignored (m12).
 #   egress      the loaded workers' global outbound: public addresses only. DNS answers are
 #               filtered per connection, so a name that resolves to a denied address fails.
 #   none        no address at all.
@@ -61,5 +62,7 @@ const supervisor :Workerd.Worker = (
     (name = "GATEWAY", service = "chelabase-api"),
     (name = "PG_RELAY", service = "pg-relay"),
     (name = "API_HOST", fromEnvironment = "CHELABASE_API_HOST"),
+    # Tests only: a SQL grant's held age in ms, which can only be shorter than its 10 minutes.
+    (name = "SQL_GRANT_MAX_AGE_MS", fromEnvironment = "SQL_GRANT_MAX_AGE_MS"),
   ],
 );

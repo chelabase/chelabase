@@ -43,7 +43,8 @@
 // and both become part of the loader id, so two functions or branches never share a loaded
 // worker, and a worker loaded with SQL is never the one an invocation without a grant runs. A
 // worker loaded with a grant gets `env.CHELABASE_DB` (the `chelabaseDb` entrypoint below, whose
-// props hold only the loader id) and `env.CHELABASE_DB_URL`. The grant itself stays in this
+// props hold only the loader id; user code calls `connect("chelabase-db:5432")`) and
+// `env.CHELABASE_DB_URL`. The grant itself stays in this
 // isolate (`grants`, the newest per loader id) and goes only into the relay's preamble.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
@@ -74,11 +75,21 @@ const verified = new Set();
 const MAX_VERIFIED = 4096;
 
 // Loader id -> {grant, at}: the newest SQL grant an invocation brought for that loaded worker.
-// Overwritten on every invocation, so a cached worker always connects with the newest; bounded
-// like `verified` (the oldest entry goes first); and a grant older than its 10-minute lifetime
-// (m14's `exp`) is never sent.
+// Overwritten on every invocation (`at` is when it arrived), so a cached worker always connects
+// with the newest. workerd has no eviction hook, so this map isn't tied to the loader's cache: an
+// entry is held from the moment its invocation arrives (before the bundle is fetched, so a failed
+// load leaves one too) and goes when 4096 newer loader ids have brought a grant (by recency) or
+// when its function is invoked without one. A grant held longer than 10 minutes from its arrival
+// (m14's lifetime; its own `exp` isn't read here) is never sent. Every way out fails closed: the
+// socket closes before anything is dialled.
 const grants = new Map();
 const GRANT_MAX_AGE_MS = 10 * 60 * 1000;
+
+// SQL_GRANT_MAX_AGE_MS (tests) can only shorten that age; anything else means 10 minutes.
+function grantMaxAge(bindings) {
+  const ms = Number(bindings.SQL_GRANT_MAX_AGE_MS);
+  return Number.isInteger(ms) && ms > 0 && ms < GRANT_MAX_AGE_MS ? ms : GRANT_MAX_AGE_MS;
+}
 
 function holdGrant(id, grant) {
   grants.delete(id);
@@ -396,10 +407,12 @@ const sqlBinding = (ctx, loaderId) => ctx.exports.chelabaseDb({ props: { loaderI
 const closeQuietly = (s) => s.close().catch(() => {});
 
 // The SQL binding (m12). A Fetcher's connect(address, options) from the loaded worker lands in
-// `connect` here, which never looks at the address: every socket goes to PG_RELAY, behind the
-// preamble `CHELABASE-SQL 1 <grant>\n` with the newest grant held for the caller's loader id.
-// workerd itself refuses `secureTransport: "on"` on a connect to an entrypoint ("Incoming CONNECT
-// with TLS not supported") and startTls() on a "starttls" socket, so no TLS crosses this hop; the
+// `connect` here, which never sees the address or options: every socket goes to PG_RELAY, behind
+// the preamble `CHELABASE-SQL 1 <grant>\n` with the newest grant held for the caller's loader id.
+// workerd requires an address (a bare connect() throws in the caller), so the documented call is
+// `connect("chelabase-db:5432")`; any address does the same. TLS is never negotiated on this
+// hop: workerd refuses `secureTransport: "on"` ("Incoming CONNECT with TLS not supported"), and
+// with "starttls" a plain socket opens (preamble and all) but its startTls() is refused. The
 // relay's TLS faces upstream. Without a grant (or with one past its lifetime) the socket closes
 // before anything is dialled. `fetch` answers 404, and the entrypoint has no RPC methods.
 export const chelabaseDb = {
@@ -408,7 +421,7 @@ export const chelabaseDb = {
   },
   async connect(socket, bindings, ctx) {
     const held = grants.get(ctx.props?.loaderId);
-    if (!held || Date.now() - held.at > GRANT_MAX_AGE_MS) {
+    if (!held || Date.now() - held.at > grantMaxAge(bindings)) {
       await closeQuietly(socket);
       return;
     }
