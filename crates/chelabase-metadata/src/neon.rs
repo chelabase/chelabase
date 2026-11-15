@@ -757,8 +757,13 @@ impl MetadataClient {
         // MH-9, I1: a personal row answers its record's verifier, never its own (a worker write
         // racing a reset can leave a row stale or empty), and only while the record is live (not
         // revoked, not past `valid_until`), judged in this same statement.
+        // Pooled endpoints m13: a function login's row answers only while its state row, on the
+        // branch this endpoint serves, still has SQL access, a password and the very run-as role
+        // (name kept, OID equal) the login was granted, with a live run-as key; otherwise none.
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT CASE WHEN r.origin = 'personal' THEN l.scram_verifier
+                         WHEN r.origin = 'function' THEN
+                             CASE WHEN bf.function_id IS NOT NULL THEN r.scram_verifier END
                          ELSE r.scram_verifier END
              FROM neon_endpoints e
              LEFT JOIN neon_roles r ON r.endpoint_id = e.id AND r.name = $2
@@ -766,6 +771,14 @@ impl MetadataClient {
                ON r.origin = 'personal' AND l.member_id = r.member_id
               AND l.database_id = r.personal_database_id AND l.role_name = r.name
               AND l.revoked_at IS NULL AND l.valid_until > now()
+             LEFT JOIN branch_functions bf
+               ON r.origin = 'function' AND bf.branch_id = r.function_branch_id
+              AND bf.function_id = r.function_id AND bf.sql_access
+              AND bf.sql_password_enc IS NOT NULL AND bf.run_as_key_id IS NOT NULL
+              AND bf.run_as_unmintable IS NULL AND bf.run_as_role_oid = r.function_role_oid
+              AND EXISTS (SELECT 1 FROM branches b
+                          WHERE b.id = bf.branch_id AND b.endpoint_id = e.id
+                            AND b.status NOT IN ('deleting', 'deleted'))
              WHERE e.id = $1 AND (e.routable OR NOT $3)",
         )
         .bind(endpoint_id)
@@ -820,7 +833,7 @@ impl MetadataClient {
                     r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of,
                     r.member_no_set, r.member_admin
              FROM neon_roles r
-             WHERE r.endpoint_id = $1
+             WHERE r.endpoint_id = $1 AND r.origin <> 'function'
              ORDER BY (r.origin <> 'owner'), r.name COLLATE \"C\"",
         )
         .bind(endpoint_id)
@@ -875,7 +888,7 @@ impl MetadataClient {
                     r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of,
                     r.member_no_set, r.member_admin
              FROM neon_endpoints e
-             LEFT JOIN neon_roles r ON r.endpoint_id = e.id
+             LEFT JOIN neon_roles r ON r.endpoint_id = e.id AND r.origin <> 'function'
              WHERE e.id = $1
              ORDER BY (r.origin <> 'owner'), r.name COLLATE \"C\"",
         )
@@ -1465,7 +1478,7 @@ impl MetadataClient {
         .await?;
         let counted = match &current {
             // S1: a personal row is its record's, never the API's.
-            Some((origin, _)) if origin == "owner" || origin == "personal" => {
+            Some((origin, _)) if matches!(origin.as_str(), "owner" | "personal" | "function") => {
                 return Ok(RoleWriteOutcome::NotFound);
             }
             Some((_, verifier)) => verifier.is_some(),
@@ -1481,7 +1494,7 @@ impl MetadataClient {
              ON CONFLICT (endpoint_id, name) DO UPDATE SET
                  scram_verifier = EXCLUDED.scram_verifier, password_enc = EXCLUDED.password_enc,
                  login = true, pending = true, password_unreadable = false, no_password = false
-             WHERE r.origin NOT IN ('owner', 'personal')",
+             WHERE r.origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1515,7 +1528,7 @@ impl MetadataClient {
         let updated = sqlx::query(
             "UPDATE neon_roles SET scram_verifier = $3, password_enc = $4, pending = true,
                  password_unreadable = false, no_password = false
-             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1558,7 +1571,7 @@ impl MetadataClient {
             sqlx::query(
                 "UPDATE neon_roles SET attributes_pending = false
                  WHERE endpoint_id = $1 AND name = $2 AND attributes_pending
-                   AND attributes_change_id = $3 AND origin <> 'personal'",
+                   AND attributes_change_id = $3 AND origin NOT IN ('personal', 'function')",
             )
             .bind(endpoint_id)
             .bind(name)
@@ -1572,7 +1585,7 @@ impl MetadataClient {
         }
         let cleared = sqlx::query(
             "UPDATE neon_roles SET pending = false
-             WHERE endpoint_id = $1 AND name = $2 AND pending AND origin <> 'personal'",
+             WHERE endpoint_id = $1 AND name = $2 AND pending AND origin NOT IN ('personal', 'function')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1602,7 +1615,7 @@ impl MetadataClient {
         }
         let deleted = sqlx::query(
             "DELETE FROM neon_roles
-             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1666,10 +1679,11 @@ impl MetadataClient {
             return Ok(RenameCopyOutcome::Taken);
         }
         // S1: a personal row is its record's (its name is the record's, by FK): nothing moves,
-        // keys included.
+        // keys included. A function login's row (m13) is its state row's alike.
         let personal: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM neon_roles
-                            WHERE endpoint_id = $1 AND name = $2 AND origin = 'personal')",
+                            WHERE endpoint_id = $1 AND name = $2
+                              AND origin IN ('personal', 'function'))",
         )
         .bind(endpoint_id)
         .bind(old)
@@ -1748,7 +1762,7 @@ impl MetadataClient {
         }
         sqlx::query(
             "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
-             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('personal', 'function')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1835,7 +1849,7 @@ impl MetadataClient {
                                                   AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
                                                        OR $7::int <> 0)
                                                 THEN false ELSE r.password_unreadable END
-                 WHERE r.origin NOT IN ('owner', 'personal')
+                 WHERE r.origin NOT IN ('owner', 'personal', 'function')
                    AND (r.level IS DISTINCT FROM EXCLUDED.level
                         OR r.pending IS DISTINCT FROM EXCLUDED.pending
                         OR r.attributes_pending
@@ -1885,7 +1899,7 @@ impl MetadataClient {
             let removed: Vec<String> = sqlx::query_scalar(
                 "DELETE FROM neon_roles
                  WHERE endpoint_id = $1 AND name = ANY($2) AND origin <> 'owner'
-                   AND origin <> 'personal'
+                   AND origin NOT IN ('personal', 'function')
                    AND (forwarded_at IS NULL OR forwarded_at <= now() - interval '10 seconds')
                  RETURNING name",
             )

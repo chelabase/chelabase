@@ -48,7 +48,7 @@ pub use functions::{
     Advance, BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
-    ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
+    FunctionSqlLogin, ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
     secrets_env_bytes, valid_function_name, valid_secret_name,
 };
 pub use merges::{
@@ -305,7 +305,8 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
 /// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `functions_password_enc`
-/// (worker function triggers, `Purpose::FunctionsDispatch`); `data_api_keys.sealed`
+/// (worker function triggers, `Purpose::FunctionsDispatch`); `branch_functions.sql_password_enc`
+/// (worker function SQL logins, `seal_function_sql_password`); `data_api_keys.sealed`
 /// (orchestrator public keys, `Purpose::DataKey` with AAD the key id; and a function's run-as
 /// key, live only, sealed the same way by [`MetadataClient::set_run_as`]); `neon_roles.password_enc` (worker roles, branch
 /// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
@@ -322,6 +323,7 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "authenticator_password_enc", None),
     ("branches", "storage_password_enc", None),
     ("branches", "functions_password_enc", None),
+    ("branch_functions", "sql_password_enc", None),
     ("data_api_keys", "sealed", None),
     ("neon_roles", "password_enc", None),
     ("member_branch_roles", "password_enc", None),

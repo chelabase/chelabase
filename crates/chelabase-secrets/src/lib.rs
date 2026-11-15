@@ -107,6 +107,9 @@ pub enum Purpose {
     /// The `chelabase_functions_dispatch` login's password on a branch (the functions
     /// service's database-event dispatcher, edge functions m13b).
     FunctionsDispatch,
+    /// A function's SQL login password on a branch (`cb_fn_…`, pooled endpoints m13; bound to
+    /// its branch and function, see [`seal_function_sql_password`]).
+    FunctionsSql,
     /// The key storage signs its object URLs with ([`derive_key`]; never a sealed value).
     StorageUrl,
     /// A storage webhook endpoint's signing secret (bound to the endpoint, see
@@ -124,6 +127,7 @@ impl Purpose {
             Purpose::MemberRole => "member_role",
             Purpose::Storage => "storage",
             Purpose::FunctionsDispatch => "functions_dispatch",
+            Purpose::FunctionsSql => "functions_sql",
             Purpose::StorageUrl => "storage_url",
             Purpose::Webhook => "webhook",
         }
@@ -219,6 +223,31 @@ pub fn open_webhook_secret(
 
 fn member_role_aad(branch_id: uuid::Uuid, role: &str) -> String {
     format!("{branch_id}:{}:{role}", Purpose::MemberRole.as_str())
+}
+
+/// Seal a function's SQL login password; the AAD is `{branch_id}:functions_sql:{function_id}`,
+/// so it opens only for that function on that branch (never on a child branch).
+pub fn seal_function_sql_password(
+    key: &SecretKey,
+    branch_id: uuid::Uuid,
+    function_id: uuid::Uuid,
+    password: &str,
+) -> String {
+    seal(key, &function_sql_aad(branch_id, function_id), password)
+}
+
+/// Open a value from [`seal_function_sql_password`] for the same branch and function.
+pub fn open_function_sql_password(
+    key: &SecretKey,
+    branch_id: uuid::Uuid,
+    function_id: uuid::Uuid,
+    sealed: &str,
+) -> Result<String, SecretsError> {
+    open(key, &function_sql_aad(branch_id, function_id), sealed)
+}
+
+fn function_sql_aad(branch_id: uuid::Uuid, function_id: uuid::Uuid) -> String {
+    format!("{branch_id}:{}:{function_id}", Purpose::FunctionsSql.as_str())
 }
 
 fn role_aad(branch_id: &str, role: &str) -> String {
@@ -462,5 +491,26 @@ mod credential_tests {
         let as_role = seal_role_password(&key, &branch.to_string(), "cb_m_a", "pw");
         assert!(open_member_role_password(&key, branch, "cb_m_a", &as_role).is_err());
         assert!(open_role_password(&key, &branch.to_string(), "cb_m_a", &sealed).is_err());
+    }
+
+    /// Pooled endpoints m13: a function's SQL login password opens only for its own branch
+    /// and function, and never as another purpose's value.
+    #[test]
+    fn function_sql_password_round_trips_and_binds_branch_and_function() {
+        let key = SecretKey::generate();
+        assert_eq!(Purpose::FunctionsSql.as_str(), "functions_sql");
+        let (branch, function) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let sealed = seal_function_sql_password(&key, branch, function, "pw");
+        assert_eq!(open_function_sql_password(&key, branch, function, &sealed).unwrap(), "pw");
+        let other = uuid::Uuid::new_v4();
+        assert!(matches!(open_function_sql_password(&key, other, function, &sealed), Err(SecretsError::Decrypt)));
+        assert!(matches!(open_function_sql_password(&key, branch, other, &sealed), Err(SecretsError::Decrypt)));
+        // Swapping the two ids doesn't open it either.
+        assert!(open_function_sql_password(&key, function, branch, &sealed).is_err());
+        // Never as the dispatch login's or a role's value.
+        assert!(open_credential(&key, &branch.to_string(), Purpose::FunctionsDispatch, &sealed).is_err());
+        let dispatch = seal_credential(&key, &branch.to_string(), Purpose::FunctionsDispatch, "pw");
+        assert!(open_function_sql_password(&key, branch, function, &dispatch).is_err());
+        assert_eq!(open(&key, &format!("{branch}:functions_sql:{function}"), &sealed).unwrap(), "pw");
     }
 }
