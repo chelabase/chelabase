@@ -41,6 +41,11 @@ for f in neon/storage-tokens/pageserver-api.jwt neon/storage-tokens/safekeeper-d
 done
 echo "public key" >"$keys/neon/compute-jwt.pub.pem"
 chmod 644 "$keys/neon/compute-jwt.pub.pem"
+# The compute CA's certificate (the proxy verifies computes with it), in its 0700 dir.
+mkdir -p "$keys/compute-ca"
+echo "ca certificate" >"$keys/compute-ca/ca.crt"
+chmod 644 "$keys/compute-ca/ca.crt"
+chmod 700 "$keys/compute-ca"
 docker run --rm --pull never -v "$tmp:/t" alpine chown -R "$uid:$gid" /t/m >/dev/null ||
   fail "could not hand the key files to $uid:$gid"
 

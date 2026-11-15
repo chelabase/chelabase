@@ -367,6 +367,8 @@ services:
     secrets:
       - {source: valkey-proxy, target: /run/valkey-proxy.password}
       - {source: token-proxy-api, target: /run/proxy-api.token}
+      # The compute CA (the base's NEON_INTERNAL_CA_FILE): the proxy verifies computes with it.
+      - {source: compute-ca-cert, target: /run/chelabase/secrets/compute-ca/ca.crt}
     # Replaces the base's (its SQL-over-HTTP port too: a stack reaches 4444 inside only).
     ports: !override
       - "127.0.0.1:${CHELABASE_PROXY_PORT:?set by chelabase workbench (stack.env)}:4432"

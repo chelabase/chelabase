@@ -36,9 +36,14 @@ neonConfig.fetchEndpoint = (host) => `https://${host}:${httpPort}/sql`;
 
 const pool = new Pool({ connectionString: url });
 const { rows } = await pool.query("SELECT count(*)::int AS n FROM e2e");
+// compute-hop-tls m1: the proxy's session to the compute runs over TLS.
+const ssl = await pool.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()");
 await pool.end();
 if (rows[0].n !== expected) {
   throw new Error(`WebSocket: expected ${expected} rows, got ${rows[0].n}`);
+}
+if (ssl.rows[0]?.ssl !== true) {
+  throw new Error(`WebSocket: the proxy's session to the compute is not TLS (pg_stat_ssl.ssl = ${ssl.rows[0]?.ssl})`);
 }
 
 const sql = neon(url);
@@ -46,4 +51,4 @@ const viaHttp = await sql`SELECT count(*)::int AS n FROM e2e`;
 if (viaHttp[0].n !== expected) {
   throw new Error(`HTTP: expected ${expected} rows, got ${viaHttp[0].n}`);
 }
-console.log(`ok   @neondatabase/serverless read ${expected} rows over WebSocket and over HTTP`);
+console.log(`ok   @neondatabase/serverless read ${expected} rows over WebSocket (compute session over TLS) and over HTTP`);

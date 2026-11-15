@@ -828,14 +828,27 @@ services:
   # Valkey.
   # RT1 T1 (S6, S27): it logs in to Valkey as the `proxy` ACL user and calls the orchestrator
   # with its generated token, each read from its file. Runs as the app user (their owner).
+  # compute-hop-tls m1: the hop to the compute is TLS too. The orchestrator names each compute's
+  # certificate (<endpoint>.compute.chelabase.internal) in its wake_compute answer, and the proxy
+  # verifies it against the compute CA (NEON_INTERNAL_CA_FILE). The proxy accepts an unset
+  # variable, so the entrypoint refuses to start without a CA file holding a certificate.
+  # Upgrading: recreate the proxy (`docker compose up -d --force-recreate proxy`); a restart
+  # keeps the old container's environment and mounts, and its cached plaintext compute entries.
   proxy:
     image: *neon-image
     restart: unless-stopped
     user: "10001:10001"
+    environment:
+      NEON_INTERNAL_CA_FILE: /run/chelabase/secrets/compute-ca/ca.crt
     entrypoint:
       - /bin/sh
       - -c
-      - >-
+      - |
+        ca="$${NEON_INTERNAL_CA_FILE:-}"
+        if [ -z "$$ca" ] || [ ! -f "$$ca" ] || [ ! -s "$$ca" ] || ! grep -q -- '-----BEGIN CERTIFICATE-----' "$$ca"; then
+          echo "proxy: NEON_INTERNAL_CA_FILE=[$$ca] is unset, missing, empty or holds no certificate; the proxy verifies computes against the compute CA and won't start without it" >&2
+          exit 1
+        fi
         exec proxy --redis-plain=redis://proxy@valkey:6379 --redis-plain-password-file=/run/valkey-proxy.password --control-plane-token-file=/run/proxy-api.token "$$@"
       - proxy
     command:
@@ -860,6 +873,7 @@ services:
       - neon_proxy_tls:/tls:ro
       - {type: volume, source: secrets, target: /run/valkey-proxy.password, read_only: true, volume: {subpath: valkey/proxy.password}}
       - {type: volume, source: secrets, target: /run/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
       interval: 2s
@@ -867,7 +881,8 @@ services:
     depends_on:
       proxy-tls:
         condition: service_completed_successfully
-      # The proxy exits if it can't reach Redis at startup.
+      # The proxy exits if it can't reach Redis at startup. Valkey waits for init-secrets, which
+      # also makes compute-ca/ca.crt.
       valkey:
         condition: service_healthy
 
