@@ -444,7 +444,7 @@ WHERE a.oid >= 16384
   AND a.rolname NOT IN ('cloud_admin', 'neon_superuser', 'anon', 'authenticated',
                         'authenticator', 'chelabase_admin', 'chelabase_auth_sync')
   AND a.rolname !~ '^pg_'
-  AND a.rolname !~* '^(cb_m_|chelabase_)'
+  AND a.rolname !~* '^(cb_m_|cb_fn_|chelabase_)'
 UNION ALL
 SELECT 'd',
        encode(convert_to(d.datname, 'UTF8'), 'hex'),
@@ -2184,7 +2184,7 @@ mod tests {
     #[test]
     fn resync_sql_skips_reserved_prefixes() {
         let sql = resync_sql("postgres");
-        assert!(sql.contains("AND a.rolname !~* '^(cb_m_|chelabase_)'"), "{sql}");
+        assert!(sql.contains("AND a.rolname !~* '^(cb_m_|cb_fn_|chelabase_)'"), "{sql}");
     }
 
     /// A row named with a hidden prefix is never re-created: the catalog read never shows

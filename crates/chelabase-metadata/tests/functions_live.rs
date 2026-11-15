@@ -2660,4 +2660,164 @@ mod functions {
         assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
         s.finish().await;
     }
+
+    // --- Pooled endpoints m13: function SQL logins -------------------------------------------
+
+    /// `(sql_access, sealed password, salt)` of the state row.
+    async fn sql_columns(s: &Scratch, branch: BranchId, f: Uuid) -> (bool, Option<String>, Option<Vec<u8>>) {
+        sqlx::query_as(
+            "SELECT sql_access, sql_password_enc, sql_password_salt FROM branch_functions
+             WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(f)
+        .fetch_one(s.pool())
+        .await
+        .unwrap()
+    }
+
+    /// A function on `main` with an endpoint and run-as `reporter` (OID 4242), as an approved
+    /// run-as role leaves it: `(db, main, endpoint, function)`.
+    async fn sql_login_function(s: &Scratch) -> (DatabaseId, BranchId, String, Uuid) {
+        let (db, main) = s.database().await;
+        let ep = s.endpoint(main).await;
+        let f = s.active(db, main, "hello").await;
+        assert!(s.client.set_run_as(main, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        (db, main, ep, f)
+    }
+
+    /// AC 1 and 2: SQL access is on by default (never set), the schema refuses a password
+    /// while it's off and a password without its salt, turning it off drops the password and
+    /// the proxy row at once, and on again starts with no password (the worker makes a new
+    /// one). A child copies the setting, never the password.
+    #[tokio::test]
+    #[ignore]
+    async fn function_sql_login_sql_access_defaults_on_and_checks() {
+        let s = Scratch::new().await;
+        let c = &s.client;
+        let (db, main, ep, f) = sql_login_function(&s).await;
+        assert_eq!(sql_columns(&s, main, f).await, (true, None, None), "on by default");
+        let pending = c.pending_sql_logins(main).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!((pending[0].function_id, pending[0].run_as_role.as_str(), pending[0].run_as_role_oid), (f, "reporter", 4242));
+        assert!(pending[0].password.is_none());
+        assert!(c.pending_sql_login_branches(1000).await.unwrap().contains(&main));
+
+        // The schema: no password while off, never a password without its salt.
+        let off_with_password = sqlx::query(
+            "UPDATE branch_functions SET sql_access = false, sql_password_enc = 'v1:x',
+                 sql_password_salt = decode('00112233445566778899aabbccddeeff', 'hex')
+             WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(main.as_uuid())
+        .bind(f)
+        .execute(s.pool())
+        .await;
+        assert!(off_with_password.is_err(), "no password while SQL access is off");
+        let unsalted = sqlx::query(
+            "UPDATE branch_functions SET sql_password_enc = 'v1:x' WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(main.as_uuid())
+        .bind(f)
+        .execute(s.pool())
+        .await;
+        assert!(unsalted.is_err(), "a password needs its salt");
+
+        // The worker's first password, then its record.
+        let salt = [7u8; 16];
+        assert!(c.store_function_sql_password(main, f, "v1:sealed", &salt).await.unwrap());
+        assert!(!c.store_function_sql_password(main, f, "v1:other", &salt).await.unwrap(), "a racing writer's stays");
+        let name = chelabase_types::role_name::function_login_name(f);
+        assert!(c.record_function_sql_login(main, f, &ep, &name, "SCRAM-SHA-256$v", "v1:sealed", 4242).await.unwrap());
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(Some("SCRAM-SHA-256$v".into())));
+        assert!(c.pending_sql_logins(main).await.unwrap().is_empty(), "confirmed");
+
+        // A child copies `sql_access` (off here), never the password.
+        assert!(c.set_function_sql_access(main, f, false).await.unwrap());
+        assert_eq!(sql_columns(&s, main, f).await, (false, None, None), "off drops the password");
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(None), "none at once");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM neon_roles WHERE function_id = $1")
+            .bind(f)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "off drops the proxy row");
+        assert!(c.pending_sql_logins(main).await.unwrap().is_empty(), "nothing wanted while off");
+        let child = s.branch(db, main, "dev").await;
+        assert_eq!(sql_columns(&s, child, f).await, (false, None, None));
+
+        // On again: no password yet, wanted again (a new password comes from the worker).
+        assert!(c.set_function_sql_access(main, f, true).await.unwrap());
+        assert_eq!(sql_columns(&s, main, f).await, (true, None, None));
+        assert_eq!(c.pending_sql_logins(main).await.unwrap().len(), 1);
+        assert!(c.store_function_sql_password(main, f, "v1:new", &salt).await.unwrap());
+        let child2 = s.branch(db, main, "dev2").await;
+        assert_eq!(sql_columns(&s, child2, f).await, (true, None, None), "never the password");
+        assert!(!c.set_function_sql_access(main, Uuid::new_v4(), true).await.is_ok_and(|x| x));
+        s.finish().await;
+    }
+
+    /// AC 4: the login's proxy row answers its verifier only while the state row still has SQL
+    /// access, the password the verifier was made from and the very run-as OID it was granted;
+    /// it is never listed, copied or counted as a role, and the role paths never change it.
+    #[tokio::test]
+    #[ignore]
+    async fn function_sql_login_secret_roundtrip() {
+        let s = Scratch::new().await;
+        let c = &s.client;
+        let (db, main, ep, f) = sql_login_function(&s).await;
+        let name = chelabase_types::role_name::function_login_name(f);
+        let salt = [9u8; 16];
+        assert!(c.store_function_sql_password(main, f, "v1:p", &salt).await.unwrap());
+        // A stale password (not the stored one), another OID, another endpoint: refused.
+        assert!(!c.record_function_sql_login(main, f, &ep, &name, "SCRAM-SHA-256$v", "v1:stale", 4242).await.unwrap());
+        assert!(!c.record_function_sql_login(main, f, &ep, &name, "SCRAM-SHA-256$v", "v1:p", 4343).await.unwrap());
+        let other_ep = s.endpoint(s.branch(db, main, "dev").await).await;
+        assert!(!c.record_function_sql_login(main, f, &other_ep, &name, "SCRAM-SHA-256$v", "v1:p", 4242).await.unwrap());
+        // The schema: the name is the function's, and the row seals nothing.
+        let wrong_name = c.record_function_sql_login(main, f, &ep, "cb_fn_000000000000", "SCRAM-SHA-256$v", "v1:p", 4242).await;
+        assert!(wrong_name.is_err(), "{wrong_name:?}");
+        // A row another origin recorded under the reserved name goes.
+        sqlx::query("INSERT INTO neon_roles (endpoint_id, name, origin, scram_verifier) VALUES ($1, $2, 'sql', 'SCRAM-SHA-256$squat')")
+            .bind(&ep)
+            .bind(&name)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        assert!(c.record_function_sql_login(main, f, &ep, &name, "SCRAM-SHA-256$v", "v1:p", 4242).await.unwrap());
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(Some("SCRAM-SHA-256$v".into())));
+        let sealed_on_row = sqlx::query("UPDATE neon_roles SET password_enc = 'v1:x' WHERE endpoint_id = $1 AND name = $2")
+            .bind(&ep)
+            .bind(&name)
+            .execute(s.pool())
+            .await;
+        assert!(sealed_on_row.is_err(), "a function row seals nothing");
+
+        // Hidden from every generic role path.
+        assert!(c.list_roles(&ep).await.unwrap().iter().all(|r| r.name != name));
+        assert!(c.role_copies(&ep).await.unwrap().0.iter().all(|r| r.name != name));
+        assert!(c.role_password(&ep, &name).await.unwrap().is_none());
+        assert!(!c.replace_role_secret(&ep, &name, "SCRAM-SHA-256$evil", "v1:e").await.unwrap());
+        assert!(!c.delete_role_copy(&ep, &name).await.unwrap_or(false));
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(Some("SCRAM-SHA-256$v".into())));
+
+        // A new run-as role (another OID): unanswered until the worker grants it again.
+        assert!(c.set_run_as(main, f, Some(&run_as("other", 5151))).await.unwrap());
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(None));
+        assert_eq!(c.pending_sql_logins(main).await.unwrap().len(), 1, "wanted again");
+        // Run-as cleared: unanswered.
+        assert!(c.set_run_as(main, f, None).await.unwrap());
+        assert_eq!(c.routable_role_secret(&ep, &name).await.unwrap(), Some(None));
+        assert!(c.pending_sql_logins(main).await.unwrap().is_empty());
+        // The function goes: so does its proxy row.
+        c.delete_function(db, f).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM neon_roles WHERE endpoint_id = $1 AND name = $2")
+            .bind(&ep)
+            .bind(&name)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        s.finish().await;
+    }
 }

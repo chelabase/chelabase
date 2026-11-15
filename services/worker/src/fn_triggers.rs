@@ -433,13 +433,15 @@ pub fn foreign_refusal(error: &str) -> Option<String> {
 const SWEEP_BATCH: i64 = 20;
 
 /// The most candidates a sweep reads per pass (it takes [`SWEEP_BATCH`] of them).
-const SWEEP_CANDIDATES: i64 = 1000;
+pub(crate) const SWEEP_CANDIDATES: i64 = 1000;
 
-/// The two reconcile sweeps, each with its own attempt times.
+/// The reconcile sweeps, each with its own attempt times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Sweep {
     Triggers,
     RunAs,
+    /// Pooled endpoints m13: function SQL logins (`fn_sql_logins`).
+    SqlLogins,
 }
 
 /// When each branch was last attempted, per sweep (this worker's memory: a restart starts
@@ -1299,7 +1301,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Records an attempt on `branch` for the sweep of `kind`, now.
-    fn attempted(&self, kind: Sweep, branch: BranchId) {
+    pub(crate) fn attempted(&self, kind: Sweep, branch: BranchId) {
         let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
         attempts
             .entry(kind)
@@ -1308,7 +1310,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Up to [`SWEEP_BATCH`] of `candidates` for the sweep of `kind` ([`sweep_order`]).
-    fn sweep_batch(&self, kind: Sweep, candidates: &[(BranchId, bool)]) -> Vec<BranchId> {
+    pub(crate) fn sweep_batch(&self, kind: Sweep, candidates: &[(BranchId, bool)]) -> Vec<BranchId> {
         let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
         let map = attempts.entry(kind).or_default();
         // Forget branches that left the sweep.
@@ -1369,10 +1371,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// After a branch create: the child's own run-as keys, then its triggers (truncating the
-    /// outbox it copied). Best effort; the sweep retries the triggers.
+    /// After a branch create: the child's own run-as keys, then (pooled endpoints m13) its
+    /// function SQL logins, then its triggers (truncating the outbox it copied). Best effort;
+    /// the sweeps retry the logins and the triggers.
     pub(crate) async fn fn_after_create(&self, branch: BranchId) {
         self.mint_child_run_as(branch).await;
+        if let Err(e) = self.sync_sql_logins(branch).await {
+            warn!(branch_id = %branch, "making the function SQL logins on the new branch: {e}");
+        }
         if let Err(e) = self.sync_fn_triggers(branch, true).await {
             warn!(branch_id = %branch, "installing the function triggers on the new branch: {e}");
         }

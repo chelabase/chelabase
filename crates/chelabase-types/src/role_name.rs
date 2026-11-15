@@ -23,6 +23,22 @@ pub const MEMBER_ROLE_PREFIX: &str = "cb_m_";
 
 const CHELABASE_PREFIX: &str = "chelabase_";
 
+/// Prefix of a function's SQL login (`cb_fn_<12 hex of the function id>`, pooled endpoints
+/// m13): made, marked and granted by the worker alone. Reserved in any case, like `cb_m_`.
+pub const FUNCTION_LOGIN_PREFIX: &str = "cb_fn_";
+
+/// A function's SQL login (prefix `cb_fn_`, any case).
+pub fn is_function_login(name: &str) -> bool {
+    has_prefix_ci(name, FUNCTION_LOGIN_PREFIX)
+}
+
+/// The SQL login of function `function` on any branch: `cb_fn_` and the first 12 hex digits
+/// of its id (random: function ids are v4), 18 characters.
+pub fn function_login_name(function: uuid::Uuid) -> String {
+    let hex = function.simple().to_string();
+    format!("{FUNCTION_LOGIN_PREFIX}{}", &hex[..12])
+}
+
 /// A hidden member login role (prefix `cb_m_`, any case).
 pub fn is_member_role(name: &str) -> bool {
     has_prefix_ci(name, MEMBER_ROLE_PREFIX)
@@ -176,9 +192,9 @@ fn has_prefix_ci(name: &str, prefix: &str) -> bool {
         && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
-/// `cb_m_…` or `chelabase_…`, any case: names only Chelabase itself may create.
+/// `cb_m_…`, `cb_fn_…` or `chelabase_…`, any case: names only Chelabase itself may create.
 pub fn has_reserved_prefix(name: &str) -> bool {
-    is_member_role(name) || has_prefix_ci(name, CHELABASE_PREFIX)
+    is_member_role(name) || is_function_login(name) || has_prefix_ci(name, CHELABASE_PREFIX)
 }
 
 /// Why a login role name was refused (422 `invalid_role_name` / `reserved_role_name`).
@@ -221,7 +237,7 @@ pub fn check_any_role_name(name: &str) -> Result<(), RoleNameError> {
     }
 }
 
-/// `RESERVED_ROLE_NAMES`, except `owner` itself; a `pg_`, `cb_m_` or `chelabase_` prefix (any
+/// `RESERVED_ROLE_NAMES`, except `owner` itself; a `pg_`, `cb_m_`, `cb_fn_` or `chelabase_` prefix (any
 /// case) is reserved even for the owner.
 pub fn is_reserved_for(name: &str, owner: &str) -> bool {
     if name.to_ascii_lowercase().starts_with("pg_") || has_reserved_prefix(name) {
@@ -238,7 +254,8 @@ pub fn is_reserved_target(name: &str, owner: &str) -> bool {
 
 /// A role no API-made role may be made a member of (U2): the owner, every reserved name
 /// (`authenticator`, `anon`, `authenticated`, `neon_superuser`, `cloud_admin`, …), any
-/// `chelabase_…` role, any `cb_m_…` member role and any `pg_…` role, in any case. Owner-level is the only way into
+/// `chelabase_…` role, any `cb_m_…` member role, any `cb_fn_…` function login and any `pg_…`
+/// role, in any case. Owner-level is the only way into
 /// `neon_superuser`.
 pub fn is_membership_reserved(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -437,6 +454,38 @@ mod tests {
         assert_eq!(name, "cb_m_0b5e7c1a2f3d4e5f8a9b0c1d2e3f4a5b");
         assert_eq!(name.len(), 37);
         assert!(is_member_role(&name) && has_reserved_prefix(&name));
+    }
+
+    /// Pooled endpoints m13: a function's SQL login (`cb_fn_<12 hex of the function id>`) is
+    /// Chelabase's own in every rule, in any case: no API role takes the name, none is changed
+    /// into it, granted to or from it, or acted as.
+    #[test]
+    fn function_logins_are_reserved() {
+        for name in ["cb_fn_0123456789ab", "CB_FN_x", "Cb_Fn_", "cb_fn_"] {
+            assert!(has_reserved_prefix(name), "{name}");
+            assert!(is_function_login(name), "{name}");
+            assert!(is_reserved_for(name, "postgres"), "{name}");
+            assert!(is_reserved_for(name, name), "even as the owner: {name}");
+            assert!(is_reserved_target(name, "postgres"), "{name}");
+            assert!(is_membership_reserved(name), "{name}");
+            assert!(crate::access::act_as_reserved(name), "{name}");
+            assert!(!is_member_role(name), "{name}");
+        }
+        assert_eq!(check_login_role_name("cb_fn_x"), Err(RoleNameError::Reserved));
+        for name in ["cb_f_x", "cbfn_x", "cb_fnx", "xcb_fn_"] {
+            assert!(!is_function_login(name), "{name}");
+            assert!(!has_reserved_prefix(name), "{name}");
+        }
+        assert_eq!(FUNCTION_LOGIN_PREFIX, "cb_fn_");
+    }
+
+    #[test]
+    fn function_login_name_is_the_prefix_and_12_hex_of_the_id() {
+        let id = uuid::Uuid::parse_str("0b5e7c1a-2f3d-4e5f-8a9b-0c1d2e3f4a5b").unwrap();
+        let name = function_login_name(id);
+        assert_eq!(name, "cb_fn_0b5e7c1a2f3d");
+        assert_eq!(name.len(), 18);
+        assert!(is_function_login(&name) && has_reserved_prefix(&name));
     }
 
     /// `parts` appear in `sql` in this order.

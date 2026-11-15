@@ -17,7 +17,8 @@
 // to start`; a handler that throws, 500. Every refusal names its reason in `x-chelabase-error`.
 //
 // A loaded worker is cached by the loader under `{database_id}/{sha256}:{sha256(env header)}`,
-// so two deployments sharing a bundle never share an env. User workers get only their own env,
+// so two deployments sharing a bundle never share an env (plus the function and SQL marks below).
+// User workers get only their own env,
 // `env.CHELABASE` (the gateway binding, below), the `egress` service as their global outbound
 // (public addresses only), and the request
 // without any x-chelabase-* header; their response loses any x-chelabase-* header too, so
@@ -33,6 +34,18 @@
 // {"type": "storage", "event": {<the object event>}}. The supervisor hands the bundle's `fetch`
 // a POST whose body is the event alone (JSON) and which carries `chelabase-event: storage`; its
 // answer passes through as for any request. A body of another shape is 400 `storage event: ...`.
+//
+// SQL (pooled-endpoints m12): the functions service names the function on each invocation,
+//
+//   x-chelabase-function   {branch_id}/{function_id}
+//   x-chelabase-sql-grant  the function's short-lived SQL grant (m14), only when it has SQL access
+//
+// and both become part of the loader id, so two functions or branches never share a loaded
+// worker, and a worker loaded with SQL is never the one an invocation without a grant runs. A
+// worker loaded with a grant gets `env.CHELABASE_DB` (the `chelabaseDb` entrypoint below, whose
+// props hold only the loader id; user code calls `connect("chelabase-db:5432")`) and
+// `env.CHELABASE_DB_URL`. The grant itself stays in this
+// isolate (`grants`, the newest per loader id) and goes only into the relay's preamble.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
@@ -45,12 +58,44 @@ const BUNDLE_RE = /^([A-Za-z0-9_-]{1,64})\/([0-9a-f]{64})$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_MANIFEST_BYTES = 64 << 20;
 const MAX_ENV_HEADER = 256 << 10;
+const FUNCTION_HEADER = "x-chelabase-function";
+const GRANT_HEADER = "x-chelabase-sql-grant";
+const FUNCTION_RE = /^[A-Za-z0-9_-]{1,64}\/[A-Za-z0-9_-]{1,64}$/;
+// `v1.<kid>.<payload>.<mac>` (m14): no whitespace or line break can reach the preamble line, and
+// the whole preamble stays under the relay's 512-byte limit.
+const GRANT_RE = /^[A-Za-z0-9._~+\/=-]{1,480}$/;
+// What drivers parse; the relay sets the real user and database (m14b).
+const DB_URL = "postgresql://function@chelabase-db/postgres";
+const PREAMBLE = "CHELABASE-SQL 1 ";
 
 // Loader ids whose manifest passed the checks in this isolate. A first request verifies before
 // it calls the loader, because the loader caches a failed load under its id; later requests
 // (or a reload after the loader evicted the worker) fetch inside the loader callback.
 const verified = new Set();
 const MAX_VERIFIED = 4096;
+
+// Loader id -> {grant, at}: the newest SQL grant an invocation brought for that loaded worker.
+// Overwritten on every invocation (`at` is when it arrived), so a cached worker always connects
+// with the newest. workerd has no eviction hook, so this map isn't tied to the loader's cache: an
+// entry is held from the moment its invocation arrives (before the bundle is fetched, so a failed
+// load leaves one too) and goes when 4096 newer loader ids have brought a grant (by recency) or
+// when its function is invoked without one. A grant held longer than 10 minutes from its arrival
+// (m14's lifetime; its own `exp` isn't read here) is never sent. Every way out fails closed: the
+// socket closes before anything is dialled.
+const grants = new Map();
+const GRANT_MAX_AGE_MS = 10 * 60 * 1000;
+
+// SQL_GRANT_MAX_AGE_MS (tests) can only shorten that age; anything else means 10 minutes.
+function grantMaxAge(bindings) {
+  const ms = Number(bindings.SQL_GRANT_MAX_AGE_MS);
+  return Number.isInteger(ms) && ms > 0 && ms < GRANT_MAX_AGE_MS ? ms : GRANT_MAX_AGE_MS;
+}
+
+function holdGrant(id, grant) {
+  grants.delete(id);
+  grants.set(id, { grant, at: Date.now() });
+  while (grants.size > MAX_VERIFIED) grants.delete(grants.keys().next().value);
+}
 
 class Refused extends Error {
   constructor(status, message) {
@@ -94,7 +139,7 @@ function badManifest(why) {
 }
 
 // Fetches and checks a bundle; returns the loader's WorkerCode.
-async function loadCode(bindings, db, sha, env, gatewayBinding) {
+async function loadCode(bindings, db, sha, env, gatewayBinding, dbBinding) {
   const res = await bindings.BUNDLES.fetch(`http://functions/internal/bundles/${db}/${sha}`);
   if (res.status !== 200) {
     await res.body?.cancel();
@@ -147,7 +192,9 @@ async function loadCode(bindings, db, sha, env, gatewayBinding) {
     compatibilityFlags: flags,
     mainModule: m.mainModule,
     modules,
-    env: { ...env, CHELABASE: gatewayBinding },
+    env: dbBinding
+      ? { ...env, CHELABASE: gatewayBinding, CHELABASE_DB: dbBinding, CHELABASE_DB_URL: DB_URL }
+      : { ...env, CHELABASE: gatewayBinding },
     globalOutbound: bindings.EGRESS,
   };
 }
@@ -230,12 +277,29 @@ export default {
       const [, db, sha] = match;
       const envHeader = request.headers.get(ENV_HEADER) ?? "";
       const env = parseEnv(envHeader);
-      const id = `${db}/${sha}:${await sha256(new TextEncoder().encode(envHeader))}`;
+      const fn = request.headers.get(FUNCTION_HEADER);
+      if (fn !== null && !FUNCTION_RE.test(fn)) {
+        throw new Refused(400, "x-chelabase-function must be {branch_id}/{function_id}");
+      }
+      const grant = request.headers.get(GRANT_HEADER);
+      if (grant !== null && !GRANT_RE.test(grant)) throw new Refused(400, "x-chelabase-sql-grant is malformed");
+      if (grant !== null && fn === null) throw new Refused(400, "x-chelabase-sql-grant needs x-chelabase-function");
+      let id = `${db}/${sha}:${await sha256(new TextEncoder().encode(envHeader))}`;
+      if (fn !== null) id += `:${fn}`;
+      let dbBinding = null;
+      if (grant !== null) {
+        id += ":sql";
+        holdGrant(id, grant);
+        dbBinding = sqlBinding(ctx, id);
+      } else {
+        // This function lost its grant: its SQL worker's grant goes now, not when it ages out.
+        grants.delete(`${id}:sql`);
+      }
       let worker;
       if (verified.has(id)) {
-        worker = bindings.LOADER.get(id, () => loadCode(bindings, db, sha, env, gateway(ctx)));
+        worker = bindings.LOADER.get(id, () => loadCode(bindings, db, sha, env, gateway(ctx), dbBinding));
       } else {
-        const code = await loadCode(bindings, db, sha, env, gateway(ctx));
+        const code = await loadCode(bindings, db, sha, env, gateway(ctx), dbBinding);
         worker = bindings.LOADER.get(id, async () => code);
         remember(id);
       }
@@ -333,5 +397,47 @@ export const chelabaseApi = {
         redirect: "manual",
       }),
     );
+  },
+};
+
+// The binding a loaded worker gets as `env.CHELABASE_DB`: the `chelabaseDb` entrypoint, whose
+// props carry the loader id and nothing else.
+const sqlBinding = (ctx, loaderId) => ctx.exports.chelabaseDb({ props: { loaderId } });
+
+const closeQuietly = (s) => s.close().catch(() => {});
+
+// The SQL binding (m12). A Fetcher's connect(address, options) from the loaded worker lands in
+// `connect` here, which never sees the address or options: every socket goes to PG_RELAY, behind
+// the preamble `CHELABASE-SQL 1 <grant>\n` with the newest grant held for the caller's loader id.
+// workerd requires an address (a bare connect() throws in the caller), so the documented call is
+// `connect("chelabase-db:5432")`; any address does the same. TLS is never negotiated on this
+// hop: workerd refuses `secureTransport: "on"` ("Incoming CONNECT with TLS not supported"), and
+// with "starttls" a plain socket opens (preamble and all) but its startTls() is refused. The
+// relay's TLS faces upstream. Without a grant (or with one past its lifetime) the socket closes
+// before anything is dialled. `fetch` answers 404, and the entrypoint has no RPC methods.
+export const chelabaseDb = {
+  fetch() {
+    return new Response("not found\n", { status: 404 });
+  },
+  async connect(socket, bindings, ctx) {
+    const held = grants.get(ctx.props?.loaderId);
+    if (!held || Date.now() - held.at > grantMaxAge(bindings)) {
+      await closeQuietly(socket);
+      return;
+    }
+    const upstream = bindings.PG_RELAY.connect("pg-relay:5433");
+    const writer = upstream.writable.getWriter();
+    try {
+      await writer.write(new TextEncoder().encode(`${PREAMBLE}${held.grant}\n`));
+    } catch {
+      await Promise.all([closeQuietly(upstream), closeQuietly(socket)]);
+      return;
+    } finally {
+      writer.releaseLock();
+    }
+    // Both ways until the relay ends the session; an error on either side closes both.
+    socket.readable.pipeTo(upstream.writable).catch(() => closeQuietly(upstream));
+    await upstream.readable.pipeTo(socket.writable).catch(() => {});
+    await Promise.all([closeQuietly(upstream), closeQuietly(socket)]);
   },
 };

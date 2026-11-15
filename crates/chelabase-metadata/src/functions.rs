@@ -486,6 +486,44 @@ impl std::fmt::Debug for RunAs {
     }
 }
 
+/// A function SQL login the worker still has to make or confirm on a branch (pooled endpoints
+/// m13; [`MetadataClient::pending_sql_logins`]): the function has SQL access and a live run-as
+/// key (the role was checked on this branch, bound to `run_as_role_oid`), and the branch's
+/// endpoint has no row of the login granted for that OID.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FunctionSqlLogin {
+    pub function_id: Uuid,
+    pub name: String,
+    pub run_as_role: String,
+    pub run_as_role_oid: i64,
+    /// The sealed password and its SCRAM salt, once made.
+    pub password: Option<(String, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for FunctionSqlLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionSqlLogin")
+            .field("function_id", &self.function_id)
+            .field("name", &self.name)
+            .field("run_as_role", &self.run_as_role)
+            .field("run_as_role_oid", &self.run_as_role_oid)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The state rows whose SQL login is wanted (`bf`, on branch `b`): SQL access on, a live
+/// run-as key with no terminal outcome, an approved OID.
+const SQL_LOGIN_WANTED: &str = "bf.sql_access AND bf.run_as_role IS NOT NULL
+    AND bf.run_as_role_oid IS NOT NULL AND bf.run_as_key_id IS NOT NULL
+    AND bf.run_as_unmintable IS NULL";
+
+/// ...and not yet confirmed: no row of the login on the branch's endpoint, granted for that OID.
+const SQL_LOGIN_UNCONFIRMED: &str = "NOT EXISTS (SELECT 1 FROM neon_roles r
+    WHERE r.origin = 'function' AND r.endpoint_id = b.endpoint_id
+      AND r.function_branch_id = bf.branch_id AND r.function_id = bf.function_id
+      AND r.function_role_oid = bf.run_as_role_oid AND r.scram_verifier IS NOT NULL)";
+
 /// `^[a-z][a-z0-9-]{0,62}$`, as the schema checks.
 pub fn valid_function_name(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -796,7 +834,7 @@ pub(crate) async fn pend_table_triggers(
 /// Copies `parent`'s function state onto `child`, a branch row inserted in the same
 /// transaction (`create_branch`, which holds the database row `FOR NO KEY UPDATE`, so no
 /// function write on the parent runs meanwhile). The child gets the same active deployment,
-/// enabled flag, auth and `run_as_role`, but never the parent's key (`run_as_key_id` is null:
+/// enabled flag, auth, `run_as_role` and `sql_access`, but never the parent's key or SQL login password (`run_as_key_id` is null:
 /// the worker mints the child's own). Schedules and triggers get new ids; table triggers start
 /// `pending_install` (the child's database needs its own), storage triggers `installed` from
 /// now, so the child never replays the parent's events. Secrets are opened and sealed again for
@@ -813,8 +851,9 @@ pub(crate) async fn copy_branch_functions(
     sqlx::query(
         "INSERT INTO branch_functions
              (branch_id, function_id, deployment_id, enabled, auth, run_as_role, run_as_key_id,
-              run_as_role_oid)
-         SELECT $2, function_id, deployment_id, enabled, auth, run_as_role, NULL, run_as_role_oid
+              run_as_role_oid, sql_access)
+         SELECT $2, function_id, deployment_id, enabled, auth, run_as_role, NULL, run_as_role_oid,
+                sql_access
          FROM branch_functions WHERE branch_id = $1",
     )
     .bind(parent)
@@ -2467,6 +2506,215 @@ impl MetadataClient {
         .fetch_all(&self.pool)
         .await?;
         Ok(ids.into_iter().map(BranchId).collect())
+    }
+
+    /// Up to `limit` ready `normal` branches (of live databases) with a function SQL login to
+    /// make or confirm ([`FunctionSqlLogin`]): the worker's sweep (pooled endpoints m13). A read.
+    pub async fn pending_sql_login_branches(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<BranchId>, MetadataError> {
+        // SAFETY (AssertSqlSafe): the interpolated fragments are compile-time constants; the
+        // limit is a bound parameter.
+        let ids: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT b.id FROM branches b JOIN databases d ON d.id = b.database_id
+             WHERE b.status = 'ready' AND b.kind = 'normal' AND b.endpoint_id IS NOT NULL
+               AND d.status NOT IN ('deleting', 'deleted')
+               AND EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.branch_id = b.id
+                           AND {SQL_LOGIN_WANTED} AND {SQL_LOGIN_UNCONFIRMED})
+             ORDER BY b.id LIMIT $1"
+        )))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().map(BranchId).collect())
+    }
+
+    /// The branch's function SQL logins to make or confirm ([`FunctionSqlLogin`]), by function
+    /// id. A read.
+    pub async fn pending_sql_logins(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<FunctionSqlLogin>, MetadataError> {
+        type Row = (Uuid, String, String, i64, Option<String>, Option<Vec<u8>>);
+        let rows: Vec<Row> =
+            // SAFETY (AssertSqlSafe): as above; the branch is a bound parameter.
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT bf.function_id, f.name, bf.run_as_role, bf.run_as_role_oid,
+                        bf.sql_password_enc, bf.sql_password_salt
+                 FROM branch_functions bf JOIN functions f ON f.id = bf.function_id
+                 JOIN branches b ON b.id = bf.branch_id
+                 WHERE bf.branch_id = $1 AND {SQL_LOGIN_WANTED} AND {SQL_LOGIN_UNCONFIRMED}
+                 ORDER BY bf.function_id"
+            )))
+            .bind(branch.as_uuid())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(function_id, name, run_as_role, run_as_role_oid, sealed, salt)| {
+                FunctionSqlLogin {
+                    function_id,
+                    name,
+                    run_as_role,
+                    run_as_role_oid,
+                    password: sealed.zip(salt),
+                }
+            })
+            .collect())
+    }
+
+    /// Stores a function SQL login's first password (sealed with
+    /// `chelabase_secrets::seal_function_sql_password`) and its SCRAM salt, only while the
+    /// function has SQL access and no password yet, on a live branch: a racing writer's stays,
+    /// and the caller reads it back. Updates the state row alone. True when stored.
+    pub async fn store_function_sql_password(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        sealed: &str,
+        salt: &[u8; 16],
+    ) -> Result<bool, MetadataError> {
+        let updated = sqlx::query(
+            "UPDATE branch_functions bf
+             SET sql_password_enc = $3, sql_password_salt = $4, updated_at = now()
+             FROM branches b JOIN databases d ON d.id = b.database_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2 AND b.id = bf.branch_id
+               AND bf.sql_access AND bf.sql_password_enc IS NULL
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND d.status NOT IN ('deleting', 'deleted')",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(sealed)
+        .bind(salt.as_slice())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Records a function SQL login the worker made and verified on `endpoint_id`: its proxy
+    /// row (origin `function`, named `role_name`) with `verifier` and `role_oid`, the run-as
+    /// OID it was granted. Guarded, in one statement that holds the state row `FOR SHARE`: only
+    /// while the function still has SQL access, the very sealed password the verifier was made
+    /// from (`sealed`), that run-as OID and a live run-as key, on a live branch the endpoint
+    /// serves. Another origin's row under the reserved name (a role recorded before the name
+    /// was reserved) is removed first. False, nothing written, when the guard doesn't match.
+    ///
+    /// Lock order (module docs): the state row (4) `FOR SHARE`, then the endpoint's row (5,
+    /// `FOR KEY SHARE`, by the foreign key) and the proxy row.
+    #[allow(clippy::too_many_arguments)] // every value is part of the guard
+    pub async fn record_function_sql_login(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        endpoint_id: &str,
+        role_name: &str,
+        verifier: &str,
+        sealed: &str,
+        role_oid: i64,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        let live: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM branch_functions bf JOIN branches b ON b.id = bf.branch_id
+             JOIN databases d ON d.id = b.database_id
+             WHERE bf.branch_id = $1 AND bf.function_id = $2 AND b.endpoint_id = $3
+               AND bf.sql_access AND bf.sql_password_enc = $4 AND bf.run_as_role_oid = $5
+               AND bf.run_as_key_id IS NOT NULL AND bf.run_as_unmintable IS NULL
+               AND b.status NOT IN ('deleting', 'deleted')
+               AND d.status NOT IN ('deleting', 'deleted')
+             FOR SHARE OF bf",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(endpoint_id)
+        .bind(sealed)
+        .bind(role_oid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "DELETE FROM neon_roles WHERE endpoint_id = $1 AND name = $2 AND origin IN ('sql', 'api')",
+        )
+        .bind(endpoint_id)
+        .bind(role_name)
+        .execute(&mut *tx)
+        .await?;
+        let stored = sqlx::query(
+            "INSERT INTO neon_roles AS r
+                 (endpoint_id, name, scram_verifier, origin, login, level, function_branch_id,
+                  function_id, function_role_oid)
+             VALUES ($1, $2, $3, 'function', true, 'plain', $4, $5, $6)
+             ON CONFLICT (endpoint_id, name) DO UPDATE
+                 SET scram_verifier = EXCLUDED.scram_verifier,
+                     function_role_oid = EXCLUDED.function_role_oid
+                 WHERE r.origin = 'function' AND r.function_branch_id = EXCLUDED.function_branch_id
+                   AND r.function_id = EXCLUDED.function_id",
+        )
+        .bind(endpoint_id)
+        .bind(role_name)
+        .bind(verifier)
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(role_oid)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_check)?
+        .rows_affected();
+        if stored != 1 {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Turns a function's SQL login on or off on the branch (`sql_access`). Off drops its
+    /// password and its proxy rows in the same transaction, so the proxy answers nothing for
+    /// it at once; on again leaves the password empty, so the worker makes a new one. False
+    /// when the function has no state on the branch.
+    ///
+    /// Lock order (module docs): the branch-function locks, the state row, then its proxy rows
+    /// (off only).
+    pub async fn set_function_sql_access(
+        &self,
+        branch: BranchId,
+        function_id: Uuid,
+        on: bool,
+    ) -> Result<bool, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        lock_branch_function(&mut tx, branch, function_id).await?;
+        let updated = sqlx::query(
+            "UPDATE branch_functions
+             SET sql_access = $3,
+                 sql_password_enc = CASE WHEN $3 THEN sql_password_enc END,
+                 sql_password_salt = CASE WHEN $3 THEN sql_password_salt END,
+                 updated_at = now()
+             WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(branch.as_uuid())
+        .bind(function_id)
+        .bind(on)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Ok(false);
+        }
+        if !on {
+            sqlx::query(
+                "DELETE FROM neon_roles
+                 WHERE origin = 'function' AND function_branch_id = $1 AND function_id = $2",
+            )
+            .bind(branch.as_uuid())
+            .bind(function_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Bundle hashes any deployment of the database still names (for the bundle sweep, with
