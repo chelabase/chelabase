@@ -12,6 +12,9 @@
 //! - `chelabase.rt.access.*`: a member's access changed (removed, suspended, a grant): every
 //!   cached key liveness goes, since a console URL lives on its member's access.
 //!
+//! The S3 keys ([`crate::s3::keys`], s3-endpoint m5) follow the same events: a key event drops
+//! that S3 key, a branch event the branch's S3 keys, an access event every S3 key.
+//!
 //! m18: after each object write commits, storage publishes an object event
 //! ([`ObjectEvents::emit`], `chelabase_nats::storage_objects`) on the same connection, in the
 //! background and retried; one that still fails is logged and counted, never failing the
@@ -39,11 +42,11 @@ use crate::app::AppState;
 /// What an event makes storage drop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Drop {
-    /// The branch's connection info, pools and schema checks.
+    /// The branch's connection info, pools and schema checks, and its S3 keys.
     Branch(Uuid),
-    /// One key's cached liveness.
+    /// One key's cached liveness (a data key's), or one S3 key.
     Key(Uuid),
-    /// Every key's cached liveness.
+    /// Every key's cached liveness, and every S3 key.
     AllKeys,
 }
 
@@ -75,9 +78,18 @@ pub fn classify(subject: &str, payload: &[u8]) -> Option<Drop> {
 /// Drops what `drop` names.
 pub async fn apply<S: ConnSource, M: ConnSource>(state: &AppState<S, M>, drop: Drop) {
     match drop {
-        Drop::Branch(branch) => state.engine.invalidate(branch).await,
-        Drop::Key(key_id) => state.urls.forget_key(key_id),
-        Drop::AllKeys => state.urls.forget_all(),
+        Drop::Branch(branch) => {
+            state.s3_keys.forget_branch(branch);
+            state.engine.invalidate(branch).await;
+        }
+        Drop::Key(key_id) => {
+            state.urls.forget_key(key_id);
+            state.s3_keys.forget_key(key_id);
+        }
+        Drop::AllKeys => {
+            state.urls.forget_all();
+            state.s3_keys.forget_all();
+        }
     }
 }
 
@@ -443,6 +455,58 @@ mod tests {
         let unconnected = ObjectEvents { retries: vec![Duration::ZERO], ..Arc::into_inner(unconnected).unwrap() };
         assert!(!unconnected.send(&first).await);
         assert_eq!(unconnected.missed.load(Ordering::SeqCst), 1);
+    }
+
+    /// s3-endpoint m5: a key event (classified from its NATS message) drops that S3 key, a
+    /// branch event (storage's or the project's) the branch's S3 keys, an access event every
+    /// S3 key, through [`apply`]; the other keys stay cached.
+    #[tokio::test]
+    async fn classify_and_apply_s3_drops() {
+        use crate::s3::keys::test_support::{FakeS3, id, key};
+        let (b1, b2) = (Uuid::new_v4(), Uuid::new_v4());
+        let (k1, k2) = (key(&id(1), b1), key(&id(2), b2));
+        let fake = FakeS3::with(&[&k1, &k2]);
+        let (_, public) = chelabase_auth::internal::generate_keypair_pem();
+        use chelabase_pgsession::test_support::RefusedSource;
+        let state = AppState {
+            engine: crate::engine::Engine::new(chelabase_pgsession::Pools::new(RefusedSource, 1), RefusedSource),
+            verifier: chelabase_auth::internal::InternalVerifier::from_pem(public.as_bytes()).unwrap(),
+            store: Arc::new(chelabase_storage::MemoryStore::default()),
+            urls: crate::control::Urls::new(fake.clone()),
+            inflight: crate::limits::InFlight::new(1 << 20),
+            events: ObjectEvents::none(),
+            s3_keys: crate::s3::keys::S3Keys::new(fake.clone()),
+        };
+        let ip = Some(std::net::IpAddr::from([203, 0, 113, 7]));
+        let both = || async {
+            state.s3_keys.get(&id(1), ip).await.unwrap();
+            state.s3_keys.get(&id(2), ip).await.unwrap();
+        };
+        let ev = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        let project = format!("{PROJECT}.{}", Uuid::new_v4());
+        both().await;
+        assert_eq!(fake.lookups(), 2);
+        for (subject, payload, asked) in [
+            (SUBJECT_STORAGE_EVENTS.to_string(), ev(json!({ "event": "key", "key_id": k1.key_id })), 3),
+            (SUBJECT_STORAGE_EVENTS.to_string(), ev(json!({ "event": "key", "key_id": Uuid::new_v4() })), 3),
+            (SUBJECT_STORAGE_EVENTS.to_string(), ev(json!({ "event": "branch", "branch_id": b2 })), 4),
+            (
+                project.clone(),
+                ev(json!({ "event": "branch.status", "database_id": Uuid::new_v4(), "branch_id": b1, "status": "ready" })),
+                5,
+            ),
+            (
+                project.clone(),
+                ev(json!({ "event": "branch.deleted", "database_id": Uuid::new_v4(), "branch_id": b2 })),
+                6,
+            ),
+            (format!("{ACCESS}.{}", Uuid::new_v4()), ev(json!({ "tenant_id": Uuid::new_v4(), "member_sub": null })), 8),
+        ] {
+            let drop = classify(&subject, &payload).expect("a drop");
+            apply(&state, drop.clone()).await;
+            both().await;
+            assert_eq!(fake.lookups(), asked, "after {drop:?}");
+        }
     }
 
     /// Each subject and event maps to what it drops; anything else drops nothing.

@@ -19,6 +19,7 @@ pub mod names;
 pub mod objects;
 pub mod openapi;
 pub mod public;
+pub mod s3;
 pub mod signed;
 pub mod token;
 
