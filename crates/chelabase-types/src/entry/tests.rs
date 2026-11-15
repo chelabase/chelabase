@@ -273,3 +273,27 @@ fn platform_mode_refuses_an_http_entry() {
     assert!(https.check_mode(Mode::Platform).is_ok());
 }
 
+
+// s3-endpoint m1: CHELABASE_S3_HOST is optional (unset or blank: the S3 endpoint is off),
+// validated and normalized like the docs host, and must differ from every other host.
+#[test]
+fn s3_host_is_optional_and_validated() {
+    assert_eq!(Entry::from_lookup(env(&[])).unwrap().s3_host(), None);
+    for blank in ["", "  "] {
+        assert_eq!(Entry::from_lookup(env(&[("CHELABASE_S3_HOST", blank)])).unwrap().s3_host(), None, "{blank:?}");
+    }
+    let e = Entry::from_lookup(env(&[("CHELABASE_S3_HOST", " S3.Chelabase.LocalHost.:8000 ")])).unwrap();
+    assert_eq!(e.s3_host(), Some("s3.chelabase.localhost:8000"));
+    for bad in ["http://s3.chelabase.localhost", "s3 chelabase", "s3/x", "::1", "s3.chelabase.localhost:http"] {
+        let msg = err(&[("CHELABASE_S3_HOST", bad)]);
+        assert!(msg.contains("CHELABASE_S3_HOST"), "{bad}: {msg}");
+    }
+    // The scheme's default port is refused, as for every host.
+    let msg = err(&[("CHELABASE_S3_HOST", "s3.chelabase.localhost:80")]);
+    assert!(msg.contains("CHELABASE_S3_HOST"), "{msg}");
+    // It can't share a host with the API (or any other entry host).
+    let msg = err(&[("CHELABASE_S3_HOST", "api.chelabase.localhost:8000")]);
+    assert!(msg.contains("CHELABASE_S3_HOST") && msg.contains("CHELABASE_API_HOST"), "{msg}");
+    let msg = err(&[("CHELABASE_DOCS_HOST", "docs.chelabase.localhost:8000"), ("CHELABASE_S3_HOST", "docs.chelabase.localhost:8000")]);
+    assert!(msg.contains("CHELABASE_S3_HOST") && msg.contains("CHELABASE_DOCS_HOST"), "{msg}");
+}

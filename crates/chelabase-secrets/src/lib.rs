@@ -112,6 +112,8 @@ pub enum Purpose {
     /// A storage webhook endpoint's signing secret (bound to the endpoint, see
     /// [`seal_webhook_secret`]).
     Webhook,
+    /// An S3 access key's secret (bound to the key's row, see [`seal_s3_secret`]).
+    S3Key,
 }
 
 impl Purpose {
@@ -126,6 +128,7 @@ impl Purpose {
             Purpose::FunctionsDispatch => "functions_dispatch",
             Purpose::StorageUrl => "storage_url",
             Purpose::Webhook => "webhook",
+            Purpose::S3Key => "s3_key",
         }
     }
 }
@@ -215,6 +218,21 @@ pub fn open_webhook_secret(
     sealed: &str,
 ) -> Result<String, SecretsError> {
     open_credential(key, &endpoint_id.to_string(), Purpose::Webhook, sealed)
+}
+
+/// Seal an S3 access key's secret; the AAD is `{key_id}:s3_key`, so it opens only for the row
+/// with that id (`storage_s3_keys.id`), never for another key's row or as another credential.
+pub fn seal_s3_secret(key: &SecretKey, key_id: uuid::Uuid, secret: &str) -> String {
+    seal_credential(key, &key_id.to_string(), Purpose::S3Key, secret)
+}
+
+/// Open a value from [`seal_s3_secret`] for the same key id.
+pub fn open_s3_secret(
+    key: &SecretKey,
+    key_id: uuid::Uuid,
+    sealed: &str,
+) -> Result<String, SecretsError> {
+    open_credential(key, &key_id.to_string(), Purpose::S3Key, sealed)
 }
 
 fn member_role_aad(branch_id: uuid::Uuid, role: &str) -> String {
@@ -371,6 +389,48 @@ mod webhook_tests {
             assert!(open_webhook_secret(&key, endpoint, &as_other).is_err(), "{purpose:?}");
             assert!(open_credential(&key, &endpoint.to_string(), purpose, &sealed).is_err(), "{purpose:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::*;
+
+    // s3-endpoint m1: an S3 key's secret opens only for its own key row: never for another
+    // key's id, never as another purpose's credential for the same id (nor the reverse).
+    #[test]
+    fn s3_secret_opens_only_for_its_key() {
+        let key = SecretKey::generate();
+        assert_eq!(Purpose::S3Key.as_str(), "s3_key");
+        let (id, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let sealed = seal_s3_secret(&key, id, "s3cr3t");
+        assert!(sealed.starts_with("v1:"));
+        assert_eq!(open_s3_secret(&key, id, &sealed).unwrap(), "s3cr3t");
+        assert!(matches!(open_s3_secret(&key, other, &sealed), Err(SecretsError::Decrypt)));
+        assert!(matches!(
+            open_s3_secret(&SecretKey::generate(), id, &sealed),
+            Err(SecretsError::Decrypt)
+        ));
+        assert_eq!(open(&key, &format!("{id}:s3_key"), &sealed).unwrap(), "s3cr3t");
+        for purpose in [
+            Purpose::Owner,
+            Purpose::Authenticator,
+            Purpose::DataKey,
+            Purpose::Storage,
+            Purpose::FunctionsDispatch,
+            Purpose::Webhook,
+        ] {
+            let as_other = seal_credential(&key, &id.to_string(), purpose, "s3cr3t");
+            assert!(open_s3_secret(&key, id, &as_other).is_err(), "{purpose:?}");
+            assert!(open_credential(&key, &id.to_string(), purpose, &sealed).is_err(), "{purpose:?}");
+        }
+        // A webhook secret sealed for the same uuid never opens as the S3 key's.
+        let webhook = seal_webhook_secret(&key, id, "s3cr3t");
+        assert!(open_s3_secret(&key, id, &webhook).is_err());
+        assert!(open_webhook_secret(&key, id, &sealed).is_err());
+        // Unbound and role-bound values don't open either.
+        assert!(open_s3_secret(&key, id, &seal(&key, &id.to_string(), "s3cr3t")).is_err());
+        assert!(open_s3_secret(&key, id, &seal_role_password(&key, &id.to_string(), "s3_key", "s3cr3t")).is_err());
     }
 }
 

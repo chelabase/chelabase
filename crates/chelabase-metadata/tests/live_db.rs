@@ -611,6 +611,18 @@ impl SealedFixture {
                 // Within its grace window: it can still be opened.
                 fixture.session = Some(insert_grace_session(client, 3600.0).await);
             }
+            ("storage_s3_keys", "secret_enc") => {
+                sqlx::query(
+                    "INSERT INTO storage_s3_keys
+                         (id, branch_id, database, role, name, access_key_id, secret_enc, role_oid, role_timeline)
+                     VALUES (gen_random_uuid(), $1, 'db', 'r', 'key-check', $2, 'v1:x', 1, 't')",
+                )
+                .bind(branch)
+                .bind(chelabase_types::s3_key::generate().access_key_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             ("branch_function_secrets", "ciphertext") => {
                 sqlx::query(
                     "WITH f AS (INSERT INTO functions (id, database_id, name, kind)
