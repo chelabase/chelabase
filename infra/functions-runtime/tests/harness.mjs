@@ -111,14 +111,16 @@ async function docker(...args) {
 
 // Starts the runtime pointed at the stub store and, with `gateway` (a port on the host), the
 // gateway binding at that stub as the API host `apiHost`, and with `relay` (a port on the host),
-// PG_RELAY at that port. Returns its base URL and helpers.
-export async function startRuntime(store, { restart = "no", gateway, relay, apiHost = "api.chelabase.test:8000" } = {}) {
+// PG_RELAY at that port; `env` adds container environment variables. Returns its base URL and
+// helpers.
+export async function startRuntime(store, { restart = "no", gateway, relay, apiHost = "api.chelabase.test:8000", env = {} } = {}) {
   const hosts = INTERNAL_NAMES.flatMap((n) => ["--add-host", `${n}:host-gateway`]);
   const id = await docker(
     "run", "-d", "--restart", restart,
     "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
     "--memory", "512m", "--pids-limit", "256",
     ...hosts, "-p", "127.0.0.1::8080", "-e", `CHELABASE_API_HOST=${apiHost}`,
+    ...Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
     IMAGE,
     // The image's command, with the bundle store moved to the stub's port (and the gateway too).
     "/usr/local/bin/workerd", "serve", "--experimental",

@@ -1,8 +1,10 @@
 // The SQL binding (pooled-endpoints m12) from user code. ?op= picks what it does:
 //
 //   env      the env's keys, CHELABASE_DB_URL, and how many requests this loaded worker served
-//   connect  env.CHELABASE_DB.connect(?addr, {secureTransport: ?tls}), writes ?msg, reads until
-//            it comes back (or 3 s), and reports what it read or the error
+//   connect  env.CHELABASE_DB.connect(?addr, {secureTransport: ?tls}) (no arguments at all
+//            without ?addr), writes ?msg, reads until it comes back (or 3 s), and reports what it
+//            read or the error
+//   later    the same connect to ?addr from ctx.waitUntil after ?ms, once the response is sent
 //   fetch    env.CHELABASE_DB.fetch(?url): the status and body
 //   rpc      calls a method the entrypoint doesn't have
 //   raw      cloudflare:sockets connect(?addr) (the global outbound): whether it opened
@@ -10,6 +12,26 @@
 import { connect } from "cloudflare:sockets";
 
 let served = 0;
+
+// connect(?addr[, {secureTransport: ?tls}]), writes ?msg and reads its echo.
+async function connectAndEcho(env, q, out) {
+  const tls = q.get("tls");
+  const args = q.has("addr") ? [q.get("addr"), ...(tls ? [{ secureTransport: tls }] : [])] : [];
+  const socket = env.CHELABASE_DB.connect(...args);
+  const writer = socket.writable.getWriter();
+  await writer.write(new TextEncoder().encode(q.get("msg") ?? "ping"));
+  writer.releaseLock();
+  out.echo = await readUntil(socket, q.get("msg") ?? "ping", 3000);
+  if (tls === "starttls") {
+    try {
+      await socket.startTls().opened;
+      out.startTls = "opened";
+    } catch (e) {
+      out.startTls = String(e?.message);
+    }
+  }
+  await socket.close().catch(() => {});
+}
 
 async function readUntil(socket, want, ms) {
   const reader = socket.readable.getReader();
@@ -73,28 +95,20 @@ function walk(roots) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     served++;
     const q = new URL(request.url).searchParams;
     const out = { served, bindings: Object.keys(env).sort(), url: env.CHELABASE_DB_URL ?? null };
     try {
       switch (q.get("op")) {
-        case "connect": {
-          const tls = q.get("tls");
-          const socket = env.CHELABASE_DB.connect(q.get("addr") ?? "chelabase-db:5432", tls ? { secureTransport: tls } : undefined);
-          const writer = socket.writable.getWriter();
-          await writer.write(new TextEncoder().encode(q.get("msg") ?? "ping"));
-          writer.releaseLock();
-          out.echo = await readUntil(socket, q.get("msg") ?? "ping", 3000);
-          if (tls === "starttls") {
-            try {
-              await socket.startTls().opened;
-              out.startTls = "opened";
-            } catch (e) {
-              out.startTls = String(e?.message);
-            }
-          }
-          await socket.close().catch(() => {});
+        case "connect":
+          await connectAndEcho(env, q, out);
+          break;
+        case "later": {
+          const ms = Number(q.get("ms") ?? "0");
+          ctx.waitUntil(
+            new Promise((res) => setTimeout(res, ms)).then(() => connectAndEcho(env, q, {})).catch(() => {}),
+          );
           break;
         }
         case "fetch": {
