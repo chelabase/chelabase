@@ -21,6 +21,12 @@
 # Compose merges this file into the base one key by key: maps (environment, networks,
 # depends_on) merge, lists of mounts merge by target, and scalars (image, command) replace.
 # YAML anchors can't cross files: the ones below are this file's own.
+#
+# Isolation between stacks stops at mounts. The orchestrator, worker, service-runner and runner
+# hold the Docker socket, which bypasses every mount rule here: code running in one of them can
+# start a container with the host's root bound in and read any stack's state dir. The key and
+# checkout masks below keep the other services (and a stack's own files) apart; they do not
+# contain those four. scripts/tests/workbench-compose.sh and compose-mask-probe.sh check the masks.
 
 # The Neon services that read the stack's 0600 secrets run as the stack's uid:gid (the files'
 # owner), whatever the host uid is; the image's own user (uid 1000) can read them only when the
