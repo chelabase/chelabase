@@ -36,7 +36,7 @@ use chelabase_secrets::SecretKey;
 use chelabase_types::BranchId;
 use uuid::Uuid;
 use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
-pub use ddl::{BoxFuture, CachePort, DdlPort, ResyncPort};
+pub use ddl::{BoxFuture, CachePort, DdlPort, ResyncPort, StorageEventsPort};
 pub(crate) use ddl::publish_login_rows;
 pub use hooks::AttachEvents;
 use chelabase_types::role_settings::RoleSettings;
@@ -651,6 +651,8 @@ pub struct InternalState<M, L> {
     pub functions_token: String,
     /// Publishes realtime's events (the DDL hook's `pg_database.*`).
     pub rt_events: Arc<dyn realtime::RtEvents>,
+    /// s3-endpoint m6: tells storage an S3 key a forwarded DDL moved or revoked changed.
+    pub storage_events: Arc<dyn StorageEventsPort>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
     /// role's password when SQL renames it.
     pub secrets: SecretKey,

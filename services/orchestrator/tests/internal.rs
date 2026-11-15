@@ -191,6 +191,8 @@ struct DdlState {
     dbs: BTreeMap<String, (String, DatabaseOrigin)>,
     /// (id, name, role, revoked)
     keys: Vec<(uuid::Uuid, String, String, bool)>,
+    /// s3-endpoint m6: S3 keys (id, name, role, database, revoked).
+    s3_keys: Vec<(uuid::Uuid, String, String, String, bool)>,
     /// `set_owner_verifier` cleared the branch's sealed owner password.
     owner_password_cleared: bool,
     /// Rows `mark_password_unreadable` was called for.
@@ -226,6 +228,8 @@ struct FakeDdl {
     state: DdlState,
     store: Arc<Mutex<HashMap<String, DdlState>>>,
     wrote: bool,
+    /// The live S3 keys moved or revoked, in order (`s3_keys_changed`).
+    s3_changed: Vec<uuid::Uuid>,
 }
 
 impl DdlPort for FakeDdl {
@@ -263,6 +267,30 @@ impl DdlPort for FakeDdl {
             .filter(|(_, _, r, revoked)| r == role && !revoked)
             .map(|(id, name, _, _)| (*id, name.clone()))
             .collect())
+    }
+    async fn live_s3_keys(
+        &mut self,
+        role: &str,
+    ) -> Result<Vec<(uuid::Uuid, String)>, MetadataError> {
+        if self.state.branch.is_none() {
+            return Ok(vec![]);
+        }
+        Ok(self
+            .state
+            .s3_keys
+            .iter()
+            .filter(|k| k.2 == role && !k.4)
+            .map(|k| (k.0, k.1.clone()))
+            .collect())
+    }
+    fn s3_keys_changed(&self) -> Vec<uuid::Uuid> {
+        let mut out: Vec<uuid::Uuid> = Vec::new();
+        for id in &self.s3_changed {
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        out
     }
     async fn upsert_sql_copy(&mut self, name: &str, verifier: &str) -> Result<(), MetadataError> {
         match self.state.roles.get_mut(name) {
@@ -364,6 +392,15 @@ impl DdlPort for FakeDdl {
                     self.wrote = true;
                 }
             }
+            for key in &mut self.state.s3_keys {
+                if key.2 == old {
+                    key.2 = new.into();
+                    self.wrote = true;
+                    if !key.4 {
+                        self.s3_changed.push(key.0);
+                    }
+                }
+            }
         }
         self.wrote |= row_moves;
         Ok(row_moves)
@@ -412,6 +449,14 @@ impl DdlPort for FakeDdl {
         }
         let row = self.state.dbs.remove(old).unwrap();
         self.state.dbs.insert(new.into(), row);
+        for key in &mut self.state.s3_keys {
+            if key.3 == old {
+                key.3 = new.into();
+                if !key.4 {
+                    self.s3_changed.push(key.0);
+                }
+            }
+        }
         self.wrote = true;
         Ok(true)
     }
@@ -420,6 +465,14 @@ impl DdlPort for FakeDdl {
             return Ok(false);
         }
         let removed = self.state.dbs.remove(name).is_some();
+        if removed {
+            for key in &mut self.state.s3_keys {
+                if key.3 == name && !key.4 {
+                    key.4 = true;
+                    self.s3_changed.push(key.0);
+                }
+            }
+        }
         self.wrote |= removed;
         Ok(removed)
     }
@@ -572,6 +625,7 @@ impl NeonMetadataPort for FakeNeon {
             state,
             store: self.ddl.clone(),
             wrote: false,
+            s3_changed: Vec::new(),
         }))
     }
 
@@ -1210,6 +1264,8 @@ async fn storcon(healthy: bool) -> String {
 struct Internal {
     /// The secrets key the orchestrator opens credentials with.
     key: SecretKey,
+    /// s3-endpoint m6: the storage events the receiver published.
+    storage_events: FakeStorageEvents,
     base: String,
     signer: ComputeSigner,
     http: reqwest::Client,
@@ -1473,6 +1529,27 @@ impl orchestrator::internal::realtime::RtEvents for FakeRtEvents {
     }
 }
 
+/// s3-endpoint m6: records each `StorageEvent::Key` the receiver publishes.
+#[derive(Clone, Default)]
+struct FakeStorageEvents {
+    keys: Arc<Mutex<Vec<uuid::Uuid>>>,
+}
+
+impl FakeStorageEvents {
+    fn keys(&self) -> Vec<uuid::Uuid> {
+        self.keys.lock().unwrap().clone()
+    }
+}
+
+impl orchestrator::internal::StorageEventsPort for FakeStorageEvents {
+    fn key_changed(&self, key_id: uuid::Uuid) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.keys.lock().unwrap().push(key_id);
+            Ok(())
+        })
+    }
+}
+
 /// Records each branch the receiver asked the worker to resync, and each it asked to
 /// reconcile the member roles of.
 #[derive(Clone, Default)]
@@ -1526,6 +1603,7 @@ async fn spawn_with_app(
 ) -> Internal {
     let (pem, x) = generate_keypair();
     let key = app.key;
+    let storage_events = FakeStorageEvents::default();
     let state = Arc::new(InternalState {
         metadata: neon,
         locator,
@@ -1541,6 +1619,7 @@ async fn spawn_with_app(
         storage_token: STORAGE_TOKEN.into(),
         functions_token: FUNCTIONS_TOKEN.into(),
         rt_events: Arc::new(app.rt_events),
+        storage_events: Arc::new(storage_events.clone()),
         secrets: key.clone(),
         roles,
         cache: Arc::new(cache),
@@ -1567,6 +1646,7 @@ async fn spawn_with_app(
     let addr = serve(build_internal_router(state)).await;
     Internal {
         key,
+        storage_events,
         base: format!("http://{addr}"),
         signer: ComputeSigner::new(&pem, &x).unwrap(),
         http: reqwest::Client::new(),
@@ -7621,4 +7701,85 @@ async fn accept_invite_answers_the_rows_state() {
     *neon.fail_clear.lock().unwrap() = false;
     neon.setup.lock().unwrap().admit_fails = true;
     assert_eq!(ask().await.0, 500);
+}
+
+// s3-endpoint m6, AC 1: the drop/recreate guard counts a live S3 key bound to the role exactly
+// as a live secret data key: the same refusal, naming the S3 key. A rename onto the name is
+// refused the same way. Revoked S3 keys don't count.
+#[tokio::test]
+async fn drop_role_guard_counts_s3_keys() {
+    let recreated = json!({ "op": "set", "name": "r1", "recreated": true, "password": STRONG, "encrypted_password": SCRAM });
+    let cases: Vec<(&str, Value, bool, &str)> = vec![
+        ("drop, S3 key only", json!({ "op": "del", "name": "r1" }), false, "role \"r1\" backs data API key(s) s3-ci; revoke them first"),
+        ("drop, both kinds", json!({ "op": "del", "name": "r1" }), true, "role \"r1\" backs data API key(s) k1, s3-ci; revoke them first"),
+        ("recreate", recreated, false, "role \"r1\" backs data API key(s) s3-ci; revoke them first"),
+        ("rename onto it", rename("r2", "r1"), false, "role \"r1\" backs data API key(s) s3-ci; revoke them first"),
+    ];
+    for (what, op, data_key, want) in cases {
+        let (neon, _) = ddl_neon();
+        let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+        neon.edit(|s| {
+            s.roles.insert("r1".into(), copy("r1", RoleOrigin::Sql, Some("SCRAM-SHA-256$r1"), None));
+            s.roles.insert("r2".into(), copy("r2", RoleOrigin::Sql, Some("SCRAM-SHA-256$r2"), None));
+            if data_key {
+                s.keys.push((uuid::Uuid::new_v4(), "k1".into(), "r1".into(), false));
+            }
+            s.s3_keys.push((uuid::Uuid::new_v4(), "s3-ci".into(), "r1".into(), "neondb".into(), false));
+            s.s3_keys.push((uuid::Uuid::new_v4(), "s3-old".into(), "r1".into(), "neondb".into(), true));
+        });
+        let before = neon.ddl_state();
+        let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![op])).await;
+        assert_eq!((status, text.as_str()), (409, want), "{what}");
+        assert_eq!(neon.ddl_state(), before, "{what}: nothing written");
+        assert!(app.storage_events.keys().is_empty(), "{what}: nothing published");
+    }
+    // Only a revoked S3 key: the drop goes through.
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    neon.edit(|s| {
+        s.roles.insert("r1".into(), copy("r1", RoleOrigin::Sql, Some("SCRAM-SHA-256$r1"), None));
+        s.s3_keys.push((uuid::Uuid::new_v4(), "s3-old".into(), "r1".into(), "neondb".into(), true));
+    });
+    let (status, _, text) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![json!({ "op": "del", "name": "r1" })]))
+        .await;
+    assert_eq!(status, 200, "{text}");
+    assert!(!neon.ddl_state().roles.contains_key("r1"));
+}
+
+// s3-endpoint m6, AC 3 and the receiver's renames: a role rename moves its S3 keys, a database
+// rename takes the keys pinned to it along, a database drop revokes them; each live key changed
+// is published as `StorageEvent::Key` once the transaction committed.
+#[tokio::test]
+async fn ddl_publishes_s3_key_changes() {
+    let (neon, _) = ddl_neon();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let (on_role, on_db, revoked) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    neon.edit(|s| {
+        s.roles.insert("r1".into(), copy("r1", RoleOrigin::Sql, Some("SCRAM-SHA-256$r1"), None));
+        s.dbs.insert("d".into(), ("postgres".into(), DatabaseOrigin::Sql));
+        s.s3_keys.push((on_role, "role-key".into(), "r1".into(), "neondb".into(), false));
+        s.s3_keys.push((on_db, "db-key".into(), "other".into(), "d".into(), false));
+        s.s3_keys.push((revoked, "old".into(), "r1".into(), "d".into(), true));
+    });
+
+    let (status, _, text) = app.ddl("ep-d", Some(COMPUTE_TOKEN), &roles_delta(vec![rename("r1", "r1b")])).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(neon.ddl_state().s3_keys[0].2, "r1b");
+    assert_eq!(neon.ddl_state().s3_keys[2].2, "r1b", "revoked keys move too");
+    assert!(eventually(|| app.storage_events.keys() == vec![on_role]).await, "{:?}", app.storage_events.keys());
+
+    let (status, _, text) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "set", "name": "e", "old_name": "d", "owner": "postgres" })]))
+        .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(neon.ddl_state().s3_keys[1].3, "e");
+    assert!(eventually(|| app.storage_events.keys() == vec![on_role, on_db]).await, "{:?}", app.storage_events.keys());
+
+    let (status, _, text) = app
+        .ddl("ep-d", Some(COMPUTE_TOKEN), &dbs_delta(vec![json!({ "op": "del", "name": "e" })]))
+        .await;
+    assert_eq!(status, 200, "{text}");
+    assert!(neon.ddl_state().s3_keys[1].4, "revoked with its database");
+    assert!(eventually(|| app.storage_events.keys() == vec![on_role, on_db, on_db]).await, "{:?}", app.storage_events.keys());
 }

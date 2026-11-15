@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         // orchestrator calls it with (both ways, as rest's); unset closes the route.
         functions_token: functions_token.clone(),
         rt_events: Arc::new(nats.clone()),
+        storage_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
         cache: proxy_cache.clone(),

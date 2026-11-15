@@ -56,6 +56,24 @@ impl CachePort for ProxyCache {
     }
 }
 
+/// Tells every storage replica that an S3 key changed (`StorageEvent::Key` on
+/// `chelabase.storage.events`, core NATS, best effort), so it drops what it cached for the key.
+/// s3-endpoint m6: the receiver sends it for each live S3 key a committed delta moved or
+/// revoked. NATS in production, a fake in tests.
+pub trait StorageEventsPort: Send + Sync + 'static {
+    fn key_changed(&self, key_id: Uuid) -> BoxFuture<'_, anyhow::Result<()>>;
+}
+
+impl StorageEventsPort for async_nats::Client {
+    fn key_changed(&self, key_id: Uuid) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(&chelabase_nats::StorageEvent::Key { key_id })?;
+            self.publish(chelabase_nats::SUBJECT_STORAGE_EVENTS, body.into()).await?;
+            Ok(())
+        })
+    }
+}
+
 /// Asks the worker to resync a branch's roles soon (`chelabase.resync.branch`). NATS in
 /// production, a fake in tests.
 pub trait ResyncPort: Send + Sync + 'static {
@@ -108,6 +126,13 @@ pub trait DdlPort: Send + Sized + 'static {
         &mut self,
         role: &str,
     ) -> impl Future<Output = Result<Vec<(Uuid, String)>, MetadataError>> + Send;
+    /// The branch's live S3 keys bound to `role`: `(id, name)` (m6).
+    fn live_s3_keys(
+        &mut self,
+        role: &str,
+    ) -> impl Future<Output = Result<Vec<(Uuid, String)>, MetadataError>> + Send;
+    /// The live S3 keys moved or revoked so far, each once (m6).
+    fn s3_keys_changed(&self) -> Vec<Uuid>;
     fn upsert_sql_copy(
         &mut self,
         name: &str,
@@ -182,6 +207,12 @@ impl DdlPort for chelabase_metadata::DdlTx {
     }
     async fn live_secret_keys(&mut self, role: &str) -> Result<Vec<(Uuid, String)>, MetadataError> {
         chelabase_metadata::DdlTx::live_secret_keys(self, role).await
+    }
+    async fn live_s3_keys(&mut self, role: &str) -> Result<Vec<(Uuid, String)>, MetadataError> {
+        chelabase_metadata::DdlTx::live_s3_keys(self, role).await
+    }
+    fn s3_keys_changed(&self) -> Vec<Uuid> {
+        chelabase_metadata::DdlTx::s3_keys_changed(self)
     }
     async fn upsert_sql_copy(&mut self, name: &str, verifier: &str) -> Result<(), MetadataError> {
         chelabase_metadata::DdlTx::upsert_sql_copy(self, name, verifier).await
@@ -762,6 +793,7 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
         branch,
         served_databases_changed,
         known_databases,
+        s3_keys,
     } = match apply(tx, &plan, &state.roles, &state.secrets, &id).await {
         Ok(applied) => applied,
         Err(Failure::Refused(message)) => return answer(StatusCode::CONFLICT, message),
@@ -800,6 +832,18 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
         }
     }
     publish_password_updated(state.cache.clone(), id, changed);
+    // m6: the S3 keys the committed delta moved or revoked; storage drops its cache of each.
+    // Off the response path; a lost event is covered by storage's cache lifetime.
+    if !s3_keys.is_empty() {
+        let events = state.storage_events.clone();
+        tokio::spawn(async move {
+            for key_id in s3_keys {
+                if let Err(e) = events.key_changed(key_id).await {
+                    warn!(%key_id, "ddl: S3 key event not published: {e:#}");
+                }
+            }
+        });
+    }
     StatusCode::OK.into_response()
 }
 
@@ -895,6 +939,8 @@ struct Applied {
     served_databases_changed: Option<BranchId>,
     /// The databases a `set` step found already there (an owner change, not a new database).
     known_databases: Vec<String>,
+    /// The live S3 keys the transaction moved or revoked (m6).
+    s3_keys: Vec<Uuid>,
 }
 
 enum Failure {
@@ -974,12 +1020,7 @@ async fn apply<T: DdlPort>(
                 facts.row = tx.role(name).await?.as_ref().map(RowFacts::of);
             }
             Step::DelRole { name } | Step::CheckRecreated { name } => {
-                facts.live_keys = tx
-                    .live_secret_keys(name)
-                    .await?
-                    .into_iter()
-                    .map(|(_, key_name)| key_name)
-                    .collect();
+                facts.live_keys = live_key_names(&mut tx, name).await?;
             }
             Step::SetDb { name, .. } => {
                 facts.db_exists = tx.has_database(name).await?;
@@ -1086,13 +1127,28 @@ async fn apply<T: DdlPort>(
             return Err(Failure::Refused(text::role_cap(rules.role_cap)));
         }
     }
+    let s3_keys = tx.s3_keys_changed();
     tx.commit().await?;
     Ok(Applied {
         roles: changed,
         branch,
         served_databases_changed: branch.filter(|_| databases_changed),
         known_databases,
+        s3_keys,
     })
+}
+
+/// The names of the live keys `role` backs on the branch: its secret data keys, then its S3
+/// keys (m6: the guard treats both alike).
+async fn live_key_names<T: DdlPort>(tx: &mut T, role: &str) -> Result<Vec<String>, MetadataError> {
+    let mut names: Vec<String> = tx
+        .live_secret_keys(role)
+        .await?
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    names.extend(tx.live_s3_keys(role).await?.into_iter().map(|(_, name)| name));
+    Ok(names)
 }
 
 /// A rename's second hop (M2). Renames move in two hops: each row first goes aside under a
@@ -1133,12 +1189,7 @@ fn step_old<'a>(step: &Step<'a>) -> &'a str {
 /// `DROP ROLE` would be, so the keys never pass to the renamed role.
 async fn finish_role_moves<T: DdlPort>(tx: &mut T, moves: &mut Vec<Move>) -> Result<(), Failure> {
     for m in moves.iter() {
-        let keys: Vec<String> = tx
-            .live_secret_keys(&m.new)
-            .await?
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect();
+        let keys = live_key_names(tx, &m.new).await?;
         if !keys.is_empty() {
             return Err(Failure::Refused(text::in_use(&m.new, &keys)));
         }
