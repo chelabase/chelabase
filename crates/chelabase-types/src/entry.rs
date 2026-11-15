@@ -42,6 +42,7 @@ pub struct Entry {
     docs: Option<String>,
     landing: Option<String>,
     mail: Option<String>,
+    s3: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +170,8 @@ fn check_same_site(studio: &str, api: &str) -> Result<(), EntryError> {
 
 impl Entry {
     /// Reads CHELABASE_PUBLIC_SCHEME (default https), CHELABASE_{STUDIO,API,AUTH}_HOST (required),
-    /// CHELABASE_{DOCS,LANDING,MAIL}_HOST (optional; blank = unset). Refuses: a missing or invalid
+    /// CHELABASE_{DOCS,LANDING,MAIL,S3}_HOST (optional; blank = unset; a set S3 host turns the
+    /// S3 endpoint on). Refuses: a missing or invalid
     /// host, a host carrying the scheme's default port, a bad scheme, two identical hosts (P1), Studio/API not one site (P2), the removed
     /// CHELABASE_API_HOSTS / CHELABASE_STUDIO_ORIGINS / CHELABASE_STUDIO_URL when non-blank (the
     /// message names the replacement). Messages name the variable.
@@ -186,14 +188,16 @@ impl Entry {
         let docs = optional_host(&get, scheme, "CHELABASE_DOCS_HOST")?;
         let landing = optional_host(&get, scheme, "CHELABASE_LANDING_HOST")?;
         let mail = optional_host(&get, scheme, "CHELABASE_MAIL_HOST")?;
+        let s3 = optional_host(&get, scheme, "CHELABASE_S3_HOST")?;
 
-        let all: [(&str, Option<&String>); 6] = [
+        let all: [(&str, Option<&String>); 7] = [
             ("CHELABASE_STUDIO_HOST", Some(&studio)),
             ("CHELABASE_API_HOST", Some(&api)),
             ("CHELABASE_AUTH_HOST", Some(&auth)),
             ("CHELABASE_DOCS_HOST", docs.as_ref()),
             ("CHELABASE_LANDING_HOST", landing.as_ref()),
             ("CHELABASE_MAIL_HOST", mail.as_ref()),
+            ("CHELABASE_S3_HOST", s3.as_ref()),
         ];
         for (i, (name_a, host_a)) in all.iter().enumerate() {
             for (name_b, host_b) in &all[i + 1..] {
@@ -217,6 +221,7 @@ impl Entry {
             docs,
             landing,
             mail,
+            s3,
         })
     }
 
@@ -263,6 +268,11 @@ impl Entry {
 
     pub fn mail_host(&self) -> Option<&str> {
         self.mail.as_deref()
+    }
+
+    /// The S3 endpoint's host; `Some` means the S3 endpoint is on.
+    pub fn s3_host(&self) -> Option<&str> {
+        self.s3.as_deref()
     }
 
     /// `<scheme>://<studio host>` (no trailing slash); likewise the API base and the issuer.
