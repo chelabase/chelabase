@@ -5,7 +5,8 @@
 //!
 //! - which API call a request is ([`classify`]): a closed [`Op`] enum, so anything not listed
 //!   is denied;
-//! - whether a client may make it ([`Profile::allows`], [`Profile::allows_target`]);
+//! - whether a client may make it ([`Profile::allows`], [`Profile::allows_target`],
+//!   [`Profile::allows_connect_container`]);
 //! - whether an object belongs to the stack ([`in_scope`]), and how creates and lists are
 //!   confined to it ([`force_labels`], [`reserved_image_labels`], [`scope_list_query`],
 //!   [`post_filter_list`]).
@@ -17,7 +18,7 @@ pub mod profile;
 pub mod scope;
 
 pub use ops::{ImagePull, ImageRef, Op, OpKind, classify, parse_query};
-pub use profile::{MountType, OpRule, Preset, PresetConfig, Profile};
+pub use profile::{LabelMatch, MountType, OpRule, Preset, PresetConfig, Profile};
 pub use scope::{
     COMPOSE_PROJECT_LABEL, Labels, STACK_LABEL, Stack, force_labels, in_scope, post_filter_list,
     reserved_image_labels, scope_list_query,
