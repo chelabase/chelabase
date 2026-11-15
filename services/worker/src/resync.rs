@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chelabase_metadata::{
     CopyUpsert, DataKeyRecord, KeyRoleFix, ObservedDatabase, ResyncApplied, ResyncWrite,
-    RoleAttributes, RoleCopy, RoleLevel, RoleOrigin, SealedChange,
+    RoleAttributes, RoleCopy, RoleLevel, RoleOrigin, S3KeyRecord, SealedChange,
 };
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::seal_role_password;
@@ -120,6 +120,59 @@ pub fn plan_key_bypass(
         .collect()
 }
 
+/// A key bound to a role by identity (OID on a timeline), which [`plan_key_roles`] holds to
+/// it: a secret data key or (s3-endpoint m6) an S3 key.
+pub trait RoleBoundKey {
+    fn key_id(&self) -> uuid::Uuid;
+    fn role(&self) -> &str;
+    fn role_oid(&self) -> Option<i64>;
+    fn role_timeline(&self) -> Option<&str>;
+    /// Whether the plan looks at the key at all (a live secret data key; any listed S3 key).
+    fn in_plan(&self) -> bool;
+    /// Whether a key without an OID takes its name's (data keys made before OIDs were
+    /// stored). An S3 key always has one (its table's CHECK); if one ever doesn't, it is
+    /// revoked.
+    const BACKFILLS: bool;
+}
+
+impl RoleBoundKey for DataKeyRecord {
+    fn key_id(&self) -> uuid::Uuid {
+        self.id
+    }
+    fn role(&self) -> &str {
+        &self.role
+    }
+    fn role_oid(&self) -> Option<i64> {
+        self.role_oid
+    }
+    fn role_timeline(&self) -> Option<&str> {
+        self.role_timeline.as_deref()
+    }
+    fn in_plan(&self) -> bool {
+        self.kind == DataKeyKind::Secret && self.revoked_at.is_none()
+    }
+    const BACKFILLS: bool = true;
+}
+
+impl RoleBoundKey for S3KeyRecord {
+    fn key_id(&self) -> uuid::Uuid {
+        self.id
+    }
+    fn role(&self) -> &str {
+        &self.role
+    }
+    fn role_oid(&self) -> Option<i64> {
+        Some(self.role_oid)
+    }
+    fn role_timeline(&self) -> Option<&str> {
+        Some(&self.role_timeline)
+    }
+    fn in_plan(&self) -> bool {
+        true
+    }
+    const BACKFILLS: bool = false;
+}
+
 /// The repairs that make the live secret keys agree with the compute's roles (`catalog`, read
 /// on the branch's current `timeline`), by identity: a key is bound to its role's OID *on the
 /// timeline the OID was read on* (E26).
@@ -136,31 +189,34 @@ pub fn plan_key_bypass(
 /// Public keys are left alone.
 ///
 /// T6 (MH-12): a live key bound to a name in `marked` (a personal login) is revoked.
-pub fn plan_key_roles(
-    keys: &[DataKeyRecord],
+///
+/// s3-endpoint m6: S3 keys go through the same rules ([`RoleBoundKey`]); having an OID always,
+/// they never get a `Backfill` (one without would be revoked).
+pub fn plan_key_roles<K: RoleBoundKey>(
+    keys: &[K],
     catalog: &[(i64, String)],
     timeline: &str,
     marked: &BTreeSet<String>,
 ) -> Vec<KeyRoleFix> {
     let name_of = |oid: i64| catalog.iter().find(|(o, _)| *o == oid).map(|(_, n)| n);
     let oid_of = |name: &str| catalog.iter().find(|(_, n)| n == name).map(|(o, _)| *o);
-    let revoke = |k: &DataKeyRecord| KeyRoleFix::Revoke {
-        id: k.id,
-        role: k.role.clone(),
-        oid: k.role_oid,
+    let revoke = |k: &K| KeyRoleFix::Revoke {
+        id: k.key_id(),
+        role: k.role().to_string(),
+        oid: k.role_oid(),
     };
     keys.iter()
-        .filter(|k| k.kind == DataKeyKind::Secret && k.revoked_at.is_none())
-        .filter_map(|k| match k.role_oid {
+        .filter(|k| k.in_plan())
+        .filter_map(|k| match k.role_oid() {
             // MH-12: a personal login never backs a key, whatever its identity says.
-            _ if marked.contains(&k.role) => Some(revoke(k)),
-            Some(oid) if k.role_timeline.as_deref() == Some(timeline) => match name_of(oid) {
+            _ if marked.contains(k.role()) => Some(revoke(k)),
+            Some(oid) if k.role_timeline() == Some(timeline) => match name_of(oid) {
                 None => Some(revoke(k)),
                 // A rename onto a personal login's name is never followed (MH-12).
                 Some(name) if marked.contains(name) => Some(revoke(k)),
-                Some(name) if *name != k.role => Some(KeyRoleFix::Follow {
-                    id: k.id,
-                    from: k.role.clone(),
+                Some(name) if name != k.role() => Some(KeyRoleFix::Follow {
+                    id: k.key_id(),
+                    from: k.role().to_string(),
                     to: name.clone(),
                     oid,
                     timeline: timeline.to_string(),
@@ -168,19 +224,20 @@ pub fn plan_key_roles(
                 Some(_) => None,
             },
             Some(oid) => Some(match name_of(oid) {
-                Some(name) if *name == k.role => KeyRoleFix::Restamp {
-                    id: k.id,
-                    role: k.role.clone(),
+                Some(name) if name == k.role() => KeyRoleFix::Restamp {
+                    id: k.key_id(),
+                    role: k.role().to_string(),
                     oid,
-                    from: k.role_timeline.clone(),
+                    from: k.role_timeline().map(str::to_string),
                     timeline: timeline.to_string(),
                 },
                 _ => revoke(k),
             }),
-            None => Some(match oid_of(&k.role) {
+            None if !K::BACKFILLS => Some(revoke(k)),
+            None => Some(match oid_of(k.role()) {
                 Some(oid) => KeyRoleFix::Backfill {
-                    id: k.id,
-                    role: k.role.clone(),
+                    id: k.key_id(),
+                    role: k.role().to_string(),
                     oid,
                     timeline: timeline.to_string(),
                 },
@@ -288,6 +345,64 @@ impl ResyncRequests {
 
     /// The branches asked for so far.
     pub fn sent(&self) -> Vec<BranchId> {
+        self.sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// Where the worker tells storage that S3 keys changed (`StorageEvent::Key` on
+/// `chelabase.storage.events`, s3-endpoint m6): each S3 key a role delete, rename or the resync
+/// revoked or moved, once its transaction committed. The process connects it to NATS once;
+/// until then (and in tests) events are only recorded. A failed publish is logged: storage's
+/// cache lifetime is the backstop.
+#[derive(Default)]
+pub struct StorageEvents {
+    client: std::sync::OnceLock<async_nats::Client>,
+    sent: std::sync::Mutex<Vec<uuid::Uuid>>,
+}
+
+impl StorageEvents {
+    /// Publishes later events with `client`.
+    pub fn connect(&self, client: async_nats::Client) {
+        let _ = self.client.set(client);
+    }
+
+    /// Publishes `StorageEvent::Key` for each of `keys`, off the caller's path.
+    pub fn keys_changed(&self, keys: &[uuid::Uuid]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(keys);
+        let Some(client) = self.client.get().cloned() else {
+            return;
+        };
+        let keys = keys.to_vec();
+        tokio::spawn(async move {
+            for key_id in keys {
+                let body = match serde_json::to_vec(&chelabase_nats::StorageEvent::Key { key_id }) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!(%key_id, "S3 key event not encoded: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = client
+                    .publish(chelabase_nats::SUBJECT_STORAGE_EVENTS, body.into())
+                    .await
+                {
+                    warn!(%key_id, "S3 key event not published: {e}");
+                }
+            }
+        });
+    }
+
+    /// The keys published so far.
+    pub fn sent(&self) -> Vec<uuid::Uuid> {
         self.sent
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1068,7 +1183,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(|e| fail("writing the copies", &e))?
             {
-                ResyncApplied::Applied { changed } => changed,
+                ResyncApplied::Applied { changed, s3_keys } => {
+                    // m6: S3 keys whose database the catalog no longer has were revoked.
+                    self.storage_events.keys_changed(&s3_keys);
+                    changed
+                }
                 ResyncApplied::VersionMoved => {
                     info!(branch_id = %branch, endpoint_id = %ep, attempt, "roles changed during the resync; reading again");
                     continue;
@@ -1128,7 +1247,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// Makes the branch's live secret keys agree with the compute's roles by OID and timeline
     /// ([`plan_key_roles`]): revokes dead keys, follows renames the DDL receiver didn't see,
     /// re-stamps or revokes keys from before a timeline switch and backfills keys made before
-    /// OIDs were stored. Only when the branch has live secret keys. A failure is logged: keys
+    /// OIDs were stored. s3-endpoint m6: the branch's live S3 keys go through the same plan
+    /// after the data keys, and each one changed is published to storage. Only when the branch
+    /// has live secret keys or S3 keys. A failure is logged: keys
     /// are still held to their OID by rest on every request, so this is tidying, and the next
     /// resync tries again. An empty catalog (never real: `pg_roles` always has the bootstrap
     /// roles) is taken as unreadable, never as "every role is gone".
@@ -1145,7 +1266,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 return;
             }
         };
-        if !keys.iter().any(|k| k.kind == DataKeyKind::Secret) {
+        let s3_keys = match self.metadata.list_live_s3_keys(branch).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(branch_id = %branch, "secret keys versus roles: listing the S3 keys: {e}");
+                return;
+            }
+        };
+        if !keys.iter().any(|k| k.kind == DataKeyKind::Secret) && s3_keys.is_empty() {
             return;
         }
         let Some(timeline) = self.current_timeline(branch).await else {
@@ -1188,14 +1316,24 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let mut fixes = plan_key_roles(&keys, &catalog, &timeline, &marked);
         let marks = plan_key_bypass(&keys, &flagged, &fixes);
         fixes.extend(marks);
-        if fixes.is_empty() {
-            return;
-        }
-        match self.metadata.fix_key_roles(branch, &fixes).await {
-            Ok(changed) => {
-                info!(branch_id = %branch, changed, ?fixes, "secret keys made to agree with the roles");
+        if !fixes.is_empty() {
+            match self.metadata.fix_key_roles(branch, &fixes).await {
+                Ok(changed) => {
+                    info!(branch_id = %branch, changed, ?fixes, "secret keys made to agree with the roles");
+                }
+                Err(e) => warn!(branch_id = %branch, "secret keys versus roles: writing: {e}"),
             }
-            Err(e) => warn!(branch_id = %branch, "secret keys versus roles: writing: {e}"),
+        }
+        // m6: the S3 keys, by the same rules, after the data keys (their own transaction).
+        let s3_fixes = plan_key_roles(&s3_keys, &catalog, &timeline, &marked);
+        if !s3_fixes.is_empty() {
+            match self.metadata.fix_s3_key_roles(branch, &s3_fixes).await {
+                Ok(changed) => {
+                    info!(branch_id = %branch, changed = changed.len(), fixes = ?s3_fixes, "S3 keys made to agree with the roles");
+                    self.storage_events.keys_changed(&changed);
+                }
+                Err(e) => warn!(branch_id = %branch, "S3 keys versus roles: writing: {e}"),
+            }
         }
     }
 
@@ -1805,6 +1943,7 @@ mod tests {
         }
         assert_eq!(catalogs.len(), 34);
         let mut checked = 0;
+        let mut s3_checked = 0;
         for catalog in &catalogs {
             for role in names {
                 for oid in [None, Some(16384), Some(16385), Some(16386), Some(16999)] {
@@ -1814,6 +1953,19 @@ mod tests {
                         }
                         let k = key_on(role, oid, timeline);
                         let fixes = plan_key_roles(std::slice::from_ref(&k), catalog, NOW, &BTreeSet::new());
+                        // m6: an S3 key with the same binding (it always has an OID and a
+                        // timeline) gets exactly the same repairs, so the invariant below
+                        // holds for S3 keys too.
+                        if let (Some(o), Some(t)) = (oid, timeline) {
+                            let mut s3 = s3_on(role, o, t);
+                            s3.id = k.id;
+                            assert_eq!(
+                                plan_key_roles(std::slice::from_ref(&s3), catalog, NOW, &BTreeSet::new()),
+                                fixes,
+                                "S3 key {s3:?} on {catalog:?}"
+                            );
+                            s3_checked += 1;
+                        }
                         let after = apply_fixes(&k, &fixes);
                         let case = format!("{k:?} on {catalog:?}: {fixes:?}");
                         let name_of = |o: i64| catalog.iter().find(|(c, _)| *c == o).map(|(_, n)| n.clone());
@@ -1851,6 +2003,97 @@ mod tests {
             }
         }
         assert_eq!(checked, 34 * 3 * (1 + 4 * 3));
+        assert_eq!(s3_checked, 34 * 3 * 4 * 2);
+    }
+
+    fn s3_on(role: &str, oid: i64, timeline: &str) -> S3KeyRecord {
+        crate::fakes::s3_key(BranchId::new(), role, oid, timeline)
+    }
+
+    // s3-endpoint m6, AC 4: S3 keys follow identity as data keys do. On the key's timeline an
+    // OID that is gone revokes and a renamed OID is followed; off it, a key whose OID still
+    // carries its name is re-stamped and any other is revoked, never followed.
+    #[test]
+    fn plan_s3_key_roles_follows_identity() {
+        let catalog = vec![(16384, "app".to_string()), (16390, "renamed".to_string()), (16400, "again".to_string())];
+        let gone = s3_on("dropped", 16385, NOW);
+        let moved = s3_on("old_name", 16390, NOW);
+        let recreated = s3_on("again", 16399, NOW);
+        let alive = s3_on("app", 16384, NOW);
+        let kept = s3_on("app", 16384, BEFORE);
+        let reused = s3_on("app", 16390, BEFORE);
+        let off_gone = s3_on("app", 16500, BEFORE);
+        let keys = [gone.clone(), moved.clone(), recreated.clone(), alive, kept.clone(), reused.clone(), off_gone.clone()];
+        assert_eq!(
+            plan_key_roles(&keys, &catalog, NOW, &BTreeSet::new()),
+            vec![
+                KeyRoleFix::Revoke { id: gone.id, role: "dropped".into(), oid: Some(16385) },
+                KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390, timeline: NOW.into() },
+                KeyRoleFix::Revoke { id: recreated.id, role: "again".into(), oid: Some(16399) },
+                KeyRoleFix::Restamp { id: kept.id, role: "app".into(), oid: 16384, from: Some(BEFORE.into()), timeline: NOW.into() },
+                KeyRoleFix::Revoke { id: reused.id, role: "app".into(), oid: Some(16390) },
+                KeyRoleFix::Revoke { id: off_gone.id, role: "app".into(), oid: Some(16500) },
+            ]
+        );
+    }
+
+    // s3-endpoint m6, AC 5: an S3 key bound to a personal login's name, or whose OID was
+    // renamed onto one, is revoked.
+    #[test]
+    fn personal_login_revokes_s3_key() {
+        let catalog = vec![(16384, "member_x".to_string()), (16390, "member_y".to_string())];
+        let marked: BTreeSet<String> = ["member_x".to_string(), "member_y".to_string()].into();
+        let bound = s3_on("member_x", 16384, NOW);
+        let renamed_onto = s3_on("svc", 16390, NOW);
+        assert_eq!(
+            plan_key_roles(&[bound.clone(), renamed_onto.clone()], &catalog, NOW, &marked),
+            vec![
+                KeyRoleFix::Revoke { id: bound.id, role: "member_x".into(), oid: Some(16384) },
+                KeyRoleFix::Revoke { id: renamed_onto.id, role: "svc".into(), oid: Some(16390) },
+            ]
+        );
+    }
+
+    // s3-endpoint m6: the resync applies the S3 plan through `fix_s3_key_roles` after the data
+    // keys and publishes each S3 key it changed; a branch with S3 keys and no data keys is
+    // read too.
+    #[tokio::test]
+    async fn resync_repairs_and_publishes_s3_keys() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let now = w.metadata.branch(branch).timeline_id.unwrap();
+        let gone = crate::fakes::s3_key(branch, "app", 16385, &now);
+        let moved = crate::fakes::s3_key(branch, "old", 16390, &now);
+        let alive = crate::fakes::s3_key(branch, "app", 16384, &now);
+        w.metadata.state().s3_keys.extend([gone.clone(), moved.clone(), alive.clone()]);
+        w.computes.answer(
+            "chelabase: key roles",
+            &format!("16384 {}\n16390 {}\n", hex::encode("app"), hex::encode("x")),
+        );
+        w.resync(branch).await.unwrap();
+        assert_eq!(
+            w.metadata.state().s3_key_fixes,
+            vec![(
+                branch,
+                vec![
+                    KeyRoleFix::Revoke { id: gone.id, role: "app".into(), oid: Some(16385) },
+                    KeyRoleFix::Follow { id: moved.id, from: "old".into(), to: "x".into(), oid: 16390, timeline: now.clone() },
+                ]
+            )]
+        );
+        assert_eq!(w.storage_events.sent(), vec![gone.id, moved.id]);
+    }
+
+    // s3-endpoint m6, AC 3: the S3 keys the resync's database write revoked (their database is
+    // gone from the catalog) are published.
+    #[tokio::test]
+    async fn resync_publishes_s3_keys_revoked_with_a_database() {
+        let (w, journal) = worker();
+        let (branch, _ep) = ready(&w, &journal).await;
+        let revoked = uuid::Uuid::new_v4();
+        w.metadata.state().resync_s3_revoked = vec![revoked];
+        w.resync(branch).await.unwrap();
+        assert_eq!(w.storage_events.sent(), vec![revoked]);
     }
 
     // E33: a live key's BYPASSRLS mark follows the role it stays bound to (after the plan's

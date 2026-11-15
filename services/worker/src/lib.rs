@@ -146,6 +146,9 @@ pub struct Worker<M, S, C, N, P> {
     pub merge_online_step_timeout: Duration,
     /// Branch resync requests (`chelabase.resync.branch`), connected by the process.
     pub resync_requests: resync::ResyncRequests,
+    /// S3 key events for storage (`chelabase.storage.events`, s3-endpoint m6), connected by
+    /// the process.
+    pub storage_events: resync::StorageEvents,
     /// Member-role reconcile requests (`chelabase.member_roles.reconcile`), connected by the
     /// process.
     pub member_role_requests: member_roles::MemberRoleRequests,

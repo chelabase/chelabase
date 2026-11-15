@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         worker.sweep_requests.connect(js.clone());
     }
     worker.resync_requests.connect(nats.clone());
+    worker.storage_events.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.
     tokio::spawn({

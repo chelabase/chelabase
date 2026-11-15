@@ -1705,7 +1705,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // row (written below) can take the name.
         for name in &personal.legacy_rows {
             match self.metadata.delete_role_copy(&ep, name).await {
-                Ok(_) => published.push(name.clone()),
+                Ok(deleted) => {
+                    self.storage_events.keys_changed(&deleted.revoked_s3_keys);
+                    published.push(name.clone());
+                }
                 Err(e) => failures.push(format!("removing the legacy row of {name}: {e}")),
             }
         }

@@ -499,6 +499,7 @@ pub fn build_with(
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
+        storage_events: Default::default(),
         member_role_requests: Default::default(),
         member_logins: chelabase_neon::spec::MemberLogins::orchestrator(cidrs),
         cert_sweep: Some(crate::certs::CertSweep {

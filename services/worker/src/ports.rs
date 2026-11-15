@@ -228,12 +228,13 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         version: i64,
         attributes_change: Option<Uuid>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
-    /// Deletes a non-owner row; false when there was none. Bumps the version.
+    /// Deletes a non-owner row (`row` false when there was none) and revokes the live S3
+    /// keys bound to the name with it (m6). Bumps the version.
     fn delete_role_copy(
         &self,
         endpoint_id: &str,
         name: &str,
-    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<chelabase_metadata::RoleCopyDeleted, MetadataError>> + Send;
     /// Every row of the endpoint (the owner's first), and `roles_version`.
     fn role_copies(
         &self,
@@ -406,6 +407,17 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         branch: BranchId,
         fixes: &[chelabase_metadata::KeyRoleFix],
     ) -> impl Future<Output = Result<u64, MetadataError>> + Send;
+    /// The branch's live S3 keys (m6).
+    fn list_live_s3_keys(
+        &self,
+        branch: BranchId,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::S3KeyRecord>, MetadataError>> + Send;
+    /// The resync's repairs of S3 keys versus the compute's roles; the ids changed (m6).
+    fn fix_s3_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> impl Future<Output = Result<Vec<Uuid>, MetadataError>> + Send;
     fn has_live_public_key(
         &self,
         branch: BranchId,
@@ -942,8 +954,12 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::confirm_role(self, endpoint_id, name, version, attributes_change).await
     }
 
-    async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
-        MetadataClient::delete_role_copy(self, endpoint_id, name).await
+    async fn delete_role_copy(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<chelabase_metadata::RoleCopyDeleted, MetadataError> {
+        MetadataClient::delete_role_copy_revoking(self, endpoint_id, name).await
     }
 
     async fn role_copies(&self, endpoint_id: &str) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
@@ -1157,6 +1173,21 @@ impl WorkerMetadata for MetadataClient {
         fixes: &[chelabase_metadata::KeyRoleFix],
     ) -> Result<u64, MetadataError> {
         MetadataClient::fix_key_roles(self, branch, fixes).await
+    }
+
+    async fn list_live_s3_keys(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<chelabase_metadata::S3KeyRecord>, MetadataError> {
+        MetadataClient::list_live_s3_keys(self, branch).await
+    }
+
+    async fn fix_s3_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> Result<Vec<Uuid>, MetadataError> {
+        MetadataClient::fix_s3_key_roles(self, branch, fixes).await
     }
 
     async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {

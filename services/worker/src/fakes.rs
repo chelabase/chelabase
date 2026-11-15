@@ -192,6 +192,12 @@ pub struct FakeState {
     pub revoked_keys: HashSet<uuid::Uuid>,
     /// Each `fix_key_roles` call: the branch and its repairs.
     pub key_fixes: Vec<(BranchId, Vec<chelabase_metadata::KeyRoleFix>)>,
+    /// s3-endpoint m6: live S3 keys (`fix_s3_key_roles` revokes by removing, follows by
+    /// renaming), and each `fix_s3_key_roles` call.
+    pub s3_keys: Vec<chelabase_metadata::S3KeyRecord>,
+    pub s3_key_fixes: Vec<(BranchId, Vec<chelabase_metadata::KeyRoleFix>)>,
+    /// What the next applied `apply_resync` reports as S3 keys revoked with a database.
+    pub resync_s3_revoked: Vec<uuid::Uuid>,
     /// Runs once, just before the next `finish_enable_data_api`: a write landing while the
     /// enable's bootstrap ran (a `default_schema` PATCH, say).
     pub before_finish_enable: Option<StateHook>,
@@ -1500,9 +1506,19 @@ impl WorkerMetadata for FakeMetadata {
         {
             key.role = new.to_string();
         }
+        let mut s3_keys = Vec::new();
+        for key in state
+            .s3_keys
+            .iter_mut()
+            .filter(|k| k.branch_id == branch && k.role == old)
+        {
+            key.role = new.to_string();
+            s3_keys.push(key.id);
+        }
         Ok(RenameCopyOutcome::Renamed {
             row: moved,
             was_unreadable,
+            s3_keys,
         })
     }
 
@@ -1560,23 +1576,43 @@ impl WorkerMetadata for FakeMetadata {
         }
     }
 
-    async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
+    async fn delete_role_copy(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<chelabase_metadata::RoleCopyDeleted, MetadataError> {
+        let nothing = chelabase_metadata::RoleCopyDeleted { row: false, revoked_s3_keys: Vec::new() };
         let mut state = self.write("delete_role_copy")?;
+        let state = &mut *state;
         let vanishes = state.role_row_vanishes;
         let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
-            return Ok(false);
+            return Ok(nothing);
         };
         if vanishes {
             ep.logins.remove(name);
             ep.set_verifier(name, None);
-            return Ok(false);
+            return Ok(nothing);
         }
         if ep.logins.remove(name).is_none() {
-            return Ok(false);
+            return Ok(nothing);
         }
         ep.set_verifier(name, None);
         ep.roles_version += 1;
-        Ok(true)
+        let branches: Vec<BranchId> = state
+            .branches
+            .values()
+            .filter(|b| b.endpoint_id.as_deref() == Some(endpoint_id))
+            .map(|b| b.id)
+            .collect();
+        let mut revoked_s3_keys = Vec::new();
+        state.s3_keys.retain(|k| {
+            let revoke = k.role == name && branches.contains(&k.branch_id);
+            if revoke {
+                revoked_s3_keys.push(k.id);
+            }
+            !revoke
+        });
+        Ok(chelabase_metadata::RoleCopyDeleted { row: true, revoked_s3_keys })
     }
 
     async fn role_copies(&self, endpoint_id: &str) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
@@ -1689,7 +1725,8 @@ impl WorkerMetadata for FakeMetadata {
                 rows.push(FakeDbRow::new(&d.name, DataApiState::Off, "public"));
             }
         }
-        Ok(ResyncApplied::Applied { changed })
+        let s3_keys = std::mem::take(&mut state.resync_s3_revoked);
+        Ok(ResyncApplied::Applied { changed, s3_keys })
     }
 
     async fn clear_forwarded(&self, endpoint_id: &str) -> Result<(), MetadataError> {
@@ -2207,6 +2244,47 @@ impl WorkerMetadata for FakeMetadata {
         let mut state = self.write("fix_key_roles")?;
         state.key_fixes.push((branch, fixes.to_vec()));
         Ok(fixes.len() as u64)
+    }
+
+    async fn list_live_s3_keys(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<chelabase_metadata::S3KeyRecord>, MetadataError> {
+        let state = self.read("list_live_s3_keys")?;
+        Ok(state.s3_keys.iter().filter(|k| k.branch_id == branch).cloned().collect())
+    }
+
+    async fn fix_s3_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> Result<Vec<uuid::Uuid>, MetadataError> {
+        use chelabase_metadata::KeyRoleFix;
+        let mut state = self.write("fix_s3_key_roles")?;
+        state.s3_key_fixes.push((branch, fixes.to_vec()));
+        let mut changed = Vec::new();
+        for fix in fixes {
+            match fix {
+                KeyRoleFix::Revoke { id, .. } | KeyRoleFix::Backfill { id, .. } => {
+                    state.s3_keys.retain(|k| k.id != *id);
+                    changed.push(*id);
+                }
+                KeyRoleFix::Follow { id, to, .. } => {
+                    if let Some(k) = state.s3_keys.iter_mut().find(|k| k.id == *id) {
+                        k.role = to.clone();
+                    }
+                    changed.push(*id);
+                }
+                KeyRoleFix::Restamp { id, timeline, .. } => {
+                    if let Some(k) = state.s3_keys.iter_mut().find(|k| k.id == *id) {
+                        k.role_timeline = timeline.clone();
+                    }
+                    changed.push(*id);
+                }
+                KeyRoleFix::Bypass { .. } => {}
+            }
+        }
+        Ok(changed)
     }
 
     async fn branch_databases(
@@ -3859,6 +3937,22 @@ pub struct FakePusher {
 }
 
 /// A fresh compute-JWT key pair for fakes.
+/// s3-endpoint m6: a live S3 key of `branch` bound to `role` (`oid` read on `timeline`).
+pub fn s3_key(branch: BranchId, role: &str, oid: i64, timeline: &str) -> chelabase_metadata::S3KeyRecord {
+    chelabase_metadata::S3KeyRecord {
+        id: uuid::Uuid::new_v4(),
+        branch_id: branch,
+        database: "app".into(),
+        role: role.into(),
+        name: format!("{role}-s3"),
+        access_key_id: "CBAKAAAAAAAAAAAAAAAA".into(),
+        role_oid: oid,
+        role_timeline: timeline.into(),
+        created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        last_used_at: None,
+    }
+}
+
 pub fn fake_signer() -> chelabase_neon::ComputeSigner {
     let (pem, x) = chelabase_neon::jwt::generate_keypair();
     chelabase_neon::ComputeSigner::new(&pem, &x).expect("a generated key pair")
@@ -4094,6 +4188,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
+        storage_events: Default::default(),
         member_role_requests: Default::default(),
         member_logins: chelabase_neon::spec::MemberLogins::orchestrator(Vec::new()),
         cert_sweep: None,

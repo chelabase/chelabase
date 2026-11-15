@@ -911,11 +911,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             self.publish_twice(&ep, &[name.to_string()]).await;
         }
         // A role made in SQL that lost its password has no copy any more.
-        if !wanted_login
-            && row.as_ref().is_some_and(|r| r.origin == RoleOrigin::Sql)
-            && let Err(e) = self.metadata.delete_role_copy(&ep, name).await
-        {
-            warn!(branch_id = %branch, endpoint_id = %ep, role = name, "removing the row; the resync will: {e}");
+        if !wanted_login && row.as_ref().is_some_and(|r| r.origin == RoleOrigin::Sql) {
+            match self.metadata.delete_role_copy(&ep, name).await {
+                Ok(deleted) => self.storage_events.keys_changed(&deleted.revoked_s3_keys),
+                Err(e) => {
+                    warn!(branch_id = %branch, endpoint_id = %ep, role = name, "removing the row; the resync will: {e}");
+                }
+            }
         }
         info!(branch_id = %branch, endpoint_id = %ep, role = name, "role changed");
         // An owner-level or membership change can make the role unsafe for member roles (R16).
@@ -1284,8 +1286,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(e) => return dropping(e),
         };
         match self.metadata.delete_role_copy(&ep, name).await {
-            // `false`: the row went meanwhile (a forwarded DROP ROLE); the role is gone either way.
-            Ok(_) => {}
+            // `row: false`: the row went meanwhile (a forwarded DROP ROLE); the role is gone
+            // either way. m6: storage drops the S3 keys revoked with the row.
+            Ok(deleted) => self.storage_events.keys_changed(&deleted.revoked_s3_keys),
             Err(e) => return failed(branch, "deleting the role's row", &e),
         }
         self.publish_twice(&ep, &[name.to_string()]).await;
@@ -1376,7 +1379,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .rename_role_copy(&ep, branch, from, to, resealed.as_deref(), None)
             .await
         {
-            Ok(RenameCopyOutcome::Renamed { was_unreadable, .. }) => was_unreadable,
+            Ok(RenameCopyOutcome::Renamed { was_unreadable, s3_keys, .. }) => {
+                // m6: the S3 keys moved with the name; storage drops what it cached of them.
+                self.storage_events.keys_changed(&s3_keys);
+                was_unreadable
+            }
             Ok(RenameCopyOutcome::Taken) => return exists(to),
             // A personal login is its record's (MH-11): not a role this API renames.
             Ok(RenameCopyOutcome::Personal) => return RoleOutcome::NotFound,
@@ -1409,12 +1416,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
                 Ok(_) => {
                     warn!(branch_id = %branch, endpoint_id = %ep, role = from, "renaming the role; moving its row back: {e:#}");
-                    if let Err(back) = self
+                    match self
                         .metadata
                         .rename_role_copy(&ep, branch, to, from, sealed.as_deref(), Some(was_unreadable))
                         .await
                     {
-                        warn!(branch_id = %branch, endpoint_id = %ep, role = from, "moving the row back; the resync finds the role under its old name: {back}");
+                        Ok(RenameCopyOutcome::Renamed { s3_keys, .. }) => {
+                            self.storage_events.keys_changed(&s3_keys);
+                        }
+                        Ok(_) => {}
+                        Err(back) => {
+                            warn!(branch_id = %branch, endpoint_id = %ep, role = from, "moving the row back; the resync finds the role under its old name: {back}");
+                        }
                     }
                     return RoleOutcome::Failed(format!("renaming the role {from}: {e:#}"));
                 }
@@ -4153,6 +4166,41 @@ mod tests {
             pos(&journal, &format!("cache.password_updated {ep} app_v2")),
         ];
         assert!(order.is_sorted(), "{:?}", entries(&journal));
+    }
+
+    /// s3-endpoint m6, AC 2: a role delete revokes the S3 keys bound to it with the row, and
+    /// each is published as a storage event; a key of another role stays.
+    #[tokio::test]
+    async fn role_delete_publishes_revoked_s3_keys() {
+        let (w, journal) = worker();
+        let (branch, _ep, _db) = with_app(&w, &journal).await;
+        let bound = crate::fakes::s3_key(branch, "app", 16384, "t");
+        let other = crate::fakes::s3_key(branch, "reader", 16385, "t");
+        w.metadata.state().s3_keys.extend([bound.clone(), other.clone()]);
+        w.computes.answer(EXISTS_APP, "1\n");
+        w.computes.answer("FROM pg_database", &databases(&["app"]));
+        w.computes.answer_in("app", "REASSIGN OWNED BY", "count|0\n");
+
+        assert!(matches!(w.delete_role(branch, "app", Q).await, RoleOutcome::Deleted(_)));
+        assert_eq!(w.storage_events.sent(), vec![bound.id]);
+        assert_eq!(w.metadata.state().s3_keys, vec![other]);
+    }
+
+    /// s3-endpoint m6: a rename through the control plane moves the role's S3 keys, and each
+    /// is published as a storage event.
+    #[tokio::test]
+    async fn rename_role_publishes_moved_s3_keys() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, _, _) = login(&w, &ep, "app").unwrap();
+        let key = crate::fakes::s3_key(branch, "app", 16384, "t");
+        w.metadata.state().s3_keys.push(key.clone());
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Ok);
+        assert_eq!(w.storage_events.sent(), vec![key.id]);
+        assert_eq!(w.metadata.state().s3_keys[0].role, "app_v2");
     }
 
     /// E29: the rename's refusals, none of which changes anything.

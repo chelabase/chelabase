@@ -312,7 +312,11 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
             .await
     }
 
-    async fn delete_role_copy(&self, endpoint_id: &str, name: &str) -> Result<bool, MetadataError> {
+    async fn delete_role_copy(
+        &self,
+        endpoint_id: &str,
+        name: &str,
+    ) -> Result<chelabase_metadata::RoleCopyDeleted, MetadataError> {
         self.inner.delete_role_copy(endpoint_id, name).await
     }
 
@@ -596,6 +600,21 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         fixes: &[chelabase_metadata::KeyRoleFix],
     ) -> Result<u64, MetadataError> {
         self.inner.fix_key_roles(branch, fixes).await
+    }
+
+    async fn list_live_s3_keys(
+        &self,
+        branch: BranchId,
+    ) -> Result<Vec<chelabase_metadata::S3KeyRecord>, MetadataError> {
+        self.inner.list_live_s3_keys(branch).await
+    }
+
+    async fn fix_s3_key_roles(
+        &self,
+        branch: BranchId,
+        fixes: &[chelabase_metadata::KeyRoleFix],
+    ) -> Result<Vec<Uuid>, MetadataError> {
+        self.inner.fix_s3_key_roles(branch, fixes).await
     }
 
     async fn has_live_public_key(&self, branch: BranchId) -> Result<bool, MetadataError> {

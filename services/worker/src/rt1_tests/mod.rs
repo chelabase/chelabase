@@ -170,6 +170,7 @@ pub(crate) fn rt_worker() -> Rt {
         merge_tx_timeout: w.merge_tx_timeout,
         merge_online_step_timeout: w.merge_online_step_timeout,
         resync_requests: w.resync_requests,
+        storage_events: w.storage_events,
         member_role_requests: w.member_role_requests,
         member_logins: w.member_logins,
         cert_sweep: w.cert_sweep,
