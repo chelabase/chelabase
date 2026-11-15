@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use serde_json::{Value, json};
 
 use crate::compute::POSTGRES_PORT;
+use crate::compute_tls;
 
 /// `reason` values we send; the proxy reads any value it doesn't know as `UNKNOWN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +41,15 @@ pub fn access_control(project_id: &str, role_secret: &str) -> Value {
 
 /// `GET wake_compute`. Until step 4 has real ids, `project_id` carries the endpoint id and
 /// `branch_id` the timeline id.
+///
+/// `server_name` is always the compute certificate's name ([`compute_tls::server_name`]).
+/// The proxy treats a null name as a plaintext hop, so it is never null: with a name, the
+/// proxy connects to `address`, sends SSLRequest, and verifies the compute's certificate
+/// against that name and the compute CA (`NEON_INTERNAL_CA_FILE`).
 pub fn wake_compute(ip: IpAddr, endpoint_id: &str, timeline_id: &str) -> Value {
     json!({
         "address": SocketAddr::new(ip, POSTGRES_PORT).to_string(),
-        "server_name": null,
+        "server_name": compute_tls::server_name(endpoint_id),
         "aux": {
             "endpoint_id": endpoint_id,
             "project_id": endpoint_id,
@@ -96,12 +102,21 @@ mod tests {
     fn wake_compute_points_at_postgres_on_the_compute() {
         let v = wake_compute("172.20.0.9".parse().unwrap(), "ep-a", "0123");
         assert_eq!(v["address"], "172.20.0.9:5432");
-        assert!(v["server_name"].is_null());
         assert_eq!(v["aux"]["endpoint_id"], "ep-a");
         assert_eq!(v["aux"]["project_id"], "ep-a");
         assert_eq!(v["aux"]["branch_id"], "0123");
         assert_eq!(v["aux"]["compute_id"], "ep-a");
         assert_eq!(v["aux"]["cold_start_info"], "warm");
+    }
+
+    #[test]
+    fn wake_compute_names_the_compute_certificate() {
+        // The proxy turns a null `server_name` into a plaintext hop; a name makes it send
+        // SSLRequest and verify the compute's certificate against that name.
+        let v = wake_compute("172.20.0.9".parse().unwrap(), "ep-a", "0123");
+        assert_eq!(v["server_name"], "ep-a.compute.chelabase.internal");
+        assert_eq!(v["server_name"], crate::compute_tls::server_name("ep-a"));
+        assert_eq!(v["address"], "172.20.0.9:5432");
     }
 
     #[test]

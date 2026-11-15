@@ -1261,9 +1261,14 @@
         "--tls-cert=/tls/tls.crt",
         "--tls-key=/tls/tls.key",
         "--project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m",
+        "--wake-compute-cache=size=4000,idle_ttl=4m,ttl=10m",
         "--redis-auth-type=plain"
       ],
       "depends_on": {
+        "orchestrator": {
+          "condition": "service_healthy",
+          "required": true
+        },
         "proxy-tls": {
           "condition": "service_completed_successfully",
           "required": true
@@ -1276,9 +1281,12 @@
       "entrypoint": [
         "/bin/sh",
         "-c",
-        "exec proxy --redis-plain=redis://proxy@valkey:6379 --redis-plain-password-file=/run/valkey-proxy.password --control-plane-token-file=/run/proxy-api.token \"$$@\"",
+        "ca=\"$${NEON_INTERNAL_CA_FILE:-}\"\nif [ -z \"$$ca\" ] || [ ! -f \"$$ca\" ] || [ ! -s \"$$ca\" ] || ! grep -q -- '-----BEGIN CERTIFICATE-----' \"$$ca\"; then\n  echo \"proxy: NEON_INTERNAL_CA_FILE=[$$ca] is unset, missing, empty or holds no certificate; the proxy verifies computes against the compute CA and won't start without it\" >&2\n  exit 1\nfi\nexec proxy --redis-plain=redis://proxy@valkey:6379 --redis-plain-password-file=/run/valkey-proxy.password --control-plane-token-file=/run/proxy-api.token \"$$@\"\n",
         "proxy"
       ],
+      "environment": {
+        "NEON_INTERNAL_CA_FILE": "/run/chelabase/secrets/compute-ca/ca.crt"
+      },
       "healthcheck": {
         "interval": "2s",
         "retries": 60,
@@ -1319,6 +1327,10 @@
         {
           "source": "token-proxy-api",
           "target": "/run/proxy-api.token"
+        },
+        {
+          "source": "compute-ca-cert",
+          "target": "/run/chelabase/secrets/compute-ca/ca.crt"
         }
       ],
       "user": "1000:1000",

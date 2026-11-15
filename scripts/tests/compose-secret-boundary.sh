@@ -108,6 +108,7 @@ pageserver	neon/storage-tokens/safekeeper-data.jwt	ro
 register-safekeepers	neon/storage-tokens/storcon-admin.jwt	ro
 proxy	valkey/proxy.password	ro
 proxy	tokens/proxy-api.token	ro
+proxy	compute-ca/ca.crt	ro
 init-secrets		rw
 init-bootstrap	db/metadata.password	ro
 init-bootstrap	identity/db.password	ro
