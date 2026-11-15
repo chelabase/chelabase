@@ -1161,6 +1161,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-docker-proxy"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chelabase-functions"
 version = "0.1.0"
 dependencies = [
