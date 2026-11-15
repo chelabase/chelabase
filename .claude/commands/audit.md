@@ -15,5 +15,8 @@ Task: `$ARGUMENTS`
    `project: chelabase`, `epic: <slug>`, `milestone: <n>`, issue number, and nothing else
    about the builder's reasoning. Model: `opus` for auth/crypto/fork/migration; `sonnet`
    otherwise. Never pass `isolation: "worktree"`.
+   **Local epic** (`.claude/.cache/epics/<slug>/state.json` has `"local": true`): check
+   status in `state.json` instead of labels, and give the auditor the absolute cache path
+   instead of an issue number.
 3. Report the verdict (`pass` / `changes-requested`), findings by severity, and next step
    (`/build <slug>` to continue, or `/build <slug> <n>` to fix).
