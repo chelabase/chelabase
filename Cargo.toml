@@ -10,6 +10,7 @@ members = [
     "services/storage",
     "services/functions",
     "services/service-runner",
+    "services/docker-proxy",
     "services/init",
     "tools/cli",
     "tools/bench-data-api",
@@ -52,6 +53,7 @@ chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
 chelabase-storage = { path = "crates/chelabase-storage" }
 chelabase-pgsession = { path = "crates/chelabase-pgsession" }
+chelabase-docker-proxy = { path = "services/docker-proxy" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
@@ -149,6 +151,12 @@ aws-sdk-s3 = { version = "1.157.0", default-features = false, features = ["defau
 aws-credential-types = "1.2"
 # Default features off (no SSO/legacy client); same aws-lc-rs TLS as the SDK.
 aws-config = { version = "1.13.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# The workbench Docker API proxy (workbench-stack-isolation): hyper serves its unix sockets and
+# forwards to the engine's; percent-encoding decodes request paths and queries.
+hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+percent-encoding = "2.3.2"
 
 [profile.dev]
 # File:line in backtraces without full debug info: smaller test binaries, faster links.
