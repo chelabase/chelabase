@@ -149,7 +149,8 @@ impl DdlTx {
                     r.api_owner_level, r.pending, r.attributes_pending, r.created_at, r.inherit,
                     r.connection_limit,
                     r.valid_until, r.bypass_rls, r.member_of, r.member_no_set, r.member_admin
-             FROM neon_roles r WHERE r.endpoint_id = $1 AND r.name = $2",
+             FROM neon_roles r WHERE r.endpoint_id = $1 AND r.name = $2
+               AND r.origin <> 'function'",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -198,7 +199,7 @@ impl DdlTx {
              ON CONFLICT (endpoint_id, name) DO UPDATE
                  SET scram_verifier = EXCLUDED.scram_verifier, password_enc = NULL,
                      no_password = false, password_unreadable = false, forwarded_at = now()
-                 WHERE neon_roles.origin NOT IN ('owner', 'personal')",
+                 WHERE neon_roles.origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -214,7 +215,7 @@ impl DdlTx {
     pub async fn set_login(&mut self, name: &str, login: bool) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE neon_roles SET login = $3, forwarded_at = now()
-             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -255,7 +256,7 @@ impl DdlTx {
     pub async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
         let marked = sqlx::query(
             "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
-             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('personal', 'function')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -291,7 +292,7 @@ impl DdlTx {
     pub async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
         let deleted = sqlx::query(
             "DELETE FROM neon_roles
-             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal', 'function')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -321,7 +322,7 @@ impl DdlTx {
             "UPDATE neon_roles SET name = $3, password_enc = $4,
                  password_unreadable = CASE WHEN $4 IS NULL THEN password_unreadable ELSE false END,
                  forwarded_at = now()
-             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('personal', 'function')",
         )
         .bind(&self.endpoint_id)
         .bind(old)

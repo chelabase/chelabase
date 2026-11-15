@@ -607,6 +607,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // key still to mint.
         self.sync_pending_fn_triggers().await;
         self.sync_pending_run_as().await;
+        self.sync_pending_sql_logins().await;
         Ok(())
     }
 

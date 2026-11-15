@@ -28,6 +28,7 @@ pub mod credentials;
 pub mod data_api;
 pub mod delete;
 pub mod fn_bundle_sweep;
+pub mod fn_sql_logins;
 pub mod fn_triggers;
 pub mod fn_schedules;
 pub mod fn_storage_triggers;
