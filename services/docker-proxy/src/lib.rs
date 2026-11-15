@@ -11,12 +11,20 @@
 //!   confined to it ([`force_labels`], [`reserved_image_labels`], [`scope_list_query`],
 //!   [`post_filter_list`]).
 //!
-//! Request bodies (m3) and the server that forwards (m4) build on this.
+//! - whether a create, exec, connect or volume body is safe to forward ([`body`]): a strict
+//!   parser and byte-exact allowlists at every level, labels forced.
+//!
+//! The server that forwards (m4) builds on this.
 
+pub mod body;
 pub mod ops;
 pub mod profile;
 pub mod scope;
 
+pub use body::{
+    NetworkConnect, RefKind, Scope, parse_strict, validate_container_create, validate_exec_create,
+    validate_network_connect, validate_network_create, validate_volume_create,
+};
 pub use ops::{ImagePull, ImageRef, Op, OpKind, classify, parse_query};
 pub use profile::{LabelMatch, MountType, OpRule, Preset, PresetConfig, Profile};
 pub use scope::{

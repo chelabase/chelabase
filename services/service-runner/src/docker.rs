@@ -45,8 +45,8 @@ fn addresses(networks: Option<HashMap<String, EndpointSettings>>) -> HashMap<Str
 }
 
 /// The create body for `plan` on `network`. Everything that could reach the host is set off or
-/// left empty explicitly: privileged, binds, volumes, devices, host namespaces, published ports,
-/// extra capabilities. Mounts are tmpfs only. Memory has no swap on top.
+/// left empty explicitly: privileged, binds, volumes, host namespaces, published ports, extra
+/// capabilities. Devices are left unset. Mounts are tmpfs only. Memory has no swap on top.
 pub fn create_body(plan: &ContainerPlan, network: &str) -> ContainerCreateBody {
     let mounts = plan
         .tmpfs
@@ -87,7 +87,8 @@ pub fn create_body(plan: &ContainerPlan, network: &str) -> ContainerCreateBody {
             network_mode: Some(network.to_string()),
             mounts: Some(mounts),
             binds: Some(Vec::new()),
-            devices: Some(Vec::new()),
+            // Devices stay unset: the stack's Docker proxy refuses any present non-default
+            // HostConfig key outside its allowlist, an empty list included.
             ipc_mode: Some("private".to_string()),
             cgroupns_mode: Some(HostConfigCgroupnsModeEnum::PRIVATE),
             publish_all_ports: Some(false),
@@ -515,7 +516,7 @@ mod tests {
         assert!(h.binds.as_ref().is_none_or(|b| b.is_empty()), "no bind");
         assert!(h.volumes_from.is_none());
         assert!(h.volume_driver.is_none());
-        assert!(h.devices.as_ref().is_none_or(|d| d.is_empty()), "no device");
+        assert!(h.devices.is_none(), "no device");
         assert!(h.device_requests.is_none() && h.device_cgroup_rules.is_none());
         for m in h.mounts.as_deref().unwrap_or_default() {
             assert_eq!(m.typ, Some(MountType::TMPFS), "{m:?}");
