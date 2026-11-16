@@ -63,7 +63,9 @@ For each ready milestone whose `touches` don't overlap others already building:
 2. Builder: test-first per `AGENTS.md` Tests; commit with explicit paths; run only the
    issue's Verification and its new/changed live tests; push the milestone branch; then
    `just wt-release <slot>` (it refuses until everything is committed); report commit SHAs, one failing run per new test from before the fix, tests run/skipped,
-   deviations. **Scope stop:** if the work needs code the design sketch doesn't name
+   deviations. The sketch is the ideal outcome, not a script: a builder may pick a better
+   design and reports each deviation with its reason (`AGENTS.md`, Judgment over the
+   letter). **Scope stop:** if the work needs code the design sketch doesn't name
    (re-implementing what a dependency did, a new validation layer, a diff well past the
    sketch's size), the builder stops and reports before writing it. Check each builder's
    `git diff --stat` mid-build; a diff far beyond the sketch gets the same stop.

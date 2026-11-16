@@ -61,6 +61,19 @@ Product, design, wording or scope choices you're unsure about go to the human: o
 2–4 concrete options, recommended first and marked "(Recommended)", each option's trade-off
 in its description. No mandated brainstorming ritual beyond that.
 
+## Judgment over the letter
+
+Issue criteria, design sketches and briefs describe the ideal outcome. They are not a script
+to follow at any cost. Builders and auditors explore and decide for themselves: a better
+design than the sketch, a different test that proves the same thing, or accepting a residual
+gap whose practical risk is low. Each such call is stated with its reason in the report.
+Three kinds of call still belong to others or never change:
+
+- product, wording and scope calls go to the human (above);
+- the rules under Product rules, Git and safety, and Tests are never relaxed;
+- an audit doesn't loop: if fix rounds keep narrowing one criterion, the auditor recommends
+  the end state it judges best and moves the rest to the backlog.
+
 ## Git and safety
 
 - Stage explicit paths only; never `git add -A`.
