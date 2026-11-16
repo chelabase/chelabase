@@ -1,5 +1,5 @@
 ---
-description: Small change as one conventional PR from its own worktree; squash after checks.
+description: Small change as one conventional PR from a pool slot; squash after checks.
 disable-model-invocation: true
 argument-hint: "<change> | #<issue>"
 ---
@@ -23,7 +23,9 @@ change, risky fork C). Say which part triggered the refusal.
 
 1. Title: `type(area): summary`. From an issue, take type from its `type:*` label and the
    summary from its title. Branch: `<type>/<area>-<short>`.
-2. Worktree: `just wt-add <branch>` from main. Never branch in the main checkout.
+2. Worktree: `just wt-claim main <branch>` from the main checkout; the last line of output
+   is the slot, a reused worktree that is already built. Never branch in the main checkout.
+   A change that needs no build (docs, config) may use `just wt-add <branch>` instead.
    From an issue, claim it first: `gh issue edit N --add-assignee @me`, label
    `status:building` (drop `status:ready`/`status:triage`).
 3. Restate the goal and what you're deliberately not changing. Respect Out of scope.
@@ -34,8 +36,10 @@ change, risky fork C). Say which part triggered the refusal.
    it closes an issue.
 7. After CI green (or local checks when CI isn't available), the PR is squash-merged when
    the human says so. Leave it open and report.
-8. `just wt-remove <branch>` when done. Report PR URL, the failing runs, tests run/skipped,
-   follow-ups.
+8. `just wt-release <slot name>` when done (after `just workbench purge` in the slot if you
+   brought a stack up there); never remove the slot. A later fix claims again with the same
+   branch. From `wt-add`: `just wt-remove <branch>`. Report PR URL, the failing runs, tests
+   run/skipped, follow-ups.
 
 ## Rules
 

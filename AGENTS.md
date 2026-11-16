@@ -27,12 +27,20 @@ GitHub issues and epic PRs.
 ## Tooling
 
 - **just**: `just check`, `just test`, `just workbench up|down|status|test|run`, `just wt-add`,
-  `just wt-remove`, and the `*-e2e` recipes. See `CONTRIBUTING.md`.
+  `just wt-remove`, `just wt-claim|wt-release|wt-slots|wt-warm`, and the `*-e2e` recipes. See
+  `CONTRIBUTING.md`.
 - **Workbench**: one isolated stack per checkout. `/build` brings it up in the epic worktree
   only when a milestone needs live tests; task worktrees reuse it via `.workbench-stack`.
   Builders and auditors never run `workbench up`/`down`.
 - **Worktrees**: main checkout stays on `main`. Every branch lives in `.worktrees/<branch>`
   (`just wt-add <branch>`). Never `EnterWorktree` and never harness `isolation: "worktree"`.
+- **Slots**: builders and auditors (`/build`, `/audit`, `/quick`) don't make a worktree each
+  (a new `target/` is a cold build). They claim a reused one from the shared pool,
+  `.worktrees/slot-<k>`: `just wt-claim <ref> [branch]` prints its directory,
+  `just wt-release <name>` gives it back clean. One agent per claimed slot, one cargo command
+  at a time in it. Slots outlive epics and are never removed at epic close. The coordinator
+  clears a claim whose agent is gone (`just wt-slots` says how) and shrinks the pool when
+  disk runs short (`CONTRIBUTING.md`, Slots).
 
 ## Product rules
 

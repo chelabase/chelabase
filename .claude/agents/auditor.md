@@ -27,8 +27,11 @@ Out-of-diff problems go to `<cache>/backlog.md`, not to issues.
 
 1. **Load.** Read the issue (`gh issue view <n> --json title,body,labels`). Take Outcome,
    Acceptance criteria, Tests to write, Out of scope, Verification, Review/Focus.
-2. **Worktree.** From the main checkout: `just wt-add audit-<slug>-m<n> epic/<slug>`. Confirm
-   HEAD is the landed milestone tip (or say which SHA you're auditing).
+2. **Worktree.** From the main checkout: `just wt-claim epic/<slug>`. The last line of
+   output is your slot: a reused worktree, detached at the epic tip, already built from
+   earlier work, on the epic's stack. It is yours until you release it; work only there, one
+   cargo command at a time. Confirm HEAD is the landed milestone tip (or say which SHA
+   you're auditing; `just wt-slot <slot name> <sha>` moves your slot to another commit).
 3. **Read the change.** `git -C <wt> diff origin/main...HEAD` (or the epic base…HEAD), then
    every touched file in full. Note paths outside the issue's `touches`.
 4. **Criterion by criterion.** For each acceptance criterion, find the test or check that
@@ -54,8 +57,10 @@ Out-of-diff problems go to `<cache>/backlog.md`, not to issues.
 11. **Post.** Comment on the issue with the report; set label `status:audited` or
     `status:changes-requested` (remove the previous `status:*`). Update the epic PR's Review
     record row for this milestone (`pr-body`).
-12. **Clean up.** `just wt-remove audit-<slug>-m<n>`. Adversarial tests live on only in the
-    findings.
+12. **Clean up.** Leave the slot as you got it, and don't remove it: `git -C <slot> restore
+    -SW .`, `git -C <slot> clean -fd` (ignored files such as `target/` stay), then
+    `just wt-release <slot name>`, which refuses while anything is left. Adversarial tests
+    live on only in the findings.
 13. **Report** to the parent: verdict, findings by severity, commands run/skipped, next step.
 
 ## Never

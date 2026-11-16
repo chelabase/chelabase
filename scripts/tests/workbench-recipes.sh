@@ -32,9 +32,32 @@ just --show wt-remove | gq 'workbench purge' || fail "wt-remove purges the workt
 ! just --show wt-remove | gq -iE 'sha256|sha256sum|cut -c' || fail "wt-remove lets the CLI resolve the worktree's stack (run from the worktree), never recomputes the slug"
 just --show wt-remove | gq -- '--show-toplevel' || fail "wt-remove checks the directory is still that worktree (git toplevel) before it purges (T5 review I4)"
 ! just --show wt-add | gq '\.env\.local' || fail "wt-add no longer links Studio's env"
-just --show wt-add | gq 'workbench slug-of' ||
-  fail "wt-add asks the CLI for the base's stack, never recomputes the slug"
-just --show wt-add | gq '\.workbench-stack' || fail "wt-add records the base's stack in the task worktree"
+# wt-add and wt-slot record the base's stack through _wt-stack: read from the base's worktree
+# (its record, or the registry entry of its checkout), and only without one asked of the CLI. The
+# slug is never recomputed, and no build runs when the base has a worktree.
+for r in wt-add wt-slot; do
+  just --show "$r" | gq '_wt-stack' || fail "$r records the base's stack through _wt-stack"
+  ! just --show "$r" | gq 'cargo' || fail "$r itself runs no cargo"
+done
+just --show _wt-stack | gq 'workbench slug-of' ||
+  fail "_wt-stack asks the CLI for the base's stack when no worktree has the base, never recomputes the slug"
+! just --show _wt-stack | gq -iE 'sha256|sha256sum|cut -c' || fail "_wt-stack never recomputes the slug"
+just --show _wt-stack | gq 'worktree list --porcelain' || fail "_wt-stack finds the base's worktree before it asks the CLI"
+just --show _wt-stack | gq '\.workbench-stack' || fail "_wt-stack records the base's stack in the worktree"
+# Slots: reused worktrees that borrow a stack. A claim is an exclusive create; a slot with changes
+# is never switched or released; a branch is never reset; removing a borrower purges nothing.
+just --show wt-claim | gq 'noclobber' || fail "wt-claim claims a slot with an exclusive create"
+for r in wt-slot wt-release; do
+  just --show "$r" | gq 'status --porcelain' || fail "$r refuses a slot with changes"
+done
+! just --show wt-slot | gq -E 'reset|--force|switch -C|checkout -B' || fail "wt-slot never resets a branch"
+just --show wt-slot | gq -- '--ff-only' || fail "wt-slot only fast-forwards an existing branch"
+just --show wt-remove | gq 'borrows stack' || fail "wt-remove purges nothing for a worktree that borrows a stack"
+just --show wt-remove | gq 'wt-release' || fail "wt-remove refuses a claimed slot"
+# The pool is shared by main-based changes (own stack allowed) and epic tasks (borrowed stack): a
+# claim drops the last holder's record, and a slot that owns a stack isn't released.
+just --show wt-claim | gq 'rm -f .*\.workbench-stack' || fail "wt-claim drops the last holder's stack record"
+just --show wt-release | gq 'workbench purge' || fail "wt-release refuses a slot that has its own stack"
 grep -qx '/.workbench-stack' .gitignore || fail ".workbench-stack is git-ignored"
 # End-of-step I1: a test that recreates the stack's apps interpolates the stack's own checkout
 # (CHELABASE_STACK_CHECKOUT), never the task checkout the runner works in.
