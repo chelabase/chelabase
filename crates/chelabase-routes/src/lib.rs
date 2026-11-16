@@ -1193,6 +1193,21 @@ pub mod orchestrator {
     pub const STORAGE_ABORT_UPLOAD: Endpoint =
         key_endpoint("orchestrator.storage_abort_upload", Method::Delete, ST_SESSION, Access::ActAs(Developer));
 
+    /// s3-endpoint m2: a branch's S3 access keys. Listing needs Viewer; creating and revoking
+    /// need Developer, and the handler refines by the key's role as for data keys (Developer for
+    /// a role the member may use, Admin for any). The secret is shown once, at creation.
+    const S3_KEYS: &str = "/v1/databases/{id}/branches/{branch_id}/storage/s3-keys";
+    pub const LIST_S3_KEYS: Endpoint =
+        key_endpoint("orchestrator.list_s3_keys", Method::Get, S3_KEYS, Access::Project(Viewer));
+    pub const CREATE_S3_KEY: Endpoint =
+        key_endpoint("orchestrator.create_s3_key", Method::Post, S3_KEYS, Access::Project(Developer));
+    pub const REVOKE_S3_KEY: Endpoint = key_endpoint(
+        "orchestrator.revoke_s3_key",
+        Method::Delete,
+        "/v1/databases/{id}/branches/{branch_id}/storage/s3-keys/{key_id}",
+        Access::Project(Developer),
+    );
+
     /// m18: a database's webhook endpoints for storage object events (every branch's), and
     /// their test events, secret rotation and recent attempts: Developer on the database.
     const WEBHOOKS: &str = "/v1/databases/{id}/storage/webhooks";
@@ -1687,6 +1702,9 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::GET_SAVED_QUERY,
     orchestrator::UPDATE_SAVED_QUERY,
     orchestrator::DELETE_SAVED_QUERY,
+    orchestrator::LIST_S3_KEYS,
+    orchestrator::CREATE_S3_KEY,
+    orchestrator::REVOKE_S3_KEY,
     orchestrator::LIST_STORAGE_WEBHOOKS,
     orchestrator::CREATE_STORAGE_WEBHOOK,
     orchestrator::GET_STORAGE_WEBHOOK,
@@ -2453,6 +2471,15 @@ mod tests {
         assert_eq!(found("POST", KEYS), "orchestrator.create_key");
         assert_eq!(found("DELETE", &format!("{KEYS}/abc")), "orchestrator.revoke_key");
         assert_eq!(found("POST", &format!("{KEYS}/abc/rotate")), "orchestrator.rotate_key");
+        // s3-endpoint m2: the S3 keys sit beside Studio's storage routes, standard transfer.
+        let s3 = "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/storage/s3-keys";
+        assert_eq!(found("GET", s3), "orchestrator.list_s3_keys");
+        assert_eq!(found("POST", s3), "orchestrator.create_s3_key");
+        assert_eq!(found("DELETE", &format!("{s3}/abc")), "orchestrator.revoke_s3_key");
+        for ep in [orchestrator::LIST_S3_KEYS, orchestrator::CREATE_S3_KEY, orchestrator::REVOKE_S3_KEY] {
+            assert_eq!(ep.transfer(), Transfer::Standard, "{}", ep.name);
+            assert_eq!(ep.policy.auth, Auth::Management, "{}", ep.name);
+        }
         assert_eq!(
             found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/schema"),
             "orchestrator.data_api_schema"
@@ -2622,6 +2649,11 @@ mod tests {
             ("orchestrator.rotate_storage_webhook_secret", Access::Project(Developer)),
             ("orchestrator.test_storage_webhook", Access::Project(Developer)),
             ("orchestrator.list_storage_webhook_attempts", Access::Project(Developer)),
+            // s3-endpoint m2: a branch's S3 access keys; create and revoke are refined by the
+            // key's role in the handler, as data keys are.
+            ("orchestrator.list_s3_keys", Access::Project(Viewer)),
+            ("orchestrator.create_s3_key", Access::Project(Developer)),
+            ("orchestrator.revoke_s3_key", Access::Project(Developer)),
             // m9: Studio's storage, as an Act-as role.
             ("orchestrator.storage_list_buckets", Access::ActAs(Viewer)),
             ("orchestrator.storage_create_bucket", Access::ActAs(Developer)),

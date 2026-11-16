@@ -323,6 +323,15 @@ impl MetadataPort for Doc {
     async fn revoke_data_key(&self, branch: BranchId, key_id: Uuid) -> Result<bool, MetadataError> {
         match *self {}
     }
+    async fn create_s3_key(&self, key: &NewS3Key<'_>) -> Result<(), MetadataError> {
+        match *self {}
+    }
+    async fn list_live_s3_keys(&self, branch: BranchId) -> Result<Vec<S3KeyRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn revoke_s3_key(&self, branch: BranchId, key_id: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
     async fn rotate_data_key(
         &self,
         branch: BranchId,
@@ -1559,6 +1568,10 @@ mod tests {
             ("GET /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageListParts"),
             ("POST /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}/complete", "storageCompleteUpload"),
             ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}", "storageAbortUpload"),
+            // s3-endpoint m2: a branch's S3 access keys.
+            ("GET /v1/databases/{id}/branches/{branch_id}/storage/s3-keys", "listS3Keys"),
+            ("POST /v1/databases/{id}/branches/{branch_id}/storage/s3-keys", "createS3Key"),
+            ("DELETE /v1/databases/{id}/branches/{branch_id}/storage/s3-keys/{key_id}", "revokeS3Key"),
         ];
         let mut expected: Vec<(String, String)> = expected
             .iter()
@@ -1770,11 +1783,13 @@ mod tests {
             "CreateProjectInviteRequest",
             "CreateProjectRequest",
             "CreateRoleRequest",
+            "CreateS3KeyRequest",
             "CreateSavedQueryRequest",
             "CreateStorageWebhookRequest",
             "CreateTable",
             "CreateTeamRequest",
             "CreatedDataKey",
+            "CreatedS3Key",
             "DataApiExposure",
             "DataApiSchema",
             "DataApiState",
@@ -1921,6 +1936,8 @@ mod tests {
             "RoleSessionView",
             "RoleSessions",
             "RunSqlRequest",
+            "S3Key",
+            "S3KeyList",
             "SavedQuery",
             "SavedQuerySummary",
             "SchemaChangeRequest",

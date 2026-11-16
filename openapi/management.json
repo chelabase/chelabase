@@ -11939,6 +11939,373 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/storage/s3-keys": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List a branch's S3 access keys",
+        "operationId": "listS3Keys",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Whether the S3 endpoint is on, its URL and region, and the branch's live keys, newest first (never their secrets)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3KeyList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: you aren't a Viewer on the database; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create an S3 access key",
+        "description": "A key for the S3 endpoint, acting as one role on one Postgres database of the branch. Like a secret data key: Developer for a role you may use (in your roles, or reachable through a granted role), Admin for any role; never a personal login. An owner-level role is refused even for an Admin (storage would refuse every request). The key is bound to the role's identity (its OID on the branch's timeline) as the worker reads it on the compute. The secret is in this response only (`Cache-Control: no-store`).",
+        "operationId": "createS3Key",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateS3KeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The new key, with its secret access key; the secret is shown only here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedS3Key"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: you aren't a Developer on the database; `required` is `role:<name>` when the key's role isn't one you may use (or is a personal login), or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) or the branch doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`s3_disabled`: the S3 endpoint is off (`CHELABASE_S3_HOST` unset); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `conflict`: the branch already has 100 live S3 keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, the name or role is invalid, or the database isn't one of the branch's (or the branch's main database is gone); `role_refused`: the role is owner-level, or the worker refused it (it doesn't exist or may not back a key; the message says why)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the worker can't be reached; `unavailable`: the role's identity couldn't be read on the compute, or the branch's roles are being changed (retry after `Retry-After`); nothing was created",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/storage/s3-keys/{key_id}": {
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Revoke an S3 access key",
+        "description": "The key stops working at once: its secret is erased and storage is told to drop it from its cache. Developer for a key whose role you may use, Admin for any key. Works with the S3 endpoint off.",
+        "operationId": "revokeS3Key",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "key_id",
+            "in": "path",
+            "description": "S3 key id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: you aren't a Developer on the database; `required` is `role:<name>` when the key's role isn't one you may use, or `admin` for a LOGIN or owner-level role; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the key doesn't exist on this branch, or the key is already revoked; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/storage/upload/session/{session}": {
       "get": {
         "tags": [
@@ -24882,6 +25249,33 @@
         },
         "additionalProperties": false
       },
+      "CreateS3KeyRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Postgres database on the branch the key reaches; absent is the branch's main\ndatabase. The system `postgres` database can't be named."
+          },
+          "name": {
+            "type": "string",
+            "description": "1 to 63 characters."
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The role the key acts as; absent is `authenticated`."
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateSavedQueryRequest": {
         "type": "object",
         "required": [
@@ -25071,6 +25465,45 @@
           },
           "role": {
             "type": "string"
+          }
+        }
+      },
+      "CreatedS3Key": {
+        "type": "object",
+        "description": "A key just made, with its secret: shown only here.",
+        "required": [
+          "id",
+          "name",
+          "access_key_id",
+          "secret_access_key",
+          "database",
+          "role",
+          "created_at"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "secret_access_key": {
+            "type": "string",
+            "description": "The secret access key (40 characters). It is never shown again."
           }
         }
       },
@@ -25788,7 +26221,8 @@
           "exposure_unconfirmed",
           "identity_unavailable",
           "runner_unavailable",
-          "functions_unavailable"
+          "functions_unavailable",
+          "s3_disabled"
         ]
       },
       "ErrorEnvelope": {
@@ -30063,6 +30497,86 @@
           }
         },
         "additionalProperties": false
+      },
+      "S3Key": {
+        "type": "object",
+        "description": "An S3 access key as listed: never its secret.",
+        "required": [
+          "id",
+          "name",
+          "access_key_id",
+          "database",
+          "role",
+          "created_at",
+          "last_used_at"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string",
+            "description": "The key's public half (`CBAK…`, 20 characters): the S3 client's access key id."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database": {
+            "type": "string",
+            "description": "The Postgres database on the branch the key reaches."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the key last signed a request (stamped at most once a minute); null if never."
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "description": "The role the key acts as."
+          }
+        }
+      },
+      "S3KeyList": {
+        "type": "object",
+        "description": "The branch's S3 access keys and where clients reach the endpoint.",
+        "required": [
+          "enabled",
+          "endpoint",
+          "region",
+          "keys"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the S3 endpoint is on (`CHELABASE_S3_HOST` is set). When off, keys can't be\ncreated; existing ones are listed and can be revoked."
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The endpoint's URL (`{scheme}://{CHELABASE_S3_HOST}`); null when the endpoint is off."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/S3Key"
+            },
+            "description": "The branch's live keys, newest first."
+          },
+          "region": {
+            "type": "string",
+            "description": "The region S3 clients sign for: always `us-east-1`."
+          }
+        }
       },
       "SavedQuery": {
         "type": "object",

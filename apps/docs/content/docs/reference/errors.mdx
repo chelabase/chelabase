@@ -72,6 +72,7 @@ Two more refusals use general codes. A grant or override below Admin that lists 
 | 409 | `database_not_ready` | The database isn't ready, or is being deleted. |
 | 409 | `already_deleting` | The database is already being deleted. |
 | 409 | `data_api_disabled` | The Postgres database isn't served by the data API; enable it first. |
+| 409 | `s3_disabled` | The S3 endpoint is off on this instance (`CHELABASE_S3_HOST` is unset), so no S3 access key can be created. Listing and revoking keys still work. |
 | 409 | `data_api_not_enabled` | The data API is off for the Postgres database on a branch. |
 | 409 | `conflict` | The change conflicts with the current state (for example the main database can't be removed from the data API, or the worker refused the change; the message says why). |
 | 502 | `unavailable` | The worker failed to apply the change. |

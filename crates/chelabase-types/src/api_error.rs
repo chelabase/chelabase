@@ -161,11 +161,14 @@ pub enum ErrorCode {
     /// 503: the functions service (the `functions` profile) can't be reached: edge functions
     /// aren't running on this instance.
     FunctionsUnavailable,
+    /// 409 (s3-endpoint m2): the S3 endpoint is off (`CHELABASE_S3_HOST` unset), so no S3
+    /// access key can be created.
+    S3Disabled,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 107] = [
+    pub const ALL: [ErrorCode; 108] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantRequired,
@@ -273,6 +276,7 @@ impl ErrorCode {
         Self::IdentityUnavailable,
         Self::RunnerUnavailable,
         Self::FunctionsUnavailable,
+        Self::S3Disabled,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -384,6 +388,7 @@ impl ErrorCode {
             Self::IdentityUnavailable => "identity_unavailable",
             Self::RunnerUnavailable => "runner_unavailable",
             Self::FunctionsUnavailable => "functions_unavailable",
+            Self::S3Disabled => "s3_disabled",
         }
     }
 }
@@ -486,7 +491,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 107] = [
+    const ALL: [(ErrorCode, &str); 108] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantRequired, "tenant_required"),
@@ -599,6 +604,7 @@ mod tests {
         (ErrorCode::IdentityUnavailable, "identity_unavailable"),
         (ErrorCode::RunnerUnavailable, "runner_unavailable"),
         (ErrorCode::FunctionsUnavailable, "functions_unavailable"),
+        (ErrorCode::S3Disabled, "s3_disabled"),
     ];
 
     #[test]
