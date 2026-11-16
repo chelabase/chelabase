@@ -21,7 +21,7 @@ epic came from `/epic-security` and nothing about it may reach GitHub before the
   Don't call `gh issue`, `gh pr` or `gh label`.
 - Builders and fix rounds **never push**. Brief each builder with the absolute cache path
   and this rule. Merge milestone branches into `epic/<slug>` locally. Slots are local
-  worktrees and work the same; `/epic-security PUBLISH` removes them with the epic worktree.
+  worktrees and work the same.
 - Commit messages are fix-only (see the writing rule in `/epic-security`).
 - The whole-epic review goes to `<cache>/review.md` and the gate output to `<cache>/gate.md`.
   Finish step 3 becomes "write the Test plan and Review record into `review.md`". The next
@@ -39,13 +39,13 @@ Everything else below applies as written.
    (`just workbench up` in the epic worktree) only when a milestone's Verification has live
    tests; slots reuse it via `.workbench-stack`. Builders and the auditor never run
    `workbench up`/`down`. `just wt-remove epic-<slug>` purges it after the human merges.
-4. Builders and auditors work in **slots**: reused worktrees `.worktrees/slot-<slug>-<k>`
-   whose `target/` stays built, so only changed crates recompile. `just wt-claim <slug>
-   epic/<slug> [branch]` (from the main checkout) claims a free one atomically, taking the
-   one closest to what it will hold and making a new one only when all are claimed; `just
-   wt-slots <slug>` lists them. The pool grows to as many agents as you run at once; how
-   many that is stays your call, not the tooling's. A claim nobody releases (the agent
-   died) is yours to clear: check the slot, discard its changes, `just wt-release <name>`.
+4. Builders and auditors work in **slots**: reused worktrees `.worktrees/slot-<k>`, one pool
+   shared by every epic and `/quick` change, whose `target/` stays built, so only changed
+   crates recompile. `just wt-claim <ref> [branch]` (from the main checkout) claims a free
+   one atomically, taking the one closest to what it will hold and making a new one only
+   when all are claimed; `just wt-slots` lists them. The pool grows to as many agents as
+   run at once; how many that is stays your call, not the tooling's. A claim whose agent
+   is gone is yours to clear: `just wt-slots` shows it and says how.
 
 ## Build a milestone
 
@@ -53,7 +53,7 @@ For each ready milestone whose `touches` don't overlap others already building:
 
 1. Launch one subagent on the issue's `model`. Brief: issue number and body, epic branch,
    `touches`, acceptance criteria, tests to write, out of scope, verification commands.
-   The builder's first step is `just wt-claim <slug> epic/<slug> epic-<slug>-m<n>` from the
+   The builder's first step is `just wt-claim epic/<slug> epic-<slug>-m<n>` from the
    main checkout (the last line of output is its slot; it records the epic stack) and it
    works only there, one cargo command at a time. A fix round claims the same way: the
    existing branch is checked out, and fast-forwarded to the epic tip when it has nothing
@@ -69,8 +69,8 @@ For each ready milestone whose `touches` don't overlap others already building:
    `git diff --stat` mid-build; a diff far beyond the sketch gets the same stop.
 3. On green: merge `--no-ff` into `epic/<slug>`, set issue label `status:landed`. Update the
    PR checklist. The slot stays for the next claim; never remove one here. When the host
-   has a spare cargo seat, `just wt-warm <slug> epic/<slug> -p <crate>…` builds the free
-   slots at the new tip so the next claim starts compiled.
+   has a spare cargo seat, `just wt-warm epic/<slug> -p <crate>…` builds the free slots at
+   the new tip so the next claim starts compiled.
 4. If `review: whiteroom`, launch the **auditor** agent yourself (same prompt and model rule
    as `/audit`) before any later milestone that depends on it builds. On
    `changes-requested`, fix the findings in place: a fix round on that milestone, then its
@@ -85,8 +85,8 @@ When every milestone is integrated (and whiteroom ones audited):
 2. One `just check` and one live pass for suites the epic touched.
 3. Fill the PR Review record and Test plan; mark the PR ready for review.
 4. Report PR URL, what ran, what's left for the human (merge). After the human merges, in a
-   later step than the merge: `just wt-slots <slug>`, then `just wt-remove <name>` for each
-   slot and for `epic-<slug>`.
+   later step than the merge: `just wt-remove epic-<slug>`. The slots stay; they belong to
+   the shared pool, not the epic.
 
 Never publish images from the epic branch: merges are squash-only, so its commits leave no
 history. When the epic needs new images, test with locally built ones, and after the human

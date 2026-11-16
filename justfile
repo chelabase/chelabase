@@ -250,7 +250,7 @@ wt-add branch base="main":
 
 # A reusable worktree at .worktrees/<name>: made on first use, then switched in place, so its
 # target/ stays warm and only the changed crates rebuild. It refuses while the slot has changes.
-# Agents sharing a pool of slots go through wt-claim, which calls this.
+# Agents take a slot of the shared pool through wt-claim, which calls this.
 # With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
 # fast-forwarded to `ref` when it has no commits of its own, and is never reset. Without: a
 # detached checkout of `ref`. The slot records the stack of `ref`'s worktree, like wt-add.
@@ -307,7 +307,8 @@ wt-slot name ref branch="":
       git -C "$main" show-ref --verify --quiet "refs/remotes/$ref"; then
       "{{just_executable()}}" --justfile "{{justfile()}}" _wt-stack "$dir" "$ref"
     elif [ ! -e "$dir/.workbench-stack" ]; then
-      # A bare commit names no base branch: an empty record makes `workbench test`/`run` ask for one.
+      # A bare commit names no base branch. The holder's own record stays (wt-claim cleared the last
+      # user's); without one, an empty record makes `workbench test`/`run` ask for a stack.
       : > "$dir/.workbench-stack"
       echo "no stack recorded for commit $ref: pass --stack, or name the base branch as the ref" >&2
     fi
@@ -317,22 +318,18 @@ wt-slot name ref branch="":
     fi
     echo "$dir"
 
-# Claim a free slot of the pool (slots .worktrees/slot-<pool>-<k>) and switch it with wt-slot; prints
-# its directory on stdout. A claim is a file made atomically, so parallel agents never get the same
-# slot. It takes the free slot closest to what it will hold (fewest changed files), or makes a new one when all
-# are claimed (up to CHELABASE_WT_POOL_MAX, default 8). Release it with wt-release.
-wt-claim pool ref branch="":
+# Claim a free slot of the shared pool (.worktrees/slot-<k>) and switch it with wt-slot; prints its
+# directory on stdout. A claim is a file made atomically, so parallel agents never get the same
+# slot. It takes the free slot closest to what it will hold (fewest changed files), or makes a new
+# one when all are claimed (up to CHELABASE_WT_POOL_MAX, default 8). Release it with wt-release.
+wt-claim ref branch="":
     #!/usr/bin/env bash
     set -euo pipefail
     common="$(git rev-parse --path-format=absolute --git-common-dir)"
     main="$(dirname "$common")"
-    pool="$1"
-    ref="$2"
-    branch="${3:-}"
+    ref="$1"
+    branch="${2:-}"
     max="${CHELABASE_WT_POOL_MAX:-8}"
-    case "$pool" in
-      "" | */* | .*) echo "wt-claim: the pool name is a plain name (no /), got \"$pool\"" >&2; exit 2 ;;
-    esac
     git -C "$main" rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
       { echo "wt-claim: $ref isn't a branch or a commit" >&2; exit 1; }
     mkdir -p "$common/wt-slots"
@@ -348,25 +345,27 @@ wt-claim pool ref branch="":
     name=""
     existing=""
     for k in $(seq 1 "$max"); do
-      d="$main/.worktrees/slot-$pool-$k"
-      if [ -d "$d" ] && [ ! -e "$common/wt-slots/slot-$pool-$k" ]; then
+      d="$main/.worktrees/slot-$k"
+      if [ -d "$d" ] && [ ! -e "$common/wt-slots/slot-$k" ]; then
         existing+="$(git -C "$d" diff --name-only HEAD "$want" | wc -l) $k"$'\n'
       fi
     done
     for k in $(printf '%s' "$existing" | sort -n | cut -d' ' -f2); do
-      n="slot-$pool-$k"
+      n="slot-$k"
       try_claim "$n" || continue
       if [ -n "$(git -C "$main/.worktrees/$n" status --porcelain)" ]; then
         echo "wt-claim: free slot $n has changes (left by its last user): skipped" >&2
         rm -f "$common/wt-slots/$n"
         continue
       fi
+      # The last user's stack record isn't the new holder's: wt-slot writes this one's.
+      rm -f "$main/.worktrees/$n/.workbench-stack"
       name="$n"
       break
     done
     if [ -z "$name" ]; then
       for k in $(seq 1 "$max"); do
-        n="slot-$pool-$k"
+        n="slot-$k"
         if [ ! -e "$main/.worktrees/$n" ] && try_claim "$n"; then
           name="$n"
           break
@@ -374,7 +373,7 @@ wt-claim pool ref branch="":
       done
     fi
     if [ -z "$name" ]; then
-      echo "wt-claim: no free slot in pool $pool (CHELABASE_WT_POOL_MAX=$max); see just wt-slots $pool" >&2
+      echo "wt-claim: every slot is claimed (CHELABASE_WT_POOL_MAX=$max); see just wt-slots" >&2
       exit 1
     fi
     if ! "{{just_executable()}}" --justfile "{{justfile()}}" wt-slot "$name" "$ref" "$branch" >&2; then
@@ -384,8 +383,8 @@ wt-claim pool ref branch="":
     fi
     echo "$main/.worktrees/$name"
 
-# Give a claimed slot back: refuses while it has changes, detaches it (so its branch can be checked
-# out elsewhere) and drops the claim. The worktree and its target/ stay for the next claim.
+# Give a claimed slot back: refuses while it has changes or a stack of its own, detaches it (so its
+# branch can be checked out elsewhere) and drops the claim. The worktree and its target/ stay.
 wt-release name:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -402,22 +401,34 @@ wt-release name:
       printf '%s\n' "$changes" >&2
       exit 1
     fi
+    # A main-based change may have started the slot's own stack (`just workbench up`): the next
+    # holder would borrow another, so it goes first.
+    registry="$(dirname "$common")/.chelabase/stacks/registry.json"
+    own=""
+    if [ -f "$registry" ]; then
+      own="$(jq -r --arg c "$dir" '[.stacks[] | select(.checkout == $c) | .slug][0] // empty' "$registry" || true)"
+    fi
+    if [ -n "$own" ]; then
+      echo "wt-release: slot $name has its own stack ($own): run just workbench purge in $dir first" >&2
+      exit 1
+    fi
     git -C "$dir" switch --quiet --detach
     rm -f "$common/wt-slots/$name"
     echo "released $name"
 
-# List the slots (of one pool, or all): free or claimed (since when, for what), HEAD, clean or not
-wt-slots pool="":
+# List the slots: free or claimed (since when, for what), HEAD, changes
+wt-slots:
     #!/usr/bin/env bash
     set -euo pipefail
     common="$(git rev-parse --path-format=absolute --git-common-dir)"
     main="$(dirname "$common")"
-    for dir in "$main/.worktrees/slot-${1:+$1-}"*; do
+    claimed=0
+    for dir in "$main/.worktrees/"*; do
       [ -e "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)/chelabase-slot" ] || continue
       name="$(basename "$dir")"
-      [ -z "${1:-}" ] || [[ "${name#"slot-$1-"}" =~ ^[0-9]+$ ]] || continue
       if [ -e "$common/wt-slots/$name" ]; then
         state="claimed $(cat "$common/wt-slots/$name")"
+        claimed=1
       else
         state="free"
       fi
@@ -425,22 +436,24 @@ wt-slots pool="":
       [ -z "$(git -C "$dir" status --porcelain)" ] || head+=" (has changes)"
       printf '%s\t%s\t%s\n' "$name" "$state" "$head"
     done
+    if [ "$claimed" = 1 ]; then
+      echo "a claim whose agent is gone: look at the slot, discard its changes (git restore -SW . && git clean -fd), then just wt-release <name>" >&2
+    fi
 
-# Build the free slots of a pool at `ref` so the next claim starts compiled: each is claimed,
+# Build the free slots at `ref` so the next claim starts compiled: each is claimed,
 # switched to a detached `ref`, built with `cargo nextest run --no-run <args>` (default
 # --workspace) and released, one after the other. Claimed slots are left alone.
-wt-warm pool ref *args:
+wt-warm ref *args:
     #!/usr/bin/env bash
     set -euo pipefail
     common="$(git rev-parse --path-format=absolute --git-common-dir)"
     main="$(dirname "$common")"
-    pool="$1"
-    ref="$2"
-    shift 2
+    ref="$1"
+    shift
     [ "$#" -gt 0 ] || set -- --workspace
-    for dir in "$main/.worktrees/slot-$pool-"*; do
+    for dir in "$main/.worktrees/slot-"*; do
       name="$(basename "$dir")"
-      [[ "${name#"slot-$pool-"}" =~ ^[0-9]+$ ]] || continue
+      [[ "${name#slot-}" =~ ^[0-9]+$ ]] || continue
       [ -e "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)/chelabase-slot" ] || continue
       (set -o noclobber; printf '%s for wt-warm\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$common/wt-slots/$name") 2>/dev/null ||
         { echo "wt-warm: $name is claimed: skipped" >&2; continue; }

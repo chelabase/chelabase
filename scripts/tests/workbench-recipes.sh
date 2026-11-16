@@ -54,6 +54,10 @@ done
 just --show wt-slot | gq -- '--ff-only' || fail "wt-slot only fast-forwards an existing branch"
 just --show wt-remove | gq 'borrows stack' || fail "wt-remove purges nothing for a worktree that borrows a stack"
 just --show wt-remove | gq 'wt-release' || fail "wt-remove refuses a claimed slot"
+# The pool is shared by main-based changes (own stack allowed) and epic tasks (borrowed stack): a
+# claim drops the last holder's record, and a slot that owns a stack isn't released.
+just --show wt-claim | gq 'rm -f .*\.workbench-stack' || fail "wt-claim drops the last holder's stack record"
+just --show wt-release | gq 'workbench purge' || fail "wt-release refuses a slot that has its own stack"
 grep -qx '/.workbench-stack' .gitignore || fail ".workbench-stack is git-ignored"
 # End-of-step I1: a test that recreates the stack's apps interpolates the stack's own checkout
 # (CHELABASE_STACK_CHECKOUT), never the task checkout the runner works in.

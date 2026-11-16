@@ -27,7 +27,7 @@ Out-of-diff problems go to `<cache>/backlog.md`, not to issues.
 
 1. **Load.** Read the issue (`gh issue view <n> --json title,body,labels`). Take Outcome,
    Acceptance criteria, Tests to write, Out of scope, Verification, Review/Focus.
-2. **Worktree.** From the main checkout: `just wt-claim <slug> epic/<slug>`. The last line of
+2. **Worktree.** From the main checkout: `just wt-claim epic/<slug>`. The last line of
    output is your slot: a reused worktree, detached at the epic tip, already built from
    earlier work, on the epic's stack. It is yours until you release it; work only there, one
    cargo command at a time. Confirm HEAD is the landed milestone tip (or say which SHA

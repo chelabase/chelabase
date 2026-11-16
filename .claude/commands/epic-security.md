@@ -99,7 +99,7 @@ human must say `PUBLISH`.
    - publish the advisory.
 
    After that, offer to file `backlog.md` as public issues and to remove the
-   `epic-<slug>` and `security/<slug>` worktrees and the epic's slots (`just wt-slots <slug>`). Follow the merge-before-cleanup rule:
+   `epic-<slug>` and `security/<slug>` worktrees. Follow the merge-before-cleanup rule:
    never in the same message as the merge.
 
 ## Rules

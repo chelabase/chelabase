@@ -34,12 +34,13 @@ GitHub issues and epic PRs.
   Builders and auditors never run `workbench up`/`down`.
 - **Worktrees**: main checkout stays on `main`. Every branch lives in `.worktrees/<branch>`
   (`just wt-add <branch>`). Never `EnterWorktree` and never harness `isolation: "worktree"`.
-- **Slots**: epic builders and auditors don't make a worktree each (a new `target/` is a cold
-  build). They claim a reused one from the epic's pool, `.worktrees/slot-<slug>-<k>`:
-  `just wt-claim <slug> epic/<slug> [branch]` prints its directory, `just wt-release <name>`
-  gives it back clean. One agent per claimed slot. Slots borrow the epic stack and are removed
-  with `just wt-remove` at epic close, after the human merges, never in the same step as a
-  merge.
+- **Slots**: builders and auditors (`/build`, `/audit`, `/quick`) don't make a worktree each
+  (a new `target/` is a cold build). They claim a reused one from the shared pool,
+  `.worktrees/slot-<k>`: `just wt-claim <ref> [branch]` prints its directory,
+  `just wt-release <name>` gives it back clean. One agent per claimed slot, one cargo command
+  at a time in it. Slots outlive epics and are never removed at epic close. The coordinator
+  clears a claim whose agent is gone (`just wt-slots` says how) and shrinks the pool when
+  disk runs short (`CONTRIBUTING.md`, Slots).
 
 ## Product rules
 
