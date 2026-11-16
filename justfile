@@ -226,8 +226,8 @@ sweep-builds days="14":
     done
 
 # New worktree at .worktrees/<branch with / as ->; creates the branch from base if it is new.
-# It builds the CLI in the new worktree (`workbench slug-of`) and starts no stack: a task worktree
-# records the base's stack in `.workbench-stack`; a main-based one gets its own from `just workbench up`.
+# It starts no stack: a task worktree records the base's stack in `.workbench-stack` (no build when
+# a worktree has the base checked out); a main-based one gets its own from `just workbench up`.
 wt-add branch base="main":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -243,17 +243,246 @@ wt-add branch base="main":
     ln -s "$main/.chelabase" "$dir/.chelabase"
     if [ "$base" != main ] && [ "$base" != origin/main ]; then
       # A task worktree of a plan lands on the plan's stack: `workbench test`/`run` read this file.
-      slug="$(env -C "$dir" cargo run -q -p chelabase -- workbench slug-of "$base" || true)"
-      printf '%s\n' "$slug" > "$dir/.workbench-stack"
-      if [ -z "$slug" ]; then
-        echo "no stack for $base: bring it up there (just workbench up) or pass --stack" >&2
-      fi
+      "{{just_executable()}}" --justfile "{{justfile()}}" _wt-stack "$dir" "$base"
     fi
     (cd "$dir" && pnpm install --frozen-lockfile)
     echo "$dir"
 
-# Purge the worktree's stack (containers, volumes, state), then remove the worktree (refuses if it
-# has changes) and its target/; the branch is kept
+# A reusable worktree at .worktrees/<name>: made on first use, then switched in place, so its
+# target/ stays warm and only the changed crates rebuild. It refuses while the slot has changes.
+# Agents sharing a pool of slots go through wt-claim, which calls this.
+# With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
+# fast-forwarded to `ref` when it has no commits of its own, and is never reset. Without: a
+# detached checkout of `ref`. The slot records the stack of `ref`'s worktree, like wt-add.
+wt-slot name ref branch="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    name="$1"
+    ref="$2"
+    branch="${3:-}"
+    case "$name" in
+      "" | */* | .*) echo "wt-slot: the slot name is a plain directory name (no /), got \"$name\"" >&2; exit 2 ;;
+    esac
+    dir="$main/.worktrees/$name"
+    git -C "$main" rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
+      { echo "wt-slot: $ref isn't a branch or a commit" >&2; exit 1; }
+    if [ ! -e "$dir" ]; then
+      git -C "$main" worktree add --detach "$dir" "$ref"
+      ln -s "$main/.chelabase" "$dir/.chelabase"
+      # The mark that makes this worktree a slot; it lives in the worktree's git dir and goes with it.
+      : > "$(git -C "$dir" rev-parse --absolute-git-dir)/chelabase-slot"
+      old_lock=""
+    else
+      top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+      if [ "$top" != "$dir" ] || [ ! -e "$(git -C "$dir" rev-parse --absolute-git-dir)/chelabase-slot" ]; then
+        echo "wt-slot: $dir exists and isn't a slot (wt-slot only switches worktrees it made)" >&2
+        exit 1
+      fi
+      changes="$(git -C "$dir" status --porcelain)"
+      if [ -n "$changes" ]; then
+        echo "wt-slot: slot $name has changes; commit or discard them first:" >&2
+        printf '%s\n' "$changes" >&2
+        exit 1
+      fi
+      old_lock="$(git -C "$dir" rev-parse --verify --quiet HEAD:pnpm-lock.yaml || true)"
+    fi
+    if [ -z "$branch" ]; then
+      git -C "$dir" switch --detach "$ref"
+    elif git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      # git refuses a branch that another worktree has checked out.
+      git -C "$dir" switch "$branch"
+      if git -C "$dir" merge-base --is-ancestor HEAD "$ref"; then
+        git -C "$dir" merge --ff-only "$ref"
+      else
+        echo "wt-slot: $branch has commits that aren't on $ref: left where it is" >&2
+      fi
+    else
+      git -C "$dir" switch -c "$branch" "$ref"
+    fi
+    # The stack the slot borrows: a slot never starts one of its own while this file names another.
+    if [ "$ref" = main ] || [ "$ref" = origin/main ]; then
+      rm -f "$dir/.workbench-stack"
+    elif git -C "$main" show-ref --verify --quiet "refs/heads/${ref#origin/}" ||
+      git -C "$main" show-ref --verify --quiet "refs/remotes/$ref"; then
+      "{{just_executable()}}" --justfile "{{justfile()}}" _wt-stack "$dir" "$ref"
+    elif [ ! -e "$dir/.workbench-stack" ]; then
+      # A bare commit names no base branch: an empty record makes `workbench test`/`run` ask for one.
+      : > "$dir/.workbench-stack"
+      echo "no stack recorded for commit $ref: pass --stack, or name the base branch as the ref" >&2
+    fi
+    new_lock="$(git -C "$dir" rev-parse --verify --quiet HEAD:pnpm-lock.yaml || true)"
+    if [ "$old_lock" != "$new_lock" ] || [ ! -d "$dir/node_modules" ]; then
+      (cd "$dir" && pnpm install --frozen-lockfile)
+    fi
+    echo "$dir"
+
+# Claim a free slot of the pool (slots .worktrees/slot-<pool>-<k>) and switch it with wt-slot; prints
+# its directory on stdout. A claim is a file made atomically, so parallel agents never get the same
+# slot. It takes the free slot closest to what it will hold (fewest changed files), or makes a new one when all
+# are claimed (up to CHELABASE_WT_POOL_MAX, default 8). Release it with wt-release.
+wt-claim pool ref branch="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    common="$(git rev-parse --path-format=absolute --git-common-dir)"
+    main="$(dirname "$common")"
+    pool="$1"
+    ref="$2"
+    branch="${3:-}"
+    max="${CHELABASE_WT_POOL_MAX:-8}"
+    case "$pool" in
+      "" | */* | .*) echo "wt-claim: the pool name is a plain name (no /), got \"$pool\"" >&2; exit 2 ;;
+    esac
+    git -C "$main" rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
+      { echo "wt-claim: $ref isn't a branch or a commit" >&2; exit 1; }
+    mkdir -p "$common/wt-slots"
+    # noclobber makes the redirect an exclusive create: exactly one of several claimers gets it.
+    try_claim() {
+      (set -o noclobber; printf '%s for %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${branch:-$ref}" > "$common/wt-slots/$1") 2>/dev/null
+    }
+    # What the slot will hold: the branch's tip if the branch exists, else `ref`.
+    want="$ref"
+    if [ -n "$branch" ] && git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      want="$branch"
+    fi
+    name=""
+    existing=""
+    for k in $(seq 1 "$max"); do
+      d="$main/.worktrees/slot-$pool-$k"
+      if [ -d "$d" ] && [ ! -e "$common/wt-slots/slot-$pool-$k" ]; then
+        existing+="$(git -C "$d" diff --name-only HEAD "$want" | wc -l) $k"$'\n'
+      fi
+    done
+    for k in $(printf '%s' "$existing" | sort -n | cut -d' ' -f2); do
+      n="slot-$pool-$k"
+      try_claim "$n" || continue
+      if [ -n "$(git -C "$main/.worktrees/$n" status --porcelain)" ]; then
+        echo "wt-claim: free slot $n has changes (left by its last user): skipped" >&2
+        rm -f "$common/wt-slots/$n"
+        continue
+      fi
+      name="$n"
+      break
+    done
+    if [ -z "$name" ]; then
+      for k in $(seq 1 "$max"); do
+        n="slot-$pool-$k"
+        if [ ! -e "$main/.worktrees/$n" ] && try_claim "$n"; then
+          name="$n"
+          break
+        fi
+      done
+    fi
+    if [ -z "$name" ]; then
+      echo "wt-claim: no free slot in pool $pool (CHELABASE_WT_POOL_MAX=$max); see just wt-slots $pool" >&2
+      exit 1
+    fi
+    if ! "{{just_executable()}}" --justfile "{{justfile()}}" wt-slot "$name" "$ref" "$branch" >&2; then
+      rm -f "$common/wt-slots/$name"
+      echo "wt-claim: switching $name failed (above): claim dropped" >&2
+      exit 1
+    fi
+    echo "$main/.worktrees/$name"
+
+# Give a claimed slot back: refuses while it has changes, detaches it (so its branch can be checked
+# out elsewhere) and drops the claim. The worktree and its target/ stay for the next claim.
+wt-release name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    common="$(git rev-parse --path-format=absolute --git-common-dir)"
+    name="$1"
+    dir="$(dirname "$common")/.worktrees/$name"
+    if [ ! -e "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)/chelabase-slot" ]; then
+      echo "wt-release: $name isn't a slot" >&2
+      exit 1
+    fi
+    changes="$(git -C "$dir" status --porcelain)"
+    if [ -n "$changes" ]; then
+      echo "wt-release: slot $name has changes; commit or discard them first:" >&2
+      printf '%s\n' "$changes" >&2
+      exit 1
+    fi
+    git -C "$dir" switch --quiet --detach
+    rm -f "$common/wt-slots/$name"
+    echo "released $name"
+
+# List the slots (of one pool, or all): free or claimed (since when, for what), HEAD, clean or not
+wt-slots pool="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    common="$(git rev-parse --path-format=absolute --git-common-dir)"
+    main="$(dirname "$common")"
+    for dir in "$main/.worktrees/slot-${1:+$1-}"*; do
+      [ -e "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)/chelabase-slot" ] || continue
+      name="$(basename "$dir")"
+      [ -z "${1:-}" ] || [[ "${name#"slot-$1-"}" =~ ^[0-9]+$ ]] || continue
+      if [ -e "$common/wt-slots/$name" ]; then
+        state="claimed $(cat "$common/wt-slots/$name")"
+      else
+        state="free"
+      fi
+      head="$(git -C "$dir" rev-parse --short HEAD) $(git -C "$dir" symbolic-ref --quiet --short HEAD || echo detached)"
+      [ -z "$(git -C "$dir" status --porcelain)" ] || head+=" (has changes)"
+      printf '%s\t%s\t%s\n' "$name" "$state" "$head"
+    done
+
+# Build the free slots of a pool at `ref` so the next claim starts compiled: each is claimed,
+# switched to a detached `ref`, built with `cargo nextest run --no-run <args>` (default
+# --workspace) and released, one after the other. Claimed slots are left alone.
+wt-warm pool ref *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    common="$(git rev-parse --path-format=absolute --git-common-dir)"
+    main="$(dirname "$common")"
+    pool="$1"
+    ref="$2"
+    shift 2
+    [ "$#" -gt 0 ] || set -- --workspace
+    for dir in "$main/.worktrees/slot-$pool-"*; do
+      name="$(basename "$dir")"
+      [[ "${name#"slot-$pool-"}" =~ ^[0-9]+$ ]] || continue
+      [ -e "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)/chelabase-slot" ] || continue
+      (set -o noclobber; printf '%s for wt-warm\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$common/wt-slots/$name") 2>/dev/null ||
+        { echo "wt-warm: $name is claimed: skipped" >&2; continue; }
+      if "{{just_executable()}}" --justfile "{{justfile()}}" wt-slot "$name" "$ref" >&2 &&
+        (cd "$dir" && cargo nextest run --no-run "$@"); then
+        echo "warmed $name at $(git -C "$dir" rev-parse --short HEAD)"
+      else
+        echo "wt-warm: $name wasn't warmed (above)" >&2
+      fi
+      rm -f "$common/wt-slots/$name"
+    done
+
+# Write <dir>/.workbench-stack for a worktree based on `base` (wt-add and wt-slot call it): the
+# stack the base's worktree borrows or owns, read from its `.workbench-stack` or the registry. Only
+# when no worktree has the base checked out does it ask the CLI, which builds it in <dir>.
+_wt-stack dir base:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    dir="$1"
+    base="${2#origin/}"
+    basedir="$(git -C "$main" worktree list --porcelain |
+      BASE="branch refs/heads/$base" awk '/^worktree /{w=substr($0,10)} $0==ENVIRON["BASE"]{print w; exit}')"
+    if [ -z "$basedir" ]; then
+      slug="$(env -C "$dir" cargo run -q -p chelabase -- workbench slug-of "$base" || true)"
+    elif [ -s "$basedir/.workbench-stack" ]; then
+      slug="$(tr -d '[:space:]' < "$basedir/.workbench-stack")"
+    else
+      registry="$main/.chelabase/stacks/registry.json"
+      slug=""
+      if [ -f "$registry" ]; then
+        slug="$(jq -r --arg c "$basedir" '[.stacks[] | select(.checkout == $c) | .slug][0] // empty' "$registry" || true)"
+      fi
+    fi
+    printf '%s\n' "$slug" > "$dir/.workbench-stack"
+    if [ -z "$slug" ]; then
+      echo "no stack for $base: bring it up there (just workbench up) or pass --stack" >&2
+    fi
+
+# Purge the worktree's own stack (containers, volumes, state), then remove the worktree or slot
+# (refuses if it has changes) and its target/; the branch is kept. A worktree that borrows a stack
+# (`.workbench-stack` names it) has none of its own, so nothing is purged and nothing is built.
 wt-remove branch:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -265,14 +494,21 @@ wt-remove branch:
     # still be that worktree: anywhere else git would resolve another checkout (main). A missing
     # stack isn't an error.
     top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ "$top" = "$dir" ]; then
+    claim="$(git rev-parse --path-format=absolute --git-common-dir)/wt-slots/$name"
+    if [ -e "$claim" ]; then
+      echo "$name is a claimed slot ($(cat "$claim")): just wt-release $name first" >&2
+      exit 1
+    fi
+    if [ "$top" != "$dir" ]; then
+      echo "warning: $dir isn't the worktree's checkout (git toplevel: ${top:-none}); its stack isn't purged (just workbench purge --stack <slug>)" >&2
+    elif [ -s "$dir/.workbench-stack" ] && [ -n "$(tr -d '[:space:]' < "$dir/.workbench-stack")" ]; then
+      echo "$name borrows stack $(tr -d '[:space:]' < "$dir/.workbench-stack"): not purged" >&2
+    else
       env -C "$dir" cargo run -q -p chelabase -- workbench purge ||
         echo "no stack purged for $name (none registered, or the purge failed: see above)" >&2
-    else
-      echo "warning: $dir isn't the worktree's checkout (git toplevel: ${top:-none}); its stack isn't purged (just workbench purge --stack <slug>)" >&2
     fi
     git -C "$main" worktree remove "$dir"
-    echo "removed worktree; branch $branch kept (git branch -d $branch to delete it)"
+    echo "removed worktree $name; its branch is kept (git branch -d to delete it)"
 
 # --- Neon storage (part of every stack) and the e2e scripts (they run in the stack's runner) ---
 

@@ -123,6 +123,8 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 | `just landing-visual [--update-snapshots]` | Pixel check of the landing page against committed baselines (not part of `just check`) |
 | `just sweep-builds [days=N]` | Delete build artifacts older than 14 days (or `N`) from the main and every worktree's `target/` |
 | `just wt-add <branch> [base]` / `just wt-remove <branch>` | Create a worktree under `.worktrees/`, or purge its stack and remove it (see [Worktrees and their stacks](#worktrees-and-their-stacks)) |
+| `just wt-claim <pool> <ref> [branch]` / `just wt-release <name>` | Claim a reused worktree (a slot) that keeps its build, switched to a branch or a commit; give it back (see [Slots](#slots-reused-worktrees)) |
+| `just wt-slots [pool]` / `just wt-warm <pool> <ref> [nextest args]` | List the slots; build the free ones at `ref` |
 
 The end-to-end recipes are in [Tests and e2e runs](#tests-and-e2e-runs).
 
@@ -201,11 +203,11 @@ just wt-remove my-feature             # purges its stack, removes the worktree; 
 `just wt-add <branch> [base]` makes `.worktrees/<branch>` (with `/` as `-`), creating the branch from `base` (default `main`) if it doesn't exist and reusing a local one if it does. It symlinks `.chelabase` from the main checkout and runs `pnpm install --frozen-lockfile`. It starts no stack:
 
 - based on `main` (or `origin/main`), the worktree gets its own stack from `just workbench up`;
-- based on another branch, it builds the CLI and records that branch's stack in `.workbench-stack`, so `just workbench test` and `run` use it. If the base has no stack, the file is empty and it says so: bring the base's stack up there, or pass `--stack`.
+- based on another branch, it records that branch's stack in `.workbench-stack`, so `just workbench test` and `run` use it. The stack is read from the base's worktree (its own `.workbench-stack`, or the registry entry of its checkout), which builds nothing; only when no worktree has the base checked out does it build the CLI in the new worktree to ask. If the base has no stack, the file is empty and it says so: bring the base's stack up there, or pass `--stack`.
 
 For a branch that exists only on origin, run `git fetch && git branch <branch> origin/<branch>` first.
 
-`just wt-remove <branch>` purges the worktree's own stack (containers, volumes, state directory, registry entry), then removes the worktree (refusing if it has changes) and its `target/`. Delete the branch yourself with `git branch -d <branch>`.
+`just wt-remove <branch>` purges the worktree's own stack (containers, volumes, state directory, registry entry), then removes the worktree (refusing if it has changes) and its `target/`. A worktree whose `.workbench-stack` names a stack borrows it and has none of its own, so nothing is purged (and nothing is built to find that out). Delete the branch yourself with `git branch -d <branch>`.
 
 Each worktree:
 
@@ -213,7 +215,28 @@ Each worktree:
 - symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys, member-JWT keys, the identity service's secret, database password and caller tokens; mounted read-only into every stack) and every stack's state;
 - runs its own stack from its own binaries: run `just workbench …` from inside the worktree. Another checkout's stack is reached with `--stack <slug>` (`down`, `purge`, `test`, `run`); `status` lists them all.
 
-`just workbench down` when you're done frees the slot. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from every `target/`.
+`just workbench down` when you're done frees the stack's place under the cap. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from every `target/`.
+
+### Slots: reused worktrees
+
+A new worktree has an empty `target/`. sccache covers the dependencies, but the workspace's own crates build incrementally (which sccache can't cache) and every test binary is linked again, so the first build in a new worktree takes a long time. Work that needs many short-lived checkouts of one line of work (an epic's milestone builders and auditors) uses slots instead: worktrees that are kept and switched in place with git, so only the crates that changed rebuild.
+
+```bash
+just wt-claim my-epic epic/my-epic epic-my-epic-m3   # a free slot, on that branch (made from the ref if new)
+just wt-claim my-epic epic/my-epic                   # a free slot, detached at the ref (read-only work)
+just wt-slots my-epic                                # each slot: free or claimed, HEAD, changes
+just wt-release slot-my-epic-1                       # give it back
+just wt-warm my-epic epic/my-epic -p worker          # build the free slots at the ref
+just wt-remove slot-my-epic-1                        # when the work is merged
+```
+
+- **Pool.** A pool's slots are `.worktrees/slot-<pool>-<k>`. `wt-claim` takes the free slot whose checkout is closest to what it will hold (fewest changed files) and makes a new one only when every slot is claimed, up to `CHELABASE_WT_POOL_MAX` (default 8). It prints the slot's directory as the last line. How many agents run at once is up to whoever starts them.
+- **Claims.** A claim is a file under the repository's git directory (`wt-slots/<name>`), made with an exclusive create, so two callers never get the same slot. Nothing expires: `wt-release` drops it, and refuses while the slot has changes (tracked or untracked), so a slot always comes back clean. Releasing detaches the slot, which leaves its branch free to be checked out elsewhere. If the holder is gone, look at the slot, discard its changes and release it.
+- **Switching.** `just wt-slot <name> <ref> [branch]` is what `wt-claim` runs, and what a holder uses to move its slot again. It refuses a slot with changes. A new branch is made from `ref`; an existing branch is checked out as it is, fast-forwarded to `ref` when it has no commits of its own, and never reset. `pnpm install --frozen-lockfile` runs only when `pnpm-lock.yaml` differs from the previous checkout.
+- **Stack.** A slot records the stack of `ref`'s worktree in `.workbench-stack` on every switch, exactly like a task worktree, so it never starts or owns one, and removing it purges nothing.
+- **Cargo.** One cargo command at a time per slot, as in any checkout (they share the slot's `target/`).
+- **Warming.** A slot is as built as the last thing compiled in it. `wt-warm` claims each free slot, switches it to `ref`, runs `cargo nextest run --no-run` with the given arguments (default `--workspace`) and releases it, so the next claim starts compiled. It is a full cargo job per slot: run it when the machine has room.
+- **Removal.** `just wt-remove <name>` (it refuses a claimed slot). Remove a pool's slots when its work is merged, in a later step than the merge.
 
 ## Tests and e2e runs
 
