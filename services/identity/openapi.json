@@ -443,7 +443,7 @@
                   "project_name": {
                     "type": "string",
                     "maxLength": 128,
-                    "description": "Shown in the notice `notify_previous` sends; single line. Default `Chelabase`."
+                    "description": "Shown in the notice `notify_previous` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -1126,7 +1126,7 @@
                   "project_name": {
                     "type": "string",
                     "maxLength": 128,
-                    "description": "Shown in the email; single line. Default `Chelabase`."
+                    "description": "Shown in the email. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",
@@ -1260,7 +1260,7 @@
                   "project_name": {
                     "type": "string",
                     "maxLength": 128,
-                    "description": "Shown in the email-changed notice an `email_change` sends; single line. Default `Chelabase`."
+                    "description": "Shown in the email-changed notice an `email_change` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -1340,7 +1340,8 @@
                 "properties": {
                   "project_name": {
                     "type": "string",
-                    "maxLength": 128
+                    "maxLength": 128,
+                    "description": "Shown in the notice. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",

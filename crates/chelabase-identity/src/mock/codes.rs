@@ -177,7 +177,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         ));
     }
     let next = new_email(body, kind)?;
-    let project = super::project_field(body)?;
+    let project = super::project_field(body);
     if next.is_some() && delivery != "email" {
         return Err(refuse(
             400,
@@ -263,7 +263,7 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         return Err(refuse(400, "invalid_request", "code must be six digits"));
     }
     let next = new_email(body, kind)?;
-    let project = super::project_field(body)?;
+    let project = super::project_field(body);
     let new_password = match (kind, body.get("new_password")) {
         (CodeKind::Verify | CodeKind::EmailChange, None) => None,
         (CodeKind::Verify | CodeKind::EmailChange, Some(_)) => {
