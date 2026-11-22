@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "mcp", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
 }
 
 target "_app" {
@@ -90,6 +90,12 @@ target "service-runner" {
   target   = "service-runner"
   tags     = ["${REPO}/service-runner:${TAG}"]
 }
+# mcp-core (m8): the MCP server (profile `mcp`). Unpublished until its first pin.
+target "mcp" {
+  inherits = ["_app"]
+  target   = "mcp"
+  tags     = ["${REPO}/mcp:${TAG}"]
+}
 target "init" {
   inherits = ["_app"]
   target   = "init"
@@ -136,7 +142,8 @@ target "functions-runtime" {
   tags        = ["${REPO}/functions-runtime:${TAG}"]
 }
 
-# The MCP sandbox runtime (mcp-core): workerd, the runner worker and the watchdog.
+# The MCP sandbox runtime (mcp-core): workerd, the runner worker and the watchdog (profile `mcp`).
+# Unpublished until its first pin.
 target "mcp-runtime" {
   context    = "."
   dockerfile = "infra/images/mcp-runtime.Dockerfile"

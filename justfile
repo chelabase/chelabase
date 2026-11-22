@@ -620,6 +620,12 @@ functions-runtime-test:
     docker buildx bake -f infra/images/docker-bake.hcl --load functions-runtime
     node --test infra/functions-runtime/tests/
 
+# CI runs this when infra/mcp-runtime/ changes. Needs Docker, no stack.
+# The MCP sandbox runtime's node tests, against a freshly baked image in throwaway containers
+mcp-runtime-test:
+    docker buildx bake -f infra/images/docker-bake.hcl --load mcp-runtime
+    node --test infra/mcp-runtime/tests/
+
 # Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
 # it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
 # and call a public function on the keyless form. Shared-state: writes and removes its own rows.
