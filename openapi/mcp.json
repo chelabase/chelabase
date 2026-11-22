@@ -4,9 +4,9 @@
     "version": "1",
     "x-sources": {
       "data": "b0eb5eecd27edf53307bd8cc1d4755ba25a860c16f4715c3455cfbdf9387f464",
-      "management": "9cfb5f3f468b8d1e092c257ae9fa844687cd6c9f58ba967d4bb5c968ea4f1d21"
+      "management": "c3ef61b32ac935dea03445a2346590e82311c96e1b0c413edf12d9d4877af1ac"
     },
-    "x-spec-hash": "14d0917b899ce4e4a14cf5e819a1d6fce8ef87a52317747ec8a5f0e1c0b1959c"
+    "x-spec-hash": "8f91c32cc7929921e09e5f3fe637ba54f2e7a9b3d9628b6ddfda95a57e85aa3c"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -16198,7 +16198,7 @@
     },
     "/v1/databases/{id}/branches/{branch_id}/sql": {
       "post": {
-        "description": "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
+        "description": "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. Without `read_only`, the script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. With `read_only: true`, every statement runs inside one transaction Postgres holds read-only (begun `READ ONLY`, its snapshot taken first, rolled back at the end, the connection never reused): Postgres refuses any write, including one made by a function a `SELECT` calls, and any switch back to read-write. Only `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top level, at most 100 statements; any other statement (transaction control, `SET`, `RESET`, `DISCARD`, `COPY`, `DO`, `CALL`, `LOCK`, ...) or a script that doesn't parse refuses the whole script with 422 `read_only_script_refused` before anything runs. Each statement is prepared on the server before it runs, and the first error ends the run (a statement whose command tag isn't a read's also ends it, with `25006`). A read-only run's timeout is at most 300000 and `confirm` can't be sent with it. Unless `confirm` is true (and the run isn't read-only), risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text; in a read-only run, in its statement), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
         "operationId": "runSql",
         "parameters": [
           {
@@ -16230,7 +16230,7 @@
                 "description": "`POST …/sql`'s body.",
                 "properties": {
                   "confirm": {
-                    "description": "`true` runs statements the guard would hold back.",
+                    "description": "`true` runs statements the guard would hold back. Refused with `read_only`.",
                     "type": [
                       "boolean",
                       "null"
@@ -16240,6 +16240,13 @@
                     "description": "The Postgres database; null or absent is the branch's main database.",
                     "type": [
                       "string",
+                      "null"
+                    ]
+                  },
+                  "read_only": {
+                    "description": "`true` runs every statement inside one transaction Postgres holds read-only: any write\nis refused by Postgres, including one a function called from a `SELECT` makes. Only\n`SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top\nlevel; any other statement refuses the whole script before anything runs. The\ntimeout is at most 300000. Absent means `false`.",
+                    "type": [
+                      "boolean",
                       "null"
                     ]
                   },
@@ -16332,7 +16339,12 @@
             "invalid_request",
             "sql",
             "timeout_ms",
-            "role"
+            "read_only",
+            "confirm",
+            "role",
+            "read_only_script_refused",
+            "unparsed",
+            "too_many_statements"
           ],
           "429": [
             "sql_run_limit"
@@ -33919,6 +33931,7 @@
               "user_token_with_secret_key",
               "run_id_in_use",
               "sql_confirm_required",
+              "read_only_script_refused",
               "sql_run_limit",
               "schema_too_large",
               "saved_query_name_taken",

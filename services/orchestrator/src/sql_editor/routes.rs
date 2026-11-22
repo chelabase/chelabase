@@ -33,7 +33,9 @@ use uuid::Uuid;
 use super::events::{Outcome, RunEvent};
 use super::registry::{Canceller, Cancelled, ReserveError};
 use super::run::{self, ConnectError, Connected, Finished, RunSpec, RunTarget};
-use super::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, guard, invalid_sql, schema};
+use super::{
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, guard, invalid_sql, read_only, schema,
+};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::console::{
     OWNER_PASSWORD_UNKNOWN, compute_addr, compute_tls_failed, database_not_found, run_tls, owner_target, pick_database,
@@ -102,9 +104,54 @@ pub struct RunSqlRequest {
     /// 100 to 900000; 60000 when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// `true` runs statements the guard would hold back.
+    /// `true` runs statements the guard would hold back. Refused with `read_only`.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// `true` runs every statement inside one transaction Postgres holds read-only: any write
+    /// is refused by Postgres, including one a function called from a `SELECT` makes. Only
+    /// `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top
+    /// level; any other statement refuses the whole script before anything runs. The
+    /// timeout is at most 300000. Absent means `false`.
+    #[serde(default)]
+    pub read_only: Option<bool>,
+}
+
+/// The longest a read-only run may take.
+const MAX_READ_ONLY_TIMEOUT_MS: u64 = 300_000;
+
+/// The 422 for a read-only request that can't run (`confirm`, or a timeout past 300 s), or
+/// `None`.
+fn read_only_refusal(request: &RunSqlRequest) -> Option<ApiError> {
+    if request.read_only != Some(true) {
+        return None;
+    }
+    if request.confirm == Some(true) {
+        return Some(unprocessable(
+            "`confirm` can't be used with `read_only`: a read-only run holds nothing back",
+        ));
+    }
+    if request.timeout_ms.is_some_and(|ms| ms > MAX_READ_ONLY_TIMEOUT_MS) {
+        return Some(unprocessable("`timeout_ms` must be 100 to 300000 for a read-only run"));
+    }
+    None
+}
+
+/// The 422 for a script a read-only run refuses: nothing ran.
+fn read_only_script_refused(refused: &read_only::Refused) -> ApiError {
+    let message = match refused.kind.as_str() {
+        read_only::UNPARSED => "the script doesn't parse; a read-only run needs every statement to parse".to_owned(),
+        read_only::TOO_MANY_STATEMENTS => format!(
+            "a read-only script holds at most {} statements",
+            read_only::MAX_STATEMENTS
+        ),
+        kind => format!(
+            "statement {} ({kind}) can't run read-only: only SELECT, SHOW and EXPLAIN can",
+            refused.statement
+        ),
+    };
+    ApiError::new(422, ErrorCode::ReadOnlyScriptRefused, message)
+        .with_extra("statement", serde_json::json!(refused.statement))
+        .with_extra("kind", serde_json::json!(refused.kind))
 }
 
 /// `GET …/sql/schema`'s query.
@@ -751,7 +798,7 @@ impl Drop for Audit {
     operation_id = "runSql",
     tag = "sql-editor",
     summary = "Run SQL on a branch",
-    description = "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. The script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. Unless `confirm` is true, risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
+    description = "Runs a script on one of the branch's Postgres databases on a fresh connection as the database's owner (Admin only), or, with `role`, as that role: the connection logs in as your own hidden member role on the branch, which can only become the roles you were granted (and what they can become), then runs `SET ROLE` to `role`, so a script that resets its role is never the owner. When the run ends (however it ends), its session is ended, whatever the script made as the member role itself is handed to `role`, and every privilege, default privilege or policy naming the member role is dropped. An Admin acting as a role a member role can't hold (LOGIN, owner-level, or reaching a reserved role) uses the owner's connection and `SET ROLE`; naming the owner runs as the owner. Without `read_only`, the script is sent unchanged as one simple query, so multi-statement scripts, explicit transactions and commands like `VACUUM` work. With `read_only: true`, every statement runs inside one transaction Postgres holds read-only (begun `READ ONLY`, its snapshot taken first, rolled back at the end, the connection never reused): Postgres refuses any write, including one made by a function a `SELECT` calls, and any switch back to read-write. Only `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top level, at most 100 statements; any other statement (transaction control, `SET`, `RESET`, `DISCARD`, `COPY`, `DO`, `CALL`, `LOCK`, ...) or a script that doesn't parse refuses the whole script with 422 `read_only_script_refused` before anything runs. Each statement is prepared on the server before it runs, and the first error ends the run (a statement whose command tag isn't a read's also ends it, with `25006`). A read-only run's timeout is at most 300000 and `confirm` can't be sent with it. Unless `confirm` is true (and the run isn't read-only), risky statements (drops, truncates, `DELETE`/`UPDATE` without `WHERE`, also under `EXPLAIN ANALYZE` or `PREPARE`, and anything that doesn't parse) and, on a protected branch, every statement that isn't a read are held back with 409 `sql_confirm_required`. Errors before the connection opens are JSON; then the answer is `200 application/x-ndjson`, one JSON event per line: `notice`, `columns` (`statement`, `columns: [{name, type}]`), `rows` (`statement`, at most 200 rows of text-or-null values), `complete` (`statement`, `tag`, `rows`, `truncated`: over 1,000 rows), `error` (`statement`, `code`, `message`, `detail`, `hint`, `position`: 1-based in the sent text; in a read-only run, in its statement), `heartbeat` (after 15 s without another event) and, always last, `done` (`outcome`: `ok`, `error`, `cancelled`, `timeout` or `truncated_response` past 10 MiB; `duration_ms`). Closing the stream cancels the run. Every run is logged with its command tags and a SHA-256 of the script, never the script.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -764,7 +811,7 @@ impl Drop for Audit {
         (status = 403, description = "Besides the access refusals: `required: \"role:<name>\"` also when the role doesn't exist on the branch or your member role can't hold it; `required: \"connect\"` when your member role may not connect to this Postgres database", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`sql_confirm_required`: the guard held statements back; `error.statements` lists them (`index`, `kind`: pg_query's node name or `unparsed`, `text_preview`: the first 200 characters, `reason`: `risky` or `protected`); send again with `confirm: true` to run them. `run_id_in_use`: you have a run with this id in flight; `owner_password_unknown`: the owner's password was set in SQL (reset it); `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body isn't the run's shape, `sql` isn't 1 byte to 1 MiB or holds a NUL byte, `timeout_ms` isn't 100 to 900000, `role` is empty, or `role` is a system role", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body isn't the run's shape, `sql` isn't 1 byte to 1 MiB or holds a NUL byte, `timeout_ms` isn't 100 to 900000 (100 to 300000 with `read_only`), `confirm` is true with `read_only`, `role` is empty, or `role` is a system role. `read_only_script_refused`: a read-only script holds a statement other than `SELECT`, `SHOW` or `EXPLAIN`, doesn't parse, or holds more than 100 statements; `error.statement` (0-based) and `error.kind` (pg_query's node name, `unparsed` or `too_many_statements`) name the first offender, and nothing ran", body = ErrorEnvelope),
         (status = 429, description = "`sql_run_limit`: you have 4 runs in flight, or the Postgres database has 4 (`Retry-After`)", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the compute isn't running, can't be reached, is starting up or is out of connections right now (`Retry-After`); `member_role_reconcile_failed`: your member role on the branch couldn't be brought up to date (`Retry-After`)", body = ErrorEnvelope),
@@ -789,6 +836,10 @@ where
     if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
         return unprocessable("`timeout_ms` must be 100 to 900000").into_response();
     }
+    if let Some(refusal) = read_only_refusal(&request) {
+        return refusal.into_response();
+    }
+    let read_only = request.read_only == Some(true);
     if let Some(refusal) = invalid_role(request.role.as_deref()) {
         return refusal.into_response();
     }
@@ -817,7 +868,22 @@ where
             confirmed,
         )
     };
-    if !confirmed {
+    // A read-only script is parsed before any connection opens: a refused one runs nothing.
+    // The guard has nothing to hold in a read-only run.
+    let statements = if read_only {
+        let sql = request.sql.clone();
+        match tokio::task::spawn_blocking(move || read_only::check(&sql)).await {
+            Ok(Ok(statements)) => Some(statements),
+            Ok(Err(refused)) => return read_only_script_refused(&refused).into_response(),
+            Err(err) => {
+                error!("SQL read-only check: {err}");
+                return ApiError::internal().into_response();
+            }
+        }
+    } else {
+        None
+    };
+    if !confirmed && !read_only {
         let sql = request.sql.clone();
         let protected = branch.protected;
         let held = match tokio::task::spawn_blocking(move || guard::check(&sql, protected)).await {
@@ -888,7 +954,14 @@ where
         after,
     };
     let finished = audit.finished.clone();
-    let events = run::run_reporting(session.connected, spec, guard, finished).map(move |event| {
+    let events = match statements {
+        Some(statements) => {
+            run::run_read_only_reporting(session.connected, spec, statements, guard, finished)
+                .left_stream()
+        }
+        None => run::run_reporting(session.connected, spec, guard, finished).right_stream(),
+    }
+    .map(move |event| {
         audit.observe(&event);
         Ok::<_, Infallible>(event.to_line())
     });
@@ -1112,6 +1185,33 @@ mod tests {
         assert!(RESERVED_ROLES.contains(&"chelabase_storage"), "{RESERVED_ROLES:?}");
         for role in ["chelabase_storage", "chelabase_storage_x", "Chelabase_Storage"] {
             assert!(invalid_role(Some(role)).is_some(), "{role}");
+        }
+    }
+
+    fn request(body: serde_json::Value) -> RunSqlRequest {
+        let mut base = serde_json::json!({"run_id": Uuid::new_v4(), "sql": "SELECT 1"});
+        base.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn read_only_with_confirm_is_422() {
+        let refusal = read_only_refusal(&request(serde_json::json!({"read_only": true, "confirm": true})))
+            .expect("confirm with read_only is refused");
+        assert_eq!(refusal.status, 422);
+        assert_eq!(refusal.code, ErrorCode::InvalidRequest);
+        // A timeout past 300 s is refused; 300 s itself and the default run.
+        let long = request(serde_json::json!({"read_only": true, "timeout_ms": 300_001}));
+        assert_eq!(read_only_refusal(&long).map(|e| e.status), Some(422));
+        for ok in [
+            serde_json::json!({"read_only": true}),
+            serde_json::json!({"read_only": true, "timeout_ms": 300_000}),
+            serde_json::json!({"read_only": true, "confirm": false}),
+            // Not read-only: unchanged (900 s and confirm are fine).
+            serde_json::json!({"timeout_ms": 900_000, "confirm": true}),
+            serde_json::json!({"read_only": false, "confirm": true}),
+        ] {
+            assert!(read_only_refusal(&request(ok.clone())).is_none(), "{ok}");
         }
     }
 

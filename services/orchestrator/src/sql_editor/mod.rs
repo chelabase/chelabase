@@ -11,6 +11,7 @@ pub mod events;
 #[cfg(test)]
 pub(crate) mod fake_pg;
 pub mod guard;
+pub mod read_only;
 pub mod registry;
 pub mod run;
 pub mod saved;
