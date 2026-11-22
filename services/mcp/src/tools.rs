@@ -283,7 +283,32 @@ pub async fn call(
     name: &str,
     arguments: Option<JsonObject>,
 ) -> Result<CallToolResult, ErrorData> {
-    let call = parse(name, arguments)?;
+    let call = match parse(name, arguments) {
+        Ok(call) => call,
+        Err(error) => {
+            // One bare line: no code, no arguments, no error code, and a tool name only when
+            // it is one of ours.
+            let tool = match name {
+                "search" | "execute" => name,
+                _ => "unknown",
+            };
+            audit(
+                &Audit {
+                    request_id,
+                    caller,
+                    tool,
+                    code_sha256: String::new(),
+                    code: "",
+                    destructive: false,
+                    duration_ms: 0,
+                    outcome: "invalid_params",
+                    result_bytes: 0,
+                },
+                log_code,
+            );
+            return Err(error);
+        }
+    };
     let started = Instant::now();
     let outcome = if call.code.len() > MAX_CODE_BYTES {
         Outcome::Error {
