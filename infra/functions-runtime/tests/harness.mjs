@@ -99,7 +99,21 @@ export async function startRuntime(store, { restart = "no", gateway, apiHost = "
     ...(gateway ? ["--external-addr", `chelabase-api=gateway-functions:${gateway}`] : []),
     "/etc/functions-runtime/config.capnp",
   );
-  const hostPort = async () => (await docker("port", id, "8080/tcp")).split("\n")[0].split(":").pop();
+  // Docker publishes the port only once the container is running, so right after a start or
+  // a restart `docker port` can fail or print nothing. Wait for it, within the readiness budget.
+  const hostPort = async (ms = 20_000) => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      try {
+        const port = (await docker("port", id, "8080/tcp")).split("\n")[0].split(":").pop()?.trim();
+        if (port) return port;
+      } catch (e) {
+        if (Date.now() >= deadline) throw e;
+      }
+      if (Date.now() >= deadline) throw new Error(`container ${id} never published 8080/tcp`);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  };
   const rt = {
     id,
     url: `http://127.0.0.1:${await hostPort()}`,
