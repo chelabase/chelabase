@@ -9,6 +9,7 @@ members = [
     "services/realtime",
     "services/storage",
     "services/functions",
+    "services/mcp",
     "services/service-runner",
     "services/init",
     "tools/cli",
