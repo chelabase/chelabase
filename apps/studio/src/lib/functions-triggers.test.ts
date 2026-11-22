@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   STORAGE_EVENTS,
+  describeTriggerFailure,
   TABLE_EVENTS,
   initialTriggerDraft,
   triggersInstalling,
@@ -110,5 +111,36 @@ describe("triggersInstalling", () => {
     expect(triggersInstalling([t("installed"), t("pending_install")])).toBe(true);
     expect(triggersInstalling([t("installed"), t("failed")])).toBe(false);
     expect(triggersInstalling([])).toBe(false);
+  });
+});
+
+describe("describeTriggerFailure", () => {
+  const KNOWN = [
+    "run_as_role_required",
+    "run_as_role_cannot_read_table",
+    "run_as_role_subject_to_rls",
+    "invalid_events",
+    "function triggers support plain tables only",
+    "function triggers can't go on a reserved schema",
+  ];
+
+  it("maps_each_known_reason", () => {
+    const seen = new Set<string>();
+    for (const code of KNOWN) {
+      const d = describeTriggerFailure(code);
+      expect(d, code).not.toBeNull();
+      expect(d!.cause.length).toBeGreaterThan(0);
+      expect(d!.fix.length).toBeGreaterThan(0);
+      seen.add(d!.fix);
+    }
+    expect(seen.size).toBe(KNOWN.length);
+    expect(describeTriggerFailure("run_as_role_required")!.fix).toMatch(/run-as role/i);
+    expect(describeTriggerFailure("run_as_role_cannot_read_table")!.fix).toMatch(/SELECT/);
+    expect(describeTriggerFailure("run_as_role_subject_to_rls")!.fix).toMatch(/BYPASSRLS/);
+  });
+
+  it("falls_back_for_unknown_reasons", () => {
+    expect(describeTriggerFailure("permission denied for table orders")).toBeNull();
+    expect(describeTriggerFailure("")).toBeNull();
   });
 });
