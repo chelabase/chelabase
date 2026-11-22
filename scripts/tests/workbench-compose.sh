@@ -14,7 +14,7 @@ fail() {
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
   -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
   --env-file "$fixture" \
-  --profile sites --profile runner --profile services config --no-env-resolution --format json |
+  --profile sites --profile runner --profile services --profile mcp config --no-env-resolution --format json |
   jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" || fail "compose config failed"
 # (The rewrite lists each service's file secrets, which Docker binds read-only, among its volumes.)
 q() { jq -r "$1" <<<"$config"; }
@@ -439,6 +439,23 @@ others="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; (.source 
   fail "service-runner joins the Docker group"
 [[ "$(q '[.services["service-runner"].volumes[] | select(.type == "bind" and (.source | test("docker.sock|service-runner.token$"))) | .source | split("/") | last] | sort | join(" ")')" == "docker.sock functions-service-runner.token worker-service-runner.token" ]] ||
   fail "service-runner mounts the Docker socket and its two caller bearers"
+
+# mcp-core (m12): the MCP server runs the checkout's debug binary and the runtime its locally built
+# image (never pulled), both in profile mcp (the CLI turns it on for every call).
+# (The gateway's CHELABASE_MCP_URL is in the rendered stack.env: a unit test in tests.rs.)
+for s in mcp mcp-runtime; do
+  [[ "$(q ".services[\"$s\"] // empty | .profiles | join(\" \")")" == mcp ]] || fail "$s is in the mcp profile only (and the overlay defines it)"
+done
+[[ "$(q '.services.mcp.command | join(" ")')" == "$(sed -n 's/^CHELABASE_CHECKOUT=//p' "$fixture")/target/debug/mcp" ]] ||
+  fail "mcp runs the checkout's debug binary"
+[[ "$(q '.services["mcp-runtime"].image')" == chelabase/mcp-runtime:* && "$(q '.services["mcp-runtime"].pull_policy')" == never ]] ||
+  fail "mcp-runtime runs the locally built image, never pulled"
+[[ "$(q '.services.mcp.image')" == chelabase-workbench:fixture000000 ]] || fail "mcp runs the workbench image"
+q '.services.mcp.env_file[]? | if type == "object" then .path else . end' | gq -x /m/.chelabase/stacks/feat-x/env/stack.env ||
+  fail "mcp reads the stack env"
+[[ "$(q '[.services.mcp.volumes[] | select(.type == "bind" and .source != "/w/feat-x") | .source] | join(" ")')" == /m/.chelabase/auth/member-jwt.pub ]] ||
+  fail "mcp mounts the member public key and no other secret"
+[[ -n "$(q '.services.mcp.healthcheck.test // empty')" ]] || fail "mcp has a healthcheck"
 
 # Neon's S3 endpoint is the base file's one setting, default http://seaweedfs:8333, for the
 # safekeepers and the pageserver under the workbench too.

@@ -40,15 +40,15 @@ impl Site {
 }
 
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
-pub(super) const RUST_APPS: [&str; 8] =
-    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage", "functions"];
+pub(super) const RUST_APPS: [&str; 9] =
+    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage", "functions", "mcp"];
 /// Rust binaries `up` builds for a compose profile that is off by default (edge functions m10:
 /// the service runner, profile `services`): built with the apps, never started, recorded or
 /// restarted with them; `docker compose --profile services up -d service-runner` runs it.
 pub(super) const PROFILE_RUST_APPS: [&str; 1] = ["service-runner"];
 /// Every app container (the Rust apps, Studio and the identity service; the sites are added by
 /// `--with`).
-pub(super) const APPS: [&str; 10] = [
+pub(super) const APPS: [&str; 11] = [
     "orchestrator",
     "worker",
     "gateway",
@@ -57,6 +57,7 @@ pub(super) const APPS: [&str; 10] = [
     "realtime",
     "storage",
     "functions",
+    "mcp",
     "studio",
     "identity",
 ];
@@ -77,6 +78,8 @@ pub(super) const INFRA: &[&str] = &[
     "proxy",
     // Edge functions (m4b): its image is built by `up` (`ensure_functions_runtime_image`).
     "functions-runtime",
+    // MCP (m12): its image is built by `up` (`ensure_mcp_runtime_image`).
+    "mcp-runtime",
 ];
 /// Started with the infra and waited on until healthy: the bootstrap creates the identity
 /// service's members pool by calling `http://identity:8080` directly on the stack network
@@ -86,7 +89,7 @@ pub(super) const FRONT: &[&str] = &["mailpit", "gateway", "identity"];
 /// Started before the bootstrap, which waits on the orchestrator and (the dev member's sign-up)
 /// auth.
 pub(super) const LATE_APPS: &[&str] =
-    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "functions", "studio"];
+    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "functions", "mcp", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -1002,6 +1005,8 @@ fn start_stack(
     let mut extra = phases.run("Neon images", || neon_images(stack))?;
     let runtime_tag = phases.run("functions runtime image", || ensure_functions_runtime_image(stack))?;
     extra.push(("CHELABASE_FUNCTIONS_RUNTIME_TAG".into(), runtime_tag));
+    let mcp_tag = phases.run("mcp runtime image", || ensure_mcp_runtime_image(stack))?;
+    extra.push(("CHELABASE_MCP_RUNTIME_TAG".into(), mcp_tag));
     let nextest = host_nextest();
     if nextest.is_none() {
         eprintln!(
@@ -1171,11 +1176,19 @@ pub(super) const FUNCTIONS_RUNTIME_INPUTS: [&str; 4] = [
     "infra/functions-runtime/watchdog.sh",
 ];
 
-/// The functions runtime image's workbench tag: `wb-<first 12 hex of the SHA-256 of its inputs>`
-/// (each input's path and bytes), so a change to any of them makes `up` build it again.
-pub(super) fn functions_runtime_tag(checkout: &Path) -> anyhow::Result<String> {
+/// What the MCP runtime's image is built from (relative to the checkout; mcp-core m12).
+pub(super) const MCP_RUNTIME_INPUTS: [&str; 4] = [
+    "infra/images/mcp-runtime.Dockerfile",
+    "infra/mcp-runtime/config.capnp",
+    "infra/mcp-runtime/runner.js",
+    "infra/mcp-runtime/watchdog.sh",
+];
+
+/// A runtime image's workbench tag: `wb-<first 12 hex of the SHA-256 of its inputs>` (each input's
+/// path and bytes), so a change to any of them makes `up` build it again.
+fn runtime_tag(checkout: &Path, inputs: &[&str]) -> anyhow::Result<String> {
     let mut h = Sha256::new();
-    for rel in FUNCTIONS_RUNTIME_INPUTS {
+    for rel in inputs {
         let bytes = std::fs::read(checkout.join(rel)).with_context(|| format!("reading {rel}"))?;
         h.update(rel.as_bytes());
         h.update((bytes.len() as u64).to_le_bytes());
@@ -1184,11 +1197,25 @@ pub(super) fn functions_runtime_tag(checkout: &Path) -> anyhow::Result<String> {
     Ok(format!("wb-{}", &hex::encode(h.finalize())[..12]))
 }
 
-/// Builds `chelabase/functions-runtime:<tag>` from the checkout unless it is there; returns the
-/// tag (the overlay's `CHELABASE_FUNCTIONS_RUNTIME_TAG`).
-fn ensure_functions_runtime_image(stack: &Stack) -> anyhow::Result<String> {
-    let tag = functions_runtime_tag(&stack.checkout)?;
-    let image = format!("chelabase/functions-runtime:{tag}");
+/// The functions runtime image's workbench tag.
+pub(super) fn functions_runtime_tag(checkout: &Path) -> anyhow::Result<String> {
+    runtime_tag(checkout, &FUNCTIONS_RUNTIME_INPUTS)
+}
+
+/// The MCP runtime image's workbench tag.
+pub(super) fn mcp_runtime_tag(checkout: &Path) -> anyhow::Result<String> {
+    runtime_tag(checkout, &MCP_RUNTIME_INPUTS)
+}
+
+/// Builds `chelabase/<name>:<tag>` from the checkout (the Dockerfile is the first input) unless
+/// it is there; returns the tag.
+fn ensure_runtime_image(
+    stack: &Stack,
+    name: &str,
+    tag: String,
+    inputs: &[&str],
+) -> anyhow::Result<String> {
+    let image = format!("chelabase/{name}:{tag}");
     let present = Command::new("docker")
         .args(["image", "inspect", &image])
         .stdout(Stdio::null())
@@ -1199,11 +1226,24 @@ fn ensure_functions_runtime_image(stack: &Stack) -> anyhow::Result<String> {
         eprintln!("[workbench]   {image} is there");
     } else {
         let mut cmd = Command::new("docker");
-        cmd.args(["build", "-t", &image, "-f", FUNCTIONS_RUNTIME_INPUTS[0], "."])
+        cmd.args(["build", "-t", &image, "-f", inputs[0], "."])
             .current_dir(&stack.checkout);
         run(cmd)?;
     }
     Ok(tag)
+}
+
+/// Builds the functions runtime image; returns the tag (the overlay's
+/// `CHELABASE_FUNCTIONS_RUNTIME_TAG`).
+fn ensure_functions_runtime_image(stack: &Stack) -> anyhow::Result<String> {
+    let tag = functions_runtime_tag(&stack.checkout)?;
+    ensure_runtime_image(stack, "functions-runtime", tag, &FUNCTIONS_RUNTIME_INPUTS)
+}
+
+/// Builds the MCP runtime image; returns the tag (`CHELABASE_MCP_RUNTIME_TAG`).
+fn ensure_mcp_runtime_image(stack: &Stack) -> anyhow::Result<String> {
+    let tag = mcp_runtime_tag(&stack.checkout)?;
+    ensure_runtime_image(stack, "mcp-runtime", tag, &MCP_RUNTIME_INPUTS)
 }
 
 /// `scripts/neon-images.sh`'s choice (a local `just neon-build`, else the pinned images), plus

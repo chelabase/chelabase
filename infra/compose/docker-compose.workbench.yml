@@ -213,6 +213,14 @@ services:
     image: chelabase/functions-runtime:${CHELABASE_FUNCTIONS_RUNTIME_TAG:-latest}
     pull_policy: never
 
+  # mcp-core (m12): the image `chelabase workbench up` builds locally from
+  # infra/images/mcp-runtime.Dockerfile, tagged by its inputs' hash. Everything else (the sandbox
+  # network, the command, the hardening) is the base file's, in profile `mcp`, which every
+  # workbench compose call turns on.
+  mcp-runtime:
+    image: chelabase/mcp-runtime:${CHELABASE_MCP_RUNTIME_TAG:-latest}
+    pull_policy: never
+
   safekeeper1:
     user: "0"
     entrypoint: *neon-as-stack-user
@@ -774,6 +782,37 @@ services:
         condition: service_healthy
       seaweedfs:
         condition: service_started
+
+  # mcp-core (m12): the host-built binary, its listeners on the base file's aliases (the public one
+  # on the default network, the internal one on `mcp-sandbox`). It reads the stack env for the
+  # hosts and the member public key's path, and mounts that key alone; no other secret.
+  mcp:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/mcp"]
+    read_only: !reset null
+    env_file:
+      - *stack-env
+    environment: !override
+      - CHELABASE_MCP_LISTEN=mcp-public:8095,127.0.0.1:8095
+      - CHELABASE_MCP_INTERNAL_LISTEN=mcp-internal:8096
+      - CHELABASE_MCP_RUNTIME_URL=http://mcp-runtime:8080
+      - CHELABASE_MCP_ALLOWED_ORIGINS=${CHELABASE_MCP_ALLOWED_ORIGINS:-}
+      - CHELABASE_MCP_LOG_CODE=${CHELABASE_MCP_LOG_CODE:-}
+      - CHELABASE_MCP_TIMEOUT_MS=${CHELABASE_MCP_TIMEOUT_MS:-}
+      - CHELABASE_MCP_RESULT_MAX_BYTES=${CHELABASE_MCP_RESULT_MAX_BYTES:-}
+      - CHELABASE_MCP_CALLS_PER_MINUTE=${CHELABASE_MCP_CALLS_PER_MINUTE:-}
+      - CHELABASE_MCP_MEMBER_CONCURRENCY=${CHELABASE_MCP_MEMBER_CONCURRENCY:-}
+      - CHELABASE_MCP_CONCURRENCY=${CHELABASE_MCP_CONCURRENCY:-}
+    volumes: !override
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+    secrets:
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8095/health"]
+    depends_on: !reset {}
 
   # Edge functions (m10): the host-built binary in the base file's profile `services`, on its
   # aliases there, in the Docker group like the orchestrator and the worker. The metadata URL in

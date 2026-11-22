@@ -557,13 +557,26 @@ async fn a_third_concurrent_call_is_rate_limited_at_once() {
 
 // ---- live: the real runtime on the workbench (m12, #356) ----
 
-/// The workbench's MCP endpoint and a member token for it, from the environment
-/// `just workbench test` sets.
+/// The workbench's MCP endpoint (`CHELABASE_MCP_LIVE_URL`, in the runner's stack env) and a member
+/// token for it: `CHELABASE_MCP_LIVE_TOKEN` when set, else the dev member's, from
+/// `chelabase dev token` (`CHELABASE_CLI`), as the other live tests get theirs.
 fn live() -> (String, String) {
     let url = std::env::var("CHELABASE_MCP_LIVE_URL")
         .expect("CHELABASE_MCP_LIVE_URL: run through `just workbench test`");
-    let token = std::env::var("CHELABASE_MCP_LIVE_TOKEN")
-        .expect("CHELABASE_MCP_LIVE_TOKEN: run through `just workbench test`");
+    let token = std::env::var("CHELABASE_MCP_LIVE_TOKEN").unwrap_or_else(|_| {
+        let cli = std::env::var("CHELABASE_CLI")
+            .expect("CHELABASE_MCP_LIVE_TOKEN or CHELABASE_CLI: run through `just workbench test`");
+        let out = std::process::Command::new(cli)
+            .args(["dev", "token"])
+            .output()
+            .expect("run chelabase dev token");
+        assert!(
+            out.status.success(),
+            "chelabase dev token: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("a token").trim().to_owned()
+    });
     (url, token)
 }
 
@@ -598,7 +611,7 @@ async fn live_call(url: &str, token: &str, code: &str) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "live: needs mcp-runtime on the workbench (m12, #356)"]
+#[ignore = "live: needs mcp-runtime on the workbench (`just workbench test -p mcp --test runtime -- --run-ignored only`)"]
 async fn search_runs_in_the_runtime() {
     let (url, token) = live();
     let result = live_call(
