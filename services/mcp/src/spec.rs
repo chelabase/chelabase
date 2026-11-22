@@ -1,5 +1,6 @@
 //! Builds the MCP spec bundle (`openapi/mcp.json`) from the management and data documents.
 
+use crate::policy::{self, Class};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -9,6 +10,7 @@ use std::fmt;
 pub enum SpecError {
     UnknownRef(String),
     Shape(String),
+    Unclassified(String),
 }
 
 impl fmt::Display for SpecError {
@@ -16,6 +18,9 @@ impl fmt::Display for SpecError {
         match self {
             SpecError::UnknownRef(r) => write!(f, "unknown $ref {r}"),
             SpecError::Shape(m) => write!(f, "unexpected document shape: {m}"),
+            SpecError::Unclassified(op) => {
+                write!(f, "{op} has no class in services/mcp/src/policy.rs")
+            }
         }
     }
 }
@@ -31,7 +36,9 @@ const METHODS: [&str; 8] = [
 ///
 /// Every local `$ref` is resolved inline; a schema that reaches itself again ends in
 /// `{"x-circular": "<Name>"}`. Error responses fold into `x-errors` and the shared envelope is
-/// described once under `x-error-envelope`. `consoleQuery`'s `tree` takes `runQuery`'s request
+/// described once under `x-error-envelope`. Operations the policy table excludes are left
+/// out (and a path left with none); the others carry `x-class`, and body-dependent ones
+/// `x-class-rule`. An operation without a class is an error. `consoleQuery`'s `tree` takes `runQuery`'s request
 /// schema from the data document.
 pub fn build(management: &Value, data: &Value) -> Result<Value, SpecError> {
     let schemas = schemas_of(management)?;
@@ -39,11 +46,23 @@ pub fn build(management: &Value, data: &Value) -> Result<Value, SpecError> {
     for (path, item) in object(management.get("paths"), "paths")? {
         let mut out = Map::new();
         for (method, operation) in object(Some(item), "path item")? {
-            if METHODS.contains(&method.as_str()) {
-                out.insert(method.clone(), operation_of(operation, schemas)?);
+            if !METHODS.contains(&method.as_str()) {
+                continue;
             }
+            let class = class_of(path, method, operation)?;
+            if class == Class::Excluded {
+                continue;
+            }
+            let mut op = operation_of(operation, schemas)?;
+            op["x-class"] = class.as_str().into();
+            if let Some(rule) = operation["operationId"].as_str().and_then(policy::rule_of) {
+                op["x-class-rule"] = rule.into();
+            }
+            out.insert(method.clone(), op);
         }
-        paths.insert(path.clone(), Value::Object(out));
+        if !out.is_empty() {
+            paths.insert(path.clone(), Value::Object(out));
+        }
     }
     type_console_tree(&mut paths, data)?;
 
@@ -77,6 +96,18 @@ pub fn render(bundle: &Value) -> String {
     let mut text = serde_json::to_string_pretty(&sorted(bundle)).expect("a Value serializes");
     text.push('\n');
     text
+}
+
+/// The table's class for one operation; an operation without one stops the build.
+fn class_of(path: &str, method: &str, operation: &Value) -> Result<Class, SpecError> {
+    let method = method.to_ascii_uppercase();
+    let Some(id) = operation.get("operationId").and_then(Value::as_str) else {
+        return Err(SpecError::Unclassified(format!(
+            "(no operationId) {method} {path}"
+        )));
+    };
+    policy::static_class(id, &method)
+        .ok_or_else(|| SpecError::Unclassified(format!("{id} {method} {path}")))
 }
 
 fn schemas_of(doc: &Value) -> Result<&Map<String, Value>, SpecError> {
@@ -248,8 +279,49 @@ mod tests {
     }
 
     fn op(responses: Value) -> Value {
-        json!({"/x": {"get": {"operationId": "getX", "tags": ["t"], "summary": "s",
+        json!({"/x": {"get": {"operationId": "getMe", "tags": ["t"], "summary": "s",
             "security": [{"bearer": []}], "responses": responses}}})
+    }
+
+    #[test]
+    fn refuses_an_unclassified_operation() {
+        let unknown = json!({"/x": {"get": {"operationId": "getNewThing", "responses": {}}}});
+        let err = build(&doc(json!({}), unknown), &empty_data()).unwrap_err();
+        assert_eq!(err, SpecError::Unclassified("getNewThing GET /x".into()));
+        let anonymous = json!({"/x": {"get": {"responses": {}}}});
+        let err = build(&doc(json!({}), anonymous), &empty_data()).unwrap_err();
+        assert_eq!(err, SpecError::Unclassified("(no operationId) GET /x".into()));
+        // A known name under another method is not the operation the table classified.
+        let moved = json!({"/x": {"post": {"operationId": "getMe", "responses": {}}}});
+        assert!(build(&doc(json!({}), moved), &empty_data()).is_err());
+    }
+
+    #[test]
+    fn drops_excluded_operations_and_marks_the_rest() {
+        let m = doc(
+            json!({}),
+            json!({
+                "/obj": {
+                    "put": {"operationId": "storagePutObject", "responses": {}},
+                    "delete": {"operationId": "storageDeleteObject", "responses": {}}
+                },
+                "/part": {"put": {"operationId": "storageUploadPart", "responses": {}}},
+                "/sql": {"post": {"operationId": "runSql", "responses": {}}}
+            }),
+        );
+        let b = build(&m, &empty_data()).unwrap();
+        assert_eq!(
+            b["paths"]["/obj"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["delete"]
+        );
+        assert_eq!(b["paths"]["/obj"]["delete"]["x-class"], "destructive");
+        assert!(b["paths"]["/obj"]["delete"].get("x-class-rule").is_none());
+        assert!(b["paths"].get("/part").is_none());
+        assert_eq!(b["paths"]["/sql"]["post"]["x-class"], "destructive");
+        assert_eq!(
+            b["paths"]["/sql"]["post"]["x-class-rule"],
+            crate::policy::rule_of("runSql").unwrap()
+        );
     }
 
     #[test]
