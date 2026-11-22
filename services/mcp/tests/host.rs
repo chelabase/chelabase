@@ -672,6 +672,49 @@ async fn destructive_without_the_flag_is_refused_and_sticky() {
     assert!(all_logs().contains("destructive_flag_required"));
 }
 
+/// A refused run's error lists the calls already made, so a retry with the flag doesn't repeat
+/// a write that happened.
+#[tokio::test]
+async fn a_refusal_lists_the_calls_already_made() {
+    let h = Harness::start().await;
+    h.respond(|_| Reply::json(201, json!({"id": "br_9"})));
+    let result = h
+        .execute(calls(vec![
+            call(
+                "POST",
+                "/v1/databases/db_1/branches",
+                json!({"name": "dev"}),
+            ),
+            call("DELETE", "/v1/databases/db_1", Value::Null),
+        ]))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "destructive_flag_required", "{result}");
+    assert_eq!(error["operations"], json!(["deleteDatabase"]));
+    assert_eq!(
+        error["calls"],
+        json!([{"operation": "createBranch", "status": 201}]),
+        "the made write is reported: {error}"
+    );
+    assert_eq!(h.seen().len(), 1);
+}
+
+/// Nothing made: the refusal carries no `calls`.
+#[tokio::test]
+async fn a_refusal_before_any_call_has_no_calls() {
+    let h = Harness::start().await;
+    let result = h
+        .execute(calls(vec![call(
+            "DELETE",
+            "/v1/databases/db_1",
+            Value::Null,
+        )]))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "destructive_flag_required", "{result}");
+    assert!(error.get("calls").is_none(), "{error}");
+}
+
 #[tokio::test]
 async fn destructive_with_the_flag_is_forwarded() {
     let h = Harness::start().await;
@@ -1331,6 +1374,60 @@ async fn audit_lines_have_no_bodies() {
     }
 }
 
+/// A body that isn't a request envelope still writes its audit line.
+#[tokio::test]
+async fn a_malformed_envelope_is_audited() {
+    let h = Harness::start().await;
+    let result = h
+        .execute(calls(vec![
+            json!({"raw": "not json"}),
+            json!({"method": "GET", "path": "/v1/projects", "extra": "marker-extra-31"}),
+        ]))
+        .await;
+    let answers = answers(&result);
+    assert_eq!(answers[0]["http"], 400, "{result}");
+    assert_eq!(answers[1]["http"], 400, "{result}");
+    assert!(h.seen().is_empty());
+    let exec_id = h.runtime.exec_ids.lock().unwrap()[0].clone();
+    let logs = all_logs();
+    let lines: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("api call") && l.contains(&exec_id))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs}");
+    for line in lines {
+        assert!(line.contains("refusal=\"invalid_request\""), "{line}");
+        assert!(line.contains("status=400"), "{line}");
+        assert!(!line.contains("marker-extra-31"), "{line}");
+    }
+}
+
+/// An integer outside i64/u64 is refused, not forwarded (maybe rounded).
+#[tokio::test]
+async fn a_number_that_would_lose_precision_is_refused() {
+    let h = Harness::start().await;
+    let raw = |n: &str| {
+        json!({"raw": format!(
+            r#"{{"method":"POST","path":"{BRANCH}/sql","body":{{"sql":"select 1","params":[{n}]}}}}"#
+        )})
+    };
+    let result = h
+        .execute_destructive(calls(vec![
+            raw("18446744073709551616"),
+            raw("-9223372036854775809"),
+            raw("18446744073709551615"),
+        ]))
+        .await;
+    let answers = answers(&result);
+    for entry in &answers[..2] {
+        assert_eq!(refusal(entry), "invalid_request", "{entry}");
+    }
+    assert_eq!(answer(&answers[2])["status"], 200, "{}", answers[2]);
+    let seen = h.seen();
+    assert_eq!(seen.len(), 1, "only the exact number went out: {seen:?}");
+    assert_eq!(seen[0].json()["params"], json!([18446744073709551615u64]));
+}
+
 // ---- deadlines ----
 
 #[tokio::test]
@@ -1371,6 +1468,121 @@ async fn a_timeout_lists_the_calls_already_made() {
         "the upstream call is still open"
     );
     assert!(h.registry.is_empty());
+}
+
+/// The host's deadline comes before the runner's, so the code can get the cut call's 504 and
+/// return a value: the tool result is still the timeout error, listing the cut call.
+#[tokio::test]
+async fn audit_a_cut_write_is_not_silent_when_the_code_returns() {
+    let h = Harness::with(Options {
+        timeout: Duration::from_millis(400),
+        ..Options::default()
+    })
+    .await;
+    h.respond(|_| Reply::hang());
+    let result = h
+        .execute_destructive(calls(vec![call(
+            "POST",
+            &format!("{BRANCH}/sql"),
+            json!({"sql": "insert into t values (1); insert into t values (2)"}),
+        )]))
+        .await;
+    assert_eq!(h.seen().len(), 1, "the write reached the API");
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "timeout", "{result}");
+    assert_eq!(
+        error["calls"],
+        json!([{"operation": "runSql", "status": "unknown"}])
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("may have been applied"), "{message}");
+}
+
+/// A gateway that answers `200` with its headers and then never finishes the body (a SQL
+/// run's NDJSON starts before the script ends): its address.
+async fn headers_then_hang() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = socket.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                            content-length: 1000\r\n\r\n{\"statement\":1}\n";
+                let _ = socket.write_all(head.as_bytes()).await;
+                // Hold the connection open until the host drops it.
+                let _ = socket.read(&mut buf).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A call cut after its status came back but before its body ended is cut all the same.
+#[tokio::test]
+async fn a_call_cut_mid_answer_is_reported() {
+    let addr = headers_then_hang().await;
+    let h = Harness::with(Options {
+        timeout: Duration::from_millis(400),
+        config: HostConfig {
+            api_url: Some(format!("http://{addr}")),
+            ..HostConfig::default()
+        },
+    })
+    .await;
+    let result = h
+        .execute_destructive(calls(vec![call(
+            "POST",
+            &format!("{BRANCH}/sql"),
+            json!({"sql": "insert into t values (1); insert into t values (2)"}),
+        )]))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "timeout", "{result}");
+    assert_eq!(
+        error["calls"],
+        json!([{"operation": "runSql", "status": "unknown"}])
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("may have been applied"), "{message}");
+}
+
+/// A run with a cut call is a timeout whatever the code returns, and lists every call made,
+/// answered or cut; the call after the deadline never leaves the host.
+#[tokio::test]
+async fn a_cut_run_lists_every_call_when_the_code_returns() {
+    let h = Harness::with(Options {
+        timeout: Duration::from_millis(400),
+        ..Options::default()
+    })
+    .await;
+    h.respond(|seen| {
+        let mut reply = Reply::json(200, json!([]));
+        if seen.uri.path() == "/v1/teams" {
+            reply.delay = Duration::from_millis(600);
+        }
+        reply
+    });
+    let result = h
+        .execute(calls(vec![
+            get("/v1/projects"),
+            get("/v1/teams"),
+            get("/v1/projects"),
+        ]))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "timeout", "{result}");
+    assert_eq!(
+        error["calls"],
+        json!([
+            {"operation": "listProjects", "status": 200},
+            {"operation": "listTeams", "status": "unknown"},
+        ])
+    );
+    assert_eq!(h.seen().len(), 2);
 }
 
 #[tokio::test]

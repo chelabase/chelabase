@@ -32,8 +32,15 @@
 //! A refusal the host makes is answered as an API-shaped error (the runner takes only statuses
 //! 100–599): `{status, ok: false, headers: {}, body: {error: {code, message}}}`.
 //!
-//! Each call writes one `info` audit line (target `mcp::audit`, message `api call`) with no
-//! body, value, concrete path or token.
+//! A number serde_json can't carry exactly (an integer outside i64/u64, or a decimal its f64
+//! would round) is refused `invalid_request` rather than forwarded rounded.
+//!
+//! A call the host answers `timeout` (cut at the deadline or the run's end, or made after the
+//! deadline) makes the run a timeout whatever the code returns, and the tool's error lists the
+//! calls made. A refused run's error lists them too.
+//!
+//! Each call, a malformed envelope included, writes one `info` audit line (target
+//! `mcp::audit`, message `api call`) with no body, value, concrete path or token.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -227,12 +234,22 @@ pub struct Refusal {
     pub operations: Vec<String>,
 }
 
-/// A call the run forwarded: its operation and the API's status (`None`: cut before the
-/// status came back).
+/// A call the run forwarded: its operation and the API's status (`None`: no status came
+/// back).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Made {
     pub operation: String,
     pub status: Option<u16>,
+    /// Cut by the host (deadline or the run's end) before its answer was whole: it may have
+    /// been applied whatever `status` says.
+    pub cut: bool,
+}
+
+impl Made {
+    /// Whether the code never learned how the call ended.
+    pub fn unknown(&self) -> bool {
+        self.cut || self.status.is_none()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +257,8 @@ struct Calls {
     calls: u32,
     refusal: Option<Refusal>,
     made: Vec<Made>,
+    /// The host answered a call `timeout` (cut, or after the deadline).
+    timed_out: bool,
 }
 
 /// What a run's API calls did, shared by the tool call and the host.
@@ -272,12 +291,27 @@ impl Journal {
         self.state().made.clone()
     }
 
-    /// Whether a `runSql` call was cut before its answer.
+    /// Whether a `runSql` call ended without the code learning how.
     pub fn sql_cut(&self) -> bool {
         self.state()
             .made
             .iter()
-            .any(|m| m.operation == "runSql" && m.status.is_none())
+            .any(|m| m.operation == "runSql" && m.unknown())
+    }
+
+    /// Whether the host answered a call `timeout`: the run is a timeout whatever the code
+    /// returns.
+    pub fn timed_out(&self) -> bool {
+        self.state().timed_out
+    }
+
+    /// Records a `timeout` answer, and the cut of entry `index` if one was made.
+    fn time_out(&self, index: Option<usize>) {
+        let mut state = self.state();
+        state.timed_out = true;
+        if let Some(made) = index.and_then(|i| state.made.get_mut(i)) {
+            made.cut = true;
+        }
     }
 
     /// Sets the sticky refusal (the first one wins) or adds `operation` to it.
@@ -422,8 +456,21 @@ async fn callback(
         return not_found();
     }
     let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
+        audit(&Line {
+            exec_id: &exec_id,
+            exec: &exec,
+            operation: "",
+            class: "",
+            method: "",
+            template: "",
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            request_bytes: bytes.len(),
+            response_bytes: 0,
+            refusal: Code::InvalidRequest.as_str(),
+        });
         return (StatusCode::BAD_REQUEST, "not a request envelope").into_response();
     };
+    let exact = !lossy_number(&bytes);
     let mut line = Line {
         exec_id: &exec_id,
         exec: &exec,
@@ -436,7 +483,7 @@ async fn callback(
         response_bytes: 0,
         refusal: "",
     };
-    let response = handle(&host, &exec, &envelope, &mut line).await;
+    let response = handle(&host, &exec, &envelope, exact, &mut line).await;
     audit(&line);
     response
 }
@@ -445,6 +492,7 @@ async fn handle<'a>(
     host: &Host,
     exec: &'a Exec,
     envelope: &'a Envelope,
+    exact: bool,
     line: &mut Line<'a>,
 ) -> Response {
     let refuse = |line: &mut Line<'a>, code: Code| {
@@ -452,10 +500,11 @@ async fn handle<'a>(
         line.status = code.status();
         refused(code)
     };
+    let journal = &exec.journal;
     if Instant::now() >= exec.deadline {
+        journal.time_out(None);
         return refuse(line, Code::Timeout);
     }
-    let journal = &exec.journal;
     let matched = Matcher::bundle().find(&envelope.method, &envelope.path);
     let read_only = exec.caller.read_only();
 
@@ -518,6 +567,10 @@ async fn handle<'a>(
     if secret_fields::answers_with_credential(operation) {
         return refuse(line, Code::SecretsUnavailable);
     }
+    // serde_json (without `arbitrary_precision`) would forward such a number rounded.
+    if !exact {
+        return refuse(line, Code::InvalidRequest);
+    }
     let body = match body.as_ref().map(serde_json::to_vec).transpose() {
         Ok(body) => body,
         Err(_) => return refuse(line, Code::InvalidRequest),
@@ -540,6 +593,80 @@ async fn handle<'a>(
             refuse(line, code)
         }
     }
+}
+
+/// The member's `Authorization` value.
+fn bearer(token: &str) -> Option<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+/// Whether the JSON text `bytes` (already parsed) holds a number serde_json can't carry
+/// exactly: an integer outside i64/u64, or a number whose re-serialized form is another
+/// decimal value.
+fn lossy_number(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let Ok(token) = std::str::from_utf8(&bytes[start..i]) else {
+                    return true;
+                };
+                if !exact_number(token) {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Whether serde_json carries the JSON number `token` exactly.
+fn exact_number(token: &str) -> bool {
+    if !token.contains(['.', 'e', 'E']) {
+        return token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok();
+    }
+    let Ok(Value::Number(n)) = serde_json::from_str::<Value>(token) else {
+        return false;
+    };
+    decimal(token) == decimal(&n.to_string())
+}
+
+/// A JSON number as `(negative, significant digits, exponent)` of `0.digits × 10^exponent`;
+/// zero is `(false, "", 0)`.
+fn decimal(token: &str) -> (bool, String, i64) {
+    let (negative, rest) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i64>().unwrap_or(i64::MAX / 2)),
+        None => (rest, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{int}{frac}");
+    let leading = digits.len() - digits.trim_start_matches('0').len();
+    let digits = digits.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return (false, String::new(), 0);
+    }
+    let exponent = exponent + int.len() as i64 - leading as i64;
+    (negative, digits.to_owned(), exponent)
 }
 
 /// The URL of a call: the gateway's address, the checked path, the query.
@@ -589,7 +716,7 @@ async fn forward(
         return Err((Code::OperationNotAllowed, 0));
     };
     let token = exec.caller.credential().expose();
-    let Ok(bearer) = HeaderValue::from_str(&format!("Bearer {token}")) else {
+    let Some(bearer) = bearer(token) else {
         return Err((Code::UpstreamUnavailable, 0));
     };
 
@@ -599,6 +726,7 @@ async fn forward(
         state.made.push(Made {
             operation: operation.to_owned(),
             status: None,
+            cut: false,
         });
         (state.made.len() - 1, state.calls)
     };
@@ -656,8 +784,14 @@ async fn forward(
     };
     let (status, headers, bytes) = tokio::select! {
         biased;
-        () = exec.ended() => return Err((Code::Timeout, 0)),
-        () = tokio::time::sleep_until(exec.deadline.into()) => return Err((Code::Timeout, 0)),
+        () = exec.ended() => {
+            exec.journal.time_out(Some(index));
+            return Err((Code::Timeout, 0));
+        }
+        () = tokio::time::sleep_until(exec.deadline.into()) => {
+            exec.journal.time_out(Some(index));
+            return Err((Code::Timeout, 0));
+        }
         done = work => done?,
     };
     let size = bytes.len();
@@ -696,6 +830,66 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bearer_is_sensitive() {
+        let value = bearer("tok").unwrap();
+        assert_eq!(value, "Bearer tok");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn integers_outside_i64_and_u64_are_lossy() {
+        let lossy = |n: &str| lossy_number(format!(r#"{{"a":[{n}]}}"#).as_bytes());
+        for n in [
+            "18446744073709551616",
+            "-9223372036854775809",
+            "123456789012345678901234567890",
+            // Outside the range even though its f64 is exact.
+            "100000000000000000000",
+        ] {
+            assert!(lossy(n), "{n}");
+        }
+        for n in [
+            "18446744073709551615",
+            "-9223372036854775808",
+            "0",
+            "-0",
+            "1.5",
+            "1e3",
+            "1E-7",
+            "0.1",
+            "1.0",
+            "-2.50",
+        ] {
+            assert!(!lossy(n), "{n}");
+        }
+        // Digits inside strings and keys are not numbers.
+        assert!(!lossy_number(
+            br#"{"99999999999999999999999": "123456789012345678901234567890", "e": "1e400\"9"}"#
+        ));
+    }
+
+    /// A decimal that serde_json would round is lossy. The build decides: `chelabase-query`
+    /// turns on serde_json's `arbitrary_precision` for this crate, and then numbers are carried
+    /// as written and none is.
+    #[test]
+    fn a_decimal_serde_json_would_round_is_lossy() {
+        for n in ["0.10000000000000000001", "12345678901234567890123.0"] {
+            let rounds = serde_json::from_str::<Value>(n).unwrap().to_string().as_str() != n;
+            assert_eq!(!exact_number(n), rounds, "{n}");
+        }
+        assert_eq!(decimal("0.10"), decimal("1e-1"));
+        assert_eq!(decimal("-2.50"), decimal("-25E-1"));
+        assert_eq!(decimal("1200"), decimal("1.2e3"));
+        assert_eq!(decimal("0"), decimal("-0.0e5"));
+        assert_ne!(decimal("0.10000000000000000001"), decimal("0.1"));
+        assert_ne!(
+            decimal("12345678901234567890123.0"),
+            decimal("1.2345678901234568e22")
+        );
+        assert_ne!(decimal("-1"), decimal("1"));
+    }
 
     #[test]
     fn config_reads_the_three_variables() {
