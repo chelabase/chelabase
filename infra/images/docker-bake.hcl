@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
 }
 
 target "_app" {
@@ -134,4 +134,16 @@ target "functions-runtime" {
   }
   annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags        = ["${REPO}/functions-runtime:${TAG}"]
+}
+
+# The MCP sandbox runtime (mcp-core): workerd, the runner worker and the watchdog.
+target "mcp-runtime" {
+  context    = "."
+  dockerfile = "infra/images/mcp-runtime.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
+  tags        = ["${REPO}/mcp-runtime:${TAG}"]
 }
