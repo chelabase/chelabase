@@ -246,6 +246,9 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
         // The detached calls reach the host before the awaited ones.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    if let Some(ms) = script["gap_ms"].as_u64() {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
     let mut answers = vec![];
     for call in script["calls"].as_array().cloned().unwrap_or_default() {
         let body = match call.get("raw").and_then(Value::as_str) {
@@ -276,6 +279,12 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
     }
     match script["then"].as_str() {
         Some("hang") => std::future::pending::<Response>().await,
+        Some("runner_timeout") => Json(json!({
+            "ok": false,
+            "error": {"code": "timeout", "message": "the runner's time is up"},
+            "logs": [],
+        }))
+        .into_response(),
         Some("throw") => Json(json!({
             "ok": false,
             "error": {"code": "threw", "message": "thrown by the code"},
@@ -1495,6 +1504,10 @@ enum End {
     Returns,
     /// The code throws.
     Throws,
+    /// The code awaits a call the host cuts at its deadline, then throws.
+    HostTimeoutThenThrow,
+    /// The code awaits a call that never answers; the runner itself times out.
+    RunnerTimeout,
     /// The code awaits a call the host cuts at its deadline, then returns.
     HostTimeout,
     /// The code makes a destructive call without the flag, then returns.
@@ -1574,7 +1587,12 @@ fn case(end: End, state: CallState) -> (Value, Vec<(String, Value)>, usize) {
     }
     match end {
         End::Returns | End::Throws => {}
-        End::HostTimeout | End::Disconnect => {
+        End::RunnerTimeout => {
+            // The call never answers; the runner gives up first and the run's end cuts it.
+            detached.push(get("/v1/projects/p_hang"));
+            labels.push(("getProject", json!("unknown")));
+        }
+        End::HostTimeout | End::HostTimeoutThenThrow | End::Disconnect => {
             calls.push(get("/v1/projects/p_hang"));
             labels.push(("getProject", json!("unknown")));
         }
@@ -1582,7 +1600,11 @@ fn case(end: End, state: CallState) -> (Value, Vec<(String, Value)>, usize) {
     }
     // One audit line per call the host received.
     let received = calls.len() + detached.len();
-    let then = if end == End::Throws { "throw" } else { "value" };
+    let then = match end {
+        End::Throws | End::HostTimeoutThenThrow => "throw",
+        End::RunnerTimeout => "runner_timeout",
+        _ => "value",
+    };
     let script = json!({
         "calls": calls,
         "detached": detached,
@@ -1629,7 +1651,13 @@ async fn check_matrix(end: End) {
     for state in STATES {
         let (script, labels, received) = case(end, state);
         let h = Harness::with(Options {
-            timeout: Duration::from_millis(if end == End::HostTimeout { 600 } else { 5000 }),
+            timeout: Duration::from_millis(
+                if matches!(end, End::HostTimeout | End::HostTimeoutThenThrow) {
+                    600
+                } else {
+                    5000
+                },
+            ),
             ..Options::default()
         })
         .await;
@@ -1668,15 +1696,26 @@ async fn check_matrix(end: End) {
                 lines.len()
             ));
         }
+        // A call cut because the run ended is `cut`, not a deadline `timeout`.
+        if state == CallState::DetachedKept
+            && matches!(end, End::Returns | End::Throws | End::Refusal)
+        {
+            let run_sql: Vec<_> = lines.iter().filter(|l| l.contains("runSql")).collect();
+            if run_sql.len() != 1 || !run_sql[0].contains("refusal=\"cut\"") {
+                failures.push(format!("{what}: runSql line is not a cut: {run_sql:?}"));
+            }
+        }
         let want_code = match end {
             End::Refusal => Some("destructive_flag_required"),
-            End::HostTimeout => Some("timeout"),
+            End::HostTimeout | End::HostTimeoutThenThrow | End::RunnerTimeout => Some("timeout"),
             End::Throws => Some("threw"),
             End::Returns if unknown => Some("calls_unfinished"),
             _ => None,
         };
         let want_calls = match end {
             End::Refusal => !labels.is_empty(),
+            // A timed-out run lists every forwarded call.
+            End::HostTimeout | End::HostTimeoutThenThrow | End::RunnerTimeout => !labels.is_empty(),
             _ => unknown,
         };
         match (want_code, result["isError"] == true) {
@@ -1744,6 +1783,62 @@ async fn invariant_when_the_code_throws() {
 #[tokio::test]
 async fn invariant_when_the_host_times_out() {
     check_matrix(End::HostTimeout).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_host_times_out_and_the_code_throws() {
+    check_matrix(End::HostTimeoutThenThrow).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_runner_times_out() {
+    check_matrix(End::RunnerTimeout).await;
+}
+
+#[tokio::test]
+async fn a_cut_then_a_throw_is_a_timeout_listing_the_call() {
+    let h = Harness::with(Options {
+        timeout: Duration::from_millis(400),
+        ..Options::default()
+    })
+    .await;
+    h.respond(|_| Reply::hang());
+    let result = h
+        .execute_destructive(json!({
+            "calls": [call("POST", &format!("{BRANCH}/sql"), json!({"sql": "insert into t values (1)"}))],
+            "then": "throw",
+        }))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(
+        error["calls"],
+        json!([{"operation": "runSql", "status": "unknown"}]),
+        "{result}"
+    );
+    assert_eq!(error["code"], "timeout", "{result}");
+}
+
+#[tokio::test]
+async fn a_call_after_the_deadline_then_a_throw_is_a_timeout_listing_calls() {
+    let h = Harness::with(Options {
+        timeout: Duration::from_millis(400),
+        ..Options::default()
+    })
+    .await;
+    h.respond(matrix_gateway);
+    let result = h
+        .execute(json!({
+            "detached": [get("/v1/projects")], "gap_ms": 500,
+            "calls": [get("/v1/projects")], "then": "throw",
+        }))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "timeout", "{result}");
+    assert_eq!(
+        error["calls"],
+        json!([{"operation": "listProjects", "status": 200}]),
+        "{result}"
+    );
 }
 
 #[tokio::test]

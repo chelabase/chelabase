@@ -500,14 +500,18 @@ fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'stat
             code: ErrorCode::Timeout,
             message,
         } if !made.is_empty() || journal.timed_out() => Some((error(timeout, message, None), timeout)),
+        // The host's deadline passed: whatever the code did after it (returned on a cut call's
+        // answer, threw on the 504), the result is `timeout`.
+        _ if journal.timed_out() => {
+            let message = match outcome {
+                Outcome::Error { message, .. } => message.as_str(),
+                Outcome::Value(_) => "the execution's time is up",
+            };
+            Some((error(timeout, message, None), timeout))
+        }
         Outcome::Error { code, message } if unknown => {
             Some((error(code.as_str(), message, None), code.as_str()))
         }
-        // The host's deadline passed: the code may have returned on a cut call's answer.
-        Outcome::Value(_) if journal.timed_out() => Some((
-            error(timeout, "the execution's time is up", None),
-            timeout,
-        )),
         Outcome::Value(_) if unknown => Some((
             error(
                 CALLS_UNFINISHED,
