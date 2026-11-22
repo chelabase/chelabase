@@ -43,6 +43,27 @@ pub const STALE_DELETE_SECS: i64 = 60;
 /// How many ready branches each pass checks for the `chelabase` schema (one `admin_sql` each)
 /// and resyncs the login roles of.
 pub const SCHEMA_CHECKS_PER_PASS: usize = 20;
+/// How many branches each pass gives the elevated data API login ahead of the health checks'
+/// round-robin ([`login_rollout_batch`]): branches set up before the login existed, whose
+/// elevated keys answer 503 until their bootstrap has run. At
+/// [`LOGIN_ROLLOUT_CONCURRENCY`] at a time and a few seconds a bootstrap, 200 keep a pass's
+/// extra time near a minute, so the pass's other work (stale rows, compute recreation) isn't
+/// held up for long; a fleet of thousands is done within a few passes instead of one pass per
+/// [`SCHEMA_CHECKS_PER_PASS`] branches.
+pub const LOGIN_ROLLOUT_PER_PASS: usize = 200;
+/// How many of those bootstraps run at once. Each is a few `psql` sessions on its own
+/// compute (never two on one compute) and a few metadata writes, so the bound is on the
+/// worker: 8 child sessions at a time, twice what the start-time key sync runs
+/// ([`crate::resync::KEY_MARK_SYNC_CONCURRENCY`]), small beside the metadata pool and the
+/// host's process and port limits.
+pub const LOGIN_ROLLOUT_CONCURRENCY: usize = 8;
+/// How many more passes try a branch whose rollout bootstrap failed, ahead of the
+/// round-robin. The elevated login's password is stored before its script runs, so a branch
+/// that failed after that is no longer listed as missing the login; without the retries it
+/// would wait for the round-robin with its elevated keys answering 503. Past them the
+/// round-robin's health check and role resync reach it as before, so a branch that keeps
+/// failing doesn't hold back the others.
+pub const LOGIN_ROLLOUT_RETRIES: u32 = 3;
 /// How long a database row may stay `enabling` before reconcile runs its enable bootstrap again
 /// (the orchestrator's publish has no reply, so a lost one would leave it there). Longer than
 /// [`crate::data_api::ENABLE_DEADLINE`], so a slow enable isn't started twice.
@@ -444,6 +465,41 @@ pub fn schema_check_batch(
         .collect()
 }
 
+/// The branches a pass gives the elevated login now: of `missing` (no elevated login stored,
+/// oldest first), those ready, `normal` and with a running compute, at most `n`. A stopped
+/// compute's branch is left out: its bootstrap runs when it starts.
+pub fn login_rollout_batch(
+    missing: &[BranchId],
+    branches: &[LiveBranch],
+    running: &HashSet<String>,
+    n: usize,
+) -> Vec<BranchId> {
+    missing
+        .iter()
+        .filter(|id| {
+            branches.iter().any(|b| {
+                b.id == **id
+                    && b.status == BranchStatus::Ready
+                    && b.kind == BranchKind::Normal
+                    && b.endpoint_id.as_ref().is_some_and(|ep| running.contains(ep))
+            })
+        })
+        .take(n)
+        .copied()
+        .collect()
+}
+
+/// Runs `job` for each of `items`, at most `limit` at a time.
+pub(crate) async fn run_bounded<T, Fut>(items: Vec<T>, limit: usize, job: impl Fn(T) -> Fut)
+where
+    Fut: Future<Output = ()>,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::iter(items)
+        .for_each_concurrent(limit.max(1), job)
+        .await;
+}
+
 /// What one pass's round-robin batch found.
 #[derive(Debug, Default)]
 struct RoundRobin {
@@ -549,7 +605,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         clock: &(dyn Fn() -> Instant + Sync),
     ) -> Result<(), String> {
         let snapshot = self.observe().await.map_err(|e| format!("{e:#}"))?;
-        let actions = plan(&snapshot);
+        let given_login = self.roll_out_elevated_logins(&snapshot).await;
+        let mut actions = plan(&snapshot);
+        // Their whole-branch bootstrap just ran.
+        actions.retain(|a| {
+            !matches!(a, Action::BootstrapDataApi { branch_id, database: None } if given_login.contains(branch_id))
+        });
         let recreating: HashSet<&str> = actions
             .iter()
             .filter_map(|a| match a {
@@ -758,6 +819,69 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         }
         stale
+    }
+
+    /// Gives the elevated data API login to branches that were set up before it existed,
+    /// ahead of the health checks' round-robin: up to [`LOGIN_ROLLOUT_PER_PASS`] of them with
+    /// a running compute ([`login_rollout_batch`]) get the whole-branch bootstrap,
+    /// [`LOGIN_ROLLOUT_CONCURRENCY`] at a time. Returns the branches whose bootstrap passed.
+    /// A failure is logged and the branch is tried again first on each of the next
+    /// [`LOGIN_ROLLOUT_RETRIES`] passes (it may no longer be listed as missing the login: the
+    /// password is stored before the script runs); after those the round-robin's health
+    /// check reaches it as before. Nothing to do costs one metadata read.
+    async fn roll_out_elevated_logins(&self, snapshot: &Snapshot) -> HashSet<BranchId> {
+        let missing = match self.metadata.branches_missing_elevated_login().await {
+            Ok(missing) => missing,
+            Err(err) => {
+                warn!("listing branches without the elevated data API login: {err}");
+                return HashSet::new();
+            }
+        };
+        let running: HashSet<String> = snapshot
+            .computes
+            .iter()
+            .filter(|ep| !snapshot.not_running.contains(*ep))
+            .cloned()
+            .collect();
+        // Earlier failures first, then the branches still listed.
+        let mut candidates: Vec<BranchId> = {
+            let mut retry = self.login_rollout_retry.lock().unwrap_or_else(|e| e.into_inner());
+            retry.retain(|id, _| snapshot.branches.iter().any(|b| b.id == *id));
+            let mut ids: Vec<BranchId> = retry.keys().copied().collect();
+            ids.sort_by_key(|id| id.as_uuid());
+            ids
+        };
+        let listed: Vec<BranchId> = missing.iter().filter(|id| !candidates.contains(id)).copied().collect();
+        candidates.extend(listed);
+        let batch = login_rollout_batch(&candidates, &snapshot.branches, &running, LOGIN_ROLLOUT_PER_PASS);
+        if batch.is_empty() {
+            return HashSet::new();
+        }
+        info!(branches = batch.len(), waiting = missing.len(), "giving branches the elevated data API login");
+        let done = std::sync::Mutex::new(HashSet::new());
+        run_bounded(batch, LOGIN_ROLLOUT_CONCURRENCY, |id| {
+            let done = &done;
+            async move {
+                match self.reconcile_data_api(id, None).await {
+                    Ok(()) => {
+                        done.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+                        self.login_rollout_retry.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    }
+                    Err(err) => {
+                        let mut retry = self.login_rollout_retry.lock().unwrap_or_else(|e| e.into_inner());
+                        let failures = retry.entry(id).or_insert(0);
+                        *failures += 1;
+                        let again = *failures <= LOGIN_ROLLOUT_RETRIES;
+                        if !again {
+                            retry.remove(&id);
+                        }
+                        warn!(branch_id = %id, retried_next_pass = again, "giving the branch the elevated data API login: {err}");
+                    }
+                }
+            }
+        })
+        .await;
+        done.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The next [`SCHEMA_CHECKS_PER_PASS`] ready `normal` branches with a compute (by id, after
@@ -3773,6 +3897,135 @@ mod tests {
         assert_eq!(healed, ["broken"], "only the broken database is bootstrapped");
     }
 
+    /// A pass with more branches missing the elevated login than the health checks'
+    /// round-robin reaches gives every one of them (with a running compute) the login in
+    /// that pass, and bootstraps none of them twice.
+    #[tokio::test]
+    async fn a_pass_gives_every_branch_missing_the_elevated_login_its_login() {
+        let (w, journal) = worker();
+        let many = SCHEMA_CHECKS_PER_PASS + 12;
+        let mut mains = Vec::new();
+        for _ in 0..many {
+            let (id, ep) = provision(&w, &journal).await;
+            mains.push((BranchId::from(id), ep));
+        }
+        // As a release before the login left them.
+        w.metadata.state().elevated_logins.clear();
+        assert_eq!(w.metadata.branches_missing_elevated_login().await.unwrap().len(), many);
+        w.computes.sql.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        let stored = w.metadata.state().elevated_logins.len();
+        assert_eq!(stored, many, "every branch has its login after one pass");
+        assert!(w.metadata.branches_missing_elevated_login().await.unwrap().is_empty());
+        let sql = w.computes.sql.lock().unwrap().clone();
+        for (_main, ep) in &mains {
+            let scripts = sql
+                .iter()
+                .filter(|(e, _, s)| e == ep && s.contains("CREATE ROLE chelabase_authenticator_elevated NOLOGIN"))
+                .count();
+            assert_eq!(scripts, 1, "{ep}: bootstrapped once in the pass");
+        }
+        // The next pass has nothing to roll out.
+        w.computes.sql.lock().unwrap().clear();
+        let snapshot = w.observe().await.unwrap();
+        assert!(w.roll_out_elevated_logins(&snapshot).await.is_empty());
+    }
+
+    /// The rollout's batch: oldest first, only ready `normal` branches with a running
+    /// compute, at most the pass's limit.
+    #[test]
+    fn the_login_rollout_batch_is_bounded_and_skips_stopped_computes() {
+        let branch = |ep: Option<&str>, status, kind| LiveBranch {
+            id: BranchId::new(),
+            database_id: DatabaseId::new(),
+            kind,
+            status,
+            endpoint_id: ep.map(str::to_owned),
+            timeline_id: None,
+            pending_timeline_id: None,
+            superseded_timeline_id: None,
+            age_secs: 0,
+        };
+        let branches = vec![
+            branch(Some("ep-a"), BranchStatus::Ready, BranchKind::Normal),
+            branch(Some("ep-stopped"), BranchStatus::Ready, BranchKind::Normal),
+            branch(None, BranchStatus::Ready, BranchKind::Normal),
+            branch(Some("ep-b"), BranchStatus::Ready, BranchKind::Normal),
+            branch(Some("ep-c"), BranchStatus::Ready, BranchKind::Normal),
+        ];
+        let missing: Vec<BranchId> = branches.iter().map(|b| b.id).collect();
+        let running: HashSet<String> = ["ep-a", "ep-b", "ep-c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            login_rollout_batch(&missing, &branches, &running, 10),
+            [branches[0].id, branches[3].id, branches[4].id]
+        );
+        assert_eq!(login_rollout_batch(&missing, &branches, &running, 2), [branches[0].id, branches[3].id]);
+        // A branch the metadata lists but the pass didn't see isn't touched.
+        assert!(login_rollout_batch(&[BranchId::new()], &branches, &running, 10).is_empty());
+        const { assert!(LOGIN_ROLLOUT_PER_PASS > SCHEMA_CHECKS_PER_PASS) };
+    }
+
+    /// W7: a branch whose rollout bootstrap failed after its password was stored is no
+    /// longer listed as missing the login, and is still tried again on the next pass, ahead
+    /// of the round-robin; one that keeps failing is tried [`LOGIN_ROLLOUT_RETRIES`] more
+    /// passes and then left to the round-robin.
+    #[tokio::test]
+    async fn a_failed_rollout_bootstrap_is_tried_again_on_the_next_passes() {
+        let (w, journal) = worker();
+        let (id, _ep) = provision(&w, &journal).await;
+        let main = BranchId::from(id);
+        let sent = |w: &FakeWorker| w.computes.sql.lock().unwrap().len();
+        w.metadata.state().elevated_logins.clear();
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        let snapshot = w.observe().await.unwrap();
+        assert!(w.roll_out_elevated_logins(&snapshot).await.is_empty(), "the bootstrap failed");
+        assert!(
+            w.metadata.branches_missing_elevated_login().await.unwrap().is_empty(),
+            "the password is stored before the script, so the branch isn't listed any more"
+        );
+        *w.computes.sql_failures_left.lock().unwrap() = 0;
+        assert_eq!(w.roll_out_elevated_logins(&snapshot).await, HashSet::from([main]));
+        assert!(w.login_rollout_retry.lock().unwrap().is_empty());
+        let before = sent(&w);
+        assert!(w.roll_out_elevated_logins(&snapshot).await.is_empty());
+        assert_eq!(sent(&w), before, "a branch that has its login isn't bootstrapped again");
+
+        // A branch that keeps failing: the listed attempt, then the retries, then no more.
+        w.metadata.state().elevated_logins.clear();
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        for attempt in 0..=LOGIN_ROLLOUT_RETRIES {
+            assert!(w.roll_out_elevated_logins(&snapshot).await.is_empty());
+            let failures = w.login_rollout_retry.lock().unwrap().get(&main).copied();
+            let want = (attempt < LOGIN_ROLLOUT_RETRIES).then_some(attempt + 1);
+            assert_eq!(failures, want, "after attempt {attempt}");
+        }
+        *w.computes.sql_failures_left.lock().unwrap() = 0;
+        let before = sent(&w);
+        assert!(w.roll_out_elevated_logins(&snapshot).await.is_empty());
+        assert_eq!(sent(&w), before, "past its retries the branch is the round-robin's");
+    }
+
+    /// The rollout's jobs all run, never more than the bound at once.
+    #[tokio::test]
+    async fn run_bounded_keeps_within_its_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, peak, ran) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        run_bounded((0..50).collect(), LOGIN_ROLLOUT_CONCURRENCY, |_| async {
+            let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            now.fetch_sub(1, Ordering::SeqCst);
+            ran.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(ran.load(Ordering::SeqCst), 50);
+        assert_eq!(peak.load(Ordering::SeqCst), LOGIN_ROLLOUT_CONCURRENCY);
+    }
+
     #[test]
     fn the_enabling_retry_waits_longer_than_an_enable_may_run() {
         assert!(ENABLING_RETRY_SECS > crate::data_api::ENABLE_DEADLINE.as_secs());
@@ -3801,7 +4054,10 @@ mod tests {
             role_timeline: None,
             role_bypass_rls: false,
         });
-        w.computes.answer("pg_has_role", "ok 16384\n");
+        // Only the role check's SQL has this (the role catalog's read has `pg_has_role` too).
+        w.computes.answer("THEN 'personal_login'", "ok 16384\n");
+        // The role catalog lists `reporting` (hex), an ordinary role: only a listed role is granted.
+        w.computes.answer("chelabase: member roles", "r 7265706f7274696e67 f f f f\n");
         w.computes.answer_in("app", "to_regclass('chelabase.schema_version')", "f\n");
         w.computes.sql.lock().unwrap().clear();
 
@@ -3809,7 +4065,9 @@ mod tests {
 
         let sql = w.computes.sql.lock().unwrap().clone();
         assert!(
-            sql.iter().any(|(e, _, s)| *e == ep && s.starts_with("GRANT \"reporting\" TO authenticator")),
+            sql.iter().any(|(e, _, s)| *e == ep
+                && s.starts_with(crate::data_api::KEY_GRANT_MARK)
+                && s.contains("\nGRANT \"reporting\" TO authenticator;\n")),
             "the secret key's role is granted again"
         );
     }

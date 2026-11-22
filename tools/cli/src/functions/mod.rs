@@ -173,11 +173,7 @@ impl Api {
         let text = resp.text().await.unwrap_or_default();
         match status {
             200..=299 => Ok(text),
-            401 => bail!(
-                "{} refused the session: run `chelabase login --url {}`",
-                self.url,
-                self.url
-            ),
+            401 => bail!("{}", session_refused(&self.url)),
             _ => {
                 let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
                 bail!("{}", error_message(method.as_str(), &path, status, &value))
@@ -471,8 +467,34 @@ async fn dev(
     }
 }
 
+/// What a 401 tells the person to run: `chelabase login` for the same URL, with `--insecure`
+/// when the URL is plain http that login refuses without it.
+fn session_refused(url: &str) -> String {
+    let insecure = if crate::login::check_scheme(url, false).is_err() && crate::login::check_scheme(url, true).is_ok() {
+        " --insecure"
+    } else {
+        ""
+    };
+    format!("{url} refused the session: run `chelabase login --url {url}{insecure}`")
+}
+
 #[cfg(test)]
 mod tests {
+    /// O11: the 401 hint names `--insecure` exactly when login would refuse the URL without it.
+    #[test]
+    fn the_session_hint_names_insecure_for_plain_http_off_loopback() {
+        assert_eq!(
+            super::session_refused("http://api.example.com:8000"),
+            "http://api.example.com:8000 refused the session: run `chelabase login --url http://api.example.com:8000 --insecure`"
+        );
+        for url in ["https://api.example.com", "http://api.chelabase.localhost:8000", "http://127.0.0.1:8000"] {
+            assert_eq!(
+                super::session_refused(url),
+                format!("{url} refused the session: run `chelabase login --url {url}`")
+            );
+        }
+    }
+
     use super::*;
     use clap::Parser;
 

@@ -53,7 +53,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::access::{RoleGraph, Target, authorize, authorize_project};
+use crate::access::{RoleGraph, Target, authorize, authorize_project, is_tenant_admin, tenant_admin_needed};
 use crate::app_user_admin::{identity_failed, identity_unavailable};
 use crate::{
     AllRoles, ApiBytes, AppState, AuthPrincipal, BoxError, InstancePrincipal, JobPort, MeRoles,
@@ -75,6 +75,14 @@ pub trait MembersPort: Send + Sync + 'static {
         tenant: TenantId,
         email: &str,
     ) -> impl Future<Output = Result<Option<MemberRecord>, MetadataError>> + Send;
+
+    /// Whether the tenant has a `removed` member with `email` (trimmed, case folded as stored;
+    /// a blank email never matches).
+    fn removed_member_with_email(
+        &self,
+        tenant: TenantId,
+        email: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
     /// The tenant's invited and active members, with what the list adds.
     fn list_members(
@@ -409,6 +417,10 @@ impl MembersPort for MetadataClient {
         email: &str,
     ) -> Result<Option<MemberRecord>, MetadataError> {
         MetadataClient::member_by_email(self, tenant, email).await
+    }
+
+    async fn removed_member_with_email(&self, tenant: TenantId, email: &str) -> Result<bool, MetadataError> {
+        MetadataClient::removed_member_with_email(self, tenant, email).await
     }
 
     async fn list_members(&self, tenant: TenantId) -> Result<Vec<MemberListing>, MetadataError> {
@@ -1231,6 +1243,7 @@ pub(crate) fn write_failed(what: &str, err: AccessWriteError, not_found: &str) -
             ErrorCode::Conflict,
             "the member's access changed while this was being checked; try again",
         ),
+        AccessWriteError::RemovedMember => tenant_admin_needed(),
         AccessWriteError::Db(err) => internal(what, err),
     }
 }
@@ -2204,6 +2217,19 @@ async fn send_invite<M, J>(
 ///    who join by accepting, and a new person (a passwordless user is made).
 ///
 /// The grants keep the invariant ([`RoleContext::check_effective`]) before anything is written.
+///
+/// Invariant (m10): two kinds of invite are a tenant admin's alone ([`is_tenant_admin`];
+/// anyone else, a key included, gets 403 `forbidden` with `required: "tenant admin"`):
+/// - `delivery: "link"`, whose code sets the account's password and marks its email verified:
+///   refused here, before any identity user, member row, invite or code is made;
+/// - one that brings back a member whose row is `removed` (a removal is a tenant-level
+///   decision): refused here, before any identity call, when a removed row has the email, or
+///   when the identity user found has one; and always by the metadata write
+///   itself, under the tenant lock, for a `removed` row with the person's identity user or email
+///   ([`NewInvite::readmit_removed`]); a live member removed before the grants write is refused
+///   by that write's member lock and answered the same.
+///
+/// Both routes come through here, so neither can skip the rule.
 async fn invite<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
@@ -2217,7 +2243,21 @@ where
     J: JobPort,
 {
     let actor = actor(principal.member.as_ref())?;
+    let tenant_admin = is_tenant_admin(principal);
+    if delivery == Delivery::Link && !tenant_admin {
+        return Err(tenant_admin_needed());
+    }
     let tenant = principal.tenant_id;
+    // O4: a refused invite has no side effects. A removed row with the email is refused here,
+    // before any identity call (no user made, no one's invite budget spent); the store's check
+    // under the tenant lock stays the authority for a row removed after this read.
+    if !tenant_admin {
+        match state.metadata.removed_member_with_email(tenant, &email).await {
+            Ok(true) => return Err(tenant_admin_needed()),
+            Ok(false) => {}
+            Err(err) => return Err(internal("invite: removed member by email", err)),
+        }
+    }
     let found = match &state.identity_service {
         Some(identity) => identity
             .find_user_by_email(&Pool::Members, &email)
@@ -2228,6 +2268,7 @@ where
     let existing = match found {
         Some(user) => match state.metadata.member_by_identity_user(tenant, &user.id).await {
             Ok(Some(m)) if m.status != MemberStatus::Removed => m,
+            Ok(Some(_)) if !tenant_admin => return Err(tenant_admin_needed()),
             Ok(_) => return invite_with_code(state, principal, actor, &email, &grants, &teams, Some(user), delivery).await,
             Err(err) => return Err(internal("invite: member by user", err)),
         },
@@ -2273,6 +2314,14 @@ where
         {
             // I4: their access moved between the check and the write: check again.
             Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
+            // The member was removed after the read (the write locks only a live member).
+            Err(AccessWriteError::NotFound) if member_removed_since(state, existing.id).await? => {
+                return Err(if tenant_admin {
+                    ApiError::new(409, ErrorCode::Conflict, "the member was removed meanwhile: send the invite again")
+                } else {
+                    tenant_admin_needed()
+                });
+            }
             other => break other.map_err(|err| write_failed("invite: put grants", err, "project not found"))?,
         }
     };
@@ -2302,6 +2351,17 @@ where
             invite_url: None,
         },
     ))
+}
+
+/// Whether `member`'s row is `removed` now (an invite's grants write found no live member).
+async fn member_removed_since<M, J>(state: &AppState<M, J>, member: Uuid) -> Result<bool, ApiError>
+where
+    M: MetadataPort,
+{
+    match state.metadata.member(member).await {
+        Ok(m) => Ok(m.is_some_and(|m| m.status == MemberStatus::Removed)),
+        Err(err) => Err(internal("invite: member after the write", err)),
+    }
 }
 
 /// Invite step 2 (R29): an `invited` member and its invite, for `existing` (a members-pool user
@@ -2412,6 +2472,9 @@ where
                     token_hash: token.hash,
                     grants: &grants,
                     teams: &seen,
+                    // m10: only a tenant admin's invite brings back a removed member; the store
+                    // decides it under the tenant lock, by identity user or email.
+                    readmit_removed: is_tenant_admin(principal),
                 },
             )
             .await;
@@ -3416,7 +3479,7 @@ where
     operation_id = "createProjectInvite",
     tag = "members",
     summary = "Invite a person into this project",
-    description = "As `createInvite` (including `delivery`), with one grant on this project.",
+    description = "As `createInvite` (including `delivery`), with one grant on this project. Two invites are a tenant admin's alone (403 `forbidden`, `required`: `tenant admin`, before anything is made): one with `delivery: \"link\"`, and one that brings back a member who was removed (matched by their account or their email).",
     params(("id" = Uuid, Path, description = "Project id")),
     request_body = CreateProjectInviteRequest,
     responses(
@@ -3424,6 +3487,7 @@ where
         (status = 201, description = "A new member, `invited` or `added`", body = InviteResult),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden` with `required`: `tenant admin`: `delivery: \"link\"`, or the person is a removed member, and you aren't a tenant admin", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account, or whom another tenant holds (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
@@ -3456,6 +3520,11 @@ where
     // MH-8, P31: before anything else is read or made.
     if body.team_ids.is_some() {
         return unprocessable("teams can be attached only by a tenant admin's invite").into_response();
+    }
+    // m10: a link sets the account's password, so it is a tenant admin's (`invite` holds the
+    // rule for every caller; refused here too so it costs no reads).
+    if body.delivery == Delivery::Link && !is_tenant_admin(&principal) {
+        return tenant_admin_needed().into_response();
     }
     let email = tri!(invite_email(&body.email));
     let grant = InviteGrant {

@@ -20,6 +20,7 @@ function meFor(over: { id: string; tenantAdmin?: boolean; role: "viewer" | "deve
   };
 }
 const adminMe = meFor({ id: "ana", role: "admin", roles: "all" });
+const tenantAdminMe = meFor({ id: "tia", tenantAdmin: true, role: "admin", roles: "all" });
 
 const member = (id: string, extra: Partial<Member> = {}): Member => ({
   id, email: `${id}@example.test`, display_name: id[0].toUpperCase() + id.slice(1), status: "active", tenant_admin: false, has_access: true,
@@ -233,6 +234,7 @@ describe("AccessTab", () => {
   it("invite_link_never_reaches_the_cache", async () => {
     const url = "http://studio.test/accept-invite#abc";
     const { queryClient } = setup({
+      me: tenantAdminMe,
       routes: {
         "GET /v1/invites/delivery": ok({ email_available: false, reason: "email_not_configured" }),
         "POST /v1/projects/p1/invites": ok({ outcome: "invited", member: member("new", { status: "invited" }), invite_url: url }),
@@ -249,6 +251,66 @@ describe("AccessTab", () => {
       queryClient.getMutationCache().getAll().map((m) => m.state.data),
     ]);
     expect(cached).not.toContain("accept-invite");
+  });
+
+  it("add_people_hides_the_link_for_a_project_admin", async () => {
+    // Ana is a project Admin, not a tenant admin.
+    const { f } = setup();
+    const dialog = await openAdd();
+    await userEvent.type(within(dialog).getByLabelText("Email"), "new@example.test");
+    expect(within(dialog).queryByRole("radio", { name: /One-time link/ })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Send invite" })).toBeEnabled();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(call(f, "POST", "/v1/projects/p1/invites")).toBeUndefined();
+  });
+
+  // The member list never holds a removed row, so the server's 403 is what tells a project
+  // Admin that bringing someone back is a tenant admin's call.
+  it("add_people_explains_a_tenant_admin_refusal_under_the_email", async () => {
+    setup({
+      routes: {
+        "POST /v1/projects/p1/invites": () =>
+          jsonResponse({ error: { code: "forbidden", message: "this needs tenant admin", required: "tenant admin" } }, 403),
+      },
+    });
+    const dialog = await openAdd();
+    await userEvent.type(within(dialog).getByLabelText("Email"), "rex@example.test");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
+    expect(
+      await within(dialog).findByText(
+        "rex@example.test was removed from the tenant, or their invite or sign-up was turned down. Only a tenant admin can invite them back.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Email")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("add_people_without_email_tells_a_project_admin_to_ask_a_tenant_admin", async () => {
+    const { f } = setup({
+      routes: {
+        "GET /v1/invites/delivery": ok({ email_available: false, reason: "email_not_configured" }),
+        "POST /v1/projects/p1/invites": ok({ outcome: "existing_member", member: member("dee"), invite_url: null }),
+      },
+    });
+    const dialog = await openAdd();
+    await userEvent.type(within(dialog).getByLabelText("Email"), "new@example.test");
+    expect(await within(dialog).findByText(/only a tenant admin can make one\. Ask a tenant admin to invite them\./)).toBeInTheDocument();
+    expect(within(dialog).queryByRole("radio", { name: /One-time link/ })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Send invite" })).toBeDisabled();
+    expect(call(f, "POST", "/v1/projects/p1/invites")).toBeUndefined();
+    // Someone already in the tenant is still added without an invite.
+    await userEvent.clear(within(dialog).getByLabelText("Email"));
+    await userEvent.type(within(dialog).getByLabelText("Email"), "dee@example.test");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(call(f, "POST", "/v1/projects/p1/invites")).toBeDefined());
+  });
+
+  it("add_people_offers_the_link_to_a_tenant_admin", async () => {
+    setup({ me: tenantAdminMe, routes: { "GET /v1/members": ok([...people, member("rex", { status: "removed", has_access: false })]) } });
+    const dialog = await openAdd();
+    await userEvent.type(within(dialog).getByLabelText("Email"), "rex@example.test");
+    expect(await within(dialog).findByRole("radio", { name: /One-time link/ })).toBeInTheDocument();
+    expect(within(dialog).queryByText(/Only a tenant admin can invite them back/)).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Send invite" })).toBeEnabled();
   });
 
   it("activity_lists_events", async () => {

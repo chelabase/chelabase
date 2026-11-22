@@ -7,7 +7,9 @@
 //!
 //! - Viewers are grouped by check identity: the role (`None` = the owner; claims are always
 //!   `{}`). N viewers of one role cost one check.
-//! - A named role's check runs on the `authenticator` pool in the console's exact session
+//! - A named role's check runs on the pool of the login that holds the role (`authenticator`,
+//!   or the elevated login for an elevated role; [`chelabase_query::roles`]'s invariant) in
+//!   the console's exact session
 //!   (`chelabase_query::console_session` with `RunAs::Role { role, claims: {}, oid: None }`,
 //!   `statement_timeout_ms` [`STATEMENT_TIMEOUT_MS`], no plugin settings) and also runs
 //!   `OWNER_LEVEL_SQL` (an owner-level role is refused); the owner's goes to
@@ -35,6 +37,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use chelabase_query::realtime::Relation;
+use chelabase_query::roles::{Login, RoleFacts, login_for};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -267,9 +270,11 @@ impl VisibilityCache {
 
 // --- the production checker ---------------------------------------------------------------
 
-/// What returns a pooled `authenticator` connection to a clean session (rest's): every
-/// transaction sends it first, and again after it ends.
-pub const RESET_SQL: &str = "SET ROLE NONE; RESET ALL";
+/// What returns a pooled `authenticator` connection to a clean session (rest's text,
+/// [`chelabase_query::engine::POOLED_RESET_SQL`]): every transaction sends it first, and
+/// again after it ends. It fails on a session that can't be cleaned (one holding a SQL-level
+/// prepared statement), so no check runs on such a connection.
+pub const RESET_SQL: &str = chelabase_query::engine::POOLED_RESET_SQL;
 
 const REQUEST_ID: &str = "realtime-check";
 
@@ -350,7 +355,13 @@ impl PgChecker {
         role: &str,
         f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, chelabase_query::QueryFailure>,
     ) -> Result<T, CheckError> {
-        let client = self.pools.get(target).await?;
+        // The role's facts, as `authenticator` (the catalog is readable by every role): they
+        // choose the login the check's session runs on.
+        let facts = self
+            .as_authenticator(target, async |c| read_facts(c, role).await)
+            .await?;
+        let login = session_login(role, facts.as_ref())?;
+        let client = self.pools.get_as(target, login).await?;
         let claims = serde_json::json!({});
         let run_as = chelabase_query::RunAs::Role {
             role,
@@ -364,23 +375,18 @@ impl PgChecker {
             &settings(),
             REQUEST_ID,
             async |c, _version| {
-                let level = c
-                    .query_typed_opt(
-                        chelabase_query::roles::OWNER_LEVEL_SQL,
-                        &[(&role, tokio_postgres::types::Type::TEXT)],
-                    )
-                    .await
-                    .map_err(pg_failure)?
-                    .map(|r| r.try_get::<_, Option<bool>>(0))
-                    .transpose()
-                    .map_err(pg_failure)?;
-                match level {
-                    Some(Some(false)) => Ok(Some(f(c).await?)),
-                    // Owner-level, or a role that isn't there (fails closed).
-                    Some(Some(true)) | Some(None) => Ok(None),
+                // Read again inside the session's transaction: the answer the check is held
+                // to. Facts that now choose another login end the check; it is never moved.
+                match read_facts(c, role).await? {
                     None => Err(chelabase_query::QueryFailure::invalid_query(
                         "the role doesn't exist",
                     )),
+                    // Owner-level (fails closed).
+                    Some(now) if now.owner_level => Ok(None),
+                    Some(now) if login_for(role, Some(&now)) != Some(login) => {
+                        Err(chelabase_query::engine::role_unusable(role))
+                    }
+                    Some(_) => Ok(Some(f(c).await?)),
                 }
             },
         )
@@ -421,6 +427,37 @@ impl PgChecker {
         self.owner
             .check(token, target, req.rel_oid, last, req.keys.as_deref(), &req.convert, req.bucket)
             .await
+    }
+}
+
+/// Role `role`'s facts ([`chelabase_query::roles::OWNER_LEVEL_SQL`]; `None`: no such role).
+async fn read_facts(
+    c: &tokio_postgres::Client,
+    role: &str,
+) -> Result<Option<RoleFacts>, chelabase_query::QueryFailure> {
+    c.query_typed_opt(
+        chelabase_query::roles::OWNER_LEVEL_SQL,
+        &[(&role, tokio_postgres::types::Type::TEXT)],
+    )
+    .await
+    .map_err(pg_failure)?
+    .as_ref()
+    .map(RoleFacts::from_row)
+    .transpose()
+    .map_err(pg_failure)
+}
+
+/// The login a check as `role` runs on, from the role's facts
+/// ([`chelabase_query::roles::login_for`]): an owner-level role is refused, a missing one
+/// fails, and an elevated role the elevated login doesn't hold is unavailable (never run on
+/// `authenticator`).
+fn session_login(role: &str, facts: Option<&RoleFacts>) -> Result<Login, CheckError> {
+    match facts {
+        None => Err(CheckError::Failed("the role doesn't exist".into())),
+        Some(f) if f.owner_level => Err(CheckError::OwnerLevel),
+        Some(_) => login_for(role, facts).ok_or_else(|| {
+            CheckError::Unavailable(chelabase_query::engine::role_unusable(role).message)
+        }),
     }
 }
 
@@ -653,6 +690,46 @@ impl Checker for PgChecker {
                 self.as_role(target, role, async |c| role_convert(c, rel_oid, keys).await)
                     .await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A role's check runs on the pool of the login that holds the role: `authenticator`
+    /// for an ordinary role and the data API's own, the elevated login for an elevated role
+    /// it holds. An elevated role it doesn't hold is unavailable (never `authenticator`'s),
+    /// an owner-level role is refused and a missing one fails.
+    #[test]
+    fn as_role_picks_the_pool_by_the_holding_login() {
+        let facts = |owner_level, elevated, held_by_elevated| RoleFacts { owner_level, elevated, held_by_elevated };
+        assert_eq!(session_login("reader", Some(&facts(false, false, false))).unwrap(), Login::Authenticator);
+        assert_eq!(session_login("boss", Some(&facts(false, true, true))).unwrap(), Login::Elevated);
+        let not_moved = session_login("boss", Some(&facts(false, true, false)));
+        assert!(matches!(not_moved, Err(CheckError::Unavailable(_))), "{not_moved:?}");
+        for held in [false, true] {
+            assert!(matches!(session_login("root", Some(&facts(true, true, held))), Err(CheckError::OwnerLevel)));
+            assert_eq!(session_login("anon", Some(&facts(false, true, held))).unwrap(), Login::Authenticator);
+        }
+        assert!(matches!(session_login("ghost", None), Err(CheckError::Failed(_))));
+    }
+
+    /// The check connections are pooled `authenticator` sessions like rest's, so they're
+    /// reset with rest's text: the same clean-up, and the same refusal of a session that
+    /// holds a SQL-level prepared statement.
+    #[test]
+    fn realtime_reset_matches_rest() {
+        assert_eq!(RESET_SQL, chelabase_query::engine::POOLED_RESET_SQL);
+        assert_eq!(settings().reset_sql, chelabase_query::engine::POOLED_RESET_SQL);
+        for part in [
+            "SET ROLE NONE; RESET ALL; ",
+            "pg_catalog.pg_advisory_unlock_all()",
+            "DISCARD TEMP",
+            chelabase_query::engine::NO_SQL_PREPARED_SQL,
+        ] {
+            assert!(RESET_SQL.contains(part), "{part}");
         }
     }
 }

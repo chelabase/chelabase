@@ -148,7 +148,7 @@ impl Fx {
         let ep = self.ep(b).await;
         self.worker
             .computes
-            .admin_sql(&ep, &self.database, sql)
+            .admin_sql(&ep, &self.database, &crate::common::tenant_sql(sql))
             .await
             .map_err(|e| format!("{e:#}"))
     }
@@ -2022,7 +2022,9 @@ async fn phase2_lock_timeout_fails_online_then_retry_finishes() {
                     .admin_sql_with(
                         &ep,
                         &fx.database,
-                        "BEGIN; LOCK TABLE n IN ACCESS SHARE MODE; SELECT pg_sleep(20); COMMIT;",
+                        &common::tenant_sql(
+                            "BEGIN; LOCK TABLE n IN ACCESS SHARE MODE; SELECT pg_sleep(20); COMMIT;",
+                        ),
                         &opts,
                     )
                     .await
@@ -2119,10 +2121,10 @@ async fn retry_after_an_enum_add_lock_timeout_runs_from_the_start() {
                         &fx.database,
                         // `replica` keeps the data API's event trigger quiet: its schema_version row
                 // update would otherwise hold back every DDL of the merge, not only this enum's.
-                &format!(
+                &common::tenant_sql(&format!(
                     "BEGIN; SET LOCAL session_replication_role = replica; \
                      ALTER TYPE {locked} ADD VALUE 'held'; SELECT pg_sleep(15); ROLLBACK;"
-                ),
+                )),
                         &opts,
                     )
                     .await

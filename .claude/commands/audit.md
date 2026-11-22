@@ -14,6 +14,11 @@ Task: `$ARGUMENTS`
 2. Launch the **auditor** agent (`.claude/agents/auditor.md`) in the background. Prompt:
    `project: chelabase`, `epic: <slug>`, `milestone: <n>`, issue number, and nothing else
    about the builder's reasoning. Model: `opus` for auth/crypto/fork/migration; `sonnet`
-   otherwise. Never pass `isolation: "worktree"`.
+   otherwise. Never pass `isolation: "worktree"`. The auditor claims a slot from the
+   shared pool itself and releases it clean; several audits can run at once. If it ends
+   without releasing, clear its claim (`just wt-slots` says how).
+   **Local epic** (`.claude/.cache/epics/<slug>/state.json` has `"local": true`): check
+   status in `state.json` instead of labels, and give the auditor the absolute cache path
+   instead of an issue number.
 3. Report the verdict (`pass` / `changes-requested`), findings by severity, and next step
    (`/build <slug>` to continue, or `/build <slug> <n>` to fix).

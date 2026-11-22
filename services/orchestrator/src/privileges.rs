@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::access::Target;
 use crate::branches::unprocessable;
-use crate::console::{owner_pool_for, pool_failure};
+use crate::console::{owner_pool_for, pool_failure, release_owner_lease};
 use crate::sql_editor::run::RunTls;
 use crate::sql_editor::{load_authorized, pick_pg_database};
 use crate::table_api::{READ_TIMEOUT_SQL, read_failure};
@@ -277,7 +277,7 @@ async fn read(
     rid: &str,
 ) -> Result<Option<String>, QueryFailure> {
     // Not marked done on failure: the connection is closed rather than pooled.
-    let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
+    let lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
     let client = lease.client();
     let pg = |e: tokio_postgres::Error| QueryFailure::from_pg(&e, rid);
     client.simple_query(READ_TIMEOUT_SQL).await.map_err(pg)?;
@@ -305,11 +305,8 @@ async fn read(
         ),
         false => None,
     };
-    client
-        .simple_query("RESET statement_timeout")
-        .await
-        .map_err(pg)?;
-    lease.done();
+    // The full reset, then back to the pool (closed when the reset fails).
+    release_owner_lease(lease, rid).await?;
     Ok(json)
 }
 

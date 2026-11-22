@@ -425,6 +425,14 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         sealed: &str,
         salt: &[u8],
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Stores the `chelabase_authenticator_elevated` password (sealed) and its SCRAM salt
+    /// only when the branch has none. A no-op on a deleting, deleted or unknown branch.
+    fn set_authenticator_elevated_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     /// The branch's Postgres databases with their data API state: main first, then by name.
     fn branch_databases(
         &self,
@@ -533,6 +541,10 @@ pub trait WorkerMetadata: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<(BranchId, String)>, MetadataError>> + Send;
     /// Ready `normal` branches without a live public key or an authenticator password.
     fn branches_missing_data_api(
+        &self,
+    ) -> impl Future<Output = Result<Vec<BranchId>, MetadataError>> + Send;
+    /// Ready `normal` branches with an authenticator password and no elevated login stored.
+    fn branches_missing_elevated_login(
         &self,
     ) -> impl Future<Output = Result<Vec<BranchId>, MetadataError>> + Send;
     fn branch_connection(
@@ -1180,6 +1192,15 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::set_storage_password(self, branch, sealed, salt).await
     }
 
+    async fn set_authenticator_elevated_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_authenticator_elevated_password(self, branch, sealed, salt).await
+    }
+
     async fn branch_databases(
         &self,
         branch: BranchId,
@@ -1291,6 +1312,10 @@ impl WorkerMetadata for MetadataClient {
 
     async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
         MetadataClient::branches_missing_data_api(self).await
+    }
+
+    async fn branches_missing_elevated_login(&self) -> Result<Vec<BranchId>, MetadataError> {
+        MetadataClient::branches_missing_elevated_login(self).await
     }
 
     async fn branch_connection(

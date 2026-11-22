@@ -241,7 +241,7 @@ impl Fx {
     async fn sql_on(&self, ep: &str, database: &str, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(ep, database, sql)
+            .admin_sql(ep, database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
     }
@@ -2066,7 +2066,7 @@ async fn a_protected_branch_refuses_a_developers_schema_changes() {
         fx.sql("CREATE DATABASE guard_two").await;
         fx.reconcile(fx.main).await;
         let triggers = fx.sql_on(&fx.ep, "guard_two", "SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%' AND evtenabled <> 'D'").await;
-        assert_eq!(triggers.trim(), "2");
+        assert_eq!(triggers.trim(), "3");
         // Unprotected again: the Developer may change the schema.
         fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
         fx.reconcile(fx.main).await;
@@ -2112,7 +2112,7 @@ async fn a_planted_guard_schema_cannot_block_the_guard() {
         let enabled = fx
             .sql_on(&fx.ep, &db, "SELECT string_agg(evtenabled::text, ',' ORDER BY evtname) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%'")
             .await;
-        assert_eq!(enabled.trim(), "A,A", "both triggers installed, ENABLE ALWAYS");
+        assert_eq!(enabled.trim(), "A,A,A", "all three triggers installed, ENABLE ALWAYS");
         let leftovers = fx
             .sql_on(&fx.ep, &db, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'chelabase_guard'")
             .await;
@@ -2135,6 +2135,114 @@ async fn a_planted_guard_schema_cannot_block_the_guard() {
             ),
         )
         .await;
+    })
+    .await;
+}
+
+// Index commands that commit their own work before `ddl_command_end` are refused at
+// `ddl_command_start` for locked sessions, before they build or drop anything; maintenance,
+// temporary tables and unlocked sessions are unaffected, and a guard missing its start
+// trigger (the previous version) is reinstalled by the reconciler.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack"]
+async fn a_protected_branch_refuses_concurrent_index_ddl_at_start() {
+    live(|fx| async move {
+        let dev = fx.members[0].id;
+        let boss = fx.members[1].id;
+        let db = fx.database.clone();
+        fx.sql_on(
+            &fx.ep,
+            &db,
+            "GRANT CREATE ON SCHEMA public TO billing; \
+             CREATE TABLE public.ci_dev (id int); ALTER TABLE public.ci_dev OWNER TO billing; \
+             CREATE INDEX ci_dev_old ON public.ci_dev (id); \
+             CREATE MATERIALIZED VIEW public.ci_mv AS SELECT 1 AS x; ALTER MATERIALIZED VIEW public.ci_mv OWNER TO billing; \
+             CREATE TABLE public.ci_owner (id int); ALTER TABLE public.ci_owner OWNER TO postgres; \
+             CREATE ROLE ci_exempt LOGIN PASSWORD 'ci-exempt-pass'; \
+             CREATE TABLE public.ci_ex (id int); ALTER TABLE public.ci_ex OWNER TO ci_exempt; \
+             CREATE ROLE ci_locked LOGIN PASSWORD 'ci-locked-pass'; \
+             CREATE TABLE public.ci_lk (id int); ALTER TABLE public.ci_lk OWNER TO ci_locked; \
+             GRANT USAGE, CREATE ON SCHEMA public TO ci_exempt, ci_locked;",
+        )
+        .await;
+        fx.grant(dev, PlatformRole::Developer, &["billing"]).await;
+        fx.grant(boss, PlatformRole::Admin, &["billing"]).await;
+        fx.metadata.add_guard_exemption(fx.main, "ci_exempt").await.unwrap();
+        fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
+        fx.reconcile(fx.main).await;
+        let triggers = "SELECT string_agg(evtname || '=' || evtenabled::text, ',' ORDER BY evtname) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_schema_guard%'";
+        let all_always = "chelabase_schema_guard_ddl=A,chelabase_schema_guard_drop=A,chelabase_schema_guard_start=A";
+        assert_eq!(fx.sql_on(&fx.ep, &db, triggers).await.trim(), all_always);
+        let refused = |out: &Result<String, String>| out.as_ref().is_err_and(|e| e.contains("42501") && e.contains("chelabase:branch_protected"));
+        let index_count = |name: &str| format!("SELECT count(*) FROM pg_class WHERE relname = '{name}';");
+        let old_valid = "SELECT coalesce((SELECT i.indisvalid::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'ci_dev_old'), 'missing');";
+
+        // A non-Admin member: refused before any work, concurrent or not.
+        let out = fx.as_member(dev, "SET ROLE billing;\nCREATE INDEX CONCURRENTLY ci_dev_new ON public.ci_dev (id);").await;
+        assert!(refused(&out), "create concurrently: {out:?}");
+        assert_eq!(fx.sql_on(&fx.ep, &db, &index_count("ci_dev_new")).await.trim(), "0", "no index, valid or invalid");
+        let out = fx.as_member(dev, "SET ROLE billing;\nDROP INDEX CONCURRENTLY public.ci_dev_old;").await;
+        assert!(refused(&out), "drop concurrently: {out:?}");
+        assert_eq!(fx.sql_on(&fx.ep, &db, old_valid).await.trim(), "true", "still there and valid");
+        let out = fx.as_member(dev, "SET ROLE billing;\nCREATE INDEX ci_dev_plain ON public.ci_dev (id);").await;
+        assert!(refused(&out), "plain create: {out:?}");
+        assert_eq!(fx.sql_on(&fx.ep, &db, &index_count("ci_dev_plain")).await.trim(), "0");
+        let out = fx.as_member(dev, "SET ROLE billing;\nDROP INDEX public.ci_dev_old;").await;
+        assert!(refused(&out), "plain drop: {out:?}");
+        assert_eq!(fx.sql_on(&fx.ep, &db, old_valid).await.trim(), "true");
+        // A login role locked by the switch is refused the same way.
+        let out = fx.direct(&fx.ep, "ci_locked", "ci-locked-pass", "CREATE INDEX CONCURRENTLY ci_lk_i ON public.ci_lk (id);").await;
+        assert!(refused(&out), "locked login: {out:?}");
+        assert_eq!(fx.sql_on(&fx.ep, &db, &index_count("ci_lk_i")).await.trim(), "0");
+        // Maintenance and temporary tables stay allowed; a temporary table's index doesn't.
+        fx.as_member(dev, "SET ROLE billing;\nREINDEX INDEX CONCURRENTLY public.ci_dev_old;").await.unwrap();
+        fx.as_member(dev, "SET ROLE billing;\nREFRESH MATERIALIZED VIEW public.ci_mv;").await.unwrap();
+        assert_eq!(fx.sql_on(&fx.ep, &db, old_valid).await.trim(), "true");
+        fx.as_member(dev, "SET ROLE billing;\nCREATE TEMP TABLE ci_scratch (id int);\nINSERT INTO ci_scratch VALUES (1);\nDROP TABLE ci_scratch;").await.unwrap();
+        let out = fx.as_member(dev, "CREATE TEMP TABLE ci_tmp (id int);\nCREATE INDEX ON ci_tmp (id);").await;
+        assert!(refused(&out), "temporary table index: {out:?}");
+
+        // Unlocked sessions: an Admin member, the owner, an exempt login.
+        fx.as_member(boss, "SET ROLE billing;\nCREATE INDEX CONCURRENTLY ci_boss ON public.ci_dev (id);\nDROP INDEX CONCURRENTLY public.ci_boss;").await.unwrap();
+        fx.sql_on(&fx.ep, &db, "SET SESSION AUTHORIZATION postgres;\nCREATE INDEX CONCURRENTLY ci_own ON public.ci_owner (id);\nDROP INDEX CONCURRENTLY public.ci_own;").await;
+        fx.direct(&fx.ep, "ci_exempt", "ci-exempt-pass", "CREATE INDEX CONCURRENTLY ci_ex_i ON public.ci_ex (id);\nDROP INDEX CONCURRENTLY public.ci_ex_i;").await.unwrap();
+
+        // The previous two-trigger guard: the check answers `f` and a reconcile reinstalls.
+        let check = worker::schema_guard::schema_guard_check_sql(&worker::schema_guard::GuardSettings {
+            guard_logins: true,
+            exempt: BTreeSet::from(["ci_exempt".to_string()]),
+        });
+        // The check passes with these settings while the guard is whole, so the `f` below
+        // is the missing trigger's and not a settings mismatch.
+        assert_eq!(fx.sql_on(&fx.ep, &db, &check).await.trim(), "t");
+        fx.sql_on(&fx.ep, &db, "DROP EVENT TRIGGER chelabase_schema_guard_start; DROP FUNCTION chelabase_guard.refuse_start();").await;
+        assert_eq!(fx.sql_on(&fx.ep, &db, &check).await.trim(), "f");
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.sql_on(&fx.ep, &db, triggers).await.trim(), all_always);
+        let out = fx.as_member(dev, "SET ROLE billing;\nCREATE INDEX CONCURRENTLY ci_dev_new ON public.ci_dev (id);").await;
+        assert!(refused(&out), "after the reinstall: {out:?}");
+        // A disabled start trigger is put back too.
+        fx.sql_on(&fx.ep, &db, "ALTER EVENT TRIGGER chelabase_schema_guard_start DISABLE;").await;
+        assert_eq!(fx.sql_on(&fx.ep, &db, &check).await.trim(), "f");
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.sql_on(&fx.ep, &db, triggers).await.trim(), all_always);
+
+        // Unprotected: all three triggers and the schema go.
+        fx.metadata.set_branch_protected(fx.main, false).await.unwrap();
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.guard_triggers(&db).await, "0");
+        let schema = fx.sql_on(&fx.ep, &db, "SELECT count(*) FROM pg_namespace WHERE nspname = 'chelabase_guard'").await;
+        assert_eq!(schema.trim(), "0");
+        fx.as_member(dev, "SET ROLE billing;\nCREATE INDEX CONCURRENTLY ci_dev_new ON public.ci_dev (id);").await.unwrap();
+        fx.sql_on(
+            &fx.ep,
+            &db,
+            "DROP MATERIALIZED VIEW public.ci_mv; DROP TABLE public.ci_dev, public.ci_owner, public.ci_ex, public.ci_lk; \
+             REVOKE USAGE, CREATE ON SCHEMA public FROM ci_exempt, ci_locked; \
+             DROP ROLE ci_exempt; DROP ROLE ci_locked; REVOKE CREATE ON SCHEMA public FROM billing;",
+        )
+        .await;
+        fx.metadata.remove_guard_exemption(fx.main, "ci_exempt").await.unwrap();
     })
     .await;
 }
@@ -2270,7 +2378,7 @@ async fn no_guarded_session_escapes_the_guard() {
         assert_eq!(fx.allow_conn("pb_esc_one").await, ("f".into(), "neon.born_closed=on".into()));
         fx.reconcile(fx.main).await;
         assert_eq!(fx.allow_conn("pb_esc_one").await, ("t".into(), "-".into()));
-        assert_eq!(fx.guard_triggers("pb_esc_one").await, "2");
+        assert_eq!(fx.guard_triggers("pb_esc_one").await, "3");
         let out = fx.direct_in(&fx.ep, "pb_esc_one", "pb_esc", "pb-esc-pass", "CREATE TABLE public.t (id int);").await;
         assert!(refused(&out), "template1 after its reconcile: {out:?}");
         // 2. One made from template0 is born closed too, guarded and opened by the reconcile.
@@ -2313,7 +2421,7 @@ impl Fx {
     async fn try_owner(&self, database: &str, sql: &str) -> Result<String, String> {
         self.worker
             .computes
-            .admin_sql(&self.ep, database, &format!("SET ROLE postgres;\n{sql}"))
+            .admin_sql(&self.ep, database, &crate::common::tenant_sql(&format!("SET ROLE postgres;\n{sql}")))
             .await
             .map_err(|e| format!("{e:#}"))
     }
@@ -2415,7 +2523,7 @@ async fn a_database_from_template0_is_born_closed_then_guarded() {
         assert_eq!(fx.allow_conn("bc1").await, ("f".into(), "neon.born_closed=on".into()));
         fx.reconcile(fx.main).await;
         assert_eq!(fx.allow_conn("bc1").await, ("t".into(), "-".into()));
-        assert_eq!(fx.guard_triggers("bc1").await, "2");
+        assert_eq!(fx.guard_triggers("bc1").await, "3");
         fx.sql_on(&fx.ep, "bc1", "GRANT CREATE ON DATABASE bc1 TO billing;").await;
         let role = member_role_name(dev);
         let password = fx.password(fx.main, &role).await;
@@ -2436,7 +2544,7 @@ async fn a_closed_database_is_guarded_but_stays_closed() {
         fx.sql("ALTER DATABASE shut ALLOW_CONNECTIONS false;").await;
         fx.metadata.set_branch_protected(fx.main, true).await.unwrap();
         fx.reconcile(fx.main).await;
-        assert_eq!(fx.guard_triggers("shut").await, "2");
+        assert_eq!(fx.guard_triggers("shut").await, "3");
         assert_eq!(fx.allow_conn("shut").await, ("f".into(), "-".into()));
         let err = fx.try_owner("postgres", "ALTER DATABASE shut ALLOW_CONNECTIONS true;").await.unwrap_err();
         assert!(err.contains("set by Chelabase"), "{err}");

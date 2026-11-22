@@ -213,6 +213,32 @@ impl Failure {
         )
     }
 
+    /// 408: a part's body ran past the total deadline
+    /// (`CHELABASE_STORAGE_PART_DEADLINE_SECS`), however steadily it was arriving.
+    pub fn part_deadline(deadline: std::time::Duration) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            format!(
+                "the part's body did not finish within {} s",
+                deadline.as_secs_f64()
+            ),
+        )
+    }
+
+    /// 429: the caller already has [`MAX_LIVE_SESSIONS`](crate::multipart::MAX_LIVE_SESSIONS)
+    /// live upload sessions in this bucket. The text is fixed here, so a user's trigger
+    /// raising the same SQLSTATE can't pass its own through.
+    pub fn too_many_uploads() -> Self {
+        let mut f = QueryFailure::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_uploads",
+            "too many resumable uploads are open in this bucket; complete or abort some",
+        );
+        f.sqlstate = Some("CB006".into());
+        Failure(f)
+    }
+
     /// 404: no resumable upload of that id for this caller (missing, finished, aborted, or
     /// another caller's: one answer).
     pub fn upload_not_found() -> Self {
@@ -313,6 +339,7 @@ impl Failure {
             AcquireError::Busy | AcquireError::TimedOut => {
                 Self::unavailable("too many connections in use; try again")
             }
+            AcquireError::NoElevatedLogin => Self::unavailable(chelabase_query::error::UNREACHABLE),
         }
     }
 

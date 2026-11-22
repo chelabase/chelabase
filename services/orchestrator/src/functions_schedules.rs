@@ -228,6 +228,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`forbidden`: Developer on the branch (Admin when it's protected) is needed; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: the function already has 20 schedules on the branch", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: a bad cron or time zone (`field` names it), an unknown field, or a schedule for a service", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),

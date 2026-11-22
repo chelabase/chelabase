@@ -268,10 +268,14 @@ impl Live {
         self.sql_in(branch, &self.database_name, sql).await
     }
 
-    /// SQL as cloud_admin on `branch`, in `database` (psql's text output).
+    /// SQL as cloud_admin on `branch`, in `database` (psql's text output). The admin session
+    /// starts with `search_path = pg_catalog, pg_temp`; the tests' SQL is written as a tenant
+    /// would write it, so it runs under Postgres's default search path.
     async fn sql_in(&self, branch: BranchId, database: &str, sql: &str) -> String {
         let b = self.branch(branch).await;
         let ep = b.endpoint_id.as_deref().expect("branch endpoint");
+        let sql = format!("SET search_path = \"$user\", public;\n{sql}");
+        let sql = sql.as_str();
         self.worker
             .computes
             .admin_sql(ep, database, sql)
@@ -1788,8 +1792,10 @@ async fn a_session_level_set_role_does_not_leak_to_the_next_request() {
                 PERFORM set_config(''default_transaction_read_only'', ''on'', false); END';",
         )
         .await;
+        // The request ends as another role than the one it asked for: nothing of it commits
+        // (a 500), and its connection isn't reused.
         let called = l.auth(json!({"v":1,"op":"call","fn":"become_anon"})).await;
-        assert_eq!(called.text, "null", "{called:?}");
+        called.error(500, "internal");
         let read = l.auth(json!({"v":1,"op":"select","from":"t"})).await;
         assert_eq!(read.ok(), &json!([{"id":1}]));
         let written = l
@@ -1813,16 +1819,39 @@ async fn the_health_check_sees_what_the_bootstrap_repairs() {
             "ALTER EVENT TRIGGER chelabase_schema_version_ddl DISABLE;",
             "ALTER EVENT TRIGGER chelabase_extension_functions DISABLE;",
             "ALTER ROLE authenticator NOLOGIN;",
+            // The elevated login is part of the machinery too.
+            "ALTER ROLE chelabase_authenticator_elevated NOLOGIN;",
+            "REVOKE SELECT ON chelabase.schema_version FROM chelabase_authenticator_elevated;",
             "REVOKE USAGE ON SCHEMA chelabase FROM PUBLIC, authenticator;",
             "REVOKE SELECT ON chelabase.schema_version FROM authenticator;",
             // The default schema's USAGE (the data API parses as authenticator).
             "REVOKE USAGE ON SCHEMA public FROM PUBLIC, authenticator;",
+            // Drift on the elevated login: its attributes, settings, password, a membership
+            // in it, and its USAGE on the default schema.
+            "ALTER ROLE chelabase_authenticator_elevated BYPASSRLS;",
+            "ALTER ROLE chelabase_authenticator_elevated INHERIT;",
+            "ALTER ROLE chelabase_authenticator_elevated CONNECTION LIMIT 3;",
+            "ALTER ROLE chelabase_authenticator_elevated VALID UNTIL '2020-01-01';",
+            "ALTER ROLE chelabase_authenticator_elevated SET statement_timeout = '1s';",
+            "ALTER ROLE chelabase_authenticator_elevated PASSWORD 'set-by-hand-0123456789';",
+            "DROP ROLE IF EXISTS health_member; CREATE ROLE health_member NOLOGIN; GRANT chelabase_authenticator_elevated TO health_member;",
+            "REVOKE USAGE ON SCHEMA public FROM PUBLIC, chelabase_authenticator_elevated;",
             "DROP EVENT TRIGGER chelabase_schema_version_drop;",
             "DROP FUNCTION chelabase.assert_schema_version(uuid);",
             "DROP FUNCTION chelabase.cap_response(text, bigint);",
         ] {
-            l.sql_on(l.main_id(), breakage).await;
-            assert!(!l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap(), "{breakage}");
+            // The stack's own worker checks this branch too and may repair a breakage before
+            // the check here runs (under full-suite load); the breakage is then made again.
+            // A health check that never sees it still fails the test.
+            let mut seen = false;
+            for _ in 0..3 {
+                l.sql_on(l.main_id(), breakage).await;
+                if !l.worker.data_api_healthy(l.main_id(), &ep).await.unwrap() {
+                    seen = true;
+                    break;
+                }
+            }
+            assert!(seen, "{breakage}");
             l.worker
                 .bootstrap_data_api(&main, &l.database_name)
                 .await
@@ -2022,8 +2051,9 @@ async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
                 && s.contains(" | off | ")),
             "{before}"
         );
+        // It ends as `anon`, not the role it asked for: a 500, nothing committed.
         let wandered = l.auth(json!({"v":1,"op":"call","fn":"wander"})).await;
-        assert_eq!(wandered.text, "null", "{wandered:?}");
+        wandered.error(500, "internal");
         assert_eq!(l.auth(whoami.clone()).await.ok(), &before);
         let read = l.auth(json!({"v":1,"op":"select","from":"t"})).await;
         assert_eq!(read.ok(), &json!([{"id":1}]));
@@ -2031,12 +2061,12 @@ async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
             .auth(json!({"v":1,"op":"insert","into":"t","values":[{"id":2}]}))
             .await;
         assert_eq!(written.ok(), &json!([]));
-        // The same in a batch. Inside the request the RPC's `SET ROLE anon` holds for the
-        // operations after it (as Postgres runs them; anon may read `t`, not run `whoami`).
+        // The same in a batch: the request ends as another role than it asked for, so it
+        // answers 500 with no rows, whatever its other operations read.
         let batch = l
             .auth(json!({"v":1,"op":"batch","ops":[{"op":"call","fn":"wander"}, {"op":"select","from":"t","orderBy":[{"col":"id"}]}]}))
             .await;
-        assert_eq!(batch.ok(), &json!([null, [{"id":1},{"id":2}]]));
+        batch.error(500, "internal");
         assert_eq!(l.auth(whoami).await.ok(), &before);
     })
     .await;
@@ -2884,6 +2914,840 @@ async fn internal_types_matches_the_data_api_types() {
         answer.error(404, "unknown_role");
         let answer = Live::answer(internal_types_of(&l, "types_boss", "", None).await).await;
         answer.error(403, "role_not_allowed");
+    })
+    .await;
+}
+
+// --- The elevated data API login -------------------------------------------------------------
+
+const ELEVATED: &str = "chelabase_authenticator_elevated";
+
+impl Live {
+    /// The roles `login` is a direct member of, sorted, comma-separated.
+    async fn held_by(&self, login: &str) -> String {
+        self.sql_on(
+            self.main_id(),
+            &format!(
+                "SELECT coalesce(string_agg(r.rolname, ',' ORDER BY r.rolname), '') FROM pg_auth_members a \
+                 JOIN pg_roles r ON r.oid = a.roleid WHERE a.member = '{login}'::regrole;"
+            ),
+        )
+        .await
+        .trim()
+        .to_owned()
+    }
+
+    /// How many memberships there are *in* the elevated login (any grantor, any option).
+    async fn members_of_elevated(&self) -> String {
+        self.sql_on(
+            self.main_id(),
+            &format!("SELECT count(*) FROM pg_auth_members WHERE roleid = '{ELEVATED}'::regrole;"),
+        )
+        .await
+        .trim()
+        .to_owned()
+    }
+
+    /// The elevated login's attributes and settings, as one line.
+    async fn elevated_attributes(&self) -> String {
+        self.sql_on(
+            self.main_id(),
+            &format!(
+                "SELECT concat_ws(' ', a.rolcanlogin, a.rolinherit, a.rolsuper, a.rolcreaterole, a.rolcreatedb, \
+                 a.rolreplication, a.rolbypassrls, a.rolconnlimit, coalesce(a.rolvaliduntil::text, 'null'), \
+                 (SELECT count(*) FROM pg_db_role_setting s WHERE s.setrole = a.oid)) \
+                 FROM pg_authid a WHERE a.rolname = '{ELEVATED}';"
+            ),
+        )
+        .await
+        .trim()
+        .to_owned()
+    }
+
+    /// The elevated login's stored password, opened.
+    async fn elevated_password(&self) -> String {
+        let row = self
+            .metadata
+            .branch_connection(self.main_id())
+            .await
+            .unwrap()
+            .expect("the branch's connection row");
+        assert_eq!(row.authenticator_elevated_password_salt.as_ref().map(Vec::len), Some(16));
+        open_credential(
+            &self.key,
+            &self.main_id().to_string(),
+            Purpose::AuthenticatorElevated,
+            row.authenticator_elevated_password_enc.as_deref().expect("an elevated password"),
+        )
+        .expect("sealed for the branch with its own purpose")
+    }
+}
+
+/// LOGIN NOINHERIT, nothing else, no expiry, no settings.
+const ELEVATED_ATTRIBUTES: &str = "t f f f f f f -1 infinity 0";
+
+/// After the bootstrap the elevated login exists with only LOGIN, holds no role, logs in with
+/// its stored password, and gets exactly the elevated roles a key is made for: a BYPASSRLS
+/// role, a LOGIN role and a NOLOGIN member of a LOGIN role go to both logins, an ordinary
+/// role to `authenticator` alone; each key's requests work.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn elevated_login_exists_and_holds_elevated_roles() {
+    live("elevated", |l| async move {
+        assert_eq!(l.elevated_attributes().await, ELEVATED_ATTRIBUTES);
+        assert_eq!(l.held_by(ELEVATED).await, "");
+        assert_eq!(l.members_of_elevated().await, "0");
+        let password = l.elevated_password().await;
+        {
+            use sqlx::Row;
+            let mut session = l.connect_as(ELEVATED, &password).await.expect("the elevated login logs in");
+            let row = sqlx::query("SELECT session_user::text, (SELECT version IS NOT NULL FROM chelabase.schema_version)")
+                .fetch_one(&mut session)
+                .await
+                .expect("it reads the schema version, as authenticator does");
+            assert_eq!(row.get::<String, _>(0), ELEVATED);
+            assert!(row.get::<bool, _>(1));
+        }
+        assert!(l.connect_as(ELEVATED, "not-the-password").await.is_err());
+        // `authenticator`'s password isn't its password.
+        let main = l.branch(l.main_id()).await;
+        let authenticator = open_credential(
+            &l.key,
+            &main.id.to_string(),
+            Purpose::Authenticator,
+            main.authenticator_password_enc.as_deref().expect("authenticator password"),
+        )
+        .unwrap();
+        assert!(l.connect_as(ELEVATED, &authenticator).await.is_err());
+
+        l.owner("CREATE TABLE e (v text); INSERT INTO e VALUES ('seen');").await;
+        // As cloud_admin: BYPASSRLS is a superuser's to give.
+        l.sql_on(
+            l.main_id(),
+            "CREATE ROLE e_bypass NOLOGIN BYPASSRLS;
+             CREATE ROLE e_login LOGIN;
+             CREATE ROLE e_group NOLOGIN;
+             GRANT e_login TO e_group;
+             CREATE ROLE e_plain NOLOGIN;
+             GRANT USAGE ON SCHEMA public TO e_bypass, e_login, e_group, e_plain;
+             GRANT SELECT ON e TO e_bypass, e_login, e_group, e_plain;",
+        )
+        .await;
+        for (role, bypass) in [("e_bypass", true), ("e_login", false), ("e_group", false), ("e_plain", false)] {
+            let check = l.worker.check_data_role(l.main_id(), role).await;
+            assert!(matches!(check, RoleCheck::Ok(_, b) if b == bypass), "{role}: {check:?}");
+        }
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_group,e_login");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+        for role in ["e_bypass", "e_login", "e_group", "e_plain"] {
+            let answer = l
+                .query_on(l.main_id(), DataKeyKind::Secret, role, json!({"v":1,"op":"select","from":"e"}))
+                .await;
+            assert_eq!(answer.ok(), &json!([{"v":"seen"}]), "{role}");
+        }
+        // A second bootstrap changes nothing: the same password, attributes and grants.
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+        assert_eq!(l.elevated_password().await, password);
+        assert_eq!(l.elevated_attributes().await, ELEVATED_ATTRIBUTES);
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_group,e_login");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+        l.connect_as(ELEVATED, &password).await.expect("the same password still logs in");
+    })
+    .await;
+}
+
+impl Live {
+    /// A table `e` every `roles` entry reads, and `whoami()`, which answers the session's
+    /// login (`session_user`) to a request that calls it.
+    async fn login_probe(&self, roles: &str) {
+        self.owner(&format!(
+            "CREATE TABLE e (v text); INSERT INTO e VALUES ('seen');
+             CREATE FUNCTION whoami() RETURNS text LANGUAGE sql STABLE AS 'SELECT session_user::text';
+             GRANT USAGE ON SCHEMA public TO {roles};
+             GRANT SELECT ON e TO {roles};
+             GRANT EXECUTE ON FUNCTION whoami() TO {roles};"
+        ))
+        .await;
+    }
+
+    /// The login a secret key of `role` runs on, as the request itself reads it.
+    async fn login_of(&self, role: &str) -> Answer {
+        self.query_on(self.main_id(), DataKeyKind::Secret, role, json!({"v":1,"op":"call","fn":"whoami"}))
+            .await
+    }
+}
+
+/// A secret key for an elevated role (BYPASSRLS; LOGIN; a NOLOGIN role that reaches a LOGIN
+/// role) runs with the elevated login as its session user; an ordinary role's key, `anon` and
+/// `authenticated` run on `authenticator`. The console's role is routed the same way.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn elevated_key_roles_run_on_their_own_login() {
+    live("own-login", |l| async move {
+        l.sql_on(
+            l.main_id(),
+            "CREATE ROLE e_bypass NOLOGIN BYPASSRLS;
+             CREATE ROLE e_login LOGIN;
+             CREATE ROLE e_group NOLOGIN;
+             GRANT e_login TO e_group;
+             CREATE ROLE e_plain NOLOGIN;",
+        )
+        .await;
+        l.login_probe("e_bypass, e_login, e_group, e_plain, anon, authenticated").await;
+        for role in ["e_bypass", "e_login", "e_group", "e_plain"] {
+            let check = l.worker.check_data_role(l.main_id(), role).await;
+            assert!(matches!(check, RoleCheck::Ok(..)), "{role}: {check:?}");
+        }
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_group,e_login");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+        // Twice: the second request is served from the cached answer and a pooled connection.
+        for _ in 0..2 {
+            for role in ["e_bypass", "e_login", "e_group"] {
+                assert_eq!(l.login_of(role).await.ok(), &json!(ELEVATED), "{role}");
+                let rows = l
+                    .query_on(l.main_id(), DataKeyKind::Secret, role, json!({"v":1,"op":"select","from":"e"}))
+                    .await;
+                assert_eq!(rows.ok(), &json!([{"v":"seen"}]), "{role}");
+            }
+            assert_eq!(l.login_of("e_plain").await.ok(), &json!("authenticator"));
+            let call = json!({"v":1,"op":"call","fn":"whoami"});
+            assert_eq!(l.anon(call.clone()).await.ok(), &json!("authenticator"));
+            assert_eq!(l.auth(call.clone()).await.ok(), &json!("authenticator"));
+            for role in ["anon", "authenticated"] {
+                assert_eq!(l.login_of(role).await.ok(), &json!("authenticator"), "a secret key of {role}");
+            }
+        }
+        // The console's schema route for an elevated role answers too (its own login's session).
+        let schema = l.role_schema("e_bypass").await;
+        assert_eq!(keys(&schema.ok()["schemas"]["public"]["tables"]), ["e"]);
+    })
+    .await;
+}
+
+/// A branch as the release before left it, elevated roles on both logins (and one on
+/// `authenticator` alone, granted before the elevated login existed): the bootstrap's resync
+/// moves each to the elevated login only, leaves the ordinary one on `authenticator`, and
+/// every existing key still answers, before and after.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn existing_elevated_key_survives_the_move() {
+    live("resync", |l| async move {
+        l.sql_on(
+            l.main_id(),
+            "CREATE ROLE e_bypass NOLOGIN BYPASSRLS;
+             CREATE ROLE e_old NOLOGIN BYPASSRLS;
+             CREATE ROLE e_plain NOLOGIN;
+             GRANT e_bypass TO authenticator;
+             GRANT e_bypass TO chelabase_authenticator_elevated;
+             GRANT e_old TO authenticator;
+             GRANT e_plain TO authenticator;
+             GRANT e_plain TO chelabase_authenticator_elevated;",
+        )
+        .await;
+        l.login_probe("e_bypass, e_old, e_plain").await;
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_plain");
+        // Before the resync the key of the role both logins hold already runs on the
+        // elevated login.
+        assert_eq!(l.login_of("e_bypass").await.ok(), &json!(ELEVATED));
+        let main = l.branch(l.main_id()).await;
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_old");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+        for (role, login) in [("e_bypass", ELEVATED), ("e_old", ELEVATED), ("e_plain", "authenticator")] {
+            assert_eq!(l.login_of(role).await.ok(), &json!(login), "{role}");
+            let rows = l
+                .query_on(l.main_id(), DataKeyKind::Secret, role, json!({"v":1,"op":"select","from":"e"}))
+                .await;
+            assert_eq!(rows.ok(), &json!([{"v":"seen"}]), "{role}");
+        }
+        // A second bootstrap moves nothing.
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass,e_old");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+    })
+    .await;
+}
+
+/// After the resync nothing `authenticator` is a member of, at any depth, is elevated: a
+/// session of it can't switch to an elevated role, and neither can a request running on it,
+/// in its statements or in a deferred trigger at `COMMIT`.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn authenticator_reaches_no_elevated_role() {
+    live("no-reach", |l| async move {
+        l.sql_on(
+            l.main_id(),
+            "CREATE ROLE e_bypass NOLOGIN BYPASSRLS;
+             CREATE ROLE e_login LOGIN;
+             CREATE ROLE e_group NOLOGIN;
+             GRANT e_login TO e_group;
+             CREATE ROLE e_plain NOLOGIN;
+             GRANT e_bypass, e_group, e_login, e_plain TO authenticator;",
+        )
+        .await;
+        l.login_probe("e_bypass, e_login, e_group, e_plain").await;
+        l.owner(
+            "CREATE TABLE audit (v text);
+             GRANT INSERT, SELECT ON audit TO e_plain;
+             CREATE FUNCTION switch_late() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN SET LOCAL ROLE e_bypass; RETURN NULL; END $$;
+             CREATE CONSTRAINT TRIGGER switch_late AFTER INSERT ON audit
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION switch_late();
+             CREATE FUNCTION become(target text) RETURNS text LANGUAGE plpgsql AS $$
+               BEGIN EXECUTE pg_catalog.format('SET LOCAL ROLE %I', target); RETURN current_user::text; END $$;
+             GRANT EXECUTE ON FUNCTION become(text) TO e_plain;",
+        )
+        .await;
+        let main = l.branch(l.main_id()).await;
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_plain");
+        // Every role `authenticator` is a member of, at any depth, by the worker's rule's
+        // inputs: none can log in, bypasses RLS, administers, or holds ADMIN.
+        let reached = l
+            .sql_on(
+                l.main_id(),
+                "SELECT coalesce(string_agg(r.rolname, ',' ORDER BY r.rolname), '') FROM pg_roles r
+                 WHERE r.rolname <> 'authenticator' AND pg_has_role('authenticator', r.oid, 'MEMBER')
+                   AND (r.rolcanlogin OR r.rolbypassrls OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
+                     OR EXISTS (SELECT FROM pg_auth_members a WHERE a.member = r.oid AND a.admin_option));",
+            )
+            .await;
+        assert_eq!(reached.trim(), "");
+        // A request on an `authenticator` connection can't become one, by any of them.
+        assert_eq!(l.login_of("e_plain").await.ok(), &json!("authenticator"));
+        for target in ["e_bypass", "e_login", "e_group", ELEVATED] {
+            let answer = l
+                .query_on(l.main_id(), DataKeyKind::Secret, "e_plain", json!({"v":1,"op":"call","fn":"become","args":{"target":target}}))
+                .await;
+            answer.error(403, "permission_denied");
+        }
+        // Nor at `COMMIT`: the deferred trigger's switch is refused and the row isn't kept.
+        let insert = l
+            .query_on(l.main_id(), DataKeyKind::Secret, "e_plain", json!({"v":1,"op":"insert","into":"audit","values":[{"v":"x"}]}))
+            .await;
+        assert_ne!(insert.status, 200, "{insert:?}");
+        let rows = l
+            .query_on(l.main_id(), DataKeyKind::Secret, "e_plain", json!({"v":1,"op":"select","from":"audit"}))
+            .await;
+        assert_eq!(rows.ok(), &json!([]));
+        // `authenticator`'s own session can't either.
+        let authenticator = open_credential(
+            &l.key,
+            &main.id.to_string(),
+            Purpose::Authenticator,
+            main.authenticator_password_enc.as_deref().expect("authenticator password"),
+        )
+        .unwrap();
+        let mut session = l.connect_as("authenticator", &authenticator).await.expect("authenticator logs in");
+        for target in ["e_bypass", "e_login", "e_group", ELEVATED] {
+            let switched = sqlx::query(sqlx::AssertSqlSafe(format!("SET ROLE {target}"))).execute(&mut session).await;
+            assert!(switched.is_err(), "{target}");
+        }
+    })
+    .await;
+}
+
+/// A keyed role an Admin later gives BYPASSRLS in SQL: until the worker has moved its grant
+/// the data API refuses it (503) rather than run it on `authenticator`; once the worker
+/// learns of the change (the login-role resync a role statement asks for) it is moved, and
+/// the key answers on the elevated login.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn role_made_bypassrls_after_keying_moves_or_is_refused() {
+    live("late", |l| async move {
+        l.sql_on(l.main_id(), "CREATE ROLE e_late NOLOGIN;").await;
+        l.login_probe("e_late").await;
+        assert!(matches!(l.worker.check_data_role(l.main_id(), "e_late").await, RoleCheck::Ok(_, false)));
+        assert_eq!(l.login_of("e_late").await.ok(), &json!("authenticator"));
+        l.sql_on(l.main_id(), "ALTER ROLE e_late BYPASSRLS;").await;
+        // The cached answer is dropped (its 30 s lifetime, cut short here).
+        l.invalidate(l.main_id()).await;
+        for _ in 0..2 {
+            l.login_of("e_late").await.error(503, "unavailable");
+        }
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,e_late");
+        l.worker.resync(l.main_id()).await.expect("the role resync");
+        assert_eq!(l.held_by(ELEVATED).await, "e_late");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated");
+        assert_eq!(l.login_of("e_late").await.ok(), &json!(ELEVATED));
+    })
+    .await;
+}
+
+/// A cached "runs on `authenticator`" answer for a role whose grant has since moved to the
+/// elevated login: the next request fails in its preamble (503) and is not run on either
+/// login, the cached answer is dropped, and the request after it runs on the elevated login.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn stale_login_answer_fails_closed_then_recovers() {
+    live("stale", |l| async move {
+        l.sql_on(l.main_id(), "CREATE ROLE e_moved NOLOGIN;").await;
+        l.login_probe("e_moved").await;
+        l.owner("CREATE TABLE seen_by (login text); GRANT INSERT ON seen_by TO e_moved;").await;
+        assert!(matches!(l.worker.check_data_role(l.main_id(), "e_moved").await, RoleCheck::Ok(_, false)));
+        assert_eq!(l.login_of("e_moved").await.ok(), &json!("authenticator"));
+        // The grant moves; rest still holds the answer from before.
+        l.sql_on(l.main_id(), "ALTER ROLE e_moved BYPASSRLS;").await;
+        l.worker.resync(l.main_id()).await.expect("the role resync");
+        assert_eq!(l.held_by(ELEVATED).await, "e_moved");
+        let stale = l
+            .query_on(l.main_id(), DataKeyKind::Secret, "e_moved", json!({"v":1,"op":"insert","into":"seen_by","values":[{"login":"x"}]}))
+            .await;
+        stale.error(503, "unavailable");
+        assert_eq!(l.sql_on(l.main_id(), "SELECT count(*) FROM seen_by;").await.trim(), "0");
+        assert_eq!(l.login_of("e_moved").await.ok(), &json!(ELEVATED));
+    })
+    .await;
+}
+
+/// W2: a cached "elevated, held by the elevated login" answer for a role since made ordinary
+/// and moved to `authenticator`, where the elevated login still reaches the role through
+/// another role it holds (so a role switch there would pass): the request is refused (503),
+/// never run with the elevated login as session user, and the one after it runs on
+/// `authenticator`.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_stale_elevated_answer_through_another_role_fails_closed() {
+    live("stale-chain", |l| async move {
+        l.sql_on(
+            l.main_id(),
+            "CREATE ROLE c_top NOLOGIN BYPASSRLS;
+             CREATE ROLE c_base NOLOGIN BYPASSRLS;
+             GRANT c_base TO c_top;",
+        )
+        .await;
+        l.login_probe("c_top, c_base").await;
+        for role in ["c_top", "c_base"] {
+            let check = l.worker.check_data_role(l.main_id(), role).await;
+            assert!(matches!(check, RoleCheck::Ok(..)), "{role}: {check:?}");
+        }
+        assert_eq!(l.held_by(ELEVATED).await, "c_base,c_top");
+        // Cached: elevated, held by the elevated login.
+        assert_eq!(l.login_of("c_base").await.ok(), &json!(ELEVATED));
+        l.sql_on(l.main_id(), "ALTER ROLE c_base NOBYPASSRLS;").await;
+        l.worker.resync(l.main_id()).await.expect("the role resync");
+        assert_eq!(l.held_by(ELEVATED).await, "c_top");
+        assert_eq!(l.held_by("authenticator").await, "anon,authenticated,c_base");
+        let stale = l.login_of("c_base").await;
+        stale.error(503, "unavailable");
+        assert_eq!(l.login_of("c_base").await.ok(), &json!("authenticator"));
+        assert_eq!(l.login_of("c_top").await.ok(), &json!(ELEVATED));
+    })
+    .await;
+}
+
+/// The bootstrap leaves no role a member of the elevated login, whoever granted it and with
+/// whatever option, sets the login's attributes and settings back, and takes from it every
+/// role that isn't elevated (`anon` and `authenticated` among them) or that no key may be made
+/// for (a CREATEDB role), keeping the elevated one.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn nobody_is_a_member_of_the_elevated_login() {
+    live("elevated-members", |l| async move {
+        l.sql_on(
+            l.main_id(),
+            &format!(
+                "CREATE ROLE e_bypass NOLOGIN BYPASSRLS;
+                 CREATE ROLE e_plain NOLOGIN;
+                 CREATE ROLE e_member NOLOGIN;
+                 CREATE ROLE e_admin NOLOGIN;
+                 CREATE ROLE e_second NOLOGIN;
+                 CREATE ROLE e_createdb NOLOGIN CREATEDB;
+                 GRANT e_createdb TO {ELEVATED};
+                 GRANT {ELEVATED} TO e_member;
+                 GRANT {ELEVATED} TO e_admin WITH ADMIN OPTION;
+                 SET ROLE e_admin;
+                 GRANT {ELEVATED} TO e_second;
+                 RESET ROLE;
+                 GRANT e_bypass, e_plain, anon, authenticated TO {ELEVATED};
+                 ALTER ROLE {ELEVATED} BYPASSRLS CREATEROLE INHERIT CONNECTION LIMIT 3 VALID UNTIL '2020-01-01';
+                 ALTER ROLE {ELEVATED} SET statement_timeout = '1s';"
+            ),
+        )
+        .await;
+        assert_eq!(l.members_of_elevated().await, "3");
+        assert_ne!(l.elevated_attributes().await, ELEVATED_ATTRIBUTES);
+        assert_eq!(l.held_by(ELEVATED).await, "anon,authenticated,e_bypass,e_createdb,e_plain");
+
+        let main = l.branch(l.main_id()).await;
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+
+        assert_eq!(l.members_of_elevated().await, "0");
+        assert_eq!(l.elevated_attributes().await, ELEVATED_ATTRIBUTES);
+        assert_eq!(l.held_by(ELEVATED).await, "e_bypass");
+        let password = l.elevated_password().await;
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in again");
+    })
+    .await;
+}
+
+/// A session open as the elevated login under a password other than the stored one is ended
+/// by the bootstrap that sets the stored password back.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn sessions_of_the_elevated_login_end_when_its_password_is_replaced() {
+    live("elevated-replaced", |l| async move {
+        const REPLACED: &str = "set-by-hand-0123456789";
+        l.sql_on(l.main_id(), &format!("ALTER ROLE {ELEVATED} PASSWORD '{REPLACED}';")).await;
+        let mut session = l.connect_as(ELEVATED, REPLACED).await.expect("the replaced password logs in");
+        sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+
+        let main = l.branch(l.main_id()).await;
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut session).await.is_err(),
+            "the session under the replaced password was ended"
+        );
+        assert!(l.connect_as(ELEVATED, REPLACED).await.is_err());
+        let password = l.elevated_password().await;
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in");
+    })
+    .await;
+}
+
+/// A session open as the elevated login under its stored password stays open through a
+/// bootstrap that finds nothing changed on the login.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn sessions_of_the_elevated_login_survive_an_unchanged_bootstrap() {
+    live("elevated-unchanged", |l| async move {
+        use sqlx::Row;
+        let password = l.elevated_password().await;
+        let mut session = l.connect_as(ELEVATED, &password).await.expect("the elevated login logs in");
+        let pid = |row: sqlx::postgres::PgRow| row.get::<i32, _>(0);
+        let before = pid(sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut session).await.unwrap());
+
+        let main = l.branch(l.main_id()).await;
+        l.worker.bootstrap_data_api(&main, &l.database_name).await.expect("bootstrap");
+
+        let after = sqlx::query("SELECT pg_backend_pid()")
+            .fetch_one(&mut session)
+            .await
+            .expect("the session under the stored password stays open");
+        assert_eq!(pid(after), before);
+        assert_eq!(l.elevated_attributes().await, ELEVATED_ATTRIBUTES);
+    })
+    .await;
+}
+
+// --- Fix round 2: which of the elevated login's sessions are void is a record on the login ----
+
+impl Live {
+    /// The record the lockdown keeps on the elevated login (`worker::login_lockdown`), or
+    /// `none`.
+    async fn elevated_record(&self) -> String {
+        self.sql_on(
+            self.main_id(),
+            &format!("SELECT coalesce(shobj_description('{ELEVATED}'::regrole, 'pg_authid'), 'none');"),
+        )
+        .await
+        .trim()
+        .to_owned()
+    }
+
+    async fn healthy(&self) -> bool {
+        let main = self.branch(self.main_id()).await;
+        let ep = main.endpoint_id.clone().expect("endpoint");
+        self.worker.data_api_healthy(self.main_id(), &ep).await.unwrap()
+    }
+
+    async fn bootstrap(&self) {
+        let main = self.branch(self.main_id()).await;
+        self.worker.bootstrap_data_api(&main, &self.database_name).await.expect("bootstrap");
+    }
+}
+
+/// Whether `record` is the cut-off form: `chelabase lockdown <microseconds>`.
+fn is_cutoff(record: &str) -> bool {
+    record
+        .strip_prefix("chelabase lockdown ")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A relay in front of main's Postgres for one connection. It passes the client's startup
+/// packet and the server's first answer (its authentication request, sent once the server
+/// has read the role's verifier), reports that on `requested`, and holds everything the
+/// client sends next until `release` fires.
+async fn held_handshake_relay(
+    upstream: SocketAddr,
+    requested: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        // The startup packet: its length (which counts itself), then the rest.
+        let mut length = [0u8; 4];
+        client.read_exact(&mut length).await.unwrap();
+        let mut startup = vec![0u8; u32::from_be_bytes(length) as usize - 4];
+        client.read_exact(&mut startup).await.unwrap();
+        server.write_all(&length).await.unwrap();
+        server.write_all(&startup).await.unwrap();
+        let mut answer = [0u8; 1024];
+        let n = server.read(&mut answer).await.unwrap();
+        assert_eq!(answer.first(), Some(&b'R'), "the server's authentication request");
+        client.write_all(&answer[..n]).await.unwrap();
+        let _ = requested.send(());
+        let _ = release.await;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+    });
+    addr
+}
+
+/// A connection as the elevated login whose handshake starts under a password the bootstrap
+/// then replaces, and finishes after the bootstrap returned, does not stay open: the health
+/// check answers `f` for it, the next bootstrap ends it, and the check answers `t` again.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_handshake_spanning_the_bootstrap_does_not_keep_the_replaced_password() {
+    live("elevated-spanning", |l| async move {
+        use sqlx::Connection;
+        const REPLACED: &str = "set-by-hand-0123456789";
+        l.sql_on(l.main_id(), &format!("ALTER ROLE {ELEVATED} PASSWORD '{REPLACED}';")).await;
+
+        let main = l.branch(l.main_id()).await;
+        let ep = main.endpoint_id.as_deref().expect("endpoint");
+        let upstream = l.worker.computes.postgres_addr(ep).await.unwrap().expect("a published Postgres port");
+        let (requested_tx, requested) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let relay = held_handshake_relay(upstream, requested_tx, release_rx).await;
+        let options = sqlx::postgres::PgConnectOptions::new()
+            .host(&relay.ip().to_string())
+            .port(relay.port())
+            .username(ELEVATED)
+            .password(REPLACED)
+            .database(&l.database_name)
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let connecting = tokio::spawn(async move { sqlx::PgConnection::connect_with(&options).await });
+        tokio::time::timeout(Duration::from_secs(20), requested)
+            .await
+            .expect("the server asked for authentication")
+            .unwrap();
+
+        l.bootstrap().await;
+        release.send(()).unwrap();
+        let mut session = connecting.await.unwrap().expect("the handshake finishes after the bootstrap");
+        sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+
+        assert!(!l.healthy().await, "the health check sees a session from before the lockdown");
+        l.bootstrap().await;
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut session).await.is_err(),
+            "the session authenticated under the replaced password was ended"
+        );
+        assert!(l.healthy().await, "healthy once it is gone");
+        assert!(l.connect_as(ELEVATED, REPLACED).await.is_err());
+        let password = l.elevated_password().await;
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in");
+    })
+    .await;
+}
+
+/// After a lockdown that found the login drifted, a session opened under the stored password
+/// stays open through the next bootstrap, which keeps the record; a record whose cut-off is
+/// from before the postmaster started is cleared.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn sessions_opened_after_a_drifted_lockdown_survive_the_next_bootstrap() {
+    live("elevated-after-drift", |l| async move {
+        use sqlx::Row;
+        l.sql_on(l.main_id(), &format!("ALTER ROLE {ELEVATED} PASSWORD 'set-by-hand-0123456789';")).await;
+        l.bootstrap().await;
+        let record = l.elevated_record().await;
+        assert!(is_cutoff(&record), "the drifted lockdown left its cut-off: {record}");
+        assert!(l.healthy().await);
+
+        let password = l.elevated_password().await;
+        let mut session = l.connect_as(ELEVATED, &password).await.expect("the elevated login logs in");
+        let pid = |row: sqlx::postgres::PgRow| row.get::<i32, _>(0);
+        let before = pid(sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut session).await.unwrap());
+
+        l.bootstrap().await;
+        let after = sqlx::query("SELECT pg_backend_pid()")
+            .fetch_one(&mut session)
+            .await
+            .expect("a session from after the cut-off stays open");
+        assert_eq!(pid(after), before);
+        assert_eq!(l.elevated_record().await, record, "a cut-off on this postmaster is kept");
+        assert!(l.healthy().await);
+
+        // A cut-off from before this postmaster started: no session it covers is left.
+        l.sql_on(
+            l.main_id(),
+            &format!(
+                "DO $$ BEGIN EXECUTE format('COMMENT ON ROLE {ELEVATED} IS %L', 'chelabase lockdown ' || \
+                 ((extract(epoch from pg_postmaster_start_time() - interval '2 seconds') * 1000000)::bigint)::text); END $$;"
+            ),
+        )
+        .await;
+        assert!(l.healthy().await, "a cut-off with no session before it is healthy");
+        l.bootstrap().await;
+        assert_eq!(l.elevated_record().await, "none", "the record clears");
+        let still = sqlx::query("SELECT pg_backend_pid()").fetch_one(&mut session).await.expect("still open");
+        assert_eq!(pid(still), before);
+        assert!(l.healthy().await);
+    })
+    .await;
+}
+
+// --- Fix round 3: the record stays until the postmaster restarts ------------------------------
+
+/// The stack whose computes these tests act on (as the worker's live tests name it): in a
+/// stack's runner the Compose project names it, elsewhere the worker's own `CHELABASE_STACK`.
+fn compute_stack() -> String {
+    let project = std::env::var("CHELABASE_COMPOSE_PROJECT")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    match project {
+        Some(p) if p == "chelabase" => chelabase_neon::DEFAULT_STACK.to_string(),
+        Some(p) => p.strip_prefix("chelabase-").unwrap_or(&p).to_string(),
+        None => WorkerConfig::from_env().expect("worker config").stack,
+    }
+}
+
+/// A session of the elevated login authenticated under a password the bootstrap replaced, and
+/// first listed only after that bootstrap and two routine ones, is still void: the routine
+/// bootstraps keep the record, the health check answers `f` once the session is listed, the
+/// next bootstrap ends it, and the check answers `t` again.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_session_listed_long_after_the_lockdown_is_still_void() {
+    live("elevated-listed-late", |l| async move {
+        use sqlx::Connection;
+        const REPLACED: &str = "set-by-hand-0123456789";
+        // How long the server keeps the authenticated session unlisted (`post_auth_delay`):
+        // long enough for one drifted and two routine bootstraps in a loaded full-suite run
+        // (they took about 30 s there; the test's premise assertions fail if they overrun).
+        const UNLISTED_SECS: u64 = 100;
+        l.sql_on(l.main_id(), &format!("ALTER ROLE {ELEVATED} PASSWORD '{REPLACED}';")).await;
+
+        let main = l.branch(l.main_id()).await;
+        let ep = main.endpoint_id.as_deref().expect("endpoint");
+        let upstream = l.worker.computes.postgres_addr(ep).await.unwrap().expect("a published Postgres port");
+        let (requested_tx, requested) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let relay = held_handshake_relay(upstream, requested_tx, release_rx).await;
+        let options = sqlx::postgres::PgConnectOptions::new()
+            .host(&relay.ip().to_string())
+            .port(relay.port())
+            .username(ELEVATED)
+            .password(REPLACED)
+            .database(&l.database_name)
+            .options([("post_auth_delay", UNLISTED_SECS)])
+            .ssl_mode(sqlx::postgres::PgSslMode::Disable);
+        let connecting = tokio::spawn(async move { sqlx::PgConnection::connect_with(&options).await });
+        // The server has read the replaced verifier; the rest of the handshake goes straight
+        // through, and the session then stays unlisted for `UNLISTED_SECS`.
+        tokio::time::timeout(Duration::from_secs(20), requested)
+            .await
+            .expect("the server asked for authentication")
+            .unwrap();
+        release.send(()).unwrap();
+
+        l.bootstrap().await;
+        let record = l.elevated_record().await;
+        assert!(is_cutoff(&record), "the drifted lockdown left its cut-off: {record}");
+        assert!(l.healthy().await, "healthy while the session is not listed");
+        l.bootstrap().await;
+        l.bootstrap().await;
+        let kept = l.elevated_record().await;
+        let listed = l
+            .sql_on(l.main_id(), &format!("SELECT count(*) FROM pg_stat_activity WHERE usename = '{ELEVATED}';"))
+            .await;
+        assert_eq!(listed.trim(), "0", "the session stayed unlisted across the routine bootstraps");
+
+        let mut session = connecting.await.unwrap().expect("authenticated under the replaced password");
+        sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+        assert!(!l.healthy().await, "the health check sees a session from before the lockdown");
+        l.bootstrap().await;
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut session).await.is_err(),
+            "the session authenticated under the replaced password was ended"
+        );
+        assert!(l.healthy().await, "healthy once it is gone");
+        assert_eq!(kept, record, "the routine bootstraps kept the cut-off");
+        assert!(l.connect_as(ELEVATED, REPLACED).await.is_err());
+        let password = l.elevated_password().await;
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in");
+    })
+    .await;
+}
+
+/// The record is cleared by the first routine bootstrap after the postmaster restarted, and
+/// not before: a restart ends every session the record covers.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_postmaster_restart_lets_the_next_bootstrap_clear_the_record() {
+    live("elevated-restart", |l| async move {
+        l.sql_on(l.main_id(), &format!("ALTER ROLE {ELEVATED} PASSWORD 'set-by-hand-0123456789';")).await;
+        l.bootstrap().await;
+        let record = l.elevated_record().await;
+        assert!(is_cutoff(&record), "the drifted lockdown left its cut-off: {record}");
+        l.bootstrap().await;
+        assert_eq!(l.elevated_record().await, record, "kept on the same postmaster");
+        let started = "SELECT pg_postmaster_start_time()::text;";
+        let before = l.sql_on(l.main_id(), started).await;
+
+        let main = l.branch(l.main_id()).await;
+        let ep = main.endpoint_id.clone().expect("endpoint");
+        let container = chelabase_neon::compute::container_name(&compute_stack(), &ep);
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("docker").args(["restart", &container]).output().expect("docker")
+        })
+        .await
+        .unwrap();
+        assert!(out.status.success(), "docker restart: {}", String::from_utf8_lossy(&out.stderr));
+        // The restarted compute replays its start-up; with the whole suite running beside it
+        // that can take minutes.
+        let deadline = Instant::now() + Duration::from_secs(360);
+        while l.worker.computes.admin_sql(&ep, &l.database_name, "SELECT 1").await.is_err() {
+            assert!(Instant::now() < deadline, "the compute didn't come back");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_ne!(l.sql_on(l.main_id(), started).await, before, "a new postmaster");
+        assert_eq!(l.elevated_record().await, record, "a restart alone leaves the record");
+
+        l.bootstrap().await;
+        assert_eq!(l.elevated_record().await, "none", "the record clears after the restart");
+        assert!(l.healthy().await);
+        let password = l.elevated_password().await;
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in");
+    })
+    .await;
+}
+
+/// A lockdown that committed its drift but never reached the step after its commit leaves
+/// the record pending: the health check answers `f`, and the next bootstrap ends the login's
+/// sessions from before it and takes the cut-off.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_lockdown_cut_short_after_its_commit_is_completed_by_the_next_bootstrap() {
+    live("elevated-cut-short", |l| async move {
+        let password = l.elevated_password().await;
+        let mut session = l.connect_as(ELEVATED, &password).await.expect("the elevated login logs in");
+        sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+        // What a drifted lockdown commits (`worker::login_lockdown::PENDING`).
+        l.sql_on(
+            l.main_id(),
+            &format!("COMMENT ON ROLE {ELEVATED} IS '{}';", worker::login_lockdown::PENDING),
+        )
+        .await;
+        assert!(!l.healthy().await, "a pending record is never healthy");
+
+        l.bootstrap().await;
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut session).await.is_err(),
+            "the session from before the lockdown was ended"
+        );
+        let record = l.elevated_record().await;
+        assert!(is_cutoff(&record), "{record}");
+        assert!(l.healthy().await);
+        l.connect_as(ELEVATED, &password).await.expect("the stored password logs in");
     })
     .await;
 }

@@ -23,7 +23,7 @@ const off = db.auth.onChange((event, user) => {
 await db.auth.signOut();
 ```
 
-Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword` and `onChange` (which returns the function that unsubscribes).
+Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `confirmEmailChange`, `changePassword` and `onChange` (which returns the function that unsubscribes).
 
 `getUser()` rejects when nobody is signed in; `currentUser()` gives `null` instead (no session, or one that is invalid, expired after one refresh, revoked, or ended by its refresh) and rejects only on other errors, such as the gateway being down. `refreshIfNeeded()` refreshes only when the access token is missing or about to expire, and sends nothing otherwise.
 
@@ -37,6 +37,8 @@ const db = createClient<Database>({ url, key, types });
 const user = await db.auth.currentUser();
 if (user) console.log(user.email);
 ```
+
+`changeEmail({ email, currentPassword })` needs the user's current password. With email verification on it resolves to `{ confirmationRequired: true }`, mails a code to the new address and changes nothing until `confirmEmailChange({ email, code })`; with it off the address changes at once (`confirmationRequired: false`). Code written for `changeEmail({ email })` must now pass `currentPassword`. See [Email changes](/using/app-users/sessions#email-changes).
 
 ## Sign-up data
 

@@ -25,7 +25,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::access::Target;
-use crate::console::{owner_pool_for, pool_failure, RETRY_AFTER_SECS};
+use crate::console::{owner_pool_for, pool_failure, release_owner_lease, RETRY_AFTER_SECS};
 use crate::sql_editor::run::RunTls;
 use crate::branches::unprocessable;
 use crate::sql_editor::{load_authorized, pick_pg_database, reconcile_member_role};
@@ -170,7 +170,7 @@ async fn read_once(
     rid: &str,
 ) -> Result<Read, QueryFailure> {
     // Not marked done on failure: the connection is closed rather than pooled.
-    let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
+    let lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
     let client = lease.client();
     client
         .simple_query(READ_TIMEOUT_SQL)
@@ -182,23 +182,15 @@ async fn read_once(
         .map_err(|e| QueryFailure::from_pg(&e, rid))?;
     let (exists, may_connect): (bool, bool) = (row.get(0), row.get(1));
     if !may_connect {
-        // The timeout is reset, so the connection goes back to the pool clean.
-        client
-            .simple_query("RESET statement_timeout")
-            .await
-            .map_err(|e| QueryFailure::from_pg(&e, rid))?;
-        lease.done();
+        // The full reset, so the connection goes back to the pool clean.
+        release_owner_lease(lease, rid).await?;
         return Ok(if exists { Read::NoConnect } else { Read::NoLogin });
     }
     let messages = client
         .simple_query(script)
         .await
         .map_err(|e| QueryFailure::from_pg(&e, rid))?;
-    client
-        .simple_query("RESET statement_timeout")
-        .await
-        .map_err(|e| QueryFailure::from_pg(&e, rid))?;
-    lease.done();
+    release_owner_lease(lease, rid).await?;
     messages
         .iter()
         .find_map(|m| match m {

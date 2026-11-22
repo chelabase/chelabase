@@ -420,7 +420,7 @@ describe("auth", () => {
     for (const c of fetch.calls.slice(1)) expect(hdr(c, "chelabase-user")).toBeNull();
     expect(await db.auth.getUser()).toEqual(user);
     expect(fetch.to("/auth/v1/app/user")[0]!.init.method).toBe("GET");
-    await db.auth.changeEmail({ email: "n@b.co" });
+    await db.auth.changeEmail({ email: "n@b.co", currentPassword: "pw" });
     await db.auth.signOut();
     for (const p of ["user", "change-email", "sign-out"]) {
       expect(hdr(fetch.to(`/auth/v1/app/${p}`)[0]!, "chelabase-user")).toBe(s1.access_token);
@@ -444,14 +444,51 @@ describe("auth", () => {
     await db.auth.resendCode({ email: "a@b.co" });
     await db.auth.requestPasswordReset({ email: "a@b.co" });
     await db.auth.confirmPasswordReset({ email: "a@b.co", code: "1", password: "x" });
-    await db.auth.changeEmail({ email: "n@b.co" });
+    await db.auth.changeEmail({ email: "n@b.co", currentPassword: "pw" });
     const body = (p: string) => JSON.parse(fetch.to(`/auth/v1/app/${p}`)[0]!.init.body as string);
     expect(body("sign-in")).toEqual({ email: "a@b.co", password: "pw" });
     expect(body("verify-email")).toEqual({ email: "a@b.co", code: "1" });
     expect(body("resend-code")).toEqual({ email: "a@b.co" });
     expect(body("password-reset")).toEqual({ email: "a@b.co" });
     expect(body("password-reset/confirm")).toEqual({ email: "a@b.co", code: "1", password: "x" });
-    expect(body("change-email")).toEqual({ email: "n@b.co" });
+    expect(body("change-email")).toEqual({ email: "n@b.co", current_password: "pw" });
+  });
+
+  test("change_email_sends_the_current_password", async () => {
+    let answer: { status: number; body?: unknown } = { status: 202, body: { confirmation_required: true } };
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1) }),
+      "/auth/v1/app/change-email": () => answer,
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    expect(await db.auth.changeEmail({ email: "n@b.co", currentPassword: "pw" })).toEqual({ confirmationRequired: true });
+    answer = { status: 204 };
+    expect(await db.auth.changeEmail({ email: "m@b.co", currentPassword: "pw" })).toEqual({ confirmationRequired: false });
+    const sent = fetch.to("/auth/v1/app/change-email").map((c) => JSON.parse(c.init.body as string));
+    expect(sent).toEqual([
+      { email: "n@b.co", current_password: "pw" },
+      { email: "m@b.co", current_password: "pw" },
+    ]);
+  });
+
+  test("confirm_email_change_uses_the_user_token", async () => {
+    const s1 = session(1);
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: s1 }),
+      "/auth/v1/app/change-email/confirm": () => ({ status: 204 }),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
+    await expect(db.auth.confirmEmailChange({ email: "n@b.co", code: "123456" })).rejects.toMatchObject({
+      code: "user_token_invalid",
+    });
+    expect(fetch.to("/auth/v1/app/change-email/confirm")).toHaveLength(0);
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await db.auth.confirmEmailChange({ email: "n@b.co", code: "123456" });
+    const [c] = fetch.to("/auth/v1/app/change-email/confirm");
+    expect(hdr(c!, "chelabase-user")).toBe(s1.access_token);
+    expect(c!.init.method).toBe("POST");
+    expect(JSON.parse(c!.init.body as string)).toEqual({ email: "n@b.co", code: "123456" });
   });
 
   test("sign_out_without_access_token_sends_refresh_token_body", async () => {

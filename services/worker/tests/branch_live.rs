@@ -39,7 +39,7 @@ impl Story<'_> {
         let ep = branch.endpoint_id.as_deref().expect("branch endpoint");
         self.worker
             .computes
-            .admin_sql(ep, &self.database_name, sql)
+            .admin_sql(ep, &self.database_name, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("sql on {}: {e:#}", branch.name))
     }
@@ -903,7 +903,7 @@ async fn write_main(worker: &RealWorker, endpoint: &str, database_name: &str, va
     loop {
         match worker
             .computes
-            .admin_sql(endpoint, database_name, &sql)
+            .admin_sql(endpoint, database_name, &crate::common::tenant_sql(&sql))
             .await
         {
             Ok(_) => return,

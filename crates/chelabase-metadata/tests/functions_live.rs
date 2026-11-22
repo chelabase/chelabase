@@ -184,8 +184,8 @@ mod functions {
             let c = &self.client;
             c.set_active_deployment(branch, f, d).await.unwrap();
             assert!(c.set_enabled(branch, f, true).await.unwrap());
-            c.put_secret(branch, f, "API_KEY", "one").await.unwrap();
-            c.put_secret(branch, f, "TOKEN", "two").await.unwrap();
+            c.put_secret(branch, f, "API_KEY", "one", true).await.unwrap();
+            c.put_secret(branch, f, "TOKEN", "two", true).await.unwrap();
             c.add_schedule(&NewSchedule {
                 branch_id: branch,
                 function_id: f,
@@ -497,10 +497,10 @@ mod functions {
         let d2 = s.deployment(f, &sha('b')).await;
         c.set_active_deployment(child, f, d2).await.unwrap();
         assert!(c.set_enabled(child, f, false).await.unwrap());
-        c.put_secret(child, f, "API_KEY", "changed").await.unwrap();
-        assert!(c.delete_secret(child, f, "TOKEN").await.unwrap());
+        c.put_secret(child, f, "API_KEY", "changed", true).await.unwrap();
+        assert!(c.delete_secret(child, f, "TOKEN", true).await.unwrap());
         assert!(
-            !c.delete_secret(child, f, "TOKEN").await.unwrap(),
+            !c.delete_secret(child, f, "TOKEN", true).await.unwrap(),
             "already gone"
         );
 
@@ -517,7 +517,7 @@ mod functions {
             secrets(&[("API_KEY", "changed")])
         );
         // A parent edit after the branch doesn't reach the child either.
-        c.put_secret(main, f, "LATER", "x").await.unwrap();
+        c.put_secret(main, f, "LATER", "x", true).await.unwrap();
         assert_eq!(c.secret_names(child, f).await.unwrap(), vec!["API_KEY"]);
         s.finish().await;
     }
@@ -543,7 +543,7 @@ mod functions {
             .await
             .unwrap_err();
         assert!(matches!(err, MetadataError::FunctionNotFound), "{err:?}");
-        let err = c.put_secret(main, foreign, "K", "v").await.unwrap_err();
+        let err = c.put_secret(main, foreign, "K", "v", true).await.unwrap_err();
         assert!(matches!(err, MetadataError::FunctionNotFound), "{err:?}");
         c.set_active_deployment(other_main, foreign, df)
             .await
@@ -574,9 +574,9 @@ mod functions {
         let f = s.function(db, "hello").await;
         let g = s.function(db, "other").await;
         let c = &s.client;
-        c.put_secret(main, f, "API_KEY", "one").await.unwrap();
-        c.put_secret(main, f, "TOKEN", "two").await.unwrap();
-        c.put_secret(main, g, "API_KEY", "g").await.unwrap();
+        c.put_secret(main, f, "API_KEY", "one", true).await.unwrap();
+        c.put_secret(main, f, "TOKEN", "two", true).await.unwrap();
+        c.put_secret(main, g, "API_KEY", "g", true).await.unwrap();
         let child = s.branch(db, main, "dev").await;
         let raw: String = sqlx::query_scalar(
             "SELECT ciphertext FROM branch_function_secrets
@@ -691,7 +691,7 @@ mod functions {
         deploy(MAX_BUNDLE_SIZE, Some(sha('a'))).await.unwrap();
 
         for bad in ["", "1A", "A-B", "a b"] {
-            let err = c.put_secret(main, f, bad, "v").await.unwrap_err();
+            let err = c.put_secret(main, f, bad, "v", true).await.unwrap_err();
             assert!(
                 matches!(err, MetadataError::InvalidFunction(_)),
                 "secret {bad:?}: {err:?}"
@@ -869,7 +869,7 @@ mod functions {
         );
         // A write to the tombstoned branch is refused, so nothing comes back.
         let f = s.client.list_for_branch(main).await.unwrap()[0].function_id;
-        let err = s.client.put_secret(child, f, "K", "v").await.unwrap_err();
+        let err = s.client.put_secret(child, f, "K", "v", true).await.unwrap_err();
         assert!(matches!(err, MetadataError::FunctionNotFound), "{err:?}");
         assert_eq!(s.branch_rows(child).await, [0; 4]);
         s.finish().await;
@@ -1293,6 +1293,60 @@ mod functions {
         s.finish().await;
     }
 
+    /// O2: a secret write that meets a kind change in flight (the function row `FOR UPDATE`,
+    /// the kind set to `service`, not committed) waits for it and decides on the kind it then
+    /// reads: a Developer's set and delete are refused, and so is a tenant admin's reserved
+    /// name; a tenant admin's ordinary name lands. Nothing a refused write names is stored.
+    #[tokio::test]
+    #[ignore]
+    async fn secret_write_waits_for_a_kind_change_and_decides_on_the_new_kind() {
+        type Boxed = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MetadataError>> + Send>>;
+        type Write = fn(MetadataClient, BranchId, Uuid) -> Boxed;
+        let cases: [(&str, Write, Option<&str>); 4] = [
+            ("developer set", |c, b, f| Box::pin(async move { c.put_secret(b, f, "DEV", "v", false).await }), Some("tenant admin")),
+            ("developer delete", |c, b, f| Box::pin(async move { c.delete_secret(b, f, "OLD", false).await.map(drop) }), Some("tenant admin")),
+            ("tenant admin reserved", |c, b, f| Box::pin(async move { c.put_secret(b, f, "LD_PRELOAD", "/x", true).await }), Some("reserved")),
+            ("tenant admin set", |c, b, f| Box::pin(async move { c.put_secret(b, f, "API_KEY", "v", true).await }), None),
+        ];
+        for (what, write, refused) in cases {
+            let s = Scratch::new().await;
+            let (db, main) = s.database().await;
+            let f = s.function(db, "hello").await;
+            s.client.put_secret(main, f, "OLD", "o", false).await.unwrap();
+            let mut changing = s.pool().begin().await.unwrap();
+            sqlx::query("SELECT 1 FROM functions WHERE id = $1 FOR UPDATE")
+                .bind(f)
+                .execute(&mut *changing)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE functions SET kind = 'service' WHERE id = $1")
+                .bind(f)
+                .execute(&mut *changing)
+                .await
+                .unwrap();
+            let pending = tokio::spawn(write(s.client.clone(), main, f));
+            lock_waiters(&s, 1).await;
+            changing.commit().await.unwrap();
+            let got = pending.await.unwrap();
+            let names = s.client.secret_names(main, f).await.unwrap();
+            match refused {
+                Some("tenant admin") => {
+                    assert!(matches!(got, Err(MetadataError::ServiceSecretNeedsTenantAdmin)), "{what}: {got:?}");
+                    assert_eq!(names, ["OLD"], "{what}: nothing written");
+                }
+                Some(_) => {
+                    assert!(matches!(&got, Err(MetadataError::InvalidFunction(m)) if m.contains("LD_PRELOAD")), "{what}: {got:?}");
+                    assert_eq!(names, ["OLD"], "{what}: nothing written");
+                }
+                None => {
+                    got.unwrap();
+                    assert_eq!(names, ["API_KEY", "OLD"], "{what}");
+                }
+            }
+            s.finish().await;
+        }
+    }
+
     /// m3a: protecting main while a delete of a function active there is in flight. Either
     /// the protect waits for the delete (which saw main unprotected), or the delete waits for
     /// the protect and is refused: never a deleted function with main protected unseen.
@@ -1661,7 +1715,7 @@ mod functions {
             assert!(c.set_enabled(main, f, true).await.unwrap());
             let ra = run_as("reporter", 4242);
             assert!(c.set_run_as(main, f, Some(&ra)).await.unwrap());
-            c.put_secret(main, f, "API_KEY", "v").await.unwrap();
+            c.put_secret(main, f, "API_KEY", "v", true).await.unwrap();
             let other_key = Uuid::new_v4();
             c.create_secret_key(&secret_key(other_key, main, "other", 77)).await.unwrap();
             let schedule = c
@@ -1724,12 +1778,12 @@ mod functions {
             ("set_function_auth", |c, x| Box::pin(async move { c.set_function_auth(x.main, x.f, FunctionAuth::Public).await.map(drop) })),
             ("set_function_kind", |c, x| Box::pin(async move { c.set_function_kind(x.db, x.f, FunctionKind::Service).await.map(drop) })),
             ("delete_function_unprotected", |c, x| Box::pin(async move { c.delete_function_unprotected(x.db, x.f).await.map(drop) })),
-            ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t").await })),
+            ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t", true).await })),
             ("set_active_deployment", |c, x| Box::pin(async move { c.set_active_deployment(x.main, x.f, x.deployment).await })),
             ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
             // Review fix: the rest of the function writes.
             ("set_enabled", |c, x| Box::pin(async move { c.set_enabled(x.main, x.f, false).await.map(drop) })),
-            ("delete_secret", |c, x| Box::pin(async move { c.delete_secret(x.main, x.f, "API_KEY").await.map(drop) })),
+            ("delete_secret", |c, x| Box::pin(async move { c.delete_secret(x.main, x.f, "API_KEY", true).await.map(drop) })),
             ("create_function", |c, x| Box::pin(async move { c.create_function(x.db, "extra", FunctionKind::Function).await.map(drop) })),
             ("create_deployment", |c, x| Box::pin(async move {
                 let spec = serde_json::json!({});
@@ -1758,7 +1812,7 @@ mod functions {
             })),
             ("update_schedule", |c, x| Box::pin(async move { c.update_schedule(x.main, x.f, x.schedule, Some("*/5 * * * *"), None, None).await.map(drop) })),
             ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
-            ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50).await.map(drop) })),
+            ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50, &[]).await.map(drop) })),
             ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
             ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
             ("settle_run_as_mint", |c, x| Box::pin(async move {
@@ -1980,6 +2034,114 @@ mod functions {
         }
         assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
         s.finish().await;
+    }
+
+    fn a_schedule(branch: BranchId, f: Uuid) -> NewSchedule<'static> {
+        NewSchedule { branch_id: branch, function_id: f, cron: "0 * * * *", timezone: "UTC", next_run_at: None }
+    }
+
+    async fn rows(s: &Scratch, table: &str, branch: BranchId, f: Uuid) -> i64 {
+        sqlx::query_scalar(AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE branch_id = $1 AND function_id = $2")))
+            .bind(branch.as_uuid())
+            .bind(f)
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    }
+
+    /// m13b: a function has at most 20 schedules on a branch; the 21st is refused with nothing
+    /// written, another function on the branch still adds, and a deleted one frees a place.
+    #[tokio::test]
+    #[ignore]
+    async fn schedule_cap_per_function() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let (f, g) = (s.function(db, "hello").await, s.function(db, "other").await);
+        let c = &s.client;
+        let mut first = None;
+        for _ in 0..20 {
+            let id = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+            first.get_or_insert(id);
+        }
+        assert_eq!(rows(&s, "function_schedules", main, f).await, 20);
+        let err = c.add_schedule(&a_schedule(main, f)).await.unwrap_err();
+        assert!(matches!(err, MetadataError::FunctionLimit(_)), "{err:?}");
+        assert_eq!(rows(&s, "function_schedules", main, f).await, 20, "nothing was written");
+        c.add_schedule(&a_schedule(main, g)).await.unwrap();
+        assert!(c.delete_schedule(main, f, first.unwrap()).await.unwrap());
+        c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        s.finish().await;
+    }
+
+    /// m13b: a function has at most 20 triggers, table and storage together; the 21st is
+    /// refused with nothing written.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_cap_per_function() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let (f, g) = (s.function(db, "hello").await, s.function(db, "other").await);
+        let c = &s.client;
+        for i in 0..20 {
+            let t = if i % 2 == 0 { table_trigger(main, f, &["insert"]) } else { storage_trigger(main, f, &["object.created"]) };
+            c.add_trigger(&t).await.unwrap();
+        }
+        for t in [table_trigger(main, f, &["delete"]), storage_trigger(main, f, &["object.deleted"])] {
+            let err = c.add_trigger(&t).await.unwrap_err();
+            assert!(matches!(err, MetadataError::FunctionLimit(_)), "{err:?}");
+        }
+        assert_eq!(rows(&s, "function_triggers", main, f).await, 20, "nothing was written");
+        c.add_trigger(&storage_trigger(main, g, &["object.created"])).await.unwrap();
+        s.finish().await;
+    }
+
+    /// m13b: two adds for a function at 19 schedules (or triggers) both commit one after the
+    /// other: exactly one succeeds. The second is stalled on the advisory lock (held here by a
+    /// transaction of its own under the lock's name) until the first has gone.
+    #[tokio::test]
+    #[ignore]
+    async fn caps_hold_under_concurrent_adds() {
+        for schedules in [true, false] {
+            let s = Scratch::new().await;
+            let (db, main) = s.database().await;
+            let f = s.function(db, "hello").await;
+            let c = &s.client;
+            for _ in 0..19 {
+                if schedules {
+                    c.add_schedule(&a_schedule(main, f)).await.unwrap();
+                } else {
+                    c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+                }
+            }
+            let name = format!("{}:{main}:{f}", if schedules { "fn-schedules" } else { "fn-triggers" });
+            let mut holder = s.pool().begin().await.unwrap();
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(&name)
+                .execute(&mut *holder)
+                .await
+                .unwrap();
+            let add = |c: MetadataClient| {
+                tokio::spawn(async move {
+                    if schedules {
+                        c.add_schedule(&a_schedule(main, f)).await.map(drop)
+                    } else {
+                        c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.map(drop)
+                    }
+                })
+            };
+            let (a, b) = (add(c.clone()), add(c.clone()));
+            // Both are waiting on the advisory lock, past the row locks.
+            settle(&s, &[&a, &b]).await;
+            assert!(!a.is_finished() && !b.is_finished(), "an add waits on the lock");
+            holder.commit().await.unwrap();
+            let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+            let ok = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+            let refused = [&ra, &rb].iter().filter(|r| matches!(r, Err(MetadataError::FunctionLimit(_)))).count();
+            assert_eq!((ok, refused), (1, 1), "{ra:?} / {rb:?}");
+            let table = if schedules { "function_schedules" } else { "function_triggers" };
+            assert_eq!(rows(&s, table, main, f).await, 20);
+            s.finish().await;
+        }
     }
 
     /// m7: a schedule's update recomputes `next_run_at` when its cron or time zone changes or it
@@ -2611,20 +2773,20 @@ mod functions {
         let (db, main) = s.database().await;
         let f = s.function(db, "hello").await;
         let big = "x".repeat(MAX_SECRET_BYTES - 1024);
-        c.put_secret(main, f, "A", &big).await.unwrap();
-        c.put_secret(main, f, "B", &big).await.unwrap();
-        let err = c.put_secret(main, f, "C", &"y".repeat(4096)).await.unwrap_err();
+        c.put_secret(main, f, "A", &big, true).await.unwrap();
+        c.put_secret(main, f, "B", &big, true).await.unwrap();
+        let err = c.put_secret(main, f, "C", &"y".repeat(4096), true).await.unwrap_err();
         assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.contains(&MAX_SECRETS_ENV_BYTES.to_string())), "{err:?}");
         assert_eq!(c.secret_names(main, f).await.unwrap(), ["A", "B"], "nothing written");
         // Escapes count: a value of control characters is six bytes each in the JSON.
-        let err = c.put_secret(main, f, "C", &"\u{1}".repeat(1024)).await.unwrap_err();
+        let err = c.put_secret(main, f, "C", &"\u{1}".repeat(1024), true).await.unwrap_err();
         assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
         // Replacing a value counts it once.
-        c.put_secret(main, f, "A", &big).await.unwrap();
-        c.put_secret(main, f, "A", "small").await.unwrap();
-        c.put_secret(main, f, "C", &"y".repeat(4096)).await.unwrap();
+        c.put_secret(main, f, "A", &big, true).await.unwrap();
+        c.put_secret(main, f, "A", "small", true).await.unwrap();
+        c.put_secret(main, f, "C", &"y".repeat(4096), true).await.unwrap();
         let g = s.function(db, "other").await;
-        c.put_secret(main, g, "A", &big).await.unwrap();
+        c.put_secret(main, g, "A", &big, true).await.unwrap();
         s.finish().await;
     }
 

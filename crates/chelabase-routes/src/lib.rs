@@ -1436,6 +1436,12 @@ pub mod auth {
     );
     pub const APP_CHANGE_EMAIL: Endpoint =
         app("auth.app_change_email", Method::Post, "/auth/v1/app/change-email");
+    /// Finishes a pending email change with the code mailed to the new address.
+    pub const APP_CHANGE_EMAIL_CONFIRM: Endpoint = app(
+        "auth.app_change_email_confirm",
+        Method::Post,
+        "/auth/v1/app/change-email/confirm",
+    );
     pub const APP_CHANGE_PASSWORD: Endpoint =
         app("auth.app_change_password", Method::Post, "/auth/v1/app/change-password");
     /// The app token signing key, for apps' own servers: no key needed.
@@ -1793,6 +1799,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     auth::APP_PASSWORD_RESET,
     auth::APP_PASSWORD_RESET_CONFIRM,
     auth::APP_CHANGE_EMAIL,
+    auth::APP_CHANGE_EMAIL_CONFIRM,
     auth::APP_CHANGE_PASSWORD,
     auth::APP_JWKS,
     realtime::TICKET,
@@ -2410,6 +2417,7 @@ mod tests {
             ("auth.app_password_reset", "POST", "/auth/v1/app/password-reset"),
             ("auth.app_password_reset_confirm", "POST", "/auth/v1/app/password-reset/confirm"),
             ("auth.app_change_email", "POST", "/auth/v1/app/change-email"),
+            ("auth.app_change_email_confirm", "POST", "/auth/v1/app/change-email/confirm"),
             ("auth.app_change_password", "POST", "/auth/v1/app/change-password"),
             ("auth.app_jwks", "GET", "/auth/v1/app/jwks"),
         ];
@@ -2866,6 +2874,7 @@ mod tests {
             ("auth.app_password_reset", Access::DataKey),
             ("auth.app_password_reset_confirm", Access::DataKey),
             ("auth.app_change_email", Access::DataKey),
+            ("auth.app_change_email_confirm", Access::DataKey),
             ("auth.app_change_password", Access::DataKey),
             ("auth.app_jwks", Access::Public),
             // Realtime (RT1 T3, S18): membership is checked at join, not here.

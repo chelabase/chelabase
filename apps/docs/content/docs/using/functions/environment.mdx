@@ -15,6 +15,8 @@ chelabase functions secrets unset billing API_KEY
 
 A secret name is a letter or `_`, then up to 127 of `A-Z`, `a-z`, `0-9` and `_`. A value is at most 64 KiB. A change reaches the function within about two seconds. A new branch gets a copy of its parent's secrets; after that each branch's are its own.
 
+On a [service](/using/services/containers#environment), secrets become a container's environment, so only a tenant admin may set or delete them, and names the runner or a runtime's loader reads at start (`PORT`, `LD_*`, `NODE_OPTIONS`, `PYTHONPATH` and [others](/using/services/containers#environment)) are refused. A plain function's secrets keep the Developer rule and accept any valid name.
+
 ## What `env` holds
 
 | Name | Value |

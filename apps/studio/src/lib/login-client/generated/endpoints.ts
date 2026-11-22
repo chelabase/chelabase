@@ -25,8 +25,11 @@ import type {
 
 import type {
   AcceptInviteBody,
+  AppChangeEmailBody,
+  AppChangeEmailConfirmBody,
   AppChangePasswordBody,
   AppEmailBody,
+  AppEmailChangePending,
   AppJwks,
   AppPasswordResetConfirmBody,
   AppRefreshBody,
@@ -172,9 +175,9 @@ export const getAppChangeEmailUrl = () => {
 }
 
 /**
- * Changes the signed-in user's email (needs the `Chelabase-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.
+ * Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.
  */
-export const appChangeEmail = async (appEmailBody: AppEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+export const appChangeEmail = async (appChangeEmailBody: AppChangeEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<AppEmailChangePending | void> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -190,12 +193,12 @@ export const appChangeEmail = async (appEmailBody: AppEmailBody, options?: Param
     }
     return headers;
   };
-return customFetch<void>(getAppChangeEmailUrl(),
+return customFetch<AppEmailChangePending | void>(getAppChangeEmailUrl(),
   {
     ...options,
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
-    body: JSON.stringify(appEmailBody)
+    body: JSON.stringify(appChangeEmailBody)
   }
 );}
 
@@ -233,9 +236,9 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
   return  { mutationFn, ...mutationOptions }}
 
     export type AppChangeEmailMutationResult = NonNullable<Awaited<ReturnType<typeof appChangeEmail>>>
-    export type AppChangeEmailMutationBody = AppEmailBody
+    export type AppChangeEmailMutationBody = AppChangeEmailBody
     export type AppChangeEmailMutationError = ErrorType<ErrorEnvelope>
-    export type AppChangeEmailMutationVariables = {data: AppEmailBody}
+    export type AppChangeEmailMutationVariables = {data: AppChangeEmailBody}
 
     export const useAppChangeEmail = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appChangeEmail>>, TError,AppChangeEmailMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -246,6 +249,91 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
         TContext
       > => {
       return useMutation(getAppChangeEmailMutationOptions(options), queryClient);
+    }
+
+export const getAppConfirmEmailChangeUrl = () => {
+
+
+
+
+  return `/auth/v1/app/change-email/confirm`
+}
+
+/**
+ * Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.
+ */
+export const appConfirmEmailChange = async (appChangeEmailConfirmBody: AppChangeEmailConfirmBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<void>(getAppConfirmEmailChangeUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(appChangeEmailConfirmBody)
+  }
+);}
+
+
+
+
+
+export const getAppConfirmEmailChangeMutationKey = () => ['appConfirmEmailChange'] as const;
+
+export const getAppConfirmEmailChangeMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appConfirmEmailChange>>, TError,AppConfirmEmailChangeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof appConfirmEmailChange>>, TError,AppConfirmEmailChangeMutationVariables, TContext> => {
+
+const mutationKey = getAppConfirmEmailChangeMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof appConfirmEmailChange>>, AppConfirmEmailChangeMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  appConfirmEmailChange(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type AppConfirmEmailChangeMutationResult = NonNullable<Awaited<ReturnType<typeof appConfirmEmailChange>>>
+    export type AppConfirmEmailChangeMutationBody = AppChangeEmailConfirmBody
+    export type AppConfirmEmailChangeMutationError = ErrorType<ErrorEnvelope>
+    export type AppConfirmEmailChangeMutationVariables = {data: AppChangeEmailConfirmBody}
+
+    export const useAppConfirmEmailChange = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof appConfirmEmailChange>>, TError,AppConfirmEmailChangeMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof appConfirmEmailChange>>,
+        TError,
+        AppConfirmEmailChangeMutationVariables,
+        TContext
+      > => {
+      return useMutation(getAppConfirmEmailChangeMutationOptions(options), queryClient);
     }
 
 export const getAppChangePasswordUrl = () => {

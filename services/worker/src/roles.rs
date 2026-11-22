@@ -536,8 +536,8 @@ fn database_names(out: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// Which of `names` exist, hex-encoded, one per line (a rename's outcome when its answer was
-/// lost). The comment is the fakes' needle.
-pub(crate) fn role_names_sql(names: &[&str]) -> String {
+/// lost). The comment is the fakes' needle. Public for the live test that runs this text.
+pub fn role_names_sql(names: &[&str]) -> String {
     let names: Vec<String> = names.iter().map(|n| quote_literal(n)).collect();
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT /* chelabase: role names */ \
@@ -910,6 +910,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
             self.publish_twice(&ep, &[name.to_string()]).await;
         }
+        // The change may have made a keyed role elevated (or ordinary again): it goes to the
+        // data API login it now belongs to.
+        if !script.is_empty() {
+            self.resync_elevated_grants_after_role_change(branch, &ep, &database).await;
+        }
         // A role made in SQL that lost its password has no copy any more.
         if !wanted_login
             && row.as_ref().is_some_and(|r| r.origin == RoleOrigin::Sql)
@@ -1230,9 +1235,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, endpoint_id = %ep, role = name, "dropping the role; the row stays: {e:#}");
             RoleOutcome::Failed(format!("dropping the role {name}: {e:#}"))
         };
+        let mut dropped_in_sql = true;
         let reassigned = match self.role_databases(&ep, &database, name).await {
             // Already gone from SQL: nothing moved, nothing exposed.
-            Ok(None) => Reassigned::default(),
+            Ok(None) => {
+                dropped_in_sql = false;
+                Reassigned::default()
+            }
             Ok(Some(databases)) => {
                 // Read before anything changes; the quarantine role exposes nothing to confirm.
                 let exposures = if successor == QUARANTINE_ROLE {
@@ -1283,6 +1292,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
             Err(e) => return dropping(e),
         };
+        // Dropping a role can change another role's class (a group that reached a LOGIN role
+        // through it is ordinary now): each goes to the data API login it now belongs to.
+        if dropped_in_sql {
+            self.resync_elevated_grants_after_role_change(branch, &ep, &database).await;
+        }
         match self.metadata.delete_role_copy(&ep, name).await {
             // `false`: the row went meanwhile (a forwarded DROP ROLE); the role is gone either way.
             Ok(_) => {}
@@ -1426,6 +1440,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
             }
         }
+        // A role's class depends on names too (reserved ones): after the rename each role goes
+        // to the data API login it now belongs to.
+        self.resync_elevated_grants_after_role_change(branch, &ep, &database).await;
         self.publish_twice(&ep, &[from.to_string(), to.to_string()])
             .await;
         info!(branch_id = %branch, endpoint_id = %ep, from, to, "role renamed");
@@ -2224,15 +2241,75 @@ mod tests {
         (main.id, ep, database)
     }
 
-    /// Every SQL text that reached the compute.
+    /// Every SQL text that reached the compute for the roles themselves: all but the role
+    /// catalog's read that follows a change (each role the data API's logins hold goes to
+    /// the login it now belongs to; nothing here is held by one).
     fn sql(w: &FakeWorker) -> Vec<String> {
         w.computes
             .sql
             .lock()
             .unwrap()
             .iter()
+            .filter(|(_, _, s)| !s.contains("/* chelabase: member roles */"))
             .map(|(_, _, s)| s.clone())
             .collect()
+    }
+
+    /// A change to a role's attributes is followed by the read that moves the role to the
+    /// data API login it now belongs to; a change that sends nothing isn't.
+    #[tokio::test]
+    async fn a_patch_is_followed_by_the_login_move_step() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, _, _) = login(&w, &ep, "app").unwrap();
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        let patch = RolePatch { bypass_rls: Some(true), ..RolePatch::default() };
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+        let all: Vec<String> = w.computes.sql.lock().unwrap().iter().map(|(_, _, s)| s.clone()).collect();
+        let alter = all.iter().position(|s| s.contains("ALTER ROLE \"app\" BYPASSRLS;")).expect("the change");
+        let moved = all.iter().position(|s| s.contains("/* chelabase: member roles */")).expect("the move step's read");
+        assert!(alter < moved, "{all:?} on {ep}");
+    }
+
+    /// W8: a delete that dropped the role in SQL and a rename are followed by the read that
+    /// moves roles to the data API login they now belong to; a delete that sent no DROP
+    /// (the role was already gone from SQL) isn't.
+    #[tokio::test]
+    async fn a_delete_or_rename_is_followed_by_the_login_move_step() {
+        const MOVE_READ: &str = "/* chelabase: member roles */";
+        let all = |w: &FakeWorker| -> Vec<String> {
+            w.computes.sql.lock().unwrap().iter().map(|(_, _, s)| s.clone()).collect()
+        };
+        // Delete.
+        let (w, journal) = worker();
+        let (branch, _ep, _db) = with_app(&w, &journal).await;
+        w.computes.answer(EXISTS_APP, "1\n");
+        w.computes.answer("FROM pg_database", &databases(&["app"]));
+        w.computes.answer_in("app", "REASSIGN OWNED BY", "count|0\n");
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
+        let sent = all(&w);
+        let dropped = sent.iter().rposition(|s| s.contains("DROP ROLE")).expect("the drop");
+        let moved = sent.iter().position(|s| s.contains(MOVE_READ)).expect("the move step's read");
+        assert!(dropped < moved, "{sent:?}");
+        // A delete of a role already gone from SQL sends nothing, so nothing follows it.
+        let (w, journal) = worker();
+        let (branch, _ep, _db) = with_app(&w, &journal).await;
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
+        assert!(!all(&w).iter().any(|s| s.contains(MOVE_READ)), "{:?}", all(&w));
+        // Rename.
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let (verifier, _, _) = login(&w, &ep, "app").unwrap();
+        in_catalog(&w, &observed("app", true, verifier.as_deref()));
+        w.computes.sql.lock().unwrap().clear();
+        assert_eq!(w.rename_role(branch, "app", "app_v2").await, RoleOutcome::Ok);
+        let sent = all(&w);
+        let renamed = sent.iter().position(|s| s.contains("RENAME TO \"app_v2\"")).expect("the rename");
+        let moved = sent.iter().position(|s| s.contains(MOVE_READ)).expect("the move step's read");
+        assert!(renamed < moved, "{sent:?}");
     }
 
     /// `(verifier, sealed password, pending)` of a non-owner row.
@@ -2719,6 +2796,9 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
+            // The login move step's read after a role change has its own test
+            // (`a_delete_or_rename_is_followed_by_the_login_move_step`).
+            .filter(|(_, _, s)| !s.contains("/* chelabase: member roles */"))
             .map(|(_, db, s)| (db.clone(), s.clone()))
             .collect()
     }
@@ -3639,8 +3719,10 @@ mod tests {
                  ALTER ROLE \"app\" LOGIN;"
             )
         );
-        // The catalog read comes first; the change runs after the row is stored.
-        let applied = entries(&journal)
+        // The catalog read comes first; the change runs after the row is stored. (The read
+        // that follows the publish moves the role to the data API login it belongs to.)
+        let published = pos(&journal, &format!("cache.password_updated {ep} app"));
+        let applied = entries(&journal)[..published]
             .iter()
             .rposition(|e| e.starts_with(&format!("compute.sql {ep} ")))
             .unwrap();

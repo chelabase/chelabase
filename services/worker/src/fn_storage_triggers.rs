@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use chelabase_metadata::{MetadataClient, StorageTriggerTarget, TriggerDelivery};
 use chelabase_nats::storage_objects::{self, ObjectEvent, ObjectEventType};
-use chelabase_types::BranchId;
+use chelabase_types::{BranchId, DatabaseId};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use tracing::{info, warn};
@@ -59,7 +59,54 @@ pub const POLL: Duration = Duration::from_secs(10);
 /// (`CHELABASE_FUNCTIONS_TIMEOUT_MS`).
 pub const ACK_WAIT: Duration = Duration::from_secs(90);
 /// Deliveries in flight per trigger.
-const CONCURRENCY: usize = 4;
+pub const CONCURRENCY: usize = 4;
+/// Invocations in flight across every storage trigger of this worker: each holds a permit of
+/// [`Delivery`]'s one semaphore for its request, so the triggers' own [`CONCURRENCY`] can't add
+/// up to more than this.
+pub const MAX_STORAGE_TRIGGER_IN_FLIGHT: usize = 32;
+/// Invocations in flight for one database's storage triggers, as for schedules: a database's
+/// share is taken before the shared permit, so one database's deliveries can't hold every
+/// permit of [`MAX_STORAGE_TRIGGER_IN_FLIGHT`] or fill its queue.
+pub const MAX_STORAGE_TRIGGER_IN_FLIGHT_PER_DATABASE: usize = 8;
+
+/// Runs `work`, calling `progress` every `period` for as long as it is pending and never
+/// after it ends: how a delivered message tells JetStream it is still being worked on.
+pub async fn with_progress<T, P: Future<Output = ()>>(
+    work: impl Future<Output = T>,
+    period: Duration,
+    mut progress: impl FnMut() -> P,
+) -> T {
+    tokio::pin!(work);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut work => break out,
+            _ = tick.tick() => progress().await,
+        }
+    }
+}
+
+/// One delivered message of a trigger, from the moment it is received: `work` runs once one
+/// of the trigger's `slots` ([`CONCURRENCY`]) is free, and `progress` is called every
+/// `period` from receipt, while it waits for the slot and while `work` runs.
+///
+/// Invariant: every message the consumer has delivered and not settled is covered by
+/// progress acks at intervals shorter than [`ACK_WAIT`], whatever it waits for (the trigger's
+/// slot, its database's share, the shared permit, the function), so waiting alone never
+/// redelivers it; and a trigger never has more than [`CONCURRENCY`] of them past the slot.
+pub async fn covered<T, P: Future<Output = ()>>(
+    slots: &tokio::sync::Semaphore,
+    period: Duration,
+    progress: impl FnMut() -> P,
+    work: impl Future<Output = T>,
+) -> T {
+    let slotted = async {
+        let _slot = slots.acquire().await.expect("a trigger's slots are never closed");
+        work.await
+    };
+    with_progress(slotted, period, progress).await
+}
 
 /// The invocation's body: what the runtime unwraps for the function's `fetch`.
 pub fn event_body(event: &ObjectEvent) -> serde_json::Value {
@@ -118,6 +165,33 @@ pub struct Delivery<R> {
     invoker: Arc<dyn Invoker>,
     recorder: R,
     pub dropped: AtomicU64,
+    /// The process-wide bound on invocations in flight ([`MAX_STORAGE_TRIGGER_IN_FLIGHT`]).
+    in_flight: Arc<tokio::sync::Semaphore>,
+    /// Each database's share ([`MAX_STORAGE_TRIGGER_IN_FLIGHT_PER_DATABASE`]): only databases
+    /// with a delivery holding or waiting for a share have an entry.
+    databases: Arc<Mutex<HashMap<DatabaseId, Arc<tokio::sync::Semaphore>>>>,
+}
+
+/// A database's share held by one delivery; dropping it frees the share and removes the
+/// database's entry when no other delivery holds or waits for one.
+struct DatabaseShare {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    database: DatabaseId,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    databases: Arc<Mutex<HashMap<DatabaseId, Arc<tokio::sync::Semaphore>>>>,
+}
+
+impl Drop for DatabaseShare {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut map = self.databases.lock().expect("database shares");
+        // Clones are made only under this lock: two left are the map's and this one.
+        if Arc::strong_count(&self.semaphore) == 2
+            && map.get(&self.database).is_some_and(|s| Arc::ptr_eq(s, &self.semaphore))
+        {
+            map.remove(&self.database);
+        }
+    }
 }
 
 impl<R: Recorder> Delivery<R> {
@@ -126,7 +200,42 @@ impl<R: Recorder> Delivery<R> {
             invoker,
             recorder,
             dropped: AtomicU64::new(0),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_STORAGE_TRIGGER_IN_FLIGHT)),
+            databases: Arc::default(),
         }
+    }
+
+    /// Databases with a delivery holding or waiting for a share (tests).
+    pub fn databases_in_flight(&self) -> usize {
+        self.databases.lock().expect("database shares").len()
+    }
+
+    /// Waits for one of `database`'s shares.
+    async fn database_share(&self, database: DatabaseId) -> DatabaseShare {
+        let semaphore = self
+            .databases
+            .lock()
+            .expect("database shares")
+            .entry(database)
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(MAX_STORAGE_TRIGGER_IN_FLIGHT_PER_DATABASE))
+            })
+            .clone();
+        // The guard exists before the wait, so a delivery cancelled while waiting leaves no
+        // entry behind either.
+        let mut share = DatabaseShare {
+            permit: None,
+            database,
+            semaphore: semaphore.clone(),
+            databases: self.databases.clone(),
+        };
+        share.permit = Some(
+            semaphore
+                .acquire_owned()
+                .await
+                .expect("a database's shares are never closed"),
+        );
+        share
     }
 
     async fn record(&self, t: &StorageTriggerTarget, delivery: TriggerDelivery) {
@@ -166,6 +275,15 @@ impl<R: Recorder> Delivery<R> {
             self.record(t, outcome(t, false, 1, None)).await;
             return Next::Dropped;
         }
+        // Held for the request; a message waiting here is kept from redelivery by the consumer
+        // (progress acks while this future is pending). The database's share comes first, so
+        // a database past its share waits there and not in the shared permit's queue.
+        let _share = self.database_share(t.database_id).await;
+        let _permit = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("the in-flight semaphore is never closed");
         let error = match self
             .invoker
             .invoke(t.branch_id, &t.function_name, event_body(&event))
@@ -462,6 +580,7 @@ async fn consume(
             delivery.record_evicted(&current, gone).await;
         }
     };
+    let slots = tokio::sync::Semaphore::new(CONCURRENCY);
     let deliver = messages
         .map(|message| {
             // In the order the consumer delivers (before any concurrency): first deliveries
@@ -479,16 +598,31 @@ async fn consume(
             drop(g);
             Some((message, seq, attempt, skipped, ordinal))
         })
-        .for_each_concurrent(CONCURRENCY, |item| async {
+        // Every delivered message is taken up at once (the consumer never has more than
+        // `MAX_ACK_PENDING` unsettled), so each is covered by progress acks from receipt; the
+        // trigger's own limit is the `slots` inside ([`covered`]).
+        .for_each_concurrent(storage_objects::MAX_ACK_PENDING as usize, |item| async {
             let Some((message, seq, attempt, skipped, ordinal)) = item else {
                 return;
             };
             let current = live.borrow().clone();
             delivery.record_evicted(&current, skipped).await;
             let jitter = (rand::random::<f64>() - 0.5) * 0.4;
-            let next = delivery
-                .process(&current, &message.payload, attempt, Utc::now(), jitter)
-                .await;
+            let next = covered(
+                &slots,
+                ACK_WAIT / 3,
+                || async {
+                    let _ = message
+                        .ack_with(async_nats::jetstream::AckKind::Progress)
+                        .await;
+                },
+                async {
+                    delivery
+                        .process(&current, &message.payload, attempt, Utc::now(), jitter)
+                        .await
+                },
+            )
+            .await;
             let ack = match next {
                 Next::Retry(delay) => {
                     let gone = gaps.lock().expect("gaps").unsettled(seq, ordinal);

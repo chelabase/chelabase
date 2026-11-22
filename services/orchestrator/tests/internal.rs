@@ -12,7 +12,7 @@ use chelabase_metadata::{
     AppSession, AppUsersStatus, BranchAuthSync, BranchConnectionRow, BranchKind, BranchRecord,
     ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin, MetadataError,
     NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, OnDelete, ProjectAuth, ProjectRecord,
-    PeekOutcome, ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
+    PeekOutcome, ProjectStatus, RefreshNext, RefreshOutcome, RefreshProof, RoleCopy, RoleLevel, RoleOrigin,
 };
 use chelabase_metadata::members::InviteDescription;
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
@@ -970,6 +970,7 @@ impl NeonMetadataPort for FakeNeon {
         id: uuid::Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         next: &RefreshNext,
     ) -> Result<RefreshOutcome, MetadataError> {
         self.check()?;
@@ -1005,6 +1006,9 @@ impl NeonMetadataPort for FakeNeon {
                     Ok(RefreshOutcome::Reused(f.s.clone()))
                 }
             }
+        } else if proof == RefreshProof::Issued {
+            f.s.revoked_at = Some(now);
+            Ok(RefreshOutcome::Reused(f.s.clone()))
         } else {
             Ok(RefreshOutcome::Invalid)
         }
@@ -1016,6 +1020,7 @@ impl NeonMetadataPort for FakeNeon {
         id: uuid::Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         cap: std::time::Duration,
     ) -> Result<PeekOutcome, MetadataError> {
         self.check()?;
@@ -1040,6 +1045,8 @@ impl NeonMetadataPort for FakeNeon {
                 }
                 _ => Ok(PeekOutcome::Reused),
             }
+        } else if proof == RefreshProof::Issued {
+            Ok(PeekOutcome::Reused)
         } else {
             Ok(PeekOutcome::Invalid)
         }
@@ -2346,6 +2353,8 @@ fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option
         storage_password_salt: None,
         functions_password_enc: None,
         functions_password_salt: None,
+        authenticator_elevated_password_enc: None,
+        authenticator_elevated_password_salt: None,
         settings: DataApiSettings {
             max_rows: 500,
             statement_timeout_ms: 4000,
@@ -5253,14 +5262,14 @@ async fn create_session_returns_a_token_of_the_right_shape() {
     assert_eq!(status, 201, "{body}");
     let sid: uuid::Uuid = body["session_id"].as_str().unwrap().parse().unwrap();
     let token = body["refresh_token"].as_str().unwrap();
-    let (id_part, secret) = token.split_once('.').unwrap();
+    let (id_part, rest) = token.split_once('.').unwrap();
     assert_eq!(id_part, sid.to_string());
-    assert_eq!(secret.len(), 43, "{secret}");
+    let (secret, tag) = rest.split_once('.').unwrap();
+    assert_eq!((secret.len(), tag.len()), (43, 43), "{rest}");
     assert!(
-        secret
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        "{secret}"
+        rest.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'),
+        "{rest}"
     );
     let expires: chrono::DateTime<chrono::Utc> = body["expires_at"].as_str().unwrap().parse().unwrap();
     let ttl = chrono::Duration::from_std(REFRESH_TTL).unwrap();
@@ -5272,7 +5281,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
     assert_eq!(stored.s.identity_session_id, "zs1");
     // Two sessions never share a secret.
     let (_, other) = a.create_session(w.project, user, "zs2").await;
-    assert_ne!(other.split_once('.').unwrap().1, secret);
+    assert_ne!(other.split_once('.').unwrap().1.split_once('.').unwrap().0, secret);
 }
 
 #[tokio::test]
@@ -5410,8 +5419,9 @@ async fn peek_answers_the_user_and_rotates_nothing() {
     assert_eq!(after.s, rotated.s, "peek wrote nothing");
 }
 
-// #59: an unknown, revoked or two-rotations-old token is `refresh_token_invalid`, the previous
-// token after the grace `refresh_token_reused`; peek revokes nothing and ends no identity session.
+// #59: an unknown, forged or revoked token is `refresh_token_invalid`, the previous token after
+// the grace `refresh_token_reused` (an older issued one too, see
+// `peek_with_an_old_issued_token_is_reused`); peek revokes nothing and ends no identity session.
 #[tokio::test]
 async fn peek_gives_refresh_verdicts_without_revoking() {
     let w = app_world();
@@ -5426,7 +5436,6 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
     a.edit_session(dead, |f| f.s.revoked_at = Some(chrono::Utc::now()));
     let unknown = format!("{}.{}", uuid::Uuid::new_v4(), t0.split_once('.').unwrap().1);
     for (what, token) in [
-        ("two rotations old", t0.clone()),
         ("unknown session", unknown),
         ("wrong secret", format!("{sid}.wrong-secret")),
         ("garbage", "garbage".to_string()),
@@ -5490,6 +5499,111 @@ async fn peek_metadata_fault_is_not_a_verdict() {
     *w.neon.fail.lock().unwrap() = false;
     assert_eq!(status, 500, "{body}");
     assert!(!a.revoked(sid));
+}
+
+/// Refreshes `token` and returns the new one.
+async fn rotate(a: &AppApp, project: ProjectId, token: &str) -> String {
+    let (status, body) = a.refresh(project, token).await;
+    assert_eq!(status, 200, "{body}");
+    body["refresh_token"].as_str().unwrap().to_string()
+}
+
+// Any earlier refresh token the orchestrator issued for a session, not only the previous one,
+// ends the session and its identity session when it comes back.
+#[tokio::test]
+async fn refresh_with_an_old_issued_token_revokes() {
+    let w = app_world();
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
+    let t1 = rotate(&a, w.project, &t0).await;
+    let t2 = rotate(&a, w.project, &t1).await;
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"), "{body}");
+    assert!(a.revoked(sid));
+    assert!(eventually(|| z.count() == 0).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["zs1"]);
+    let (status, body) = a.refresh(w.project, &t2).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
+}
+
+// A token whose tag doesn't verify, a two-part token with an unknown secret, or another
+// session's issued token with this session's id is refused and changes nothing.
+#[tokio::test]
+async fn refresh_with_a_forged_token_for_a_live_session_changes_nothing() {
+    let w = app_world();
+    let a = spawn_app(&w, None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let t1 = rotate(&a, w.project, &t0).await;
+    let t2 = rotate(&a, w.project, &t1).await;
+    let (_, other) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs2").await;
+    let other_rest = other.split_once('.').unwrap().1;
+    let (nonce, _) = t2.split_once('.').unwrap().1.split_once('.').unwrap();
+    let before = a.session(sid);
+    for (what, token) in [
+        ("wrong tag", format!("{sid}.{nonce}.{}", "A".repeat(43))),
+        ("short tag", format!("{sid}.{nonce}.AAAA")),
+        ("two-part, unknown secret", format!("{sid}.{nonce}")),
+        ("another session's tag", format!("{sid}.{other_rest}")),
+        ("extra part", format!("{t2}.x")),
+    ] {
+        for peek in [false, true] {
+            let (status, body) = if peek { a.peek(w.project, &token).await } else { a.refresh(w.project, &token).await };
+            assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{what} (peek {peek}): {body}");
+        }
+    }
+    let after = a.session(sid);
+    assert_eq!((after.s, after.hash, after.prev), (before.s, before.hash, before.prev), "nothing changed");
+    assert!(!a.revoked(sid));
+    rotate(&a, w.project, &t2).await;
+}
+
+// Peek gives the same verdict for an old issued token, and writes nothing.
+#[tokio::test]
+async fn peek_with_an_old_issued_token_is_reused() {
+    let w = app_world();
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
+    let t1 = rotate(&a, w.project, &t0).await;
+    let t2 = rotate(&a, w.project, &t1).await;
+    let before = a.session(sid);
+    let (status, body) = a.peek(w.project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"), "{body}");
+    let after = a.session(sid);
+    assert_eq!((after.s, after.hash, after.prev), (before.s, before.hash, before.prev), "peek wrote nothing");
+    assert!(z.revoked().is_empty(), "{:?}", z.fake.calls());
+    let (status, body) = a.peek(w.project, &t2).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+// A session from before the three-part tokens: its current token rotates into the new form;
+// its stale two-part tokens are refused without ending the session.
+#[tokio::test]
+async fn legacy_tokens_rotate_and_never_revoke_on_a_mismatch() {
+    let w = app_world();
+    let a = spawn_app(&w, None).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (legacy0, legacy1) = (format!("{sid}.{}", "a".repeat(43)), format!("{sid}.{}", "b".repeat(43)));
+    // Rotated once under the old scheme: `legacy1` current, `legacy0` previous, grace over.
+    a.edit_session(sid, |f| {
+        f.hash = sha256(&legacy1);
+        f.prev = Some(sha256(&legacy0));
+        f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    });
+    let stale = format!("{sid}.{}", "c".repeat(43));
+    for peek in [false, true] {
+        let (status, body) = if peek { a.peek(w.project, &stale).await } else { a.refresh(w.project, &stale).await };
+        assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "peek {peek}: {body}");
+    }
+    assert!(!a.revoked(sid));
+    let t = rotate(&a, w.project, &legacy1).await;
+    assert_eq!(t.split('.').count(), 3, "{t}");
+    // The legacy token is now two generations old: still only invalid.
+    let (status, body) = a.refresh(w.project, &legacy0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
+    assert!(!a.revoked(sid));
+    rotate(&a, w.project, &t).await;
 }
 
 #[tokio::test]
@@ -7577,4 +7691,106 @@ async fn accept_invite_answers_the_rows_state() {
     *neon.fail_clear.lock().unwrap() = false;
     neon.setup.lock().unwrap().admit_fails = true;
     assert_eq!(ask().await.0, 500);
+}
+
+/// A ready branch's connection row with every login's password stored, the elevated one
+/// included when `elevated`.
+fn row_with_every_login(app_key: &chelabase_secrets::SecretKey, elevated: bool) -> BranchConnectionRow {
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    let branch = row.branch_id.to_string();
+    row.authenticator_password_enc = Some(seal_credential(app_key, &branch, Purpose::Authenticator, "auth-pw"));
+    row.storage_password_enc = Some(seal_credential(app_key, &branch, Purpose::Storage, "storage-pw"));
+    row.storage_password_salt = Some(vec![1; 16]);
+    row.functions_password_enc = Some(seal_credential(app_key, &branch, Purpose::FunctionsDispatch, "dispatch-pw"));
+    row.functions_password_salt = Some(vec![2; 16]);
+    if elevated {
+        row.authenticator_elevated_password_enc =
+            Some(seal_credential(app_key, &branch, Purpose::AuthenticatorElevated, "elevated-pw"));
+        row.authenticator_elevated_password_salt = Some(vec![3; 16]);
+    }
+    row
+}
+
+/// The data connection answer carries the elevated login and its password (sealed for the
+/// branch with its own purpose) beside `authenticator`'s, which is unchanged.
+#[tokio::test]
+async fn data_connection_carries_elevated_credentials() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = row_with_every_login(&app.key, true);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let path = format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid());
+    let (code, body) = app.get(&path, Some(REST_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!((&body["user"], &body["password"]), (&json!("authenticator"), &json!("auth-pw")));
+    assert_eq!(
+        body["elevated"],
+        json!({ "user": "chelabase_authenticator_elevated", "password": "elevated-pw" })
+    );
+
+    // A value sealed for another purpose never opens as the elevated password.
+    let branch = row.branch_id.to_string();
+    row.authenticator_elevated_password_enc =
+        Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "swapped"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(REST_TOKEN)).await;
+    assert_eq!(code, 500);
+    assert!(!body.to_string().contains("swapped"));
+}
+
+/// Until the worker stored an elevated password the field is absent, and the rest of the
+/// answer is what it was.
+#[tokio::test]
+async fn elevated_credentials_absent_until_stored() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let row = row_with_every_login(&app.key, false);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let path = format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid());
+    let (code, body) = app.get(&path, Some(REST_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.get("elevated").is_none(), "{body}");
+    assert_eq!((&body["user"], &body["password"]), (&json!("authenticator"), &json!("auth-pw")));
+
+    let with = row_with_every_login(&app.key, true);
+    neon.connections.lock().unwrap().insert(with.branch_id, with.clone());
+    let (code, body) = app
+        .get(&format!("/internal/data/branches/{}/connection", with.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.get("elevated").is_some(), "{body}");
+}
+
+/// The storage and functions connection routes answer as their own logins and never carry
+/// the elevated login or its password.
+#[tokio::test]
+async fn storage_and_functions_routes_never_carry_elevated() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let row = row_with_every_login(&app.key, true);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    // The data route does carry it, so the two below are compared with a live value.
+    let (code, data) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(REST_TOKEN))
+        .await;
+    assert_eq!(code, 200, "{data}");
+    assert!(data.to_string().contains("elevated-pw"), "{data}");
+    for (route, token, user) in [
+        ("storage", STORAGE_TOKEN, "chelabase_storage"),
+        ("functions", FUNCTIONS_TOKEN, "chelabase_functions_dispatch"),
+    ] {
+        let path = format!("/internal/{route}/branches/{}/connection", row.branch_id.as_uuid());
+        let (code, body) = app.get(&path, Some(token)).await;
+        assert_eq!(code, 200, "{route}: {body}");
+        assert_eq!(body["user"], user, "{route}");
+        assert!(body.get("elevated").is_none(), "{route}: {body}");
+        let text = body.to_string();
+        assert!(!text.contains("elevated-pw") && !text.contains("chelabase_authenticator_elevated"), "{route}: {text}");
+    }
 }

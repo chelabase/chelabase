@@ -19,6 +19,9 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
    invalidation, reconciles), weigh a NATS event (`crates/chelabase-nats`) against polling,
    reconcile loops or direct database reads, and record the choice in the design sketch
    (Approach or Rejected).
+   For a hard plan (cross-service design, auth, privileges, migrations, lock ordering, or
+   unclear scope), call the `advisor` now, before cutting milestones, and once more before
+   step 7 (`AGENTS.md`, Advisor). Skip it for routine epics.
 2. Pick a kebab-case slug (≤ 30 chars) and an epic title `type(area): summary`.
 3. Cut milestones. Each one:
    - lands in one build run (aim ≤ ~400 changed lines);
@@ -31,11 +34,13 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
    `shared-state` (see `issue-spec` Verification) never share a wave.
 5. Write draft issue bodies (`m1.md`, …) and a short `plan.md` (outcome, non-goals, risks,
    waves, milestone table) under `.claude/.cache/epics/<slug>/` (git-ignored). Bodies follow `issue-spec`.
-6. **Red-team** (only when a milestone is `whiteroom`): one opus agent reads `plan.md`, the
-   whiteroom bodies and the code they touch, and attacks them: bypasses, races, privilege
-   paths, fail-open errors, and how the change interacts with the subsystems around it.
-   At most 10 findings, each one line with a concrete scenario. Fold them into the bodies
-   (an acceptance criterion, a test to write, or the Focus line). No separate document.
+6. **Gap review** (only when a milestone is `whiteroom`): one opus agent reads `plan.md`, the
+   whiteroom bodies and the code they touch, and looks for what the fix doesn't yet
+   guarantee: missing authorization checks, races, privilege paths left open, fail-open
+   errors, and how the change interacts with the subsystems around it. At most 10 gaps, each
+   one line stated as the missing guarantee and its fix (see "Fixes, not exploits"). Fold them
+   into the bodies (an acceptance criterion, a test to write, or the Focus line). No separate
+   document.
 7. Report the epic brief, waves, milestones table (n, title, wave, depends, review, model,
    why), open questions, and the draft path. Stop for human OK. Do not create issues or PRs.
 
@@ -55,6 +60,15 @@ Work from the draft in `.claude/.cache/epics/<slug>/` as it is; don't re-plan. I
 
 ## Rules
 
+- **Fixes, not exploits.** `plan.md`, findings notes, milestone bodies and gap-review output
+  describe every security problem by where it is, the guarantee that is missing, the fix and
+  the acceptance criteria that prove it holds. Never write attack steps, payloads, proof-of-
+  concept walkthroughs or "an attacker could…" narratives. Write "`<handler>` doesn't check
+  `<permission>` → require it; a caller without it gets 403", not how to abuse it. Tests are
+  named for the behaviour that must hold ("refuses a caller without `<permission>`"), not
+  for the attack. This applies to subagent prompts too: ask sweep and review agents for
+  defects and fixes.
+- Unfixed vulnerabilities go through `/epic-security`, never this lane: the repo is public.
 - No product-code edits while planning.
 - Prefer `/quick` when every piece could land alone.
 - Never pass harness `isolation: "worktree"`.

@@ -69,7 +69,7 @@ Protect a branch in Studio's branch settings, or with `PATCH /v1/databases/{id}/
 
 ### What protecting blocks
 
-A protected branch refuses schema changes from member logins that aren't Admins. A member login is the login a project member gets on a branch (`cb_m_<id>`). Postgres refuses the statement with SQLSTATE `42501` and the hint `chelabase:branch_protected`. Temporary objects, `REFRESH MATERIALIZED VIEW` and `REINDEX` stay allowed for everyone.
+A protected branch refuses schema changes from member logins that aren't Admins. A member login is the login a project member gets on a branch (`cb_m_<id>`). Postgres refuses the statement with SQLSTATE `42501` and the hint `chelabase:branch_protected`. Temporary objects, `REFRESH MATERIALIZED VIEW` and `REINDEX` stay allowed for everyone. Indexes are the exception: for these logins `CREATE INDEX` and `DROP INDEX`, concurrent or not, are refused before they start, on temporary tables too.
 
 Each branch also has a **guard login roles** switch (`guard_logins`). When the switch is on and the branch is protected, every login role on the branch is refused schema changes in the same way, from its first statement, including roles created later from SQL. Superusers, the owner, the member logins of Admins and the roles exempted on that branch are not refused. The member logins of non-Admins are refused whatever the switch says.
 
