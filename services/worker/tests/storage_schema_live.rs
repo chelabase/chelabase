@@ -5229,8 +5229,8 @@ const AUTH_SYNC_SQL: &str = "SELECT coalesce((SELECT rolcanlogin || ' ' || rolin
   FROM pg_authid WHERE rolname = 'chelabase_auth_sync'), '<none>')";
 
 /// The claim helpers' definitions. They're `BEGIN ATOMIC`, so `prosrc` is empty (the body is
-/// in `prosqlbody`, which [`CHELABASE_SHAPE_SQL`] doesn't hash): compare the whole definition.
-const HELPERS_PROSRC_SQL: &str = "SELECT string_agg(proname || ':' || md5(pg_get_functiondef(oid)), ',' ORDER BY proname) FROM pg_proc
+/// in `prosqlbody`): compare the whole definition, as [`CHELABASE_SHAPE_SQL`] does.
+const HELPERS_DEF_SQL: &str = "SELECT string_agg(proname || ':' || md5(pg_get_functiondef(oid)), ',' ORDER BY proname) FROM pg_proc
   WHERE pronamespace = 'chelabase'::regnamespace AND proname IN ('claims', 'user_id', 'user_email')";
 
 #[tokio::test]
@@ -5272,14 +5272,14 @@ CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE 
     let shape = fx.value(CHELABASE_SHAPE_SQL).await;
     assert_ne!(shape, unrewritten, "the shape hash sees a BEGIN ATOMIC helper's body");
     let auth_sync = fx.value(AUTH_SYNC_SQL).await;
-    let prosrc = fx.value(HELPERS_PROSRC_SQL).await;
+    let prosrc = fx.value(HELPERS_DEF_SQL).await;
     let why = format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}");
     for (what, script) in [("enable", enable("second-password")), ("claim helpers", helpers.clone())] {
         let e = fx.admin_on(&fx.ep, &script).await.expect_err(what);
         assert_eq!(newer_data_api_error(&e), Some(why.as_str()), "{what}: {e}");
         assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape, "{what} changed a newer chelabase");
         assert_eq!(fx.value(AUTH_SYNC_SQL).await, auth_sync, "{what} changed chelabase_auth_sync");
-        assert_eq!(fx.value(HELPERS_PROSRC_SQL).await, prosrc, "{what} rewrote the claim helpers");
+        assert_eq!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what} rewrote the claim helpers");
     }
     // The protect triggers are still there and enabled (the guard runs before their drop).
     assert_eq!(
@@ -5305,7 +5305,7 @@ CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE 
         fx.admin(&format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment}")).await;
         fx.admin(&enable(&format!("{what}-password"))).await;
         fx.admin(&helpers).await;
-        assert_ne!(fx.value(HELPERS_PROSRC_SQL).await, prosrc, "{what}: the helpers are this worker's");
+        assert_ne!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what}: the helpers are this worker's");
     }
 
     // 4. AC 3: an owner-forged stamp never blocks either script.
