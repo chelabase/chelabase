@@ -43,8 +43,10 @@
 //!
 //! A write that happened is never silent. Precisely:
 //!
-//! 1. **One audit line per call.** Every call the host receives writes exactly one audit line,
-//!    also when its handler is dropped mid-call (the runner cancels a call still in flight
+//! 1. **One audit line per call.** Every call the host forwards or refuses writes exactly one
+//!    audit line. A 404 for an unknown or ended run, and a handler dropped while it is still
+//!    reading the body, send nothing and write none. A line is written also when the handler
+//!    is dropped mid-call (the runner cancels a call still in flight
 //!    when the code settles: an un-awaited `chelabase.request`, or a `Promise.all` sibling).
 //!    A drop guard made before the handler's first await writes it; a dropped call's line says
 //!    `refusal="cut"`, `status=0`.
@@ -202,6 +204,8 @@ pub enum Code {
     /// An integer outside i64/u64, or a decimal serde_json would round (`invalid_request`).
     InexactNumber,
     Timeout,
+    /// The run ended while the call was in flight (no deadline passed).
+    Cut,
 }
 
 impl Code {
@@ -218,6 +222,7 @@ impl Code {
             Code::RequestTooLarge => "request_too_large",
             Code::InvalidRequest | Code::InexactNumber => "invalid_request",
             Code::Timeout => "timeout",
+            Code::Cut => "cut",
         }
     }
 
@@ -232,7 +237,7 @@ impl Code {
             Code::RequestTooLarge => 413,
             Code::InvalidRequest | Code::InexactNumber => 400,
             Code::ResponseTooLarge | Code::BinaryBody | Code::UpstreamUnavailable => 502,
-            Code::Timeout => 504,
+            Code::Timeout | Code::Cut => 504,
         }
     }
 
@@ -257,7 +262,7 @@ impl Code {
             Code::InexactNumber => {
                 "a number in the request is an integer outside the 64-bit range or a decimal that can't be carried exactly: send it as a string"
             }
-            Code::Timeout => "the execution's time is up",
+            Code::Timeout | Code::Cut => "the execution's time is up",
         }
     }
 }
@@ -677,9 +682,12 @@ async fn handle<'a>(
         Err((code, bytes)) => {
             line.response_bytes = bytes;
             let (response, _) = refuse(line, code);
+            if code == Code::Cut {
+                line.status = 0;
+            }
             // A cut call stays unanswered: the code never learns its outcome.
             let delivery = index
-                .filter(|_| code != Code::Timeout)
+                .filter(|_| !matches!(code, Code::Timeout | Code::Cut))
                 .map(|index| Delivery {
                     index,
                     upstream_unavailable: code == Code::UpstreamUnavailable,
@@ -894,7 +902,7 @@ async fn send(
     };
     let (status, headers, bytes) = tokio::select! {
         biased;
-        () = exec.ended() => return Err((Code::Timeout, 0)),
+        () = exec.ended() => return Err((Code::Cut, 0)),
         () = tokio::time::sleep_until(exec.deadline.into()) => {
             exec.journal.time_out();
             return Err((Code::Timeout, 0));
