@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POLL_MS } from "@/lib/query";
 import { jsonResponse, sequence } from "@/test/fake-fetch";
+import { meAs, type Level } from "@/test/table-editor-fixtures";
 import { columnSnap, detailOf, mergeOf, planStep } from "@/test/merge-fixtures";
 import { MERGE_URL, bodies, renderMergePage } from "@/test/merge-page-harness";
 
@@ -301,5 +302,42 @@ describe("MergePage", () => {
     expect(box).not.toBeChecked();
     await act(() => vi.advanceTimersByTimeAsync(POLL_MS));
     await vi.waitFor(() => expect(screen.getByRole("checkbox", { name: "I accept the data loss of s1" })).toBeChecked());
+  });
+
+  describe("what a Developer may do on a plan that needs Admin", () => {
+    const asLevel = (level: Level) => ({ "GET /v1/me": () => jsonResponse(meAs(level)) });
+    const userPlan = { steps: [planStep("u1", { kind: "user" })] };
+
+    it("disables_rehearse_with_an_admin_note_for_a_developer_on_a_user_sql_plan", async () => {
+      renderMergePage(mergeOf({ plan: userPlan }), { routes: asLevel("developer") });
+      const rehearse = await screen.findByRole("button", { name: "Rehearse" });
+      await vi.waitFor(() => expect(rehearse).toBeDisabled());
+      expect(screen.getAllByText(/needs Admin on this project/).length).toBeGreaterThan(0);
+    });
+
+    it("disables_apply_for_a_developer_on_a_user_sql_plan", async () => {
+      renderMergePage(mergeOf({ status: "rehearsed", plan: userPlan }), { routes: asLevel("developer") });
+      const apply = await screen.findByRole("button", { name: "Apply to main" });
+      await vi.waitFor(() => expect(apply).toBeDisabled());
+      expect(screen.getAllByText(/needs Admin on this project/).length).toBeGreaterThan(0);
+    });
+
+    it("disables_retry_for_a_developer_on_a_user_sql_plan", async () => {
+      renderMergePage(mergeOf({ status: "failed", failed_phase: "online", plan: userPlan }), { routes: asLevel("developer") });
+      const retry = await screen.findByRole("button", { name: "Retry the online steps" });
+      await vi.waitFor(() => expect(retry).toBeDisabled());
+    });
+
+    it("keeps_the_actions_for_a_developer_on_a_generated_plan", async () => {
+      renderMergePage(mergeOf({ plan: { steps: [planStep("g1")] } }), { routes: asLevel("developer") });
+      const rehearse = await screen.findByRole("button", { name: "Rehearse" });
+      expect(rehearse).toBeEnabled();
+      expect(screen.queryByText(/needs Admin on this project/)).not.toBeInTheDocument();
+    });
+
+    it("keeps_the_actions_for_an_admin_on_a_user_sql_plan", async () => {
+      renderMergePage(mergeOf({ plan: userPlan }), { routes: asLevel("admin") });
+      expect(await screen.findByRole("button", { name: "Rehearse" })).toBeEnabled();
+    });
   });
 });

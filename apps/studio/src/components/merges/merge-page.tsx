@@ -32,6 +32,7 @@ import {
   PHASE_LABEL,
   baseUnavailable,
   explainMergeError,
+  adminReason,
   isFinishPending,
   isMergeBusy,
   isMergeCancellable,
@@ -106,6 +107,7 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
   useCrumbLabel("databaseId", databaseId, crumbProject?.databases.find((d) => d.database_id === databaseId)?.name);
   const caps = projectCaps(me.data, projectId, databaseId);
   const canAct = caps.atLeast(target?.protected ? "admin" : "developer");
+  const isAdmin = caps.atLeast("admin");
 
   /** The merge's fields from an action's answer, at once; the refetch brings the rest. */
   function patchCache(next: Partial<Merge>) {
@@ -341,6 +343,7 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
           plan={plan}
           targetName={targetName}
           pending={pending}
+          adminReason={adminReason(merge, "rehearse", isAdmin)}
           onRehearse={() => void act(() => rehearseMerge(databaseId, mergeId, { version: merge.version }))}
         />
       </Section>
@@ -354,6 +357,8 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
           targetProtected={target?.protected ?? false}
           branchesLoaded={branches.data !== undefined}
           pending={pending}
+          applyReason={adminReason(merge, "apply", isAdmin)}
+          retryReason={adminReason(merge, "retry", isAdmin)}
           onApply={apply}
           onRetry={() => void act(() => retryMerge(databaseId, mergeId))}
           onAbandon={() => void act(() => abandonMerge(databaseId, mergeId))}

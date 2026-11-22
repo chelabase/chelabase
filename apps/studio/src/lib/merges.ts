@@ -706,3 +706,36 @@ export function stepErrors(error: string | null, ids: string[]): Record<string, 
   }
   return out;
 }
+
+/**
+ * Whether the plan runs SQL the user wrote (a `user` step, or `own_sql` from a resolution). The
+ * server holds rehearsing, applying and retrying such a merge to Admin on any target, and fails
+ * closed: a plan whose `steps` isn't a list, or a step whose `kind` isn't `generated`, counts, and
+ * so do recorded user steps the plan doesn't list. A merge with no plan has none.
+ */
+export function hasUserSqlSteps(merge: Pick<Merge, "plan" | "steps">): boolean {
+  const recorded: unknown = merge.steps;
+  if (Array.isArray(recorded) ? recorded.length > 0 : recorded !== null && recorded !== undefined) return true;
+  const plan: unknown = merge.plan;
+  if (plan === null || plan === undefined) return false;
+  const steps = isObj(plan) ? plan.steps : undefined;
+  if (!Array.isArray(steps)) return true;
+  return steps.some((s) => !isObj(s) || s.kind !== "generated");
+}
+
+/** Whether a plan step is a security step (BYPASSRLS, owner-level): applying it needs Admin. */
+export function hasSecuritySteps(merge: Pick<Merge, "plan">): boolean {
+  return (readPlan(merge.plan)?.steps ?? []).some((s) => s.security === true);
+}
+
+/**
+ * Why the viewer can't take `action` on this merge though their level on the target allows it:
+ * the merge needs Admin (user SQL, or for apply a security step). Null when they may, or when the
+ * viewer is an Admin.
+ */
+export function adminReason(merge: Merge, action: "rehearse" | "apply" | "retry", isAdmin: boolean): string | null {
+  if (isAdmin) return null;
+  if (hasUserSqlSteps(merge)) return "This plan runs SQL written by a person, so it needs Admin on this project.";
+  if (action === "apply" && hasSecuritySteps(merge)) return "This plan has a security step, so applying it needs Admin on this project.";
+  return null;
+}

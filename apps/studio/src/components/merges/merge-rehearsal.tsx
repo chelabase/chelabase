@@ -9,6 +9,8 @@ export interface MergeRehearsalProps {
   targetName: string;
   /** An action or save is in flight. */
   pending: boolean;
+  /** Why this viewer can't rehearse though their level allows merging here (the plan needs Admin), or null. */
+  adminReason?: string | null;
   onRehearse: () => void;
 }
 
@@ -26,10 +28,10 @@ function rehearseReason(merge: Merge, plan: Plan | null): string | null {
 }
 
 /** The rehearsal: run it, its timings, its failure, and what own SQL produced. */
-export function MergeRehearsal({ merge, plan, targetName, pending, onRehearse }: MergeRehearsalProps) {
+export function MergeRehearsal({ merge, plan, targetName, pending, adminReason = null, onRehearse }: MergeRehearsalProps) {
   const reasonId = useId();
   const rehearsal = readRehearsal(merge.rehearsal);
-  const reason = rehearseReason(merge, plan);
+  const reason = adminReason ?? rehearseReason(merge, plan);
   const failedSql = rehearsal?.failed_step ? plan?.steps.find((s) => s.id === rehearsal.failed_step)?.sql : undefined;
   const produced = rehearsal?.drift.filter((d) => d.produced) ?? [];
   const drift = rehearsal?.drift.filter((d) => !d.produced) ?? [];
