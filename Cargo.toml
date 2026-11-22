@@ -77,7 +77,7 @@ async-nats = { version = "0.50.0", default-features = false, features = ["jetstr
 dotenvy = "0.15.7"
 chrono = { version = "0.4.45", features = ["serde"] }
 # Edge functions m7: function schedules (5-field cron, IANA time zones).
-croner = { version = "4.0.2", default-features = false, features = ["chrono"] }
+croner = { version = "5.0.0", default-features = false, features = ["std", "chrono", "jiff"] }
 chrono-tz = "0.10.4"
 # async-nats's own time type (a consumer's start time); already in the tree through it.
 time = "0.3.55"
