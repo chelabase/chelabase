@@ -81,8 +81,8 @@ expect 'infra/compose/nats/nats.conf' $'rust=none\nweb=none'
 expect 'scripts/neon-images.sh' $'rust=chelabase-neon chelabase\nweb=none'
 # The workbench CLI hashes the functions runtime's inputs into its image tag.
 expect $'infra/functions-runtime/supervisor.js\ninfra/images/functions-runtime.Dockerfile' $'rust=chelabase\nweb=none'
-# No Rust or web check reads the MCP sandbox runtime; its image tests run on their own.
-expect $'infra/mcp-runtime/runner.js\ninfra/mcp-runtime/tests/run.test.mjs\ninfra/images/mcp-runtime.Dockerfile' $'rust=none\nweb=none'
+# The workbench CLI hashes the MCP sandbox runtime's inputs into its image tag.
+expect $'infra/mcp-runtime/runner.js\ninfra/mcp-runtime/config.capnp\ninfra/mcp-runtime/watchdog.sh\ninfra/images/mcp-runtime.Dockerfile' $'rust=chelabase\nweb=none'
 [[ "$(CI_AFFECTED_FILES= scripts/ci-affected.sh)" == $'rust=none\nweb=none' ]] || fail "an empty list selects nothing"
 
 # --- 2. Outside-crate reads -----------------------------------------------------------------
