@@ -685,6 +685,19 @@ describeDb("codes", () => {
       expect((await confirm(user.id, next, code)).body.error).toBe("invalid_code");
     });
 
+    it("email_change notice names the project", async () => {
+      const user = await mkUser();
+      const next = at("new");
+      const { code } = await issueChange(user.id, next);
+      const before = sink.messages.length;
+      const r = await confirm(user.id, next, code, { project_name: "Acme" });
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      expect(sink.messages.length).toBe(before + 1);
+      const notice = sink.messages.at(-1)!;
+      expect(notice.to).toEqual([user.email]);
+      expect(notice.data).toContain("Your Acme email address was changed");
+    });
+
     it("email_change code is bound to the requested address", async () => {
       const user = await mkUser();
       const next = at("new");

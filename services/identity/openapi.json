@@ -439,6 +439,11 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Mail the previous address that it was replaced, when SMTP is configured and the address changes. A refused send does not fail the request."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the notice `notify_previous` sends; single line. Default `Chelabase`."
                   }
                 }
               }
@@ -1251,6 +1256,11 @@
                     "type": "string",
                     "maxLength": 320,
                     "description": "Required for `email_change`: the address the code was issued for. Refused for every other kind."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the email-changed notice an `email_change` sends; single line. Default `Chelabase`."
                   }
                 }
               }

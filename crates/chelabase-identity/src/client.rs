@@ -279,15 +279,20 @@ impl Identity {
 
     /// As [`set_email`](Self::set_email), and the previous address is told it was replaced
     /// (when SMTP is configured and the address changes; a refused send is not an error).
+    /// `project_name` is shown in the notice, as in [`crate::CodeRequest::project_name`].
     pub async fn set_email_notifying(
         &self,
         pool: &Pool,
         user_id: &str,
         email: &str,
         email_verified: bool,
+        project_name: Option<&str>,
     ) -> Result<User, IdentityError> {
-        let body =
+        let mut body =
             json!({ "email": email, "email_verified": email_verified, "notify_previous": true });
+        if let Some(name) = project_name {
+            body["project_name"] = Value::String(name.to_string());
+        }
         self.put_email(pool, user_id, body).await
     }
 

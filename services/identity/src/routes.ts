@@ -12,7 +12,7 @@ import type { Mailer } from "./email/mailer.ts";
 import { HttpError, type Json } from "./http.ts";
 import { parsePoolName, type PoolRef } from "./pool-name.ts";
 import type { PoolRegistry } from "./registry.ts";
-import { codeRoutes, emailStatusRoute, inviteNoticeRoute, notifyEmailChanged } from "./routes/codes.ts";
+import { codeRoutes, emailStatusRoute, inviteNoticeRoute, notifyEmailChanged, optProjectName } from "./routes/codes.ts";
 
 export type RouteId =
   | "pools.create"
@@ -390,7 +390,7 @@ const ROUTES: readonly Route[] = [
     // Mirrors the email branch of `adminUpdateUser` (/admin/update-user): lowercase, z.email(),
     // refuse an email another user holds. `email_verified` is passed through in the same
     // update, false unless given. `notify_previous: true` mails the previous address that it
-    // was replaced (when SMTP is configured and the address did change).
+    // was replaced (when SMTP is configured and the address did change), naming `project_name`.
     id: "users.set_email",
     method: "PUT",
     rest: ["users", ":id", "email"],
@@ -398,6 +398,7 @@ const ROUTES: readonly Route[] = [
       const email = str(body, "email", MAX_EMAIL).toLowerCase();
       const verified = optBool(body, "email_verified") === true;
       const notify = optBool(body, "notify_previous") === true;
+      const project = optProjectName(body);
       if (!z.email().safeParse(email).success) throw new HttpError(400, "invalid_email", "invalid email");
       return registry.use(pool, async (auth) => {
         const ctx = await context(auth);
@@ -409,7 +410,7 @@ const ROUTES: readonly Route[] = [
         const changed = await auth.codes.changeEmail(id, email, verified);
         if (!changed) throw new HttpError(404, "user_not_found", "no such user");
         const user = await requireUser(ctx, id);
-        if (notify && changed.previous.toLowerCase() !== email) await notifyEmailChanged(mailer, changed.previous);
+        if (notify && changed.previous.toLowerCase() !== email) await notifyEmailChanged(mailer, changed.previous, project);
         return { status: 200, body: { user: userOut(user) } };
       });
     },

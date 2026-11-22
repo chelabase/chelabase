@@ -78,6 +78,8 @@ pub struct SentCode {
     pub code: String,
     /// The `link` the mail carried, if any.
     pub link: Option<String>,
+    /// The `project_name` the mail named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 /// What a test may read of a fake user.
@@ -105,6 +107,8 @@ pub struct ChangeNotice {
     pub user_id: String,
     /// The previous address, which the notice went to.
     pub email: String,
+    /// The `project_name` the notice named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 struct Fault {
@@ -219,6 +223,30 @@ pub(crate) fn str_field<'a>(body: &'a Value, key: &str) -> Result<&'a str, Refus
             400,
             "invalid_request",
             &format!("{key} must be a non-empty string"),
+        )),
+    }
+}
+
+/// `project_name`, checked as the service checks it: absent, or a non-empty single line of at
+/// most 128 UTF-16 units.
+pub(crate) fn project_field(body: &Value) -> Result<Option<String>, Refusal> {
+    let Some(v) = body.get("project_name") else {
+        return Ok(None);
+    };
+    match v.as_str() {
+        Some(name)
+            if !name.trim().is_empty()
+                && name.encode_utf16().count() <= 128
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}') =>
+        {
+            Ok(Some(name.to_string()))
+        }
+        _ => Err(refuse(
+            400,
+            "invalid_request",
+            "project_name must be a non-empty single-line string of at most 128 characters",
         )),
     }
 }
@@ -448,6 +476,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             let email = check_email(str_field(body, "email")?)?;
             let verified = bool_field(body, "email_verified")?;
             let notify = bool_field(body, "notify_previous")?;
+            let project = project_field(body)?;
             if p.users.iter().any(|u| u.email == email && u.id != *id) {
                 return Err(refuse(409, "conflict", "another user has this email"));
             }
@@ -464,6 +493,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                     pool: name.clone(),
                     user_id: id.to_string(),
                     email: previous,
+                    project,
                 });
             }
             (200, Some(json!({ "user": out })))
