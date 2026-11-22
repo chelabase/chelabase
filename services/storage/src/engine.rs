@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use chelabase_auth::internal::DataIdentity;
-use chelabase_pgsession::owner_level::{self, OwnerLevelCache, RoleRefused};
+use chelabase_pgsession::owner_level::{self, OwnerLevelCache, RoleAcquireError, RoleRefused};
 use chelabase_pgsession::service::ServiceError;
 use chelabase_pgsession::{
     ConnInfo, ConnSource, NamedStatement, Pools, ServedDatabase, Service, ServicePool,
@@ -55,12 +55,18 @@ pub fn datoid_of(oid: Option<i64>) -> Option<u32> {
     oid.and_then(|o| u32::try_from(o).ok())
 }
 
+/// The schema's code for a session past the live-session cap (m14).
+pub const SESSION_CAP: &str = "CB006";
+
 /// A managed statement's failure as the caller sees it: never its message, detail or SQLSTATE
 /// (logged with the request id instead). A constraint (a ticket already minted for the
-/// version) is a fixed `conflict`; anything else, storage isn't available.
+/// version) is a fixed `conflict`, [`SESSION_CAP`] a fixed 429 `too_many_uploads`; anything
+/// else, storage isn't available.
 pub fn managed_failure(f: QueryFailure, request_id: &str) -> Failure {
     tracing::warn!(request_id, sqlstate = ?f.sqlstate, "storage's own statement failed: {}", f.message);
-    if f.sqlstate.as_deref().is_some_and(|s| s.starts_with("23")) {
+    if f.sqlstate.as_deref() == Some(SESSION_CAP) {
+        Failure::too_many_uploads()
+    } else if f.sqlstate.as_deref().is_some_and(|s| s.starts_with("23")) {
         Failure::object_conflict()
     } else {
         Failure::storage_unavailable()
@@ -268,26 +274,33 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         let served = self.served_database(data, requested).await?;
         let branch = data.branch_id;
         self.check_schema(branch, &served.name, request_id).await?;
+        // The role's facts (cached), the owner-level refusal for a secret key, and a
+        // connection of the login that holds the role.
         let conn = self
             .pools
-            .acquire(branch, &served.name)
+            .acquire_for_role(
+                &self.owner_level,
+                branch,
+                &served.name,
+                &data.role,
+                owner_level::Guard::of_key(data),
+                request_id,
+            )
             .await
-            .map_err(|e| Failure::from_acquire(&e, request_id))?;
-        let out = conn
-            .with_role_session(&data.role, &data.claims, data.role_oid, async |session| {
-                owner_level::ensure_not_owner_level(&self.owner_level, data, || async {
-                    session
-                        .owner_level(&data.role, request_id)
-                        .await
-                        .map_err(|e| QueryFailure::from_pg(&e, request_id))
-                })
-                .await
-                .map_err(|e| match e {
+            .map_err(|e| match e {
+                RoleAcquireError::Refused(
                     RoleRefused::OwnerLevel(role)
                     | RoleRefused::Reserved(role)
-                    | RoleRefused::UnknownRole(role) => Failure::role_not_allowed(&role),
-                    RoleRefused::Check(f) => Failure(f),
-                })?;
+                    | RoleRefused::UnknownRole(role),
+                ) => Failure::role_not_allowed(&role),
+                RoleAcquireError::Unavailable(role) => {
+                    Failure(chelabase_query::engine::role_unusable(&role))
+                }
+                RoleAcquireError::Acquire(e) => Failure::from_acquire(&e, request_id),
+                RoleAcquireError::Check(e) => Failure(QueryFailure::from_pg(&e, request_id)),
+            })?;
+        let out = conn
+            .with_role_session(&data.role, &data.claims, data.role_oid, async |session| {
                 let settings = session.settings(&served);
                 session
                     .transaction_mapped(&served.name, &settings, request_id, on_commit, f)

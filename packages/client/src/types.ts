@@ -154,7 +154,18 @@ type FunctionOf<DB extends DatabaseShape, N> = Lookup<DB, "functions", N>;
 type Present<V> = Exclude<V, null | undefined>;
 type Combinator = "and" | "or" | "not";
 
-/** The operators on one column. Several in one object are combined with `and`. */
+declare const opValue: unique symbol;
+
+/**
+ * An operator built by the `op` helpers (`op.gte(1)`), the only operator form `where()`
+ * takes for a column. `V` is the type of the values it compares with.
+ */
+export interface Op<V> {
+  /** Type-only brand: no runtime value. */
+  readonly [opValue]?: V;
+}
+
+/** The operators of a condition object (`{ col, <operator>: value }`). Several in one object are combined with `and`. */
 export type Ops<V> = {
   eq?: Present<V>;
   neq?: Present<V>;
@@ -173,13 +184,13 @@ export type Ops<V> = {
 };
 
 /**
- * A filter object: each key is a column (a bare value means `eq`, `null` means `is null`,
- * `{ op: v }` uses the operator) or one of `and`, `or`, `not`; keys are combined with
+ * A filter object: each key is a column (a bare value, an object included, means `eq`,
+ * `null` means `is null`, `op.gte(v)` uses the operator) or one of `and`, `or`, `not`; keys are combined with
  * `and`. A column literally named `and`, `or` or `not` is reached with a condition
  * object, `{ col: "and", eq: … }`, inside an `and`/`or` list or under `not`.
  */
 export type Where<Row> = {
-  [K in Exclude<keyof Row & string, Combinator>]?: Row[K] | Ops<Row[K]>;
+  [K in Exclude<keyof Row & string, Combinator>]?: Row[K] | Op<Present<Row[K]>>;
 } & {
   and?: readonly WhereItem<Row>[];
   or?: readonly WhereItem<Row>[];
@@ -376,7 +387,14 @@ export interface Auth<DB extends DatabaseShape, S = Session> {
   resendCode(p: { email: string }): Promise<void>;
   requestPasswordReset(p: { email: string }): Promise<void>;
   confirmPasswordReset(p: { email: string; code: string; password: string }): Promise<void>;
-  changeEmail(p: { email: string }): Promise<void>;
+  /**
+   * Changes the signed-in user's email; needs their current password. With email verification
+   * on, a code goes to the new address and nothing changes until `confirmEmailChange`
+   * (`confirmationRequired: true`); with it off, the new address applies at once.
+   */
+  changeEmail(p: { email: string; currentPassword: string }): Promise<{ confirmationRequired: boolean }>;
+  /** Finishes a pending email change with the code mailed to the new address. */
+  confirmEmailChange(p: { email: string; code: string }): Promise<void>;
   changePassword(p: { currentPassword: string; password: string }): Promise<S>;
   /** Subscribe to sign-in, sign-out and refresh; returns the unsubscribe function. */
   onChange(cb: (event: AuthEvent, user: AppUser | null) => void): () => void;

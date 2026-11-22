@@ -44,10 +44,10 @@ Unknown keys are errors, so a typo is caught instead of ignored.
 ## chelabase login
 
 ```text
-chelabase login --url <URL> [--email <EMAIL>]
+chelabase login --url <URL> [--email <EMAIL>] [--insecure]
 ```
 
-Signs in to an instance with an email and password. The email is prompted for when missing; the password is always prompted for or read from stdin. The session is stored per instance URL in `~/.config/chelabase/credentials.json` (mode 0600). When it expires the CLI asks you to sign in again; it never prints the token.
+Signs in to an instance with an email and password. The email is prompted for when missing; the password is always prompted for or read from stdin. The session is stored per instance URL in `~/.config/chelabase/credentials.json` (mode 0600). When it expires the CLI asks you to sign in again; it never prints the token. A plain `http://` URL is refused unless the host is `localhost`, `*.localhost` or a loopback address; `--insecure` allows it and sends the password unencrypted.
 
 ## chelabase functions
 

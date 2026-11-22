@@ -1112,6 +1112,234 @@ mod functions {
         assert_eq!(status, 404);
     }
 
+    fn secret_body(value: &str) -> Value {
+        json!({"value": value})
+    }
+
+    fn stored_secrets(w: &World) -> Vec<(uuid::Uuid, uuid::Uuid, String, String)> {
+        w.w.metadata
+            .functions
+            .lock()
+            .unwrap()
+            .secrets
+            .iter()
+            .map(|((b, f, n), v)| (*b, *f, n.clone(), v.clone()))
+            .collect()
+    }
+
+    /// A service `stub` on dev, made by the tenant admin `tom`.
+    async fn with_service(w: &World) {
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"})))
+            .await;
+        assert_eq!(status, 201, "{body}");
+    }
+
+    /// AC 1, 2, 7: on a service, a Developer or project Admin who isn't a tenant admin gets
+    /// 403 `forbidden` (`required: "tenant admin"`) setting or deleting a secret, with the store
+    /// and the publishes unchanged; another project's member still gets 404.
+    #[tokio::test]
+    async fn functions_service_secrets_need_a_tenant_admin() {
+        let w = service_world().await;
+        with_service(&w).await;
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub/secrets/API_KEY"), Some(secret_body("v1")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+        let before = stored_secrets(&w);
+        let published = w.published();
+        for sub in ["dee", "ada"] {
+            for secret in ["API_KEY", "NEW_ONE"] {
+                let (status, body) = w
+                    .json(sub, "PUT", &w.path(w.w.dev, &format!("/stub/secrets/{secret}")), Some(secret_body("v2")))
+                    .await;
+                assert_eq!(status, 403, "{sub} {secret}: {body}");
+                assert_eq!(body["error"]["code"], "forbidden", "{body}");
+                assert_eq!(body["error"]["required"], "tenant admin", "{body}");
+            }
+            // Who may write is answered before the body is read (O12, m7 N2).
+            let (status, body) = w
+                .json(sub, "PUT", &w.path(w.w.dev, "/stub/secrets/API_KEY"), Some(json!({"nope": 1})))
+                .await;
+            assert_eq!(status, 403, "{sub} with a bad body: {body}");
+            let (status, body) = w
+                .json(sub, "DELETE", &w.path(w.w.dev, "/stub/secrets/API_KEY"), None)
+                .await;
+            assert_eq!(status, 403, "{sub}: {body}");
+            assert_eq!(body["error"]["required"], "tenant admin", "{body}");
+        }
+        assert_eq!(stored_secrets(&w), before, "nothing written");
+        assert_eq!(w.published(), published, "nothing published");
+        let (status, names) = w.json("dee", "GET", &w.path(w.w.dev, "/stub/secrets"), None).await;
+        assert_eq!(status, 200, "{names}");
+        assert!(names.to_string().contains("API_KEY"), "still listed: {names}");
+        for (method, body) in [("PUT", Some(secret_body("v3"))), ("DELETE", None)] {
+            let (status, text) = w
+                .json("out", method, &w.path(w.w.dev, "/stub/secrets/API_KEY"), body)
+                .await;
+            assert_eq!(status, 404, "{method}: {text}");
+        }
+        assert_eq!(stored_secrets(&w), before);
+    }
+
+    /// O1: a kind change to or from a service needs a tenant admin, whoever else asks (a project
+    /// Admin, a Developer): 403 `forbidden`, `required: "tenant admin"`, with the kind, the
+    /// store and the publishes unchanged. So a service never leaves the tenant admin's hands
+    /// to take a Developer's secret and come back with it.
+    #[tokio::test]
+    async fn functions_kind_change_from_a_service_needs_a_tenant_admin() {
+        let w = service_world().await;
+        with_service(&w).await;
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub/secrets/API_KEY"), Some(secret_body("v1")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+        let before = stored_secrets(&w);
+        let published = w.published();
+        for sub in ["ada", "dee"] {
+            let (status, body) = w
+                .json(sub, "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "function"})))
+                .await;
+            assert_eq!(status, 403, "{sub}: {body}");
+            assert_eq!(body["error"]["code"], "forbidden", "{body}");
+            assert_eq!(body["error"]["required"], "tenant admin", "{body}");
+            let (status, body) = w
+                .json(sub, "PUT", &w.path(w.w.dev, "/stub/secrets/DEV_SECRET"), Some(secret_body("d")))
+                .await;
+            assert_eq!(status, 403, "still a service, so still a tenant admin's: {sub}: {body}");
+        }
+        let kinds: Vec<_> = w.w.metadata.functions.lock().unwrap().functions.iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, [chelabase_metadata::FunctionKind::Service], "still a service");
+        assert_eq!(stored_secrets(&w), before, "nothing written");
+        assert_eq!(w.published(), published, "nothing published");
+        // Naming the kind it already has changes nothing and needs no tenant admin.
+        let (status, body) = w
+            .json("ada", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": "service"})))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        // A tenant admin may turn it into a function, and back.
+        for kind in ["function", "service"] {
+            let (status, body) = w
+                .json("tom", "PUT", &w.path(w.w.dev, "/stub"), Some(json!({"kind": kind})))
+                .await;
+            assert_eq!(status, 200, "{kind}: {body}");
+            assert_eq!(body["kind"], kind, "{body}");
+        }
+    }
+
+    /// O2: the kind the secret write is decided on is the kind the store reads under the
+    /// function row's lock. A plain function that becomes a service between the route's read
+    /// and the write refuses a Developer's set and delete (403 `required: "tenant admin"`) and a
+    /// tenant admin's reserved name (422), with nothing written or published.
+    #[tokio::test]
+    async fn functions_secret_write_racing_a_kind_change_never_lands_on_a_service() {
+        let w = service_world().await;
+        let (status, body) = w.json("dee", "PUT", &w.path(w.w.dev, "/plain"), Some(json!({}))).await;
+        assert_eq!(status, 201, "{body}");
+        let (status, body) = w
+            .json("dee", "PUT", &w.path(w.w.dev, "/plain/secrets/OLD"), Some(secret_body("o")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+        let to_service = |md: &FakeMetadata| {
+            for f in md.functions.lock().unwrap().functions.iter_mut() {
+                f.kind = chelabase_metadata::FunctionKind::Service;
+            }
+        };
+        let to_function = |w: &World| {
+            for f in w.w.metadata.functions.lock().unwrap().functions.iter_mut() {
+                f.kind = chelabase_metadata::FunctionKind::Function;
+            }
+        };
+        let before = stored_secrets(&w);
+        let published = w.published();
+        for (sub, method, secret, want, required) in [
+            ("dee", "PUT", "DEV_SECRET", 403, Some("tenant admin")),
+            ("dee", "DELETE", "OLD", 403, Some("tenant admin")),
+            ("tom", "PUT", "LD_PRELOAD", 422, None),
+        ] {
+            w.w.metadata.race_secret_write_once(to_service);
+            let body = (method == "PUT").then(|| secret_body("v"));
+            let (status, text) = w
+                .json(sub, method, &w.path(w.w.dev, &format!("/plain/secrets/{secret}")), body)
+                .await;
+            assert_eq!(status, want, "{sub} {method} {secret}: {text}");
+            if let Some(required) = required {
+                assert_eq!(text["error"]["required"], required, "{text}");
+            }
+            to_function(&w);
+        }
+        assert_eq!(stored_secrets(&w), before, "nothing written");
+        assert_eq!(w.published(), published, "nothing published");
+        // A tenant admin's ordinary secret still lands on the service it became.
+        w.w.metadata.race_secret_write_once(to_service);
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/plain/secrets/API_KEY"), Some(secret_body("v")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+    }
+
+    /// AC 3: a tenant admin sets and deletes a service's secret as before.
+    #[tokio::test]
+    async fn functions_service_secrets_set_by_a_tenant_admin() {
+        let w = service_world().await;
+        with_service(&w).await;
+        let published = w.published().len();
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub/secrets/API_KEY"), Some(secret_body("v1")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert_eq!(stored_secrets(&w).len(), 1);
+        let (status, body) = w
+            .json("tom", "DELETE", &w.path(w.w.dev, "/stub/secrets/API_KEY"), None)
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert!(stored_secrets(&w).is_empty());
+        assert_eq!(w.published().len(), published + 2, "each write published");
+    }
+
+    /// AC 4: a plain function's secrets stay Developer-level, loader names included (workerd
+    /// gets them as bindings, not a process environment).
+    #[tokio::test]
+    async fn functions_plain_function_secrets_stay_developer_level() {
+        let w = service_world().await;
+        w.json("dee", "PUT", &w.path(w.w.dev, "/plain"), Some(json!({}))).await;
+        for secret in ["API_KEY", "LD_PRELOAD", "NODE_OPTIONS", "PORT"] {
+            let path = w.path(w.w.dev, &format!("/plain/secrets/{secret}"));
+            let (status, body) = w.json("dee", "PUT", &path, Some(secret_body("v"))).await;
+            assert_eq!(status, 204, "{secret}: {body}");
+            let (status, body) = w.json("dee", "DELETE", &path, None).await;
+            assert_eq!(status, 204, "{secret}: {body}");
+        }
+        assert!(stored_secrets(&w).is_empty());
+    }
+
+    /// AC 5, 9: on a service, a tenant admin's secret with a reserved name is 422
+    /// `invalid_request` naming it, nothing written; another case of the name is accepted.
+    #[tokio::test]
+    async fn functions_service_secret_names_reserved() {
+        let w = service_world().await;
+        with_service(&w).await;
+        let published = w.published();
+        for secret in chelabase_types::container_env::LOADER_NAMES
+            .iter()
+            .copied()
+            .chain(["LD_PRELOAD", "LD_ANYTHING", "LD_LIBRARY_PATH", "PORT"])
+        {
+            let (status, body) = w
+                .json("tom", "PUT", &w.path(w.w.dev, &format!("/stub/secrets/{secret}")), Some(secret_body("/x")))
+                .await;
+            assert_eq!(status, 422, "{secret}: {body}");
+            assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+            assert!(body.to_string().contains(secret), "names {secret}: {body}");
+        }
+        assert!(stored_secrets(&w).is_empty(), "nothing written");
+        assert_eq!(w.published(), published, "nothing published");
+        let (status, body) = w
+            .json("tom", "PUT", &w.path(w.w.dev, "/stub/secrets/ld_preload"), Some(secret_body("v")))
+            .await;
+        assert_eq!(status, 204, "{body}");
+    }
+
     /// AC: unsafe URLs and malformed specs are refused at save time (422).
     #[tokio::test]
     async fn functions_service_unsafe_urls_refused() {
@@ -1139,6 +1367,14 @@ mod functions {
         ] {
             let (status, body) = w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external(url))).await;
             assert_eq!(status, 422, "{url}: {body}");
+            let text = body.to_string();
+            for leak in ["does not resolve", "non-public", "part of the platform", "not a public address", "metadata-db", "nowhere.example.test"] {
+                assert!(!text.contains(leak), "{url}: {body}");
+            }
+        }
+        for url in ["http://127.0.0.1", "http://metadata-db:5432", "https://private.example.test/", "https://nowhere.example.test/"] {
+            let (_, body) = w.json("tom", "POST", &w.path(w.w.dev, "/stub/deployments"), Some(external(url))).await;
+            assert!(body.to_string().contains("the URL's host must resolve only to public addresses"), "{url}: {body}");
         }
         for spec in [
             json!({"backend": "image", "url": "https://hooks.example.test/", "health_path": "/h"}),

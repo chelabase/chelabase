@@ -69,6 +69,16 @@ A container gets the service's [secrets](/using/functions/environment#secrets) o
 | `CHELABASE_URL` | The instance's public API URL |
 | `CHELABASE_BRANCH_ID` | The branch the container serves |
 
+Because a service's secrets become its process environment, only a **tenant admin** may set or delete them; anyone else gets 403 `forbidden` (`required: "tenant admin"`). Anyone who can view the function can still list the names.
+
+Some names are reserved on a service, because the runner or a runtime's loader reads them when the container starts. Setting one answers 422 `invalid_request`, and the runner refuses to create a container whose environment holds one (for example a secret set while the service was still a plain function):
+
+- `PORT`;
+- every name starting with `LD_` (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, …);
+- `NODE_OPTIONS`, `NODE_PATH`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE`, `PYTHONWARNINGS`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `GCONV_PATH`, `GLIBC_TUNABLES`, `DOTNET_STARTUP_HOOKS`, `DOTNET_ADDITIONAL_DEPS`, `CORECLR_ENABLE_PROFILING`, `CORECLR_PROFILER_PATH`, `CORECLR_PROFILER_PATH_32` and `CORECLR_PROFILER_PATH_64`.
+
+Names match case-sensitively, as Linux reads them: `ld_preload` is an ordinary name. If a deploy fails because an old secret holds a reserved name, a tenant admin can delete it with `chelabase functions secrets unset`. A container started before the upgrade that added a name keeps running with that secret in its environment until a tenant admin deletes it (which replaces the container); after upgrading, check each service's `last_error` and its secret names.
+
 ## How the runner works
 
 The **service runner** is the only component that starts member containers. It holds the Docker socket, so it is narrow on purpose:

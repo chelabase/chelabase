@@ -3,7 +3,7 @@
 import { SESSION_GONE, USER_HEADER } from "./auth.ts";
 import { NO_REDIRECTS } from "./error.ts";
 import { StorageError, toStorageError } from "./storage-errors.ts";
-import { downloadParam, encodeName, queryOf, type StorageContext } from "./storage-lazy.ts";
+import { assertNameSegments, downloadParam, encodeBucket, encodeName, queryOf, type StorageContext } from "./storage-lazy.ts";
 import type { StorageRefLike } from "./types.ts";
 
 // --- public types ----------------------------------------------------------------------
@@ -343,7 +343,7 @@ export async function readJson<T>(res: Response): Promise<T> {
   }
 }
 
-const objectPath = (bucket: string, name: string) => `/storage/v1/object/${encodeURIComponent(bucket)}/${encodeName(name)}`;
+const objectPath = (bucket: string, name: string) => `/storage/v1/object/${encodeBucket(bucket)}/${encodeName(name)}`;
 const flag = (b: boolean | undefined) => (b ? "true" : undefined);
 
 function retryable(e: unknown): boolean {
@@ -422,6 +422,8 @@ function asStream(src: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | s
 
 async function upload(ctx: StorageContext, bucket: string, name: string, body: UploadBody, o: UploadOptions = {}): Promise<UploadResult> {
   o.signal?.throwIfAborted();
+  // Checked here, not inside the retried request: a refused name is never retried.
+  objectPath(bucket, name);
   if (o.partSize !== undefined && !(o.partSize >= MIN_PART && o.partSize <= MAX_PART)) {
     throw new RangeError(`storage upload: partSize must be 5 MiB to 100 MiB (got ${o.partSize})`);
   }
@@ -491,7 +493,7 @@ async function multipart(
     const s = await readJson<{ id: string }>(
       await call(ctx, {
         method: "POST",
-        path: `/storage/v1/upload/${encodeURIComponent(bucket)}/${encodeName(name)}`,
+        path: `/storage/v1/upload/${encodeBucket(bucket)}/${encodeName(name)}`,
         query: { upsert: flag(o.upsert) },
         headers,
         signal: o.signal,
@@ -561,19 +563,24 @@ export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBuck
   const sign = async (path: string, opts: SignedUrlOptions = {}): Promise<SignedUrl> => {
     const res = await call(ctx, {
       method: "POST",
-      path: `/storage/v1/object/sign/${encodeURIComponent(bucket)}/${encodeName(path)}`,
+      path: `/storage/v1/object/sign/${encodeBucket(bucket)}/${encodeName(path)}`,
       json: opts.expiresIn === undefined ? {} : { expires_in: opts.expiresIn },
     });
     const s = await readJson<{ signed_url: string; expires_at: number }>(res);
     return { path, signedUrl: absolute(s.signed_url, opts.download), expiresAt: s.expires_at };
   };
-  const relocate = (op: "move" | "copy", from: string, to: string, opts: RelocateOptions = {}) =>
-    call(ctx, {
+  const relocate = (op: "move" | "copy", from: string, to: string, opts: RelocateOptions = {}) => {
+    encodeBucket(bucket);
+    if (opts.toBucket !== undefined) encodeBucket(opts.toBucket);
+    assertNameSegments(from, "object name");
+    assertNameSegments(to, "object name");
+    return call(ctx, {
       method: "POST",
       path: `/storage/v1/object/${op}`,
       query: { upsert: flag(opts.upsert) },
       json: { bucket, from, to, ...(opts.toBucket === undefined ? {} : { to_bucket: opts.toBucket }) },
     });
+  };
   const head = (path: string, accept?: number[]) => call(ctx, { method: "HEAD", path: objectPath(bucket, path), accept });
 
   return {
@@ -593,13 +600,14 @@ export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBuck
       if (opts.search !== undefined) body["search"] = opts.search;
       if (opts.sortBy !== undefined) body["sort_by"] = opts.sortBy;
       if (opts.order !== undefined) body["order"] = opts.order;
-      const res = await call(ctx, { method: "POST", path: `/storage/v1/object/list/${encodeURIComponent(bucket)}`, json: body });
+      const res = await call(ctx, { method: "POST", path: `/storage/v1/object/list/${encodeBucket(bucket)}`, json: body });
       const page = await readJson<{ items: FileObject[]; next_cursor: string | null }>(res);
       return Object.assign(page.items, { nextCursor: page.next_cursor ?? null });
     },
     async remove(paths) {
       const names = typeof paths === "string" ? [paths] : paths;
-      const res = await call(ctx, { method: "DELETE", path: `/storage/v1/object/${encodeURIComponent(bucket)}`, json: { names } });
+      for (const n of names) assertNameSegments(n, "object name");
+      const res = await call(ctx, { method: "DELETE", path: `/storage/v1/object/${encodeBucket(bucket)}`, json: { names } });
       return (await readJson<{ deleted: string[] }>(res)).deleted;
     },
     async move(from, to, opts) {
@@ -620,14 +628,18 @@ export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBuck
       };
     },
     createSignedUrl: sign,
-    createSignedUrls: (paths, opts) => Promise.all(paths.map((p) => sign(p, opts))),
+    createSignedUrls: async (paths, opts) => {
+      encodeBucket(bucket);
+      for (const p of paths) assertNameSegments(p, "object name");
+      return Promise.all(paths.map((p) => sign(p, opts)));
+    },
     async createSignedUploadUrl(path, opts = {}) {
       const json: Record<string, unknown> = {};
       if (opts.expiresIn !== undefined) json["expires_in"] = opts.expiresIn;
       if (opts.upsert !== undefined) json["upsert"] = opts.upsert;
       const res = await call(ctx, {
         method: "POST",
-        path: `/storage/v1/object/upload/sign/${encodeURIComponent(bucket)}/${encodeName(path)}`,
+        path: `/storage/v1/object/upload/sign/${encodeBucket(bucket)}/${encodeName(path)}`,
         json,
       });
       const s = await readJson<{ signed_url: string; expires_at: number }>(res);
@@ -638,7 +650,7 @@ export function bucketApi(ctx: StorageContext, bucket: string): Omit<StorageBuck
 }
 
 export function adminApi(ctx: StorageContext): Omit<StorageClient, "from" | "resolve"> {
-  const at = (name: string) => `/storage/v1/bucket/${encodeURIComponent(name)}`;
+  const at = (name: string) => `/storage/v1/bucket/${encodeBucket(name)}`;
   return {
     listBuckets: async () => readJson(await call(ctx, { method: "GET", path: "/storage/v1/bucket" })),
     createBucket: async (bucket) => readJson(await call(ctx, { method: "POST", path: "/storage/v1/bucket", json: bucket })),

@@ -16,7 +16,7 @@ import { RadioGroup } from "@/components/ui/radio-group";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { functionErrorText, useToggles } from "@/lib/functions";
-import { STORAGE_EVENTS, TABLE_EVENTS, initialTriggerDraft, triggerDraftReducer, triggerReason, triggerRequest, triggerTarget, triggersInstalling } from "@/lib/functions-triggers";
+import { STORAGE_EVENTS, TABLE_EVENTS, TRIGGERS_DOCS_URL, describeTriggerFailure, initialTriggerDraft, triggerDraftReducer, triggerReason, triggerRequest, triggerTarget, triggersInstalling } from "@/lib/functions-triggers";
 import { pollWhile } from "@/lib/query";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
@@ -33,6 +33,23 @@ export const AWAKE_NOTE = "The branch's compute stays awake while table triggers
 const field = "h-8 border border-input bg-ink px-2 font-mono text-sm disabled:opacity-50";
 
 const STATE_TONE: Record<string, string> = { installed: "border-seafoam/60 text-seafoam", failed: "border-coral/60 text-coral" };
+
+function InstallFailure({ lastError }: { lastError: string }) {
+  const why = describeTriggerFailure(lastError);
+  if (!why) return <p className="font-mono text-xs break-all text-coral">Install failed: {lastError}</p>;
+  return (
+    <div className="space-y-0.5 text-xs">
+      <p className="text-coral">Install failed: {why.cause}</p>
+      <p className="text-chalk-dim">
+        {why.fix}{" "}
+        <a href={TRIGGERS_DOCS_URL} target="_blank" rel="noreferrer" className="underline">
+          Trigger docs
+        </a>
+      </p>
+      <p className="font-mono break-all text-chalk-dim">{lastError}</p>
+    </div>
+  );
+}
 
 function TriggerRow({ t, canChange, busy, toggles, onToggle, onDelete }: {
   t: FunctionTrigger;
@@ -81,7 +98,7 @@ function TriggerRow({ t, canChange, busy, toggles, onToggle, onDelete }: {
           </Button>
         </ReadOnlyHint>
       </div>
-      {t.last_error && <p className="font-mono text-xs break-all text-coral">Install failed: {t.last_error}</p>}
+      {t.last_error && <InstallFailure lastError={t.last_error} />}
       {t.last_delivery_error && <p className="font-mono text-xs break-all text-coral">Last delivery failed: {t.last_delivery_error}</p>}
       {err && (
         <p role="alert" className="text-xs text-coral">

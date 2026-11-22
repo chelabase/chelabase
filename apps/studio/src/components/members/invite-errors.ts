@@ -28,6 +28,12 @@ export function inviteFailure(err: unknown, email: string, rows: readonly GrantR
       return err.extra.email_available === true
         ? { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Send the invite by email.`, switchToEmail: true }
         : { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Ask them to sign in with their existing account instead.` };
+    // m10: a project Admin's invite of someone whose member row is removed (removed from the
+    // tenant, an invite revoked or a sign-up declined) is a tenant admin's call.
+    case "forbidden":
+      if (err.extra.required === "tenant admin")
+        return { email: `${email} was removed from the tenant, or their invite or sign-up was turned down. Only a tenant admin can invite them back.` };
+      break;
     case "signup_pending":
       return { email: `${email} signed up and is waiting for approval. Approve them under Requests.` };
     case "project_deleting":

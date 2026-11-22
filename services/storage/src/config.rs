@@ -33,6 +33,14 @@ pub struct Config {
     /// delivers no bytes for this long fails (408 `request_timeout`) and frees its share of
     /// the upload memory.
     pub body_idle: std::time::Duration,
+    /// `CHELABASE_STORAGE_PART_DEADLINE_SECS` (default 900, at least 1): a resumable upload's
+    /// part body must finish within this long in all (408 `request_timeout`), which frees its
+    /// share of the upload memory.
+    pub part_deadline: std::time::Duration,
+    /// `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH` (default a quarter of
+    /// `max_inflight_bytes`, at least 1): the most upload memory one branch holds at once;
+    /// past it its next upload is 503 `busy` while other branches still upload.
+    pub max_inflight_bytes_per_branch: u64,
     /// The object store (`CHELABASE_STORAGE_BACKEND`, `CHELABASE_STORAGE_S3_*`).
     pub store: StorageConfig,
 }
@@ -50,6 +58,8 @@ impl Config {
         };
         let env_or =
             |name: &str, default: &str| non_blank(name).unwrap_or_else(|| default.to_owned());
+        let max_inflight_bytes: usize =
+            env_or("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES", "1073741824").parse()?;
         let internal_token = chelabase_types::secret_env::lookup_secret(&get, BEARER)
             .map_err(anyhow::Error::msg)?
             .unwrap_or_else(|| chelabase_types::dev_defaults::dev_bearer(BEARER).to_owned());
@@ -79,11 +89,22 @@ impl Config {
                     )
                 })?
                 .into(),
-            max_inflight_bytes: env_or("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES", "1073741824").parse()?,
             body_idle: match env_or("CHELABASE_STORAGE_BODY_IDLE_SECS", "60").parse::<u64>()? {
                 0 => anyhow::bail!("CHELABASE_STORAGE_BODY_IDLE_SECS is at least 1"),
                 secs => std::time::Duration::from_secs(secs),
             },
+            part_deadline: match env_or("CHELABASE_STORAGE_PART_DEADLINE_SECS", "900").parse::<u64>()? {
+                0 => anyhow::bail!("CHELABASE_STORAGE_PART_DEADLINE_SECS is at least 1"),
+                secs => std::time::Duration::from_secs(secs),
+            },
+            max_inflight_bytes_per_branch: match non_blank("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH") {
+                Some(v) => match v.parse::<u64>()? {
+                    0 => anyhow::bail!("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH is at least 1"),
+                    n => n,
+                },
+                None => (max_inflight_bytes as u64 / 4).max(1),
+            },
+            max_inflight_bytes,
             store: StorageConfig::from_lookup(&get)?,
         })
     }
@@ -123,6 +144,8 @@ mod tests {
         assert_eq!(c.max_connections, 200);
         assert_eq!(c.max_inflight_bytes, 1 << 30);
         assert_eq!(c.body_idle, std::time::Duration::from_secs(60));
+        assert_eq!(c.part_deadline, std::time::Duration::from_secs(900));
+        assert_eq!(c.max_inflight_bytes_per_branch, 1 << 28);
         assert_eq!(c.store.bucket, "chelabase-storage");
     }
 
@@ -148,6 +171,37 @@ mod tests {
             ("CHELABASE_STORAGE_BODY_IDLE_SECS", "0"),
         ];
         assert!(Config::from_lookup(lookup(ZERO)).is_err());
+    }
+
+    /// m14: the part deadline and the per-branch share are settings: defaults, a quarter of
+    /// the cap for the share, and zero refused.
+    #[test]
+    fn the_part_deadline_and_branch_share_are_settings() {
+        const BASE_PLUS: &[(&str, &str)] = &[
+            ("CHELABASE_STORAGE_INTERNAL_TOKEN", "a-generated-storage-token"),
+            ("CHELABASE_COMPUTE_CA_FILE", "/ca.crt"),
+            ("CHELABASE_STORAGE_BACKEND", "s3"),
+            ("CHELABASE_STORAGE_S3_REGION", "us-east-1"),
+            ("CHELABASE_STORAGE_S3_BUCKET", "chelabase-storage"),
+        ];
+        let with = |extra: &'static [(&'static str, &'static str)]| {
+            let all: Vec<(&'static str, &'static str)> =
+                BASE_PLUS.iter().chain(extra).copied().collect();
+            Config::from_lookup(move |n| {
+                all.iter().find(|(k, _)| *k == n).map(|(_, v)| v.to_string())
+            })
+        };
+        let c = with(&[
+            ("CHELABASE_STORAGE_PART_DEADLINE_SECS", "30"),
+            ("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH", "1000"),
+        ])
+        .unwrap();
+        assert_eq!(c.part_deadline, std::time::Duration::from_secs(30));
+        assert_eq!(c.max_inflight_bytes_per_branch, 1000);
+        let c = with(&[("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES", "4000")]).unwrap();
+        assert_eq!(c.max_inflight_bytes_per_branch, 1000);
+        assert!(with(&[("CHELABASE_STORAGE_PART_DEADLINE_SECS", "0")]).is_err());
+        assert!(with(&[("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH", "0")]).is_err());
     }
 
     /// The development bearer is refused without `CHELABASE_DEV_DEFAULTS=1`; the CA is required.

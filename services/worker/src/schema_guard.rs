@@ -2,7 +2,7 @@
 //!
 //! On a protected branch the member-role reconciler grants the marker role
 //! `chelabase_schema_locked` ([`SCHEMA_LOCKED_ROLE`]) to every member role whose member isn't
-//! an Admin, and runs [`schema_guard_sql`] in every database of the branch. Two event triggers
+//! an Admin, and runs [`schema_guard_sql`] in every database of the branch. Three event triggers
 //! then refuse any schema change made by a *locked* session, whatever role it `SET ROLE`s to.
 //! A session is locked when its `session_user` holds the marker or, while the branch's
 //! "guard login roles" switch is on ([`GuardSettings::guard_logins`]), when its (non-superuser)
@@ -20,16 +20,21 @@
 //!   trigger): its drops are the next trigger's to judge.
 //! - `chelabase_schema_guard_drop` (`sql_drop`): refused unless every dropped object is
 //!   temporary.
+//! - `chelabase_schema_guard_start` (`ddl_command_start`): `CREATE INDEX` and `DROP INDEX` are
+//!   refused before they start. Their `CONCURRENTLY` forms commit their own work before the
+//!   two triggers above fire, so a refusal there would come too late. The start event knows
+//!   neither the target nor whether the command is concurrent, so every `CREATE INDEX` and
+//!   `DROP INDEX` of a locked session is refused, on temporary tables too.
 //!
-//! Data maintenance stays allowed: `REFRESH MATERIALIZED VIEW` and `REINDEX` pass both
-//! triggers. Both triggers are `ENABLE ALWAYS`, so `session_replication_role = replica` doesn't
+//! Data maintenance stays allowed: `REFRESH MATERIALIZED VIEW` and `REINDEX` pass all three
+//! triggers. All three are `ENABLE ALWAYS`, so `session_replication_role = replica` doesn't
 //! skip them.
 //!
 //! The refusal is `42501` with the hint [`BRANCH_PROTECTED_HINT`]. Superusers (`cloud_admin`:
 //! the reconciler, migrations, merges) are never refused: Postgres counts a superuser a member
 //! of every role, so the functions rule one out first, before `pg_has_role`.
 //!
-//! The settings are rendered into both function bodies (S1, P1): the functions are SECURITY
+//! The settings are rendered into every function body (S1, P1): the functions are SECURITY
 //! INVOKER on purpose, so they couldn't read a superuser-only table. Each body carries one
 //! line `-- settings: guard_logins=<on|off> exempt=[<hex>, …]`, and the exemptions are
 //! compared as the lowercase hex of their UTF-8 bytes, so no name can break out of the body or
@@ -104,6 +109,7 @@ pub fn schema_guard_sql(settings: &GuardSettings) -> String {
     format!(
         "{script}COMMENT ON FUNCTION chelabase_guard.refuse_ddl() IS '{stamp}';
 COMMENT ON FUNCTION chelabase_guard.refuse_drop() IS '{stamp}';
+COMMENT ON FUNCTION chelabase_guard.refuse_start() IS '{stamp}';
 COMMIT;
 "
     )
@@ -111,23 +117,24 @@ COMMIT;
 
 /// A read-only query, for `admin_sql` in one database, answering `t` when the installed guard
 /// is the current [`schema_guard_sql`] for `settings`: the schema is a superuser's with no
-/// grants and holds exactly the two functions, both a superuser's, stamped with this version,
+/// grants and holds exactly the three functions, each a superuser's, stamped with this version,
 /// with exactly this version's bodies (a `CREATE OR REPLACE` keeps the comment, so the stamp
 /// alone can't tell an older worker's bodies apart; the bodies carry the settings), no
-/// `SECURITY DEFINER`, the pinned `search_path`, executable by nobody else, and exactly two
+/// `SECURITY DEFINER`, the pinned `search_path`, executable by nobody else, and exactly three
 /// event triggers point at them, one on each function's event, `ENABLE ALWAYS`, unfiltered
 /// and a superuser's. Anything else answers `f`.
 pub fn schema_guard_check_sql(settings: &GuardSettings) -> String {
     let stamp = guard_stamp(settings);
     let ddl = refuse_ddl_body(settings);
     let drop = refuse_drop_body(settings);
+    let start = refuse_start_body(settings);
     format!(
         "{GUARD_CHECK_MARK}
 SELECT
   (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger e
       JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid
       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
-    WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 2
+    WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 3
   AND (SELECT pg_catalog.count(DISTINCT p.proname) FROM pg_catalog.pg_event_trigger e
       JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid
       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
@@ -136,29 +143,31 @@ SELECT
     WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
       AND pg_catalog.starts_with(e.evtname, 'chelabase_schema_guard_')
       AND ((e.evtevent OPERATOR(pg_catalog.=) 'ddl_command_end' AND p.proname OPERATOR(pg_catalog.=) 'refuse_ddl')
-        OR (e.evtevent OPERATOR(pg_catalog.=) 'sql_drop' AND p.proname OPERATOR(pg_catalog.=) 'refuse_drop'))
+        OR (e.evtevent OPERATOR(pg_catalog.=) 'sql_drop' AND p.proname OPERATOR(pg_catalog.=) 'refuse_drop')
+        OR (e.evtevent OPERATOR(pg_catalog.=) 'ddl_command_start' AND p.proname OPERATOR(pg_catalog.=) 'refuse_start'))
       AND e.evtenabled OPERATOR(pg_catalog.=) 'A' AND e.evttags IS NULL AND eo.rolsuper
       AND p.pronargs OPERATOR(pg_catalog.=) 0 AND po.rolsuper
       AND pg_catalog.obj_description(p.oid, 'pg_proc') OPERATOR(pg_catalog.=) '{stamp}'
-      AND p.prosrc OPERATOR(pg_catalog.=) (CASE WHEN p.proname OPERATOR(pg_catalog.=) 'refuse_ddl'
-        THEN $b${ddl}$b$ ELSE $b${drop}$b$ END)
+      AND p.prosrc OPERATOR(pg_catalog.=) (CASE WHEN p.proname OPERATOR(pg_catalog.=) 'refuse_ddl' THEN $b${ddl}$b$
+        WHEN p.proname OPERATOR(pg_catalog.=) 'refuse_drop' THEN $b${drop}$b$
+        ELSE $b${start}$b$ END)
       AND NOT p.prosecdef
       AND p.proconfig OPERATOR(pg_catalog.=) ARRAY['search_path=pg_catalog, pg_temp']::pg_catalog.text[]
       AND p.proacl IS NOT NULL
       AND NOT EXISTS (SELECT FROM pg_catalog.aclexplode(p.proacl) a WHERE a.grantee OPERATOR(pg_catalog.<>) p.proowner)
-  ) OPERATOR(pg_catalog.=) 2
+  ) OPERATOR(pg_catalog.=) 3
   AND EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
     WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard' AND r.rolsuper
       AND NOT EXISTS (SELECT FROM pg_catalog.aclexplode(n.nspacl) a WHERE a.grantee OPERATOR(pg_catalog.<>) n.nspowner))
   AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d
       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) d.refobjid
     WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
-      AND n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 2;
+      AND n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 3;
 "
     )
 }
 
-/// A read-only query, for `admin_sql` in one database, answering `t` when either event trigger
+/// A read-only query, for `admin_sql` in one database, answering `t` when any event trigger
 /// of the guard or its schema [`GUARD_SCHEMA`] exists (an unprotected branch's reconcile asks
 /// it before removing anything, so a normal run makes no DDL).
 pub fn schema_guard_present_sql() -> String {
@@ -166,14 +175,15 @@ pub fn schema_guard_present_sql() -> String {
         "{GUARD_PRESENT_MARK}
 SELECT EXISTS (SELECT FROM pg_catalog.pg_event_trigger e
     WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_ddl'
-      OR e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_drop')
+      OR e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_drop'
+      OR e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_start')
   OR EXISTS (SELECT FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard');
 "
     )
 }
 
-/// Removes the guard, as one transaction for `admin_sql` (`cloud_admin`) in one database: both
-/// event triggers, then schema [`GUARD_SCHEMA`] with all it holds (S2). The marker role stays
+/// Removes the guard, as one transaction for `admin_sql` (`cloud_admin`) in one database: the
+/// three event triggers, then schema [`GUARD_SCHEMA`] with all it holds (S2). The marker role stays
 /// (a cluster-wide role, granted to nobody on an unprotected branch).
 pub fn schema_unguard_sql() -> String {
     format!(
@@ -182,6 +192,7 @@ BEGIN;
 SET search_path = pg_catalog, pg_temp;
 DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_ddl;
 DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_drop;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start;
 DROP SCHEMA IF EXISTS chelabase_guard CASCADE;
 COMMIT;
 "
@@ -200,7 +211,7 @@ fn guard_stamp(settings: &GuardSettings) -> String {
     format!("chelabase schema guard {hash:016x}")
 }
 
-/// How both functions start (PB spec §2): a superuser session returns at once, then data
+/// How every function starts (PB spec §2): a superuser session returns at once, then data
 /// maintenance; then the session is locked when it holds the marker (looked up only once the
 /// marker role is known to exist: `pg_has_role` fails for a missing role) or, with the switch
 /// on, when its `session_user` isn't the owner, a member login or an exemption. An
@@ -238,7 +249,7 @@ fn locked_or_return(settings: &GuardSettings) -> String {
 const REFUSAL: &str = "RAISE EXCEPTION 'branch is protected: schema changes need Admin' USING ERRCODE = '42501', HINT = 'chelabase:branch_protected';";
 
 /// Data maintenance (T7 review): rebuilding a materialized view's rows or an index changes no
-/// schema, so both functions let it through.
+/// schema, so every function lets it through.
 const MAINTENANCE_RETURNS: &str = "
     IF TG_TAG OPERATOR(pg_catalog.=) 'REFRESH MATERIALIZED VIEW' OR TG_TAG OPERATOR(pg_catalog.=) 'REINDEX' THEN RETURN; END IF;";
 
@@ -276,9 +287,33 @@ fn refuse_drop_body(settings: &GuardSettings) -> String {
     )
 }
 
+/// `refuse_start`'s body (its `prosrc`): at `ddl_command_start`, before the command does any
+/// work. `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` commit their own work
+/// before `ddl_command_end` and `sql_drop`, so they must be refused here. The start event
+/// knows neither the target nor the concurrency, so every index create and drop is refused.
+fn refuse_start_body(settings: &GuardSettings) -> String {
+    format!(
+        "{start}
+    IF TG_TAG OPERATOR(pg_catalog.=) 'CREATE INDEX' OR TG_TAG OPERATOR(pg_catalog.=) 'DROP INDEX' THEN
+      {REFUSAL}
+    END IF;
+  END",
+        start = locked_or_return(settings),
+    )
+}
+
 /// The script up to its stamp and `COMMIT` ([`schema_guard_sql`] adds them).
 fn guard_script(settings: &GuardSettings) -> String {
-    [GUARD_SQL_HEAD, &refuse_ddl_body(settings), GUARD_SQL_MID, &refuse_drop_body(settings), GUARD_SQL_TAIL].concat()
+    [
+        GUARD_SQL_HEAD,
+        &refuse_ddl_body(settings),
+        GUARD_SQL_MID,
+        &refuse_drop_body(settings),
+        GUARD_SQL_START,
+        &refuse_start_body(settings),
+        GUARD_SQL_TAIL,
+    ]
+    .concat()
 }
 
 const GUARD_SQL_HEAD: &str = "BEGIN;
@@ -286,6 +321,7 @@ SET search_path = pg_catalog, pg_temp;
 DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_schema_locked') THEN CREATE ROLE chelabase_schema_locked NOLOGIN; END IF; END$$;
 DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_ddl;
 DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_drop;
+DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start;
 DO $$BEGIN
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
       AND (NOT EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.oid OPERATOR(pg_catalog.=) n.nspowner AND r.rolsuper)
@@ -295,7 +331,8 @@ DO $$BEGIN
             AND NOT EXISTS (SELECT FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) p.proowner
               WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
                 AND p.oid OPERATOR(pg_catalog.=) d.objid AND r.rolsuper
-                AND (p.proname OPERATOR(pg_catalog.=) 'refuse_ddl' OR p.proname OPERATOR(pg_catalog.=) 'refuse_drop'))))) THEN
+                AND (p.proname OPERATOR(pg_catalog.=) 'refuse_ddl' OR p.proname OPERATOR(pg_catalog.=) 'refuse_drop'
+                  OR p.proname OPERATOR(pg_catalog.=) 'refuse_start'))))) THEN
     DROP SCHEMA chelabase_guard CASCADE;
   END IF;
 END$$;
@@ -315,7 +352,8 @@ DO $$DECLARE f pg_catalog.regprocedure; BEGIN
   FOR f IN SELECT p.oid FROM pg_catalog.pg_proc p
       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
     WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
-      AND (p.proname OPERATOR(pg_catalog.=) 'refuse_ddl' OR p.proname OPERATOR(pg_catalog.=) 'refuse_drop')
+      AND (p.proname OPERATOR(pg_catalog.=) 'refuse_ddl' OR p.proname OPERATOR(pg_catalog.=) 'refuse_drop'
+        OR p.proname OPERATOR(pg_catalog.=) 'refuse_start')
   LOOP
     EXECUTE pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', f);
   END LOOP;
@@ -329,14 +367,22 @@ CREATE OR REPLACE FUNCTION chelabase_guard.refuse_drop() RETURNS event_trigger
   LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS
   $f$";
 
+const GUARD_SQL_START: &str = "$f$;
+CREATE OR REPLACE FUNCTION chelabase_guard.refuse_start() RETURNS event_trigger
+  LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS
+  $f$";
+
 const GUARD_SQL_TAIL: &str = "$f$;
 ALTER FUNCTION chelabase_guard.refuse_ddl() OWNER TO CURRENT_USER;
 ALTER FUNCTION chelabase_guard.refuse_drop() OWNER TO CURRENT_USER;
-REVOKE ALL ON FUNCTION chelabase_guard.refuse_ddl(), chelabase_guard.refuse_drop() FROM PUBLIC;
+ALTER FUNCTION chelabase_guard.refuse_start() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION chelabase_guard.refuse_ddl(), chelabase_guard.refuse_drop(), chelabase_guard.refuse_start() FROM PUBLIC;
 CREATE EVENT TRIGGER chelabase_schema_guard_ddl ON ddl_command_end EXECUTE FUNCTION chelabase_guard.refuse_ddl();
 ALTER EVENT TRIGGER chelabase_schema_guard_ddl ENABLE ALWAYS;
 CREATE EVENT TRIGGER chelabase_schema_guard_drop ON sql_drop EXECUTE FUNCTION chelabase_guard.refuse_drop();
 ALTER EVENT TRIGGER chelabase_schema_guard_drop ENABLE ALWAYS;
+CREATE EVENT TRIGGER chelabase_schema_guard_start ON ddl_command_start EXECUTE FUNCTION chelabase_guard.refuse_start();
+ALTER EVENT TRIGGER chelabase_schema_guard_start ENABLE ALWAYS;
 ";
 
 /// The settings the TE-A text tests render the guard with: the switch on and exemptions, and
@@ -384,7 +430,7 @@ mod guard_text {
             assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
             assert!(sql.trim_end().ends_with("COMMIT;"), "{sql}");
             // Each trigger is dropped just before it is made again, inside the transaction.
-            for t in ["chelabase_schema_guard_ddl", "chelabase_schema_guard_drop"] {
+            for t in ["chelabase_schema_guard_ddl", "chelabase_schema_guard_drop", "chelabase_schema_guard_start"] {
                 let drop = sql.find(&format!("DROP EVENT TRIGGER IF EXISTS {t};")).unwrap();
                 let create = sql.find(&format!("CREATE EVENT TRIGGER {t} ")).unwrap();
                 assert!(drop < create);
@@ -399,7 +445,7 @@ mod guard_text {
     fn both_functions_rule_out_superusers_and_a_missing_role_before_pg_has_role() {
         for settings in test_settings() {
             let sql = schema_guard_sql(&settings);
-            for f in ["chelabase_guard.refuse_ddl", "chelabase_guard.refuse_drop"] {
+            for f in ["chelabase_guard.refuse_ddl", "chelabase_guard.refuse_drop", "chelabase_guard.refuse_start"] {
                 let b = body(&sql, f);
                 let superuser = b.find("session_user AND rolsuper) THEN RETURN;").unwrap();
                 let exists = b.find("IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_schema_locked') THEN\n      locked := pg_catalog.pg_has_role(").unwrap();
@@ -435,7 +481,7 @@ mod guard_text {
     fn the_storage_schema_gets_no_exemption() {
         for settings in test_settings() {
             let sql = schema_guard_sql(&settings);
-            for f in ["chelabase_guard.refuse_ddl", "chelabase_guard.refuse_drop"] {
+            for f in ["chelabase_guard.refuse_ddl", "chelabase_guard.refuse_drop", "chelabase_guard.refuse_start"] {
                 let b = body(&sql, f);
                 assert!(!b.contains("storage") && !b.contains("nspname") && !b.contains("schema_name OPERATOR"), "{b}");
             }
@@ -476,7 +522,66 @@ mod guard_text {
             assert!(sql.contains("REVOKE ALL ON SCHEMA chelabase_guard FROM %I CASCADE"));
             assert!(sql.contains("ALTER FUNCTION chelabase_guard.refuse_ddl() OWNER TO CURRENT_USER;"));
             assert!(sql.contains("ALTER FUNCTION chelabase_guard.refuse_drop() OWNER TO CURRENT_USER;"));
-            assert!(sql.contains("REVOKE ALL ON FUNCTION chelabase_guard.refuse_ddl(), chelabase_guard.refuse_drop() FROM PUBLIC;"));
+            assert!(sql.contains("ALTER FUNCTION chelabase_guard.refuse_start() OWNER TO CURRENT_USER;"));
+            assert!(sql.contains("REVOKE ALL ON FUNCTION chelabase_guard.refuse_ddl(), chelabase_guard.refuse_drop(), chelabase_guard.refuse_start() FROM PUBLIC;"));
+        }
+    }
+
+    // Commands that commit their own work before `ddl_command_end` (`CREATE INDEX
+    // CONCURRENTLY`, `DROP INDEX CONCURRENTLY`) are refused at `ddl_command_start`, before
+    // they do anything. The start event can't tell a concurrent or temporary index apart, so
+    // every `CREATE INDEX` and `DROP INDEX` of a locked session is refused there.
+    #[test]
+    fn the_start_trigger_refuses_index_ddl_for_locked_sessions() {
+        for settings in test_settings() {
+            let sql = schema_guard_sql(&settings);
+            let b = body(&sql, "chelabase_guard.refuse_start");
+            let unlocked = b.find("IF NOT locked THEN RETURN; END IF;").unwrap();
+            let rule = b
+                .find("IF TG_TAG OPERATOR(pg_catalog.=) 'CREATE INDEX' OR TG_TAG OPERATOR(pg_catalog.=) 'DROP INDEX' THEN")
+                .expect("the index rule");
+            assert!(unlocked < rule && rule < b.find("RAISE EXCEPTION").unwrap(), "{b}");
+            assert_eq!(b.matches("RAISE EXCEPTION").count(), 1, "{b}");
+            assert!(b.contains("HINT = 'chelabase:branch_protected'"), "{b}");
+            // Nothing the start event can't answer.
+            assert!(!b.contains("pg_event_trigger_ddl_commands") && !b.contains("pg_event_trigger_dropped_objects"), "{b}");
+            assert!(sql.contains("CREATE EVENT TRIGGER chelabase_schema_guard_start ON ddl_command_start EXECUTE FUNCTION chelabase_guard.refuse_start();"), "{sql}");
+            assert!(sql.contains("ALTER EVENT TRIGGER chelabase_schema_guard_start ENABLE ALWAYS;"), "{sql}");
+            // Unfiltered, like the other two: no `WHEN TAG IN`.
+            assert!(!sql.contains("WHEN TAG"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_start_trigger_keeps_maintenance() {
+        for settings in test_settings() {
+            let sql = schema_guard_sql(&settings);
+            let b = body(&sql, "chelabase_guard.refuse_start");
+            let maintenance = b.find(MAINTENANCE_RETURNS.trim()).expect("maintenance allowed");
+            assert!(maintenance < b.find("RAISE EXCEPTION").unwrap(), "{b}");
+            assert!(maintenance < b.find("IF NOT locked THEN RETURN; END IF;").unwrap(), "{b}");
+        }
+    }
+
+    #[test]
+    fn the_check_expects_three_triggers() {
+        for settings in test_settings() {
+            let check = schema_guard_check_sql(&settings);
+            assert!(check.contains("WHERE n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 3\n"), "{check}");
+            assert!(check.contains("  ) OPERATOR(pg_catalog.=) 3\n"), "{check}");
+            assert!(check.contains("AND n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard') OPERATOR(pg_catalog.=) 3;"), "{check}");
+            assert!(!check.contains("OPERATOR(pg_catalog.=) 2"), "{check}");
+            assert!(check.contains("(e.evtevent OPERATOR(pg_catalog.=) 'ddl_command_start' AND p.proname OPERATOR(pg_catalog.=) 'refuse_start')"), "{check}");
+            assert!(check.contains(&format!("$b${}$b$", refuse_start_body(&settings))), "{check}");
+            let present = schema_guard_present_sql();
+            assert!(present.contains("e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_start'"), "{present}");
+            let unguard = schema_unguard_sql();
+            let start = unguard.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start;").unwrap();
+            assert!(start < unguard.find("DROP SCHEMA IF EXISTS chelabase_guard CASCADE;").unwrap(), "{unguard}");
+            // The planted-schema cleanup and the function-drop loop know the third function.
+            let sql = schema_guard_sql(&settings);
+            assert_eq!(sql.matches("OR p.proname OPERATOR(pg_catalog.=) 'refuse_start'").count(), 2, "{sql}");
+            assert!(sql.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start;").unwrap() < sql.find("DROP SCHEMA chelabase_guard CASCADE;").unwrap());
         }
     }
 }
@@ -494,6 +599,9 @@ mod tests {
                 "REVOKE ALL ON SCHEMA chelabase_guard FROM PUBLIC",
                 "CREATE OR REPLACE FUNCTION chelabase_guard.refuse_ddl()",
                 "CREATE OR REPLACE FUNCTION chelabase_guard.refuse_drop()",
+                "CREATE OR REPLACE FUNCTION chelabase_guard.refuse_start()",
+                "DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start",
+                "CREATE EVENT TRIGGER chelabase_schema_guard_start ON ddl_command_start",
                 "DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_ddl",
                 "CREATE EVENT TRIGGER chelabase_schema_guard_ddl ON ddl_command_end",
                 "DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_drop",
@@ -528,7 +636,9 @@ mod tests {
             // 7: the check is a cheap, separate query answering `t` when the guard is current.
             let check = schema_guard_check_sql(&settings);
             assert!(check.contains("chelabase: schema guard check"), "{check}");
-            assert!(!check.contains("CREATE "), "the check changes nothing: {check}");
+            // Outside the bodies it compares as text (the start body names `CREATE INDEX`).
+            let outside = check.replace(&refuse_start_body(&settings), "");
+            assert!(!outside.contains("CREATE "), "the check changes nothing: {check}");
         }
     }
 }
@@ -545,6 +655,7 @@ mod stamp {
             let sql = schema_guard_sql(&settings);
             assert!(sql.contains(&format!("COMMENT ON FUNCTION chelabase_guard.refuse_ddl() IS '{stamp}';")));
             assert!(sql.contains(&format!("COMMENT ON FUNCTION chelabase_guard.refuse_drop() IS '{stamp}';")));
+            assert!(sql.contains(&format!("COMMENT ON FUNCTION chelabase_guard.refuse_start() IS '{stamp}';")));
             // The stamp comes before COMMIT, in the same transaction.
             assert!(sql.find(&stamp).unwrap() < sql.rfind("COMMIT;").unwrap());
             let check = schema_guard_check_sql(&settings);
@@ -553,7 +664,8 @@ mod stamp {
             // Read-only: one SELECT, nothing else (outside the bodies it compares as text).
             let outside = check
                 .replace(&refuse_ddl_body(&settings), "")
-                .replace(&refuse_drop_body(&settings), "");
+                .replace(&refuse_drop_body(&settings), "")
+                .replace(&refuse_start_body(&settings), "");
             for word in ["INSERT", "UPDATE", "DELETE", "ALTER", "DROP", "COMMENT", "GRANT", "REVOKE"] {
                 assert!(!outside.contains(word), "{word}: {outside}");
             }
@@ -570,7 +682,7 @@ mod stamp {
         for settings in test_settings() {
             let sql = schema_guard_sql(&settings);
             let check = schema_guard_check_sql(&settings);
-            for body in [refuse_ddl_body(&settings), refuse_drop_body(&settings)] {
+            for body in [refuse_ddl_body(&settings), refuse_drop_body(&settings), refuse_start_body(&settings)] {
                 assert!(sql.contains(&format!("$f${body}$f$;")), "installed as is: {body}");
                 assert!(check.contains(&format!("$b${body}$b$")), "compared as is: {body}");
                 assert!(!body.contains("$b$") && !body.contains("$f$"));
@@ -595,8 +707,8 @@ mod stamp {
             let create = sql.find("CREATE OR REPLACE FUNCTION chelabase_guard.refuse_ddl()").unwrap();
             let schema = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase_guard;").unwrap();
             assert!(planted < schema && schema < routines && routines < create, "{sql}");
-            // Both triggers are dropped before any function is.
-            for t in ["chelabase_schema_guard_ddl", "chelabase_schema_guard_drop"] {
+            // Every trigger is dropped before any function is.
+            for t in ["chelabase_schema_guard_ddl", "chelabase_schema_guard_drop", "chelabase_schema_guard_start"] {
                 assert!(sql.find(&format!("DROP EVENT TRIGGER IF EXISTS {t};")).unwrap() < planted);
             }
         }
@@ -613,12 +725,12 @@ mod settings_text {
     }
 
     #[test]
-    fn the_settings_line_is_in_both_bodies() {
+    fn the_settings_line_is_in_every_body() {
         let sql = schema_guard_sql(&s(true, &["deploy", "Ci Bot"]));
         // "Ci Bot" and "deploy", hex of their UTF-8 bytes, in the set's order.
-        assert_eq!(sql.matches("-- settings: guard_logins=on exempt=[436920426f74, 6465706c6f79]").count(), 2, "{sql}");
+        assert_eq!(sql.matches("-- settings: guard_logins=on exempt=[436920426f74, 6465706c6f79]").count(), 3, "{sql}");
         let off = schema_guard_sql(&s(false, &[]));
-        assert_eq!(off.matches("-- settings: guard_logins=off exempt=[]").count(), 2, "{off}");
+        assert_eq!(off.matches("-- settings: guard_logins=off exempt=[]").count(), 3, "{off}");
     }
 
     #[test]
@@ -666,8 +778,9 @@ mod settings_text {
         assert!(unguard.starts_with(UNGUARD_MARK), "{unguard}");
         let ddl = unguard.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_ddl;").unwrap();
         let drop = unguard.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_drop;").unwrap();
+        let start = unguard.find("DROP EVENT TRIGGER IF EXISTS chelabase_schema_guard_start;").unwrap();
         let schema = unguard.find("DROP SCHEMA IF EXISTS chelabase_guard CASCADE;").unwrap();
-        assert!(ddl < schema && drop < schema, "{unguard}");
+        assert!(ddl < schema && drop < schema && start < schema, "{unguard}");
         assert!(unguard.contains("BEGIN;") && unguard.trim_end().ends_with("COMMIT;"), "{unguard}");
     }
 }

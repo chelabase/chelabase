@@ -6,8 +6,8 @@ use super::internal::{
 };
 use super::AppUsers;
 use crate::app::{AppState, SIGN_UP_EXTRA, usable_password};
-use crate::guard::{Slot, email_tag, pad};
-use crate::session::may_issue_code;
+use crate::guard::{CodeCheckSlot, SignInSlots, email_tag, pad};
+use crate::session::reserve_code_issue;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -47,6 +47,7 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(app_password_reset))
         .routes(routes!(app_password_reset_confirm))
         .routes(routes!(app_change_email))
+        .routes(routes!(app_change_email_confirm))
         .routes(routes!(app_change_password))
         .routes(routes!(app_jwks))
 }
@@ -82,6 +83,14 @@ pub struct SignUpPending {
     pub user: AppUserView,
     /// Always `true`.
     pub verification_required: bool,
+}
+
+/// An email change that waits for the code mailed to the new address: nothing changed yet.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[schema(as = AppEmailChangePending)]
+pub struct EmailChangePending {
+    /// Always `true`: finish with `change-email/confirm`.
+    pub confirmation_required: bool,
 }
 
 /// Sign-up's answer: a session (verification off) or a pending sign-up (verification on).
@@ -131,6 +140,20 @@ pub struct AppVerifyEmailBody {
 #[derive(Deserialize, ToSchema)]
 pub struct AppEmailBody {
     email: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct AppChangeEmailBody {
+    /// The new address.
+    email: String,
+    current_password: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct AppChangeEmailConfirmBody {
+    /// The new address the code was mailed to.
+    email: String,
+    code: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -450,28 +473,64 @@ async fn app_password_reset_confirm(
     path = "/auth/v1/app/change-email",
     operation_id = "appChangeEmail",
     tag = TAG,
-    description = "Changes the signed-in user's email (needs the `Chelabase-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
-    request_body = AppEmailBody,
+    description = "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.",
+    request_body = AppChangeEmailBody,
     responses(
-        (status = 204, description = "Changed"),
+        (status = 202, description = "Verification is on: a code went to the new address; nothing changed yet", body = EmailChangePending),
+        (status = 204, description = "Verification is off: changed"),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
-        (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
+        (status = 401, description = "The current password is wrong (`invalid_credentials`), no user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
         (status = 409, description = "The email is taken (`email_taken`), it is the user's email already (`conflict`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
         (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
-        (status = 422, description = "Invalid input: `invalid_request`", body = ErrorEnvelope),
-        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 422, description = "Invalid input, or the body has the wrong fields: `invalid_request`", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts or codes: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service, its email or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_change_email(
     State(s): S,
     caller: AppCaller,
-    ApiJson(b): ApiJson<AppEmailBody>,
+    ApiJson(b): ApiJson<AppChangeEmailBody>,
 ) -> Response {
-    change_email(&s, &caller, b)
+    let start = Instant::now();
+    let answer = change_email(&s, &caller, b)
         .await
-        .unwrap_or_else(IntoResponse::into_response)
+        .unwrap_or_else(IntoResponse::into_response);
+    pad(start, s.config.min_response).await;
+    answer
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/v1/app/change-email/confirm",
+    operation_id = "appConfirmEmailChange",
+    tag = TAG,
+    description = "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.",
+    request_body = AppChangeEmailConfirmBody,
+    responses(
+        (status = 204, description = "Changed"),
+        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
+        (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
+        (status = 409, description = "Another user took the address meanwhile (`email_taken`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
+        (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
+        (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
+        (status = 422, description = "The code is wrong, expired or for another address (`invalid_code`), or the body has the wrong fields (`invalid_request`)", body = ErrorEnvelope),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn app_change_email_confirm(
+    State(s): S,
+    caller: AppCaller,
+    ApiJson(b): ApiJson<AppChangeEmailConfirmBody>,
+) -> Response {
+    let start = Instant::now();
+    let answer = change_email_confirm(&s, &caller, b)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    pad(start, s.config.min_response).await;
+    answer
 }
 
 #[utoipa::path(
@@ -584,6 +643,10 @@ fn weak_password() -> ApiError {
     fail(422, ErrorCode::WeakPassword, text::WEAK_PASSWORD)
 }
 
+fn too_many() -> ApiError {
+    fail(429, ErrorCode::RateLimited, text::TOO_MANY)
+}
+
 fn no_user() -> ApiError {
     fail(401, ErrorCode::UserTokenInvalid, text::NO_USER)
 }
@@ -599,6 +662,13 @@ fn refresh_invalid() -> ApiError {
 /// Identity refused a password it was given (`weak_password`).
 fn is_weak(e: &IdentityError) -> bool {
     matches!(e, IdentityError::Invalid { code, .. } if code == "weak_password")
+}
+
+/// Reserves one of `email`'s refused code checks of `kind` ([`CodeCheckSlot`]), for known and
+/// unknown emails alike; 429 once they are used. Only a right code refunds it.
+fn code_check_slot<'a>(s: &'a AppState, caller: &AppCaller, kind: &str, email: &str) -> Flow<CodeCheckSlot<'a>> {
+    let scope = format!("app:{}:", caller.project_id);
+    CodeCheckSlot::reserve(&s.limiter, &scope, kind, &email_tag(email)).ok_or_else(too_many)
 }
 
 /// The extractor answered 503 already when app users aren't configured.
@@ -796,18 +866,24 @@ async fn publish_sync(app: &AppUsers, req: SyncRequest) {
     }
 }
 
-/// Mails the user a code of `kind`, within [`may_issue_code`]: at most five of a kind an hour
-/// per user, whatever flow asks (m2's guess limit resets with each new code, so this is what
-/// bounds the guesses). The answer never says whether one went out; a failure is only logged.
+/// Mails the user a code of `kind`, within [`reserve_code_issue`]: at most five of a kind an
+/// hour per user, whatever flow asks. The answer never says whether one went out; a failure is
+/// only logged. Identity keeps a live code sent under a minute ago (`CodeRecentlySent`): nothing
+/// is sent, so the hour's slot is given back.
 async fn send_code(s: &AppState, info: &AppBranchInfo, user_id: Uuid, kind: CodeKind) {
     let user = user_id.to_string();
-    if !may_issue_code(&s.limiter, kind, &user) {
+    let Some(slot) = reserve_code_issue(&s.limiter, kind, &user) else {
         info!(kind = kind.as_str(), "an app user's code limit is used up; nothing sent");
         return;
-    }
+    };
     let request = CodeRequest::new(&user, kind, Delivery::Email);
-    if let Err(e) = s.identity.create_code(&pool(info), &request).await {
-        warn!(error = %e, kind = kind.as_str(), "sending an app user's code failed");
+    match s.identity.create_code(&pool(info), &request).await {
+        Ok(_) => {}
+        Err(IdentityError::CodeRecentlySent) => {
+            slot.refund();
+            info!(kind = kind.as_str(), "an app user's code went out under a minute ago; nothing sent");
+        }
+        Err(e) => warn!(error = %e, kind = kind.as_str(), "sending an app user's code failed"),
     }
 }
 
@@ -1034,9 +1110,14 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     // lands, and a client that hangs up during the check still spends it. Only these outcomes
     // give it back:
     //
-    // | Outcome                                                         | Answer | Email slot |
+    // Two slots are reserved and refunded together ([`SignInSlots`]): the email from this
+    // client (5 a minute) and the email from anywhere (30 a minute), so failures from one
+    // client don't lock the owner out from another. A server-vouched call's client is the app
+    // server's address.
+    //
+    // | Outcome                                                         | Answer | Both slots |
     // |-----------------------------------------------------------------|--------|------------|
-    // | the email's 5 a minute are used                                 | 429    | none held  |
+    // | this client's 5 or the email's 30 a minute are used             | 429    | none held  |
     // | `BadCredentials`: an unknown email or a wrong password          | 401    | counts     |
     // | `Invalid`: identity's request validation (the caller's input)   | 401    | counts     |
     // | `Banned`: the password is right, the user banned                | 403    | refunded   |
@@ -1047,12 +1128,8 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     // An unknown email and a wrong password are one answer of identity's, so they count and
     // answer the same 401, padded alike. Whatever [`open_session`] answers afterwards (403
     // unverified, 503) comes after the refund.
-    let key = format!(
-        "app:{}:sign-in:email:{}",
-        caller.project_id,
-        email_tag(&email)
-    );
-    let Some(slot) = Slot::reserve(&s.limiter, key, 5, MINUTE) else {
+    let scope = format!("app:{}:", caller.project_id);
+    let Some(slot) = SignInSlots::reserve(&s.limiter, &scope, &email_tag(&email), &caller.ip) else {
         return Err(fail(429, ErrorCode::RateLimited, text::TOO_MANY));
     };
     let signed = match s.identity.sign_in(&pool(&info), &email, &b.password).await {
@@ -1282,9 +1359,9 @@ async fn verify_email(s: &AppState, caller: &AppCaller, b: AppVerifyEmailBody) -
         caller,
         &[
             ("verify", "ip", &caller.ip, 10, MINUTE),
-            ("verify", "email", &email_tag(&email), 10, HOUR),
         ],
     )?;
+    let slot = code_check_slot(s, caller, "verify", &email)?;
     let info = branch_info(app, caller).await?;
     let Some((user_id, _)) = find_user(s, &info, &email).await? else {
         return Err(bad_code());
@@ -1294,7 +1371,10 @@ async fn verify_email(s: &AppState, caller: &AppCaller, b: AppVerifyEmailBody) -
         .verify_code(&pool(&info), &user_id.to_string(), CodeKind::Verify, b.code.trim(), None)
         .await
     {
-        Ok(_) => {}
+        Ok(_) => slot.refund(),
+        // The stored guess budget is spent: no code is checked, a right one included. The email's
+        // own check bound refuses first, so this answers only after an auth restart lost its count.
+        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
         // A wrong, used, expired or locked code, a malformed one, or a user gone meanwhile:
         // the same answer as an unknown email.
         Err(
@@ -1371,13 +1451,13 @@ async fn password_reset_confirm(
         caller,
         &[
             ("confirm", "ip", &caller.ip, 10, MINUTE),
-            ("confirm", "email", &email_tag(&email), 10, HOUR),
         ],
     )?;
     // Before identity sees the email, so this answer can't tell accounts apart.
     if !usable_password(&b.password) {
         return Err(weak_password());
     }
+    let slot = code_check_slot(s, caller, "reset", &email)?;
     let info = branch_info(app, caller).await?;
     let Some((user_id, _)) = find_user(s, &info, &email).await? else {
         return Err(bad_code());
@@ -1393,8 +1473,11 @@ async fn password_reset_confirm(
         )
         .await
     {
-        Ok(_) => {}
+        Ok(_) => slot.refund(),
         Err(e) if is_weak(&e) => return Err(weak_password()),
+        // The stored guess budget is spent: no code is checked, a right one included. The email's
+        // own check bound refuses first, so this answers only after an auth restart lost its count.
+        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
         // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
         Err(
             IdentityError::CodeInvalid
@@ -1420,28 +1503,61 @@ async fn password_reset_confirm(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Sets the new address, unverified when verification is on (then a code goes to it), and
-/// syncs. Sessions continue. A failure at `set_email` changes nothing; after it, a lost code is
-/// what `resend-code` is for and a lost sync is the reconcile's (a retry answers 409
-/// `conflict`: the address is the account's already).
-async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow {
+/// Changes the email, behind the current password. In order:
+///
+/// 1. rate limits, the address's shape, the branch;
+/// 2. the current password, checked with an identity sign-in against the current address. The
+///    check's identity session is ended at once, whatever comes next;
+/// 3. an address another user holds is 409 `email_taken`, the user's own 409 `conflict`;
+/// 4. verification on: a code goes to the new address (within [`reserve_code_issue`]; 429
+///    while a code sent under a minute ago stands) and the answer is 202 with nothing changed;
+///    `change-email/confirm` makes the change. Verification off: the address is set, verified,
+///    the previous address is told, and the change is synced.
+///
+/// Sessions continue. Nothing is written before step 4, so any refusal changes nothing. A lost
+/// sync is the reconcile's.
+async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
         return Err(no_user());
     };
+    let sub = claims.sub.to_string();
     let email = normalize_email(&b.email);
+    // 1.
     rate_limit(
         s,
         caller,
         &[
             ("change-email", "ip", &caller.ip, 10, MINUTE),
-            ("change-email", "user", &claims.sub.to_string(), 5, HOUR),
+            // Above the five codes an hour (step 4), so the code limit is what bounds issuance
+            // and a few mistyped addresses don't hold the user back for the hour.
+            ("change-email", "user", &sub, 10, HOUR),
         ],
     )?;
     if !valid_email(&email) {
         return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
     }
     let info = branch_info(app, caller).await?;
+    let pool = pool(&info);
+    // 2.
+    let current = match s.identity.get_user(&pool, &sub).await {
+        Ok(u) => u,
+        Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
+        Err(e) => return Err(identity_down(&e)),
+    };
+    match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
+        Ok(signed) => {
+            end_identity_session(s, &pool, &signed.session_id).await;
+            if signed.user.id != sub {
+                return Err(refused());
+            }
+        }
+        Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
+            return Err(refused());
+        }
+        Err(e) => return Err(identity_down(&e)),
+    }
+    // 3.
     match find_user(s, &info, &email).await? {
         Some((id, _)) if id == claims.sub => {
             return Err(fail(409, ErrorCode::Conflict, text::EMAIL_NOT_CHANGED));
@@ -1449,27 +1565,107 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow
         Some(_) => return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS)),
         None => {}
     }
-    let ev = info.email_verification;
+    // 4.
+    if info.email_verification {
+        let Some(slot) = reserve_code_issue(&s.limiter, CodeKind::EmailChange, &sub) else {
+            return Err(too_many());
+        };
+        return match s.identity.create_email_change_code(&pool, &sub, &email, None).await {
+            Ok(_) => {
+                let body = EmailChangePending { confirmation_required: true };
+                Ok((StatusCode::ACCEPTED, Json(body)).into_response())
+            }
+            // A code went out under a minute ago and still stands: nothing was sent, so the
+            // hour's slot is given back. The signed-in user is told to wait (the route's 429):
+            // a 202 would promise a code at the new address that never comes.
+            Err(IdentityError::CodeRecentlySent) => {
+                slot.refund();
+                Err(too_many())
+            }
+            Err(e) => Err(email_write_refused(e)),
+        };
+    }
+    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true).await {
+        return Err(email_write_refused(e));
+    }
+    publish_sync(
+        app,
+        SyncRequest {
+            project_id: info.project_id,
+            user_id: claims.sub,
+            data: None,
+            origin_branch_id: None,
+        },
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Identity's refusal of a new address, at the code or at the write.
+fn email_write_refused(e: IdentityError) -> ApiError {
+    match e {
+        // Taken between the lookup and identity's own check.
+        IdentityError::Conflict(_) => fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS),
+        IdentityError::NotFound(Missing::User) => no_user(),
+        // Identity's check of the address: the caller's input.
+        IdentityError::Invalid { code, message } if code != "weak_password" => {
+            info!(code, message, "identity refused the new email");
+            fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL)
+        }
+        IdentityError::EmailNotConfigured => {
+            warn!("an app email change needs a code, but identity has no SMTP server");
+            unavailable()
+        }
+        e => identity_down(&e),
+    }
+}
+
+/// Finishes a pending email change for the token's user (never one named in the body): the
+/// code must have been mailed to `email` for this user, while their current address is the one
+/// it was issued under. Identity swaps the address in, verified, and tells the previous one;
+/// then the change is synced.
+async fn change_email_confirm(
+    s: &AppState,
+    caller: &AppCaller,
+    b: AppChangeEmailConfirmBody,
+) -> Flow {
+    let app = app(s);
+    let Some(claims) = &caller.user else {
+        return Err(no_user());
+    };
+    let sub = claims.sub.to_string();
+    let email = normalize_email(&b.email);
+    rate_limit(
+        s,
+        caller,
+        &[
+            ("change-email-confirm", "ip", &caller.ip, 10, MINUTE),
+            ("change-email-confirm", "user", &sub, 10, HOUR),
+            ("change-email-confirm", "email", &email_tag(&email), 10, HOUR),
+        ],
+    )?;
+    let info = branch_info(app, caller).await?;
+    // No code is ever issued for an address that fails the shape check.
+    if !valid_email(&email) {
+        return Err(bad_code());
+    }
     match s
         .identity
-        .set_email(&pool(&info), &claims.sub.to_string(), &email, !ev)
+        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim())
         .await
     {
         Ok(_) => {}
-        // Taken between the lookup and the write.
+        // The stored guess budget is spent: no code is checked, a right one included.
+        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
+        // A wrong, used, expired or locked code, one for another address, or a current
+        // address changed since it was issued.
+        Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. }) => return Err(bad_code()),
+        // Another user took the address since the code was issued (the code is spent).
         Err(IdentityError::Conflict(_)) => {
             return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
         }
         Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
-        // Identity's check of the address: the caller's input.
-        Err(IdentityError::Invalid { code, message }) if code != "weak_password" => {
-            info!(code, message, "identity refused the new email");
-            return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
-        }
         Err(e) => return Err(identity_down(&e)),
-    }
-    if ev {
-        send_code(s, &info, claims.sub, CodeKind::Verify).await;
     }
     publish_sync(
         app,

@@ -16,7 +16,7 @@ A **service** is a backend you run, not code Chelabase runs for you. Chelabase r
 | Needs | `CHELABASE_SERVICES_ALLOW_HOSTS` for a private target | The `services` compose profile |
 | Who may create it | A **tenant admin** | A **tenant admin** |
 
-Both are tenant-admin only: an external URL opens a network path from the platform, and pulling an image opens one from the Docker host.
+Both are tenant-admin only: an external URL opens a network path from the platform, and pulling an image opens one from the Docker host. Changing a function's `kind` to or from `service` is a tenant admin's too (403 `forbidden`, `required: "tenant admin"`, otherwise), since a service's secrets are its process environment.
 
 ## Calling a service
 

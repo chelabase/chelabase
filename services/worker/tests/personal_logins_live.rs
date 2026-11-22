@@ -136,7 +136,7 @@ impl Fx {
     async fn sql_on(&self, ep: &str, database: &str, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(ep, database, sql)
+            .admin_sql(ep, database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
     }

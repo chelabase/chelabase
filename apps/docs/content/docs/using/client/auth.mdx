@@ -23,7 +23,7 @@ const off = db.auth.onChange((event, user) => {
 await db.auth.signOut();
 ```
 
-Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword` and `onChange` (which returns the function that unsubscribes).
+Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `confirmEmailChange`, `changePassword` and `onChange` (which returns the function that unsubscribes).
 
 `getUser()` rejects when nobody is signed in; `currentUser()` gives `null` instead (no session, or one that is invalid, expired after one refresh, revoked, or ended by its refresh) and rejects only on other errors, such as the gateway being down. `refreshIfNeeded()` refreshes only when the access token is missing or about to expire, and sends nothing otherwise.
 
@@ -38,6 +38,8 @@ const user = await db.auth.currentUser();
 if (user) console.log(user.email);
 ```
 
+`changeEmail({ email, currentPassword })` needs the user's current password. With email verification on it resolves to `{ confirmationRequired: true }`, mails a code to the new address and changes nothing until `confirmEmailChange({ email, code })`; with it off the address changes at once (`confirmationRequired: false`). Code written for `changeEmail({ email })` must now pass `currentPassword`. See [Email changes](/using/app-users/sessions#email-changes).
+
 ## Sign-up data
 
 `signUp`'s `data` fills the app's own columns of the users table. With a generated `Database` it is typed from that table's insertable columns, without the managed ones (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`). `session` is `null` while email verification is pending (`verificationRequired`).
@@ -47,6 +49,7 @@ if (user) console.log(user.email);
 - Only the refresh token is stored, under the key `chelabase.<first 12 characters of the key>.refresh`: in `localStorage` when present, otherwise in memory. Pass `auth.storage` (`{ get, set, remove }`, sync or async) for anything else, such as React Native. The access token stays in memory.
 - `database()` siblings share the same session.
 - In a server-rendered app the session lives in cookies instead: see [Server rendering](/using/client/ssr).
+- **For a browser app, prefer the cookie mode.** Anything in `localStorage` can be read by every script on the page, so a script injected by an XSS bug or a compromised dependency can take the refresh token and use it from elsewhere until it is revoked. In the cookie mode the refresh token is `HttpOnly`, so page scripts never see it. `localStorage` is the right trade only for an app with no server of its own, such as a single-page app: it works with nothing else to run, and it is what `createClient` does by default.
 
 ## Refresh and sign-out
 

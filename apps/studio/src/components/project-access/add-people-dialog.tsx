@@ -33,6 +33,11 @@ export interface AddPeopleDialogProps {
   members: readonly Member[];
   /** The project's grants: a member with one (or a tenant admin) can't be added again. */
   grants: readonly ProjectGrant[];
+  /**
+   * Whether the viewer is a tenant admin. Only a tenant admin may invite by one-time link or
+   * bring back someone who was removed; anyone else invites new people by email only.
+   */
+  tenantAdmin: boolean;
   onDone: (message: string) => void;
   onLink: (link: OneTimeLink) => void;
   finalFocus?: RefObject<HTMLElement | null>;
@@ -42,7 +47,7 @@ export interface AddPeopleDialogProps {
 const UNKNOWN: InviteDelivery = { email_available: false, reason: "identity_unavailable" };
 
 /** "Add people to {project}": an email, a platform role, Postgres roles and how they get the invite. */
-export function AddPeopleDialog({ open, onOpenChange, project, suggestions, members, grants, onDone, onLink, finalFocus }: AddPeopleDialogProps) {
+export function AddPeopleDialog({ open, onOpenChange, project, suggestions, members, grants, tenantAdmin, onDone, onLink, finalFocus }: AddPeopleDialogProps) {
   const [busy, setBusy] = useState(false);
   return (
     <Modal
@@ -59,6 +64,7 @@ export function AddPeopleDialog({ open, onOpenChange, project, suggestions, memb
           suggestions={suggestions}
           grants={grants}
           members={members}
+          tenantAdmin={tenantAdmin}
           onBusy={setBusy}
           onCancel={() => onOpenChange(false)}
           onDone={onDone}
@@ -74,11 +80,12 @@ function AddForm({
   suggestions,
   grants,
   members,
+  tenantAdmin,
   onBusy,
   onCancel,
   onDone,
   onLink,
-}: Pick<AddPeopleDialogProps, "project" | "suggestions" | "members" | "grants" | "onDone" | "onLink"> & {
+}: Pick<AddPeopleDialogProps, "project" | "suggestions" | "members" | "grants" | "tenantAdmin" | "onDone" | "onLink"> & {
   onBusy: (busy: boolean) => void;
   onCancel: () => void;
 }) {
@@ -95,14 +102,16 @@ function AddForm({
   const [failure, setFailure] = useState<InviteFailure>({});
 
   useEffect(() => {
-    if (info) setHow(info.email_available ? "email" : "link");
-  }, [info]);
+    if (info) setHow(info.email_available || !tenantAdmin ? "email" : "link");
+  }, [info, tenantAdmin]);
   useEffect(() => onBusy(busy), [busy, onBusy]);
 
   const address = email.trim().toLowerCase();
   // Someone already in the tenant needs no invite email: no delivery choice for them.
   const existing = members.find((m) => m.email?.toLowerCase() === address && m.status !== "removed");
   const known = existing !== undefined;
+  // Without email, a new person can only get a link, and only a tenant admin makes one.
+  const noWay = !known && !tenantAdmin && info !== undefined && !info.email_available;
   // A grant here (or tenant admin) already exists: adding would replace it.
   const current: PlatformRole | undefined = existing
     ? existing.tenant_admin
@@ -112,7 +121,7 @@ function AddForm({
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy || current) return;
+    if (busy || current || noWay) return;
     if (!looksLikeEmail(address)) {
       setFailure({ email: "Enter an email address." });
       return;
@@ -185,7 +194,20 @@ function AddForm({
           onBlockedChange={setBlocked}
         />
         {rowError && <FailureText failure={rowError} />}
-        {!known && <DeliveryField info={info} value={how} onChange={setHow} error={failure.delivery} />}
+        {!known &&
+          (tenantAdmin ? (
+            <DeliveryField info={info} value={how} onChange={setHow} error={failure.delivery} />
+          ) : noWay ? (
+            <p className="max-w-[65ch] text-sm text-chalk-dim">
+              Email isn't set up on this instance, so new people get a one-time link, and only a tenant admin can make one. Ask a tenant admin to invite them.
+            </p>
+          ) : (
+            failure.delivery && (
+              <p role="alert" className="text-sm text-coral">
+                {failure.delivery}
+              </p>
+            )
+          ))}
       </fieldset>
       {failure.form && (
         <p role="alert" className="text-sm text-coral">
@@ -196,7 +218,7 @@ function AddForm({
         <Button type="button" variant="ghost" onClick={onCancel} disabled={busy}>
           Cancel
         </Button>
-        <Button type="submit" disabled={busy || blocked || info === undefined || current !== undefined}>
+        <Button type="submit" disabled={busy || blocked || info === undefined || current !== undefined || noWay}>
           {busy ? "Sending…" : known ? "Add" : how === "link" ? "Create link" : "Send invite"}
         </Button>
       </div>

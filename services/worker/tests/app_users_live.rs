@@ -826,6 +826,43 @@ async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
 
 // --- Sync-role writes: sign-up data and marked deletes -------------------------------------
 
+/// A database whose plain literals take backslash escapes: the sync's upsert still stores the
+/// email and the sign-up data exactly as given.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn upsert_keeps_backslashes_with_conforming_strings_off() {
+    live(|fx| async move {
+        fx.sql(&format!(
+            "ALTER DATABASE \"{}\" SET standard_conforming_strings = off;",
+            fx.database.replace('"', "\"\"")
+        ))
+        .await;
+        fx.bootstrap().await.expect("bootstrap");
+        fx.owner_ok(
+            "ALTER TABLE users ADD COLUMN display_name text;
+             GRANT INSERT (display_name) ON users TO authenticated;",
+        )
+        .await;
+        let email = "o'b\\rien\\\\@example.com";
+        let display_name = "A\\nn 'the' \\\\ \"Q\" 表\\";
+        let id = Uuid::new_v4();
+        assert_eq!(
+            fx.upsert(id, email, Some(json!({ "display_name": display_name }))).await,
+            "inserted"
+        );
+        let hex = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            fx.value(&format!(
+                "SELECT encode(convert_to(email, 'UTF8'), 'hex') || '|' || \
+                 encode(convert_to(display_name, 'UTF8'), 'hex') FROM public.users WHERE id = '{id}'"
+            ))
+            .await,
+            format!("{}|{}", hex(email), hex(display_name))
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn sign_up_data_respects_column_insert_privilege() {
@@ -855,6 +892,70 @@ async fn sign_up_data_respects_column_insert_privilege() {
             ))
             .await,
             "<null>|free"
+        );
+    })
+    .await;
+}
+
+/// AC 5: sign-up data reaches a column only through a column-level INSERT granted straight to
+/// `authenticated`; a table-level grant made after the bootstrap, a grant to PUBLIC and a column
+/// grant to a role `authenticated` is a member of all leave the column at its default.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn sign_up_data_ignores_table_public_and_inherited_insert_grants() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        fx.owner_ok("ALTER TABLE users ADD COLUMN display_name text, ADD COLUMN plan text NOT NULL DEFAULT 'free'")
+            .await;
+        let member = format!("au_member_{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let data = json!({ "plan": "enterprise" });
+        for (grant, undo) in [
+            (
+                "GRANT INSERT ON public.users TO authenticated".to_string(),
+                "REVOKE INSERT ON public.users FROM authenticated".to_string(),
+            ),
+            (
+                "GRANT INSERT ON public.users TO PUBLIC".to_string(),
+                "REVOKE INSERT ON public.users FROM PUBLIC".to_string(),
+            ),
+            (
+                "GRANT INSERT (plan) ON public.users TO PUBLIC".to_string(),
+                "REVOKE INSERT (plan) ON public.users FROM PUBLIC".to_string(),
+            ),
+            (
+                format!(
+                    "CREATE ROLE {member} NOLOGIN; GRANT {member} TO authenticated; \
+                     GRANT INSERT (plan) ON public.users TO {member}"
+                ),
+                format!("REVOKE INSERT (plan) ON public.users FROM {member}"),
+            ),
+        ] {
+            fx.sql(&grant).await;
+            let id = Uuid::new_v4();
+            assert_eq!(
+                fx.upsert(id, &format!("{id}@example.com"), Some(data.clone())).await,
+                "inserted_managed",
+                "after `{grant}`"
+            );
+            assert_eq!(
+                fx.value(&format!("SELECT plan FROM public.users WHERE id = '{id}'")).await,
+                "free",
+                "after `{grant}`"
+            );
+            fx.sql(&undo).await;
+        }
+        // AC 6: a direct column grant still opens its column, under the inherited one.
+        fx.sql(&format!(
+            "GRANT INSERT (plan) ON public.users TO {member}; GRANT INSERT (display_name) ON public.users TO authenticated"
+        ))
+        .await;
+        let id = Uuid::new_v4();
+        let both = json!({ "display_name": "Ann", "plan": "enterprise" });
+        assert_eq!(fx.upsert(id, "ann@example.com", Some(both)).await, "inserted");
+        assert_eq!(
+            fx.value(&format!("SELECT display_name || '|' || plan FROM public.users WHERE id = '{id}'"))
+                .await,
+            "Ann|free"
         );
     })
     .await;
@@ -979,7 +1080,8 @@ async fn helpers_work_under_the_data_api() {
 async fn new_users_table_is_rls_locked() {
     live(|fx| async move {
         fx.bootstrap().await.expect("bootstrap");
-        fx.owner_ok("ALTER TABLE users ADD COLUMN nickname text").await;
+        // App columns are self-updatable only through a column grant.
+        fx.owner_ok("ALTER TABLE users ADD COLUMN nickname text; GRANT UPDATE (nickname) ON users TO authenticated").await;
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         fx.upsert(a, "a@example.com", None).await;
         fx.upsert(b, "b@example.com", None).await;
@@ -1017,6 +1119,242 @@ async fn new_users_table_is_rls_locked() {
                 .await,
             "nick,-"
         );
+    })
+    .await;
+}
+
+/// The number of table-level UPDATE grants `authenticated` holds on `public.users`, any grantor.
+const TABLE_UPDATE_SQL: &str = "SELECT count(*) FROM pg_class c, aclexplode(c.relacl) x \
+    WHERE c.oid = 'public.users'::regclass AND x.privilege_type = 'UPDATE' \
+    AND x.grantee = 'authenticated'::regrole";
+
+/// The app columns `authenticated` holds a column-level UPDATE on, comma-separated.
+const COLUMN_UPDATE_SQL: &str = "SELECT coalesce(string_agg(DISTINCT a.attname, ',' ORDER BY a.attname), '-') \
+    FROM pg_attribute a, aclexplode(a.attacl) x \
+    WHERE a.attrelid = 'public.users'::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+    AND x.privilege_type = 'UPDATE' AND x.grantee = 'authenticated'::regrole";
+
+/// The users table's ACL and every column's, as text, to compare byte for byte.
+const ACLS_SQL: &str = "SELECT coalesce(relacl::text, '<null>') || ' ' || (SELECT string_agg(attname || '=' || \
+    coalesce(attacl::text, '<null>'), ' ' ORDER BY attnum) FROM pg_attribute \
+    WHERE attrelid = c.oid AND attnum > 0 AND NOT attisdropped) FROM pg_class c WHERE c.oid = 'public.users'::regclass";
+
+/// AC 1, 2: a new users table gives `authenticated` SELECT and DELETE, no UPDATE: an app user's
+/// update of an app column is refused until the developer grants that column, and then only
+/// changes the user's own row; another app column stays refused.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn new_users_table_has_no_update_grant() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        assert_eq!(
+            fx.value(
+                "SELECT has_table_privilege('authenticated', 'public.users', 'SELECT') || '|' || \
+                 has_table_privilege('authenticated', 'public.users', 'DELETE') || '|' || \
+                 has_table_privilege('authenticated', 'public.users', 'UPDATE')"
+            )
+            .await,
+            "true|true|false"
+        );
+        assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "0");
+        fx.owner_ok("ALTER TABLE users ADD COLUMN nickname text, ADD COLUMN bio text").await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        fx.upsert(a, "a@example.com", None).await;
+        fx.upsert(b, "b@example.com", None).await;
+        let key = fx.public_key().await;
+        let token = fx.user_token(a, "a@example.com").await;
+        let update = |col: &str, id: Uuid| {
+            let mut set = serde_json::Map::new();
+            set.insert(col.to_string(), json!("x"));
+            json!({"v": 1, "op": "update", "table": "users", "set": set,
+                   "where": {"col": "id", "eq": id.to_string()}})
+        };
+        let cols = "SELECT string_agg(coalesce(nickname, '-') || '/' || coalesce(bio, '-'), ',' ORDER BY email) FROM public.users";
+
+        let (status, body) = data(&key, Some(&token), update("nickname", a)).await;
+        assert!(!(200..300).contains(&status), "no grant: {status} {body}");
+        assert_eq!(fx.value(cols).await, "-/-,-/-");
+
+        fx.owner_ok("GRANT UPDATE (nickname) ON users TO authenticated").await;
+        let (status, body) = data(&key, Some(&token), update("nickname", a)).await;
+        assert_eq!(status, 200, "own row: {body}");
+        let (status, body) = data(&key, Some(&token), update("nickname", b)).await;
+        assert_eq!(status, 200, "another user's row: {body}");
+        let (status, body) = data(&key, Some(&token), update("bio", a)).await;
+        assert!(!(200..300).contains(&status), "bio isn't granted: {status} {body}");
+        assert_eq!(fx.value(cols).await, "x/-,-/-");
+    })
+    .await;
+}
+
+/// AC 3, 4: a rerun removes a table-level UPDATE `authenticated` holds and keeps its column
+/// grants; a rerun with nothing to remove leaves every ACL byte-equal.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn rebootstrap_removes_table_update_and_keeps_column_grants() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        fx.owner_ok(
+            "ALTER TABLE users ADD COLUMN nickname text, ADD COLUMN bio text;
+             GRANT UPDATE ON users TO authenticated;
+             GRANT UPDATE (nickname) ON users TO authenticated;",
+        )
+        .await;
+        assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "1");
+        fx.bootstrap().await.expect("rerun");
+        assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "0", "{}", fx.value(ACLS_SQL).await);
+        assert_eq!(fx.value(COLUMN_UPDATE_SQL).await, "nickname");
+
+        let before = fx.value(ACLS_SQL).await;
+        fx.bootstrap().await.expect("a rerun with nothing to fix");
+        assert_eq!(fx.value(ACLS_SQL).await, before, "the rerun changed an ACL");
+    })
+    .await;
+}
+
+/// AC 8: the table-level UPDATE goes whoever granted it: a role holding it WITH GRANT OPTION,
+/// and the owner's grant WITH GRANT OPTION that `authenticated` passed on. The column grants
+/// stay, and what `authenticated` passed on goes with it.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn rebootstrap_revokes_update_from_every_grantor() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let (grantor, passed) = (format!("au_grantor_{suffix}"), format!("au_passed_{suffix}"));
+        fx.owner_ok("ALTER TABLE users ADD COLUMN nickname text, ADD COLUMN bio text").await;
+        fx.sql(&format!(
+            "CREATE ROLE {grantor} NOLOGIN; CREATE ROLE {passed} NOLOGIN;
+             GRANT USAGE ON SCHEMA public TO {grantor}, {passed};
+             GRANT UPDATE ON public.users TO {grantor} WITH GRANT OPTION;
+             BEGIN; SET LOCAL ROLE {grantor}; GRANT UPDATE ON public.users TO authenticated; COMMIT;
+             GRANT UPDATE ON public.users TO authenticated WITH GRANT OPTION;
+             BEGIN; SET LOCAL ROLE authenticated; GRANT UPDATE ON public.users TO {passed}; COMMIT;
+             GRANT UPDATE (nickname) ON public.users TO authenticated;"
+        ))
+        .await;
+        assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "2", "{}", fx.value(ACLS_SQL).await);
+        fx.bootstrap().await.expect("rerun");
+        let acls = fx.value(ACLS_SQL).await;
+        assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "0", "{acls}");
+        assert_eq!(fx.value(COLUMN_UPDATE_SQL).await, "nickname", "{acls}");
+        assert_eq!(
+            fx.value(&format!("SELECT has_table_privilege('{passed}', 'public.users', 'UPDATE')"))
+                .await,
+            "f",
+            "{acls}"
+        );
+        // The grantor keeps its own grant: only what `authenticated` held is removed.
+        assert_eq!(
+            fx.value(&format!("SELECT has_table_privilege('{grantor}', 'public.users', 'UPDATE')"))
+                .await,
+            "t",
+            "{acls}"
+        );
+    })
+    .await;
+}
+
+/// The table-level INSERT grants `anon` and `authenticated` hold on `public.users`, any grantor.
+const TABLE_INSERT_SQL: &str = "SELECT count(*) FROM pg_class c, aclexplode(c.relacl) x \
+    WHERE c.oid = 'public.users'::regclass AND x.privilege_type = 'INSERT' \
+    AND x.grantee IN ('authenticated'::regrole, 'anon'::regrole)";
+
+/// The app columns `authenticated` holds a column-level INSERT on, comma-separated.
+const COLUMN_INSERT_SQL: &str = "SELECT coalesce(string_agg(DISTINCT a.attname, ',' ORDER BY a.attname), '-') \
+    FROM pg_attribute a, aclexplode(a.attacl) x \
+    WHERE a.attrelid = 'public.users'::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+    AND x.privilege_type = 'INSERT' AND x.grantee = 'authenticated'::regrole";
+
+/// W3: a rerun removes every table-level INSERT `anon` and `authenticated` hold, whoever
+/// granted it, and keeps exactly the column-level INSERT grants (the owner's and another
+/// grantor's): sign-up data still reaches the opted-in columns and no other. A rerun with
+/// nothing to remove leaves every ACL byte-equal.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn rebootstrap_removes_table_insert_and_keeps_column_grants() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let grantor = format!("au_ins_grantor_{suffix}");
+        fx.owner_ok("ALTER TABLE users ADD COLUMN display_name text, ADD COLUMN bio text, ADD COLUMN plan text").await;
+        fx.sql(&format!(
+            "CREATE ROLE {grantor} NOLOGIN;
+             GRANT USAGE ON SCHEMA public TO {grantor};
+             GRANT INSERT ON public.users TO {grantor} WITH GRANT OPTION;
+             BEGIN; SET LOCAL ROLE {grantor};
+             GRANT INSERT ON public.users TO authenticated;
+             GRANT INSERT (bio) ON public.users TO authenticated; COMMIT;
+             GRANT INSERT ON public.users TO authenticated, anon;
+             GRANT INSERT (display_name) ON public.users TO authenticated;"
+        ))
+        .await;
+        assert_eq!(fx.value(TABLE_INSERT_SQL).await, "3", "{}", fx.value(ACLS_SQL).await);
+        assert_eq!(fx.value(COLUMN_INSERT_SQL).await, "bio,display_name");
+        fx.bootstrap().await.expect("rerun");
+        let acls = fx.value(ACLS_SQL).await;
+        assert_eq!(fx.value(TABLE_INSERT_SQL).await, "0", "{acls}");
+        assert_eq!(fx.value(COLUMN_INSERT_SQL).await, "bio,display_name", "{acls}");
+        // The grantor keeps its own grant: only what the two roles held is removed.
+        assert_eq!(
+            fx.value(&format!("SELECT has_table_privilege('{grantor}', 'public.users', 'INSERT')")).await,
+            "t",
+            "{acls}"
+        );
+        let a = Uuid::new_v4();
+        let data = json!({ "display_name": "Ann", "bio": "hello", "plan": "enterprise" });
+        assert_eq!(fx.upsert(a, "a@example.com", Some(data)).await, "inserted");
+        assert_eq!(
+            fx.value(&format!(
+                "SELECT display_name || '|' || bio || '|' || coalesce(plan, '<null>') FROM public.users WHERE id = '{a}'"
+            ))
+            .await,
+            "Ann|hello|<null>"
+        );
+        fx.bootstrap().await.expect("a rerun with nothing to fix");
+        assert_eq!(fx.value(ACLS_SQL).await, acls, "the rerun changed an ACL");
+    })
+    .await;
+}
+
+/// W11: a table-level grant whose grantor the bootstrap can't act as (it has no USAGE on the
+/// table's schema) fails the run with SQLSTATE 42501 and a message naming the table and that
+/// grantor, and leaves every ACL as it was.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_grantor_the_bootstrap_cannot_act_as_is_named() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        for privilege in ["UPDATE", "INSERT"] {
+            let grantor = format!("au_stuck_{}_{suffix}", privilege.to_lowercase());
+            fx.owner_ok("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname text").await;
+            fx.sql(&format!(
+                "CREATE ROLE {grantor} NOLOGIN;
+                 GRANT USAGE ON SCHEMA public TO {grantor};
+                 GRANT {privilege} ON public.users TO {grantor} WITH GRANT OPTION;
+                 BEGIN; SET LOCAL ROLE {grantor}; GRANT {privilege} ON public.users TO authenticated; COMMIT;
+                 GRANT {privilege} ON public.users TO authenticated;
+                 GRANT {privilege} (nickname) ON public.users TO authenticated;
+                 REVOKE USAGE ON SCHEMA public FROM {grantor};
+                 REVOKE USAGE ON SCHEMA public FROM PUBLIC;"
+            ))
+            .await;
+            let before = fx.value(ACLS_SQL).await;
+            let err = fx.bootstrap().await.expect_err("the grantor's grant can't be revoked");
+            assert!(err.contains("42501") || err.contains("still holds a table-level"), "{err}");
+            assert!(
+                err.contains(&format!("authenticated still holds a table-level {privilege} on public.users"))
+                    && err.contains(&grantor),
+                "{privilege}: the error names the table and the grantor: {err}"
+            );
+            assert_eq!(fx.value(ACLS_SQL).await, before, "{privilege}: the failed run changed an ACL");
+            // Once the grantor can be acted as again, the run repairs it.
+            fx.sql(&format!("GRANT USAGE ON SCHEMA public TO {grantor}; GRANT USAGE ON SCHEMA public TO PUBLIC;")).await;
+            fx.bootstrap().await.expect("rerun");
+            assert_eq!(fx.value(TABLE_UPDATE_SQL).await, "0");
+            assert_eq!(fx.value(TABLE_INSERT_SQL).await, "0");
+        }
     })
     .await;
 }

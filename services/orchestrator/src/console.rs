@@ -74,11 +74,39 @@ pub const APPLICATION_NAME: &str = "chelabase-console";
 /// Seconds a 503 asks the client to wait (the data API's value).
 pub(crate) const RETRY_AFTER_SECS: u32 = 2;
 /// Run on an owner connection before and after every request (`RunSettings::reset_sql`): the
-/// next request starts as the owner with the connection's defaults, holding no advisory lock
-/// and no temporary table (a function the owner called may have left any of them). A reset
-/// that fails discards the connection.
-pub const OWNER_RESET_SQL: &str =
-    "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP";
+/// next request starts as the owner with the connection's defaults, holding no advisory lock,
+/// no temporary table, no open cursor, no `LISTEN` registration and no sequence state (a
+/// function the owner called may have left any of them): the pooled reset's text, the same
+/// clean-up rest's connections get. Its last
+/// statement ([`chelabase_query::engine::NO_SQL_PREPARED_SQL`]) fails when the session holds
+/// a SQL-level prepared statement, which no reset can drop without the statements the pool
+/// caches. A reset that fails discards the connection.
+pub const OWNER_RESET_SQL: &str = chelabase_query::engine::POOLED_RESET_SQL;
+/// Ends work that ran outside a transaction on an owner connection (the privileges and
+/// catalog reads) and gives the connection back: the full [`OWNER_RESET_SQL`] as its last
+/// statement, as [`Lease`]'s rule asks, and the lease marked done only when it passed. A
+/// reset that fails closes the connection (the lease is dropped unfinished) and fails the
+/// read: a 500 with Postgres's text in the log only, or the 503 of a database out of reach.
+pub(crate) async fn release_owner_lease(mut lease: Lease, rid: &str) -> Result<(), QueryFailure> {
+    use chelabase_query::QueryClient;
+    if let Err(e) = lease.client().batch_execute(OWNER_RESET_SQL).await {
+        let unreachable = e.as_db_error().is_none_or(|db| {
+            chelabase_query::error::classify(db.code().code())
+                .is_some_and(|(status, _)| status == 503)
+        });
+        return Err(if unreachable {
+            QueryFailure::from_pg(&e, rid)
+        } else {
+            QueryFailure::internal(
+                rid,
+                format!("the owner connection couldn't be reset after a read; it is discarded: {e}"),
+            )
+        });
+    }
+    lease.done();
+    Ok(())
+}
+
 /// An owner pool's manager settings: `Fast` recycling (only a closed connection is dropped).
 /// Every request resets the session itself, before and after its work
 /// ([`OWNER_RESET_SQL`] as `RunSettings::reset_sql`), so a reset on checkout would only add
@@ -1209,13 +1237,102 @@ mod tests {
     /// function set, no setting, no advisory lock, no temporary table (rest's reset, plus
     /// what an owner may leave behind). The unlock runs after `RESET ALL`, under the login
     /// role's `search_path` (a database-level setting the owner controls), so it is named by
-    /// schema (RT1 final fix round).
+    /// schema (RT1 final fix round). A SQL-level prepared statement can't be cleaned away
+    /// (it shares its namespace with the statements the pool caches), so the reset's last
+    /// statement fails when the session holds one, which discards the connection.
     #[test]
     fn owner_connections_are_reset_when_released() {
+        assert_eq!(OWNER_RESET_SQL, chelabase_query::engine::POOLED_RESET_SQL);
         assert_eq!(
             OWNER_RESET_SQL,
-            "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP"
+            format!(
+                "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP; \
+                 CLOSE ALL; UNLISTEN *; DISCARD SEQUENCES; {}",
+                chelabase_query::engine::NO_SQL_PREPARED_SQL
+            )
         );
+        assert!(OWNER_RESET_SQL.ends_with(
+            "(SELECT 1 FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql) THEN '' ELSE 'none' END, false)"
+        ));
+    }
+
+    /// A Postgres stand-in that answers every simple query `OK`, or with an error when
+    /// `refuses` says so; it records what it was sent.
+    async fn stand_in(
+        refuses: fn(&str) -> bool,
+    ) -> (Pool, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![kind];
+            out.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+            out.extend_from_slice(body);
+            out
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let Ok(len) = socket.read_i32().await else { return };
+                    let mut startup = vec![0; usize::try_from(len).unwrap() - 4];
+                    let _ = socket.read_exact(&mut startup).await;
+                    let mut hello = message(b'R', &0_i32.to_be_bytes());
+                    hello.extend(message(b'Z', b"I"));
+                    let _ = socket.write_all(&hello).await;
+                    while let Ok(kind) = socket.read_u8().await {
+                        let Ok(len) = socket.read_i32().await else { break };
+                        let mut body = vec![0; usize::try_from(len).unwrap() - 4];
+                        if socket.read_exact(&mut body).await.is_err() || kind != b'Q' {
+                            break;
+                        }
+                        let sql = String::from_utf8_lossy(&body[..body.len() - 1]).into_owned();
+                        let mut out = if refuses(&sql) {
+                            message(b'E', b"SERROR\0C22023\0Mrefused\0\0")
+                        } else {
+                            message(b'C', b"OK\0")
+                        };
+                        log.lock().unwrap().push(sql);
+                        out.extend(message(b'Z', b"I"));
+                        if socket.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("x").dbname("x");
+        let manager = Manager::from_config(config, NoTls, owner_manager_config());
+        let pool = Pool::builder(manager)
+            .max_size(2)
+            .runtime(Runtime::Tokio1)
+            .build()
+            .unwrap();
+        (pool, seen)
+    }
+
+    /// Work that runs outside a transaction on an owner connection (the privileges and
+    /// catalog reads) ends with the full owner reset; the connection goes back to its pool
+    /// only when that reset passed, and is closed otherwise. The next transaction on a
+    /// pooled connection leaves the prepared-statement check out of its opening, which is
+    /// only right when every lease ended with the full reset.
+    #[tokio::test]
+    async fn an_owner_lease_goes_back_only_after_the_full_reset() {
+        let (pool, seen) = stand_in(|_| false).await;
+        let lease = Lease::new(pool.get().await.unwrap());
+        release_owner_lease(lease, "rid").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![OWNER_RESET_SQL.to_owned()]);
+        assert_eq!(pool.status().size, 1, "reset: back in the pool");
+
+        let (pool, seen) = stand_in(|sql| sql.contains("pg_prepared_statement")).await;
+        let lease = Lease::new(pool.get().await.unwrap());
+        let failure = release_owner_lease(lease, "rid").await.unwrap_err();
+        assert_eq!(failure.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(*seen.lock().unwrap(), vec![OWNER_RESET_SQL.to_owned()]);
+        assert_eq!(pool.status().size, 0, "the reset failed: closed, not pooled");
     }
 
     /// The reset runs inside each request (before and after it, `RunSettings::reset_sql`),
