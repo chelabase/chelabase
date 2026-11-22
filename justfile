@@ -95,7 +95,7 @@ deny:
 
 # Everything CI checks offline: the shell script tests, the Rust checks and the web checks.
 # CI runs the same recipes, each limited to what a pull request affects (scripts/ci-affected.sh).
-check: check-scripts check-rust check-web
+check: check-scripts check-rust check-web deny
 
 # The shell script tests (offline; they need docker compose, cargo and an installed pnpm workspace)
 check-scripts:
@@ -121,7 +121,8 @@ check-scripts:
     scripts/tests/ci-affected.sh
     scripts/tests/storage-docs-vars.sh
 
-# cargo-deny, check, clippy, nextest and doctests: the whole workspace, or only the given packages
+# check, clippy, nextest and doctests: the whole workspace, or only the given packages (`just deny` is
+# its own recipe and CI job, so a new advisory never hides the Rust checks)
 # (`just check-rust gateway chelabase-routes`)
 check-rust *packages:
     #!/usr/bin/env bash
@@ -138,7 +139,6 @@ check-rust *packages:
       done
     fi
     set -x
-    just deny
     cargo check "${sel[@]}"
     cargo clippy "${sel[@]}" --all-targets -- -D warnings
     cargo nextest run "${sel[@]}" "${no_tests[@]}"
