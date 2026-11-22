@@ -1,5 +1,5 @@
-//! Where a tool's code runs. The real runtime arrives in m7 (#351); until then the binary uses
-//! [`Unavailable`] and the tests a double.
+//! Where a tool's code runs: [`crate::runtime::Runtime`] over HTTP to `mcp-runtime`, or
+//! [`Unavailable`] when no runtime is configured.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -30,6 +30,9 @@ pub struct Run {
     /// `execute`'s `destructive` argument (always false for `search`).
     pub destructive: bool,
     pub caller: Caller,
+    /// The run's random id (256 bits, hex): it names the run in the runtime's callbacks and
+    /// in the audit line.
+    pub exec_id: String,
 }
 
 /// Why a run gave no value.
@@ -40,6 +43,8 @@ pub enum ErrorCode {
     Timeout,
     NotSerializable,
     RuntimeUnavailable,
+    /// Refused by a limit before it ran (with `retry_after_ms` in the tool error).
+    RateLimited,
 }
 
 impl ErrorCode {
@@ -50,6 +55,7 @@ impl ErrorCode {
             ErrorCode::Timeout => "timeout",
             ErrorCode::NotSerializable => "not_serializable",
             ErrorCode::RuntimeUnavailable => "runtime_unavailable",
+            ErrorCode::RateLimited => "rate_limited",
         }
     }
 }
@@ -61,20 +67,37 @@ pub enum Outcome {
     Error { code: ErrorCode, message: String },
 }
 
-#[async_trait]
-pub trait Sandbox: Send + Sync {
-    async fn run(&self, run: Run) -> Outcome;
+/// A finished run: its outcome and the code's `console` lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ran {
+    pub outcome: Outcome,
+    pub logs: Vec<String>,
 }
 
-/// The sandbox until m7 wires the runtime: every run is `runtime_unavailable`.
+impl From<Outcome> for Ran {
+    fn from(outcome: Outcome) -> Self {
+        Ran {
+            outcome,
+            logs: vec![],
+        }
+    }
+}
+
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    async fn run(&self, run: Run) -> Ran;
+}
+
+/// The sandbox when `CHELABASE_MCP_RUNTIME_URL` is unset: every run is `runtime_unavailable`.
 pub struct Unavailable;
 
 #[async_trait]
 impl Sandbox for Unavailable {
-    async fn run(&self, _run: Run) -> Outcome {
+    async fn run(&self, _run: Run) -> Ran {
         Outcome::Error {
             code: ErrorCode::RuntimeUnavailable,
             message: "the code runtime is not configured".into(),
         }
+        .into()
     }
 }
