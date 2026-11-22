@@ -219,6 +219,7 @@ The functions service's internal control routes (called by the orchestrator, nev
 | Status | Code | Meaning |
 |---|---|---|
 | 409 | `sql_confirm_required` | The guard held statements back. `error.statements` lists them; send again with `confirm: true` to run them. |
+| 422 | `read_only_script_refused` | A read-only run (`read_only: true`) holds a statement other than `SELECT`, `SHOW` or `EXPLAIN`, doesn't parse, or holds more than 100 statements. `error.statement` (0-based) and `error.kind` name the first offender; nothing ran. |
 | 409 | `run_id_in_use` | You have a run with this id in flight. |
 | 429 | `sql_run_limit` | You have 4 runs in flight, or the Postgres database has 4. Comes with `Retry-After`. |
 | 422 | `schema_too_large` | The schema is over 8 MiB; use keyword completion. |

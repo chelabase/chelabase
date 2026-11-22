@@ -181,9 +181,27 @@ fn setup_sql(timeout: Duration, role: Option<&str>) -> Vec<String> {
 
 /// A read-only run's steps: the setup, `BEGIN TRANSACTION READ ONLY`, the snapshot, each
 /// statement prepared then run, and `ROLLBACK`.
-fn read_only_steps<'a>(timeout: Duration, role: Option<&str>, statements: &'a [String]) -> Vec<Step<'a>> {
-    let _ = statements;
-    setup_sql(timeout, role).into_iter().map(Step::Setup).collect()
+fn read_only_steps<'a>(
+    timeout: Duration,
+    role: Option<&str>,
+    statements: &'a [String],
+) -> Vec<Step<'a>> {
+    let mut steps: Vec<Step<'a>> = setup_sql(timeout, role).into_iter().map(Step::Setup).collect();
+    steps.push(Step::Setup("BEGIN TRANSACTION READ ONLY".to_owned()));
+    steps.push(Step::Setup(SNAPSHOT_SQL.to_owned()));
+    for (statement, sql) in statements.iter().enumerate() {
+        steps.push(Step::Prepare { statement, sql });
+        steps.push(Step::Run { statement, sql });
+    }
+    steps.push(Step::Rollback);
+    steps
+}
+
+/// Whether a read-only statement's command tag is a read's (`SELECT n`, `SHOW`, `EXPLAIN`).
+/// The allow-list already admits nothing else; a tag past it stops the run before the next
+/// statement, whatever the parse thought.
+fn is_read_tag(tag: &str) -> bool {
+    matches!(tag, "SHOW" | "EXPLAIN") || tag == "SELECT" || tag.starts_with("SELECT ")
 }
 
 /// Work for after a run ([`RunSpec::after`]).
@@ -462,8 +480,7 @@ pub fn run_read_only_reporting(
     finished: Finished,
 ) -> impl Stream<Item = RunEvent> + Send + 'static {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
-    let _ = statements;
-    tokio::spawn(drive(connected, spec, None, guard, tx, finished));
+    tokio::spawn(drive(connected, spec, Some(statements), guard, tx, finished));
     stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
 }
 
@@ -544,7 +561,13 @@ async fn drive(
         bytes: 0,
         last: started,
     };
-    let outcome = match execute(&client, &mut notices, &spec, &mut out).await {
+    let executed = match &spec.statements {
+        Some(statements) => {
+            execute_read_only(&client, &mut notices, &spec, statements, &mut out).await
+        }
+        None => execute(&client, &mut notices, &spec, &mut out).await,
+    };
+    let outcome = match executed {
         Ok(outcome) => Some(outcome),
         Err(stop) => {
             // The backend may still be busy: stop it before the connection goes.
@@ -616,8 +639,102 @@ async fn execute(
             return Ok(Outcome::Error);
         }
     };
+    consume(stream, 0, notices, out, None).await
+}
+
+/// A read-only run: [`read_only_steps`] in order. After the first failure only the
+/// `ROLLBACK` runs; a stop (cancel, deadline, client gone, response cap) returns at once and
+/// [`drive`] closes the connection, which ends the transaction.
+async fn execute_read_only(
+    client: &Client,
+    notices: &mut mpsc::Receiver<DbError>,
+    spec: &Script,
+    statements: &[String],
+    out: &mut Emitter,
+) -> Result<Outcome, Stop> {
+    let mut outcome = Outcome::Ok;
+    for step in read_only_steps(spec.timeout, spec.role.as_deref(), statements) {
+        if outcome != Outcome::Ok && step != Step::Rollback {
+            continue;
+        }
+        match step {
+            Step::Setup(sql) => {
+                let result = out.guarded(client.simple_query(&sql)).await?;
+                drain_notices(notices, out).await?;
+                if let Err(err) = result {
+                    out.send(error_event(0, &err)).await?;
+                    outcome = Outcome::Error;
+                }
+            }
+            Step::Prepare { statement, sql } => {
+                // The server parses the slice and refuses more than one command. The
+                // prepared statement itself is closed when dropped.
+                if let Err(err) = beating(client.prepare(sql), notices, out).await? {
+                    if is_statement_timeout(&err, out.deadline) {
+                        return Err(Stop::Timeout);
+                    }
+                    out.send(error_event(statement, &err)).await?;
+                    outcome = Outcome::Error;
+                }
+            }
+            Step::Run { statement, sql } => {
+                // The very text the server just accepted as one command.
+                outcome = match out.guarded(client.simple_query_raw(sql)).await? {
+                    Ok(stream) => {
+                        consume(stream.with_command_tags(), statement, notices, out, Some(is_read_tag))
+                            .await?
+                    }
+                    Err(err) => {
+                        out.send(error_event(statement, &err)).await?;
+                        Outcome::Error
+                    }
+                };
+            }
+            Step::Rollback => {
+                // Best effort: the connection closes right after, which ends it anyway.
+                let _ = out.guarded(client.simple_query("ROLLBACK")).await;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Waits for `future` while sending notices and heartbeats, unless the run is cancelled,
+/// times out or loses its client first.
+async fn beating<T>(
+    future: impl Future<Output = T>,
+    notices: &mut mpsc::Receiver<DbError>,
+    out: &mut Emitter,
+) -> Result<T, Stop> {
+    let mut future = pin!(future);
+    loop {
+        let beat = out.last + HEARTBEAT;
+        tokio::select! {
+            biased;
+            _ = out.token.cancelled() => return Err(Stop::Cancelled),
+            _ = sleep_until(out.deadline) => return Err(Stop::Timeout),
+            _ = out.tx.closed() => return Err(Stop::Gone),
+            Some(notice) = notices.recv() => out.send(notice_event(&notice)).await?,
+            value = &mut future => {
+                drain_notices(notices, out).await?;
+                return Ok(value);
+            }
+            _ = sleep_until(beat) => out.send(RunEvent::Heartbeat).await?,
+        }
+    }
+}
+
+/// Turns one simple query's messages into events, statements counted from `first`. With
+/// `tag_ok`, a command tag it refuses ends the run with an error (`25006`) before `complete`.
+async fn consume(
+    stream: impl Stream<Item = Result<SimpleQueryMessage, tokio_postgres::Error>>,
+    first: usize,
+    notices: &mut mpsc::Receiver<DbError>,
+    out: &mut Emitter,
+    tag_ok: Option<fn(&str) -> bool>,
+) -> Result<Outcome, Stop> {
     let mut stream = pin!(stream);
-    let mut statement = 0usize;
+    let mut statement = first;
     let mut seen = 0usize;
     let mut buffer = RowBuffer::default();
     loop {
@@ -683,6 +800,10 @@ async fn execute(
             }
             Some(Ok(SimpleQueryMessage::CommandTag(tag))) => {
                 flush(&mut buffer, statement, out).await?;
+                if tag_ok.is_some_and(|ok| !ok(tag.tag())) {
+                    out.send(not_a_read(statement, tag.tag())).await?;
+                    return Ok(Outcome::Error);
+                }
                 out.send(RunEvent::Complete {
                     statement,
                     tag: tag.tag().to_string(),
@@ -783,6 +904,18 @@ fn notice_event(notice: &DbError) -> RunEvent {
         detail: notice.detail().map(str::to_owned),
         hint: notice.hint().map(str::to_owned),
         position: original_position(notice),
+    }
+}
+
+/// The error for a read-only statement whose tag isn't a read's.
+fn not_a_read(statement: usize, tag: &str) -> RunEvent {
+    RunEvent::Error {
+        statement,
+        code: SqlState::READ_ONLY_SQL_TRANSACTION.code().to_string(),
+        message: format!("the statement ran as `{tag}`, not as a read; the read-only run stopped"),
+        detail: None,
+        hint: None,
+        position: None,
     }
 }
 

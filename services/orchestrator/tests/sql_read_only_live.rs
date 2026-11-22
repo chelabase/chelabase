@@ -12,7 +12,7 @@ use chelabase_types::BranchId;
 use futures_util::StreamExt;
 use orchestrator::sql_editor::events::{Outcome, RunEvent};
 use orchestrator::sql_editor::read_only::{self, Refused};
-use orchestrator::sql_editor::registry::{Canceller, Cancelled, RunGuard, RunRegistry};
+use orchestrator::sql_editor::registry::{Cancelled, Canceller, RunGuard, RunRegistry};
 use orchestrator::sql_editor::run::{self, Finished, RunSpec, RunTarget, RunTls};
 use orchestrator::sql_editor::{APPLICATION_NAME, MAX_RESPONSE_BYTES, MAX_ROWS_PER_STATEMENT};
 use tokio_postgres::NoTls;
@@ -24,8 +24,9 @@ const READ_ONLY: &str = "25006";
 const DENIED: &str = "42501";
 
 fn admin_url() -> String {
-    std::env::var("CHELABASE_METADATA_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into())
+    std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".into()
+    })
 }
 
 async fn admin_connect() -> tokio_postgres::Client {
@@ -89,13 +90,11 @@ impl Scratch {
             #[allow(unreachable_patterns)]
             _ => "metadata-db".into(),
         };
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(&format!(
-            "{host}:{}",
-            config.get_ports()[0]
-        ))
-        .unwrap()
-        .next()
-        .unwrap();
+        let addr =
+            std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:{}", config.get_ports()[0]))
+                .unwrap()
+                .next()
+                .unwrap();
         Scratch {
             admin,
             db,
@@ -123,7 +122,8 @@ impl Scratch {
 
     /// A read-only run as the route does it: parsed first, never connected when refused.
     async fn run_ro(&self, sql: &str) -> Result<Vec<RunEvent>, Refused> {
-        self.run_ro_on(&self.target, sql, None, Duration::from_secs(30)).await
+        self.run_ro_on(&self.target, sql, None, Duration::from_secs(30))
+            .await
     }
 
     async fn run_ro_on(
@@ -134,14 +134,22 @@ impl Scratch {
         timeout: Duration,
     ) -> Result<Vec<RunEvent>, Refused> {
         let statements = read_only::check(sql)?;
-        Ok(self.run_slices_on(target, statements, role, timeout, self.guard()).await)
+        Ok(self
+            .run_slices_on(target, statements, role, timeout, self.guard())
+            .await)
     }
 
     /// The seam: these slices run as they are, without the parse.
     async fn run_slices(&self, statements: &[&str]) -> Vec<RunEvent> {
         let statements = statements.iter().map(|s| (*s).to_owned()).collect();
-        self.run_slices_on(&self.target, statements, None, Duration::from_secs(30), self.guard())
-            .await
+        self.run_slices_on(
+            &self.target,
+            statements,
+            None,
+            Duration::from_secs(30),
+            self.guard(),
+        )
+        .await
     }
 
     async fn run_slices_on(
@@ -152,7 +160,10 @@ impl Scratch {
         timeout: Duration,
         guard: RunGuard,
     ) -> Vec<RunEvent> {
-        self.start(target, statements, role, timeout, guard).await.collect().await
+        self.start(target, statements, role, timeout, guard)
+            .await
+            .collect()
+            .await
     }
 
     async fn start(
@@ -198,7 +209,10 @@ impl Scratch {
             if left == 0 {
                 return;
             }
-            assert!(Instant::now() < until, "{left} editor backend(s) still running");
+            assert!(
+                Instant::now() < until,
+                "{left} editor backend(s) still running"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -209,13 +223,20 @@ impl Scratch {
 
     /// Rows in `t`, read by the superuser.
     async fn rows_in_t(&self) -> i64 {
-        self.db.query_one("SELECT count(*) FROM t", &[]).await.unwrap().get(0)
+        self.db
+            .query_one("SELECT count(*) FROM t", &[])
+            .await
+            .unwrap()
+            .get(0)
     }
 
     async fn drop(self) {
         drop(self.db);
         self.admin
-            .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", self.target.database))
+            .batch_execute(&format!(
+                "DROP DATABASE {} WITH (FORCE)",
+                self.target.database
+            ))
             .await
             .unwrap();
         self.admin
@@ -258,7 +279,9 @@ fn errors(events: &[RunEvent]) -> Vec<(usize, String)> {
     events
         .iter()
         .filter_map(|e| match e {
-            RunEvent::Error { statement, code, .. } => Some((*statement, code.clone())),
+            RunEvent::Error {
+                statement, code, ..
+            } => Some((*statement, code.clone())),
             _ => None,
         })
         .collect()
@@ -312,12 +335,18 @@ async fn a_multi_statement_script_returns_every_result() {
             (4, "SELECT 1".into()),
         ]
     );
-    assert_eq!(rows_of(&events, 0), vec![vec![Some("1".into()), Some("x".into())]]);
+    assert_eq!(
+        rows_of(&events, 0),
+        vec![vec![Some("1".into()), Some("x".into())]]
+    );
     assert_eq!(rows_of(&events, 1).len(), 3);
     assert_eq!(rows_of(&events, 2).len(), 1);
     assert_eq!(rows_of(&events, 4), vec![vec![Some("2".into())]]);
     // The event shape a normal run uses: columns before rows before complete, per statement.
-    let columns = events.iter().filter(|e| matches!(e, RunEvent::Columns { .. })).count();
+    let columns = events
+        .iter()
+        .filter(|e| matches!(e, RunEvent::Columns { .. }))
+        .count();
     assert_eq!(columns, 5);
     s.assert_no_backend_within(Duration::from_secs(2)).await;
     s.drop().await;
@@ -349,7 +378,9 @@ async fn writes_are_refused() {
         "SELECT 1 INTO u".to_owned(),
         "EXPLAIN ANALYZE INSERT INTO t VALUES (1)".to_owned(),
     ];
-    s.db.batch_execute("INSERT INTO t VALUES (7)").await.unwrap();
+    s.db.batch_execute("INSERT INTO t VALUES (7)")
+        .await
+        .unwrap();
     for sql in &writes {
         let events = s.run_slices(&["SELECT 1", sql, "SELECT 2"]).await;
         failed_at(&events, 1, &[READ_ONLY], sql);
@@ -357,22 +388,23 @@ async fn writes_are_refused() {
     }
     // The allowed-path forms go through the parse too.
     for sql in &writes[13..] {
-        let events = s.run_ro(sql).await.unwrap_or_else(|r| panic!("{sql}: {r:?}"));
+        let events = s
+            .run_ro(sql)
+            .await
+            .unwrap_or_else(|r| panic!("{sql}: {r:?}"));
         failed_at(&events, 0, &[READ_ONLY], sql);
     }
     // Nothing changed.
-    let after: Vec<(i64, i32)> = s
-        .db
-        .query("SELECT count(*), max(id) FROM t", &[])
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
+    let after: Vec<(i64, i32)> =
+        s.db.query("SELECT count(*), max(id) FROM t", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
     assert_eq!(after, vec![(1, 7)]);
-    let objects: i64 = s
-        .db
-        .query_one(
+    let objects: i64 =
+        s.db.query_one(
             "SELECT count(*) FROM pg_class WHERE relname IN ('u', 'tmp', 'v') \
              OR (relname = 't' AND relnatts <> 1) \
              OR (relkind = 'i' AND relnamespace = 'public'::regnamespace)",
@@ -383,7 +415,10 @@ async fn writes_are_refused() {
         .get(0);
     assert_eq!(objects, 0);
     let comment: Option<String> =
-        s.db.query_one("SELECT obj_description('t'::regclass)", &[]).await.unwrap().get(0);
+        s.db.query_one("SELECT obj_description('t'::regclass)", &[])
+            .await
+            .unwrap()
+            .get(0);
     assert_eq!(comment, None);
     s.drop().await;
 }
@@ -392,7 +427,12 @@ async fn writes_are_refused() {
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn a_select_calling_a_writing_function_is_refused() {
     let s = Scratch::new().await;
-    for sql in ["SELECT w()", "SELECT * FROM w()", "SELECT 1 WHERE w() = 1", "VALUES (w())"] {
+    for sql in [
+        "SELECT w()",
+        "SELECT * FROM w()",
+        "SELECT 1 WHERE w() = 1",
+        "VALUES (w())",
+    ] {
         let events = s.run_ro(sql).await.unwrap();
         failed_at(&events, 0, &[READ_ONLY], sql);
     }
@@ -404,12 +444,19 @@ async fn a_select_calling_a_writing_function_is_refused() {
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn nextval_is_refused() {
     let s = Scratch::new().await;
-    for sql in ["SELECT nextval('s')", "SELECT setval('s', 100)", "SELECT setval('s', 5, false)"] {
+    for sql in [
+        "SELECT nextval('s')",
+        "SELECT setval('s', 100)",
+        "SELECT setval('s', 5, false)",
+    ] {
         let events = s.run_ro(sql).await.unwrap();
         failed_at(&events, 0, &[READ_ONLY], sql);
     }
     let (last, called): (i64, bool) = {
-        let row = s.db.query_one("SELECT last_value, is_called FROM s", &[]).await.unwrap();
+        let row =
+            s.db.query_one("SELECT last_value, is_called FROM s", &[])
+                .await
+                .unwrap();
         (row.get(0), row.get(1))
     };
     assert_eq!((last, called), (1, false));
@@ -465,12 +512,11 @@ async fn a_script_that_leaves_the_transaction_is_refused_whole() {
     }
     // Nothing connected, so nothing ran: no editor backend, the lock is free, `t` is empty.
     assert_eq!(s.editor_backends().await, 0);
-    let free: bool = s
-        .db
-        .query_one("SELECT pg_try_advisory_lock(4242)", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let free: bool =
+        s.db.query_one("SELECT pg_try_advisory_lock(4242)", &[])
+            .await
+            .unwrap()
+            .get(0);
     assert!(free);
     assert_eq!(s.rows_in_t().await, 0);
     s.drop().await;
@@ -483,22 +529,45 @@ async fn a_boundary_mismatch_is_refused_not_run() {
     // `;` and a write hidden where a careless splitter would cut: each stays one statement,
     // and runs as the read it is.
     for (sql, want) in [
-        ("SELECT $$; COMMIT; INSERT INTO t VALUES (1); $$ AS v", "; COMMIT; INSERT INTO t VALUES (1); "),
+        (
+            "SELECT $$; COMMIT; INSERT INTO t VALUES (1); $$ AS v",
+            "; COMMIT; INSERT INTO t VALUES (1); ",
+        ),
         ("SELECT $x$ $$; COMMIT; $$ $x$ AS v", " $$; COMMIT; $$ "),
-        ("SELECT 1 /* ; COMMIT; INSERT INTO t VALUES (1) */ AS v", "1"),
+        (
+            "SELECT 1 /* ; COMMIT; INSERT INTO t VALUES (1) */ AS v",
+            "1",
+        ),
         ("SELECT 1 -- ; COMMIT; INSERT INTO t VALUES (1)\n AS v", "1"),
-        ("SELECT '; COMMIT; INSERT INTO t VALUES (1)' AS v", "; COMMIT; INSERT INTO t VALUES (1)"),
-        ("SELECT E'\\'; COMMIT; INSERT INTO t VALUES (1); --' AS v", "'; COMMIT; INSERT INTO t VALUES (1); --"),
+        (
+            "SELECT '; COMMIT; INSERT INTO t VALUES (1)' AS v",
+            "; COMMIT; INSERT INTO t VALUES (1)",
+        ),
+        (
+            "SELECT E'\\'; COMMIT; INSERT INTO t VALUES (1); --' AS v",
+            "'; COMMIT; INSERT INTO t VALUES (1); --",
+        ),
         ("SELECT 1 AS \"; COMMIT; INSERT INTO t VALUES (1)\"", "1"),
     ] {
-        let events = s.run_ro(sql).await.unwrap_or_else(|r| panic!("{sql}: {r:?}"));
+        let events = s
+            .run_ro(sql)
+            .await
+            .unwrap_or_else(|r| panic!("{sql}: {r:?}"));
         assert_eq!(outcome(&events), Outcome::Ok, "{sql}: {events:?}");
         assert_eq!(completes(&events), vec![(0, "SELECT 1".into())], "{sql}");
         assert_eq!(rows_of(&events, 0), vec![vec![Some(want.into())]], "{sql}");
     }
     // A comment or string the parse can't close is a refusal, never a guess.
-    for sql in ["SELECT 1 /* ; COMMIT", "SELECT $$; COMMIT", "SELECT '; COMMIT"] {
-        assert_eq!(s.run_ro(sql).await.expect_err(sql).kind, read_only::UNPARSED, "{sql}");
+    for sql in [
+        "SELECT 1 /* ; COMMIT",
+        "SELECT $$; COMMIT",
+        "SELECT '; COMMIT",
+    ] {
+        assert_eq!(
+            s.run_ro(sql).await.expect_err(sql).kind,
+            read_only::UNPARSED,
+            "{sql}"
+        );
     }
     // Through the seam: a slice the server sees as two commands is refused by the prepare,
     // and neither command runs.
@@ -515,8 +584,15 @@ async fn a_boundary_mismatch_is_refused_not_run() {
     // A lone transaction statement the parse would have refused, through the seam: it is one
     // command, so the prepare takes it, but the run stops at its tag before anything else
     // runs outside the transaction.
-    for slice in ["COMMIT", "ROLLBACK", "END", "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"] {
-        let events = s.run_slices(&["SELECT 1", slice, "INSERT INTO t VALUES (3)"]).await;
+    for slice in [
+        "COMMIT",
+        "ROLLBACK",
+        "END",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+    ] {
+        let events = s
+            .run_slices(&["SELECT 1", slice, "INSERT INTO t VALUES (3)"])
+            .await;
         failed_at(&events, 1, &[READ_ONLY], slice);
     }
     assert_eq!(s.rows_in_t().await, 0);
@@ -550,7 +626,10 @@ async fn a_function_cannot_commit_or_go_read_write() {
         "SELECT set_config('transaction_read_only', 'off', false)",
         "SELECT set_config('transaction_read_only', 'off', false), w()",
     ] {
-        let events = s.run_ro(sql).await.unwrap_or_else(|r| panic!("{sql}: {r:?}"));
+        let events = s
+            .run_ro(sql)
+            .await
+            .unwrap_or_else(|r| panic!("{sql}: {r:?}"));
         assert_eq!(errors(&events).len(), 1, "{sql}: {events:?}");
         assert_eq!(outcome(&events), Outcome::Error, "{sql}");
     }
@@ -562,7 +641,10 @@ async fn a_function_cannot_commit_or_go_read_write() {
         .unwrap();
     failed_at(&events, 1, &[READ_ONLY], "default_transaction_read_only");
     // A procedure that commits can't be called (refused before anything runs).
-    assert_eq!(s.run_ro("CALL p_commit()").await.expect_err("call").kind, "CallStmt");
+    assert_eq!(
+        s.run_ro("CALL p_commit()").await.expect_err("call").kind,
+        "CallStmt"
+    );
     assert_eq!(s.rows_in_t().await, 0);
     s.drop().await;
 }
@@ -602,7 +684,10 @@ impl MemberRole {
     async fn drop(self) {
         admin_connect()
             .await
-            .batch_execute(&format!("DROP ROLE {}; DROP ROLE {}", self.target.user, self.group))
+            .batch_execute(&format!(
+                "DROP ROLE {}; DROP ROLE {}",
+                self.target.user, self.group
+            ))
             .await
             .unwrap();
     }
@@ -629,18 +714,28 @@ async fn set_config_stays_within_the_members_reach() {
     // The member's own login, acting as the group.
     let on_member = |sql: String| {
         let (s, m) = (&s, &m);
-        async move { s.run_ro_on(&m.target, &sql, Some(&m.group), timeout).await.unwrap() }
+        async move {
+            s.run_ro_on(&m.target, &sql, Some(&m.group), timeout)
+                .await
+                .unwrap()
+        }
     };
     let events = on_member(format!("SELECT set_config('role', '{owner}', false)")).await;
     failed_at(&events, 0, &[DENIED], "role to the owner");
-    let events = on_member(format!("SELECT set_config('session_authorization', '{owner}', false)")).await;
+    let events = on_member(format!(
+        "SELECT set_config('session_authorization', '{owner}', false)"
+    ))
+    .await;
     failed_at(&events, 0, &[DENIED], "session_authorization");
     // Back to the member role itself: within reach, still no secret and no write.
     let events = on_member(
         "SELECT set_config('role', 'none', false), current_user; SELECT * FROM secret".into(),
     )
     .await;
-    assert_eq!(rows_of(&events, 0), vec![vec![Some("none".into()), Some(m.target.user.clone())]]);
+    assert_eq!(
+        rows_of(&events, 0),
+        vec![vec![Some("none".into()), Some(m.target.user.clone())]]
+    );
     failed_at(&events, 1, &[DENIED], "secret as the member role");
     // As the group (which may insert), writes are still refused.
     let events = on_member("SELECT current_user; SELECT w()".into()).await;
@@ -649,27 +744,56 @@ async fn set_config_stays_within_the_members_reach() {
 
     // An Admin acting as the group on the owner's connection: `set_config` can return to the
     // owner (whom an Admin may act as anyway), never beyond, and nothing writes.
-    s.admin.batch_execute(&format!("GRANT {} TO {owner}", m.group)).await.unwrap();
+    s.admin
+        .batch_execute(&format!("GRANT {} TO {owner}", m.group))
+        .await
+        .unwrap();
     let on_owner = |sql: String| {
         let (s, m) = (&s, &m);
-        async move { s.run_ro_on(&s.target, &sql, Some(&m.group), timeout).await.unwrap() }
+        async move {
+            s.run_ro_on(&s.target, &sql, Some(&m.group), timeout)
+                .await
+                .unwrap()
+        }
     };
     let events = on_owner(
-        "SELECT current_user; SELECT set_config('role', 'none', false), current_user; SELECT w()".into(),
+        "SELECT current_user; SELECT set_config('role', 'none', false), current_user; SELECT w()"
+            .into(),
     )
     .await;
     assert_eq!(rows_of(&events, 0), vec![vec![Some(m.group.clone())]]);
-    assert_eq!(rows_of(&events, 1), vec![vec![Some("none".into()), Some(owner.clone())]]);
+    assert_eq!(
+        rows_of(&events, 1),
+        vec![vec![Some("none".into()), Some(owner.clone())]]
+    );
     failed_at(&events, 2, &[READ_ONLY], "insert as the owner");
-    let superuser: String = s.admin.query_one("SELECT current_user", &[]).await.unwrap().get(0);
-    let events = on_owner(format!("SELECT set_config('session_authorization', '{superuser}', false)")).await;
-    failed_at(&events, 0, &[DENIED], "session_authorization to the superuser");
+    let superuser: String = s
+        .admin
+        .query_one("SELECT current_user", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let events = on_owner(format!(
+        "SELECT set_config('session_authorization', '{superuser}', false)"
+    ))
+    .await;
+    failed_at(
+        &events,
+        0,
+        &[DENIED],
+        "session_authorization to the superuser",
+    );
     let events = on_owner(format!("SELECT set_config('role', '{superuser}', false)")).await;
     failed_at(&events, 0, &[DENIED], "role to the superuser");
 
     assert_eq!(s.rows_in_t().await, 0);
-    s.admin.batch_execute(&format!("REVOKE {} FROM {owner}", m.group)).await.unwrap();
-    s.db.batch_execute(&format!("DROP OWNED BY {}", m.group)).await.unwrap();
+    s.admin
+        .batch_execute(&format!("REVOKE {} FROM {owner}", m.group))
+        .await
+        .unwrap();
+    s.db.batch_execute(&format!("DROP OWNED BY {}", m.group))
+        .await
+        .unwrap();
     s.drop().await;
     m.drop().await;
 }
@@ -678,7 +802,11 @@ async fn set_config_stays_within_the_members_reach() {
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn functions_with_lasting_effects_are_refused_or_denied() {
     let s = Scratch::new().await;
-    let admin_pid: i32 = s.db.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+    let admin_pid: i32 =
+        s.db.query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
     for sql in [
         format!("SELECT pg_terminate_backend({admin_pid})"),
         format!("SELECT pg_cancel_backend({admin_pid})"),
@@ -692,7 +820,10 @@ async fn functions_with_lasting_effects_are_refused_or_denied() {
         "SELECT lo_create(0)".into(),
         "SELECT pg_read_file('postgresql.conf')".into(),
     ] {
-        let events = s.run_ro(&sql).await.unwrap_or_else(|r| panic!("{sql}: {r:?}"));
+        let events = s
+            .run_ro(&sql)
+            .await
+            .unwrap_or_else(|r| panic!("{sql}: {r:?}"));
         failed_at(&events, 0, &[READ_ONLY, DENIED, "55000"], &sql);
     }
     // The superuser's backend is alive, no slot exists, no large object was made.
@@ -700,13 +831,19 @@ async fn functions_with_lasting_effects_are_refused_or_denied() {
     assert_eq!(alive, 1);
     let slots: i64 = s
         .admin
-        .query_one("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'm5_slot'", &[])
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'm5_slot'",
+            &[],
+        )
         .await
         .unwrap()
         .get(0);
     assert_eq!(slots, 0);
     let objects: i64 =
-        s.db.query_one("SELECT count(*) FROM pg_largeobject_metadata", &[]).await.unwrap().get(0);
+        s.db.query_one("SELECT count(*) FROM pg_largeobject_metadata", &[])
+            .await
+            .unwrap()
+            .get(0);
     assert_eq!(objects, 0);
     s.drop().await;
 }
@@ -716,20 +853,37 @@ async fn functions_with_lasting_effects_are_refused_or_denied() {
 async fn a_silent_statement_still_gets_heartbeats() {
     let s = Scratch::new().await;
     let events = s
-        .run_ro_on(&s.target, "SELECT pg_sleep(20); SELECT 1", None, Duration::from_secs(60))
+        .run_ro_on(
+            &s.target,
+            "SELECT pg_sleep(20); SELECT 1",
+            None,
+            Duration::from_secs(60),
+        )
         .await
         .unwrap();
     assert_eq!(outcome(&events), Outcome::Ok, "{events:?}");
-    assert!(events.iter().any(|e| matches!(e, RunEvent::Heartbeat)), "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(e, RunEvent::Heartbeat)),
+        "{events:?}"
+    );
     // A result past the row cap is streamed and capped, not collected.
     let n = MAX_ROWS_PER_STATEMENT * 5;
-    let events = s.run_ro(&format!("SELECT g FROM generate_series(1, {n}) g")).await.unwrap();
+    let events = s
+        .run_ro(&format!("SELECT g FROM generate_series(1, {n}) g"))
+        .await
+        .unwrap();
     assert_eq!(rows_of(&events, 0).len(), MAX_ROWS_PER_STATEMENT);
     assert!(events.iter().any(|e| matches!(
         e,
         RunEvent::Complete { statement: 0, truncated: true, rows, .. } if *rows == n as u64
     )));
-    assert!(events.iter().filter(|e| matches!(e, RunEvent::Rows { .. })).count() > 1);
+    assert!(
+        events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::Rows { .. }))
+            .count()
+            > 1
+    );
     s.drop().await;
 }
 
@@ -737,13 +891,20 @@ async fn a_silent_statement_still_gets_heartbeats() {
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn an_error_stops_the_script() {
     let s = Scratch::new().await;
-    let events = s.run_ro("SELECT 1; SELECT 1/0; SELECT pg_advisory_lock(99)").await.unwrap();
+    let events = s
+        .run_ro("SELECT 1; SELECT 1/0; SELECT pg_advisory_lock(99)")
+        .await
+        .unwrap();
     assert_eq!(rows_of(&events, 0), vec![vec![Some("1".into())]]);
     // 0-based, as in a normal run: the second statement is `statement: 1`.
     failed_at(&events, 1, &["22012"], "division by zero");
     assert!(!touches(&events, 2));
     s.assert_no_backend_within(Duration::from_secs(2)).await;
-    let free: bool = s.db.query_one("SELECT pg_try_advisory_lock(99)", &[]).await.unwrap().get(0);
+    let free: bool =
+        s.db.query_one("SELECT pg_try_advisory_lock(99)", &[])
+            .await
+            .unwrap()
+            .get(0);
     assert!(free, "the third statement ran");
     s.drop().await;
 }
@@ -755,7 +916,13 @@ async fn a_cancelled_read_only_run_rolls_back() {
     // Cancelled.
     let id = Uuid::new_v4();
     let stream = s
-        .start(&s.target, vec!["SELECT pg_sleep(30)".into()], None, Duration::from_secs(60), s.guard_for(id))
+        .start(
+            &s.target,
+            vec!["SELECT pg_sleep(30)".into()],
+            None,
+            Duration::from_secs(60),
+            s.guard_for(id),
+        )
         .await;
     let scratch = &s;
     let (events, _) = tokio::join!(stream.collect::<Vec<_>>(), async {
@@ -766,7 +933,12 @@ async fn a_cancelled_read_only_run_rolls_back() {
     s.assert_no_backend_within(Duration::from_secs(2)).await;
     // Timed out.
     let events = s
-        .run_ro_on(&s.target, "SELECT 1; SELECT pg_sleep(10)", None, Duration::from_secs(1))
+        .run_ro_on(
+            &s.target,
+            "SELECT 1; SELECT pg_sleep(10)",
+            None,
+            Duration::from_secs(1),
+        )
         .await
         .unwrap();
     assert_eq!(outcome(&events), Outcome::Timeout, "{events:?}");
@@ -775,7 +947,10 @@ async fn a_cancelled_read_only_run_rolls_back() {
     let wide = "SELECT repeat('x', 10000) FROM generate_series(1, 1000)";
     let events = s.run_ro(&format!("{wide}; {wide}")).await.unwrap();
     assert_eq!(outcome(&events), Outcome::TruncatedResponse);
-    let sent: usize = events[..events.len() - 1].iter().map(|e| e.to_line().len()).sum();
+    let sent: usize = events[..events.len() - 1]
+        .iter()
+        .map(|e| e.to_line().len())
+        .sum();
     assert!(sent <= MAX_RESPONSE_BYTES, "{sent}");
     s.assert_no_backend_within(Duration::from_secs(2)).await;
     s.drop().await;
@@ -796,9 +971,21 @@ async fn nothing_reaches_the_next_run() {
     let wide = "SELECT repeat('x', 10000) FROM generate_series(1, 1000)";
     let endings: Vec<(String, Duration, Outcome)> = vec![
         (dirty.to_owned(), Duration::from_secs(30), Outcome::Ok),
-        (format!("{dirty}; SELECT 1/0"), Duration::from_secs(30), Outcome::Error),
-        (format!("{dirty}; SELECT pg_sleep(10)"), Duration::from_secs(1), Outcome::Timeout),
-        (format!("{dirty}; {wide}; {wide}"), Duration::from_secs(30), Outcome::TruncatedResponse),
+        (
+            format!("{dirty}; SELECT 1/0"),
+            Duration::from_secs(30),
+            Outcome::Error,
+        ),
+        (
+            format!("{dirty}; SELECT pg_sleep(10)"),
+            Duration::from_secs(1),
+            Outcome::Timeout,
+        ),
+        (
+            format!("{dirty}; {wide}; {wide}"),
+            Duration::from_secs(30),
+            Outcome::TruncatedResponse,
+        ),
     ];
     for (sql, timeout, want) in endings {
         let events = s.run_ro_on(&s.target, &sql, None, timeout).await.unwrap();
@@ -807,12 +994,22 @@ async fn nothing_reaches_the_next_run() {
         let events = s.run_ro(check).await.unwrap();
         assert_eq!(
             rows_of(&events, 0),
-            vec![vec![Some("\"$user\", public".into()), Some("off".into()), Some("on".into())]],
+            vec![vec![
+                Some("\"$user\", public".into()),
+                Some("off".into()),
+                Some("on".into())
+            ]],
             "after {want:?}"
         );
-        let free: bool = s.db.query_one("SELECT pg_try_advisory_lock(7)", &[]).await.unwrap().get(0);
+        let free: bool =
+            s.db.query_one("SELECT pg_try_advisory_lock(7)", &[])
+                .await
+                .unwrap()
+                .get(0);
         assert!(free, "after {want:?}");
-        s.db.batch_execute("SELECT pg_advisory_unlock(7)").await.unwrap();
+        s.db.batch_execute("SELECT pg_advisory_unlock(7)")
+            .await
+            .unwrap();
     }
     // Cancelled.
     let id = Uuid::new_v4();
@@ -832,7 +1029,11 @@ async fn nothing_reaches_the_next_run() {
     });
     assert_eq!(outcome(&events), Outcome::Cancelled);
     s.assert_no_backend_within(Duration::from_secs(2)).await;
-    let free: bool = s.db.query_one("SELECT pg_try_advisory_lock(7)", &[]).await.unwrap().get(0);
+    let free: bool =
+        s.db.query_one("SELECT pg_try_advisory_lock(7)", &[])
+            .await
+            .unwrap()
+            .get(0);
     assert!(free, "after the cancel");
     s.drop().await;
 }

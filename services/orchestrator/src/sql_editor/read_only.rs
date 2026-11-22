@@ -41,20 +41,83 @@ pub const TOO_MANY_STATEMENTS: &str = "too_many_statements";
 
 /// The script's statements as the text each one runs with, or why it can't run read-only.
 pub fn check(sql: &str) -> Result<Vec<String>, Refused> {
-    let _ = sql;
-    Ok(Vec::new())
+    let ranges = split(sql)?;
+    // `split` checked every range against the script.
+    Ok(ranges
+        .into_iter()
+        .map(|range| sql[range].to_owned())
+        .collect())
 }
 
-/// The byte ranges of the script's statements, at the parser's own boundaries.
+/// The byte ranges of the script's statements, at the parser's own boundaries
+/// (`stmt_location` / `stmt_len`), once every statement passed the allow-list. A range the
+/// script can't be cut at, or a statement without a node, refuses the script.
 pub fn split(sql: &str) -> Result<Vec<Range<usize>>, Refused> {
-    let _ = sql;
-    Ok(Vec::new())
+    let unparsed = |statement| Refused {
+        statement,
+        kind: UNPARSED.to_owned(),
+    };
+    let parsed = pg_query::parse(sql).map_err(|_| unparsed(0))?;
+    let stmts = &parsed.protobuf.stmts;
+    if stmts.len() > MAX_STATEMENTS {
+        return Err(Refused {
+            statement: MAX_STATEMENTS,
+            kind: TOO_MANY_STATEMENTS.to_owned(),
+        });
+    }
+    let mut ranges = Vec::with_capacity(stmts.len());
+    let mut end_of_last = 0;
+    for (statement, raw) in stmts.iter().enumerate() {
+        let node = raw
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| unparsed(statement))?;
+        if !allowed(node) {
+            return Err(Refused {
+                statement,
+                kind: super::guard::kind_name(node).to_owned(),
+            });
+        }
+        let start = usize::try_from(raw.stmt_location).map_err(|_| unparsed(statement))?;
+        let end = match usize::try_from(raw.stmt_len).map_err(|_| unparsed(statement))? {
+            // 0: the statement runs to the end of the script.
+            0 => sql.len(),
+            len => start.checked_add(len).ok_or_else(|| unparsed(statement))?,
+        };
+        let cut = start >= end_of_last
+            && start < end
+            && end <= sql.len()
+            && sql.is_char_boundary(start)
+            && sql.is_char_boundary(end);
+        if !cut {
+            return Err(unparsed(statement));
+        }
+        ranges.push(start..end);
+        end_of_last = end;
+    }
+    Ok(ranges)
 }
 
-#[allow(dead_code)]
+/// The allow-list: `SELECT` (which `WITH`, `VALUES` and `TABLE` parse to), `SHOW`, and
+/// `EXPLAIN` of a select, insert, update, delete or merge (Postgres refuses the write if
+/// `ANALYZE` would run it). Nothing else, so no statement kind can leave the transaction or
+/// change the session, whatever later Postgres releases add.
 fn allowed(node: &NodeEnum) -> bool {
-    let _ = node;
-    true
+    match node {
+        NodeEnum::SelectStmt(_) | NodeEnum::VariableShowStmt(_) => true,
+        NodeEnum::ExplainStmt(e) => matches!(
+            e.query.as_ref().and_then(|q| q.node.as_ref()),
+            Some(
+                NodeEnum::SelectStmt(_)
+                    | NodeEnum::InsertStmt(_)
+                    | NodeEnum::UpdateStmt(_)
+                    | NodeEnum::DeleteStmt(_)
+                    | NodeEnum::MergeStmt(_)
+            )
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -92,7 +155,10 @@ mod tests {
         }
         // `SET TRANSACTION` is a `SET` to the parser.
         assert_eq!(kind("SET TRANSACTION READ WRITE"), "VariableSetStmt");
-        assert_eq!(kind("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"), "VariableSetStmt");
+        assert_eq!(
+            kind("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"),
+            "VariableSetStmt"
+        );
     }
 
     #[test]
@@ -111,21 +177,33 @@ mod tests {
         ] {
             assert_eq!(kind(sql), "VariableSetStmt", "{sql}");
         }
-        for sql in ["DISCARD ALL", "DISCARD PLANS", "DISCARD TEMP", "DISCARD SEQUENCES"] {
+        for sql in [
+            "DISCARD ALL",
+            "DISCARD PLANS",
+            "DISCARD TEMP",
+            "DISCARD SEQUENCES",
+        ] {
             assert_eq!(kind(sql), "DiscardStmt", "{sql}");
         }
     }
 
     #[test]
     fn copy_is_refused() {
-        for sql in ["COPY t TO STDOUT", "COPY t FROM STDIN", "COPY (SELECT 1) TO STDOUT"] {
+        for sql in [
+            "COPY t TO STDOUT",
+            "COPY t FROM STDIN",
+            "COPY (SELECT 1) TO STDOUT",
+        ] {
             assert_eq!(kind(sql), "CopyStmt", "{sql}");
         }
     }
 
     #[test]
     fn show_is_allowed() {
-        assert_eq!(check("SHOW server_version").unwrap(), vec!["SHOW server_version"]);
+        assert_eq!(
+            check("SHOW server_version").unwrap(),
+            vec!["SHOW server_version"]
+        );
         assert_eq!(check("SHOW ALL").unwrap().len(), 1);
     }
 
@@ -154,7 +232,10 @@ mod tests {
             ("INSERT INTO t VALUES (1)", "InsertStmt"),
             ("UPDATE t SET a = 1", "UpdateStmt"),
             ("DELETE FROM t", "DeleteStmt"),
-            ("MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE", "MergeStmt"),
+            (
+                "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE",
+                "MergeStmt",
+            ),
             ("TRUNCATE t", "TruncateStmt"),
             ("CREATE TEMP TABLE x (a int)", "CreateStmt"),
             ("DROP TABLE t", "DropStmt"),
@@ -194,18 +275,36 @@ mod tests {
 
     #[test]
     fn an_unparsable_script_is_refused() {
-        for sql in ["SELEC 1", "SELECT 1; SELEC 2", "SELECT 'unterminated", "SELECT $$a"] {
-            assert_eq!(refused(sql), Refused { statement: 0, kind: UNPARSED.into() }, "{sql}");
+        for sql in [
+            "SELEC 1",
+            "SELECT 1; SELEC 2",
+            "SELECT 'unterminated",
+            "SELECT $$a",
+        ] {
+            assert_eq!(
+                refused(sql),
+                Refused {
+                    statement: 0,
+                    kind: UNPARSED.into()
+                },
+                "{sql}"
+            );
         }
     }
 
     #[test]
     fn the_statement_cap() {
         let script = |n: usize| vec!["SELECT 1"; n].join(";");
-        assert_eq!(check(&script(MAX_STATEMENTS)).unwrap().len(), MAX_STATEMENTS);
+        assert_eq!(
+            check(&script(MAX_STATEMENTS)).unwrap().len(),
+            MAX_STATEMENTS
+        );
         assert_eq!(
             refused(&script(MAX_STATEMENTS + 1)),
-            Refused { statement: MAX_STATEMENTS, kind: TOO_MANY_STATEMENTS.into() }
+            Refused {
+                statement: MAX_STATEMENTS,
+                kind: TOO_MANY_STATEMENTS.into()
+            }
         );
         // Empty statements don't count.
         let padded = format!("{};;;;", script(MAX_STATEMENTS));
@@ -219,7 +318,11 @@ mod tests {
         let filler = "x".repeat(super::super::MAX_SQL_BYTES / MAX_STATEMENTS - 40);
         let one = format!("SELECT '{filler}' AS a");
         let script = vec![one.as_str(); MAX_STATEMENTS].join(";\n");
-        assert!(script.len() <= super::super::MAX_SQL_BYTES, "{}", script.len());
+        assert!(
+            script.len() <= super::super::MAX_SQL_BYTES,
+            "{}",
+            script.len()
+        );
         let started = std::time::Instant::now();
         let slices = check(&script).unwrap();
         let took = started.elapsed();
@@ -232,17 +335,26 @@ mod tests {
     fn a_refusal_names_the_statement() {
         assert_eq!(
             refused("SELECT 1; SHOW x; COMMIT; SELECT 2"),
-            Refused { statement: 2, kind: "TransactionStmt".into() }
+            Refused {
+                statement: 2,
+                kind: "TransactionStmt".into()
+            }
         );
         // The first offender, counted past empty statements.
         assert_eq!(
             refused(";; SELECT 1;; SET ROLE x; COMMIT"),
-            Refused { statement: 1, kind: "VariableSetStmt".into() }
+            Refused {
+                statement: 1,
+                kind: "VariableSetStmt".into()
+            }
         );
         // Last position.
         assert_eq!(
             refused("SELECT 1; SELECT 2; DISCARD ALL"),
-            Refused { statement: 2, kind: "DiscardStmt".into() }
+            Refused {
+                statement: 2,
+                kind: "DiscardStmt".into()
+            }
         );
     }
 
@@ -250,14 +362,35 @@ mod tests {
     fn slices_follow_the_parser() {
         for (sql, want) in [
             ("SELECT 1; SELECT 2", vec!["SELECT 1", " SELECT 2"]),
-            ("SELECT $$a;b$$; SELECT 2", vec!["SELECT $$a;b$$", " SELECT 2"]),
-            ("SELECT $t$ ; $$ ; $t$; SELECT 2", vec!["SELECT $t$ ; $$ ; $t$", " SELECT 2"]),
-            ("SELECT 1 /* ; */; SELECT 2", vec!["SELECT 1 /* ; */", " SELECT 2"]),
-            ("SELECT 1 -- ;\n; SELECT 2", vec!["SELECT 1 -- ;\n", " SELECT 2"]),
+            (
+                "SELECT $$a;b$$; SELECT 2",
+                vec!["SELECT $$a;b$$", " SELECT 2"],
+            ),
+            (
+                "SELECT $t$ ; $$ ; $t$; SELECT 2",
+                vec!["SELECT $t$ ; $$ ; $t$", " SELECT 2"],
+            ),
+            (
+                "SELECT 1 /* ; */; SELECT 2",
+                vec!["SELECT 1 /* ; */", " SELECT 2"],
+            ),
+            (
+                "SELECT 1 -- ;\n; SELECT 2",
+                vec!["SELECT 1 -- ;\n", " SELECT 2"],
+            ),
             ("SELECT 'x;y'; SELECT 2", vec!["SELECT 'x;y'", " SELECT 2"]),
-            ("SELECT E'\\';'; SELECT 2", vec!["SELECT E'\\';'", " SELECT 2"]),
-            ("SELECT 1 AS \"a;b\"; SELECT 2", vec!["SELECT 1 AS \"a;b\"", " SELECT 2"]),
-            ("SELECT 'é;✓'; SELECT '😀'", vec!["SELECT 'é;✓'", " SELECT '😀'"]),
+            (
+                "SELECT E'\\';'; SELECT 2",
+                vec!["SELECT E'\\';'", " SELECT 2"],
+            ),
+            (
+                "SELECT 1 AS \"a;b\"; SELECT 2",
+                vec!["SELECT 1 AS \"a;b\"", " SELECT 2"],
+            ),
+            (
+                "SELECT 'é;✓'; SELECT '😀'",
+                vec!["SELECT 'é;✓'", " SELECT '😀'"],
+            ),
             ("SELECT 1;;; SELECT 2;  ", vec!["SELECT 1", " SELECT 2"]),
             ("/* only a comment */", vec![]),
         ] {

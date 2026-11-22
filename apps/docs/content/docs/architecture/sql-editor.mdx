@@ -61,6 +61,17 @@ Before running, the script is parsed (pg_query, Postgres's own parser) and each 
   A client that sends `confirm: true` skips it. The guard looks at the statement, not at what it calls. On a protected branch, a `SELECT` that calls a function which writes, `SELECT … FOR UPDATE` inside a subquery or CTE, and writing functions such as `nextval` all pass as reads, so a protected branch isn't a safety boundary against them. On a normal branch, `EXECUTE` of a prepared risky statement, a data-modifying CTE (`WITH d AS (DELETE FROM t) …`), `MERGE`, `DO` blocks, and functions and rules that delete pass without confirmation.
 </Callout>
 
+## Read-only runs
+
+A run with `read_only: true` can't change anything. The MCP server's read-only tools use it. Studio doesn't send it. Two layers do separate jobs:
+
+- **Postgres decides what is a write.** The run opens `BEGIN TRANSACTION READ ONLY` and takes the transaction's snapshot with one statement. From then on, Postgres refuses every write and every switch back to read-write, whether it comes from `SET TRANSACTION`, `set_config` or a function. That includes a write made inside a function that a `SELECT` calls, and `nextval`. The transaction is always rolled back, and the connection is never reused, so session state (settings, advisory locks) never reaches another run.
+- **A parse keeps the script inside the transaction.** Before any connection opens, the script is parsed with `pg_query`. Only `SELECT` (with `WITH`, `VALUES` and `TABLE`), `SHOW` and `EXPLAIN` of a select or DML statement may appear at the top level, up to 100 statements. Anything else refuses the whole script with 422 `read_only_script_refused`, which names the first offending statement's index and kind. That covers transaction control, `SET`, `RESET`, `DISCARD`, `COPY`, `DO`, `CALL`, `LOCK`, `PREPARE` and maintenance commands. It's an allow-list, so a statement kind added in a later Postgres release is refused too.
+
+The statements then run one at a time, cut at the parser's own boundaries. Each one is first prepared on the server, and Postgres refuses to prepare a text that holds more than one command. If the parse and the server ever disagree about where a statement ends (a `;` in a dollar-quoted body, a comment or a string), the run ends in a refusal, never in a statement that ran outside the check. A statement whose command tag isn't a read's also stops the run before the next one. Results stream in the normal event shape. The first error ends the run. A statement's `position` counts from the start of that statement. The timeout defaults to 60 s and is at most 300 s. `confirm` can't be sent with a read-only run.
+
+A read-only transaction still allows effects that aren't writes: advisory locks, `pg_sleep`, signalling the role's own backends, and reading anything the role may read. The role's rights and the timeout bound them.
+
 ## Run as
 
 The run's role picker (`role` in the request) does `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. With a role, the connection logs in as the caller's hidden member login and runs `SET ROLE`, so a `RESET ROLE` lands on the member login, never the owner. An Admin acting as a role a member login can't hold (a login or owner-level role) uses the owner's connection and `SET ROLE`: only that case is a preview, not a security boundary.
