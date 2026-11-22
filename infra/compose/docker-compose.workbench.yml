@@ -796,6 +796,8 @@ services:
       - CHELABASE_MCP_LISTEN=mcp-public:8095,127.0.0.1:8095
       - CHELABASE_MCP_INTERNAL_LISTEN=mcp-internal:8096
       - CHELABASE_MCP_RUNTIME_URL=http://mcp-runtime:8080
+      # execute's API calls: the gateway on the stack's port (it listens on it inside too).
+      - CHELABASE_MCP_API_URL=http://gateway:${CHELABASE_GATEWAY_PORT:?set by chelabase workbench (stack.env)}
       - CHELABASE_MCP_ALLOWED_ORIGINS=${CHELABASE_MCP_ALLOWED_ORIGINS:-}
       - CHELABASE_MCP_LOG_CODE=${CHELABASE_MCP_LOG_CODE:-}
       - CHELABASE_MCP_TIMEOUT_MS=${CHELABASE_MCP_TIMEOUT_MS:-}
@@ -803,6 +805,8 @@ services:
       - CHELABASE_MCP_CALLS_PER_MINUTE=${CHELABASE_MCP_CALLS_PER_MINUTE:-}
       - CHELABASE_MCP_MEMBER_CONCURRENCY=${CHELABASE_MCP_MEMBER_CONCURRENCY:-}
       - CHELABASE_MCP_CONCURRENCY=${CHELABASE_MCP_CONCURRENCY:-}
+      - CHELABASE_MCP_MAX_CALLS=${CHELABASE_MCP_MAX_CALLS:-}
+      - CHELABASE_MCP_RESPONSE_MAX_BYTES=${CHELABASE_MCP_RESPONSE_MAX_BYTES:-}
     volumes: !override
       - *checkout-ro
       - *keys-mask

@@ -603,9 +603,14 @@ for render in "${renders[@]}"; do
   got="$(jq -c '.services.mcp.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
   [[ "$got" == '{"default":["mcp-public"],"mcp-sandbox":["mcp-internal"]}' ]] || err "$render: mcp's networks and aliases: got $got"
   menv="$(jq -c '.services.mcp.environment // {} | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
-    | {CHELABASE_MCP_LISTEN, CHELABASE_MCP_INTERNAL_LISTEN, CHELABASE_MCP_RUNTIME_URL}' "$f")"
-  [[ "$menv" == '{"CHELABASE_MCP_LISTEN":"mcp-public:8095,127.0.0.1:8095","CHELABASE_MCP_INTERNAL_LISTEN":"mcp-internal:8096","CHELABASE_MCP_RUNTIME_URL":"http://mcp-runtime:8080"}' ]] ||
-    err "$render: mcp binds its aliases only, one listener per network, and reaches the runtime by name: got $menv"
+    | {CHELABASE_MCP_LISTEN, CHELABASE_MCP_INTERNAL_LISTEN, CHELABASE_MCP_RUNTIME_URL, CHELABASE_MCP_API_URL}' "$f")"
+  # execute's API calls go to the gateway on the default network, at the port it listens on there
+  # (.env.example's CHELABASE_PUBLIC_PORT in the base render, the stack's gateway port in the
+  # workbench's); with the Host header at the API host.
+  gw_port=8000
+  [[ "$render" == wb ]] && gw_port=8137
+  [[ "$menv" == '{"CHELABASE_MCP_LISTEN":"mcp-public:8095,127.0.0.1:8095","CHELABASE_MCP_INTERNAL_LISTEN":"mcp-internal:8096","CHELABASE_MCP_RUNTIME_URL":"http://mcp-runtime:8080","CHELABASE_MCP_API_URL":"http://gateway:'"$gw_port"'"}' ]] ||
+    err "$render: mcp binds its aliases only, one listener per network, reaches the runtime by name and the API through the gateway: got $menv"
   [[ "$(jq -c '[.services.mcp.ports // [], .services.mcp.expose // []]' "$f")" == '[[],[]]' ]] || err "$render: mcp publishes or exposes a port"
   # Nothing else joins the sandbox network or uses the runtime's or mcp's internal name.
   got="$(jq -r '.services | to_entries[] | select(.key != "mcp" and .key != "mcp-runtime")

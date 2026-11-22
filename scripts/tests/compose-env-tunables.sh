@@ -35,7 +35,7 @@ awk -v want="^# --- ($sections)( .*)? ---\$" '
     line = substr($0, RSTART, RLENGTH); sub(/^# /, "", line); sub(/=$/, "", line); print line
   }' "$example" | sort -u >"$tmp/names"
 # The MCP profile's own settings (mcp-core m8) are documented there, so they are checked.
-for name in CHELABASE_MCP_URL CHELABASE_MCP_RUNTIME_MEMORY; do
+for name in CHELABASE_MCP_URL CHELABASE_MCP_RUNTIME_MEMORY CHELABASE_MCP_MAX_CALLS CHELABASE_MCP_RESPONSE_MAX_BYTES; do
   grep -qx "$name" "$tmp/names" || err "$example's MCP section has no $name line"
 done
 [[ "$(wc -l <"$tmp/names")" -ge 10 ]] || err "found only $(wc -l <"$tmp/names") tunables in $example's sections ($sections): did a heading change?"

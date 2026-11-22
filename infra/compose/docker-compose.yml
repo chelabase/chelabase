@@ -1559,6 +1559,8 @@ services:
       CHELABASE_MCP_LISTEN: mcp-public:8095,127.0.0.1:8095
       CHELABASE_MCP_INTERNAL_LISTEN: mcp-internal:8096
       CHELABASE_MCP_RUNTIME_URL: http://mcp-runtime:8080
+      # execute's API calls go to the gateway on the default network, with Host set to the API host.
+      CHELABASE_MCP_API_URL: http://gateway:${CHELABASE_PUBLIC_PORT:-8000}
       # .env's tunables (blank = the service's default).
       CHELABASE_MCP_ALLOWED_ORIGINS: ${CHELABASE_MCP_ALLOWED_ORIGINS:-}
       CHELABASE_MCP_LOG_CODE: ${CHELABASE_MCP_LOG_CODE:-}
@@ -1567,6 +1569,8 @@ services:
       CHELABASE_MCP_CALLS_PER_MINUTE: ${CHELABASE_MCP_CALLS_PER_MINUTE:-}
       CHELABASE_MCP_MEMBER_CONCURRENCY: ${CHELABASE_MCP_MEMBER_CONCURRENCY:-}
       CHELABASE_MCP_CONCURRENCY: ${CHELABASE_MCP_CONCURRENCY:-}
+      CHELABASE_MCP_MAX_CALLS: ${CHELABASE_MCP_MAX_CALLS:-}
+      CHELABASE_MCP_RESPONSE_MAX_BYTES: ${CHELABASE_MCP_RESPONSE_MAX_BYTES:-}
     networks:
       default:
         aliases: [mcp-public]
