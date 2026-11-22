@@ -17133,6 +17133,29 @@ async fn refused_invites_of_a_removed_email_spend_no_invite_budget() {
     created(t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("gone@x.com", "email"))).await).await;
 }
 
+// #315: the actor authenticated as a tenant admin and is demoted before the invite's write: the
+// write re-reads the actor and answers as for a non-admin, the member stays removed.
+#[tokio::test]
+async fn readmission_by_an_admin_demoted_before_the_write_is_refused() {
+    for path in ["project", "tenant"] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "back@x.com");
+        t.w.metadata.set_member(t.w.tenant, &sub, |m| m.email = Some("back@x.com".into()));
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+        let tenant = t.w.tenant;
+        t.w.metadata.race_invite_write_once(move |md| md.set_member(tenant, DEFAULT_SUB, |m| m.tenant_admin = false));
+        let resp = if path == "project" {
+            t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("back@x.com", "email"))).await
+        } else {
+            t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "viewer", &[]))).await
+        };
+        assert_tenant_admin_needed(&error_of(resp, 403).await);
+        let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+        assert_eq!((stored.id, stored.status, stored.offboarded), (member, MemberStatus::Removed, true), "{path}");
+        assert!(t.w.metadata.invites.lock().unwrap().is_empty(), "{path}: no invite");
+    }
+}
+
 // A tenant admin's removal commits between the invite's reads and its write: the write's own
 // check refuses it, for a live member found at read time and for a person found nowhere then.
 #[tokio::test]

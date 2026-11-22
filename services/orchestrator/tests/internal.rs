@@ -5086,6 +5086,7 @@ async fn branch_info_for_auth_branch_targets_itself() {
             "schema": "public",
             "table": "users",
             "target_branch_id": w.main,
+            "project_name": "shop",
             "sync": {
                 "branch_id": w.main,
                 "host": std::net::Ipv4Addr::LOCALHOST.to_string(),

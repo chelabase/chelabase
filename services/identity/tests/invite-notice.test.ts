@@ -61,6 +61,16 @@ describeDb("invite notice", () => {
     expect(rows.rowCount).toBe(0);
   });
 
+  it("notice_under_a_name_identity_cannot_show_uses_the_default", async () => {
+    for (const bad of ["\ufeff", "\ufeff ", "Acme\nInc"]) {
+      const user = await createUser("password-notice-bad");
+      const r = await notice(mailed, user.id, { project_name: bad, link: LINK });
+      expect(r.status, JSON.stringify(bad) + JSON.stringify(r.body)).toBe(202);
+      expect(r.body).toEqual({ sent: true });
+      expect(sink.messages.at(-1)!.data).toContain("Chelabase");
+    }
+  });
+
   it("notice_refuses_a_link_with_a_code", async () => {
     const user = await createUser("password-notice-2");
     const r = await notice(mailed, user.id, { link: `${LINK}&code=123456` });

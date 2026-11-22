@@ -1711,6 +1711,60 @@ async fn invite_without_readmit_refuses_a_removed_row_by_user_or_email() {
     s.finish().await;
 }
 
+// #315: `readmit_removed` is what the request saw when it authenticated; the store re-reads the
+// actor's row under the tenant lock. An actor demoted or suspended since is answered as a
+// non-admin (`RemovedMember`): the row stays removed, no row or invite is added. An active
+// tenant admin still re-admits.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn readmission_rechecks_the_actor_under_the_lock() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let a = s
+        .client
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
+        .await
+        .unwrap();
+    let b = s
+        .client
+        .ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", Admission::Active)
+        .await
+        .unwrap();
+    let r = s
+        .client
+        .ensure_member_first_comer_for_tests(t, "r", "r@x.com", "R", Admission::Active)
+        .await
+        .unwrap();
+    s.client.remove_member(a.id, r.id).await.unwrap();
+    s.client.revoke_logins_for_identity_user(t, "r").await.unwrap();
+    let members = s.member_count(t).await;
+    let assert_refused = async |why: &str| {
+        assert!(
+            matches!(
+                s.client.create_invited_member(b.id, t, new_invite("r", "r@x.com", &[])).await,
+                Err(AccessWriteError::RemovedMember)
+            ),
+            "{why}"
+        );
+        let kept = s.client.member(r.id).await.unwrap().unwrap();
+        assert_eq!(kept.status, MemberStatus::Removed, "{why}");
+        assert_eq!(s.member_count(t).await, members, "{why}: no row added");
+        assert!(s.client.open_invites(t).await.unwrap().is_empty(), "{why}: no invite");
+    };
+    // An admin when the request authenticated, demoted before the write.
+    s.client.set_tenant_admin(Some(a.id), b.id, true).await.unwrap();
+    s.client.set_tenant_admin(Some(a.id), b.id, false).await.unwrap();
+    assert_refused("demoted").await;
+    // Still flagged an admin, but suspended.
+    s.client.set_tenant_admin(Some(a.id), b.id, true).await.unwrap();
+    s.client.suspend_member(a.id, b.id).await.unwrap();
+    assert_refused("suspended").await;
+    // An active tenant admin re-admits the same row.
+    let (back, _) = s.client.create_invited_member(a.id, t, new_invite("r", "r@x.com", &[])).await.unwrap();
+    assert_eq!((back.id, back.status), (r.id, MemberStatus::Invited));
+    s.finish().await;
+}
+
 // M8: another tenant's projects and databases are NotFound, with no row and no event.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]

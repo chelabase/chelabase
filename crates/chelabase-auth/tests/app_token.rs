@@ -129,3 +129,26 @@ fn app_token_without_iss_aud_or_exp_is_invalid() {
         assert_eq!(verifier.verify(&token, project), Err(AppTokenError::Invalid), "without {missing}");
     }
 }
+
+// A correctly signed, unexpired token is accepted only when its header names the verifier's
+// key: no `kid` and a different `kid` are both refused.
+#[test]
+fn a_token_without_kid_is_refused() {
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let signer = AppTokenSigner::from_pem(private_pem.as_bytes(), public_pem.as_bytes()).unwrap();
+    let verifier = AppTokenVerifier::from_pem(public_pem.as_bytes()).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+    let project = Uuid::new_v4();
+    let c = claims(project, now() + 900);
+    let sign_with = |kid: Option<&str>| {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = kid.map(str::to_string);
+        jsonwebtoken::encode(&header, &c, &key).unwrap()
+    };
+    assert_eq!(verifier.verify(&sign_with(Some(signer.kid())), project).unwrap(), c);
+    assert_eq!(verifier.verify(&sign_with(None), project), Err(AppTokenError::Invalid));
+    assert_eq!(
+        verifier.verify(&sign_with(Some("0000000000000000")), project),
+        Err(AppTokenError::Invalid)
+    );
+}

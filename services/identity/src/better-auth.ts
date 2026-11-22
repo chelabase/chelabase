@@ -52,6 +52,9 @@ export function authOptions(pool: pg.Pool, secret: string, schema: string | unde
     database: {
       dialect: new PoolDialect({ pool }, schema),
       type: "postgres",
+      // Better Auth only opens real transactions for a dialect when told to; the password
+      // routes need one (replacePasswordEndingSessions).
+      transaction: true,
       ...(schema === undefined ? {} : { schemaName: schema }),
     },
     emailAndPassword: {

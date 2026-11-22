@@ -354,7 +354,7 @@ fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
         "project_id": project, "status": "enabled",
         "email_verification": verification, "on_delete": "delete",
         "auth_database_id": Uuid::nil(), "pg_database": "app", "schema": "public",
-        "table": "users", "target_branch_id": target,
+        "table": "users", "target_branch_id": target, "project_name": "Acme",
         "sync": {"branch_id": target, "host": std::net::Ipv4Addr::LOCALHOST.to_string(), "port": 5432, "database": "app",
             "user": "chelabase_auth_sync", "password": "pw", "schema": "public", "table": "users"},
     })
@@ -3355,7 +3355,7 @@ impl H {
         let client = self.fake.client();
         let pw = (kind == CodeKind::Reset).then_some(NEW_PW);
         let guess = async |code: &str| match kind {
-            CodeKind::EmailChange => client.confirm_email_change(&self.pool(), user, next, code).await.unwrap_err(),
+            CodeKind::EmailChange => client.confirm_email_change(&self.pool(), user, next, code, None).await.unwrap_err(),
             _ => client.verify_code(&self.pool(), user, kind, code, pw).await.unwrap_err(),
         };
         for _ in 0..2 {
@@ -3555,4 +3555,90 @@ async fn code_checks_answer_a_known_and_an_unknown_email_alike() {
 /// [`code`], for tests with a local `code`.
 fn code_of(a: &Ans) -> &str {
     code(a)
+}
+
+// #314: app-user mail names the project (from the caller's own branch info), not the platform.
+/// The project each mailed code of the fake named, as `(kind, project)`.
+fn code_projects(h: &H) -> Vec<(CodeKind, Option<String>)> {
+    h.fake.codes_sent().into_iter().map(|c| (c.kind, c.project)).collect()
+}
+
+#[tokio::test]
+async fn code_mails_carry_the_project_name() {
+    let h = harness_opts(true, 1, true).await;
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let id = h.add_user("bob@example.com", true).await;
+    let a = h.post("password-reset", json!({"email": "bob@example.com"}), None).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let s = h.sign_in("bob@example.com", PW).await;
+    assert_eq!(h.change_email("bob@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    assert_eq!(h.last_code(&id, CodeKind::Reset).len(), 6);
+    let acme = Some("Acme".to_string());
+    assert_eq!(
+        code_projects(&h),
+        vec![
+            (CodeKind::Verify, acme.clone()),
+            (CodeKind::Reset, acme.clone()),
+            (CodeKind::EmailChange, acme),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn email_changed_notice_carries_the_project_name() {
+    // With verification: the notice goes when the code is confirmed.
+    let h = harness_opts(true, 1, true).await;
+    h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let a = h.confirm_email_change("ada@new.example", &sent, access(&s)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| (n.email, n.project)).collect();
+    assert_eq!(notices, vec![("ada@example.com".to_string(), Some("Acme".to_string()))]);
+    // Without verification: the change applies at once and the notice goes with it.
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::NO_CONTENT);
+    let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| (n.email, n.project)).collect();
+    assert_eq!(notices, vec![("ada@example.com".to_string(), Some("Acme".to_string()))]);
+}
+
+#[tokio::test]
+async fn a_project_name_identity_would_refuse_still_mails_under_the_default_name() {
+    // A project name may hold a line break; identity cannot show that as a `project_name`, so the
+    // mail goes out under the service's default name instead of not at all.
+    let h = harness_opts(true, 1, true).await;
+    let mut branch = info(h.project, h.branch, true);
+    branch["project_name"] = json!("Acme\nInc");
+    h.internal.set_branch(h.branch, branch);
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)]);
+}
+
+#[tokio::test]
+async fn a_project_named_only_a_byte_order_mark_mails_under_the_default_name() {
+    // JavaScript's `trim()` strips U+FEFF and Rust's does not, so identity treats these names
+    // as blank. Identity is the one judge of a name: it falls back to the default, so the code
+    // and the email-changed notice still go.
+    for name in ["\u{feff}", "\u{feff} "] {
+        let h = harness_opts(true, 1, true).await;
+        let mut branch = info(h.project, h.branch, true);
+        branch["project_name"] = json!(name);
+        h.internal.set_branch(h.branch, branch);
+        let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+        assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)], "{name:?}");
+        h.add_user("bob@example.com", true).await;
+        let s = h.sign_in("bob@example.com", PW).await;
+        assert_eq!(h.change_email("bob@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+        let sent = h.email_change_codes().pop().unwrap().2;
+        let a = h.confirm_email_change("bob@new.example", &sent, access(&s)).await;
+        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+        let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| n.project).collect();
+        assert_eq!(notices, vec![None], "{name:?}");
+    }
 }
