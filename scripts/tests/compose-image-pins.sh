@@ -30,11 +30,12 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner)
-# Images added before their first release (none right now).
-unpublished=()
+images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner mcp mcp-runtime)
+# Images added before their first release: the MCP server and its runtime (mcp-core m8, profile
+# `mcp`).
+unpublished=(mcp mcp-runtime)
 # Every profile of the base file, so a render sees every service.
-profiles=(--profile services)
+profiles=(--profile services --profile mcp)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }

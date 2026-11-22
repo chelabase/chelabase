@@ -119,6 +119,37 @@ describe("mcp runtime /run", () => {
     assert.equal((await runCode(rt, job("async () => 1", { host }))).body.result, 1);
   });
 
+  test("a run that ends its own isolate", async () => {
+    // workerd gives the runner the same error for abortIsolate() as for a promise nothing can
+    // settle, so the answer is a timeout whose message names both.
+    const code = `async () => { const w = await import("cloudflare:workers"); w.abortIsolate("bye") }`;
+    const t0 = Date.now();
+    const { body } = await runCode(rt, job(code, { host, timeout_ms: 5000 }));
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.equal(body.error.code, "timeout", JSON.stringify(body));
+    assert.match(body.error.message, /ended its own isolate/);
+    assert.ok(Date.now() - t0 < 4000, `took ${Date.now() - t0}ms`);
+    assert.equal((await runCode(rt, job("async () => 1", { host }))).body.result, 1);
+  });
+
+  test("a host that never sends the spec ends the run with 502", async () => {
+    const saved = host.specText;
+    host.specText = JSON.stringify({ paths: { "/stalled": {} } });
+    host.stallSpec = true;
+    try {
+      const t0 = Date.now();
+      const { status, body } = await runCode(rt, job("async () => 1", { host }), { timeout: 30_000 });
+      assert.equal(status, 502, JSON.stringify(body));
+      assert.match(body.error, /did not send the spec/);
+      assert.ok(Date.now() - t0 < 15_000, `took ${Date.now() - t0}ms`);
+    } finally {
+      host.stallSpec = false;
+      host.specText = saved;
+    }
+    // A later run with a host that answers gets the spec.
+    assert.equal((await runCode(rt, job("async () => 1", { host }))).body.result, 1);
+  });
+
   test("throwing code", async () => {
     const { body } = await runCode(rt, job(`async () => { throw new Error("boom") }`, { host }));
     assert.equal(body.ok, false);

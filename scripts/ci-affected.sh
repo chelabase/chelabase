@@ -30,8 +30,9 @@ web_full=(package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc 'tsconfig*.json
 # `closure` also selects their dependents: the read is in library code. Name the files read, not
 # their directory. scripts/tests/ci-affected.sh checks every row against the Rust sources.
 rust_reads=(
-  'openapi/management.json                                   self     orchestrator'
-  'openapi/data.json                                         self     rest chelabase-query'
+  'openapi/management.json                                   self     orchestrator mcp'
+  'openapi/data.json                                         self     rest chelabase-query mcp'
+  'openapi/mcp.json                                          closure  mcp'
   'openapi/login.json                                        self     auth'
   'apps/studio/package.json                                  self     orchestrator'
   'apps/studio/src/lib/role-rules.fixtures.json              self     orchestrator'

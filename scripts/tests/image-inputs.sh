@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline tests of the image release tooling on a scratch git repo: a small cargo and pnpm
-# workspace with all thirteen images pinned at its first commit, and a stub `docker` that only logs.
+# workspace with all fifteen images pinned at its first commit, and a stub `docker` that only logs.
 #   - scripts/image-inputs.sh changed: which images changed since their pins
 #   - scripts/publish-images.sh: --service / --all / no flag, and --push-only on the selection
 #   - scripts/pin-images.sh + scripts/tests/compose-image-pins.sh: a partial digests file, and
@@ -53,6 +53,8 @@ crate services/storage chelabase-storage-service bin 'http = { path = "../../cra
 # functions' package isn't named after its image either (edge functions m4b).
 crate services/functions chelabase-functions bin
 crate services/service-runner chelabase-service-runner bin
+# The MCP server (mcp-core m8) embeds openapi/mcp.json.
+crate services/mcp mcp bin 'http = { path = "../../crates/http" }'
 crate tools/cli cli bin 'meta = { path = "../../crates/meta" }'
 cargo generate-lockfile --offline -q
 
@@ -72,16 +74,18 @@ pkg packages/client @x/client
 pkg services/identity @x/identity
 mkdir -p openapi docs
 echo '{}' >openapi/management.json
+echo '{}' >openapi/mcp.json
 echo 'docs' >docs/readme.md
 
 mkdir -p infra/images infra/compose scripts/tests
-cp "$src"/infra/images/{docker-bake.hcl,server.Dockerfile,studio.Dockerfile,studio.Caddyfile,identity.Dockerfile,functions-runtime.Dockerfile} infra/images/
-mkdir -p infra/functions-runtime
+cp "$src"/infra/images/{docker-bake.hcl,server.Dockerfile,studio.Dockerfile,studio.Caddyfile,identity.Dockerfile,functions-runtime.Dockerfile,mcp-runtime.Dockerfile} infra/images/
+mkdir -p infra/functions-runtime infra/mcp-runtime
 for f in config.capnp supervisor.js watchdog.sh; do echo "// $f" >"infra/functions-runtime/$f"; done
+for f in config.capnp runner.js watchdog.sh; do echo "// $f" >"infra/mcp-runtime/$f"; done
 cp "$src/.dockerignore" .
 cp "$src"/scripts/{image-inputs.sh,publish-images.sh,pin-images.sh} scripts/ 2>/dev/null || true
 cp "$src/scripts/tests/compose-image-pins.sh" scripts/tests/
-images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime mcp mcp-runtime)
 digest() { printf 'sha256:%064d' "$1"; }
 write_pins() { # write_pins <sha12>: every image pinned at <sha12>
   local i n=0
@@ -141,7 +145,7 @@ expect "apps/studio only -> studio" "studio" "$(changed)"
 case_ edit crates/meta/src/lib.rs
 expect "crates/meta -> its dependents, not rest (dev only)" "orchestrator worker" "$(changed)"
 case_ edit crates/http/src/lib.rs
-expect "crates/http -> direct and transitive dependents" "gateway orchestrator worker storage" "$(changed)"
+expect "crates/http -> direct and transitive dependents" "gateway orchestrator worker storage mcp" "$(changed)"
 case_ edit services/auth/src/main.rs
 expect "a service's own crate -> that service" "auth" "$(changed)"
 case_ edit services/storage/src/main.rs
@@ -156,13 +160,21 @@ for f in infra/functions-runtime/supervisor.js infra/images/functions-runtime.Do
   case_ edit "$f"
   expect "$f -> functions-runtime" "functions-runtime" "$(changed)"
 done
+case_ edit services/mcp/src/main.rs
+expect "mcp's own crate -> mcp" "mcp" "$(changed)"
+case_ edit openapi/mcp.json
+expect "openapi/mcp.json (embedded by mcp; studio reads openapi/) -> studio and mcp" "studio mcp" "$(changed)"
+for f in infra/mcp-runtime/runner.js infra/images/mcp-runtime.Dockerfile; do
+  case_ edit "$f"
+  expect "$f -> mcp-runtime" "mcp-runtime" "$(changed)"
+done
 case_ edit tools/cli/src/main.rs
 expect "a crate no image builds -> nothing" "" "$(changed)"
 case_ edit crates/meta/Cargo.toml
-expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init" "$(changed)"
+expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init mcp" "$(changed)"
 for f in Cargo.lock Cargo.toml rust-toolchain.toml; do
   case_ edit "$f"
-  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init" "$(changed)"
+  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init mcp" "$(changed)"
 done
 case_ edit packages/ui/index.ts
 expect "a workspace package studio uses -> studio" "studio" "$(changed)"
@@ -184,7 +196,7 @@ for f in services/identity/src.ts infra/images/identity.Dockerfile; do
 done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
-all="gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime"
+all="gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime mcp mcp-runtime"
 for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"

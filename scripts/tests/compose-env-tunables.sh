@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline check that the app tunables in infra/compose/.env.example reach a self-hosted install
 # (epic selfhost-install, close-out S1): every `CHELABASE_*=` line, commented or not, in the
-# sections "Mode", "Database credentials", "App users", "Object storage" and "Edge functions" must arrive, with the value .env gives
+# sections "Mode", "Database credentials", "App users", "Object storage", "Edge functions" and "MCP" must arrive, with the value .env gives
 # it, in the environment of at least one service of the base file. Compose reads .env only for
 # its own substitutions, so a setting docker-compose.yml doesn't pass through is silently
 # ignored. Each tunable is set to a unique marker in a scratch env file and looked up in
@@ -14,6 +14,8 @@
 #                              platform mode only: never passed
 #   CHELABASE_FUNCTIONS_RUNTIME_MEMORY
 #                              the runtime container's mem_limit (a size, not an env var)
+#   CHELABASE_MCP_RUNTIME_MEMORY
+#                              the MCP runtime container's mem_limit and memswap_limit (no swap)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -26,12 +28,16 @@ err() {
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-sections='Mode|Database credentials|App users|Object storage|Edge functions'
+sections='Mode|Database credentials|App users|Object storage|Edge functions|MCP'
 awk -v want="^# --- ($sections)( .*)? ---\$" '
   /^# --- .* ---$/ { on = ($0 ~ want); next }
   on && match($0, /^(# )?CHELABASE_[A-Z0-9_]+=/) {
     line = substr($0, RSTART, RLENGTH); sub(/^# /, "", line); sub(/=$/, "", line); print line
   }' "$example" | sort -u >"$tmp/names"
+# The MCP profile's own settings (mcp-core m8) are documented there, so they are checked.
+for name in CHELABASE_MCP_URL CHELABASE_MCP_RUNTIME_MEMORY; do
+  grep -qx "$name" "$tmp/names" || err "$example's MCP section has no $name line"
+done
 [[ "$(wc -l <"$tmp/names")" -ge 10 ]] || err "found only $(wc -l <"$tmp/names") tunables in $example's sections ($sections): did a heading change?"
 
 {
@@ -39,6 +45,7 @@ awk -v want="^# --- ($sections)( .*)? ---\$" '
   while read -r name; do
     case "$name" in
       CHELABASE_FUNCTIONS_RUNTIME_MEMORY) echo "$name=777m" ;;
+      CHELABASE_MCP_RUNTIME_MEMORY) echo "$name=333m" ;;
       *) echo "$name=tunable-$name" ;;
     esac
   done <"$tmp/names"
@@ -46,7 +53,7 @@ awk -v want="^# --- ($sections)( .*)? ---\$" '
 mv "$tmp/env.all" "$tmp/env"
 
 docker compose -p chelabase-env-tunables --project-directory "$dir" -f "$dir/docker-compose.yml" \
-  --profile services --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
+  --profile services --profile mcp --env-file "$tmp/env" config --format json >"$tmp/config.json" 2>"$tmp/config.err" ||
   { cat "$tmp/config.err" >&2; err "docker compose config failed"; exit 1; }
 
 checked=0
@@ -60,6 +67,11 @@ while read -r name; do
       got="$(jq -r '.services["functions-runtime"].mem_limit // empty' "$tmp/config.json")"
       [[ "$got" == $((777 * 1024 * 1024)) || "$got" == 777m ]] ||
         err "$name doesn't set functions-runtime's mem_limit (got '$got')"
+      ;;
+    CHELABASE_MCP_RUNTIME_MEMORY)
+      got="$(jq -r '.services["mcp-runtime"] // {} | "\(.mem_limit // "") \(.memswap_limit // "")"' "$tmp/config.json")"
+      [[ "$got" == "$((333 * 1024 * 1024)) $((333 * 1024 * 1024))" || "$got" == "333m 333m" ]] ||
+        err "$name doesn't set mcp-runtime's mem_limit and memswap_limit (got '$got')"
       ;;
     CHELABASE_OPERATOR_TENANT_ID)
       [[ -z "$(jq -r --arg n "$name" '[.services[] | .environment[$n] // empty] | join(",")' "$tmp/config.json")" ]] ||

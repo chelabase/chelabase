@@ -74,7 +74,7 @@ macro_rules! node_names {
 }
 
 /// The variant name, e.g. `DropStmt` (pg_query 6.2's node list).
-fn kind_name(node: &NodeEnum) -> &'static str {
+pub(super) fn kind_name(node: &NodeEnum) -> &'static str {
     node_names!(node;
         Alias, RangeVar, TableFunc, IntoClause, Var, Param, Aggref, GroupingFunc, WindowFunc,
         WindowFuncRunCondition, MergeSupportFunc, SubscriptingRef, FuncExpr, NamedArgExpr,
