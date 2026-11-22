@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use chelabase_types::container_env::reserved_container_env_name;
 
 /// Memory a container gets when its spec names none (MiB), unless the cap is lower.
 pub const DEFAULT_MEMORY_MB: u32 = 512;
@@ -20,7 +21,7 @@ pub const MAX_ENV: usize = 128;
 pub const MAX_ENV_VALUE: usize = 32 * 1024;
 pub const MAX_ENV_TOTAL: usize = 256 * 1024;
 /// The variable the runner sets to the spec's port; a caller can't set it.
-pub const PORT_ENV: &str = "PORT";
+pub const PORT_ENV: &str = chelabase_types::container_env::PORT_ENV;
 
 /// The spec as stored. `deny_unknown_fields` at every level: anything else is refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -335,7 +336,9 @@ pub fn registry_host(image: &ImageRef) -> Option<(String, u16)> {
 }
 
 /// The container's environment: the caller's entries (names `[A-Za-z_][A-Za-z0-9_]*`, no NUL,
-/// bounded) and `PORT`, which only the runner sets.
+/// bounded) and `PORT`, which only the runner sets. An entry whose name is reserved
+/// ([`reserved_container_env_name`]: `PORT`, any `LD_` name, a runtime's start-up loader
+/// variable) is refused, so no environment is produced that carries one.
 pub fn environment(env: &BTreeMap<String, String>, port: u16) -> Result<Vec<String>, SpecError> {
     if env.len() > MAX_ENV {
         return Err(bad(format!("at most {MAX_ENV} environment entries")));
@@ -352,8 +355,17 @@ pub fn environment(env: &BTreeMap<String, String>, port: u16) -> Result<Vec<Stri
                 "environment name {name:?} is not [A-Za-z_][A-Za-z0-9_]*"
             )));
         }
+        // `reserved_container_env_name` below covers `PORT` too; this check comes first only
+        // for its clearer message.
         if name == PORT_ENV {
             return Err(bad("PORT is set by the runner"));
+        }
+        // A secret set before the orchestrator refused these, or kept through a change from
+        // function to service, stops here: no container starts with a loader variable.
+        if reserved_container_env_name(name) {
+            return Err(bad(format!(
+                "environment name {name} is reserved: a runtime or the loader reads it at start"
+            )));
         }
         if value.len() > MAX_ENV_VALUE || value.contains('\0') {
             return Err(bad(format!(
@@ -580,5 +592,71 @@ mod tests {
         assert!(environment(&many, 1).is_err());
         let big: BTreeMap<String, String> = [("A".into(), "x".repeat(MAX_ENV_VALUE + 1))].into();
         assert!(environment(&big, 1).is_err());
+    }
+
+    /// AC 6: an environment holding a loader variable (an exact name or any `LD_` name) is
+    /// refused, naming the entry, even beside valid ones; near misses and other cases pass.
+    #[test]
+    fn environment_refuses_loader_variables() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_ANYTHING",
+            "NODE_OPTIONS",
+            "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "PERL5OPT",
+            "RUBYOPT",
+            "BASH_ENV",
+            "ENV",
+        ] {
+            let env: BTreeMap<String, String> =
+                [("API_KEY".into(), "k".into()), (name.to_string(), "/x".into())].into();
+            let err = environment(&env, 8080).expect_err(name);
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
+        for name in ["LDX", "LD", "NODE_OPTION", "ld_preload", "Ld_PRELOAD", "ENVIRONMENT", "env"] {
+            let env: BTreeMap<String, String> = [(name.to_string(), "v".into())].into();
+            assert_eq!(environment(&env, 1).unwrap(), [format!("{name}=v"), "PORT=1".into()]);
+        }
+    }
+
+    /// AC 9: the runner also refuses the other variables a runtime or libc reads at start to
+    /// load code or options, from the same list the orchestrator checks secrets against.
+    #[test]
+    fn environment_refuses_every_runtime_loader_variable() {
+        for name in [
+            "JDK_JAVA_OPTIONS",
+            "GCONV_PATH",
+            "DOTNET_STARTUP_HOOKS",
+            "PERL5LIB",
+            "RUBYLIB",
+            "PYTHONHOME",
+            "NODE_PATH",
+            "PYTHONWARNINGS",
+            "PYTHONUSERBASE",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "CORECLR_ENABLE_PROFILING",
+            "CORECLR_PROFILER_PATH",
+            "CORECLR_PROFILER_PATH_32",
+            "CORECLR_PROFILER_PATH_64",
+            "DOTNET_ADDITIONAL_DEPS",
+        ]
+        .into_iter()
+        .chain(chelabase_types::container_env::LOADER_NAMES.iter().copied())
+        {
+            let env: BTreeMap<String, String> = [(name.to_string(), "/x".into())].into();
+            let err = environment(&env, 1).expect_err(name);
+            assert!(err.to_string().contains(name), "{name}: {err}");
+        }
+        for name in ["PYTHONHOME2", "NODE_PATHS", "perl5lib", "GCONV"] {
+            let env: BTreeMap<String, String> = [(name.to_string(), "v".into())].into();
+            assert!(environment(&env, 1).is_ok(), "{name}");
+        }
     }
 }

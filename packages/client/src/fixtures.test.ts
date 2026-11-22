@@ -4,7 +4,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { createClient } from "./index.ts";
+import { createClient, op } from "./index.ts";
 import { stringify } from "./json.ts";
 import { type Database, types } from "./test-db.ts";
 
@@ -19,7 +19,7 @@ const builders: Record<string, () => { toTree(): unknown }> = {
     db
       .from("orders")
       .select("id", "total", { col: "customer_name", as: "customer" })
-      .where({ status: "paid", total: { gte: "100" } })
+      .where({ status: "paid", total: op.gte("100") })
       .orderBy("created_at", "desc")
       .limit(50),
   "select-everything": () => db.from("orders"),
@@ -29,26 +29,26 @@ const builders: Record<string, () => { toTree(): unknown }> = {
       .select("id")
       .where({
         and: [
-          { status: { eq: "paid" } },
-          { region: { neq: "eu" } },
-          { qty: { lt: 10 } },
-          { qty: { lte: 9 } },
-          { total: { gt: "1.00" } },
-          { total: { gte: "1.50" } },
-          { region: { in: ["eu", "us"] } },
-          { vip: { is: true } },
-          { customer_name: { like: "A%" } },
-          { region: { ilike: "e%" } },
+          { status: op.eq("paid") },
+          { region: op.neq("eu") },
+          { qty: op.lt(10) },
+          { qty: op.lte(9) },
+          { total: op.gt("1.00") },
+          { total: op.gte("1.50") },
+          { region: op.in(["eu", "us"]) },
+          { vip: op.is(true) },
+          { customer_name: op.like("A%") },
+          { region: op.ilike("e%") },
         ],
       }),
   "select-nested-filters": () =>
     db.from("orders").where({
       status: "paid",
-      or: [{ region: { in: ["eu"] } }, { vip: true, qty: { gt: 2 } }],
+      or: [{ region: op.in(["eu"]) }, { vip: true, qty: op.gt(2) }],
       not: { customer_name: null },
     }),
   "select-several-operators-on-one-column": () =>
-    db.from("orders").select("id").where({ qty: { gte: 1, lt: 10 } }),
+    db.from("orders").select("id").where({ qty: op.all(op.gte(1), op.lt(10)) }),
   "select-alias": () => db.from("orders").select({ col: "customer_name", as: "customer" }, "id"),
   "select-order-nulls": () =>
     db
@@ -63,8 +63,8 @@ const builders: Record<string, () => { toTree(): unknown }> = {
     db.from("orders").where({ and: [{ col: "and", eq: "x" }, { status: "paid" }] }),
   "select-big-values": () =>
     big.from("events").where({
-      id: { in: [9007199254740993n, 1n] },
-      amount: { gt: "123456789012345678901234567890.12" },
+      id: op.in([9007199254740993n, 1n]),
+      amount: op.gt("123456789012345678901234567890.12"),
     }),
   "insert-many": () =>
     db
@@ -88,7 +88,7 @@ const builders: Record<string, () => { toTree(): unknown }> = {
     db
       .from("orders")
       .delete()
-      .where({ status: "pending", created_at: { lt: "2026-01-01T00:00:00Z" } }),
+      .where({ status: "pending", created_at: op.lt("2026-01-01T00:00:00Z") }),
   "delete-all": () => db.from("billing.invoices").delete().all().returning("id"),
   call: () => db.call("add_points", { user_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7", n: 5 }),
   "call-qualified-no-args": () => db.call("public.next_id"),

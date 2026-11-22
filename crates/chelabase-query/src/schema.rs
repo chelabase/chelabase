@@ -52,8 +52,47 @@ type SchemaJson = (
     BTreeMap<String, Vec<FunctionDesc>>,
 );
 
-/// Roles cached per schema version; past this many, the oldest are dropped.
-const ROLE_VIEWS: u64 = 64;
+/// Roles cached per schema version; past this many, the oldest are dropped. Each view holds
+/// its own copy of the tables and functions its role reaches, so a schema is weighed as if
+/// it held this many full views ([`Schema::approx_bytes`]): 16 keeps that weight, for an
+/// ordinary schema, well inside the schema cache's bound, and covers the roles one database
+/// serves at a time (a role past it is read again, one catalog query).
+const ROLE_VIEWS: u64 = 16;
+
+/// The bytes one table's entry takes in a [`RoleView`]: its key and its [`TableInfo`].
+fn table_view_bytes<'a>(schema: &str, name: &str, columns: impl Iterator<Item = &'a ColumnInfo>) -> usize {
+    use std::mem::size_of;
+    size_of::<((String, String), TableInfo)>()
+        + 2 * (schema.len() + name.len())
+        + columns
+            .map(|c| size_of::<ColumnInfo>() + c.name.len() + c.type_sql.len() + c.type_qualified.len())
+            .sum::<usize>()
+}
+
+/// The bytes one overload takes in a [`RoleView`], with a key of its own (overloads of one
+/// name share theirs, so this is an upper bound).
+fn function_view_bytes<'a>(info: &FunctionInfo, required: impl Iterator<Item = &'a str>) -> usize {
+    use std::mem::size_of;
+    size_of::<((String, String), Overloads)>()
+        + size_of::<(FunctionInfo, Vec<String>)>()
+        + 2 * (info.schema.len() + info.name.len())
+        + info
+            .args
+            .iter()
+            .map(|(n, t)| size_of::<(String, String)>() + n.len() + t.len())
+            .sum::<usize>()
+        + required.map(|r| size_of::<String>() + r.len()).sum::<usize>()
+}
+
+/// The bytes a [`RoleView`]'s [`Visibility`] takes for this many schemas, tables and
+/// functions.
+fn visibility_bytes(schemas: usize, tables: usize, functions: usize) -> usize {
+    use std::mem::size_of;
+    size_of::<RoleView>()
+        + schemas * size_of::<u32>()
+        + tables * size_of::<(u32, Privileges)>()
+        + functions * size_of::<u32>()
+}
 
 pub fn is_reserved(schema: &str) -> bool {
     RESERVED_SCHEMAS.contains(&schema)
@@ -351,6 +390,8 @@ pub struct Schema {
     /// Enum type oid → (schema, name, labels in order).
     enums: HashMap<u32, (String, String, Vec<String>)>,
     views: moka::sync::Cache<String, Arc<RoleView>>,
+    /// [`Schema::approx_bytes`], computed once when the schema is built.
+    bytes: usize,
 }
 
 impl std::fmt::Debug for Schema {
@@ -541,8 +582,9 @@ impl Schema {
             .filter(|f| !is_reserved(&f.1))
             .filter_map(|f| callable(&types, f))
             .collect();
-        Schema {
+        let mut schema = Schema {
             version,
+            bytes: 0,
             namespaces: raw
                 .namespaces
                 .into_iter()
@@ -553,7 +595,118 @@ impl Schema {
             app_users: raw.app_users,
             enums,
             views: moka::sync::Cache::new(ROLE_VIEWS),
-        }
+        };
+        schema.bytes = schema.measure();
+        schema
+    }
+
+    /// About how many bytes this schema can hold: its own (tables, columns, functions, enums
+    /// and namespaces) plus [`ROLE_VIEWS`] role views, each counted as a view of everything
+    /// ([`Self::full_view_bytes`]), since the views fill in after the schema is cached and a
+    /// cached entry's weight isn't revised. Computed once when it is built; what the schema
+    /// cache weighs it by, so the cache's byte bound covers the views too.
+    pub fn approx_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// An upper bound on one role view's bytes: a view of every table and function, with
+    /// every schema, table and function in its visibility.
+    fn full_view_bytes(&self) -> usize {
+        let tables: usize = self
+            .tables
+            .iter()
+            .map(|t| table_view_bytes(&t.schema, &t.name, t.columns.iter().map(|c| &c.info)))
+            .sum();
+        let functions: usize = self
+            .functions
+            .iter()
+            .map(|f| function_view_bytes(&f.info, f.required()))
+            .sum();
+        tables + functions + visibility_bytes(self.namespaces.len(), self.tables.len(), self.functions.len())
+    }
+
+    fn measure(&self) -> usize {
+        self.own_bytes()
+            .saturating_add((ROLE_VIEWS as usize).saturating_mul(self.full_view_bytes()))
+    }
+
+    /// The schema's own bytes, its role views left out.
+    fn own_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let ty = |t: &TypeDesc| {
+            size_of::<TypeDesc>() + t.name.len() + t.enum_ref.as_ref().map_or(0, String::len)
+        };
+        let tables: usize = self
+            .tables
+            .iter()
+            .map(|t| {
+                let columns: usize = t
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        size_of::<Column>()
+                            + c.info.name.len()
+                            + c.info.type_sql.len()
+                            + c.info.type_qualified.len()
+                            + ty(&c.ty)
+                            + c.storage_ref.as_ref().map_or(0, |s| match s {
+                                StorageRefDesc::Path { bucket } => bucket.len(),
+                                _ => 0,
+                            })
+                    })
+                    .sum();
+                size_of::<Table>()
+                    + t.schema.len()
+                    + t.name.len()
+                    + columns
+                    + t.primary_key.iter().map(|k| size_of::<String>() + k.len()).sum::<usize>()
+            })
+            .sum();
+        let functions: usize = self
+            .functions
+            .iter()
+            .map(|f| {
+                let info_args: usize = f
+                    .info
+                    .args
+                    .iter()
+                    .map(|(n, t)| size_of::<(String, String)>() + n.len() + t.len())
+                    .sum();
+                let args: usize = f
+                    .args
+                    .iter()
+                    .map(|a| size_of::<Arg>() + a.name.len() + ty(&a.ty))
+                    .sum();
+                size_of::<Function>()
+                    + f.info.schema.len()
+                    + f.info.name.len()
+                    + info_args
+                    + args
+                    + ty(&f.returns)
+            })
+            .sum();
+        let enums: usize = self
+            .enums
+            .values()
+            .map(|(s, n, labels)| {
+                size_of::<(String, String, Vec<String>)>()
+                    + s.len()
+                    + n.len()
+                    + labels.iter().map(|l| size_of::<String>() + l.len()).sum::<usize>()
+            })
+            .sum();
+        let namespaces: usize = self
+            .namespaces
+            .iter()
+            .map(|(_, n)| size_of::<(u32, String)>() + n.len())
+            .sum();
+        size_of::<Schema>()
+            + self.version.len()
+            + tables
+            + functions
+            + enums
+            + namespaces
+            + self.app_users.as_ref().map_or(0, |(a, b)| a.len() + b.len())
     }
 
     /// The cached view for `role`, if it was computed at this version.
@@ -817,6 +970,30 @@ pub struct RoleView {
     pub visibility: Visibility,
 }
 
+impl RoleView {
+    /// About how many bytes this view holds.
+    pub fn approx_bytes(&self) -> usize {
+        let tables: usize = self
+            .tables
+            .values()
+            .map(|t| table_view_bytes(&t.schema, &t.name, t.columns.iter()))
+            .sum();
+        let functions: usize = self
+            .functions
+            .values()
+            .flatten()
+            .map(|(f, required)| function_view_bytes(f, required.iter().map(String::as_str)))
+            .sum();
+        tables
+            + functions
+            + visibility_bytes(
+                self.visibility.schemas.len(),
+                self.visibility.tables.len(),
+                self.visibility.functions.len(),
+            )
+    }
+}
+
 impl Catalog for RoleView {
     fn table(&self, name: &Name) -> Option<&TableInfo> {
         let schema = name.schema.as_ref()?;
@@ -1022,7 +1199,41 @@ mod tests {
             functions: vec![search],
             enums,
             views: moka::sync::Cache::new(ROLE_VIEWS),
+            bytes: 0,
         }
+    }
+
+    /// W9: a schema's weight covers what it can come to hold: its own bytes plus a full set
+    /// of role views. A view of everything the schema has is within the bound for one view,
+    /// a narrower view is smaller, and with every view slot filled the views' real bytes
+    /// stay within what the weight counted for them.
+    #[test]
+    fn a_schemas_weight_covers_a_full_set_of_role_views() {
+        let mut schema = fixture();
+        schema.bytes = schema.measure();
+        let all = Privileges { select: true, insert: true, update: true, delete: true };
+        let full = schema.view(visibility(&[(10, all), (11, all)]));
+        assert!(full.approx_bytes() > 0);
+        assert!(full.approx_bytes() <= schema.full_view_bytes());
+        let narrow = schema.view(visibility(&[(11, all)]));
+        assert!(narrow.approx_bytes() < full.approx_bytes());
+        assert!(
+            schema.approx_bytes() >= schema.own_bytes() + ROLE_VIEWS as usize * full.approx_bytes(),
+            "{} < {} + {ROLE_VIEWS} * {}",
+            schema.approx_bytes(),
+            schema.own_bytes(),
+            full.approx_bytes()
+        );
+        // More roles than slots: the cache keeps at most `ROLE_VIEWS` views.
+        for i in 0..ROLE_VIEWS * 2 {
+            schema.insert_view(&format!("role_{i}"), visibility(&[(10, all), (11, all)]));
+        }
+        schema.views.run_pending_tasks();
+        let held: usize = schema.views.iter().map(|(_, v)| v.approx_bytes()).sum();
+        assert!(schema.views.entry_count() <= ROLE_VIEWS);
+        assert!(schema.own_bytes() + held <= schema.approx_bytes());
+        // An ordinary schema still fits the cache many times over.
+        assert!(schema.approx_bytes() < 1 << 20, "{}", schema.approx_bytes());
     }
 
     fn visibility(tables: &[(u32, Privileges)]) -> Visibility {

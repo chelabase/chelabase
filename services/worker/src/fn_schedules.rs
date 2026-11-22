@@ -10,12 +10,19 @@
 //! than there are free slots (none while every slot is busy), so a slow functions service
 //! delays the next claims instead of piling up requests. Schedules left unclaimed stay due and
 //! run, coalesced, once a slot frees.
+//!
+//! One database never holds more than [`chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE`] of
+//! those slots: [`DatabaseRuns`] counts each database's runs in flight (a [`RunGuard`] held by
+//! the run's task, released on every way out of it: done, failed, timed out, panicked or
+//! dropped at shutdown), and a claim gives each database only what is left of its share, so
+//! one tenant's due schedules can't fill every slot. The ones left out stay due, untouched.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chelabase_metadata::MetadataClient;
-use chelabase_types::BranchId;
+use chelabase_types::{BranchId, DatabaseId};
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -91,6 +98,50 @@ impl Invoker for HttpInvoker {
     }
 }
 
+/// The runs in flight per database. Cheap to clone (shared).
+#[derive(Clone, Default)]
+pub struct DatabaseRuns(Arc<Mutex<HashMap<DatabaseId, usize>>>);
+
+/// One run's count in [`DatabaseRuns`]; dropping it (on any exit of the run's task) gives it
+/// back.
+pub struct RunGuard {
+    runs: DatabaseRuns,
+    database: DatabaseId,
+}
+
+impl DatabaseRuns {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<DatabaseId, usize>> {
+        // The map is only ever incremented and decremented: a poisoned lock holds valid data.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Counts a run of `database` until the guard drops.
+    pub fn enter(&self, database: DatabaseId) -> RunGuard {
+        *self.map().entry(database).or_insert(0) += 1;
+        RunGuard {
+            runs: self.clone(),
+            database,
+        }
+    }
+
+    /// Every database with runs in flight and how many, for the claim.
+    pub fn in_flight(&self) -> Vec<(DatabaseId, usize)> {
+        self.map().iter().map(|(d, n)| (*d, *n)).collect()
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let mut map = self.runs.map();
+        if let Some(n) = map.get_mut(&self.database) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.database);
+            }
+        }
+    }
+}
+
 /// How many schedules the next claim may take: the free run slots, at most [`BATCH`].
 pub fn claim_limit(permits: &Semaphore) -> i64 {
     (permits.available_permits() as i64).min(BATCH)
@@ -101,6 +152,7 @@ pub fn claim_limit(permits: &Semaphore) -> i64 {
 /// a run.
 pub async fn start_runs(
     permits: &Arc<Semaphore>,
+    runs: &DatabaseRuns,
     invoker: &Arc<dyn Invoker>,
     claimed: &[chelabase_metadata::ClaimedSchedule],
 ) {
@@ -109,6 +161,8 @@ pub async fn start_runs(
             debug!(schedule = %s.id, branch_id = %s.branch_id, function = %s.function_name, "schedule advanced without a run");
             continue;
         };
+        // Counted before the wait for a slot, so the next claim sees this run.
+        let counted = runs.enter(s.database_id);
         let Ok(slot) = permits.clone().acquire_owned().await else {
             return;
         };
@@ -116,7 +170,7 @@ pub async fn start_runs(
         let (id, branch, name) = (s.id, s.branch_id, s.function_name.clone());
         let body = event_body(&s.cron, tick);
         tokio::spawn(async move {
-            let _slot = slot;
+            let (_slot, _counted) = (slot, counted);
             match invoker.invoke(branch, &name, body).await {
                 Ok(status) if (200..300).contains(&status) => {
                     debug!(schedule = %id, branch_id = %branch, function = %name, "scheduled run done");
@@ -139,26 +193,28 @@ pub async fn claim_once(
     metadata: &MetadataClient,
     invoker: &Arc<dyn Invoker>,
     permits: &Arc<Semaphore>,
+    runs: &DatabaseRuns,
 ) -> Result<bool, chelabase_metadata::MetadataError> {
     let limit = claim_limit(permits);
     if limit == 0 {
         debug!("every scheduled-run slot is busy: claiming later");
         return Ok(false);
     }
-    let claimed = metadata.claim_due_schedules(limit).await?;
-    start_runs(permits, invoker, &claimed).await;
+    let claimed = metadata.claim_due_schedules(limit, &runs.in_flight()).await?;
+    start_runs(permits, runs, invoker, &claimed).await;
     Ok(claimed.len() as i64 >= limit)
 }
 
 /// The loop: a claim every [`EVERY`], and again at once after a full one.
 pub async fn schedule_loop(metadata: MetadataClient, invoker: Arc<dyn Invoker>) {
     let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+    let runs = DatabaseRuns::default();
     let mut every = tokio::time::interval(EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
         loop {
-            match claim_once(&metadata, &invoker, &permits).await {
+            match claim_once(&metadata, &invoker, &permits, &runs).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -300,9 +356,14 @@ mod tests {
     }
 
     fn claimed(run: bool) -> chelabase_metadata::ClaimedSchedule {
+        claimed_in(DatabaseId::new(), run)
+    }
+
+    fn claimed_in(database: DatabaseId, run: bool) -> chelabase_metadata::ClaimedSchedule {
         chelabase_metadata::ClaimedSchedule {
             id: uuid::Uuid::new_v4(),
             branch_id: BranchId::new(),
+            database_id: database,
             function_name: "f".into(),
             cron: "* * * * *".into(),
             run: run.then(Utc::now),
@@ -332,7 +393,7 @@ mod tests {
             .collect();
         let starting = {
             let (permits, invoker) = (permits.clone(), invoker.clone());
-            tokio::spawn(async move { start_runs(&permits, &invoker, &batch).await })
+            tokio::spawn(async move { start_runs(&permits, &DatabaseRuns::default(), &invoker, &batch).await })
         };
         while held.now.load(SeqCst) < 3 {
             tokio::task::yield_now().await;
@@ -371,5 +432,95 @@ mod tests {
             event_body("* * * * *", t),
             serde_json::json!({"type": "scheduled", "cron": "* * * * *", "scheduledTime": 1767225600000_i64})
         );
+    }
+
+    /// Answers each call by its name: `fail` a 500, `down` an error, `boom` a panic, `block`
+    /// waits until cancelled, anything else 200.
+    struct Scripted;
+
+    #[async_trait::async_trait]
+    impl Invoker for Scripted {
+        async fn invoke(&self, _: BranchId, name: &str, _: serde_json::Value) -> Result<u16, String> {
+            match name {
+                "fail" => Ok(500),
+                "down" => Err("unreachable".into()),
+                "boom" => panic!("the run panicked"),
+                "block" => std::future::pending().await,
+                _ => Ok(200),
+            }
+        }
+    }
+
+    fn named(database: DatabaseId, name: &str) -> chelabase_metadata::ClaimedSchedule {
+        chelabase_metadata::ClaimedSchedule {
+            function_name: name.into(),
+            ..claimed_in(database, true)
+        }
+    }
+
+    /// Whatever way a run ends (a failure status, an unreachable service, a panic, the task
+    /// cancelled at shutdown), its database's count drops, so no database stays reported busy.
+    #[tokio::test]
+    async fn a_failed_or_panicking_run_releases_its_database_slot() {
+        let runs = DatabaseRuns::default();
+        let permits = Arc::new(Semaphore::new(8));
+        let invoker: Arc<dyn Invoker> = Arc::new(Scripted);
+        let db = DatabaseId::new();
+        let batch: Vec<_> = ["ok", "fail", "down", "boom"].iter().map(|n| named(db, n)).collect();
+        start_runs(&permits, &runs, &invoker, &batch).await;
+        while !runs.in_flight().is_empty() || permits.available_permits() < 8 {
+            tokio::task::yield_now().await;
+        }
+
+        // A run still going is counted; a guard gives its count back whenever it drops.
+        let batch = [named(db, "block")];
+        start_runs(&permits, &runs, &invoker, &batch).await;
+        assert_eq!(runs.in_flight(), vec![(db, 1)]);
+        let guard = runs.enter(db);
+        assert_eq!(runs.in_flight(), vec![(db, 2)]);
+        drop(guard);
+        assert_eq!(runs.in_flight(), vec![(db, 1)]);
+
+        // A start_runs future dropped while it waits for a slot gives its count back too.
+        let tight = Arc::new(Semaphore::new(0));
+        let waiting = {
+            let (runs, invoker) = (runs.clone(), invoker.clone());
+            let batch = [named(DatabaseId::new(), "ok")];
+            tokio::spawn(async move { start_runs(&tight, &runs, &invoker, &batch).await })
+        };
+        while runs.in_flight().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(runs.in_flight(), vec![(db, 1)]);
+    }
+
+    /// The claim is told which databases have runs in flight and how many, and a database's
+    /// count rises with each run started and falls as each ends.
+    #[tokio::test]
+    async fn busy_databases_are_reported_to_the_claim() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let held = Arc::new(Held {
+            now: 0.into(),
+            most: 0.into(),
+            done: 0.into(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let invoker: Arc<dyn Invoker> = held.clone();
+        let permits = Arc::new(Semaphore::new(64));
+        let runs = DatabaseRuns::default();
+        let (a, b) = (DatabaseId::new(), DatabaseId::new());
+        let batch: Vec<_> = (0..3).map(|_| claimed_in(a, true)).chain([claimed_in(b, true)]).collect();
+        start_runs(&permits, &runs, &invoker, &batch).await;
+        while held.now.load(SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+        let seen: HashMap<_, _> = runs.in_flight().into_iter().collect();
+        assert_eq!(seen, HashMap::from([(a, 3), (b, 1)]));
+        held.release.add_permits(4);
+        while held.done.load(SeqCst) < 4 || !runs.in_flight().is_empty() {
+            tokio::task::yield_now().await;
+        }
     }
 }

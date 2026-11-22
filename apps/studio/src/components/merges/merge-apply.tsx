@@ -14,6 +14,10 @@ export interface MergeApplyProps {
   branchesLoaded: boolean;
   /** An action or save is in flight. */
   pending: boolean;
+  /** Why this viewer can't apply though their level allows merging here (the plan needs Admin), or null. */
+  applyReason?: string | null;
+  /** The same for a retry. */
+  retryReason?: string | null;
   /** Applies; resolves to "confirm" when the API asks for the protected-target confirm. */
   onApply: (confirm: boolean) => Promise<"confirm" | undefined>;
   /** Retries the apply (E20): from the start after a roles, enum or transaction failure, else the online steps. */
@@ -58,6 +62,8 @@ export function MergeApply({
   targetProtected,
   branchesLoaded,
   pending,
+  applyReason = null,
+  retryReason = null,
   onApply,
   onRetry,
   onAbandon,
@@ -65,7 +71,7 @@ export function MergeApply({
   const [confirming, setConfirming] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
   const reasonId = useId();
-  const refusals = applyBlockers(merge);
+  const refusals = applyReason ? [applyReason] : applyBlockers(merge);
   const blockers = refusals.length === 0 && !branchesLoaded ? ["Loading the branches…"] : refusals;
   const steps = plan?.steps ?? [];
   const done = appliedSteps(events, steps);
@@ -140,9 +146,10 @@ export function MergeApply({
             enum values the first attempt made stay on {targetName}; the retry finds them and goes on. To plan the merge
             again instead, recompute it.
           </p>
-          <Button size="sm" variant="outline" disabled={pending} onClick={onRetry}>
+          <Button size="sm" variant="outline" disabled={pending || retryReason !== null} onClick={onRetry}>
             Retry the apply
           </Button>
+          {retryReason && <p className="text-xs text-muted-foreground">{retryReason}</p>}
         </div>
       )}
 
@@ -156,7 +163,7 @@ export function MergeApply({
           </p>
           {merge.error && <ErrorBody error={merge.error} />}
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="outline" disabled={pending} onClick={onRetry}>
+            <Button size="sm" variant="outline" disabled={pending || retryReason !== null} onClick={onRetry}>
               Retry the online steps
             </Button>
             {!abandoning && (
@@ -165,6 +172,7 @@ export function MergeApply({
               </Button>
             )}
           </div>
+          {retryReason && <p className="text-xs text-muted-foreground">{retryReason}</p>}
           {abandoning && (
             <section aria-label="Confirm the abandon" className="space-y-2 rounded-lg border border-destructive/60 p-3">
               <p>

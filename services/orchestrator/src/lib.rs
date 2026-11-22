@@ -3659,7 +3659,7 @@ mod function_secrets_key_tests {
             let branch = BranchId(Uuid::new_v4());
             tokio::time::timeout(
                 std::time::Duration::from_millis(300),
-                client.put_secret(branch, Uuid::new_v4(), "API_KEY", "value"),
+                client.put_secret(branch, Uuid::new_v4(), "API_KEY", "value", false),
             )
             .await
         };

@@ -188,7 +188,7 @@ impl Fx {
     async fn cloud(&self, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(&self.ep, &self.database, sql)
+            .admin_sql(&self.ep, &self.database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
             .trim()

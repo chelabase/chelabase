@@ -2193,7 +2193,7 @@
             }
           },
           "408": {
-            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default), or did not finish within `CHELABASE_STORAGE_PART_DEADLINE_SECS` (900 s by default)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2213,7 +2213,7 @@
             }
           },
           "413": {
-            "description": "`too_large`: over 100 MiB or the bucket's limit",
+            "description": "`too_large`: over 100 MiB or the bucket's limit (with the parts uploaded at the same time)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2345,6 +2345,16 @@
           },
           "415": {
             "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too_many_uploads`: 100 resumable uploads are already open for this key and caller in the bucket",
             "content": {
               "application/json": {
                 "schema": {

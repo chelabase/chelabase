@@ -528,6 +528,7 @@ fn info(server_name: Option<&str>) -> ConnInfo {
         replication_host: None,
         user: "authenticator".into(),
         password: "pw".into(),
+        elevated: None,
     }
 }
 

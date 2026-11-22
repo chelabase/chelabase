@@ -1,5 +1,5 @@
 {
-  "call": "db.from(\"orders\").where({ status: \"paid\", or: [{ region: { in: [\"eu\"] } }, { vip: true, qty: { gt: 2 } }], not: { customer_name: null } })",
+  "call": "db.from(\"orders\").where({ status: \"paid\", or: [{ region: op.in([\"eu\"]) }, { vip: true, qty: op.gt(2) }], not: { customer_name: null } })",
   "tree": {
     "v": 1,
     "op": "select",

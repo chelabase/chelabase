@@ -158,12 +158,19 @@ pub trait PendingInsert: Send {
 }
 
 /// The insertable columns of the table (`$1`, a quoted `schema.table`), minus `$2` (the
-/// managed ones): not generated, not `GENERATED ALWAYS`, and `authenticated` may insert.
+/// managed ones): not generated, not `GENERATED ALWAYS`, and the column's own ACL (`attacl`)
+/// grants `INSERT` straight to `authenticated` (`GRANT INSERT (col) … TO authenticated`). A
+/// table-level, `PUBLIC` or inherited grant doesn't count: the row is written by a role that
+/// bypasses those checks, so only the per-column opt-in decides. The role is matched by name at
+/// run time (not a `regrole` constant), so a cached statement stays right if the role is
+/// re-created.
 pub const INSERTABLE_COLUMNS_SQL: &str = "SELECT a.attname::text FROM pg_catalog.pg_attribute a
  WHERE a.attrelid OPERATOR(pg_catalog.=) $1::pg_catalog.regclass AND a.attnum OPERATOR(pg_catalog.>) 0
    AND NOT a.attisdropped AND a.attgenerated OPERATOR(pg_catalog.=) '' AND a.attidentity OPERATOR(pg_catalog.<>) 'a'
    AND a.attname OPERATOR(pg_catalog.<>) ALL ($2::pg_catalog.name[])
-   AND pg_catalog.has_column_privilege('authenticated', a.attrelid, a.attname::pg_catalog.text, 'INSERT')";
+   AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+     WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+       AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated')";
 
 fn quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
@@ -500,6 +507,22 @@ async fn insert_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sign-up data reaches a column only when the column's own ACL grants `INSERT` straight
+    /// to `authenticated`: a table-level, `PUBLIC` or inherited grant doesn't count.
+    #[test]
+    fn insertable_columns_sql_reads_the_column_acl() {
+        assert!(
+            INSERTABLE_COLUMNS_SQL.ends_with(
+                "\n   AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x\n     \
+                 WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'\n       \
+                 AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated')"
+            ),
+            "{INSERTABLE_COLUMNS_SQL}"
+        );
+        assert!(!INSERTABLE_COLUMNS_SQL.contains("has_column_privilege"));
+        assert!(!INSERTABLE_COLUMNS_SQL.contains("has_table_privilege"));
+    }
 
     struct Fake {
         code: &'static str,

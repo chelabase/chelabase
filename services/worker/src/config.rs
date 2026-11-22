@@ -490,6 +490,7 @@ pub fn build_with(
         claim_refresh: DEFAULT_CLAIM_REFRESH,
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
+        login_rollout_retry: Default::default(),
         recreate_backoff: Default::default(),
         fn_sweeps: Default::default(),
         identity: identity_client(config),

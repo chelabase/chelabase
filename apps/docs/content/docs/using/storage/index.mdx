@@ -57,8 +57,8 @@ Every download is served with `X-Content-Type-Options: nosniff` and `Content-Sec
 ## Uploads and limits
 
 - **Single uploads** stream the body of any length (chunked included) in one request. Bytes are counted as they arrive, so `file_size_limit` holds whatever `Content-Length` says.
-- **Resumable uploads** go up in parts: start a session (`POST /storage/v1/upload/{bucket}/{name}`), send parts 1 to 10000 of **5 MiB to 100 MiB** each (the last may be smaller; a part sent again replaces it), then complete it. Completing checks the policies and the bucket's limits again and makes the object atomically; a refusal (403, 413, 415) aborts the upload. A session lasts 24 hours, then its parts answer 410 `upload_expired` and the sweep removes them. A session belongs to its caller: anyone else gets 404.
-- **Idle bodies.** An upload whose body sends nothing for 60 seconds fails with 408 `request_timeout` and frees its memory (`CHELABASE_STORAGE_BODY_IDLE_SECS`).
+- **Resumable uploads** go up in parts: start a session (`POST /storage/v1/upload/{bucket}/{name}`), send parts 1 to 10000 of **5 MiB to 100 MiB** each (the last may be smaller; a part sent again replaces it), then complete it. Completing checks the policies and the bucket's limits again and makes the object atomically; a refusal (403, 413, 415) aborts the upload. A session lasts 24 hours, then its parts answer 410 `upload_expired` and the sweep removes them. A session belongs to its caller: anyone else gets 404. A key and caller can have 100 live sessions in a bucket; starting another answers 429 `too_many_uploads` until some are completed, aborted or expired. The parts recorded for a session never total more than the bucket's `file_size_limit`: a part that would pass it, even one racing another part, answers 413 `too_large`.
+- **Idle bodies.** An upload whose body sends nothing for 60 seconds fails with 408 `request_timeout` and frees its memory (`CHELABASE_STORAGE_BODY_IDLE_SECS`). A part's body must also finish within 900 seconds in all (`CHELABASE_STORAGE_PART_DEADLINE_SECS`), however steadily it arrives, or it fails the same way.
 - **In-flight cap.** Each storage process holds at most 1 GiB of upload buffers at once (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`). Past it, uploads are refused with 503 `busy`: retry them. The client retries for you.
 
 The client picks single or resumable uploads by size and resumes after a failure. See [Client and server](/using/storage/client#upload).
@@ -84,7 +84,7 @@ Errors use the data API's envelope, `{"error": {"code", "message", …}}`. The c
 | 403 | `not_allowed`, `permission_denied` | No policy allows it |
 | 403 | `database_not_allowed`, `role_not_allowed`, `token_not_valid` | The key can't use the database, its role is owner-level, or a URL's token is for another object, used already, or its key was revoked |
 | 404 | `bucket_not_found`, `object_not_found`, `upload_not_found` | Missing or hidden (the same answer, so a hidden object isn't revealed) |
-| 408 | `request_timeout` | The body went idle |
+| 408 | `request_timeout` | The body went idle, or a resumable part ran past its total deadline |
 | 409 | `conflict` | The name is taken, or it changed meanwhile |
 | 409 | `write_once` | A write-once bucket refused the change |
 | 409 | `referenced`, `delete_refused`, `retry` | A delete refused by a table that references the object; see [Object references](/using/storage/refs#deleting-a-referenced-object) |
@@ -93,4 +93,5 @@ Errors use the data API's envelope, `{"error": {"code", "message", …}}`. The c
 | 413 | `too_large` | Over the bucket's `file_size_limit`, or a part over 100 MiB |
 | 415 | `mime_not_allowed` | A type the bucket doesn't allow |
 | 416 | `range_not_satisfiable` | A `Range` outside the object |
+| 429 | `too_many_uploads` | 100 resumable uploads are already open for this key and caller in the bucket |
 | 503 | `busy`, `unavailable`, `storage_unavailable` | Too many uploads in flight, or the database or storage isn't available right now; retry |

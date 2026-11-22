@@ -44,6 +44,9 @@ fn sql_on(w: &FakeWorker) -> Vec<(String, String)> {
         .lock()
         .unwrap()
         .iter()
+        // The login move step's read after the drop has its own test
+        // (`a_delete_or_rename_is_followed_by_the_login_move_step`).
+        .filter(|(_, _, s)| !s.contains("/* chelabase: member roles */"))
         .map(|(_, db, s)| (db.clone(), s.clone()))
         .collect()
 }

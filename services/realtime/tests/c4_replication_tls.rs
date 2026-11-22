@@ -71,6 +71,7 @@ fn the_check_pools_keep_host() {
         replication_host: Some("10.213.4.20".into()),
         user: "authenticator".into(),
         password: "pw".into(),
+        elevated: None,
     };
     let config = connect_config(&info, "app", Some(&tls)).unwrap();
     let addrs: Vec<String> = config
