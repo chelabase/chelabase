@@ -28,6 +28,10 @@ const config :Workerd.Config = (
   # pinned workerd has no per-isolate memory limit for loaded workers and aborts the process
   # when any isolate reaches this cap; the watchdog exits with it and the restart policy starts
   # it again (one run's unbounded allocation costs every in-flight run, like a busy loop).
+  # ArrayBuffer and typed-array memory sits outside the V8 heap and this cap doesn't count it:
+  # only the container's memory limit ends an unbounded Uint8Array allocation (the kernel kills
+  # workerd and the restart policy starts it again). Run the container with swap equal to memory
+  # (compose: memswap_limit = mem_limit) so that limit is the whole bound.
   v8Flags = ["--max-old-space-size=128"],
 );
 
