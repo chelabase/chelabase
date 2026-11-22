@@ -33,6 +33,16 @@ const config :Workerd.Config = (
   # workerd and the restart policy starts it again). Run the container with swap equal to memory
   # (compose: memswap_limit = mem_limit) so that limit is the whole bound.
   v8Flags = ["--max-old-space-size=128"],
+  # What a request leaves behind in a long-lived isolate (Request, Response, streams, stubs) is a
+  # few bytes each to V8 but 10-25 KiB of C++ memory, freed only by a major GC of that isolate.
+  # Left alone V8 runs one only after thousands of requests or more, and the watchdog's probe is
+  # a request every 2 s to two such isolates (the runner and the probe worker): an idle runtime
+  # climbs to about 400 MiB in a day and a half. This gate (cloudflare/workerd#8496, in
+  # 1.20261119.1, off by default while it rolls out) reports those objects' size to V8, so it
+  # collects in time: about 70 MiB after 2000 runs, 115-130 MiB with the probes' share, and level
+  # from there. workerd ignores a gate name it doesn't know, so tests/memory.test.mjs is what
+  # says the line still works after a workerd bump; drop it once a release has it on by default.
+  autogates = ["workerd-autogate-wrappable-external-memory"],
 );
 
 const runner :Workerd.Worker = (
