@@ -234,7 +234,7 @@ pub const RULES: &[(&str, &str, Rule)] = &[
     ),
     (
         "applySchemaChanges",
-        "A dry run (`dry_run: true`) is read, or write when any operation carries a SQL expression (a default, generated column, check, exclusion, index expression or predicate, policy, or `using`). A real run is destructive when any operation carries one, drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type, default or identity or lifts NOT NULL, or isn't known; otherwise write.",
+        "A dry run (`dry_run: true`) is read, or write when any operation carries a SQL expression (a default, generated column, check, exclusion, index expression or predicate, policy, or `using`). A real run is destructive when any operation carries one, adds a foreign key whose `on_delete` or `on_update` is anything but `no_action` or `restrict`, drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type, default or identity or lifts NOT NULL, or isn't known; otherwise write.",
         schema_changes,
     ),
 ];
@@ -432,11 +432,11 @@ fn schema_change(op: &Value) -> Class {
         return Destructive;
     };
     match kind.as_str() {
+        "add_constraint" if !constraint_cascades(fields.get("constraint")) => Write,
         "rename_table"
         | "set_table_comment"
         | "add_column"
         | "rename_column"
-        | "add_constraint"
         | "validate_constraint"
         | "rename_constraint"
         | "create_index"
@@ -450,7 +450,11 @@ fn schema_change(op: &Value) -> Class {
             let plain = ["grants", "policies", "rls", "owner"]
                 .iter()
                 .all(|key| empty(fields.get(*key)));
-            if fields.is_object() && plain {
+            let cascades = match fields.get("constraints") {
+                Some(Value::Array(cs)) => cs.iter().any(|c| constraint_cascades(Some(c))),
+                _ => false,
+            };
+            if fields.is_object() && plain && !cascades {
                 Write
             } else {
                 Destructive
@@ -555,6 +559,22 @@ fn constraint_runs_code(constraint: Option<&Value>) -> bool {
     };
     !single_entry(kind)
         .is_some_and(|(kind, _)| matches!(kind.as_str(), "primary_key" | "unique" | "foreign_key"))
+}
+
+/// A foreign key whose `on_delete` or `on_update` is anything but `no_action` or `restrict`
+/// (absent means `no_action`): a later delete or key change in the referenced table then
+/// deletes or rewrites rows here, so adding it is destructive.
+fn constraint_cascades(constraint: Option<&Value>) -> bool {
+    let Some((kind, fields)) = constraint.and_then(|c| c.get("kind")).and_then(single_entry)
+    else {
+        return false;
+    };
+    kind == "foreign_key"
+        && ["on_delete", "on_update"].iter().any(|key| match fields.get(*key) {
+            None => false,
+            Some(Value::String(action)) => !matches!(action.as_str(), "no_action" | "restrict"),
+            Some(_) => true,
+        })
 }
 
 /// An `alter_column` that only sets a comment or adds NOT NULL.
@@ -952,6 +972,39 @@ mod tests {
                 "predicate": null}}),
         ] {
             assert_eq!(changes(json!([op])), Class::Write, "{op}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_key_with_a_cascading_action_is_destructive() {
+        let t = json!({"name": "orders"});
+        let column = json!({"name": "x", "data_type": {"name": "int4"}});
+        let fk = |extra: Value| {
+            let mut fk = json!({"columns": ["x"], "references": {"name": "o"},
+                "referenced_columns": ["id"]});
+            fk.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            json!({"kind": {"foreign_key": fk}})
+        };
+        let add = |c: Value| json!({"add_constraint": {"table": t, "constraint": c}});
+        let create = |c: Value| json!({"create_table": {"table": t, "columns": [column],
+            "constraints": [c]}});
+        let dry = |op: Value| class(CHANGES, json!({"dry_run": true, "operations": [op]}));
+        for action in ["cascade", "set_null", "set_default", "future_action"] {
+            for extra in [json!({"on_delete": action}), json!({"on_update": action}),
+                json!({"on_delete": "restrict", "on_update": action})] {
+                for op in [add(fk(extra.clone())), create(fk(extra.clone()))] {
+                    assert_eq!(changes(json!([op])), Class::Destructive, "{op}");
+                    // A dry run without an expression stays a read.
+                    assert_eq!(dry(op.clone()), Class::Read, "{op}");
+                }
+            }
+        }
+        for extra in [json!({}), json!({"on_delete": "no_action"}),
+            json!({"on_delete": "restrict", "on_update": "no_action"}),
+            json!({"on_update": "restrict"})] {
+            for op in [add(fk(extra.clone())), create(fk(extra.clone()))] {
+                assert_eq!(changes(json!([op])), Class::Write, "{op}");
+            }
         }
     }
 
