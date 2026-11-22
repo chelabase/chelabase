@@ -64,7 +64,8 @@ web_reads=(
 
 # Paths no Rust or web check reads.
 no_checks=('*.md' 'docs/*' '.github/*' '.claude/*' '.cursor/*' .mcp.json 'LICENSE*' .gitignore
-  .dockerignore 'infra/images/*' 'infra/neon/*' 'infra/compose/*' 'infra/workbench/*' 'scripts/*')
+  .dockerignore 'infra/images/*' 'infra/neon/*' 'infra/compose/*' 'infra/workbench/*' 'scripts/*'
+  'infra/mcp-runtime/*')
 
 # The packages `just check-web` checks, in its order.
 web_checked=(@chelabase/management-client @chelabase/studio @chelabase/client @chelabase/design

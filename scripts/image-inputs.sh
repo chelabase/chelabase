@@ -29,6 +29,9 @@
 #                 pnpm-workspace.yaml, identity.Dockerfile
 #   functions-runtime  infra/functions-runtime (the supervisor, its config and the watchdog) and
 #                 functions-runtime.Dockerfile
+#   mcp-runtime   infra/mcp-runtime (the runner, its config and the watchdog) and
+#                 mcp-runtime.Dockerfile. Not in `images` yet: it becomes a release image (and
+#                 joins `changed` and the publish and pin scripts) with its compose service
 # A pin commit missing from history (or no pin yet: the default tag `unpublished`) counts as
 # changed, with a warning.
 set -euo pipefail
@@ -97,6 +100,8 @@ inputs() { # inputs <image>
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/identity.Dockerfile ;;
     functions-runtime)
       printf '%s\n' infra/functions-runtime infra/images/functions-runtime.Dockerfile ;;
+    mcp-runtime)
+      printf '%s\n' infra/mcp-runtime infra/images/mcp-runtime.Dockerfile ;;
     *)
       rust_dirs "$1"
       rust_dirs "${rust[@]}" | sed 's#$#/Cargo.toml#'
@@ -177,6 +182,7 @@ case "$cmd" in
       copies "$root/infra/images/studio.Dockerfile" studio || rc=1
       copies "$root/infra/images/identity.Dockerfile" identity || rc=1
       copies "$root/infra/images/functions-runtime.Dockerfile" functions-runtime || rc=1
+      copies "$root/infra/images/mcp-runtime.Dockerfile" mcp-runtime || rc=1
       [[ $rc -eq 0 ]] && echo "image-inputs: every Dockerfile COPY is within its images' inputs"
       exit $rc
     fi ;;
