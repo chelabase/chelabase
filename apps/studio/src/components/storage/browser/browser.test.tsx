@@ -328,6 +328,42 @@ describe("ObjectBrowser uploads", () => {
   });
 });
 
+describe("ObjectBrowser: an owner's previews under Studio's CSP", () => {
+  // O13: img-src and frame-src admit only Studio's origin and blob:, so images and PDFs preview
+  // from a typed blob: URL; audio streams from a signed URL (media-src admits the API host).
+  it("an_owner_previews_images_and_pdfs_from_a_blob_and_streams_audio_from_a_signed_url", async () => {
+    let n = 0;
+    const made: Blob[] = [];
+    Object.assign(URL, { createObjectURL: vi.fn((b: Blob) => (made.push(b), `blob:o-${++n}`)), revokeObjectURL: vi.fn() });
+    const { f, user } = setup("admin", {
+      items: [file("a.png"), file("r.pdf", 4, "application/pdf"), file("t.wav", 4, "audio/wav")],
+      routes: {
+        [`GET ${S}/object/avatars/a.png`]: () => new Response(new Uint8Array([137, 80]), { headers: { "content-type": "image/png" } }),
+        [`GET ${S}/object/avatars/r.pdf`]: () => new Response("%PDF", { headers: { "content-type": "application/octet-stream" } }),
+        [`POST ${S}/object/sign/avatars/t.wav`]: () => jsonResponse({ signed_url: "/storage/v1/object/sign/avatars/t.wav?token=t", expires_at: 1762003600 }),
+      },
+    });
+    const rows = within(await objects());
+    const signs = () => f.calls.filter((r) => new URL(r.url).pathname.includes("/object/sign/")).map((r) => new URL(r.url).pathname);
+
+    await user.click(await rows.findByRole("button", { name: "a.png" }));
+    let details = within(await screen.findByRole("complementary", { name: "Object details" }));
+    expect(await details.findByRole("img", { name: "a.png" })).toHaveAttribute("src", expect.stringMatching(/^blob:o-/));
+
+    await user.click(rows.getByRole("button", { name: "r.pdf" }));
+    details = within(await screen.findByRole("complementary", { name: "Object details" }));
+    await waitFor(() => expect(document.querySelector('iframe[title="r.pdf"]')).toHaveAttribute("src", expect.stringMatching(/^blob:o-/)));
+    // Typed as a PDF whatever the response said, so the frame renders it.
+    expect(made.at(-1)!.type).toBe("application/pdf");
+    expect(signs()).toEqual([]);
+
+    await user.click(rows.getByRole("button", { name: "t.wav" }));
+    details = within(await screen.findByRole("complementary", { name: "Object details" }));
+    await waitFor(() => expect(details.getByLabelText("t.wav")).toHaveAttribute("src", "https://api.test/storage/v1/object/sign/avatars/t.wav?token=t"));
+    expect(signs()).toEqual([`${S}/object/sign/avatars/t.wav`]);
+  });
+});
+
 describe("ObjectBrowser: a Viewer reads through the download route", () => {
   it("a_viewer_previews_an_image_and_a_text_file_and_gets_no_signed_url", async () => {
     let n = 0;

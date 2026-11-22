@@ -409,4 +409,25 @@ mod functions_schedules {
             );
         }
     }
+
+    /// A function has at most 20 schedules on a branch: the 21st is a 409 `conflict` and
+    /// nothing is written; another function on the branch can still add its own.
+    #[tokio::test]
+    async fn functions_schedules_cap_409() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        w.function(w.w.dev, "other").await;
+        for _ in 0..20 {
+            w.schedule(w.w.dev, "hello").await;
+        }
+        let base = w.path(w.w.dev, "/hello/schedules");
+        let (status, err) = w
+            .call("dee", "POST", &base, Some(json!({"cron": "0 * * * *"}).to_string()))
+            .await;
+        assert_eq!(status, 409, "{err}");
+        assert_eq!(err["error"]["code"], "conflict", "{err}");
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!(list.as_array().unwrap().len(), 20, "nothing was written");
+        w.schedule(w.w.dev, "other").await;
+    }
 }

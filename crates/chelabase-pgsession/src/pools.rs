@@ -2,7 +2,9 @@
 //!
 //! Connection info comes from the orchestrator's internal listener and is cached 60 s (or
 //! until [`Pools::invalidate`]). Each served database of a branch gets its own
-//! deadpool-postgres pool (dropped after 5 minutes unused); every pool of a branch waits on
+//! deadpool-postgres pool per login (`authenticator`, and the elevated login once a role it
+//! holds is asked for: [`Login`], chosen by [`Pools::acquire_for_role`]), dropped after 5
+//! minutes unused; every pool of a branch, whichever its login, waits on
 //! one set of branch slots (the service's [`Budget`]: rest's is `max_connections`), and one
 //! global semaphore caps connections across every branch. Open connections, idle ones
 //! included, stay within that budget per branch too: before a pool may open one, idle connections of the branch's other pools
@@ -31,6 +33,7 @@ use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+use chelabase_query::roles::Login;
 use chelabase_query::server_tls::ServerTls;
 use tokio_postgres_rustls_improved::MakeRustlsConnect;
 
@@ -57,10 +60,16 @@ pub const FIRST_ATTEMPT: Duration = Duration::from_secs(1);
 /// Most databases with a live pool.
 const MAX_POOLS: u64 = 10_000;
 /// Sent at the front of every request (`[ROLLBACK;] BEGIN; RESET_SQL`) and after its end: a
-/// function an earlier request called may have changed the session (`SET ROLE`, `set_config(…, false)`), and
-/// each request must start as `authenticator` with the connection's defaults. Prepared
-/// statements survive it.
-pub const RESET_SQL: &str = "SET ROLE NONE; RESET ALL";
+/// function an earlier request called may have changed the session (`SET ROLE`,
+/// `set_config(…, false)`, an advisory lock, a temporary table, a cursor held open, a
+/// `LISTEN`, a sequence's `currval`), and each request must start as a new `authenticator`
+/// session would. The protocol-level prepared statements the connection caches survive it;
+/// a session that holds a SQL-level one (`PREPARE`) can't be cleaned without dropping
+/// those, so the reset fails on it and the connection is closed
+/// ([`chelabase_query::engine::POOLED_RESET_SQL`], the one text rest, storage and realtime
+/// send). A [`Dedicated`] connection (a service's long-lived `LISTEN` session) is never
+/// sent it.
+pub const RESET_SQL: &str = chelabase_query::engine::POOLED_RESET_SQL;
 
 /// The branch's data API settings (project-wide), as the internal listener sends them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -139,32 +148,62 @@ pub struct ConnInfo {
     pub database_id: Option<Uuid>,
     pub user: String,
     pub password: String,
+    /// The elevated login's credentials ([`Login::Elevated`]); `None` until the branch's
+    /// bootstrap has stored them.
+    pub elevated: Option<LoginCredentials>,
     pub settings: Settings,
     /// The served databases, main first.
     pub databases: Vec<ServedDatabase>,
 }
 
+/// A login's name and password.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct LoginCredentials {
+    pub user: String,
+    pub password: String,
+}
+
+impl fmt::Debug for LoginCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginCredentials")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 impl ConnInfo {
+    /// What `login` connects with: the info's own user for [`Login::Authenticator`], the
+    /// elevated login's for [`Login::Elevated`] (`None`: the branch has none stored).
+    pub fn credentials(&self, login: Login) -> Option<(&str, &str)> {
+        match login {
+            Login::Authenticator => Some((&self.user, &self.password)),
+            Login::Elevated => self
+                .elevated
+                .as_ref()
+                .map(|c| (c.user.as_str(), c.password.as_str())),
+        }
+    }
+
     /// The served database named `name`.
     pub fn served(&self, name: &str) -> Option<&ServedDatabase> {
         self.databases.iter().find(|d| d.name == name)
     }
 
-    /// Whether a pool built for `self` still fits `other` (the database is the pool's key).
-    fn same_server(&self, other: &ConnInfo) -> bool {
+    /// Whether `login`'s pool built for `self` still fits `other` (the database is the
+    /// pool's key): the same server, the same credentials for that login, the same cap.
+    fn same_server(&self, other: &ConnInfo, login: Login) -> bool {
         (
             &self.host,
             self.port,
             &self.server_name,
-            &self.user,
-            &self.password,
+            self.credentials(login),
             self.settings.max_connections,
         ) == (
             &other.host,
             other.port,
             &other.server_name,
-            &other.user,
-            &other.password,
+            other.credentials(login),
             other.settings.max_connections,
         )
     }
@@ -183,6 +222,8 @@ struct WireConnInfo {
     database_id: Option<Uuid>,
     user: String,
     password: String,
+    #[serde(default)]
+    elevated: Option<LoginCredentials>,
     settings: WireSettings,
     #[serde(default)]
     databases: Option<Vec<ServedDatabase>>,
@@ -222,6 +263,7 @@ impl From<WireConnInfo> for ConnInfo {
             database_id: w.database_id,
             user: w.user,
             password: w.password,
+            elevated: w.elevated,
             settings: Settings {
                 max_rows: w.settings.max_rows,
                 statement_timeout_ms: w.settings.statement_timeout_ms,
@@ -242,6 +284,7 @@ impl fmt::Debug for ConnInfo {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("elevated", &self.elevated)
             .field("settings", &self.settings)
             .field("databases", &self.databases)
             .finish()
@@ -358,6 +401,10 @@ pub enum AcquireError {
     /// The database stopped being served (the info fetched again for a retry says so).
     #[error("the database isn't served")]
     NotServed,
+    /// A connection as the elevated login was asked for and the branch's info has no
+    /// credentials for it, fetched again once ([`INFO_REFRESH_AFTER`]) included.
+    #[error("the branch has no elevated login")]
+    NoElevatedLogin,
     #[error(transparent)]
     Db(DbAcquireError),
 }
@@ -369,11 +416,41 @@ pub struct DbAcquireError(pub PoolError);
 
 /// A connection, holding its branch and global slots until it's dropped. Its client is
 /// reached only through a role session ([`Conn::with_role_session`]): nothing runs on it
-/// without a role.
+/// without a role. One from [`Pools::acquire_for_role`] is bound to the role it was routed
+/// for and opens a session as no other; one from [`Pools::acquire`] is `authenticator`'s and
+/// opens only the login's own session ([`Conn::with_login_session`]).
 pub struct Conn {
     pub(crate) client: Object,
     pub info: Arc<ConnInfo>,
     pub(crate) permits: Permits,
+    /// The login it is a session of.
+    pub(crate) login: Login,
+    /// The role it was routed for ([`Pools::acquire_for_role`]).
+    pub(crate) role: Option<String>,
+    /// The role's cached facts, dropped when its session finds the role unusable on `login`.
+    pub(crate) facts: Option<(crate::owner_level::OwnerLevelCache, (Uuid, String))>,
+    /// A statement was sent on it before its session ([`Conn::confirm_role_facts`]): the
+    /// session starts owing the full reset.
+    pub(crate) outside: bool,
+    /// Its session may not be clean: it is closed at its session's end, never pooled.
+    pub(crate) broken: bool,
+}
+
+impl Conn {
+    /// The login the connection is a session of.
+    pub fn login(&self) -> Login {
+        self.login
+    }
+
+    pub(crate) fn bound_to(
+        mut self,
+        role: &str,
+        facts: Option<(crate::owner_level::OwnerLevelCache, (Uuid, String))>,
+    ) -> Self {
+        self.role = Some(role.to_owned());
+        self.facts = facts;
+        self
+    }
 }
 
 /// A branch slot and a global slot, held together for the life of a connection.
@@ -454,19 +531,25 @@ impl Drop for Opening<'_> {
 }
 
 /// How a pool for `database` of `info` connects, plain (`host` dialled as given).
+#[cfg(test)]
 fn pg_config(info: &ConnInfo, database: &str, service: Service) -> tokio_postgres::Config {
-    let mut config = base_config(info, database, service);
+    let mut config = base_config(info, (&info.user, &info.password), database, service);
     config.host(&info.host);
     config
 }
 
 /// Everything but where: the caller sets the host (plain) or the TLS target.
-fn base_config(info: &ConnInfo, database: &str, service: Service) -> tokio_postgres::Config {
+fn base_config(
+    info: &ConnInfo,
+    (user, password): (&str, &str),
+    database: &str,
+    service: Service,
+) -> tokio_postgres::Config {
     let mut config = tokio_postgres::Config::new();
     config
         .port(info.port)
-        .user(&info.user)
-        .password(&info.password)
+        .user(user)
+        .password(password)
         .dbname(database)
         .application_name(service.application_name())
         .connect_timeout(CONNECT_TIMEOUT);
@@ -478,13 +561,14 @@ fn base_config(info: &ConnInfo, database: &str, service: Service) -> tokio_postg
 /// only without a CA (the fakes). A target that can't be verified is refused, never dialled.
 fn connect_config(
     info: &ConnInfo,
+    credentials: (&str, &str),
     database: &str,
     server_tls: Option<&ServerTls>,
     service: Service,
 ) -> Result<(tokio_postgres::Config, Option<MakeRustlsConnect>), ConnError> {
     match (&info.server_name, server_tls) {
         (Some(name), Some(tls)) => {
-            let mut config = base_config(info, database, service);
+            let mut config = base_config(info, credentials, database, service);
             tls.configure(&mut config, &info.host, name)
                 .map_err(|e| ConnError::Unreachable(format!("compute TLS: {e}")))?;
             Ok((config, Some(tls.connector())))
@@ -495,7 +579,11 @@ fn connect_config(
         (None, Some(_)) => Err(ConnError::Unreachable(
             "no certificate name to verify the compute's TLS against".into(),
         )),
-        (None, None) => Ok((pg_config(info, database, service), None)),
+        (None, None) => {
+            let mut config = base_config(info, credentials, database, service);
+            config.host(&info.host);
+            Ok((config, None))
+        }
     }
 }
 
@@ -543,8 +631,22 @@ fn service_login_hook(user: String) -> deadpool_postgres::Hook {
 /// m13b: a dedicated connection and the notifications it receives (`LISTEN`).
 pub struct Dedicated {
     pub client: tokio_postgres::Client,
-    /// Each `NOTIFY` delivered to the session; closed when the connection ends.
-    pub notifications: tokio::sync::mpsc::UnboundedReceiver<tokio_postgres::Notification>,
+    /// A wake for the `NOTIFY`s delivered to the session: at most one is ever pending, whatever
+    /// the notify rate (the payloads are never kept), and the channel closes when the
+    /// connection ends.
+    pub notifications: tokio::sync::mpsc::Receiver<()>,
+}
+
+/// The wake channel of a [`Dedicated`] session. Invariant: its capacity is one, so the memory
+/// it holds is constant in the number of notifications, and a wake dropped because one is
+/// already pending loses nothing (the pending one makes the reader run a pass after it).
+fn wake_channel() -> (tokio::sync::mpsc::Sender<()>, tokio::sync::mpsc::Receiver<()>) {
+    tokio::sync::mpsc::channel(1)
+}
+
+/// Records that a notification arrived: queues a wake unless one is already pending.
+fn wake(tx: &tokio::sync::mpsc::Sender<()>) {
+    let _ = tx.try_send(());
 }
 
 /// m13b: one connection to `database` of `info`, outside any pool or budget, for a long-lived
@@ -558,9 +660,9 @@ pub async fn connect_dedicated(
     server_tls: Option<&ServerTls>,
     service: Service,
 ) -> Result<Dedicated, ConnError> {
-    let (mut config, connector) = connect_config(info, database, server_tls, service)?;
+    let (mut config, connector) = connect_config(info, (&info.user, &info.password), database, server_tls, service)?;
     config.options("-c search_path=pg_catalog,pg_temp");
-    let (tx, notifications) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, notifications) = wake_channel();
     let refused = |e: tokio_postgres::Error| ConnError::Unreachable(format!("connecting: {e}"));
     let client = match connector {
         Some(connector) => {
@@ -587,17 +689,18 @@ pub async fn connect_dedicated(
     Ok(Dedicated { client, notifications })
 }
 
-/// Drives `conn` until it ends, sending each notification on `tx`.
+/// Drives `conn` until it ends, waking `tx` for each notification (coalesced, [`wake`]);
+/// `tx` drops with the connection, which closes the channel.
 async fn forward_notifications<S, T>(
     mut conn: tokio_postgres::Connection<S, T>,
-    tx: tokio::sync::mpsc::UnboundedSender<tokio_postgres::Notification>,
+    tx: tokio::sync::mpsc::Sender<()>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     while let Some(Ok(message)) = std::future::poll_fn(|cx| conn.poll_message(cx)).await {
-        if let tokio_postgres::AsyncMessage::Notification(n) = message {
-            let _ = tx.send(n);
+        if let tokio_postgres::AsyncMessage::Notification(_) = message {
+            wake(&tx);
         }
     }
 }
@@ -670,7 +773,7 @@ fn reap(pool: &Pool, idle: Duration) {
     let _closed = pool.retain(|_, m| m.last_used() < idle);
 }
 
-type PoolCache = moka::future::Cache<(Uuid, String), Arc<DbPool>>;
+type PoolCache = moka::future::Cache<(Uuid, String, Login), Arc<DbPool>>;
 
 /// Every `every`, [`reap`]s each cached pool with `idle`; ends once the cache is gone.
 fn spawn_reaper(
@@ -969,27 +1072,45 @@ impl<S: ConnSource> Pools<S> {
         }
     }
 
-    /// The pool of `database` for `info`, rebuilt when the branch's address, credentials or
-    /// `max_connections` changed, resized when only the service's budget did.
+    /// `authenticator`'s pool of `database` ([`Self::pool_of`]).
+    #[cfg(any(test, feature = "test-support"))]
     async fn pool(
         &self,
         branch: Uuid,
         database: &str,
         info: &Arc<ConnInfo>,
     ) -> Result<Arc<DbPool>, ConnError> {
-        let key = (branch, database.to_owned());
+        self.pool_of(branch, database, Login::Authenticator, info)
+            .await
+            .map(|p| p.expect("the info's own login always has credentials"))
+    }
+
+    /// `login`'s pool of `database` for `info`, rebuilt when the branch's address, credentials
+    /// or `max_connections` changed, resized when only the service's budget did. `None`: the
+    /// info has no credentials for `login`.
+    async fn pool_of(
+        &self,
+        branch: Uuid,
+        database: &str,
+        login: Login,
+        info: &Arc<ConnInfo>,
+    ) -> Result<Option<Arc<DbPool>>, ConnError> {
+        let Some(credentials) = info.credentials(login) else {
+            return Ok(None);
+        };
+        let key = (branch, database.to_owned(), login);
         if let Some(p) = self.pools.get(&key).await
-            && p.info.same_server(info)
+            && p.info.same_server(info, login)
             && !p.pool.is_closed()
         {
             let size = (self.budget)(info).max(1) as usize;
             if p.pool.status().max_size != size {
                 p.pool.resize(size);
             }
-            return Ok(p);
+            return Ok(Some(p));
         }
         let (mut config, connector) =
-            connect_config(info, database, self.server_tls.as_ref(), self.service)?;
+            connect_config(info, credentials, database, self.server_tls.as_ref(), self.service)?;
         if self.managed {
             config.options("-c search_path=pg_catalog,pg_temp");
         }
@@ -1001,7 +1122,7 @@ impl<S: ConnSource> Pools<S> {
             self.managed.then(|| info.user.clone()),
         ));
         self.pools.insert(key, p.clone()).await;
-        Ok(p)
+        Ok(Some(p))
     }
 
     /// The branch's slots and pools, resized in place when the service's budget (rest's:
@@ -1061,8 +1182,22 @@ impl<S: ConnSource> Pools<S> {
     /// A connection to the branch's `database`, as `authenticator`, holding a branch slot
     /// and a global slot until it's dropped. The caller checked the database is served.
     pub async fn acquire(&self, branch: Uuid, database: &str) -> Result<Conn, AcquireError> {
+        self.acquire_login(branch, database, Login::Authenticator).await
+    }
+
+    /// [`Self::acquire`] as `login`, within the same branch and global slots whichever the
+    /// login. For [`Login::Elevated`] on a branch whose cached info has no credentials for it
+    /// (cached before the worker stored them), the info is fetched again once, when it is at
+    /// least [`INFO_REFRESH_AFTER`] old; still none is [`AcquireError::NoElevatedLogin`].
+    /// Callers reach it through [`Self::acquire_for_role`], which chooses the login.
+    pub(crate) async fn acquire_login(
+        &self,
+        branch: Uuid,
+        database: &str,
+        login: Login,
+    ) -> Result<Conn, AcquireError> {
         let deadline = tokio::time::Instant::now() + ACQUIRE_DEADLINE;
-        tokio::time::timeout_at(deadline, self.acquire_by(branch, database, deadline))
+        tokio::time::timeout_at(deadline, self.acquire_by(branch, database, login, deadline))
             .await
             .unwrap_or(Err(AcquireError::TimedOut))
     }
@@ -1071,11 +1206,22 @@ impl<S: ConnSource> Pools<S> {
         &self,
         branch: Uuid,
         database: &str,
+        login: Login,
         deadline: tokio::time::Instant,
     ) -> Result<Conn, AcquireError> {
         let mut retried = false;
+        let mut reread = false;
         loop {
-            let info = self.info(branch).await?;
+            let mut info = self.info(branch).await?;
+            if info.credentials(login).is_none() && !reread {
+                reread = true;
+                if let Some(fresh) = self.refresh_stale(branch).await? {
+                    info = fresh;
+                }
+            }
+            if info.credentials(login).is_none() {
+                return Err(AcquireError::NoElevatedLogin);
+            }
             // The info fetched again for a retry may no longer serve it.
             if info.served(database).is_none() {
                 return Err(AcquireError::NotServed);
@@ -1086,7 +1232,9 @@ impl<S: ConnSource> Pools<S> {
                 return Err(AcquireError::Busy);
             }
             let slots = self.branch(branch, &info).await;
-            let pool = self.pool(branch, database, &info).await?;
+            let Some(pool) = self.pool_of(branch, database, login, &info).await? else {
+                return Err(AcquireError::NoElevatedLogin);
+            };
             slots.register(&pool);
             let permits = self.permits(&slots.slots).await?;
             *pool.last_used.lock().expect("last_used") = tokio::time::Instant::now();
@@ -1113,6 +1261,11 @@ impl<S: ConnSource> Pools<S> {
                         client,
                         info,
                         permits,
+                        login,
+                        role: None,
+                        facts: None,
+                        outside: false,
+                        broken: false,
                     });
                 }
                 Err(e) if !retried && is_connect_error(&e, pool_at_size(&pool)) => {
@@ -1167,6 +1320,7 @@ pub mod test_support {
             database_id: Some(Uuid::nil()),
             user: "authenticator".into(),
             password: "pw".into(),
+            elevated: None,
             settings: Settings {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
@@ -1314,6 +1468,66 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// However many notifications arrive before the reader looks, one wake is queued and the
+    /// next send finds the channel full: the reader sees one wake, then nothing pending.
+    #[test]
+    fn notifications_coalesce_to_one_wake() {
+        let (tx, mut rx) = wake_channel();
+        for _ in 0..100_000 {
+            wake(&tx);
+        }
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        // After the read, a new notification wakes again.
+        wake(&tx);
+        assert_eq!(rx.try_recv(), Ok(()));
+    }
+
+    /// When the connection's task ends its sender drops: the reader gets the pending wake
+    /// (if any) and then the closed channel, never a hang.
+    #[tokio::test]
+    async fn closed_connection_closes_the_wake_channel() {
+        let (tx, mut rx) = wake_channel();
+        wake(&tx);
+        wake(&tx);
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(()));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// The reset leaves a pooled connection as a new session is: no role, default settings,
+    /// no session advisory lock, no temporary table, no cursor, no `LISTEN`, no sequence
+    /// state; and it fails (so the connection is closed) when the session holds a SQL-level
+    /// prepared statement. Every part is allowed inside a transaction block (`DISCARD ALL`
+    /// isn't, and would drop the cached protocol-level statements), and every name is
+    /// qualified: it runs under the login's `search_path`.
+    #[test]
+    fn reset_clears_temp_locks_and_refuses_sql_prepared() {
+        let parts: Vec<&str> = RESET_SQL.split("; ").collect();
+        assert_eq!(
+            parts,
+            [
+                "SET ROLE NONE",
+                "RESET ALL",
+                "SELECT pg_catalog.pg_advisory_unlock_all()",
+                "DISCARD TEMP",
+                "CLOSE ALL",
+                "UNLISTEN *",
+                "DISCARD SEQUENCES",
+                chelabase_query::engine::NO_SQL_PREPARED_SQL,
+            ]
+        );
+        assert_eq!(RESET_SQL, chelabase_query::engine::POOLED_RESET_SQL);
+        let check = parts[parts.len() - 1];
+        assert!(check.contains("FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql"));
+        // The empty name is no role: the statement fails when such a statement exists.
+        assert!(check.contains("THEN '' ELSE 'none' END, false)"), "{check}");
+        assert!(!RESET_SQL.contains("DISCARD ALL"));
+    }
 
     struct NoSource;
 
@@ -1734,6 +1948,7 @@ mod tests {
             database_id: None,
             user: parsed.username().into(),
             password: parsed.password().unwrap_or_default().into(),
+            elevated: None,
             settings: Settings {
                 max_rows: 10,
                 statement_timeout_ms: 1000,
@@ -1770,7 +1985,7 @@ mod tests {
             let pools = &pools;
             async move {
                 for _ in 0..200 {
-                    if let Some(p) = pools.pools.get(&(branch, db.clone())).await
+                    if let Some(p) = pools.pools.get(&(branch, db.clone(), Login::Authenticator)).await
                         && p.pool.status().available == idle
                     {
                         return;
@@ -1797,7 +2012,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(seen <= 2, "{seen} connections open for a branch capped at 2");
-        let a_pool = pools.pools.get(&(branch, a.clone())).await.unwrap();
+        let a_pool = pools.pools.get(&(branch, a.clone(), Login::Authenticator)).await.unwrap();
         assert_eq!(
             a_pool.pool.status().size + 1,
             2,
@@ -2116,7 +2331,7 @@ mod tests {
             pg_config(&info, "main", Service::Rest),
             2,
         ));
-        pools.insert((Uuid::nil(), "main".to_owned()), pool.clone()).await;
+        pools.insert((Uuid::nil(), "main".to_owned(), Login::Authenticator), pool.clone()).await;
         let (a, b) = (pool.pool.get().await.unwrap(), pool.pool.get().await.unwrap());
         drop(a);
         let reaper = spawn_reaper(
@@ -2150,5 +2365,294 @@ mod tests {
             .await
             .expect("the reaper ends with its pools")
             .unwrap();
+    }
+
+    // --- which login a role session's connection is ----------------------------------------
+
+    use crate::owner_level::{Guard, RoleAcquireError, owner_level_cache};
+    use crate::session::tests::{recorder, settle};
+    use chelabase_query::roles::{ELEVATED_LOGIN, RoleFacts};
+    use std::sync::atomic::AtomicBool;
+
+    /// `two_databases` at a recorder's port, capped at `max`, with the elevated login's
+    /// credentials while `elevated` is set; counts its fetches.
+    struct Routed {
+        port: u16,
+        max: u32,
+        elevated: Arc<AtomicBool>,
+        fetches: Arc<AtomicUsize>,
+    }
+
+    impl Routed {
+        fn new(port: u16, elevated: bool) -> Self {
+            Routed {
+                port,
+                max: 4,
+                elevated: Arc::new(AtomicBool::new(elevated)),
+                fetches: Arc::default(),
+            }
+        }
+    }
+
+    impl ConnSource for Routed {
+        async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let mut info = test_support::two_databases();
+            info.port = self.port;
+            info.settings.max_connections = self.max;
+            if self.elevated.load(Ordering::SeqCst) {
+                info.elevated = Some(LoginCredentials {
+                    user: ELEVATED_LOGIN.into(),
+                    password: "elevated-pw".into(),
+                });
+            }
+            Ok(info)
+        }
+    }
+
+    const ELEVATED_HELD: RoleFacts = RoleFacts { owner_level: false, elevated: true, held_by_elevated: true };
+    const ELEVATED_NOT_MOVED: RoleFacts = RoleFacts { owner_level: false, elevated: true, held_by_elevated: false };
+    const ORDINARY: RoleFacts = RoleFacts { owner_level: false, elevated: false, held_by_elevated: false };
+
+    /// A role the elevated login holds runs on that login's pool; an ordinary role, `anon`
+    /// and `authenticated` on `authenticator`'s. The connection is bound to its role, and the
+    /// elevated login has no session of its own.
+    #[tokio::test]
+    async fn elevated_role_uses_the_elevated_pool() {
+        let fake = recorder(|_, _| false).await;
+        *fake.facts.lock().unwrap() = Some([false, true, true]);
+        let pools = Pools::new(Routed::new(fake.port, true), 10);
+        let cache = owner_level_cache();
+        let branch = Uuid::new_v4();
+        cache.insert((branch, "boss".into()), ELEVATED_HELD).await;
+        cache.insert((branch, "reader".into()), ORDINARY).await;
+        let conn = pools
+            .acquire_for_role(&cache, branch, "main", "boss", Guard::SecretKey, "rid")
+            .await
+            .unwrap();
+        assert_eq!(conn.login(), Login::Elevated);
+        assert_eq!(*fake.users.lock().unwrap(), vec![ELEVATED_LOGIN.to_owned()]);
+        let claims = serde_json::json!({});
+        let other = conn.with_role_session("reader", &claims, None, async |_| ()).await;
+        assert!(other.is_err(), "bound to the role it was routed for");
+        let conn = pools
+            .acquire_for_role(&cache, branch, "main", "boss", Guard::Console, "rid")
+            .await
+            .unwrap();
+        assert!(conn.with_login_session(async |_| ()).await.is_none());
+        for (role, guard) in [
+            ("reader", Guard::SecretKey),
+            ("reader", Guard::Console),
+            ("anon", Guard::None),
+            ("authenticated", Guard::None),
+        ] {
+            let conn = pools
+                .acquire_for_role(&cache, branch, "main", role, guard, "rid")
+                .await
+                .unwrap();
+            assert_eq!(conn.login(), Login::Authenticator, "{role}");
+        }
+        let users = fake.users.lock().unwrap().clone();
+        assert!(users[1..].iter().all(|u| u == "authenticator") && users.len() > 1, "{users:?}");
+        assert_eq!(users.iter().filter(|u| *u == ELEVATED_LOGIN).count(), 1, "{users:?}");
+    }
+
+    /// On a branch without the elevated login's credentials an elevated role is unavailable,
+    /// and no connection is opened for it, as `authenticator` or otherwise.
+    #[tokio::test]
+    async fn missing_elevated_login_is_unavailable() {
+        let fake = recorder(|_, _| false).await;
+        let pools = Pools::new(Routed::new(fake.port, false), 10);
+        let cache = owner_level_cache();
+        let branch = Uuid::new_v4();
+        cache.insert((branch, "boss".into()), ELEVATED_HELD).await;
+        let out = pools
+            .acquire_for_role(&cache, branch, "main", "boss", Guard::SecretKey, "rid")
+            .await;
+        assert!(matches!(&out, Err(RoleAcquireError::Unavailable(r)) if r == "boss"));
+        assert!(fake.users.lock().unwrap().is_empty());
+        assert_eq!(pools.cached(branch).await.1, 0, "no pool was built");
+    }
+
+    /// W2: cached facts that choose the elevated login are not enough to run there. The facts
+    /// are read again on the elevated login's own connection, and the connection is handed
+    /// out only when they still choose it and still pass the guard. Otherwise the request is
+    /// refused, the cached facts are dropped, and the connection is pooled after its full
+    /// reset (closed when the read failed).
+    #[tokio::test]
+    async fn the_elevated_login_runs_a_role_only_on_facts_read_there() {
+        let branch = Uuid::new_v4();
+        let key = (branch, "boss".to_owned());
+        // (what the read answers, whether the connection is handed out, sockets left open)
+        let cases: [(Option<[bool; 3]>, bool, usize); 6] = [
+            (Some([false, true, true]), true, 1),
+            // Made ordinary since: the elevated login may still reach it, and doesn't run it.
+            (Some([false, false, true]), false, 1),
+            (Some([false, false, false]), false, 1),
+            // Elevated and no longer held.
+            (Some([false, true, false]), false, 1),
+            // Owner-level now.
+            (Some([true, true, true]), false, 1),
+            // The read failed.
+            (None, false, 0),
+        ];
+        for (now, runs, open) in cases {
+            let fake = recorder(|_, _| false).await;
+            *fake.facts.lock().unwrap() = now;
+            let pools = Pools::new(Routed::new(fake.port, true), 10);
+            let cache = owner_level_cache();
+            cache.insert(key.clone(), ELEVATED_HELD).await;
+            let out = pools
+                .acquire_for_role(&cache, branch, "main", "boss", Guard::SecretKey, "rid")
+                .await;
+            assert_eq!(*fake.users.lock().unwrap(), vec![ELEVATED_LOGIN.to_owned()], "{now:?}");
+            match (out, now) {
+                (Ok(conn), _) => {
+                    assert!(runs, "{now:?}");
+                    assert_eq!(conn.login(), Login::Elevated);
+                    assert!(cache.get(&key).await.is_some());
+                    // The read is followed by the session's full reset before pooling.
+                    conn.with_role_session("boss", &serde_json::json!({}), None, async |_| ())
+                        .await
+                        .unwrap();
+                }
+                (Err(e), now) => {
+                    assert!(!runs, "{now:?}: {e:?}");
+                    match now {
+                        None => assert!(matches!(e, RoleAcquireError::Check(_)), "{e:?}"),
+                        Some([true, ..]) => assert!(
+                            matches!(e, RoleAcquireError::Refused(crate::owner_level::RoleRefused::OwnerLevel(_))),
+                            "{e:?}"
+                        ),
+                        Some(_) => assert!(matches!(e, RoleAcquireError::Unavailable(_)), "{now:?}: {e:?}"),
+                    }
+                    assert!(cache.get(&key).await.is_none(), "{now:?}: the stale facts are dropped");
+                }
+            }
+            assert_eq!(settle(&fake.open, open).await, open, "{now:?}");
+            if open == 1 {
+                let queries = fake.queries.lock().unwrap().clone();
+                assert_eq!(queries.last().map(String::as_str), Some(RESET_SQL), "{now:?}: {queries:?}");
+            }
+        }
+    }
+
+    /// An elevated role the elevated login doesn't hold (made elevated after its grant, not
+    /// moved yet) is refused: never `authenticator`'s. The answer isn't kept.
+    #[tokio::test]
+    async fn elevated_role_held_by_authenticator_is_refused() {
+        let fake = recorder(|_, _| false).await;
+        let pools = Pools::new(Routed::new(fake.port, true), 10);
+        let cache = owner_level_cache();
+        let branch = Uuid::new_v4();
+        let key = (branch, "boss".to_owned());
+        for guard in [Guard::SecretKey, Guard::Console, Guard::None] {
+            cache.insert(key.clone(), ELEVATED_NOT_MOVED).await;
+            let out = pools
+                .acquire_for_role(&cache, branch, "main", "boss", guard, "rid")
+                .await;
+            assert!(matches!(&out, Err(RoleAcquireError::Unavailable(r)) if r == "boss"), "{guard:?}");
+            assert!(cache.get(&key).await.is_none(), "{guard:?}");
+        }
+        assert!(fake.users.lock().unwrap().is_empty());
+    }
+
+    /// Connection info cached before the worker stored the elevated login is read again
+    /// once it is `INFO_REFRESH_AFTER` old, and the role then runs; a younger one isn't
+    /// fetched again for every request.
+    #[tokio::test(start_paused = true)]
+    async fn missing_elevated_credentials_refetch_connection_info_once() {
+        let fake = recorder(|_, _| false).await;
+        *fake.facts.lock().unwrap() = Some([false, true, true]);
+        let source = Routed::new(fake.port, false);
+        let (stored, fetches) = (source.elevated.clone(), source.fetches.clone());
+        let pools = Pools::new(source, 10);
+        let cache = owner_level_cache();
+        let branch = Uuid::new_v4();
+        let ask = async || {
+            cache.insert((branch, "boss".into()), ELEVATED_HELD).await;
+            pools
+                .acquire_for_role(&cache, branch, "main", "boss", Guard::SecretKey, "rid")
+                .await
+        };
+        assert!(matches!(ask().await, Err(RoleAcquireError::Unavailable(_))));
+        assert!(matches!(ask().await, Err(RoleAcquireError::Unavailable(_))));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        tokio::time::advance(INFO_REFRESH_AFTER).await;
+        assert!(matches!(ask().await, Err(RoleAcquireError::Unavailable(_))));
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "one more look, once");
+        stored.store(true, Ordering::SeqCst);
+        tokio::time::advance(INFO_REFRESH_AFTER).await;
+        tokio::time::resume();
+        let conn = ask().await.unwrap();
+        assert_eq!(conn.login(), Login::Elevated);
+        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+        assert_eq!(*fake.users.lock().unwrap(), vec![ELEVATED_LOGIN.to_owned()]);
+    }
+
+    /// Both logins' pools wait on the branch's one set of slots, and open connections across
+    /// both stay within the branch's `max_connections`: an idle connection of one login's
+    /// pool is closed before the other's opens one past the cap.
+    #[tokio::test]
+    async fn both_logins_share_the_branch_budget() {
+        let fake = recorder(|_, _| false).await;
+        *fake.facts.lock().unwrap() = Some([false, true, true]);
+        let mut source = Routed::new(fake.port, true);
+        source.max = 2;
+        let pools = Pools::new(source, 10);
+        let cache = owner_level_cache();
+        let branch = Uuid::new_v4();
+        cache.insert((branch, "boss".into()), ELEVATED_HELD).await;
+        cache.insert((branch, "reader".into()), ORDINARY).await;
+        let get = async |role: &str| {
+            pools
+                .acquire_for_role(&cache, branch, "main", role, Guard::SecretKey, "rid")
+                .await
+                .unwrap()
+        };
+        let (a, b) = (get("boss").await, get("reader").await);
+        assert_eq!((a.login(), b.login()), (Login::Elevated, Login::Authenticator));
+        assert_eq!(settle(&fake.open, 2).await, 2);
+        // Both slots are held: a third request of either login waits.
+        for role in ["boss", "reader"] {
+            let third = tokio::time::timeout(Duration::from_millis(200), get(role)).await;
+            assert!(third.is_err(), "{role}: a third connection past the branch's cap");
+        }
+        assert_eq!(fake.open.load(Ordering::SeqCst), 2);
+        drop((a, b));
+        // One idle connection in each pool. Two requests on one login need a second
+        // connection there: the other login's idle one closes first.
+        for role in ["reader", "boss", "reader"] {
+            let held = (get(role).await, get(role).await);
+            assert_eq!(settle(&fake.open, 2).await, 2, "{role}");
+            assert!(fake.open.load(Ordering::SeqCst) <= 2);
+            drop(held);
+        }
+        let users = fake.users.lock().unwrap().clone();
+        assert!(users.iter().any(|u| u == ELEVATED_LOGIN) && users.iter().any(|u| u == "authenticator"), "{users:?}");
+    }
+
+    /// The wire answer's `elevated` credentials are read, absent ones are `None`, and a
+    /// printed info shows neither password.
+    #[test]
+    fn conn_info_reads_the_elevated_login() {
+        let wire = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "host": "h", "port": 5432, "database": "main", "user": "authenticator", "password": "pw-secret",
+                "settings": { "max_rows": 1, "statement_timeout_ms": 1, "max_connections": 1 },
+            });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<ConnInfo>(v).unwrap()
+        };
+        let without = wire(serde_json::json!({}));
+        assert_eq!(without.credentials(Login::Elevated), None);
+        assert_eq!(without.credentials(Login::Authenticator), Some(("authenticator", "pw-secret")));
+        let with = wire(serde_json::json!({ "elevated": { "user": ELEVATED_LOGIN, "password": "el-secret" } }));
+        assert_eq!(with.credentials(Login::Elevated), Some((ELEVATED_LOGIN, "el-secret")));
+        let printed = format!("{with:?}");
+        assert!(!printed.contains("el-secret") && !printed.contains("pw-secret"), "{printed}");
+        // A stored elevated login leaves `authenticator`'s pool as it is.
+        assert!(with.same_server(&without, Login::Authenticator));
+        assert!(!with.same_server(&without, Login::Elevated));
     }
 }

@@ -1,4 +1,7 @@
-//! Check connections (spec §4, P8, W20): `authenticator` pools per (branch, Postgres database)
+//! Check connections (spec §4, P8, W20): pools per (branch, Postgres database, login), the
+//! login `authenticator` or, for a check as an elevated role, the elevated login
+//! ([`chelabase_query::roles`] holds the rule; [`crate::check`] applies it), both within the
+//! compute's one budget,
 //! from `GET /internal/data/branches/{id}/connection` (at `CHELABASE_INTERNAL_URL`, realtime's
 //! bearer, the answer cached [`LOOKUP_TTL`]), TLS verified as the compute's `server_name`.
 //!
@@ -10,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use chelabase_query::roles::Login;
 use chelabase_query::server_tls::ServerTls;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -22,6 +26,9 @@ use crate::check::{CheckError, CheckTarget};
 pub const PER_COMPUTE: usize = 4;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LOOKUP_TTL: Duration = Duration::from_secs(60);
+/// A cached answer without the elevated login's credentials is asked for again when it is at
+/// least this old (the worker may have stored them since).
+pub const REFETCH_AFTER: Duration = Duration::from_secs(2);
 /// How long a check waits for a connection of its compute's budget.
 pub const ACQUIRE_WAIT: Duration = Duration::from_secs(2);
 /// Connecting (TCP, TLS, authentication).
@@ -129,6 +136,29 @@ pub struct ConnInfo {
     pub replication_host: Option<String>,
     pub user: String,
     pub password: String,
+    /// The elevated login's credentials; absent until the branch's bootstrap stored them.
+    #[serde(default)]
+    pub elevated: Option<Credentials>,
+}
+
+/// A login's name and password.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
+}
+
+impl ConnInfo {
+    /// What `login` connects with (`None`: the branch has no elevated login stored).
+    pub fn credentials(&self, login: Login) -> Option<(&str, &str)> {
+        match login {
+            Login::Authenticator => Some((&self.user, &self.password)),
+            Login::Elevated => self
+                .elevated
+                .as_ref()
+                .map(|c| (c.user.as_str(), c.password.as_str())),
+        }
+    }
 }
 
 impl std::fmt::Debug for ConnInfo {
@@ -140,6 +170,7 @@ impl std::fmt::Debug for ConnInfo {
             .field("replication_host", &self.replication_host)
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("elevated", &self.elevated.as_ref().map(|c| c.user.as_str()))
             .finish()
     }
 }
@@ -210,6 +241,22 @@ impl ConnLookup {
             None => self.fetch(branch_id).await,
         }
     }
+    /// The cached answer when it is younger than `age`, else [`ConnLookup::fetch`]: a second
+    /// look for something the cached answer lacks, at most once per `age` per branch.
+    pub async fn get_newer_than(&self, branch_id: Uuid, age: Duration) -> Result<Arc<ConnInfo>, CheckError> {
+        let cached = self
+            .cache
+            .lock()
+            .unwrap()
+            .get(&branch_id)
+            .filter(|(at, _)| at.elapsed() < age)
+            .map(|(_, info)| info.clone());
+        match cached {
+            Some(info) => Ok(info),
+            None => self.fetch(branch_id).await,
+        }
+    }
+
     pub fn invalidate(&self, branch_id: Uuid) {
         self.cache.lock().unwrap().remove(&branch_id);
     }
@@ -223,11 +270,21 @@ pub fn connect_config(
     database: &str,
     tls: Option<&ServerTls>,
 ) -> Result<tokio_postgres::Config, CheckError> {
+    connect_config_as(info, (&info.user, &info.password), database, tls)
+}
+
+/// [`connect_config`] with a login's `credentials` ([`ConnInfo::credentials`]).
+pub fn connect_config_as(
+    info: &ConnInfo,
+    (user, password): (&str, &str),
+    database: &str,
+    tls: Option<&ServerTls>,
+) -> Result<tokio_postgres::Config, CheckError> {
     let mut config = tokio_postgres::Config::new();
     config
         .port(info.port)
-        .user(&info.user)
-        .password(&info.password)
+        .user(user)
+        .password(password)
         .dbname(database)
         .application_name("chelabase-realtime")
         .connect_timeout(CONNECT_TIMEOUT);
@@ -280,7 +337,7 @@ pub async fn connect(
     }
 }
 
-type PoolKey = (Uuid, String);
+type PoolKey = (Uuid, String, Login);
 
 struct IdleConn {
     client: Client,
@@ -289,7 +346,7 @@ struct IdleConn {
     since: Instant,
 }
 
-/// The `authenticator` connections of every compute this instance checks on.
+/// The check connections (of either login) of every compute this instance checks on.
 pub struct CheckPools {
     lookup: Arc<ConnLookup>,
     tls: Option<ServerTls>,
@@ -378,7 +435,8 @@ impl CheckPools {
         idle.retain(|_, conns| !conns.is_empty());
     }
 
-    /// Closes one idle connection of `branch_id`'s other databases (its budget share goes back).
+    /// Closes one idle connection of `branch_id`'s other pools, whichever their database or
+    /// login (its budget share goes back).
     fn evict_other(&self, branch_id: Uuid, keep: &PoolKey) -> bool {
         let mut idle = self.idle.lock().unwrap();
         for (key, conns) in idle.iter_mut() {
@@ -391,8 +449,28 @@ impl CheckPools {
 
     /// A connection to `target`'s database as `authenticator`.
     pub async fn get(self: &Arc<Self>, target: &CheckTarget) -> Result<PooledClient, CheckError> {
-        let info = self.lookup.get(target.branch_id).await?;
-        let key: PoolKey = (target.branch_id, target.pg_database.clone());
+        self.get_as(target, Login::Authenticator).await
+    }
+
+    /// A connection to `target`'s database as `login`, within the compute's one budget. For
+    /// the elevated login on a branch whose cached answer has no credentials for it (cached
+    /// before the worker stored them), the route is asked again once; still none is
+    /// `Unavailable`, and nothing is opened as `authenticator` instead.
+    pub async fn get_as(
+        self: &Arc<Self>,
+        target: &CheckTarget,
+        login: Login,
+    ) -> Result<PooledClient, CheckError> {
+        let mut info = self.lookup.get(target.branch_id).await?;
+        if info.credentials(login).is_none() {
+            info = self.lookup.get_newer_than(target.branch_id, REFETCH_AFTER).await?;
+        }
+        let Some(credentials) = info.credentials(login) else {
+            return Err(CheckError::Unavailable(
+                "the branch has no elevated login to check as".into(),
+            ));
+        };
+        let key: PoolKey = (target.branch_id, target.pg_database.clone(), login);
         let reused = {
             let mut idle = self.idle.lock().unwrap();
             let mut found = None;
@@ -431,7 +509,7 @@ impl CheckPools {
                 }
             }
         };
-        let config = connect_config(&info, &target.pg_database, self.tls.as_ref())?;
+        let config = connect_config_as(&info, credentials, &target.pg_database, self.tls.as_ref())?;
         let client = connect(&config, self.tls.as_ref()).await.map_err(|e| {
             self.lookup.invalidate(target.branch_id);
             CheckError::Unavailable(format!("connecting to the compute: {e}"))
@@ -443,5 +521,56 @@ impl CheckPools {
             key,
             pools: Arc::downgrade(self),
         })
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    fn info(elevated: bool) -> ConnInfo {
+        let mut v = serde_json::json!({
+            "host": "127.0.0.1", "port": 5432, "user": "authenticator", "password": "pw-secret",
+        });
+        if elevated {
+            v["elevated"] = serde_json::json!({
+                "user": chelabase_query::roles::ELEVATED_LOGIN, "password": "el-secret",
+            });
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Each login's pool connects with that login's credentials; a branch without the
+    /// elevated login has none for it; neither password is printed.
+    #[test]
+    fn each_login_connects_with_its_own_credentials() {
+        let with = info(true);
+        assert_eq!(info(false).credentials(Login::Elevated), None);
+        assert_eq!(with.credentials(Login::Authenticator), Some(("authenticator", "pw-secret")));
+        let credentials = with.credentials(Login::Elevated).unwrap();
+        assert_eq!(credentials, (chelabase_query::roles::ELEVATED_LOGIN, "el-secret"));
+        let config = connect_config_as(&with, credentials, "main", None).unwrap();
+        assert_eq!(config.get_user(), Some(chelabase_query::roles::ELEVATED_LOGIN));
+        assert_eq!(config.get_password(), Some(&b"el-secret"[..]));
+        let config = connect_config(&with, "main", None).unwrap();
+        assert_eq!(config.get_user(), Some("authenticator"));
+        let printed = format!("{with:?}");
+        assert!(!printed.contains("el-secret") && !printed.contains("pw-secret"), "{printed}");
+    }
+
+    /// Both logins' pools of a compute draw on its one budget, and a pool's key carries the
+    /// login, so a connection of one login is never handed out for the other.
+    #[test]
+    fn both_logins_share_the_compute_budget() {
+        let budget = ComputeBudget::new(PER_COMPUTE);
+        let branch = Uuid::new_v4();
+        let held: Vec<_> = (0..PER_COMPUTE).map(|_| budget.try_take(branch).unwrap()).collect();
+        assert!(budget.try_take(branch).is_none());
+        drop(held);
+        let (a, e): (PoolKey, PoolKey) = (
+            (branch, "main".into(), Login::Authenticator),
+            (branch, "main".into(), Login::Elevated),
+        );
+        assert_ne!(a, e);
     }
 }

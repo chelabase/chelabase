@@ -730,12 +730,17 @@ for svc in $(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; .so
   cid="$(compose "$PROJECT" ps -aq "$svc")"
   [[ -n "$cid" ]] || die "no container for $svc"
   [[ "$(docker inspect -f '{{.State.Running}}' "$cid")" == true ]] || continue # a one-shot that is done
-  pid="$(docker inspect -f '{{.State.Pid}}' "$cid")"
-  # The main process's real ids (not the configured user: it may start as root and drop).
-  uid="$(awk '/^Uid:/ {print $3}' "/proc/$pid/status")"
-  gid="$(awk '/^Gid:/ {print $3}' "/proc/$pid/status")"
+  # The main process's real ids (not the configured user: it may start as root and drop). Read
+  # from inside the container's pid namespace, where it is pid 1, by the helper image's cat (the
+  # service image may have no shell): the host's /proc has no such pid when the daemon runs in a
+  # VM (Docker Desktop).
+  docker run --rm --network none --pid="container:$cid" --entrypoint cat "$HELPER" /proc/1/status \
+    >"$tmp/status" || die "read $svc's /proc/1/status"
+  uid="$(awk '/^Uid:/ {print $3}' "$tmp/status")"
+  gid="$(awk '/^Gid:/ {print $3}' "$tmp/status")"
+  [[ -n "$uid" && -n "$gid" ]] || die "no Uid/Gid in $svc's /proc/1/status"
   groups_args=()
-  for g in $(awk '/^Groups:/ {for (i = 2; i <= NF; i++) print $i}' "/proc/$pid/status"); do groups_args+=(--group-add "$g"); done
+  for g in $(awk '/^Groups:/ {for (i = 2; i <= NF; i++) print $i}' "$tmp/status"); do groups_args+=(--group-add "$g"); done
   mounts=()
   paths=""
   i=0

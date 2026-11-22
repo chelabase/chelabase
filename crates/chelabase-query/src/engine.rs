@@ -16,14 +16,20 @@
 //! 3. the tree is planned through the shape cache, keyed by
 //!    `(branch, database, schema version, role, default_schema, shape hash)`;
 //! 4. each plan runs with its values bound (`max_rows` applied at binding), its result
-//!    counted against the response cap ([`ResponseBudget`]).
+//!    counted against the response cap ([`ResponseBudget`]);
+//! 5. before `COMMIT`, in the same round trip: `SET CONSTRAINTS ALL IMMEDIATE` (deferred
+//!    triggers fire now, not at `COMMIT`), then [`SESSION_CHECK_SQL`], which fails unless
+//!    the transaction still runs as the role the request asked for and the session holds
+//!    no SQL-level prepared statement. A failed check commits nothing: the request answers
+//!    500 and the connection is discarded ([`with_checked_transaction`]). The pipelined
+//!    path sends the same two steps ([`crate::pipeline`]).
 //!
 //! Every statement declares its parameters' types (`text`, `jsonb`, `int8`, `text[]`): the
 //! server never infers one. Every plan returns one `text` row: the operation's JSON, sent on
 //! unparsed. A batch joins its results into one array.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::StatusCode;
@@ -33,7 +39,7 @@ use uuid::Uuid;
 
 use crate::error::{DbFields, QueryFailure, SCHEMA_MISSING, classify, schema_missing_in};
 use crate::pipeline::{
-    self, Attempt, Call, Ctx, Param, QueryClient, Step, join_in_order, sql_budget,
+    self, Attempt, Call, Ctx, Param, QueryClient, Step, StepKind, join_in_order, sql_budget,
     take_trailing_reset,
 };
 use crate::query::Op;
@@ -41,12 +47,19 @@ use crate::schema::{self, IntrospectError, RoleView, Schema};
 use crate::shape::shape_hash;
 use crate::sql::{BindValue, ParamType, Plan, PlanError, plan, resolve_bind};
 
-/// Schema versions kept (one per served database in the steady state).
+/// Schema versions kept by the count-bounded caches (versions and guard marks: one entry
+/// per served database in the steady state).
 pub const SCHEMA_CACHE: u64 = 1_000;
-/// Shapes kept per branch.
-pub const SHAPES_PER_BRANCH: u32 = 1_000;
-/// Shapes kept across every branch.
-pub const SHAPES_TOTAL: u64 = 50_000;
+/// The bytes the schema cache holds across every branch and database (each schema weighed
+/// by [`Schema::approx_bytes`] and its key).
+pub const SCHEMA_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// The bytes of plans kept per branch.
+pub const SHAPE_BYTES_PER_BRANCH: u64 = 8 * 1024 * 1024;
+/// The bytes of plans kept across every branch.
+pub const SHAPE_BYTES_TOTAL: u64 = 256 * 1024 * 1024;
+/// A plan set (or a statement) over this many bytes is used for its request and never
+/// cached: not as a plan, not as a named statement on the server.
+pub const MAX_CACHED_PLAN_BYTES: usize = 64 * 1024;
 /// The largest query response, unless the caller says otherwise.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -86,6 +99,95 @@ pub const GUARDED_PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('role', CAS
 pub const OWNER_GUARDED_PREAMBLE_SQL: &str = "SELECT pg_catalog.set_config('statement_timeout', $1, true), \
      pg_catalog.set_config('transaction_timeout', $1, true), current_user::pg_catalog.text, \
      chelabase.assert_schema_version($2)";
+
+/// Fails when the session holds a prepared statement made in SQL (`PREPARE`), and leaves the
+/// role unset otherwise. It reads `pg_prepared_statement()`, the function behind the
+/// `pg_prepared_statements` view (cheaper to plan, and this text is planned on every use).
+/// The function builds a row per statement the session holds, so its cost grows with the
+/// connection's statement cache: a request sends it as seldom as it can
+/// ([`opening_reset_sql`]). Such a statement shares its namespace with the protocol-level
+/// statements a pooled connection caches, and no reset drops it without dropping those too,
+/// so a session that holds one is closed rather than cleaned. It raises the way the
+/// preamble does: the empty name is no role, so `set_config` refuses it.
+pub const NO_SQL_PREPARED_SQL: &str = "SELECT pg_catalog.set_config('role', CASE WHEN EXISTS \
+     (SELECT 1 FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql) THEN '' ELSE 'none' END, false)";
+
+/// What returns a pooled `authenticator` connection to the state a new session has: no
+/// role, the connection's default settings, no session-level advisory lock, no temporary
+/// table, no open cursor, no `LISTEN` registration, no sequence state, and (or the reset
+/// fails, [`NO_SQL_PREPARED_SQL`]) no SQL-level prepared statement. Protocol-level prepared
+/// statements survive it. Every statement of it is allowed inside a transaction block.
+/// Every transaction sends it first ([`begin_sql`]) and again after its end; a reset that
+/// fails discards the connection. rest, storage and realtime share this text.
+pub const POOLED_RESET_SQL: &str = "SET ROLE NONE; RESET ALL; \
+     SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP; CLOSE ALL; UNLISTEN *; \
+     DISCARD SEQUENCES; \
+     SELECT pg_catalog.set_config('role', CASE WHEN EXISTS \
+     (SELECT 1 FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql) THEN '' ELSE 'none' END, false)";
+
+/// `reset_sql` without its prepared-statement check ([`NO_SQL_PREPARED_SQL`], when it ends
+/// with it): what opens a transaction on a connection whose last transaction ended with the
+/// full reset ([`QueryClient::opening_reset`]). Nothing ran on the session since that reset
+/// passed, so the check has nothing new to find, and the request's own two (before its
+/// `COMMIT`, and in the reset after it) still run.
+pub fn opening_reset_sql(reset_sql: &str) -> &str {
+    match reset_sql.strip_suffix(NO_SQL_PREPARED_SQL) {
+        Some(rest) => rest.trim_end().trim_end_matches(';'),
+        None => reset_sql,
+    }
+}
+
+/// Sent before [`SESSION_CHECK_SQL`]: deferred constraints and constraint triggers queued so
+/// far run now, inside the checked part of the transaction. Work they queue in turn while
+/// deferring constraints again still runs at `COMMIT`; the check's second column is what
+/// covers that (the connection is closed).
+pub const CONSTRAINTS_IMMEDIATE_SQL: &str = "SET CONSTRAINTS ALL IMMEDIATE";
+
+/// The last statement before `COMMIT`: `$1` (`text`) the role the request runs as
+/// ([`RunAs::role`]; `none` stands for the connection's own login). It fails unless
+/// `current_user` is that role and the session holds no SQL-level prepared statement, which
+/// aborts the transaction, so the `COMMIT` behind it rolls back. When it passes it sets the
+/// role to what it already is. It raises the way the preamble does (the empty name is no
+/// role), with no function of the database's own.
+///
+/// Its second column ([`wrote_deferrable`]) says whether the transaction wrote a row of a
+/// table that has a deferrable constraint trigger (a deferrable key or foreign key, or a
+/// `CREATE CONSTRAINT TRIGGER … DEFERRABLE`). Only such a write can queue deferred work, and
+/// deferred work can queue more of itself for `COMMIT`, after this check, where nothing
+/// can look at it. Postgres has no statement that tells whether deferred work is pending,
+/// so the signal is the write itself: the transaction's own row counts
+/// (`pg_stat_get_xact_tuples_*`), which the code a request runs can't lower. They are only
+/// kept while `track_counts` is on (a setting only a superuser changes), so anything else
+/// counts as written. A request with the mark commits as usual, and its connection is
+/// closed instead of pooled.
+pub const SESSION_CHECK_SQL: &str = "SELECT pg_catalog.set_config('role', CASE WHEN \
+     current_user::pg_catalog.text OPERATOR(pg_catalog.=) \
+     (CASE WHEN $1 OPERATOR(pg_catalog.=) 'none' THEN session_user::pg_catalog.text ELSE $1 END) \
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql) \
+     THEN pg_catalog.current_setting('role') ELSE '' END, true), \
+     (pg_catalog.current_setting('track_counts') OPERATOR(pg_catalog.<>) 'on' OR EXISTS \
+     (SELECT 1 FROM pg_catalog.pg_trigger t WHERE t.tgdeferrable AND \
+     (pg_catalog.pg_stat_get_xact_tuples_inserted(t.tgrelid) OPERATOR(pg_catalog.+) \
+     pg_catalog.pg_stat_get_xact_tuples_updated(t.tgrelid) OPERATOR(pg_catalog.+) \
+     pg_catalog.pg_stat_get_xact_tuples_deleted(t.tgrelid)) OPERATOR(pg_catalog.>) 0))";
+
+/// Whether the session check's row says the transaction wrote a table with a deferrable
+/// constraint trigger ([`SESSION_CHECK_SQL`]'s second column). A row that can't be read
+/// counts as yes.
+pub(crate) fn wrote_deferrable(row: &tokio_postgres::Row) -> bool {
+    row.try_get::<_, bool>(1).unwrap_or(true)
+}
+
+/// A request that may have left deferred work for its `COMMIT` ([`wrote_deferrable`]): what
+/// it did is committed, and its connection is closed rather than pooled
+/// ([`QueryClient::mark_broken`]).
+pub(crate) fn discard_after_deferrable_write<C: QueryClient + ?Sized>(client: &C, request_id: &str) {
+    tracing::debug!(
+        request_id,
+        "the request wrote a table with a deferrable constraint trigger; its connection isn't pooled again"
+    );
+    client.mark_broken();
+}
 
 /// How long a database found without the guard functions runs sequentially before the
 /// pipeline is tried again (reconcile reinstalls them).
@@ -180,62 +282,110 @@ pub(crate) fn too_large(cap: usize) -> QueryFailure {
     )
 }
 
-/// One branch's shapes, and how many were ever inserted (its weight in the global bound).
+/// One branch's shapes. `held` is the bytes its cache holds, kept exactly by the cache's
+/// eviction listener (so it trails an eviction until moka's maintenance runs, never an
+/// insert).
 struct BranchShapes {
     plans: moka::sync::Cache<ShapeKey, Arc<Vec<Plan>>>,
-    inserts: AtomicU32,
+    held: Arc<AtomicU64>,
 }
 
 impl BranchShapes {
+    /// Its weight in the global bound: the bytes it holds (at least 1; a weight is never 0).
     fn weight(&self) -> u32 {
-        self.inserts
-            .load(Ordering::Relaxed)
-            .clamp(1, SHAPES_PER_BRANCH)
+        clamp_weight(self.held.load(Ordering::Relaxed).max(1) as usize)
     }
 }
 
-/// Plans by shape: at most [`SHAPES_PER_BRANCH`] per branch (LRU-like, every database of
-/// the branch together), and about [`SHAPES_TOTAL`] in all. The global bound weighs each
-/// branch by the shapes it has held (capped at the per-branch bound), refreshed every 50
-/// inserts.
+/// A moka weight: `bytes`, saturating at `u32::MAX` rather than wrapping.
+fn clamp_weight(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+/// The bytes a cached plan set weighs: its plans and the key it is stored under.
+fn shape_bytes(key: &ShapeKey, plans: &[Plan]) -> usize {
+    let (schema_key, role, default_schema, _) = key;
+    std::mem::size_of::<ShapeKey>()
+        + schema_key.database.len()
+        + schema_key.version.len()
+        + role.len()
+        + default_schema.len()
+        + std::mem::size_of::<Vec<Plan>>()
+        + plans.iter().map(Plan::approx_bytes).sum::<usize>()
+}
+
+/// Plans by shape, bounded in bytes.
+///
+/// Invariants (tested in `engine::tests`):
+/// - a branch holds at most `per_branch` bytes of plans (every database of the branch
+///   together; LRU), each plan set weighed by [`shape_bytes`];
+/// - the branches together hold at most about `total` bytes: the global cache weighs each
+///   branch by the bytes it holds, refreshed on every insert, and evicts whole branches
+///   past `total`;
+/// - a plan set over [`MAX_CACHED_PLAN_BYTES`] is planned, returned and never inserted, so
+///   no single request shape can take more than that from the bound, and the bound holds
+///   whatever shapes arrive.
 pub struct ShapeCache {
     branches: moka::sync::Cache<Uuid, Arc<BranchShapes>>,
+    per_branch: u64,
 }
 
 impl Default for ShapeCache {
     fn default() -> Self {
-        ShapeCache {
-            branches: moka::sync::Cache::builder()
-                .max_capacity(SHAPES_TOTAL)
-                .weigher(|_, b: &Arc<BranchShapes>| b.weight())
-                .build(),
-        }
+        ShapeCache::with_bounds(SHAPE_BYTES_PER_BRANCH, SHAPE_BYTES_TOTAL)
     }
 }
 
 impl ShapeCache {
+    /// A cache holding at most `per_branch` bytes of plans per branch and about `total` in
+    /// all.
+    pub fn with_bounds(per_branch: u64, total: u64) -> Self {
+        ShapeCache {
+            branches: moka::sync::Cache::builder()
+                .max_capacity(total)
+                .weigher(|_, b: &Arc<BranchShapes>| b.weight())
+                .build(),
+            per_branch,
+        }
+    }
+
+    fn new_branch(&self) -> Arc<BranchShapes> {
+        let held = Arc::new(AtomicU64::new(0));
+        let released = held.clone();
+        let plans = moka::sync::Cache::builder()
+            .max_capacity(self.per_branch)
+            .eviction_policy(moka::policy::EvictionPolicy::lru())
+            .weigher(|k: &ShapeKey, v: &Arc<Vec<Plan>>| clamp_weight(shape_bytes(k, v)))
+            .eviction_listener(move |k: Arc<ShapeKey>, v: Arc<Vec<Plan>>, _| {
+                released.fetch_sub(shape_bytes(&k, &v) as u64, Ordering::Relaxed);
+            })
+            .build();
+        Arc::new(BranchShapes { plans, held })
+    }
+
     pub fn get_or_plan(
         &self,
         key: ShapeKey,
         make: impl FnOnce() -> Result<Vec<Plan>, PlanError>,
     ) -> Result<Arc<Vec<Plan>>, PlanError> {
         let branch = key.0.branch;
-        let shapes = self.branches.get_with(branch, || {
-            Arc::new(BranchShapes {
-                plans: moka::sync::Cache::new(u64::from(SHAPES_PER_BRANCH)),
-                inserts: AtomicU32::new(0),
-            })
-        });
-        if let Some(plans) = shapes.plans.get(&key) {
+        if let Some(plans) = self
+            .branches
+            .get(&branch)
+            .and_then(|shapes| shapes.plans.get(&key))
+        {
             return Ok(plans);
         }
         let plans = Arc::new(make()?);
-        shapes.plans.insert(key, plans.clone());
-        let n = shapes.inserts.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(50) && n <= SHAPES_PER_BRANCH {
-            // Re-weigh the branch.
-            self.branches.insert(branch, shapes);
+        let bytes = shape_bytes(&key, &plans);
+        if bytes > MAX_CACHED_PLAN_BYTES {
+            return Ok(plans);
         }
+        let shapes = self.branches.get_with(branch, || self.new_branch());
+        shapes.held.fetch_add(bytes as u64, Ordering::Relaxed);
+        shapes.plans.insert(key, plans.clone());
+        // Re-weigh the branch in the global bound.
+        self.branches.insert(branch, shapes);
         Ok(plans)
     }
 
@@ -243,6 +393,37 @@ impl ShapeCache {
     pub fn invalidate_branch(&self, branch: Uuid) {
         self.branches.invalidate(&branch);
     }
+
+    /// Runs moka's pending maintenance (evictions); the bounds hold exactly only after it.
+    pub fn run_pending_tasks(&self) {
+        self.branches.run_pending_tasks();
+        for (_, shapes) in self.branches.iter() {
+            shapes.plans.run_pending_tasks();
+        }
+    }
+
+    /// The bytes of plans the cache holds, and how many plan sets (after
+    /// [`ShapeCache::run_pending_tasks`] for exact numbers).
+    pub fn held(&self) -> (u64, u64) {
+        self.branches.iter().fold((0, 0), |(bytes, sets), (_, b)| {
+            (bytes + b.plans.weighted_size(), sets + b.plans.entry_count())
+        })
+    }
+
+    /// The bytes of plans held for `branch`, if it holds any.
+    pub fn branch_bytes(&self, branch: Uuid) -> Option<u64> {
+        self.branches.get(&branch).map(|b| b.plans.weighted_size())
+    }
+}
+
+/// A cached schema's moka weight: its approximate size and its key's.
+fn schema_weight(key: &SchemaKey, schema: &Schema) -> u32 {
+    clamp_weight(
+        schema
+            .approx_bytes()
+            .saturating_add(std::mem::size_of::<SchemaKey>())
+            .saturating_add(key.database.len() + key.version.len()),
+    )
 }
 
 /// `(branch, database)`.
@@ -268,7 +449,8 @@ impl Default for QueryCache {
     fn default() -> Self {
         QueryCache {
             schemas: moka::future::Cache::builder()
-                .max_capacity(SCHEMA_CACHE)
+                .max_capacity(SCHEMA_CACHE_BYTES)
+                .weigher(|k: &SchemaKey, s: &Arc<Schema>| schema_weight(k, s))
                 .support_invalidation_closures()
                 .build(),
             shapes: ShapeCache::default(),
@@ -316,6 +498,27 @@ impl QueryCache {
                 Ok(e) => introspect_failure(e, request_id),
                 Err(e) => QueryFailure::internal(request_id, e),
             })
+    }
+
+    /// Drops the cached schemas of `(branch, database)` at any version but `keep`. A request
+    /// still planning against an older one holds its own `Arc`, so it is unaffected.
+    pub fn forget_other_versions(&self, branch: Uuid, database: &str, keep: &str) {
+        let (database, keep) = (database.to_owned(), keep.to_owned());
+        let _ = self.schemas.invalidate_entries_if(move |k, _| {
+            k.branch == branch && k.database == database && k.version != keep
+        });
+    }
+
+    /// The bytes and the count of the schemas held (after [`QueryCache::run_pending_tasks`]
+    /// for exact numbers).
+    pub fn schemas_held(&self) -> (u64, u64) {
+        (self.schemas.weighted_size(), self.schemas.entry_count())
+    }
+
+    /// Runs moka's pending maintenance on the schema and shape caches.
+    pub async fn run_pending_tasks(&self) {
+        self.schemas.run_pending_tasks().await;
+        self.shapes.run_pending_tasks();
     }
 
     /// The schema at `key` when the cache holds it.
@@ -399,38 +602,157 @@ pub async fn with_transaction_mapped<C: QueryClient + ?Sized, T>(
     on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
     f: impl AsyncFnOnce(&Client) -> Result<T, QueryFailure>,
 ) -> Result<T, QueryFailure> {
+    transact(client, reset_sql, None, request_id, on_commit, f).await
+}
+
+/// [`with_transaction_mapped`] for a transaction that runs as `role` (`none`: the
+/// connection's own login): when `f` succeeds, [`CONSTRAINTS_IMMEDIATE_SQL`] and
+/// [`SESSION_CHECK_SQL`] go out before the `COMMIT`, in its round trip
+/// ([`closing_steps`]). Deferred work that fails is `on_commit`'s, as when it failed at
+/// `COMMIT`. A failed check (the transaction no longer runs as `role`, or the session holds
+/// a SQL-level prepared statement) commits nothing: a 500, the details in the log only, and
+/// the connection marked broken. A transaction that wrote a table with a deferrable
+/// constraint trigger commits, and its connection is marked broken too
+/// ([`SESSION_CHECK_SQL`]): deferred work may have run inside its `COMMIT`, after the check.
+pub async fn with_checked_transaction<C: QueryClient + ?Sized, T>(
+    client: &C,
+    reset_sql: &str,
+    role: &str,
+    request_id: &str,
+    on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+    f: impl AsyncFnOnce(&Client) -> Result<T, QueryFailure>,
+) -> Result<T, QueryFailure> {
+    transact(client, reset_sql, Some(role), request_id, on_commit, f).await
+}
+
+/// What ends a transaction, in the order sent (one round trip): with the session check
+/// (`checked`) the constraints go immediate first, then the check, then the `COMMIT`, then
+/// the reset; without it (a rollback, or a transaction no role was set in) the `COMMIT` or
+/// `ROLLBACK` and the reset.
+pub(crate) fn closing_steps(checked: bool) -> &'static [StepKind] {
+    if checked {
+        &[
+            StepKind::Constraints,
+            StepKind::Check,
+            StepKind::Commit,
+            StepKind::Reset,
+        ]
+    } else {
+        &[StepKind::Commit, StepKind::Reset]
+    }
+}
+
+/// The 500 of a failed [`SESSION_CHECK_SQL`]: Postgres's text goes to the log only. Logged
+/// at warn, not error: a function of the database's own can cause it on every call.
+pub(crate) fn session_check_failure(
+    role: &str,
+    error: impl std::fmt::Display,
+    request_id: &str,
+) -> QueryFailure {
+    tracing::warn!(
+        request_id,
+        role,
+        "the session check before COMMIT failed; nothing was committed and the connection is discarded: {error}"
+    );
+    QueryFailure::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        format!("internal error (request id {request_id})"),
+    )
+}
+
+async fn transact<C: QueryClient + ?Sized, T>(
+    client: &C,
+    reset_sql: &str,
+    check: Option<&str>,
+    request_id: &str,
+    on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+    f: impl AsyncFnOnce(&Client) -> Result<T, QueryFailure>,
+) -> Result<T, QueryFailure> {
     let c = client.client();
-    let begin = begin_sql(reset_sql, client.transaction_status());
+    let status = client.transaction_status();
+    let begin = begin_sql(client.opening_reset(reset_sql, status), status);
     if let Err(e) = c.batch_execute(&begin).await {
         tracing::warn!(
             request_id,
             "the transaction couldn't begin on a clean session; the connection is discarded: {e}"
         );
         client.mark_broken();
-        return Err(QueryFailure::from_pg(&e, request_id));
+        return Err(pipeline::begin_failure(&e, request_id));
     }
     let out = f(c).await;
     let end = if out.is_ok() { "COMMIT" } else { "ROLLBACK" };
+    // Only work that would commit is checked: a rollback keeps nothing. Nor does a
+    // transaction a failed statement already aborted, when `f` answered for that statement
+    // itself (its `Ok` carries the answer): the `COMMIT` rolls it back, and `f`'s answer
+    // stands as it always did. The status is the connection's own (from the server's
+    // `ReadyForQuery`), read while nothing is in flight; an error's SQLSTATE is never
+    // taken for it (the request's own work can raise any).
+    let mut status = client.transaction_status();
+    if check.is_some() && out.is_ok() && status == TransactionStatus::Unknown {
+        // In practice only after a statement of `f`'s failed: the driver can hand a failed
+        // statement's error back just before it has read the status that follows it, while a
+        // statement that succeeded resolves with its status already read. So a request whose
+        // statements all succeeded never sends this. An empty query settles it (one more round trip, on this
+        // path only), so the choice below never rests on a status not yet known. If this
+        // fails, the status stays as it is and the steps before `COMMIT` are sent.
+        let _ = c.batch_execute("").await;
+        status = client.transaction_status();
+    }
+    let aborted = status == TransactionStatus::Failed;
+    let check = check.filter(|_| out.is_ok() && !aborted);
+    let kinds = closing_steps(check.is_some());
+    // Set by the check's row ([`wrote_deferrable`]).
+    let deferrable = std::sync::atomic::AtomicBool::new(false);
+    let deferrable = &deferrable;
     type Out = Result<(), tokio_postgres::Error>;
-    let steps: Vec<Step<'_, Out>> = vec![
-        Box::pin(c.batch_execute(end)),
-        Box::pin(c.batch_execute(reset_sql)),
-    ];
+    let steps: Vec<Step<'_, Out>> = kinds
+        .iter()
+        .map(|kind| -> Step<'_, Out> {
+            match kind {
+                StepKind::Constraints => Box::pin(c.batch_execute(CONSTRAINTS_IMMEDIATE_SQL)),
+                StepKind::Check => Box::pin(async move {
+                    let role = check.unwrap_or_default();
+                    c.query_typed_one(SESSION_CHECK_SQL, &[(&role, Type::TEXT)])
+                        .await
+                        .map(|row| deferrable.store(wrote_deferrable(&row), Ordering::Relaxed))
+                }),
+                StepKind::Reset => Box::pin(c.batch_execute(reset_sql)),
+                _ => Box::pin(c.batch_execute(end)),
+            }
+        })
+        .collect();
     let mut results = join_in_order(steps).await;
     take_trailing_reset(&mut results, client, request_id);
     let ended = results.pop().expect("the COMMIT or ROLLBACK step");
-    match out {
-        Ok(out) => {
-            ended.map_err(|e| on_commit(&e))?;
-            Ok(out)
-        }
+    let out = match out {
+        Ok(out) => out,
         Err(failure) => {
             if let Err(e) = ended {
                 tracing::debug!(request_id, "the rollback failed: {e}");
             }
-            Err(failure)
+            return Err(failure);
+        }
+    };
+    if let Some(role) = check {
+        let checked = results.pop().expect("the session check step");
+        let constraints = results.pop().expect("the SET CONSTRAINTS step");
+        // Deferred work that failed: the transaction is aborted, and the COMMIT behind it
+        // rolled back.
+        if let Err(e) = constraints {
+            return Err(on_commit(&e));
+        }
+        if let Err(e) = checked {
+            client.mark_broken();
+            return Err(session_check_failure(role, &e, request_id));
+        }
+        // Whatever the COMMIT answered: deferred work may have run in it.
+        if deferrable.load(Ordering::Relaxed) {
+            discard_after_deferrable_write(client, request_id);
         }
     }
+    ended.map_err(|e| on_commit(&e))?;
+    Ok(out)
 }
 
 /// The sequential path's transaction opening, for callers that run their own statements
@@ -463,7 +785,8 @@ pub async fn console_session_mapped<C: QueryClient + ?Sized, T>(
     on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
     f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
 ) -> Result<T, QueryFailure> {
-    with_transaction_mapped(client, settings.reset_sql, request_id, on_commit, async |c| {
+    let reset = settings.reset_sql;
+    with_checked_transaction(client, reset, run_as.role(), request_id, on_commit, async |c| {
         let pre = preamble(c, run_as, settings.statement_timeout_ms, request_id)
             .await
             .map_err(|f| in_database(f, database))?;
@@ -578,6 +901,12 @@ pub fn preamble_failure(db: &dyn DbFields, role: &str, request_id: &str) -> Quer
         "the preamble failed: {code}: {}",
         db.message()
     );
+    role_unusable(role)
+}
+
+/// The 503 a request answers when its role can't be used on the login it runs on: the
+/// preamble's role switch was refused, or the role may run on neither login right now.
+pub fn role_unusable(role: &str) -> QueryFailure {
     QueryFailure::unavailable(format!(
         "the key's role {role} can't be used right now; try again"
     ))
@@ -615,9 +944,15 @@ pub async fn load_schema(
         database: key.1.to_owned(),
         version: pre.version,
     };
+    let database = (key.0, key.1.to_owned());
+    let previous = cache.versions.get(&database);
     cache
         .versions
-        .insert((key.0, key.1.to_owned()), schema_key.version.clone());
+        .insert(database, schema_key.version.clone());
+    if previous.is_some_and(|v| v != schema_key.version) {
+        // The database moved on: nothing will ask for its older schemas again.
+        cache.forget_other_versions(key.0, key.1, &schema_key.version);
+    }
     let schema = cache.schema(client, schema_key.clone(), request_id).await?;
     Ok((schema, schema_key, pre.role))
 }
@@ -632,7 +967,9 @@ pub async fn schema_for<C: QueryClient + ?Sized>(
     settings: &RunSettings,
     request_id: &str,
 ) -> Result<(Arc<Schema>, Arc<RoleView>), QueryFailure> {
-    with_transaction(client, settings.reset_sql, request_id, async |client| {
+    let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+    let reset = settings.reset_sql;
+    with_checked_transaction(client, reset, run_as.role(), request_id, on_commit, async |client| {
         let (schema, _, role) = load_schema(
             client,
             cache,
@@ -667,8 +1004,10 @@ pub async fn run<C: QueryClient + ?Sized>(
 ) -> Result<String, QueryFailure> {
     let attempt = pipelined(client, cache, key, run_as, settings, budget, op, request_id).await;
     pipeline::settle(cache, key, attempt, async || {
-        with_transaction(client, settings.reset_sql, request_id, async |client| {
-            run_sequential(client, cache, key, run_as, settings, budget, op, request_id).await
+        let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+        let reset = settings.reset_sql;
+        with_checked_transaction(client, reset, run_as.role(), request_id, on_commit, async |c| {
+            run_sequential(c, cache, key, run_as, settings, budget, op, request_id).await
         })
         .await
     })
@@ -1162,6 +1501,53 @@ mod tests {
         assert!(matches!(attempt().await, Attempt::Sequential));
     }
 
+    /// The opening reset drops the prepared-statement check only for a pooled connection
+    /// that is idle and not marked broken: its last transaction ended with the full reset,
+    /// or it would have been closed. Any other client, and any other state, gets the full
+    /// text.
+    #[tokio::test]
+    async fn opening_reset_skips_the_check_only_on_a_clean_pooled_connection() {
+        let light = "SET ROLE NONE; RESET ALL; SELECT pg_catalog.pg_advisory_unlock_all(); \
+                     DISCARD TEMP; CLOSE ALL; UNLISTEN *; DISCARD SEQUENCES";
+        assert_eq!(opening_reset_sql(POOLED_RESET_SQL), light);
+        assert_eq!(
+            format!("{light}; {NO_SQL_PREPARED_SQL}"),
+            POOLED_RESET_SQL,
+            "only the check is left out"
+        );
+        // A reset without the check is sent whole.
+        assert_eq!(opening_reset_sql("RESET ALL"), "RESET ALL");
+        assert_eq!(opening_reset_sql(light), light);
+
+        // A plain client isn't known clean: the full reset, whatever its status.
+        let plain = crate::error::tests::closed_client().await;
+        for status in [TransactionStatus::Idle, TransactionStatus::Unknown] {
+            assert_eq!(plain.opening_reset(POOLED_RESET_SQL, status), POOLED_RESET_SQL);
+        }
+
+        let pool = crate::fake_pg::pool(1).await;
+        let lease = crate::pipeline::Lease::new(pool.get().await.unwrap());
+        assert_eq!(lease.opening_reset(POOLED_RESET_SQL, TransactionStatus::Idle), light);
+        // Maybe inside a transaction a dropped request left: the full reset.
+        for status in [
+            TransactionStatus::InTransaction,
+            TransactionStatus::Failed,
+            TransactionStatus::Unknown,
+        ] {
+            assert_eq!(
+                lease.opening_reset(POOLED_RESET_SQL, status),
+                POOLED_RESET_SQL,
+                "{status:?}"
+            );
+        }
+        // A reset or a check failed earlier on this lease: the full reset.
+        lease.mark_broken();
+        assert_eq!(
+            lease.opening_reset(POOLED_RESET_SQL, TransactionStatus::Idle),
+            POOLED_RESET_SQL
+        );
+    }
+
     /// Every transaction starts by ending whatever a dropped request may have left open
     /// (unless the connection is idle: outside a transaction Postgres logs a warning), then
     /// begins, then resets the session inside the transaction: one round trip.
@@ -1298,6 +1684,128 @@ mod tests {
         });
         assert!(err.is_err());
         assert!(cache.get_or_plan(k, || Ok(vec![])).is_ok());
+    }
+
+    fn plan_of(bytes: usize) -> Vec<Plan> {
+        vec![Plan {
+            sql: "x".repeat(bytes),
+            binds: vec![],
+            capped_sql: String::new(),
+        }]
+    }
+
+    fn put(cache: &ShapeCache, branch: Uuid, hash: u64, bytes: usize) {
+        let mut k = key("anon", hash);
+        k.0.branch = branch;
+        cache.get_or_plan(k, || Ok(plan_of(bytes))).unwrap();
+    }
+
+    /// A branch never holds more than its byte bound, and still serves the latest shapes.
+    #[test]
+    fn shape_cache_stays_under_branch_bytes() {
+        let bound = 100_000;
+        let cache = ShapeCache::with_bounds(bound, u64::MAX / 2);
+        let branch = Uuid::new_v4();
+        for hash in 0..200 {
+            put(&cache, branch, hash, 5_000);
+            if hash % 7 == 0 {
+                cache.run_pending_tasks();
+                assert!(cache.held().0 <= bound, "{}", cache.held().0);
+            }
+        }
+        cache.run_pending_tasks();
+        let (bytes, sets) = cache.held();
+        assert!(bytes <= bound && sets > 5, "{bytes} bytes, {sets} sets");
+        let made = std::cell::Cell::new(0);
+        let mut k = key("anon", 199);
+        k.0.branch = branch;
+        cache
+            .get_or_plan(k, || {
+                made.set(made.get() + 1);
+                Ok(plan_of(5_000))
+            })
+            .unwrap();
+        assert_eq!(made.get(), 0, "the latest shape is still cached");
+    }
+
+    /// Branches together stay under the global bound: whole branches are evicted.
+    #[test]
+    fn shape_cache_global_bytes_evict_branches() {
+        let total = 200_000;
+        let cache = ShapeCache::with_bounds(100_000, total);
+        let branches: Vec<Uuid> = (0..30).map(|_| Uuid::new_v4()).collect();
+        for round in 0..10 {
+            for b in &branches {
+                put(&cache, *b, round, 5_000);
+            }
+        }
+        cache.run_pending_tasks();
+        let (bytes, _) = cache.held();
+        assert!(bytes <= total, "{bytes} bytes held, bound {total}");
+        assert!(bytes > 0);
+        let alive = branches
+            .iter()
+            .filter(|b| cache.branch_bytes(**b).is_some())
+            .count();
+        assert!(alive < branches.len(), "some branches were evicted");
+    }
+
+    /// A plan set over [`MAX_CACHED_PLAN_BYTES`] is returned and never kept.
+    #[test]
+    fn oversized_plan_is_not_cached() {
+        let cache = ShapeCache::default();
+        let branch = Uuid::new_v4();
+        let made = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let mut k = key("anon", 1);
+            k.0.branch = branch;
+            let plans = cache
+                .get_or_plan(k, || {
+                    made.set(made.get() + 1);
+                    Ok(plan_of(MAX_CACHED_PLAN_BYTES + 1))
+                })
+                .unwrap();
+            assert_eq!(plans.len(), 1);
+        }
+        assert_eq!(made.get(), 2, "planned again: nothing was kept");
+        cache.run_pending_tasks();
+        assert_eq!(cache.held(), (0, 0));
+        assert_eq!(cache.branch_bytes(branch), None);
+        // One under the limit, key included, is kept.
+        put(&cache, branch, 2, 1_000);
+        cache.run_pending_tasks();
+        assert_eq!(cache.held().1, 1);
+    }
+
+    /// Recording a database's new schema version drops its old versions, and no other
+    /// database's.
+    #[tokio::test]
+    async fn new_schema_version_evicts_the_old_one() {
+        let cache = QueryCache::default();
+        let branch = Uuid::new_v4();
+        let load = |database: &'static str, version: &'static str| {
+            let cache = &cache;
+            async move {
+                cache
+                    .cached_schema(schema_key(branch, database, version), "rid", async {
+                        Ok(Schema::build(version.into(), Raw::default()))
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        load("main", "v1").await;
+        load("shop", "v1").await;
+        cache.versions.insert((branch, "main".into()), "v1".into());
+        // What load_schema does on reading v2 where v1 was held.
+        cache.forget_other_versions(branch, "main", "v2");
+        load("main", "v2").await;
+        cache.run_pending_tasks().await;
+        assert!(cache.cached(&schema_key(branch, "main", "v1")).await.is_none());
+        assert!(cache.cached(&schema_key(branch, "main", "v2")).await.is_some());
+        assert!(cache.cached(&schema_key(branch, "shop", "v1")).await.is_some());
+        assert_eq!(cache.schemas_held().1, 2);
+        assert!(cache.schemas_held().0 > 0, "schemas are weighed");
     }
 
     /// Two databases of one branch at the same version never share a plan or a schema, and

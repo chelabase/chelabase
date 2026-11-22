@@ -1317,6 +1317,7 @@ mod tests {
             database_id: None,
             user: "authenticator".into(),
             password: "x".into(),
+            elevated: None,
             settings: rest::conn::Settings {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,

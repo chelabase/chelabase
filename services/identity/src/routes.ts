@@ -12,7 +12,7 @@ import type { Mailer } from "./email/mailer.ts";
 import { HttpError, type Json } from "./http.ts";
 import { parsePoolName, type PoolRef } from "./pool-name.ts";
 import type { PoolRegistry } from "./registry.ts";
-import { codeRoutes, emailStatusRoute, inviteNoticeRoute } from "./routes/codes.ts";
+import { codeRoutes, emailStatusRoute, inviteNoticeRoute, notifyEmailChanged } from "./routes/codes.ts";
 
 export type RouteId =
   | "pools.create"
@@ -138,7 +138,7 @@ export interface GlobalRoute {
   handle(ctx: Pick<Ctx, "caller" | "mailer">): Promise<Reply>;
 }
 
-const MAX_EMAIL = 320;
+export const MAX_EMAIL = 320;
 const MAX_PASSWORD = 1024;
 const MAX_NAME = 256;
 const MAX_TOKEN = 512;
@@ -388,20 +388,27 @@ const ROUTES: readonly Route[] = [
   {
     // Mirrors the email branch of `adminUpdateUser` (/admin/update-user): lowercase, z.email(),
     // refuse an email another user holds. `email_verified` is passed through in the same
-    // update, false unless given.
+    // update, false unless given. `notify_previous: true` mails the previous address that it
+    // was replaced (when SMTP is configured and the address did change).
     id: "users.set_email",
     method: "PUT",
     rest: ["users", ":id", "email"],
-    async handle({ registry, pool, id, body }) {
+    async handle({ mailer, registry, pool, id, body }) {
       const email = str(body, "email", MAX_EMAIL).toLowerCase();
       const verified = optBool(body, "email_verified") === true;
+      const notify = optBool(body, "notify_previous") === true;
       if (!z.email().safeParse(email).success) throw new HttpError(400, "invalid_email", "invalid email");
       return registry.use(pool, async (auth) => {
         const ctx = await context(auth);
         const holder = await ctx.internalAdapter.findUserByEmail(email);
         if (holder && holder.user.id !== id) throw new HttpError(409, "conflict", "another user has this email");
         await requireUser(ctx, id);
-        const user = (await ctx.internalAdapter.updateUser(id, { email, emailVerified: verified })) as BaUser;
+        // A real change of address also revokes the user's outstanding codes, in the same
+        // statement (email/codes.ts).
+        const changed = await auth.codes.changeEmail(id, email, verified);
+        if (!changed) throw new HttpError(404, "user_not_found", "no such user");
+        const user = await requireUser(ctx, id);
+        if (notify && changed.previous.toLowerCase() !== email) await notifyEmailChanged(mailer, changed.previous);
         return { status: 200, body: { user: userOut(user) } };
       });
     },

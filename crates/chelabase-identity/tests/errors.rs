@@ -188,3 +188,17 @@ fn token_file_is_read_and_trimmed() {
     ));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn code_budget_spent_and_recently_sent_map() {
+    assert_eq!(
+        classify(429, &body("code_budget_spent")),
+        Some(IdentityError::CodeBudgetSpent)
+    );
+    assert_eq!(
+        classify(429, &body("code_recently_sent")),
+        Some(IdentityError::CodeRecentlySent)
+    );
+    assert!(!IdentityError::CodeBudgetSpent.is_retryable());
+    assert!(!IdentityError::CodeRecentlySent.is_retryable());
+}

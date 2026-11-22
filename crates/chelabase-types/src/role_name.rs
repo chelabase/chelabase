@@ -252,10 +252,18 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// A single-quoted SQL literal (`'` doubled; no backslash escapes, so valid with
-/// `standard_conforming_strings = on`).
+/// An SQL string literal, as Postgres's `quote_literal` writes it: single-quoted with `'`
+/// doubled; a string with a backslash gets the `E` prefix and its backslashes doubled, so it
+/// reads the same whatever `standard_conforming_strings` is. A NUL byte is not handled here
+/// (Postgres has none in a string): the worker's admin SQL path refuses a script that
+/// contains one before it is sent (`chelabase_neon::backend::refuse_nul`).
 pub fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let quoted = s.replace('\'', "''");
+    if s.contains('\\') {
+        format!("E'{}'", quoted.replace('\\', "\\\\"))
+    } else {
+        format!("'{quoted}'")
+    }
 }
 
 /// The role setting (`ALTER ROLE … SET`) that marks a personal login: the compute's guard
@@ -287,6 +295,17 @@ pub fn is_marked_sql(role: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A literal with a backslash is an `E'…'` string with the backslashes doubled, which reads
+    /// the same whatever `standard_conforming_strings` is; any other stays a plain `'…'`.
+    #[test]
+    fn quote_literal_escapes_backslashes() {
+        assert_eq!(quote_literal("a\\b'c"), "E'a\\\\b''c'");
+        assert_eq!(quote_literal("\\"), "E'\\\\'");
+        assert_eq!(quote_literal("plain"), "'plain'");
+        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_literal(""), "''");
+    }
 
     #[test]
     fn valid_names() {
@@ -562,7 +581,7 @@ mod tests {
     fn quoting() {
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_literal("it's"), "'it''s'");
-        assert_eq!(quote_literal("a\\b"), "'a\\b'");
+        assert_eq!(quote_literal("a\\b"), "E'a\\\\b'");
     }
 
     // c3 (RT4-4, SP22): the role marker's name and the two statements built on it.

@@ -141,3 +141,12 @@ export function useToggles(scope: string) {
     flip,
   };
 }
+
+/**
+ * Why this viewer can't change a function's secrets though their project level allows it: a
+ * service's secrets need a tenant admin (the server refuses a write or a delete otherwise). Null
+ * when they may.
+ */
+export function serviceSecretsReason(kind: string, tenantAdmin: boolean): string | null {
+  return kind === "service" && !tenantAdmin ? "A service's secrets can only be changed by a tenant admin." : null;
+}

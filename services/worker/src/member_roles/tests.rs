@@ -3792,3 +3792,63 @@ async fn a_viewer_only_member_role_on_a_protected_branch_is_locked_and_holds_not
         texts(&w)
     );
 }
+
+/// The password read pins its own search path, after the mark the fakes look for.
+#[test]
+fn member_password_sql_pins_search_path() {
+    let sql = member_password_sql("cb_m_'x\\y");
+    assert!(
+        sql.starts_with(&format!("{PASSWORD_MARK}\nSET search_path = pg_catalog, pg_temp;\nSELECT ")),
+        "{sql}"
+    );
+    assert!(sql.contains("rolname OPERATOR(pg_catalog.=) E'cb_m_''x\\\\y';"), "{sql}");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The data API's elevated classification is the member rule, nothing else: on any role
+    /// graph, [`is_elevated`] answers what [`unsafe_node`] answers for every role.
+    #[test]
+    fn elevated_matches_unsafe_node(
+        flags in proptest::collection::vec((any::<bool>(), any::<bool>(), any::<bool>()), 8),
+        edges in proptest::collection::vec((0..8usize, 0..8usize), 0..14),
+    ) {
+        let names = ["r0", "r1", "r2", "r3", "r4", "r5", "anon", "chelabase_x"];
+        let mut catalog = MemberCatalog::default();
+        for (name, (owner_level, admin, login)) in names.iter().zip(&flags) {
+            catalog.roles.insert(name.to_string());
+            if *owner_level { catalog.owner_level.insert(name.to_string()); }
+            if *admin { catalog.admin.insert(name.to_string()); }
+            if *login { catalog.login.insert(name.to_string()); }
+        }
+        for (member, role) in &edges {
+            catalog.all_edges.entry(names[*member].to_string()).or_default().insert(names[*role].to_string());
+        }
+        for name in names {
+            prop_assert_eq!(is_elevated(&catalog, name), unsafe_node(&catalog, name), "{}", name);
+        }
+    }
+}
+
+// The elevated classification by example: LOGIN, owner-level (BYPASSRLS is), ADMIN-holding,
+// and any role whose memberships reach one; an ordinary NOLOGIN chain isn't.
+#[test]
+fn elevated_roles_by_example() {
+    let mut catalog = MemberCatalog::default();
+    for name in ["plain", "readers", "bypasser", "signer", "granter", "group", "outer"] {
+        catalog.roles.insert(name.to_string());
+    }
+    catalog.owner_level.insert("bypasser".into());
+    catalog.login.insert("signer".into());
+    catalog.admin.insert("granter".into());
+    for (member, role) in [("plain", "readers"), ("group", "signer"), ("outer", "group")] {
+        catalog.all_edges.entry(member.to_string()).or_default().insert(role.to_string());
+    }
+    for role in ["bypasser", "signer", "granter", "group", "outer"] {
+        assert!(is_elevated(&catalog, role), "{role}");
+    }
+    for role in ["plain", "readers"] {
+        assert!(!is_elevated(&catalog, role), "{role}");
+    }
+}

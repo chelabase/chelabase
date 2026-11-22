@@ -8,7 +8,8 @@
  * - `forbidden` (403): no policy allows it, or a signed URL's key was revoked;
  * - `not_found` (404): missing, or hidden from the caller;
  * - `timeout` (408, 504): the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS`
- *   (60 s by default), or the gateway timed out. Storage itself can also return a 504 `timeout`:
+ *   (60 s by default), a resumable upload's part did not finish within
+ *   `CHELABASE_STORAGE_PART_DEADLINE_SECS` (900 s by default), or the gateway timed out. Storage itself can also return a 504 `timeout`:
  *   a delete that ran past the statement timeout (nothing is deleted; try again);
  * - `conflict` (409): the name is taken without `upsert`, another write won, or a bucket isn't empty.
  *   A delete's 409 `retry` (a concurrent transaction or held lock rolled it back; try again) also
@@ -24,7 +25,8 @@
  * - `too_large` (413): over the bucket's file size limit;
  * - `unsupported_type` (415): a type the bucket's `allowed_mime_types` doesn't list;
  * - `range_not_satisfiable` (416);
- * - `rate_limited` (429);
+ * - `rate_limited` (429): too many requests, or (`serverCode: "too_many_uploads"`) 100 resumable
+ *   uploads are already open for this key and caller in the bucket; complete or abort some;
  * - `unavailable` (502, 503): storage is down or busy;
  * - `internal`: anything else, including a redirect (never followed).
  */

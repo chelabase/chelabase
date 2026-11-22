@@ -3,12 +3,12 @@
 // `{{expires}}` and `{{link}}`; without a link, every line holding `{{link}}` is dropped.
 import { readFileSync } from "node:fs";
 
-export const TEMPLATE_KINDS = ["verify", "reset", "invite", "invite_notice"] as const;
+export const TEMPLATE_KINDS = ["verify", "reset", "invite", "email_change", "invite_notice", "email_changed"] as const;
 export type TemplateKind = (typeof TEMPLATE_KINDS)[number];
 
 export interface TemplateValues {
   project: string;
-  /** Left out of `invite_notice`, which holds neither. */
+  /** Left out of `invite_notice` and `email_changed`, which hold neither. */
   code?: string;
   expires?: string;
   link?: string;

@@ -262,3 +262,53 @@ async fn column_without_authenticated_insert_is_unknown() {
     assert_eq!(s.count().await, 0);
     s.finish().await;
 }
+
+/// Only a column-level `INSERT` granted straight to `authenticated` opens a column to sign-up
+/// data: a table-level grant, a grant to `PUBLIC` (table or column) and a column grant to a
+/// role `authenticated` is a member of leave the key unknown, while a direct column grant
+/// keeps working under all of them.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn table_or_public_insert_grant_is_unknown_column() {
+    let mut s = Scratch::new().await;
+    let schema = s.target.schema.clone();
+    let member = format!("{schema}_member");
+    let exec = |sql: String| sqlx::query(sqlx::AssertSqlSafe(sql));
+    exec(format!("REVOKE INSERT (secret_col) ON {schema}.users FROM authenticated"))
+        .execute(&mut s.admin)
+        .await
+        .unwrap();
+    let grants = [
+        format!("GRANT INSERT ON {schema}.users TO PUBLIC"),
+        format!("GRANT INSERT (secret_col) ON {schema}.users TO PUBLIC"),
+        format!("CREATE ROLE {member} NOLOGIN; GRANT {member} TO authenticated; GRANT INSERT (secret_col) ON {schema}.users TO {member}"),
+        // Last: revoking it would also clear the column grants.
+        format!("GRANT INSERT ON {schema}.users TO authenticated"),
+    ];
+    let mut outcome = Ok(());
+    for (i, grant) in grants.iter().enumerate() {
+        for sql in grant.split("; ") {
+            exec(sql.to_string()).execute(&mut s.admin).await.unwrap();
+        }
+        let r =
+            s.db.begin_insert(&s.target, &row(&format!("s{i}@x.io"), json!({"secret_col": "x"})))
+                .await;
+        if r.as_ref().err() != Some(&UserRowError::UnknownColumn("secret_col".into())) {
+            outcome = Err(format!("after `{grant}`: {:?}", r.err()));
+            break;
+        }
+        // The direct column grant still counts.
+        let p =
+            s.db.begin_insert(&s.target, &row(&format!("n{i}@x.io"), json!({"nick": "n"})))
+                .await
+                .unwrap_or_else(|e| panic!("nick after `{grant}`: {e:?}"));
+        p.commit().await.unwrap();
+    }
+    let rows = s.count().await;
+    s.finish().await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {member}")))
+        .execute(&mut PgConnection::connect(&url()).await.unwrap())
+        .await;
+    outcome.unwrap();
+    assert_eq!(rows, grants.len() as i64, "one row per direct-grant insert");
+}

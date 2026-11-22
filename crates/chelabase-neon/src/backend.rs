@@ -275,6 +275,16 @@ pub fn admin_psql_command(database: &str) -> anyhow::Result<Vec<String>> {
     admin_psql_command_with(database, &SqlOpts::admin_default())
 }
 
+/// Refuses an admin script with a NUL byte before it is sent: Postgres has no NUL in a string
+/// or an identifier, so the quoting helpers can't carry one, and what psql would make of the
+/// rest of such a script isn't ours to rely on.
+pub fn refuse_nul(sql: &str) -> anyhow::Result<()> {
+    if sql.contains('\0') {
+        bail!("admin SQL with a NUL byte is refused");
+    }
+    Ok(())
+}
+
 /// [`admin_psql_command`] with `opts.verbose_errors` and `opts.user` honoured.
 pub fn admin_psql_command_with(database: &str, opts: &SqlOpts) -> anyhow::Result<Vec<String>> {
     if database.is_empty() || database.len() > 63 || database.contains('\0') {
@@ -399,15 +409,29 @@ fn admin_exec_env() -> Vec<String> {
     admin_exec_env_with(&SqlOpts::admin_default())
 }
 
-/// [`admin_exec_env`] plus `PGAPPNAME` when `opts` names the session. DDL forwarding is turned
-/// off only for `cloud_admin`: `neon.forward_ddl` is superuser-only, so another role's
-/// connection would be refused (`permission denied to set parameter`). The owner's merge
-/// sessions (E15) run no role or database DDL (P8 refuses it), so forwarding has nothing to do.
+/// [`admin_exec_env`] plus `PGAPPNAME` when `opts` names the session.
+///
+/// Every session reads its script as UTF8 with `standard_conforming_strings = on`, and
+/// `cloud_admin` resolves names in `pg_catalog` only: startup options come after the database's
+/// and the role's own settings (`ALTER DATABASE … SET`, `ALTER ROLE … SET`), so no script
+/// depends on those. The owner's session keeps the database's search path: merge user steps
+/// resolve the tenant's objects through it. None of the values has a space, so `PGOPTIONS`
+/// needs no escaping.
+///
+/// DDL forwarding is turned off only for `cloud_admin`: `neon.forward_ddl` is superuser-only,
+/// so another role's connection would be refused (`permission denied to set parameter`). The
+/// owner's merge sessions (E15) run no role or database DDL (P8 refuses it), so forwarding has
+/// nothing to do.
 fn admin_exec_env_with(opts: &SqlOpts) -> Vec<String> {
-    let mut env = vec!["PGCONNECT_TIMEOUT=5".to_string()];
+    let mut options = "PGOPTIONS=-c standard_conforming_strings=on".to_string();
     if opts.user.is_none() {
-        env.push("PGOPTIONS=-c neon.forward_ddl=off".to_string());
+        options.push_str(" -c search_path=pg_catalog,pg_temp -c neon.forward_ddl=off");
     }
+    let mut env = vec![
+        "PGCONNECT_TIMEOUT=5".to_string(),
+        "PGCLIENTENCODING=UTF8".to_string(),
+        options,
+    ];
     if let Some(name) = &opts.app_name {
         // Postgres keeps 63 bytes of an application_name and turns other than printable ASCII
         // into `?`: a longer or odder name wouldn't find its backend to cancel.
@@ -810,6 +834,7 @@ impl ComputeBackend for DockerBackend {
         sql: &str,
         opts: &SqlOpts,
     ) -> anyhow::Result<String> {
+        refuse_nul(sql)?;
         let cmd = admin_psql_command_with(database, opts)?;
         let env = admin_exec_env_with(opts);
         tokio::time::timeout(opts.timeout, self.run_exec(endpoint_id, cmd, env, sql))
@@ -1577,6 +1602,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_sql_with_a_nul_is_refused_before_it_is_sent() {
+        // No engine is reachable here: a script that got as far as the exec would fail with
+        // a connection error, not with this refusal.
+        let err = refuse_nul("SELECT 1;\0DROP TABLE t;").unwrap_err();
+        assert!(format!("{err:#}").contains("NUL"), "{err:#}");
+        assert!(refuse_nul("SELECT 'a b';\n").is_ok());
+    }
+
+    #[tokio::test]
     async fn admin_sql_with_passes_app_name_and_timeout() {
         let journal = Journal::default();
         let fake = FakeBackend::with_journal(journal.clone());
@@ -1655,7 +1689,7 @@ mod tests {
         assert!(cmd.contains(&"VERBOSITY=default".to_string()), "{cmd:?}");
         assert!(!cmd.contains(&"VERBOSITY=terse".to_string()), "{cmd:?}");
         let env = admin_exec_env_with(&verbose);
-        assert_eq!(env[..2], admin_exec_env()[..]);
+        assert_eq!(env[..3], admin_exec_env()[..]);
         assert!(env.contains(&"PGAPPNAME=chelabase-merge-7".to_string()), "{env:?}");
         let plain = SqlOpts::admin_default();
         assert_eq!(
@@ -1698,9 +1732,68 @@ mod tests {
     #[test]
     fn admin_exec_turns_forwarding_off() {
         let env = admin_exec_env();
-        assert_eq!(env.len(), 2);
+        assert_eq!(env.len(), 3);
         assert_eq!(env[0], "PGCONNECT_TIMEOUT=5");
-        assert_eq!(env[1], "PGOPTIONS=-c neon.forward_ddl=off");
+        assert_eq!(env[1], "PGCLIENTENCODING=UTF8");
+        assert_eq!(
+            env[2],
+            "PGOPTIONS=-c standard_conforming_strings=on -c search_path=pg_catalog,pg_temp \
+             -c neon.forward_ddl=off"
+        );
+    }
+
+    /// The one `PGOPTIONS` entry of `env`, split into its `-c` settings.
+    fn pg_options(env: &[String]) -> Vec<&str> {
+        let mut entries = env.iter().filter_map(|e| e.strip_prefix("PGOPTIONS="));
+        let options = entries.next().expect("a PGOPTIONS entry");
+        assert_eq!(entries.next(), None, "{env:?}");
+        let words: Vec<&str> = options.split(' ').collect();
+        assert!(words.len().is_multiple_of(2), "{options:?}");
+        words
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-c", "{options:?}");
+                pair[1]
+            })
+            .collect()
+    }
+
+    fn owner_opts() -> SqlOpts {
+        SqlOpts {
+            user: Some("postgres".into()),
+            ..SqlOpts::admin_default()
+        }
+    }
+
+    /// Every session reads its script as UTF8 with standard-conforming strings, whatever the
+    /// database or the role sets: the worker's quoting holds under exactly those two.
+    #[test]
+    fn admin_session_pins_client_encoding_and_literals() {
+        for opts in [SqlOpts::admin_default(), owner_opts()] {
+            let env = admin_exec_env_with(&opts);
+            assert_eq!(
+                env.iter().filter(|e| e.starts_with("PGCLIENTENCODING=")).collect::<Vec<_>>(),
+                ["PGCLIENTENCODING=UTF8"],
+                "{env:?}"
+            );
+            assert!(
+                pg_options(&env).contains(&"standard_conforming_strings=on"),
+                "{env:?}"
+            );
+        }
+    }
+
+    /// `cloud_admin` resolves names in `pg_catalog` only; the owner's session keeps the
+    /// database's search path (merge user steps resolve the tenant's objects through it).
+    #[test]
+    fn search_path_is_pinned_for_cloud_admin_only() {
+        let admin = admin_exec_env();
+        let admin = pg_options(&admin);
+        assert!(admin.contains(&"search_path=pg_catalog,pg_temp"), "{admin:?}");
+        assert!(admin.contains(&"neon.forward_ddl=off"), "{admin:?}");
+        let owner = admin_exec_env_with(&owner_opts());
+        let owner = pg_options(&owner);
+        assert_eq!(owner, ["standard_conforming_strings=on"]);
     }
 
     /// Verbose sessions read the script with `-f -`, so psql prefixes an error with
@@ -1732,7 +1825,7 @@ mod tests {
         };
         let env = admin_exec_env_with(&owner);
         assert!(
-            !env.iter().any(|e| e.starts_with("PGOPTIONS=")),
+            !env.iter().any(|e| e.contains("neon.forward_ddl")),
             "{env:?}"
         );
         assert!(env.contains(&"PGCONNECT_TIMEOUT=5".to_string()), "{env:?}");
