@@ -49,6 +49,7 @@ if (user) console.log(user.email);
 - Only the refresh token is stored, under the key `chelabase.<first 12 characters of the key>.refresh`: in `localStorage` when present, otherwise in memory. Pass `auth.storage` (`{ get, set, remove }`, sync or async) for anything else, such as React Native. The access token stays in memory.
 - `database()` siblings share the same session.
 - In a server-rendered app the session lives in cookies instead: see [Server rendering](/using/client/ssr).
+- **For a browser app, prefer the cookie mode.** Anything in `localStorage` can be read by every script on the page, so a script injected by an XSS bug or a compromised dependency can take the refresh token and use it from elsewhere until it is revoked. In the cookie mode the refresh token is `HttpOnly`, so page scripts never see it. `localStorage` is the right trade only for an app with no server of its own, such as a single-page app: it works with nothing else to run, and it is what `createClient` does by default.
 
 ## Refresh and sign-out
 
