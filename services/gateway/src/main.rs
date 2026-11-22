@@ -42,8 +42,14 @@ fn main() -> anyhow::Result<()> {
         Some(m) => info!(kid = m.kid(), "member tokens are verified with CHELABASE_MEMBER_JWT_PUBLIC_KEY"),
         None => tracing::warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: every bearer is refused"),
     }
+    // MCP core m2: `/mcp` and its metadata exist only with an mcp upstream.
+    let mcp_api_base = config
+        .upstreams
+        .addr(chelabase_routes::Service::Mcp)
+        .map(|_| config.entry.api_base());
     let pipeline = Pipeline::new(registry, config.entry.studio_origin(), signer, keys, users)
-        .with_member_tokens(members);
+        .with_member_tokens(members)
+        .with_mcp(mcp_api_base.as_deref());
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under Compose (the workbench) or k8s a process manager restarts us,

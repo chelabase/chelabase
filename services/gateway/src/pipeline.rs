@@ -10,7 +10,7 @@ use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
 use chelabase_auth::member_token::{MemberTokenError, MemberTokenVerifier};
 use chelabase_auth::AuthError;
-use chelabase_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
+use chelabase_routes::{match_served, Auth, Cors, Endpoint, Match, Scope, Service};
 use chelabase_types::data_key::DataKeyKind;
 use http::HeaderMap;
 use serde_json::{json, Value};
@@ -43,15 +43,18 @@ pub const CLIENT_IP_HEADER: &str = "chelabase-client-ip";
 /// neither, and a client's copies are removed everywhere.
 pub const FORWARDED_KEY_HEADER: &str = "chelabase-forwarded-key";
 pub const FORWARDED_USER_HEADER: &str = "chelabase-forwarded-user";
+/// `authorization` comes first: [`BEARER_KEPT_REQUEST_HEADERS`] is the rest.
 const STRIPPED_REQUEST_HEADERS: &[&str] = &[
-    IDENTITY_HEADER,
     "authorization",
+    IDENTITY_HEADER,
     USER_TOKEN_HEADER,
     SERVER_KEY_HEADER,
     CLIENT_IP_HEADER,
     FORWARDED_KEY_HEADER,
     FORWARDED_USER_HEADER,
 ];
+/// An `Auth::Mcp` route's: the list less `authorization`, which the mcp service verifies itself.
+const BEARER_KEPT_REQUEST_HEADERS: &[&str] = STRIPPED_REQUEST_HEADERS.split_at(1).1;
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id, x-chelabase-studio";
 /// Any-origin (data key, app user) routes: the request headers `@chelabase/client` sends to the
 /// data API and storage (`x-upsert` and `range` are storage's).
@@ -112,10 +115,11 @@ impl ProxyPlan {
             set.push((IDENTITY_HEADER, token.clone()));
         }
         set.extend(self.forwarded.iter().cloned());
-        UpstreamHeaders {
-            remove: STRIPPED_REQUEST_HEADERS,
-            set,
-        }
+        let remove = match self.endpoint.policy.auth {
+            Auth::Mcp => BEARER_KEPT_REQUEST_HEADERS,
+            _ => STRIPPED_REQUEST_HEADERS,
+        };
+        UpstreamHeaders { remove, set }
     }
 }
 
@@ -142,6 +146,9 @@ pub struct Pipeline {
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
     users: Arc<UserTokens>,
+    /// The `WWW-Authenticate` challenge `/mcp` answers a missing bearer with, when the gateway
+    /// has an mcp upstream; `None` and the mcp routes don't exist.
+    mcp_challenge: Option<String>,
     /// The last readiness `/_gateway/ready` answered ([`READY_UNKNOWN`] before the first), so
     /// its reason is logged once per change, not per probe.
     ready_seen: std::sync::atomic::AtomicU8,
@@ -166,6 +173,7 @@ impl Pipeline {
             signer,
             keys,
             users,
+            mcp_challenge: None,
             ready_seen: std::sync::atomic::AtomicU8::new(READY_UNKNOWN),
         }
     }
@@ -174,6 +182,20 @@ impl Pipeline {
     pub fn with_member_tokens(mut self, members: Option<MemberTokenVerifier>) -> Self {
         self.members = members;
         self
+    }
+
+    /// Route the mcp service's endpoints (`CHELABASE_MCP_URL` is set): `api_base` is the
+    /// public API origin the challenge's `resource_metadata` names. `None` leaves them unrouted.
+    pub fn with_mcp(mut self, api_base: Option<&str>) -> Self {
+        self.mcp_challenge = api_base.map(|base| {
+            format!(r#"Bearer resource_metadata="{base}{}""#, chelabase_routes::mcp::PROTECTED_RESOURCE_MCP.path)
+        });
+        self
+    }
+
+    /// Whether `service` is routed: every service but `mcp`, which needs its upstream.
+    fn serves(&self, service: Service) -> bool {
+        service != Service::Mcp || self.mcp_challenge.is_some()
     }
 
     pub async fn handle(&self, req: &RequestParts<'_>) -> Handled {
@@ -234,7 +256,7 @@ impl Pipeline {
         }
 
         let data_route = req.path == "/data" || req.path.starts_with("/data/");
-        let endpoint = match match_endpoint(scope, req.method, req.path) {
+        let endpoint = match match_served(scope, req.method, req.path, |s| self.serves(s)) {
             Match::Found(endpoint) => endpoint,
             Match::NotFound if data_route => {
                 return Outcome::Respond(data_error(
@@ -275,6 +297,21 @@ impl Pipeline {
         let mut forwarded = Vec::new();
         let identity = match endpoint.policy.auth {
             Auth::Public => None,
+            // The mcp service verifies the bearer (and calls the API with it): the gateway only
+            // requires exactly one, in bearer form, and mints nothing.
+            Auth::Mcp => {
+                let Some(challenge) = &self.mcp_challenge else {
+                    // Unreachable: without an upstream the mcp routes don't match.
+                    return respond(404, Vec::new(), error_json("not_found", "no route"));
+                };
+                if !has_one_bearer(req.headers) {
+                    let mut resp = unauthorized(&AuthError::Unauthorized);
+                    resp.headers.push(("www-authenticate", challenge.clone()));
+                    resp.headers.extend(cors);
+                    return Outcome::Respond(resp);
+                }
+                None
+            }
             Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
                 let secret_only = endpoint.policy.auth == Auth::SecretDataKey;
                 let public_only = endpoint.policy.auth == Auth::PublicDataKey;
@@ -327,7 +364,7 @@ impl Pipeline {
         }
         let origin = header_str(req.headers, "origin")?;
         let requested = header_str(req.headers, "access-control-request-method")?;
-        let Match::Found(endpoint) = match_endpoint(scope, requested, req.path) else {
+        let Match::Found(endpoint) = match_served(scope, requested, req.path, |s| self.serves(s)) else {
             return None;
         };
         if endpoint.policy.cors == Cors::Any {
@@ -702,6 +739,11 @@ fn unauthorized(err: &AuthError) -> GatewayResponse {
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
+}
+
+/// Exactly one `Authorization` line, and it is `Bearer <token>` ([`bearer_token`]).
+fn has_one_bearer(headers: &HeaderMap) -> bool {
+    single_header(headers, "authorization").is_some() && bearer_token(headers).is_some()
 }
 
 /// `Authorization: Bearer <token>`, scheme case-insensitive.
@@ -2533,6 +2575,189 @@ mod tests {
         ] {
             let resp = expect_response(run(&h.pipeline, method, &path, None, &[]).await.outcome);
             assert_eq!(resp.status, 404, "{method} {path}");
+        }
+    }
+
+    // ---- MCP core m2: `/mcp` and its metadata, routed to the mcp service ----
+
+    const MCP_CHALLENGE: &str =
+        "Bearer resource_metadata=\"http://api.test/.well-known/oauth-protected-resource/mcp\"";
+
+    /// A harness whose gateway has an mcp upstream.
+    async fn mcp_harness() -> Harness {
+        let mut h = harness(&[API]).await;
+        h.pipeline = h.pipeline.with_mcp(Some("http://api.test"));
+        h
+    }
+
+    #[tokio::test]
+    async fn mcp_bearer_is_passed_on_unchanged() {
+        let h = mcp_harness().await;
+        let member = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
+        for bearer in ["Bearer x", "bearer chmcp_at_abc", member.as_str()] {
+            for (method, name) in [("POST", "mcp.endpoint"), ("GET", "mcp.endpoint_get"), ("DELETE", "mcp.endpoint_delete")] {
+                let plan = expect_plan(run(&h.pipeline, method, "/mcp", None, &[("authorization", bearer)]).await.outcome);
+                assert_eq!(plan.endpoint.name, name);
+                assert_eq!(plan.endpoint.service, Service::Mcp);
+                let edits = plan.upstream_headers("rid");
+                assert!(!edits.remove.contains(&"authorization"), "{method}: authorization is kept");
+                assert!(edits.set.iter().all(|(n, _)| *n != "authorization"), "{method}: left as the client sent it");
+                assert!(plan.response_headers.is_empty(), "{method}: no CORS on /mcp");
+            }
+        }
+        // The client address headers come from the plan, as on every route.
+        let headers = headers(&[("authorization", "Bearer x")]);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let handled = h
+            .pipeline
+            .handle(&RequestParts { method: "POST", path: "/mcp", host: Some(API), headers: &headers, client_ip: Some(ip) })
+            .await;
+        assert_eq!(expect_plan(handled.outcome).client_ip, Some(ip));
+    }
+
+    #[tokio::test]
+    async fn mcp_without_a_bearer_is_401_with_the_challenge() {
+        let h = mcp_harness().await;
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("authorization", "Basic abc")],
+            &[("authorization", "Bearer")],
+            &[("authorization", "Bearer   ")],
+            &[("authorization", "Token x")],
+            // Two credentials: which one the service would read is ambiguous.
+            &[("authorization", "Bearer a"), ("authorization", "Bearer b")],
+        ];
+        for method in ["POST", "GET", "DELETE"] {
+            for pairs in cases {
+                let resp = expect_response(run(&h.pipeline, method, "/mcp", None, pairs).await.outcome);
+                assert_eq!(resp.status, 401, "{method} {pairs:?}");
+                assert_eq!(header(&resp.headers, "www-authenticate"), Some(MCP_CHALLENGE), "{method} {pairs:?}");
+                assert_eq!(resp.body.as_ref().unwrap()["error"]["code"], "unauthorized");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_routes_are_unknown_without_an_upstream() {
+        let h = harness(&[API]).await;
+        let unknown = expect_response(run(&h.pipeline, "GET", "/v1/other", None, &[]).await.outcome);
+        for (method, path, pairs) in [
+            ("POST", "/mcp", &[("authorization", "Bearer x")][..]),
+            ("GET", "/mcp", &[][..]),
+            ("PUT", "/mcp", &[][..]),
+            ("GET", "/.well-known/oauth-protected-resource", &[][..]),
+            ("GET", "/.well-known/oauth-protected-resource/mcp", &[][..]),
+            ("POST", "/.well-known/oauth-protected-resource", &[][..]),
+            (
+                "OPTIONS",
+                "/.well-known/oauth-protected-resource/mcp",
+                &[("origin", "https://app.example"), ("access-control-request-method", "GET")][..],
+            ),
+        ] {
+            let resp = expect_response(run(&h.pipeline, method, path, None, pairs).await.outcome);
+            assert_eq!(resp, unknown, "{method} {path}");
+        }
+        // With the upstream, the metadata is public and the endpoint is routed.
+        let h = mcp_harness().await;
+        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"] {
+            let plan = expect_plan(run(&h.pipeline, "GET", path, None, &[]).await.outcome);
+            assert_eq!((plan.endpoint.service, plan.identity.as_deref()), (Service::Mcp, None), "{path}");
+            assert!(plan.upstream_headers("rid").remove.contains(&"authorization"), "{path}");
+        }
+    }
+
+    /// `/mcp` is an API-host route: on Studio's host it is Studio's, and the auth host routes
+    /// nothing.
+    #[tokio::test]
+    async fn mcp_is_not_routed_on_the_studio_or_auth_host() {
+        let mut h = site_harness().await;
+        h.pipeline = h.pipeline.with_mcp(Some("http://api.test"));
+        for path in ["/mcp", "/.well-known/oauth-protected-resource/mcp"] {
+            let handled = run(&h.pipeline, "POST", path, Some("studio.test"), &[("authorization", "Bearer x")]).await;
+            assert!(matches!(handled.outcome, Outcome::Site(Site::Studio)), "{path}");
+            let resp = expect_response(
+                run(&h.pipeline, "POST", path, Some("auth.test"), &[("authorization", "Bearer x")]).await.outcome,
+            );
+            assert_eq!((resp.status, resp.body), (404, None), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_request_gets_no_internal_identity() {
+        let h = mcp_harness().await;
+        // Even a valid member token mints nothing: the mcp service verifies the bearer.
+        let member = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
+        let plan = expect_plan(
+            run(&h.pipeline, "POST", "/mcp", None, &[("authorization", &member), (IDENTITY_HEADER, "forged")])
+                .await
+                .outcome,
+        );
+        assert_eq!(plan.identity, None);
+        assert!(plan.forwarded.is_empty());
+        let edits = plan.upstream_headers("rid-9");
+        assert_eq!(edits.set, vec![(REQUEST_ID_HEADER, "rid-9".to_string())]);
+        assert!(edits.remove.contains(&IDENTITY_HEADER));
+    }
+
+    #[tokio::test]
+    async fn mcp_drops_private_headers() {
+        let h = mcp_harness().await;
+        let plan = expect_plan(
+            run(
+                &h.pipeline,
+                "POST",
+                "/mcp",
+                None,
+                &[
+                    ("authorization", "Bearer x"),
+                    (IDENTITY_HEADER, "forged"),
+                    (USER_TOKEN_HEADER, "u"),
+                    (SERVER_KEY_HEADER, "k"),
+                    (CLIENT_IP_HEADER, "198.51.100.1"),
+                    (FORWARDED_KEY_HEADER, "k"),
+                    (FORWARDED_USER_HEADER, "u"),
+                ],
+            )
+            .await
+            .outcome,
+        );
+        let edits = plan.upstream_headers("rid");
+        for private in [
+            IDENTITY_HEADER,
+            USER_TOKEN_HEADER,
+            SERVER_KEY_HEADER,
+            CLIENT_IP_HEADER,
+            FORWARDED_KEY_HEADER,
+            FORWARDED_USER_HEADER,
+        ] {
+            assert!(edits.remove.contains(&private), "{private}");
+        }
+        // Exactly the usual list less `authorization`.
+        let mut expected: Vec<&str> = STRIPPED_REQUEST_HEADERS.iter().copied().filter(|h| *h != "authorization").collect();
+        let mut removed = edits.remove.to_vec();
+        expected.sort_unstable();
+        removed.sort_unstable();
+        assert_eq!(removed, expected);
+    }
+
+    /// Every route but the `Auth::Mcp` ones strips `authorization` (and the rest of the list)
+    /// before the upstream.
+    #[test]
+    fn authorization_is_stripped_on_every_other_route() {
+        for endpoint in chelabase_routes::ENDPOINTS {
+            let plan = ProxyPlan {
+                endpoint,
+                identity: None,
+                response_headers: Vec::new(),
+                client_ip: None,
+                forwarded: Vec::new(),
+            };
+            let edits = plan.upstream_headers("rid");
+            let keeps = edits.remove.iter().all(|h| *h != "authorization");
+            assert_eq!(keeps, endpoint.policy.auth == Auth::Mcp, "{}", endpoint.name);
+            if endpoint.policy.auth != Auth::Mcp {
+                assert_eq!(edits.remove, STRIPPED_REQUEST_HEADERS, "{}", endpoint.name);
+            }
         }
     }
 }

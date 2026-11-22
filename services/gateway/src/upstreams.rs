@@ -17,6 +17,8 @@ pub struct Upstreams {
     realtime: String,
     storage: String,
     functions: String,
+    /// `mcp` (MCP core m4): optional, so no default; unset, the gateway doesn't route it.
+    mcp: Option<String>,
     /// The pass-through sites that have an upstream.
     sites: HashMap<Site, String>,
 }
@@ -30,6 +32,7 @@ impl Upstreams {
             realtime: DEFAULT_REALTIME.to_string(),
             storage: DEFAULT_STORAGE.to_string(),
             functions: DEFAULT_FUNCTIONS.to_string(),
+            mcp: None,
             sites: HashMap::new(),
         })
     }
@@ -58,21 +61,30 @@ impl Upstreams {
         Ok(self)
     }
 
+    /// Where `mcp` (the MCP endpoint) lives; until this is called it has no upstream.
+    pub fn with_mcp(mut self, mcp_url: &str) -> Result<Self, String> {
+        self.mcp = Some(authority_from_url(mcp_url)?);
+        Ok(self)
+    }
+
     /// Where `site` lives.
     pub fn with_site(mut self, site: Site, url: &str) -> Result<Self, String> {
         self.sites.insert(site, authority_from_url(url)?);
         Ok(self)
     }
 
-    pub fn addr(&self, service: Service) -> &str {
-        match service {
+    /// `host:port` of `service`'s upstream; None only for an optional service left unset
+    /// (`mcp`).
+    pub fn addr(&self, service: Service) -> Option<&str> {
+        Some(match service {
             Service::Orchestrator => &self.orchestrator,
             Service::Auth => &self.auth,
             Service::Rest => &self.rest,
             Service::Realtime => &self.realtime,
             Service::Storage => &self.storage,
             Service::Functions => &self.functions,
-        }
+            Service::Mcp => return self.mcp.as_deref(),
+        })
     }
 
     /// `host:port` of `site`'s upstream; None when it has none.
@@ -106,13 +118,13 @@ mod tests {
     #[test]
     fn plain_http_url_becomes_host_port() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Orchestrator), "127.0.0.1:8081");
+        assert_eq!(upstreams.addr(Service::Orchestrator), Some("127.0.0.1:8081"));
     }
 
     #[test]
     fn trailing_slash_is_accepted() {
         let upstreams = Upstreams::new("http://orchestrator:8081/", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Orchestrator), "orchestrator:8081");
+        assert_eq!(upstreams.addr(Service::Orchestrator), Some("orchestrator:8081"));
     }
 
     #[test]
@@ -133,7 +145,7 @@ mod tests {
     #[test]
     fn auth_has_its_own_upstream() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Auth), "127.0.0.1:8084");
+        assert_eq!(upstreams.addr(Service::Auth), Some("127.0.0.1:8084"));
     }
 
     #[test]
@@ -156,9 +168,9 @@ mod tests {
     #[test]
     fn storage_has_its_own_upstream_checked_like_the_others() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Storage), "127.0.0.1:8089");
+        assert_eq!(upstreams.addr(Service::Storage), Some("127.0.0.1:8089"));
         let set = upstreams.clone().with_storage("http://storage:8089/").unwrap();
-        assert_eq!(set.addr(Service::Storage), "storage:8089");
+        assert_eq!(set.addr(Service::Storage), Some("storage:8089"));
         for bad in ["https://storage:8089", "http://storage", "http://storage:8089/x"] {
             assert!(upstreams.clone().with_storage(bad).is_err(), "{bad}");
         }
@@ -167,10 +179,10 @@ mod tests {
     #[test]
     fn realtime_has_its_own_upstream_checked_like_the_others() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Realtime), "127.0.0.1:8087");
+        assert_eq!(upstreams.addr(Service::Realtime), Some("127.0.0.1:8087"));
         let set = upstreams.clone().with_realtime("http://realtime:9000/").unwrap();
-        assert_eq!(set.addr(Service::Realtime), "realtime:9000");
-        assert_eq!(set.addr(Service::Rest), "127.0.0.1:8085");
+        assert_eq!(set.addr(Service::Realtime), Some("realtime:9000"));
+        assert_eq!(set.addr(Service::Rest), Some("127.0.0.1:8085"));
         for bad in ["https://realtime:9000", "http://realtime", "http://realtime:9000/x"] {
             assert!(upstreams.clone().with_realtime(bad).is_err(), "{bad}");
         }
@@ -179,11 +191,22 @@ mod tests {
     #[test]
     fn functions_has_its_own_upstream_checked_like_the_others() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(Service::Functions), "127.0.0.1:8091");
+        assert_eq!(upstreams.addr(Service::Functions), Some("127.0.0.1:8091"));
         let set = upstreams.clone().with_functions("http://functions:8091/").unwrap();
-        assert_eq!(set.addr(Service::Functions), "functions:8091");
+        assert_eq!(set.addr(Service::Functions), Some("functions:8091"));
         for bad in ["https://functions:8091", "http://functions", "http://functions:8091/x"] {
             assert!(upstreams.clone().with_functions(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn mcp_has_no_upstream_until_one_is_set() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(Service::Mcp), None);
+        let set = upstreams.clone().with_mcp("http://mcp:8093/").unwrap();
+        assert_eq!(set.addr(Service::Mcp), Some("mcp:8093"));
+        for bad in ["https://mcp:8093", "http://mcp", "http://mcp:8093/x"] {
+            assert!(upstreams.clone().with_mcp(bad).is_err(), "{bad}");
         }
     }
 }
