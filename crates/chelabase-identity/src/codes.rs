@@ -8,7 +8,7 @@
 //! - Every real change of a user's email (`set_email`, `set_email_notifying`, or a confirmed
 //!   `EmailChange`) revokes all of that user's outstanding codes, so a code never comes back
 //!   when the address changes back to the one it was sent to.
-//! - TTL: 15 minutes for verify, reset and email change, 7 days for invite. A new code replaces the old one
+//! - TTL: 15 minutes for verify, reset and email change, 72 hours for invite. A new code replaces the old one
 //!   and resets the attempts. A code allows 5 wrong guesses; after that every guess is refused.
 //! - A live verify, reset or email change code issued less than 60 seconds ago is not replaced:
 //!   [`IdentityError::CodeRecentlySent`](crate::IdentityError::CodeRecentlySent), nothing is
