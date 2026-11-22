@@ -3,9 +3,13 @@
 //! reaches it).
 //!
 //! A script is the `code` of a tool call: `{"calls": [envelope | {"raw": text}, …],
-//! "then": "value" | "hang", "exec_id"?: id}`. The stub runtime POSTs each envelope to the
-//! host's callback for the run's exec_id (or `exec_id`), and answers the run with
-//! `{"answers": [{"http": host status, "answer": host body}, …]}` unless `then` is `hang`.
+//! "detached": [envelope, …], "abort": bool, "pause_ms": n, "then": "value" | "throw" |
+//! "hang", "exec_id"?: id}`. The stub runtime first starts each `detached` call without
+//! awaiting it (an un-awaited `chelabase.request`, or a `Promise.all` sibling), then POSTs each
+//! of `calls` in turn to the host's callback for the run's exec_id (or `exec_id`), waits
+//! `pause_ms`, drops the detached calls still in flight when `abort` is set (as workerd does
+//! once the code settles), and answers the run: with `{"answers": [{"http": host status,
+//! "answer": host body}, …]}`, with a `threw` error for `throw`, or never for `hang`.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,6 +109,8 @@ struct Reply {
     body: Vec<u8>,
     /// Never answer.
     hang: bool,
+    /// Drop the connection without an answer (after reading the request).
+    reset: bool,
     delay: Duration,
 }
 
@@ -115,7 +121,15 @@ impl Reply {
             headers: vec![("content-type", "application/json".into())],
             body: body.to_string().into_bytes(),
             hang: false,
+            reset: false,
             delay: Duration::ZERO,
+        }
+    }
+
+    fn reset() -> Self {
+        Reply {
+            reset: true,
+            ..Reply::json(200, json!({}))
         }
     }
 
@@ -164,6 +178,10 @@ async fn gateway_any(
         let _guard = CutGuard(gw.clone());
         std::future::pending::<()>().await;
     }
+    if reply.reset {
+        // The connection's task ends without a response: the host's send fails.
+        panic!("stub gateway: reset the connection");
+    }
     tokio::time::sleep(reply.delay).await;
     let mut response = (StatusCode::from_u16(reply.status).unwrap(), reply.body).into_response();
     response.headers_mut().remove("content-type");
@@ -208,6 +226,26 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
         "{}/internal/exec/{target}/request",
         stub.internal.lock().unwrap()
     );
+    let detached: Vec<_> = script["detached"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|call| {
+            let request = stub
+                .http
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(call.to_string());
+            tokio::spawn(async move {
+                let _ = request.send().await;
+            })
+        })
+        .collect();
+    if !detached.is_empty() {
+        // The detached calls reach the host before the awaited ones.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let mut answers = vec![];
     for call in script["calls"].as_array().cloned().unwrap_or_default() {
         let body = match call.get("raw").and_then(Value::as_str) {
@@ -228,10 +266,24 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
         answers.push(json!({"http": http, "answer": answer}));
     }
     *stub.last_answers.lock().unwrap() = answers.clone();
-    if script["then"] == "hang" {
-        std::future::pending::<()>().await;
+    if let Some(ms) = script["pause_ms"].as_u64() {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
-    Json(json!({"ok": true, "result": {"answers": answers}, "logs": []})).into_response()
+    if script["abort"] == true {
+        for call in &detached {
+            call.abort();
+        }
+    }
+    match script["then"].as_str() {
+        Some("hang") => std::future::pending::<Response>().await,
+        Some("throw") => Json(json!({
+            "ok": false,
+            "error": {"code": "threw", "message": "thrown by the code"},
+            "logs": [],
+        }))
+        .into_response(),
+        _ => Json(json!({"ok": true, "result": {"answers": answers}, "logs": []})).into_response(),
+    }
 }
 
 async fn start_runtime() -> (String, Arc<RuntimeStub>) {
@@ -1421,11 +1473,287 @@ async fn a_number_that_would_lose_precision_is_refused() {
     let answers = answers(&result);
     for entry in &answers[..2] {
         assert_eq!(refusal(entry), "invalid_request", "{entry}");
+        // The message names the number, not query values.
+        let message = answer(entry)["body"]["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("number") && !message.contains("query"),
+            "{message}"
+        );
     }
     assert_eq!(answer(&answers[2])["status"], 200, "{}", answers[2]);
     let seen = h.seen();
     assert_eq!(seen.len(), 1, "only the exact number went out: {seen:?}");
     assert_eq!(seen[0].json()["params"], json!([18446744073709551615u64]));
+}
+
+// ---- the invariant, exhaustively: how a run ends × what state each call is in ----
+
+/// How the run ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum End {
+    /// The code returns a value.
+    Returns,
+    /// The code throws.
+    Throws,
+    /// The code awaits a call the host cuts at its deadline, then returns.
+    HostTimeout,
+    /// The code makes a destructive call without the flag, then returns.
+    Refusal,
+    /// The MCP client goes away while the code awaits a call.
+    Disconnect,
+}
+
+/// The state of the run's call (or calls) under test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CallState {
+    /// Refused by the host before forwarding.
+    Refused,
+    /// Awaited, answered 200.
+    Answered,
+    /// Awaited, answered with the API's error (403).
+    ApiError,
+    /// Awaited; the API's connection dropped (`upstream_unavailable`).
+    UpstreamUnavailable,
+    /// Not awaited, still in flight when the code settles; the runner drops it.
+    Detached,
+    /// Not awaited and still in flight; the runner is slow to drop it (the run's end cuts it).
+    DetachedKept,
+    /// A `Promise.all` sibling still in flight when another member's error rejects it.
+    PromiseAllSibling,
+}
+
+const STATES: [CallState; 7] = [
+    CallState::Refused,
+    CallState::Answered,
+    CallState::ApiError,
+    CallState::UpstreamUnavailable,
+    CallState::Detached,
+    CallState::DetachedKept,
+    CallState::PromiseAllSibling,
+];
+
+/// The script, and what each forwarded call's label must be, sorted.
+fn case(end: End, state: CallState) -> (Value, Vec<(String, Value)>, usize) {
+    let sql = || {
+        call(
+            "POST",
+            &format!("{BRANCH}/sql"),
+            json!({"sql": "insert into t values (1)"}),
+        )
+    };
+    let mut calls = vec![];
+    let mut detached = vec![];
+    let mut labels: Vec<(&str, Value)> = vec![];
+    let mut abort = false;
+    match state {
+        CallState::Refused => calls.push(get("/v1/nope")),
+        CallState::Answered => {
+            calls.push(get("/v1/projects"));
+            labels.push(("listProjects", json!(200)));
+        }
+        CallState::ApiError => {
+            calls.push(get("/v1/teams"));
+            labels.push(("listTeams", json!(403)));
+        }
+        CallState::UpstreamUnavailable => {
+            calls.push(get("/v1/databases/db_down"));
+            labels.push(("getDatabase", json!("upstream_unavailable")));
+        }
+        CallState::Detached | CallState::DetachedKept => {
+            detached.push(sql());
+            labels.push(("runSql", json!("unknown")));
+            abort = state == CallState::Detached;
+        }
+        CallState::PromiseAllSibling => {
+            detached.push(sql());
+            calls.push(get("/v1/teams"));
+            labels.push(("runSql", json!("unknown")));
+            labels.push(("listTeams", json!(403)));
+            abort = true;
+        }
+    }
+    match end {
+        End::Returns | End::Throws => {}
+        End::HostTimeout | End::Disconnect => {
+            calls.push(get("/v1/projects/p_hang"));
+            labels.push(("getProject", json!("unknown")));
+        }
+        End::Refusal => calls.push(call("DELETE", "/v1/databases/db_1", Value::Null)),
+    }
+    // One audit line per call the host received.
+    let received = calls.len() + detached.len();
+    let then = if end == End::Throws { "throw" } else { "value" };
+    let script = json!({
+        "calls": calls,
+        "detached": detached,
+        "abort": abort,
+        // Long enough for a detached call to reach the gateway first.
+        "pause_ms": 250,
+        "then": then,
+    });
+    let mut labels: Vec<(String, Value)> =
+        labels.into_iter().map(|(o, l)| (o.to_owned(), l)).collect();
+    labels.sort_by(|a, b| a.0.cmp(&b.0));
+    (script, labels, received)
+}
+
+fn matrix_gateway(seen: &Seen) -> Reply {
+    match (seen.method.as_str(), seen.uri.path()) {
+        (_, "/v1/projects") => Reply::json(200, json!([])),
+        (_, "/v1/teams") => Reply::json(
+            403,
+            json!({"error": {"code": "forbidden", "message": "no"}}),
+        ),
+        (_, "/v1/databases/db_down") => Reply::reset(),
+        _ => Reply::hang(),
+    }
+}
+
+/// The audit lines of the harness's only run.
+fn run_lines(h: &Harness) -> Vec<String> {
+    let exec_id = h.runtime.exec_ids.lock().unwrap()[0].clone();
+    all_logs()
+        .lines()
+        .filter(|l| l.contains("api call") && l.contains(&exec_id))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Checks the invariant (`mcp::host`'s module doc) for every call state under `end`:
+/// - each call the host received has exactly one audit line, a dropped handler's included;
+/// - whenever a forwarded call ended without the code seeing its answer, the tool result is an
+///   error listing `calls`, whatever the code returned or threw;
+/// - each listed call's label is its state: the status, `upstream_unavailable` or `unknown`.
+async fn check_matrix(end: End) {
+    let mut failures = vec![];
+    for state in STATES {
+        let (script, labels, received) = case(end, state);
+        let h = Harness::with(Options {
+            timeout: Duration::from_millis(if end == End::HostTimeout { 600 } else { 5000 }),
+            ..Options::default()
+        })
+        .await;
+        h.respond(matrix_gateway);
+        let unknown = labels.iter().any(|(_, l)| l == "unknown");
+        let what = format!("{end:?} × {state:?}");
+        if end == End::Disconnect {
+            let gone = tokio::time::timeout(Duration::from_millis(600), h.execute(script)).await;
+            assert!(gone.is_err(), "{what}: the call finished");
+            // No tool result reaches anyone; the calls are cut and audited all the same.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while run_lines(&h).len() < received && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if run_lines(&h).len() != received {
+                failures.push(format!(
+                    "{what}: audit lines {:?}, want {received}",
+                    run_lines(&h)
+                ));
+            }
+            if !h.gateway.cut.load(Ordering::SeqCst) {
+                failures.push(format!("{what}: the awaited call was not cut"));
+            }
+            continue;
+        }
+        let result = h.execute(script).await;
+        // A dropped handler writes its line when it is dropped, just after the result.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while run_lines(&h).len() < received && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lines = run_lines(&h);
+        if lines.len() != received {
+            failures.push(format!(
+                "{what}: {} audit lines, want {received}: {lines:?}",
+                lines.len()
+            ));
+        }
+        let want_code = match end {
+            End::Refusal => Some("destructive_flag_required"),
+            End::HostTimeout => Some("timeout"),
+            End::Throws => Some("threw"),
+            End::Returns if unknown => Some("calls_unfinished"),
+            _ => None,
+        };
+        let want_calls = match end {
+            End::Refusal => !labels.is_empty(),
+            _ => unknown,
+        };
+        match (want_code, result["isError"] == true) {
+            (None, false) => {}
+            (None, true) => failures.push(format!("{what}: want success, got {result}")),
+            (Some(_), false) => failures.push(format!("{what}: want an error, got {result}")),
+            (Some(code), true) => {
+                let text = result["content"][0]["text"].as_str().unwrap_or("");
+                let error =
+                    serde_json::from_str::<Value>(text).unwrap_or_default()["error"].clone();
+                if error["code"] != code {
+                    failures.push(format!("{what}: code {}, want {code}", error["code"]));
+                }
+                match (want_calls, error.get("calls")) {
+                    (false, None) => {}
+                    (false, Some(c)) => failures.push(format!("{what}: unexpected calls {c}")),
+                    (true, None) => failures.push(format!("{what}: no calls: {error}")),
+                    (true, Some(c)) => {
+                        let mut got: Vec<(String, Value)> = c
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|e| {
+                                (
+                                    e["operation"].as_str().unwrap().to_owned(),
+                                    e["status"].clone(),
+                                )
+                            })
+                            .collect();
+                        got.sort_by(|a, b| a.0.cmp(&b.0));
+                        if got != labels {
+                            failures.push(format!("{what}: calls {got:?}, want {labels:?}"));
+                        }
+                    }
+                }
+                if unknown
+                    && !error["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("may have been applied")
+                {
+                    failures.push(format!("{what}: no may-have-been-applied note: {error}"));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failing cases:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn invariant_when_the_code_returns() {
+    check_matrix(End::Returns).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_code_throws() {
+    check_matrix(End::Throws).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_host_times_out() {
+    check_matrix(End::HostTimeout).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_run_is_refused() {
+    check_matrix(End::Refusal).await;
+}
+
+#[tokio::test]
+async fn invariant_when_the_client_goes_away() {
+    check_matrix(End::Disconnect).await;
 }
 
 // ---- deadlines ----
@@ -1473,7 +1801,7 @@ async fn a_timeout_lists_the_calls_already_made() {
 /// The host's deadline comes before the runner's, so the code can get the cut call's 504 and
 /// return a value: the tool result is still the timeout error, listing the cut call.
 #[tokio::test]
-async fn audit_a_cut_write_is_not_silent_when_the_code_returns() {
+async fn a_cut_write_is_reported_when_the_code_returns() {
     let h = Harness::with(Options {
         timeout: Duration::from_millis(400),
         ..Options::default()

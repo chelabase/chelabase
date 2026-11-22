@@ -32,15 +32,43 @@
 //! A refusal the host makes is answered as an API-shaped error (the runner takes only statuses
 //! 100–599): `{status, ok: false, headers: {}, body: {error: {code, message}}}`.
 //!
-//! A number serde_json can't carry exactly (an integer outside i64/u64, or a decimal its f64
-//! would round) is refused `invalid_request` rather than forwarded rounded.
-//!
-//! A call the host answers `timeout` (cut at the deadline or the run's end, or made after the
-//! deadline) makes the run a timeout whatever the code returns, and the tool's error lists the
-//! calls made. A refused run's error lists them too.
+//! An integer outside i64/u64 is refused `invalid_request` (fail closed: this build carries
+//! numbers as written, through serde_json's `arbitrary_precision`, but a build without it
+//! would round them), and so is a decimal serde_json would round.
 //!
 //! Each call, a malformed envelope included, writes one `info` audit line (target
 //! `mcp::audit`, message `api call`) with no body, value, concrete path or token.
+//!
+//! # The invariant
+//!
+//! A write that happened is never silent. Precisely:
+//!
+//! 1. **One audit line per call.** Every call the host receives writes exactly one audit line,
+//!    also when its handler is dropped mid-call (the runner cancels a call still in flight
+//!    when the code settles: an un-awaited `chelabase.request`, or a `Promise.all` sibling).
+//!    A drop guard made before the handler's first await writes it; a dropped call's line says
+//!    `refusal="cut"`, `status=0`.
+//! 2. **Each forwarded call ends in one state.** A call refused before forwarding has no
+//!    journal entry. Each forwarded call has one ([`Made`]), and once the run's registration
+//!    has dropped it is in exactly one of these states:
+//!    - *answered*: the host handed the code the API's answer (its status);
+//!    - *upstream-unavailable*: the host handed the code `upstream_unavailable` (the API's
+//!      connection failed; the call may or may not have run);
+//!    - *unanswered*: the code never got its outcome (cut at the deadline or the run's end,
+//!      or its handler dropped). It may have been applied.
+//!
+//!    The entry is marked when the handler hands its answer back, the last synchronous step
+//!    before the answer goes out; a call answered `timeout` stays unanswered.
+//! 3. **Unanswered calls make the result an error with `calls`.** Whenever an entry is
+//!    unanswered, the tool result is an error listing every forwarded call (`status`: the
+//!    number, `upstream_unavailable` or `unknown`), whatever the code returned or threw:
+//!    the run's refusal if it was refused, `timeout` if the host's deadline passed or the
+//!    runner timed out, the code's own error (`threw`, …) if it threw, else
+//!    [`CALLS_UNFINISHED`]. A refused run's error and a timed-out run's error list `calls`
+//!    whenever any call was forwarded.
+//!
+//! Calls are never kept running past the run to learn their outcome: unanswered is the end
+//! state, reported as `unknown`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -62,6 +90,8 @@ use crate::sandbox::Kind;
 use crate::secret_fields;
 
 pub const DEFAULT_MAX_CALLS: u32 = 50;
+/// The tool error when the code returned while a call it made had no answer yet.
+pub const CALLS_UNFINISHED: &str = "calls_unfinished";
 pub const DEFAULT_RESPONSE_MAX_BYTES: usize = 1 << 20;
 /// The largest request body forwarded (after re-serializing).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1 << 20;
@@ -169,6 +199,8 @@ pub enum Code {
     SecretsUnavailable,
     RequestTooLarge,
     InvalidRequest,
+    /// An integer outside i64/u64, or a decimal serde_json would round (`invalid_request`).
+    InexactNumber,
     Timeout,
 }
 
@@ -184,7 +216,7 @@ impl Code {
             Code::UpstreamUnavailable => "upstream_unavailable",
             Code::SecretsUnavailable => "secrets_unavailable",
             Code::RequestTooLarge => "request_too_large",
-            Code::InvalidRequest => "invalid_request",
+            Code::InvalidRequest | Code::InexactNumber => "invalid_request",
             Code::Timeout => "timeout",
         }
     }
@@ -198,7 +230,7 @@ impl Code {
             | Code::SecretsUnavailable => 403,
             Code::TooManyCalls => 429,
             Code::RequestTooLarge => 413,
-            Code::InvalidRequest => 400,
+            Code::InvalidRequest | Code::InexactNumber => 400,
             Code::ResponseTooLarge | Code::BinaryBody | Code::UpstreamUnavailable => 502,
             Code::Timeout => 504,
         }
@@ -222,6 +254,9 @@ impl Code {
             }
             Code::RequestTooLarge => "the request body is over 1 MiB",
             Code::InvalidRequest => "query values must be strings, numbers or booleans",
+            Code::InexactNumber => {
+                "a number in the request is an integer outside the 64-bit range or a decimal that can't be carried exactly: send it as a string"
+            }
             Code::Timeout => "the execution's time is up",
         }
     }
@@ -234,21 +269,33 @@ pub struct Refusal {
     pub operations: Vec<String>,
 }
 
-/// A call the run forwarded: its operation and the API's status (`None`: no status came
-/// back).
+/// A call the run forwarded (see the invariant in the module doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Made {
     pub operation: String,
+    /// The API's status, once its headers came back.
     pub status: Option<u16>,
-    /// Cut by the host (deadline or the run's end) before its answer was whole: it may have
-    /// been applied whatever `status` says.
-    pub cut: bool,
+    /// The host handed the code its answer: the API's, or a refusal made after the API
+    /// answered. Unset: the code never got the outcome.
+    pub answered: bool,
+    /// The answer the code got was `upstream_unavailable`.
+    pub upstream_unavailable: bool,
 }
 
 impl Made {
-    /// Whether the code never learned how the call ended.
+    /// Whether the code never got the call's outcome: it may have been applied.
     pub fn unknown(&self) -> bool {
-        self.cut || self.status.is_none()
+        !self.answered
+    }
+
+    /// The call's `status` in a tool error's `calls`.
+    pub fn label(&self) -> Value {
+        match (self.answered, self.upstream_unavailable, self.status) {
+            (false, ..) => json!("unknown"),
+            (true, true, _) => json!("upstream_unavailable"),
+            (true, false, Some(status)) => json!(status),
+            (true, false, None) => json!("unknown"),
+        }
     }
 }
 
@@ -257,7 +304,7 @@ struct Calls {
     calls: u32,
     refusal: Option<Refusal>,
     made: Vec<Made>,
-    /// The host answered a call `timeout` (cut, or after the deadline).
+    /// The host's deadline passed during the run (a call was cut at it, or came after it).
     timed_out: bool,
 }
 
@@ -299,18 +346,21 @@ impl Journal {
             .any(|m| m.operation == "runSql" && m.unknown())
     }
 
-    /// Whether the host answered a call `timeout`: the run is a timeout whatever the code
-    /// returns.
+    /// Whether the host's deadline passed during the run: the run is a timeout whatever the
+    /// code returns.
     pub fn timed_out(&self) -> bool {
         self.state().timed_out
     }
 
-    /// Records a `timeout` answer, and the cut of entry `index` if one was made.
-    fn time_out(&self, index: Option<usize>) {
-        let mut state = self.state();
-        state.timed_out = true;
-        if let Some(made) = index.and_then(|i| state.made.get_mut(i)) {
-            made.cut = true;
+    fn time_out(&self) {
+        self.state().timed_out = true;
+    }
+
+    /// Marks entry `index` answered: the code is getting its outcome.
+    fn deliver(&self, delivery: Delivery) {
+        if let Some(made) = self.state().made.get_mut(delivery.index) {
+            made.answered = true;
+            made.upstream_unavailable = delivery.upstream_unavailable;
         }
     }
 
@@ -440,6 +490,30 @@ fn refused(code: Code) -> Response {
     .into_response()
 }
 
+/// What the code is told about a forwarded call (marked by [`Journal::deliver`]).
+#[derive(Debug, Clone, Copy)]
+struct Delivery {
+    index: usize,
+    upstream_unavailable: bool,
+}
+
+/// Writes a call's audit line exactly once: when the handler ends, or when it is dropped
+/// mid-call (then as `cut`).
+struct Audited<'a> {
+    line: Line<'a>,
+    finished: bool,
+}
+
+impl Drop for Audited<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.line.status = 0;
+            self.line.refusal = "cut";
+        }
+        audit(&self.line);
+    }
+}
+
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "no such run").into_response()
 }
@@ -471,20 +545,27 @@ async fn callback(
         return (StatusCode::BAD_REQUEST, "not a request envelope").into_response();
     };
     let exact = !lossy_number(&bytes);
-    let mut line = Line {
-        exec_id: &exec_id,
-        exec: &exec,
-        operation: "",
-        class: "",
-        method: &envelope.method,
-        template: "",
-        status: 0,
-        request_bytes: 0,
-        response_bytes: 0,
-        refusal: "",
+    // Made before the first await: a dropped handler still writes its line.
+    let mut audited = Audited {
+        line: Line {
+            exec_id: &exec_id,
+            exec: &exec,
+            operation: "",
+            class: "",
+            method: &envelope.method,
+            template: "",
+            status: 0,
+            request_bytes: 0,
+            response_bytes: 0,
+            refusal: "",
+        },
+        finished: false,
     };
-    let response = handle(&host, &exec, &envelope, exact, &mut line).await;
-    audit(&line);
+    let (response, delivery) = handle(&host, &exec, &envelope, exact, &mut audited.line).await;
+    audited.finished = true;
+    if let Some(delivery) = delivery {
+        exec.journal.deliver(delivery);
+    }
     response
 }
 
@@ -494,15 +575,15 @@ async fn handle<'a>(
     envelope: &'a Envelope,
     exact: bool,
     line: &mut Line<'a>,
-) -> Response {
+) -> (Response, Option<Delivery>) {
     let refuse = |line: &mut Line<'a>, code: Code| {
         line.refusal = code.as_str();
         line.status = code.status();
-        refused(code)
+        (refused(code), None)
     };
     let journal = &exec.journal;
     if Instant::now() >= exec.deadline {
-        journal.time_out(None);
+        journal.time_out();
         return refuse(line, Code::Timeout);
     }
     let matched = Matcher::bundle().find(&envelope.method, &envelope.path);
@@ -569,7 +650,7 @@ async fn handle<'a>(
     }
     // serde_json (without `arbitrary_precision`) would forward such a number rounded.
     if !exact {
-        return refuse(line, Code::InvalidRequest);
+        return refuse(line, Code::InexactNumber);
     }
     let body = match body.as_ref().map(serde_json::to_vec).transpose() {
         Ok(body) => body,
@@ -582,15 +663,28 @@ async fn handle<'a>(
         return refuse(line, Code::RequestTooLarge);
     }
     line.request_bytes = body.as_ref().map_or(0, Vec::len);
-    match forward(host, exec, envelope, operation, body).await {
+    let (index, outcome) = forward(host, exec, envelope, operation, body).await;
+    match outcome {
         Ok((status, answer, bytes)) => {
             line.status = status;
             line.response_bytes = bytes;
-            axum::Json(answer).into_response()
+            let delivery = index.map(|index| Delivery {
+                index,
+                upstream_unavailable: false,
+            });
+            (axum::Json(answer).into_response(), delivery)
         }
         Err((code, bytes)) => {
             line.response_bytes = bytes;
-            refuse(line, code)
+            let (response, _) = refuse(line, code);
+            // A cut call stays unanswered: the code never learns its outcome.
+            let delivery = index
+                .filter(|_| code != Code::Timeout)
+                .map(|index| Delivery {
+                    index,
+                    upstream_unavailable: code == Code::UpstreamUnavailable,
+                });
+            (response, delivery)
         }
     }
 }
@@ -697,14 +791,28 @@ fn url_of(
     Some(url)
 }
 
-/// Makes the call. `Ok` is the API's status, the sandbox's answer and the answer's bytes;
-/// `Err` a refusal and the bytes read.
+/// Makes the call: its journal entry (once one is made) and the outcome.
 async fn forward(
     host: &Host,
     exec: &Exec,
     envelope: &Envelope,
     operation: &str,
     body: Option<Vec<u8>>,
+) -> (Option<usize>, Result<(u16, Value, usize), (Code, usize)>) {
+    let mut index = None;
+    let outcome = send(host, exec, envelope, operation, body, &mut index).await;
+    (index, outcome)
+}
+
+/// [`forward`]'s work. `Ok` is the API's status, the sandbox's answer and the answer's bytes;
+/// `Err` a refusal and the bytes read. `entry` is set once the journal entry is made.
+async fn send(
+    host: &Host,
+    exec: &Exec,
+    envelope: &Envelope,
+    operation: &str,
+    body: Option<Vec<u8>>,
+    entry: &mut Option<usize>,
 ) -> Result<(u16, Value, usize), (Code, usize)> {
     let Some(base) = &host.api_url else {
         return Err((Code::UpstreamUnavailable, 0));
@@ -726,10 +834,12 @@ async fn forward(
         state.made.push(Made {
             operation: operation.to_owned(),
             status: None,
-            cut: false,
+            answered: false,
+            upstream_unavailable: false,
         });
         (state.made.len() - 1, state.calls)
     };
+    *entry = Some(index);
 
     let mut request = host
         .http
@@ -784,12 +894,9 @@ async fn forward(
     };
     let (status, headers, bytes) = tokio::select! {
         biased;
-        () = exec.ended() => {
-            exec.journal.time_out(Some(index));
-            return Err((Code::Timeout, 0));
-        }
+        () = exec.ended() => return Err((Code::Timeout, 0)),
         () = tokio::time::sleep_until(exec.deadline.into()) => {
-            exec.journal.time_out(Some(index));
+            exec.journal.time_out();
             return Err((Code::Timeout, 0));
         }
         done = work => done?,
@@ -876,7 +983,11 @@ mod tests {
     #[test]
     fn a_decimal_serde_json_would_round_is_lossy() {
         for n in ["0.10000000000000000001", "12345678901234567890123.0"] {
-            let rounds = serde_json::from_str::<Value>(n).unwrap().to_string().as_str() != n;
+            let rounds = serde_json::from_str::<Value>(n)
+                .unwrap()
+                .to_string()
+                .as_str()
+                != n;
             assert_eq!(!exact_number(n), rounds, "{n}");
         }
         assert_eq!(decimal("0.10"), decimal("1e-1"));

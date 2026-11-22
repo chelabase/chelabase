@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::{Audit, audit};
 use crate::auth::Caller;
-use crate::host::{Journal, Made};
+use crate::host::{CALLS_UNFINISHED, Journal, Made};
 use crate::limits::{self, Admission};
 use crate::runtime::new_exec_id;
 use crate::sandbox::{ErrorCode, Kind, Outcome, Ran, Run, Sandbox};
@@ -459,53 +459,65 @@ pub async fn call(
     Ok(result)
 }
 
-/// The tool error that replaces an `execute` run's outcome, with its code: the run's sticky
-/// refusal (whatever the code returned, so a `try` cannot hide it), or for a timed-out run the
-/// calls it already made with their statuses (`unknown` for one cut), so a write that happened
-/// is never silent.
+/// The tool error that replaces an `execute` run's outcome, with its code (the invariant in
+/// [`crate::host`]'s module doc): the run's sticky refusal (whatever the code returned, so a
+/// `try` cannot hide it), a timeout, or, whenever a forwarded call never got its answer to the
+/// code, an error listing the calls so a write that may have happened is never silent.
 fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'static str)> {
     let made = journal.made();
     let calls: Vec<Value> = made
         .iter()
-        .map(|m| {
-            let status = match m.status {
-                Some(s) if !m.unknown() => json!(s),
-                _ => json!("unknown"),
-            };
-            json!({"operation": m.operation, "status": status})
-        })
+        .map(|m| json!({"operation": m.operation, "status": m.label()}))
         .collect();
-    let cut_note = if journal.sql_cut() {
-        Some("; a SQL run was cut before its answer: its earlier statements may have been applied")
-    } else if made.iter().any(Made::unknown) {
-        Some("; a call was cut before its answer: it may have been applied")
+    let unknown = made.iter().any(Made::unknown);
+    let note = if journal.sql_cut() {
+        "; a SQL run ended before its answer reached the code: its earlier statements may have been applied"
+    } else if unknown {
+        "; a call ended before its answer reached the code: it may have been applied"
     } else {
-        None
+        ""
     };
-    if let Some(refusal) = journal.refusal() {
-        let mut error = json!({
-            "code": refusal.code.as_str(),
-            "message": format!("{}{}", refusal.code.message(), cut_note.unwrap_or("")),
-            "operations": refusal.operations,
-        });
-        // The calls already made, so a retry doesn't repeat a write that happened.
+    let error = |code: &str, message: &str, operations: Option<&[String]>| {
+        let mut error = json!({"code": code, "message": format!("{message}{note}")});
+        if let Some(operations) = operations {
+            error["operations"] = json!(operations);
+        }
         if !calls.is_empty() {
             error["calls"] = json!(calls);
         }
-        return Some((json!({ "error": error }).to_string(), refusal.code.as_str()));
+        json!({ "error": error }).to_string()
+    };
+    if let Some(refusal) = journal.refusal() {
+        let code = refusal.code.as_str();
+        return Some((
+            error(code, refusal.code.message(), Some(&refusal.operations)),
+            code,
+        ));
     }
-    let message = match outcome {
+    let timeout = ErrorCode::Timeout.as_str();
+    match outcome {
         Outcome::Error {
             code: ErrorCode::Timeout,
             message,
-        } if !made.is_empty() || journal.timed_out() => message.clone(),
-        // The host cut a call: the code may have returned anyway, on the cut call's answer.
-        _ if journal.timed_out() => "the execution's time is up".to_owned(),
-        _ => return None,
-    };
-    let message = format!("{message}{}", cut_note.unwrap_or(""));
-    let body = json!({"error": {"code": ErrorCode::Timeout.as_str(), "message": message, "calls": calls}});
-    Some((body.to_string(), ErrorCode::Timeout.as_str()))
+        } if !made.is_empty() || journal.timed_out() => Some((error(timeout, message, None), timeout)),
+        Outcome::Error { code, message } if unknown => {
+            Some((error(code.as_str(), message, None), code.as_str()))
+        }
+        // The host's deadline passed: the code may have returned on a cut call's answer.
+        Outcome::Value(_) if journal.timed_out() => Some((
+            error(timeout, "the execution's time is up", None),
+            timeout,
+        )),
+        Outcome::Value(_) if unknown => Some((
+            error(
+                CALLS_UNFINISHED,
+                "the code returned before every API call it made had its answer",
+                None,
+            ),
+            CALLS_UNFINISHED,
+        )),
+        _ => None,
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
