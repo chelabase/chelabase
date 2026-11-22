@@ -1,4 +1,4 @@
-//! SQL editor saved queries: each user's own, per Chelabase database.
+//! SQL editor saved queries: shared per Chelabase database; only the author or an Admin can change one.
 
 use std::sync::Arc;
 

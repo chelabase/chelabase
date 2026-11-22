@@ -45,14 +45,14 @@ const MINUTE_MS = 60_000;
 export const CODE_TTL_MS: Record<CodeKind, number> = {
   verify: 15 * MINUTE_MS,
   reset: 15 * MINUTE_MS,
-  invite: 7 * 24 * 60 * MINUTE_MS,
+  invite: 72 * 60 * MINUTE_MS, // the orchestrator's INVITE_LIFETIME_HOURS
   email_change: 15 * MINUTE_MS,
 };
 /** Human wording of each TTL for the templates. */
 export const CODE_TTL_TEXT: Record<CodeKind, string> = {
   verify: "15 minutes",
   reset: "15 minutes",
-  invite: "7 days",
+  invite: "72 hours",
   email_change: "15 minutes",
 };
 /** Wrong guesses a code survives; the next guess, right or wrong, is refused. */
