@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::{Audit, audit};
 use crate::auth::Caller;
-use crate::host::Journal;
+use crate::host::{Journal, Made};
 use crate::limits::{self, Admission};
 use crate::runtime::new_exec_id;
 use crate::sandbox::{ErrorCode, Kind, Outcome, Ran, Run, Sandbox};
@@ -464,40 +464,46 @@ pub async fn call(
 /// calls it already made with their statuses (`unknown` for one cut), so a write that happened
 /// is never silent.
 fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'static str)> {
-    if let Some(refusal) = journal.refusal() {
-        let body = json!({"error": {
-            "code": refusal.code.as_str(),
-            "message": refusal.code.message(),
-            "operations": refusal.operations,
-        }});
-        return Some((body.to_string(), refusal.code.as_str()));
-    }
-    let Outcome::Error {
-        code: ErrorCode::Timeout,
-        message,
-    } = outcome
-    else {
-        return None;
-    };
     let made = journal.made();
-    if made.is_empty() {
-        return None;
-    }
     let calls: Vec<Value> = made
         .iter()
         .map(|m| {
-            let status = m.status.map_or_else(|| json!("unknown"), |s| json!(s));
+            let status = match m.status {
+                Some(s) if !m.unknown() => json!(s),
+                _ => json!("unknown"),
+            };
             json!({"operation": m.operation, "status": status})
         })
         .collect();
-    let mut message = message.clone();
-    if journal.sql_cut() {
-        message.push_str(
-            "; a SQL run was cut at the deadline: its earlier statements may have been applied",
-        );
-    } else if made.iter().any(|m| m.status.is_none()) {
-        message.push_str("; a call was cut at the deadline: it may have been applied");
+    let cut_note = if journal.sql_cut() {
+        Some("; a SQL run was cut before its answer: its earlier statements may have been applied")
+    } else if made.iter().any(Made::unknown) {
+        Some("; a call was cut before its answer: it may have been applied")
+    } else {
+        None
+    };
+    if let Some(refusal) = journal.refusal() {
+        let mut error = json!({
+            "code": refusal.code.as_str(),
+            "message": format!("{}{}", refusal.code.message(), cut_note.unwrap_or("")),
+            "operations": refusal.operations,
+        });
+        // The calls already made, so a retry doesn't repeat a write that happened.
+        if !calls.is_empty() {
+            error["calls"] = json!(calls);
+        }
+        return Some((json!({ "error": error }).to_string(), refusal.code.as_str()));
     }
+    let message = match outcome {
+        Outcome::Error {
+            code: ErrorCode::Timeout,
+            message,
+        } if !made.is_empty() || journal.timed_out() => message.clone(),
+        // The host cut a call: the code may have returned anyway, on the cut call's answer.
+        _ if journal.timed_out() => "the execution's time is up".to_owned(),
+        _ => return None,
+    };
+    let message = format!("{message}{}", cut_note.unwrap_or(""));
     let body = json!({"error": {"code": ErrorCode::Timeout.as_str(), "message": message, "calls": calls}});
     Some((body.to_string(), ErrorCode::Timeout.as_str()))
 }
