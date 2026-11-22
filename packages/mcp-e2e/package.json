@@ -1,0 +1,15 @@
+{
+  "name": "@chelabase/mcp-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check": "node src/main.ts"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/node": "^24.19.0",
+    "typescript": "^7.0.2",
+    "zod": "4.6.7"
+  }
+}

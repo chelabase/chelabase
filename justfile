@@ -677,6 +677,11 @@ role-e2e:
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
 
+# Live MCP check: the official TypeScript client over `chelabase mcp` against the stack's /mcp
+# (needs the stack up with the mcp profile; its busy-loop check restarts mcp-runtime)
+mcp-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/mcp-e2e.sh
+
 # Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
 # revocation on grant loss (compute suspended), suspend, revoke-now, offboarding, expiry
 personal-logins-e2e:
