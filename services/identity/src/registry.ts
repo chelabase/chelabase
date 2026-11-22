@@ -53,15 +53,24 @@ export class PoolRegistry {
   private readonly capacity: number;
   /** Every table a pool's migration creates, from the same options the migration uses. */
   private readonly tables: string[];
+  /** Every column the migration declares for each of those tables. */
+  private readonly columns: Map<string, string[]>;
 
   constructor(databaseUrl: string, secret: string, capacity: number) {
     this.databaseUrl = databaseUrl;
     this.secret = secret;
     this.capacity = capacity;
     this.db = sharedPgPool(databaseUrl);
-    this.tables = Object.entries(getSchema(authOptions(this.db, secret, undefined)))
-      .filter(([, table]) => !table.disableMigrations)
-      .map(([name]) => name);
+    const declared = Object.entries(getSchema(authOptions(this.db, secret, undefined))).filter(
+      ([, table]) => !table.disableMigrations,
+    );
+    this.tables = declared.map(([name]) => name);
+    this.columns = new Map(
+      declared.map(([name, table]) => [
+        name,
+        ["id", ...Object.entries(table.fields).map(([field, def]) => def.fieldName ?? field)],
+      ]),
+    );
   }
 
   /** Runs `fn` with the pool's instance. */
@@ -73,17 +82,48 @@ export class PoolRegistry {
   async createPool(ref: PoolRef): Promise<void> {
     await this.locked(ref.schema, async () => {
       await this.db.query("SELECT identity_admin.create_pool_schema($1)", [ref.schema]);
-      // Migrate in search_path mode on a connection pinned to the schema: Better Auth targets
-      // current_schema() and emits no CREATE SCHEMA, which this role may not run (it has no
-      // CREATE on the database). The schema exists by now.
-      const pinned = pgPool(this.databaseUrl, ref.schema, 1);
-      try {
-        const { runMigrations } = await getMigrations(authOptions(pinned, this.secret, undefined));
-        await runMigrations();
-      } finally {
-        await pinned.end();
-      }
+      await this.migrate(ref);
     });
+  }
+
+  /**
+   * Runs Better Auth's migrations for an existing pool schema: creates missing tables, adds
+   * missing columns and indexes. Holds a session advisory lock on the schema name throughout,
+   * so two identity processes never migrate one pool at once (the second finds nothing left to
+   * do). The caller holds the in-process lock for the schema.
+   */
+  private async migrate(ref: PoolRef): Promise<void> {
+    const lock = await this.db.connect();
+    let broken: Error | undefined;
+    try {
+      await lock.query("SELECT pg_catalog.pg_advisory_lock(pg_catalog.hashtextextended($1, 0))", [
+        `chelabase-identity migrate ${ref.schema}`,
+      ]);
+      try {
+        // Migrate in search_path mode on a connection pinned to the schema: Better Auth targets
+        // current_schema() and emits no CREATE SCHEMA, which this role may not run (it has no
+        // CREATE on the database). The schema exists by now.
+        const pinned = pgPool(this.databaseUrl, ref.schema, 1);
+        try {
+          const { runMigrations } = await getMigrations(authOptions(pinned, this.secret, undefined));
+          await runMigrations();
+        } finally {
+          await pinned.end();
+        }
+      } finally {
+        await lock.query("SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtextextended($1, 0))", [
+          `chelabase-identity migrate ${ref.schema}`,
+        ]).catch((err: Error) => {
+          // Closing the connection releases the lock instead.
+          broken = err;
+        });
+      }
+    } catch (err) {
+      broken ??= err as Error;
+      throw err;
+    } finally {
+      lock.release(broken);
+    }
   }
 
   /** Evicts the pool's instance and drops its schema through m5's function. Idempotent. Never `members`. */
@@ -122,14 +162,23 @@ export class PoolRegistry {
   private async load(ref: PoolRef): Promise<Auth> {
     const cached = this.cache.get(ref.schema);
     if (cached) return cached;
-    // A pool exists once its migration ran to the end: every table it creates is there. One
-    // that stopped partway (or predates a table) is not found until createPool runs again;
-    // loading never migrates.
-    const found = await this.db.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = ANY($2::text[])",
+    // A pool exists once its migration created every table. One that stopped partway (or
+    // predates a table) is not found until createPool runs again. One with every table that
+    // lacks a declared column (it predates the column) is upgraded in place here, so every
+    // pool in use gets additive schema changes without an operator step.
+    const found = await this.db.query<{ name: string; columns: string[] }>(
+      `SELECT c.relname::text AS name, array_agg(a.attname::text) AS columns
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND c.relname = ANY($2::text[])
+        GROUP BY c.relname`,
       [ref.schema, this.tables],
     );
-    if (found.rows[0]?.n !== this.tables.length) throw new PoolNotFound(ref.name);
+    if (found.rows.length !== this.tables.length) throw new PoolNotFound(ref.name);
+    const present = new Map(found.rows.map((row) => [row.name, new Set(row.columns)]));
+    const missing = this.tables.some((table) => this.columns.get(table)!.some((col) => !present.get(table)?.has(col)));
+    if (missing) await this.migrate(ref);
     const auth = createAuth(this.db, this.secret, ref.schema);
     this.cache.set(ref.schema, auth);
     while (this.cache.size > this.capacity) {

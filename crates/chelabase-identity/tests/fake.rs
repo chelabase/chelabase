@@ -149,6 +149,8 @@ async fn return_vs_email_delivery() {
         .unwrap();
     assert!(returned.code.is_some());
     assert!(f.codes_sent().is_empty(), "return delivery sends nothing");
+    // Past the replacement window, so the mailed code replaces the returned one.
+    f.advance(Duration::from_secs(61));
     let mailed = id
         .create_code(
             &pool,
@@ -375,6 +377,8 @@ async fn a_new_code_resets_the_attempts() {
             .await
             .unwrap_err();
     }
+    // Past the replacement window: the first code is still live.
+    f.advance(Duration::from_secs(61));
     let second = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
     let wrong = if second == "000000" {
         "111111"
@@ -551,4 +555,106 @@ async fn find_user_by_email_is_one_exact_lookup() {
     assert!(id.find_user_by_email(&pool, "xact@x.io").await.unwrap().is_none());
     assert!(id.find_user_by_email(&pool, "%@x.io").await.unwrap().is_none());
     assert_eq!(lists() - before, 2);
+}
+
+/// The code `issue` returned, plus one: always wrong.
+fn wrong_for(code: &str) -> String {
+    format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
+}
+
+#[tokio::test]
+async fn mock_budget_survives_new_codes() {
+    let (f, id, p) = setup(1).await;
+    let uid = f.with_user(&p[0], "budget@example.com", PW);
+    let other = f.with_user(&p[0], "other@example.com", PW);
+    // Ten wrong guesses across three codes; each code is locked or replaced before the next.
+    for guesses in [5, 4, 1] {
+        let code = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+        for _ in 0..guesses {
+            let e = id
+                .verify_code(&p[0], &uid, CodeKind::Reset, &wrong_for(&code), Some("n3w password!"))
+                .await
+                .unwrap_err();
+            assert_eq!(e, IdentityError::CodeInvalid);
+        }
+        f.advance(Duration::from_secs(61));
+    }
+    // A new code doesn't refill it: the right code is refused, unchecked and not consumed.
+    let code = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    let e = id
+        .verify_code(&p[0], &uid, CodeKind::Reset, &code, Some("n3w password!"))
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeBudgetSpent);
+    // Per kind and per user.
+    let v = common::issue(&id, &p[0], &uid, CodeKind::Verify).await;
+    id.verify_code(&p[0], &uid, CodeKind::Verify, &v, None).await.unwrap();
+    let r = common::issue(&id, &p[0], &other, CodeKind::Reset).await;
+    id.verify_code(&p[0], &other, CodeKind::Reset, &r, Some("n3w password!"))
+        .await
+        .unwrap();
+    // Once the window ends, the same code works and clears the budget.
+    f.advance(Duration::from_secs(24 * 3600));
+    let code = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    id.verify_code(&p[0], &uid, CodeKind::Reset, &code, Some("n3w password!"))
+        .await
+        .unwrap();
+    // A right code clears it: nine more wrong guesses then a right code work.
+    for _ in 0..2 {
+        f.advance(Duration::from_secs(61));
+        let code = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+        for _ in 0..4 {
+            id.verify_code(&p[0], &uid, CodeKind::Reset, &wrong_for(&code), Some("n3w password!"))
+                .await
+                .unwrap_err();
+        }
+    }
+    f.advance(Duration::from_secs(61));
+    let code = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    id.verify_code(&p[0], &uid, CodeKind::Reset, &wrong_for(&code), Some("n3w password!"))
+        .await
+        .unwrap_err();
+    id.verify_code(&p[0], &uid, CodeKind::Reset, &code, Some("n3w password!"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mock_refuses_replacing_a_recent_code() {
+    let (f, id, p) = setup(1).await;
+    let uid = f.with_user(&p[0], "recent@example.com", PW);
+    let first = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    f.advance(Duration::from_secs(30));
+    let e = id
+        .create_code(&p[0], &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Email))
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeRecentlySent);
+    assert!(f.codes_sent().is_empty(), "nothing is mailed");
+    // After 60 s it is replaced.
+    f.advance(Duration::from_secs(31));
+    let second = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    if first != second {
+        let e = id
+            .verify_code(&p[0], &uid, CodeKind::Reset, &first, Some("n3w password!"))
+            .await
+            .unwrap_err();
+        assert_eq!(e, IdentityError::CodeInvalid);
+    }
+    // A used code is replaced at once.
+    id.verify_code(&p[0], &uid, CodeKind::Reset, &second, Some("n3w password!"))
+        .await
+        .unwrap();
+    common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    // Invites are always replaced.
+    let invitee = f.with_invited_user(&p[0], "invitee@example.com");
+    let a = common::issue(&id, &p[0], &invitee, CodeKind::Invite).await;
+    let b = common::issue(&id, &p[0], &invitee, CodeKind::Invite).await;
+    if a != b {
+        let e = id
+            .verify_code(&p[0], &invitee, CodeKind::Invite, &a, Some("n3w password!"))
+            .await
+            .unwrap_err();
+        assert_eq!(e, IdentityError::CodeInvalid);
+    }
 }

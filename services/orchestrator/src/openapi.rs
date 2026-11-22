@@ -892,10 +892,10 @@ impl functions::FunctionsPort for Doc {
     async fn list_for_branch(&self, branch: BranchId) -> Result<Vec<chelabase_metadata::BranchFunction>, MetadataError> {
         match *self {}
     }
-    async fn put_secret(&self, branch: BranchId, function: Uuid, name: &str, value: &str) -> Result<(), MetadataError> {
+    async fn put_secret(&self, branch: BranchId, function: Uuid, name: &str, value: &str, tenant_admin: bool) -> Result<(), MetadataError> {
         match *self {}
     }
-    async fn delete_secret(&self, branch: BranchId, function: Uuid, name: &str) -> Result<bool, MetadataError> {
+    async fn delete_secret(&self, branch: BranchId, function: Uuid, name: &str, tenant_admin: bool) -> Result<bool, MetadataError> {
         match *self {}
     }
     async fn secret_names(&self, branch: BranchId, function: Uuid) -> Result<Vec<String>, MetadataError> {
@@ -951,6 +951,9 @@ impl members::MembersPort for Doc {
         match *self {}
     }
     async fn member_by_email(&self, tenant: TenantId, email: &str) -> Result<Option<MemberRecord>, MetadataError> {
+        match *self {}
+    }
+    async fn removed_member_with_email(&self, tenant: TenantId, email: &str) -> Result<bool, MetadataError> {
         match *self {}
     }
     async fn list_members(

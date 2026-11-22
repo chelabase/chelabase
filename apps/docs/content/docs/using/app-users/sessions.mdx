@@ -28,10 +28,11 @@ const mine = await db.from('users').select('id', 'display_name'); // only the si
 | `currentUser()` | The signed-in user, or `null` when signed out. |
 | `verifyEmail({ email, code })`, `resendCode({ email })` | Confirm an address with the emailed code, or send it again. |
 | `requestPasswordReset({ email })`, `confirmPasswordReset({ email, code, password })` | Reset a forgotten password with an emailed code. |
-| `changeEmail({ email })`, `changePassword({ currentPassword, password })` | Change the signed-in user's email or password. `changePassword` returns a fresh session. |
+| `changeEmail({ email, currentPassword })`, `confirmEmailChange({ email, code })` | Change the signed-in user's email. Returns `{ confirmationRequired }`: with email verification on, a code goes to the new address and nothing changes until `confirmEmailChange`. See [Email changes](#email-changes). |
+| `changePassword({ currentPassword, password })` | Change the signed-in user's password. Returns a fresh session. |
 | `onChange(callback)` | Subscribe to `signed_in`, `signed_out` and `refreshed`; returns the unsubscribe function. |
 
-The client keeps the refresh token in `localStorage` in browsers and in memory elsewhere. Pass your own `{ get, set, remove }` (sync or async) as `auth.storage` to change that, and `auth.autoRefresh: false` to turn off the background refresh timer:
+The client keeps the refresh token in `localStorage` in browsers and in memory elsewhere. That is convenient for an app with no server, but any script on the page can read `localStorage`, so for a browser app we recommend the cookie mode, which keeps the refresh token in an `HttpOnly` cookie out of script reach: see [Server rendering](/using/client/ssr). Pass your own `{ get, set, remove }` (sync or async) as `auth.storage` to change that, and `auth.autoRefresh: false` to turn off the background refresh timer:
 
 ```ts twoslash
 import { createClient } from '@chelabase/client';
@@ -67,7 +68,7 @@ The flows live under `/auth/v1/app/` on the gateway and take a **public** key as
 | `user` | GET | yes |
 | `verify-email`, `resend-code` | POST | no |
 | `password-reset`, `password-reset/confirm` | POST | no |
-| `change-email`, `change-password` | POST | yes |
+| `change-email`, `change-email/confirm`, `change-password` | POST | yes |
 | `jwks` | GET | no |
 
 `jwks` is public: your own servers can verify access tokens with it. The credential flows are rate limited, and sign-up and sign-in answer after a minimum response time, so they don't give away whether an account exists. With email verification on, sign-up and `resend-code` answer the same for a taken address; with verification off, sign-up for a taken email is 409 `email_taken`.
@@ -101,13 +102,38 @@ The gateway checks the token and that its session is still live. Liveness is cac
 
 ## Refresh token
 
-A string of the form `<session id>.<secret>`. It expires on a sliding schedule of `CHELABASE_APP_REFRESH_TTL_SECS` (default 30 days), capped at 90 days from sign-in.
+An opaque string that starts with the session id. It expires on a sliding schedule of `CHELABASE_APP_REFRESH_TTL_SECS` (default 30 days), capped at 90 days from sign-in.
 
 - Every refresh rotates it.
 - Within 10 seconds of a rotation, presenting the previous token returns the same new pair (two tabs refreshing at once).
-- After that, presenting it revokes the session: 401 `refresh_token_reused`.
+- After that, presenting it revokes the session: 401 `refresh_token_reused`. The same goes for any earlier refresh token of the session, not only the last one.
 
 The client refreshes 60 seconds before the access token expires, refreshes first when a request would carry a token with under 5 seconds left, and refreshes once after a data request answers 401 `user_token_expired`. It signs out locally (and emits `signed_out`) when a refresh answers `refresh_token_reused`, `refresh_token_invalid`, `user_session_revoked` or `user_inactive`, or when any request answers `user_session_revoked`.
+
+## Email changes
+
+`change-email` takes the new address and the user's current password (`{ email, current_password }`); a wrong password is 401 `invalid_credentials`. An address another user holds is 409 `email_taken`, and the user's own is 409 `conflict`.
+
+- **Verification on:** the answer is 202 `{ "confirmation_required": true }` and a code goes to the new address. The account keeps its current, verified address until `change-email/confirm` with `{ email, code }` (the same new address and the code). Then the address changes, verified. A wrong code, or one for another address, is 422 `invalid_code`; an address another user took meanwhile is 409 `email_taken`. The code needs mail: without SMTP configured, `change-email` answers 503 `unavailable` and changes nothing. A second ask within a minute of a code is 429 `rate_limited`.
+- **Verification off:** the answer is 204 and the new address applies at once, verified.
+
+When the address changes, the previous one gets a notice (when SMTP is configured). Sessions continue; tokens carry the new `email` claim from their next refresh.
+
+```ts twoslash
+import { createClient } from '@chelabase/client';
+const db = createClient({ url: 'http://api.chelabase.localhost:8000', key: 'chk_pub_…' });
+const code = '123456';
+// ---cut---
+const { confirmationRequired } = await db.auth.changeEmail({ email: 'ann@new.example', currentPassword: 'Str0ng!pass' });
+if (confirmationRequired) {
+  // The user reads the code from their new mailbox.
+  await db.auth.confirmEmailChange({ email: 'ann@new.example', code });
+}
+```
+
+<Callout type="warn">
+**Migrating from `changeEmail({ email })`:** `changeEmail` now needs `currentPassword`, and `change-email` refuses a body without `current_password` (422). With email verification on, a change takes effect only after `confirmEmailChange`; before, the unverified new address replaced the old one at once.
+</Callout>
 
 ## Password changes
 

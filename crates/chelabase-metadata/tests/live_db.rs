@@ -15,7 +15,7 @@ use chelabase_metadata::{
     ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
     DataApiState, EnableStart, ServedDatabase,
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
-    PeekOutcome, RefreshOutcome, RenameProject, AppUsersStatus,
+    PeekOutcome, RefreshOutcome, RefreshProof::{Issued, Unproven}, RenameProject, AppUsersStatus,
     SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQueryWrite,
     BaseSource, BranchBusy, MergeCreate, MergeDirection, MergeDraftPatch, MergeEvent, MergeState, MergeStatus, MergeStatusPatch,
     MergeWrite, NewMerge, NewStaticEndpoint, SchemaBase,
@@ -543,7 +543,7 @@ impl SealedFixture {
                     .unwrap();
             }
             // The storage and functions logins' passwords always have their salt beside them.
-            ("branches", "storage_password_enc" | "functions_password_enc") => {
+            ("branches", "storage_password_enc" | "functions_password_enc" | "authenticator_elevated_password_enc") => {
                 let salt = column.replace("_enc", "_salt");
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE branches SET {column} = 'v1:x', {salt} = '\\x00000000000000000000000000000000' WHERE id = $1"
@@ -629,6 +629,17 @@ impl SealedFixture {
                 sqlx::query(
                     "INSERT INTO functions (id, database_id, name, kind, signing_secret)
                      VALUES (gen_random_uuid(), $1, 'key-check', 'service', 'v1:x')",
+                )
+                .bind(database.as_uuid())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("storage_webhooks", "secret_enc") => {
+                sqlx::query(
+                    "INSERT INTO storage_webhooks (id, database_id, url, events, secret_enc)
+                     VALUES (gen_random_uuid(), $1, 'https://example.test/hook',
+                             ARRAY['object.created'], 'v1:x')",
                 )
                 .bind(database.as_uuid())
                 .execute(pool)
@@ -807,12 +818,10 @@ async fn key_check_waits_for_an_inflight_sealed_write() {
 const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[
     ("branches", "storage_password_salt", "the storage login's SCRAM salt, not secret"),
     ("branches", "functions_password_salt", "the dispatch login's SCRAM salt, not secret"),
+    ("branches", "authenticator_elevated_password_salt", "the elevated login's SCRAM salt, not secret"),
     ("control_settings", "key", "a setting's name"),
     ("invites", "token_hash", "a SHA-256 of the invite token, never opened"),
     ("neon_endpoints", "compute_token_sha256", "a SHA-256 of the compute token, never opened"),
-    // TODO(#178): sealed with the secrets key (`Purpose::Webhook`) but not yet in
-    // SECRETS_KEY_SEALED; #178 adds it (and its fixture) and removes this entry.
-    ("storage_webhooks", "secret_enc", "TODO(#178)"),
 ];
 
 // #38: a new sealed column must join the key check (or be excluded here, with a reason). Edge
@@ -3103,10 +3112,34 @@ async fn branch_connection_returns_settings() {
     // m13b: the functions dispatcher's login, the same way.
     client.set_functions_password(main_of(id), "v1:functions", &[5; 16]).await.unwrap();
     client.set_functions_password(main_of(id), "v1:later", &[6; 16]).await.unwrap();
+    // The elevated data API login's password and salt: stored together, once, and never one
+    // without the other.
+    let elevated_alone = sqlx::query("UPDATE branches SET authenticator_elevated_password_enc = 'v1:alone' WHERE id = $1")
+        .bind(main_of(id).as_uuid())
+        .execute(client.pool())
+        .await;
+    let elevated_salt_alone = sqlx::query("UPDATE branches SET authenticator_elevated_password_salt = '\\x00000000000000000000000000000000' WHERE id = $1")
+        .bind(main_of(id).as_uuid())
+        .execute(client.pool())
+        .await;
+    let had_authenticator: bool = sqlx::query_scalar(
+        "SELECT status = 'ready' AND kind = 'normal' AND authenticator_password_enc IS NOT NULL FROM branches WHERE id = $1",
+    )
+    .bind(main_of(id).as_uuid())
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    let missing_login_before = client.branches_missing_elevated_login().await.unwrap();
+    client.set_authenticator_elevated_password(main_of(id), "v1:elevated", &[3; 16]).await.unwrap();
+    client.set_authenticator_elevated_password(main_of(id), "v1:later", &[4; 16]).await.unwrap();
+    let missing_login_after = client.branches_missing_elevated_login().await.unwrap();
     let with_storage = client.branch_connection(main_of(id)).await.unwrap().expect("row");
     let missing = client.branch_connection(BranchId::new()).await.unwrap();
     let record = main_branch(&client, id).await;
     cleanup(&client, id).await;
+    // A ready branch with an authenticator password is listed until its elevated login is stored.
+    assert_eq!(missing_login_before.contains(&main_of(id)), had_authenticator);
+    assert!(!missing_login_after.contains(&main_of(id)));
     assert_eq!(pending.expect("pending branches have a row").status, BranchStatus::Pending);
     assert_eq!(ready.branch_id, main_of(id));
     assert_eq!(ready.status, BranchStatus::Ready);
@@ -3123,6 +3156,16 @@ async fn branch_connection_returns_settings() {
     assert_eq!((ready.functions_password_enc.as_deref(), ready.functions_password_salt.as_deref()), (None, None));
     assert_eq!(with_storage.functions_password_enc.as_deref(), Some("v1:functions"));
     assert_eq!(with_storage.functions_password_salt.as_deref(), Some(&[5u8; 16][..]));
+    assert_eq!(
+        (ready.authenticator_elevated_password_enc.as_deref(), ready.authenticator_elevated_password_salt.as_deref()),
+        (None, None)
+    );
+    for alone in [elevated_alone, elevated_salt_alone] {
+        let err = alone.expect_err("the elevated password and its salt are stored together");
+        assert!(format!("{err}").contains("branches_authenticator_elevated_password_with_salt"), "{err}");
+    }
+    assert_eq!(with_storage.authenticator_elevated_password_enc.as_deref(), Some("v1:elevated"));
+    assert_eq!(with_storage.authenticator_elevated_password_salt.as_deref(), Some(&[3u8; 16][..]));
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
     assert!(missing.is_none());
@@ -6045,8 +6088,8 @@ async fn purge_app_sessions_clears_grace_tokens_past_the_window() {
     let (past, within) = (new_session(project, user, 1), new_session(project, user, 3));
     client.insert_app_session(&past).await.unwrap();
     client.insert_app_session(&within).await.unwrap();
-    client.refresh_app_session(past.id, project, hash(1), &next(2, 60)).await.unwrap();
-    client.refresh_app_session(within.id, project, hash(3), &next(4, 60)).await.unwrap();
+    client.refresh_app_session(past.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(within.id, project, hash(3), Issued, &next(4, 60)).await.unwrap();
     sqlx::query("UPDATE app_sessions SET grace_until = now() - interval '1 second' WHERE id = $1")
         .bind(past.id)
         .execute(client.pool())
@@ -6065,7 +6108,7 @@ async fn purge_app_sessions_clears_grace_tokens_past_the_window() {
     };
     let (past_sealed, within_sealed) = (sealed(past.id).await, sealed(within.id).await);
     // The previous token past the window is reuse, not grace.
-    let reused = client.refresh_app_session(past.id, project, hash(1), &next(5, 60)).await.unwrap();
+    let reused = client.refresh_app_session(past.id, project, hash(1), Issued, &next(5, 60)).await.unwrap();
     cleanup_project(&client, project, &[]).await;
     assert_eq!(past_sealed, None);
     assert_eq!(within_sealed.as_deref(), Some("sealed-4"));
@@ -6081,12 +6124,19 @@ async fn refresh_rotates_grace_and_reuse() {
     let session = new_session(project, uuid::Uuid::new_v4(), 1);
     client.insert_app_session(&session).await.unwrap();
 
-    let rotated = client.refresh_app_session(session.id, project, hash(1), &next(2, 2)).await.unwrap();
-    let within = client.refresh_app_session(session.id, project, hash(1), &next(3, 2)).await.unwrap();
+    let rotated = client.refresh_app_session(session.id, project, hash(1), Issued, &next(2, 2)).await.unwrap();
+    let within = client.refresh_app_session(session.id, project, hash(1), Issued, &next(3, 2)).await.unwrap();
     let after_grace_check = client.app_session(session.id).await.unwrap().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
-    let reused = client.refresh_app_session(session.id, project, hash(1), &next(4, 2)).await.unwrap();
-    let current = client.refresh_app_session(session.id, project, hash(2), &next(5, 2)).await.unwrap();
+    let reused = client.refresh_app_session(session.id, project, hash(1), Issued, &next(4, 2)).await.unwrap();
+    let current = client.refresh_app_session(session.id, project, hash(2), Issued, &next(5, 2)).await.unwrap();
+    let stale = client.refresh_app_session(session.id, project, hash(77), Issued, &next(6, 2)).await.unwrap();
+    let revoked_row = session_row(&client, session.id).await;
+    let stale_peek = client
+        .peek_app_session(session.id, project, hash(77), Issued, std::time::Duration::from_secs(30 * 86400))
+        .await
+        .unwrap();
+    let after_row = session_row(&client, session.id).await;
     cleanup_project(&client, project, &[]).await;
 
     let RefreshOutcome::Rotated(r) = rotated else { panic!("{rotated:?}") };
@@ -6099,6 +6149,9 @@ async fn refresh_rotates_grace_and_reuse() {
     let RefreshOutcome::Reused(u) = reused else { panic!("{reused:?}") };
     assert!(u.revoked_at.is_some());
     assert_eq!(current, RefreshOutcome::Invalid, "a revoked session refuses even its current token");
+    assert_eq!(stale, RefreshOutcome::Invalid, "a revoked session refuses an issued stale token");
+    assert_eq!(stale_peek, PeekOutcome::Invalid);
+    assert_eq!(revoked_row, after_row, "nothing written for a revoked session");
 }
 
 #[tokio::test]
@@ -6108,22 +6161,27 @@ async fn refresh_expires_on_cap() {
     let project = new_project(&client, "cap").await;
     let capped = new_session(project, uuid::Uuid::new_v4(), 1);
     let expired = new_session(project, uuid::Uuid::new_v4(), 2);
+    let expired_stale = new_session(project, uuid::Uuid::new_v4(), 3);
     client.insert_app_session(&capped).await.unwrap();
     client.insert_app_session(&expired).await.unwrap();
+    client.insert_app_session(&expired_stale).await.unwrap();
     backdate_session(&client, capped.id, 2 * 86400).await;
-    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
-        .bind(expired.id)
+    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '1 second' WHERE id = ANY($1)")
+        .bind(vec![expired.id, expired_stale.id])
         .execute(client.pool())
         .await
         .unwrap();
     let mut one_day = next(9, 2);
     one_day.cap = std::time::Duration::from_secs(86400);
 
-    let a = client.refresh_app_session(capped.id, project, hash(1), &one_day).await.unwrap();
-    let b = client.refresh_app_session(expired.id, project, hash(2), &one_day).await.unwrap();
+    let a = client.refresh_app_session(capped.id, project, hash(1), Issued, &one_day).await.unwrap();
+    let b = client.refresh_app_session(expired.id, project, hash(2), Issued, &one_day).await.unwrap();
+    // An issued stale token on an expired session is `Invalid` like the current one, not reuse (A2).
+    let c = client.refresh_app_session(expired_stale.id, project, hash(77), Issued, &one_day).await.unwrap();
     let a_row = client.app_session(capped.id).await.unwrap().unwrap();
     let b_row = client.app_session(expired.id).await.unwrap().unwrap();
     cleanup_project(&client, project, &[]).await;
+    assert_eq!(c, RefreshOutcome::Invalid, "an issued stale token on an expired session");
     assert_eq!((a, b), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
     assert!(a_row.revoked_at.is_some() && b_row.revoked_at.is_some());
 }
@@ -6135,14 +6193,14 @@ async fn unknown_secret_is_invalid_without_revoking() {
     let project = new_project(&client, "unknown").await;
     let session = new_session(project, uuid::Uuid::new_v4(), 1);
     client.insert_app_session(&session).await.unwrap();
-    let wrong = client.refresh_app_session(session.id, project, hash(77), &next(2, 2)).await.unwrap();
+    let wrong = client.refresh_app_session(session.id, project, hash(77), Unproven, &next(2, 2)).await.unwrap();
     let missing = client
-        .refresh_app_session(uuid::Uuid::new_v4(), project, hash(1), &next(2, 2))
+        .refresh_app_session(uuid::Uuid::new_v4(), project, hash(1), Issued, &next(2, 2))
         .await
         .unwrap();
     let row = client.app_session(session.id).await.unwrap().unwrap();
     // Nothing changed: the real token still rotates.
-    let rotated = client.refresh_app_session(session.id, project, hash(1), &next(2, 2)).await.unwrap();
+    let rotated = client.refresh_app_session(session.id, project, hash(1), Issued, &next(2, 2)).await.unwrap();
     cleanup_project(&client, project, &[]).await;
     assert_eq!((wrong, missing), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
     assert_eq!(row.revoked_at, None);
@@ -6181,9 +6239,9 @@ async fn peek_answers_like_refresh_and_writes_nothing() {
     for x in [&s, &late, &revoked, &expired, &capped] {
         client.insert_app_session(x).await.unwrap();
     }
-    client.refresh_app_session(s.id, project, hash(1), &next(2, 60)).await.unwrap();
-    client.refresh_app_session(s.id, project, hash(2), &next(3, 60)).await.unwrap();
-    client.refresh_app_session(late.id, project, hash(4), &next(5, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    client.refresh_app_session(late.id, project, hash(4), Issued, &next(5, 60)).await.unwrap();
     sqlx::query("UPDATE app_sessions SET grace_until = now() - interval '1 second' WHERE id = $1")
         .bind(late.id)
         .execute(client.pool())
@@ -6202,42 +6260,114 @@ async fn peek_answers_like_refresh_and_writes_nothing() {
         before.push(session_row(&client, id).await);
     }
 
-    let peek = |id, project, n| client.peek_app_session(id, project, hash(n), cap);
-    let current = peek(s.id, project, 3).await.unwrap();
-    let grace = peek(s.id, project, 2).await.unwrap();
-    let old = peek(s.id, project, 1).await.unwrap();
-    let unknown_hash = peek(s.id, project, 99).await.unwrap();
-    let unknown_id = peek(uuid::Uuid::new_v4(), project, 3).await.unwrap();
-    let elsewhere = peek(s.id, other, 3).await.unwrap();
-    let reused = peek(late.id, project, 4).await.unwrap();
-    let late_current = peek(late.id, project, 5).await.unwrap();
-    let dead = peek(revoked.id, project, 6).await.unwrap();
-    let past = peek(expired.id, project, 7).await.unwrap();
-    let over_cap = peek(capped.id, project, 8).await.unwrap();
+    let peek = |id, project, n, proof| client.peek_app_session(id, project, hash(n), proof, cap);
+    let current = peek(s.id, project, 3, Issued).await.unwrap();
+    let grace = peek(s.id, project, 2, Issued).await.unwrap();
+    let grace_unproven = peek(s.id, project, 2, Unproven).await.unwrap();
+    let old = peek(s.id, project, 1, Unproven).await.unwrap();
+    let old_issued = peek(s.id, project, 1, Issued).await.unwrap();
+    let unknown_hash = peek(s.id, project, 99, Unproven).await.unwrap();
+    let unknown_id = peek(uuid::Uuid::new_v4(), project, 3, Issued).await.unwrap();
+    let elsewhere = peek(s.id, other, 3, Issued).await.unwrap();
+    let elsewhere_stale = peek(s.id, other, 1, Issued).await.unwrap();
+    let reused = peek(late.id, project, 4, Issued).await.unwrap();
+    let reused_unproven = peek(late.id, project, 4, Unproven).await.unwrap();
+    let late_current = peek(late.id, project, 5, Issued).await.unwrap();
+    let dead = peek(revoked.id, project, 6, Issued).await.unwrap();
+    let dead_stale = peek(revoked.id, project, 66, Issued).await.unwrap();
+    let past = peek(expired.id, project, 7, Issued).await.unwrap();
+    let past_stale = peek(expired.id, project, 77, Issued).await.unwrap();
+    let over_cap = peek(capped.id, project, 8, Issued).await.unwrap();
+    let over_cap_stale = peek(capped.id, project, 88, Issued).await.unwrap();
     let mut after = Vec::new();
     for id in ids {
         after.push(session_row(&client, id).await);
     }
     // The current token still rotates afterwards; the reused one still revokes.
-    let rotated = client.refresh_app_session(s.id, project, hash(3), &next(10, 60)).await.unwrap();
-    let revokes = client.refresh_app_session(late.id, project, hash(4), &next(11, 60)).await.unwrap();
+    let rotated = client.refresh_app_session(s.id, project, hash(3), Issued, &next(10, 60)).await.unwrap();
+    let revokes = client.refresh_app_session(late.id, project, hash(4), Issued, &next(11, 60)).await.unwrap();
     cleanup_project(&client, project, &[]).await;
     cleanup_project(&client, other, &[]).await;
 
     let PeekOutcome::Live { session: c, grace: false } = current else { panic!("{current:?}") };
     assert_eq!((c.id, c.user_id, c.project_id), (s.id, user, project));
     // #59 audit B1: the previous token within its grace says so.
+    assert_eq!(grace_unproven, grace, "the grace answer doesn't depend on the proof");
     let PeekOutcome::Live { session: g, grace: true } = grace else { panic!("{grace:?}") };
     assert_eq!((g.id, g.user_id), (s.id, user));
     assert!(matches!(late_current, PeekOutcome::Live { grace: false, .. }), "{late_current:?}");
     assert_eq!(
-        [old, unknown_hash, unknown_id, elsewhere, dead, past, over_cap],
-        [const { PeekOutcome::Invalid }; 7]
+        [old, unknown_hash, unknown_id, elsewhere, elsewhere_stale, dead, dead_stale, past, past_stale, over_cap, over_cap_stale],
+        [const { PeekOutcome::Invalid }; 11]
     );
-    assert_eq!(reused, PeekOutcome::Reused);
+    assert_eq!([reused, reused_unproven, old_issued], [const { PeekOutcome::Reused }; 3]);
     assert_eq!(before, after, "peek wrote nothing");
     assert!(matches!(rotated, RefreshOutcome::Rotated(_)), "{rotated:?}");
     assert!(matches!(revokes, RefreshOutcome::Reused(_)), "{revokes:?}");
+}
+
+// Any earlier token the orchestrator issued for the session, not only the previous one, ends
+// the session; afterwards its current token is refused too.
+#[tokio::test]
+#[ignore]
+async fn refresh_revokes_on_an_issued_stale_token() {
+    let client = client().await;
+    let project = new_project(&client, "stale-issued").await;
+    let s = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&s).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    let reused = client.refresh_app_session(s.id, project, hash(1), Issued, &next(4, 60)).await.unwrap();
+    let row = client.app_session(s.id).await.unwrap().unwrap();
+    let current = client.refresh_app_session(s.id, project, hash(3), Issued, &next(5, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    let RefreshOutcome::Reused(u) = reused else { panic!("{reused:?}") };
+    assert_eq!(u.id, s.id);
+    assert!(u.revoked_at.is_some() && row.revoked_at.is_some());
+    assert_eq!(current, RefreshOutcome::Invalid);
+}
+
+// Peek answers `Reused` for the same token and leaves the session as it was.
+#[tokio::test]
+#[ignore]
+async fn peek_answers_reused_for_an_issued_stale_token_and_writes_nothing() {
+    let client = client().await;
+    let project = new_project(&client, "stale-peek").await;
+    let cap = std::time::Duration::from_secs(30 * 86400);
+    let s = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&s).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    let before = session_row(&client, s.id).await;
+    let peeked = client.peek_app_session(s.id, project, hash(1), Issued, cap).await.unwrap();
+    let after = session_row(&client, s.id).await;
+    let current = client.peek_app_session(s.id, project, hash(3), Issued, cap).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(peeked, PeekOutcome::Reused);
+    assert_eq!(before, after, "peek wrote nothing");
+    assert!(matches!(current, PeekOutcome::Live { grace: false, .. }), "{current:?}");
+}
+
+// A token without the orchestrator's tag (a session from before them) never revokes on a
+// mismatch: stale or unknown, it is `Invalid` and the current token still rotates.
+#[tokio::test]
+#[ignore]
+async fn refresh_keeps_the_session_for_an_unproven_stale_token() {
+    let client = client().await;
+    let project = new_project(&client, "stale-unproven").await;
+    let s = new_session(project, uuid::Uuid::new_v4(), 1);
+    client.insert_app_session(&s).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(1), Unproven, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(2), Unproven, &next(3, 60)).await.unwrap();
+    let before = session_row(&client, s.id).await;
+    let old = client.refresh_app_session(s.id, project, hash(1), Unproven, &next(4, 60)).await.unwrap();
+    let unknown = client.refresh_app_session(s.id, project, hash(99), Unproven, &next(5, 60)).await.unwrap();
+    let after = session_row(&client, s.id).await;
+    let rotated = client.refresh_app_session(s.id, project, hash(3), Unproven, &next(6, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!((old, unknown), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
+    assert_eq!(before, after, "nothing written");
+    assert!(matches!(rotated, RefreshOutcome::Rotated(_)), "{rotated:?}");
 }
 
 #[tokio::test]
@@ -6249,7 +6379,7 @@ async fn revoke_by_hash_needs_a_matching_token() {
     client.insert_app_session(&a).await.unwrap();
     client.insert_app_session(&b).await.unwrap();
     // `b` rotated once: both its tokens match.
-    client.refresh_app_session(b.id, project, hash(2), &next(3, 2)).await.unwrap();
+    client.refresh_app_session(b.id, project, hash(2), Issued, &next(3, 2)).await.unwrap();
 
     let wrong = client.revoke_app_session_by_hash(a.id, project, hash(9)).await.unwrap();
     let live = client.app_session(a.id).await.unwrap().unwrap().revoked_at;
@@ -6272,16 +6402,22 @@ async fn session_functions_refuse_another_project() {
     let session = new_session(mine, uuid::Uuid::new_v4(), 1);
     client.insert_app_session(&session).await.unwrap();
 
-    let refreshed = client.refresh_app_session(session.id, other, hash(1), &next(2, 2)).await.unwrap();
+    // An issued stale token from another project is refused and revokes nothing (A2).
+    let before_stale = session_row(&client, session.id).await;
+    let stale = client.refresh_app_session(session.id, other, hash(77), Issued, &next(3, 2)).await.unwrap();
+    let after_stale = session_row(&client, session.id).await;
+    let refreshed = client.refresh_app_session(session.id, other, hash(1), Issued, &next(2, 2)).await.unwrap();
     let revoked = client.revoke_app_session(session.id, other).await.unwrap();
     let by_hash = client.revoke_app_session_by_hash(session.id, other, hash(1)).await.unwrap();
     let user_wide = client.revoke_user_sessions(other, session.user_id, None, None).await.unwrap();
     let project_wide = client.revoke_project_sessions(other).await.unwrap();
     let row = client.app_session(session.id).await.unwrap().unwrap();
     // The current token is unchanged: it still rotates in the right project.
-    let rotated = client.refresh_app_session(session.id, mine, hash(1), &next(2, 2)).await.unwrap();
+    let rotated = client.refresh_app_session(session.id, mine, hash(1), Issued, &next(2, 2)).await.unwrap();
     cleanup_project(&client, mine, &[]).await;
     cleanup_project(&client, other, &[]).await;
+    assert_eq!(stale, RefreshOutcome::Invalid, "an issued stale token from another project");
+    assert_eq!(before_stale, after_stale, "nothing written for another project's stale token");
     assert_eq!(refreshed, RefreshOutcome::Invalid);
     assert!(revoked.is_none() && by_hash.is_none() && user_wide.is_empty() && project_wide.is_empty());
     assert_eq!(row.revoked_at, None);

@@ -11,6 +11,8 @@ export interface FunctionSecretsProps {
   /** The function's name. */
   name: string;
   canChange: boolean;
+  /** Why the viewer can't change them, when it isn't just their project level (shown instead of the Viewer note). */
+  readOnlyReason?: string | null;
 }
 
 const field = "h-8 border border-input bg-ink px-2 text-sm disabled:opacity-50";
@@ -20,7 +22,7 @@ const field = "h-8 border border-input bg-ink px-2 text-sm disabled:opacity-50";
  * write-only: the value field is uncontrolled (React state never holds it), it is read once on
  * submit, sent with the plain function (never the mutation cache) and cleared after.
  */
-export function FunctionSecrets({ databaseId, branchId, name, canChange }: FunctionSecretsProps) {
+export function FunctionSecrets({ databaseId, branchId, name, canChange, readOnlyReason = null }: FunctionSecretsProps) {
   const queryClient = useQueryClient();
   const list = useListFunctionSecrets(databaseId, branchId, name);
   const [secretName, setSecretName] = useState("");
@@ -32,7 +34,7 @@ export function FunctionSecrets({ databaseId, branchId, name, canChange }: Funct
   const nameId = useId();
   const valueId = useId();
   const reasonId = useId();
-  const reason = canChange ? null : VIEWER_SECRETS_REASON;
+  const reason = canChange ? null : (readOnlyReason ?? VIEWER_SECRETS_REASON);
   const nameReason = secretName === "" ? null : secretNameReason(secretName);
   const ready = secretName !== "" && nameReason === null && hasValue && !busy;
   const refresh = () => queryClient.invalidateQueries({ queryKey: getListFunctionSecretsQueryKey(databaseId, branchId, name) });

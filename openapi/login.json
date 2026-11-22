@@ -134,21 +134,31 @@
         "tags": [
           "app-users"
         ],
-        "description": "Changes the signed-in user's email (needs the `Chelabase-User` token). With verification on, a code is emailed and the email is unverified until `verify-email`.",
+        "description": "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.",
         "operationId": "appChangeEmail",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AppEmailBody"
+                "$ref": "#/components/schemas/AppChangeEmailBody"
               }
             }
           },
           "required": true
         },
         "responses": {
+          "202": {
+            "description": "Verification is on: a code went to the new address; nothing changed yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppEmailChangePending"
+                }
+              }
+            }
+          },
           "204": {
-            "description": "Changed"
+            "description": "Verification is off: changed"
           },
           "400": {
             "description": "The body is malformed: `invalid_request`",
@@ -161,7 +171,7 @@
             }
           },
           "401": {
-            "description": "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)",
+            "description": "The current password is wrong (`invalid_credentials`), no user token (`user_token_invalid`), or no valid public key (`unauthorized`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -201,7 +211,111 @@
             }
           },
           "422": {
-            "description": "Invalid input: `invalid_request`",
+            "description": "Invalid input, or the body has the wrong fields: `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts or codes: `rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The identity service, its email or the orchestrator is unavailable: `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/v1/app/change-email/confirm": {
+      "post": {
+        "tags": [
+          "app-users"
+        ],
+        "description": "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.",
+        "operationId": "appConfirmEmailChange",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppChangeEmailConfirmBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "400": {
+            "description": "The body is malformed: `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another user took the address meanwhile (`email_taken`), or app users are off (`app_users_disabled`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is too large: `too_large`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not JSON: `invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The code is wrong, expired or for another address (`invalid_code`), or the body has the wrong fields (`invalid_request`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2241,6 +2355,38 @@
           }
         }
       },
+      "AppChangeEmailBody": {
+        "type": "object",
+        "required": [
+          "email",
+          "current_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "The new address."
+          }
+        }
+      },
+      "AppChangeEmailConfirmBody": {
+        "type": "object",
+        "required": [
+          "email",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "The new address the code was mailed to."
+          }
+        }
+      },
       "AppChangePasswordBody": {
         "type": "object",
         "required": [
@@ -2264,6 +2410,19 @@
         "properties": {
           "email": {
             "type": "string"
+          }
+        }
+      },
+      "AppEmailChangePending": {
+        "type": "object",
+        "description": "An email change that waits for the code mailed to the new address: nothing changed yet.",
+        "required": [
+          "confirmation_required"
+        ],
+        "properties": {
+          "confirmation_required": {
+            "type": "boolean",
+            "description": "Always `true`: finish with `change-email/confirm`."
           }
         }
       },

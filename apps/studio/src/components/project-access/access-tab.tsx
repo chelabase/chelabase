@@ -285,6 +285,7 @@ function AdminAccess({ project }: { project: Project }) {
         suggestions={suggestions}
         members={list}
         grants={grants.data ?? []}
+        tenantAdmin={me.data?.member?.tenant_admin === true}
         finalFocus={addButton}
         onDone={(message) => {
           setAdding(false);

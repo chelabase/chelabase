@@ -7,20 +7,21 @@ description: Build where conditions with objects, operators, and, or and not.
 
 - a bare value means `eq`: `{ status: "paid" }`;
 - `null` means `is null`: `{ raw: null }`;
-- an operator object uses the operators: `{ total: { gte: "10", lt: "20" } }`. The operators are `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `in`, `is`, `like` and `ilike`; several in one object are combined with `and`, and `in: []` matches nothing;
+- an `op` helper uses an operator: `{ total: op.gte("10") }`. The operators are `op.eq`, `op.neq`, `op.lt`, `op.lte`, `op.gt`, `op.gte`, `op.in`, `op.is`, `op.like` and `op.ilike`; several on one column are combined with `op.all(op.gte("10"), op.lt("20"))`, and `op.in([])` matches nothing;
+- any other object, whatever its keys, is a value to compare with (`eq`);
 - `and` and `or` take lists of filters, and `not` takes one filter.
 
 Calling `where` again adds its conditions with `and`.
 
 ```ts twoslash
-import { createClient } from "@chelabase/client";
+import { createClient, op } from "@chelabase/client";
 import { type Database, types } from "./db";
 const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 const tree = db
   .from("orders")
-  .where({ status: "paid", total: { gte: "10", lt: "20" } })
-  .where({ not: { tags: null }, or: [{ vip: true }, { qty: { in: [1, 2] } }] })
+  .where({ status: "paid", total: op.all(op.gte("10"), op.lt("20")) })
+  .where({ not: { tags: null }, or: [{ vip: true }, { qty: op.in([1, 2]) }] })
   .toTree();
 ```
 
@@ -40,14 +41,34 @@ const tree = db.from("orders").where({ and: [{ col: "and", eq: "x" }, { status: 
 
 Inside a list (or under `not`), an object whose only keys are `col` (a string) and operators is read as a condition object; any other object is a filter.
 
-## json and jsonb values that look like operators
+## json and jsonb values
 
-A json or jsonb value that looks like operators (`{ meta: { eq: 1 } }`) is read as operators, not as the object to compare with. Compare such a value with a condition object:
+An object in `where()` is always a value to compare with, so a json or jsonb value whose keys are operator names is compared as that value:
 
 ```ts twoslash
 import { createClient } from "@chelabase/client";
 import { type Database, types } from "./db";
 const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
-const tree = db.from("orders").where({ and: [{ col: "meta", eq: { eq: 1 } }] }).toTree();
+const tree = db.from("orders").where({ meta: { eq: 1 } }).toTree();
 ```
+
+## Migrating from bare operator objects
+
+Earlier versions read an object whose keys were all operator names as operators. That form is now a value to compare with; write operators with `op`.
+
+Before:
+
+```ts
+db.from("orders").where({ total: { gte: "10", lt: "20" }, region: { in: ["eu"] } });
+```
+
+After:
+
+```ts
+import { op } from "@chelabase/client";
+
+db.from("orders").where({ total: op.all(op.gte("10"), op.lt("20")), region: op.in(["eu"]) });
+```
+
+The condition-object form inside `and`, `or` and `not` lists (`{ col: "total", gte: "10" }`) is unchanged.

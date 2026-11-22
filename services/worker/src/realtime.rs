@@ -16,6 +16,7 @@
 
 use chelabase_neon::ComputeBackend;
 use chelabase_neon::backend::SqlOpts;
+use chelabase_schema::sql::literal;
 use tracing::warn;
 
 use crate::Worker;
@@ -33,11 +34,6 @@ pub const REALTIME_VERIFIER_MARK: &str = "-- chelabase: realtime verifier";
 /// Where the role script runs: roles are cluster-wide, and the system database always exists
 /// (the main one may be dropped).
 const ROLE_DATABASE: &str = "postgres";
-
-/// `'…'` with embedded quotes doubled.
-fn literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
 
 /// `"…"` with embedded double quotes doubled.
 fn ident(s: &str) -> String {

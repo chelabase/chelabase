@@ -66,7 +66,7 @@ impl Db {
     async fn sql(&self, database: &str, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(&self.ep, database, sql)
+            .admin_sql(&self.ep, database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
     }
@@ -264,7 +264,7 @@ impl Db {
     }
 
     async fn sql_result(&self, sql: &str) -> Result<String, String> {
-        self.worker.computes.admin_sql(&self.ep, "postgres", sql).await.map_err(|e| format!("{e:#}"))
+        self.worker.computes.admin_sql(&self.ep, "postgres", &crate::common::tenant_sql(sql)).await.map_err(|e| format!("{e:#}"))
     }
 
     async fn ctl_status(&self) -> ComputeCtlStatus {
@@ -646,7 +646,7 @@ async fn create_child(db: &Db, name: &str) -> (BranchId, String) {
 async fn as_owner(db: &Db, ep: &str, sql: &str) -> Result<String, String> {
     db.worker
         .computes
-        .admin_sql(ep, "postgres", &format!("SET ROLE postgres;\n{sql}"))
+        .admin_sql(ep, "postgres", &crate::common::tenant_sql(&format!("SET ROLE postgres;\n{sql}")))
         .await
         .map_err(|e| format!("{e:#}"))
 }

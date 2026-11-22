@@ -18,6 +18,8 @@ A blank value counts as unset. Durations marked *(duration)* take a number with 
 | `CHELABASE_STORAGE_INTERNAL_TOKEN`, `CHELABASE_STORAGE_INTERNAL_TOKEN_FILE` | storage, orchestrator | the generated `tokens/storage-internal.token` | The bearer between them, both ways. Use the `_FILE` form. A public development value is refused unless `CHELABASE_DEV_DEFAULTS=1` |
 | `CHELABASE_STORAGE_MAX_CONNECTIONS` | storage | `200` | Connections storage opens to computes, across every branch. Each database also has its own budget, `storage_max_connections`, in Studio's database settings |
 | `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES` | storage | `1073741824` (1 GiB) | Upload buffers one storage process holds at once; past it, uploads get 503 `busy` |
+| `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES_PER_BRANCH` | storage | a quarter of `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES` (at least 1) | The most of those buffers one branch holds at once; past it that branch's next upload gets 503 `busy` while other branches still upload |
+| `CHELABASE_STORAGE_PART_DEADLINE_SECS` | storage | `900` (at least 1) | A resumable upload's part must finish within this many seconds in all, however steadily it arrives; otherwise 408 `request_timeout` and its memory is freed. 900 s fits 100 MiB at about 115 KiB/s |
 | `CHELABASE_STORAGE_BODY_IDLE_SECS` | storage | `60` (at least 1) | An upload whose body sends nothing for this many seconds fails with 408 `request_timeout` |
 
 ## The object store

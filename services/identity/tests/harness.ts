@@ -102,6 +102,8 @@ export interface SmtpSink {
   port: number;
   /** Each delivered message: envelope recipients and the raw DATA. */
   messages: { to: string[]; data: string }[];
+  /** Recipients the sink refuses at RCPT (550), so a send to them fails. */
+  refuse: Set<string>;
   close(): Promise<void>;
 }
 
@@ -111,6 +113,7 @@ export interface SmtpSink {
  */
 export async function startSmtpSink(): Promise<SmtpSink> {
   const messages: SmtpSink["messages"] = [];
+  const refuse = new Set<string>();
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -141,7 +144,12 @@ export async function startSmtpSink(): Promise<SmtpSink> {
         const verb = line.slice(0, 4).toUpperCase();
         if (verb === "EHLO") reply("250-sink\r\n250 8BITMIME");
         else if (verb === "RCPT") {
-          to.push(/<([^>]*)>/.exec(line)?.[1] ?? "");
+          const rcpt = /<([^>]*)>/.exec(line)?.[1] ?? "";
+          if (refuse.has(rcpt.toLowerCase())) {
+            reply("550 mailbox unavailable");
+            continue;
+          }
+          to.push(rcpt);
           reply("250 ok");
         } else if (verb === "DATA") {
           inData = true;
@@ -158,6 +166,7 @@ export async function startSmtpSink(): Promise<SmtpSink> {
   return {
     port: (server.address() as AddressInfo).port,
     messages,
+    refuse,
     async close() {
       for (const s of sockets) s.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

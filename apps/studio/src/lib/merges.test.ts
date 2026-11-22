@@ -3,6 +3,9 @@ import { ApiError, type UserStepBody } from "@chelabase/management-client";
 import { columnSnap as col, mergeOf, planStep as step } from "@/test/merge-fixtures";
 import {
   MERGE_STATUS_LABEL,
+  adminReason,
+  hasSecuritySteps,
+  hasUserSqlSteps,
   applyBlockers,
   baseUnavailable,
   deleteUserStep,
@@ -487,5 +490,43 @@ describe("the after-merge choice, in words", () => {
     expect(isFinishPending(mergeOf({ ...base, result: { after: { choice: "keep", skipped: "x" } } }))).toBe(false);
     expect(isFinishPending(mergeOf({ ...base, result: { after: { choice: "keep", base: "recorded" } } }))).toBe(false);
     expect(isFinishPending(mergeOf({ status: "done", result: { after: { choice: "keep", requested: true } } }))).toBe(false);
+  });
+});
+
+describe("hasUserSqlSteps", () => {
+  const withPlan = (steps: unknown, userSteps: unknown[] = []) => mergeOf({ plan: { steps } as never, steps: userSteps as never });
+
+  it("detects_user_sql_and_treats_a_malformed_plan_as_having_it", () => {
+    expect(hasUserSqlSteps(withPlan([step("a"), step("b")]))).toBe(false);
+    expect(hasUserSqlSteps(mergeOf({ plan: null }))).toBe(false);
+    expect(hasUserSqlSteps(withPlan([step("a"), step("u", { kind: "user" })]))).toBe(true);
+    expect(hasUserSqlSteps(withPlan([step("o", { kind: "own_sql" })]))).toBe(true);
+    // User steps the merge records count even when the plan doesn't list them.
+    expect(hasUserSqlSteps(withPlan([step("a")], [{ sql: "select 1" }]))).toBe(true);
+    // Fail closed: a plan without a step list, or a step of unknown kind.
+    expect(hasUserSqlSteps(mergeOf({ plan: {} as never }))).toBe(true);
+    expect(hasUserSqlSteps(withPlan("nope"))).toBe(true);
+    expect(hasUserSqlSteps(withPlan([{ id: "x", kind: "future" }]))).toBe(true);
+    expect(hasUserSqlSteps(withPlan([{ id: "x" }]))).toBe(true);
+  });
+});
+
+describe("adminReason", () => {
+  const userSql = mergeOf({ plan: { steps: [step("u", { kind: "user" })] } as never });
+  const secure = mergeOf({ plan: { steps: [step("s", { security: true })] } as never });
+  const plain = mergeOf({ plan: { steps: [step("a")] } as never });
+
+  it("asks_for_admin_only_where_the_server_does", () => {
+    expect(hasSecuritySteps(secure)).toBe(true);
+    expect(hasSecuritySteps(plain)).toBe(false);
+    for (const action of ["rehearse", "apply", "retry"] as const) {
+      expect(adminReason(userSql, action, false)).toMatch(/Admin/);
+      expect(adminReason(userSql, action, true)).toBeNull();
+      expect(adminReason(plain, action, false)).toBeNull();
+    }
+    // A security step needs Admin to apply, not to rehearse or retry.
+    expect(adminReason(secure, "apply", false)).toMatch(/Admin/);
+    expect(adminReason(secure, "rehearse", false)).toBeNull();
+    expect(adminReason(secure, "retry", false)).toBeNull();
   });
 });

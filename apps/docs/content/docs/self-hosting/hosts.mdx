@@ -38,7 +38,7 @@ The gateway listens in plain HTTP. For HTTPS, terminate TLS in front of it, eith
 CHELABASE_PUBLIC_SCHEME=https
 ```
 
-`CHELABASE_PUBLIC_SCHEME` is `http` or `https` (case does not matter) and defaults to `https`; a blank value is `https` too. It decides the scheme of every URL Chelabase builds (Studio's origin, the API base, the issuer) and the `X-Forwarded-Proto` the gateway sends to the services. Session cookies are marked Secure exactly when it is `https`, in every mode; `CHELABASE_AUTH_SECURE_COOKIES` overrides that, and auth logs a warning at startup when it turns Secure off under `https`. Use `http` only for local work: platform mode refuses to start with it.
+`CHELABASE_PUBLIC_SCHEME` is `http` or `https` (case does not matter) and defaults to `https`; a blank value is `https` too. It decides the scheme of every URL Chelabase builds (Studio's origin, the API base, the issuer) and the `X-Forwarded-Proto` the gateway sends to the services. Session cookies are marked Secure exactly when it is `https`, in every mode; `CHELABASE_AUTH_SECURE_COOKIES` overrides that, and auth logs a warning at startup when it turns Secure off under `https`. Studio's content security policy lets it call the API over `http` and `ws` as well as `https` and `wss`, so a plain-http install works on any host name, not only `*.localhost`. Use `http` only for local work: platform mode refuses to start with it.
 
 ### Calls inside the network
 

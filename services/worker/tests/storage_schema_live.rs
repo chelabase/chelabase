@@ -26,7 +26,7 @@ use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use worker::config::RealWorker;
-use worker::data_api::schema_check_sql;
+use worker::data_api::{DATA_API_SCHEMA_STAMP, DATA_API_SCHEMA_VERSION, newer_data_api_schema, schema_check_sql};
 use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
@@ -102,6 +102,15 @@ impl Fx {
         cleanup(&self.worker, &self.metadata, self.id).await;
     }
 
+    /// The verifier the branch's elevated data API login must carry (the bootstrap stored it).
+    async fn elevated_verifier(&self) -> String {
+        self.worker
+            .elevated_verifier(self.main)
+            .await
+            .expect("read the elevated login")
+            .expect("a stored elevated login")
+    }
+
     /// The verifier the branch's `chelabase_storage` must carry (the bootstrap stored its login).
     async fn verifier(&self) -> String {
         self.worker
@@ -142,7 +151,7 @@ impl Fx {
     async fn admin_on(&self, ep: &str, sql: &str) -> Result<String, String> {
         self.worker
             .computes
-            .admin_sql(ep, &self.database, sql)
+            .admin_sql(ep, &self.database, &crate::common::tenant_sql(sql))
             .await
             .map_err(|e| format!("{e:#}"))
     }
@@ -323,7 +332,7 @@ async fn run(fx: &Fx) {
     assert_eq!(fx.value("SELECT count(*) FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid WHERE c.relnamespace = 'storage'::regnamespace").await, "0");
     assert_eq!(fx.value("SELECT rolbypassrls AND NOT rolsuper AND rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'").await, "t");
     assert_eq!(fx.value("SELECT storage.foldername('a/b/c.png')::text || ' ' || storage.filename('a/b/c.png') || ' ' || storage.extension('a/b/c.tar.gz') || ' ' || storage.foldername('c')::text").await, "{a,b} c.png gz {}");
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await), "t");
 
     // AC 2: a second run changes nothing.
     let before = fx.value(SHAPE_SQL).await;
@@ -848,12 +857,12 @@ async fn hardening(fx: &Fx) {
     )
     .await;
     assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
         "f",
         "the check notices the plant"
     );
     bootstrap(fx).await;
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await), "t");
     assert_eq!(fx.value("SELECT to_regprocedure('storage.audit_backdoor()') IS NULL AND to_regclass('storage.audit_v') IS NULL").await, "t");
     assert_eq!(
         fx.value(
@@ -1043,7 +1052,7 @@ async fn reaudit(fx: &Fx) {
     fx.owner("CREATE ROLE audit_grp NOLOGIN; GRANT audit_grp TO chelabase_storage;")
         .await
         .expect("the owner grants a role to it");
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "f");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await), "f");
     bootstrap(fx).await;
     assert_eq!(
         fx.value(
@@ -1052,7 +1061,7 @@ async fn reaudit(fx: &Fx) {
         .await,
         "0"
     );
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await), "t");
     assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '00000000-0000-0000-0000-0000000000f2'").await, "1", "a membership voids no ticket");
     fx.owner("DROP ROLE audit_grp").await.unwrap();
 
@@ -1072,13 +1081,13 @@ async fn reaudit(fx: &Fx) {
         ))
         .await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
             "f",
             "{plant}"
         );
         bootstrap(fx).await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
             "t",
             "{plant}"
         );
@@ -1190,7 +1199,7 @@ fn service_login_check() -> String {
 
 async fn storage_login(fx: &Fx) {
     let password = fx.storage_password().await;
-    let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+    let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await) };
     // Provisioned: it logs in straight to the compute with the stored password, as the bare
     // login the managed pool requires, with its pinned settings.
     assert_eq!(fx.locked_down().await, LOCKED_DOWN);
@@ -2440,6 +2449,11 @@ async fn in_process_storage(store: Arc<FailingStore>, branch: BranchId) -> (Stri
 
 /// [`in_process_storage`] with the upload memory cap `inflight`.
 async fn in_process_storage_with(store: Arc<FailingStore>, branch: BranchId, inflight: storage::limits::InFlight) -> (String, String) {
+    in_process_storage_for(store, branch, inflight, "authenticated").await
+}
+
+/// [`in_process_storage_with`], the identity token for a secret key on `role`.
+async fn in_process_storage_for(store: Arc<FailingStore>, branch: BranchId, inflight: storage::limits::InFlight, role: &str) -> (String, String) {
     use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, InternalVerifier, generate_keypair_pem};
     let url = std::env::var("CHELABASE_INTERNAL_URL").unwrap_or_else(|_| "http://orchestrator:8083".into());
     let token = std::fs::read_to_string(std::env::var("CHELABASE_STORAGE_INTERNAL_TOKEN_FILE").expect("the storage bearer"))
@@ -2469,7 +2483,7 @@ async fn in_process_storage_with(store: Arc<FailingStore>, branch: BranchId, inf
             branch_id: branch.as_uuid(),
             key_id: Uuid::new_v4(),
             kind: chelabase_types::data_key::DataKeyKind::Secret,
-            role: "authenticated".into(),
+            role: role.into(),
             claims: json!({}),
             databases: None,
             project_id: None,
@@ -2481,6 +2495,55 @@ async fn in_process_storage_with(store: Arc<FailingStore>, branch: BranchId, inf
     };
     let signer = InternalSigner::from_pem(private.as_bytes()).unwrap();
     (base, signer.sign(storage::app::AUDIENCE, &identity).unwrap())
+}
+
+/// A storage request as a secret key's role runs on the data API login that holds the role:
+/// an elevated role (one that can log in) on the elevated login, an ordinary one on
+/// `authenticator`. The bucket's policy shows it to each role only on its own login, so a
+/// request on the other login would list nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_runs_a_key_role_on_the_login_that_holds_it_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        fx.admin("CREATE ROLE st_login LOGIN; CREATE ROLE st_plain NOLOGIN; GRANT authenticated TO st_login, st_plain;").await;
+        fx.bucket("files").await;
+        fx.owner(
+            "SELECT storage.create_policy('b_own_login', 'buckets', 'SELECT', ARRAY['authenticated']::name[], \
+             '(current_user = ''st_login'' AND session_user = ''chelabase_authenticator_elevated'') \
+              OR (current_user = ''st_plain'' AND session_user = ''authenticator'')', NULL)",
+        )
+        .await
+        .unwrap();
+        for role in ["st_login", "st_plain"] {
+            let check = fx.worker.check_data_role(fx.main, role).await;
+            assert!(matches!(check, worker::data_api::RoleCheck::Ok(..)), "{role}: {check:?}");
+        }
+        let held = |login: &'static str| async move {
+            fx.value(&format!(
+                "SELECT coalesce(string_agg(r.rolname, ',' ORDER BY r.rolname), '') FROM pg_auth_members a \
+                 JOIN pg_roles r ON r.oid = a.roleid WHERE a.member = '{login}'::regrole AND r.rolname LIKE 'st\\_%'"
+            ))
+            .await
+        };
+        assert_eq!(held("chelabase_authenticator_elevated").await, "st_login");
+        assert_eq!(held("authenticator").await, "st_plain");
+        for role in ["st_login", "st_plain"] {
+            let (base, token) = in_process_storage_for(
+                Arc::new(FailingStore::default()),
+                fx.main,
+                storage::limits::InFlight::new(1 << 30),
+                role,
+            )
+            .await;
+            // Twice: the second request uses the cached answer and a pooled connection.
+            for _ in 0..2 {
+                let (status, list) = direct(&base, &token, "GET", "/storage/v1/bucket", vec![]).await;
+                assert_eq!((status, list.as_array().map(Vec::len)), (200, Some(1)), "{role}: {list}");
+            }
+        }
+    }))
+    .await;
 }
 
 async fn direct(base: &str, token: &str, method: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
@@ -2558,7 +2621,7 @@ async fn versions(fx: &Fx) {
     .await;
     let before = fx.value(SHAPE_SQL).await;
     assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
         "f",
         "the role's drift still shows"
     );
@@ -2571,7 +2634,7 @@ async fn versions(fx: &Fx) {
     assert_eq!(fx.value(stamp).await, "chelabase storage schema 99");
     assert_eq!(fx.locked_down().await, LOCKED_DOWN);
     assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
         "t",
         "a newer schema is healthy here"
     );
@@ -2581,7 +2644,7 @@ async fn versions(fx: &Fx) {
         fx.admin(&format!("COMMENT ON SCHEMA storage IS '{old}'"))
             .await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
             "f",
             "{old}"
         );
@@ -2598,7 +2661,7 @@ async fn versions(fx: &Fx) {
             "{old}: healed"
         );
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await),
             "t",
             "{old}"
         );
@@ -3287,7 +3350,7 @@ async fn storage_multipart_memory_cap_live() {
         let fx = &*fx;
         objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
         let store = Arc::new(FailingStore::default());
-        let (base, token) = in_process_storage_with(store, fx.main, storage::limits::InFlight::new(6 * MIB)).await;
+        let (base, token) = in_process_storage_with(store, fx.main, storage::limits::InFlight::new(6 * MIB).with_branch_limit(6 * MIB as u64)).await;
         let call = |method: &'static str, path: String, body: reqwest::Body| {
             let (base, token) = (base.clone(), token.clone());
             async move {
@@ -3376,7 +3439,7 @@ async fn storage_write_once_live() {
         let fx = &*fx;
         const TEXT: (&str, &str) = ("content-type", "text/plain");
         let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
-        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await) };
         assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
         assert_eq!(check().await, "t");
         // Every policy open for `authenticated`: only write-once stands in the way.
@@ -3736,8 +3799,8 @@ async fn storage_multipart_concurrent_complete_live() {
 }
 
 /// The audit's, AC 2 on counted bytes: a chunked single upload (no `Content-Length`) over the
-/// limit is 413, and parts sent in parallel that each fit but together don't make a 413
-/// completion; no row, no blob.
+/// limit is 413, and parts sent in parallel that each fit but together don't record only one
+/// (the other is 413: m14); no row, no blob.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
 async fn storage_multipart_counted_limits_live() {
@@ -3749,11 +3812,25 @@ async fn storage_multipart_counted_limits_live() {
         let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..8).map(|_| Ok(bytes::Bytes::from(vec![7u8; 256 << 10]))).collect();
         let (s, _, b) = object("POST", "/storage/v1/object/mib/chunked.bin", &secret, Some(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))), &[]).await;
         assert_eq!(s, 413, "{}", json_of(&b));
-        let (_, b) = open_upload(&secret, "eight", "par.bin", "application/octet-stream", &[]).await;
-        let id = b["id"].as_str().unwrap().to_string();
-        let (p1, p2) = tokio::join!(put_part(&secret, &id, 1, part_bytes(1), &[]), put_part(&secret, &id, 2, part_bytes(2), &[]));
-        let (s, b) = session_call(&secret, "POST", &id, "/complete", &[]).await;
-        assert_eq!((s, b["error"]["code"].clone()), (413, json!("too_large")), "parts {} {}: {b}", p1.0, p2.0);
+        // m14, through this process's storage service (the stack's may run an earlier build):
+        // the schema refuses the part that would take the recorded total over the limit, so
+        // exactly one of two parts that each fit but not together is recorded, the other 413.
+        let (base, token) = in_process_storage(Arc::new(FailingStore::default()), fx.main).await;
+        let (s, b) = raw(&base, &token, "POST", "/storage/v1/upload/eight/par.bin", vec![], &[("content-type", "application/octet-stream")]).await;
+        assert_eq!(s, 200, "{}", json_of(&b));
+        let id = json_of(&b)["id"].as_str().unwrap().to_string();
+        let (path1, path2) = (format!("/storage/v1/upload/session/{id}/1"), format!("/storage/v1/upload/session/{id}/2"));
+        let ((s1, b1), (s2, b2)) = tokio::join!(
+            raw(&base, &token, "PUT", &path1, part_bytes(1), &[]),
+            raw(&base, &token, "PUT", &path2, part_bytes(2), &[]),
+        );
+        let mut statuses = [s1, s2];
+        statuses.sort();
+        assert_eq!(statuses, [200, 413], "{} {}", json_of(&b1), json_of(&b2));
+        let refused = if s1 == 413 { b1 } else { b2 };
+        assert_eq!(json_of(&refused)["error"]["code"], "too_large");
+        assert_eq!(fx.value(&format!("SELECT count(*) FROM storage.upload_sessions, jsonb_object_keys(parts) WHERE id = '{id}'")).await, "1");
+        assert_eq!(raw(&base, &token, "DELETE", &format!("/storage/v1/upload/session/{id}"), vec![], &[]).await.0, 204);
         assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
         assert!(fx.blobs(&store).await.is_empty(), "{:?}", fx.blobs(&store).await);
     }))
@@ -4411,7 +4488,7 @@ async fn storage_ref_foreign_key_live() {
         let fx = &*fx;
         const TEXT: (&str, &str) = ("content-type", "text/plain");
         let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
-        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await) };
         let privileges = "SELECT has_column_privilege('postgres', 'storage.objects', 'id', 'REFERENCES')::text || ' '
             || has_column_privilege('postgres', 'storage.objects', 'name', 'REFERENCES')::text || ' '
             || has_column_privilege('postgres', 'storage.objects', 'bucket_id', 'REFERENCES')::text || ' '
@@ -4918,5 +4995,529 @@ async fn review(fx: &Fx) {
         "rv_other/trigger/storage.rv_tg(storage.t)",
     ] {
         assert!(keys.contains(&key.to_string()), "{key} hidden: {keys:?}");
+    }
+}
+
+// --- data-api-schema-stamp m1 (#198): the chelabase data API schema's stamp -----------------
+
+/// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
+/// ACL, whole definition: `prosrc` is empty for the `BEGIN ATOMIC` claim helpers), the event triggers (owner, state, function, comment) and the schema itself.
+const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
+  SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
+    FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(pg_catalog.pg_get_functiondef(p.oid))
+    FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
+    FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
+  UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '')
+    FROM pg_namespace n WHERE n.nspname = 'chelabase'
+) s";
+
+/// The stamp trigger's comment (`<none>` without one), whether a superuser owns it, and its
+/// function.
+const DDL_TRIGGER_SQL: &str = "SELECT coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>') || ' ' || r.rolsuper || ' ' || e.evtfoid::regprocedure
+  FROM pg_event_trigger e JOIN pg_roles r ON r.oid = e.evtowner WHERE e.evtname = 'chelabase_schema_version_ddl'";
+
+/// A newer worker's schema: stamp 99 and a function only it makes (the bootstrap
+/// superuser's, so no tamper).
+const MAKE_NEWER_SQL: &str = "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;";
+
+impl Fx {
+    async fn data_api_check(&self, schema: &str) -> String {
+        last_line(&self.admin(&schema_check_sql(schema, Some(&self.verifier().await), Some(&self.elevated_verifier().await))).await)
+    }
+
+    async fn quarantines(&self) -> u32 {
+        self.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase\\_quarantine\\_%'")
+            .await
+            .parse()
+            .unwrap()
+    }
+
+    async fn authenticator_password(&self) -> String {
+        let main = self.metadata.get_branch(self.main).await.unwrap().unwrap();
+        open_credential(
+            &self.worker.key,
+            &main.id.to_string(),
+            Purpose::Authenticator,
+            main.authenticator_password_enc.as_deref().expect("authenticator password"),
+        )
+        .unwrap()
+    }
+
+    /// This worker's install, freshly stamped: the trigger a superuser's on its own function.
+    async fn assert_current(&self, what: &str) {
+        assert_eq!(
+            self.value(DDL_TRIGGER_SQL).await,
+            format!("{DATA_API_SCHEMA_STAMP} true chelabase.bump_schema_version()"),
+            "{what}"
+        );
+        assert_eq!(
+            self.value("SELECT to_regprocedure('chelabase.from_v99()') IS NULL AND (SELECT prosrc LIKE '%CB002%' FROM pg_proc WHERE oid = to_regprocedure('chelabase.cap_response(text,bigint)'))").await,
+            "t",
+            "{what}: this worker's functions"
+        );
+        assert_eq!(self.data_api_check("public").await, "t", "{what}");
+    }
+
+    /// A bootstrap that quarantines and installs afresh.
+    async fn assert_quarantined_by_bootstrap(&self, what: &str) {
+        let before = self.quarantines().await;
+        bootstrap(self).await;
+        assert_eq!(self.quarantines().await, before + 1, "{what}: quarantined");
+        self.assert_current(what).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn data_api_schema_versions_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { data_api_versions(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn data_api_versions(fx: &Fx) {
+    // 1. AC 10: a fresh provision is stamped.
+    fx.assert_current("fresh").await;
+    assert_eq!(fx.quarantines().await, 0);
+
+    // 2. AC 1: a valid newer stamp, a function only it has and a body this worker would
+    // rewrite: nothing in chelabase changes, nothing is quarantined, the check is healthy.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE OR REPLACE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text LANGUAGE sql AS $$ SELECT result $$")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "t", "a newer schema is healthy here");
+    let before = fx.value(CHELABASE_SHAPE_SQL).await;
+    bootstrap(fx).await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "a newer chelabase schema was changed");
+    assert_eq!(fx.quarantines().await, 0);
+    assert_eq!(
+        fx.value(DDL_TRIGGER_SQL).await,
+        "chelabase data api schema 99 true chelabase.bump_schema_version()"
+    );
+    assert_eq!(fx.data_api_check("public").await, "t");
+    // The script itself, through psql: the gate skips the DDL and the warning names both
+    // versions.
+    let out = fx
+        .admin(&worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, &fx.elevated_verifier().await, "public"))
+        .await;
+    assert_eq!(
+        newer_data_api_schema(&out),
+        Some(format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}; it was left alone").as_str()),
+        "{out}"
+    );
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "the script changed a newer schema");
+
+    // 3. AC 2: a newer stamp and a default schema changed meanwhile: authenticator's login
+    // and the new schema's grants are still applied, chelabase still untouched.
+    fx.admin("CREATE SCHEMA reporting AUTHORIZATION postgres; ALTER ROLE authenticator NOLOGIN;")
+        .await;
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "reporting")
+        .await
+        .expect("set default schema");
+    assert_eq!(fx.data_api_check("reporting").await, "f", "the login and USAGE still count");
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value("SELECT bool_and(has_schema_privilege(r, 'reporting', 'USAGE')) FROM unnest(ARRAY['authenticator', 'anon', 'authenticated']) r")
+            .await,
+        "t"
+    );
+    assert_eq!(
+        fx.value("SELECT string_agg(defaclobjtype::text, ',' ORDER BY defaclobjtype) FROM pg_default_acl WHERE defaclnamespace = 'reporting'::regnamespace AND defaclrole = 'postgres'::regrole")
+            .await,
+        "S,f,r"
+    );
+    fx.direct("authenticator", &fx.authenticator_password().await, "SELECT 1")
+        .await
+        .expect("authenticator logs in with the branch's password");
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "chelabase changed");
+    assert_eq!(fx.data_api_check("reporting").await, "t");
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "public")
+        .await
+        .expect("reset default schema");
+
+    // 4. AC 9: the escape hatch for a permanent rollback.
+    fx.admin("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS NULL").await;
+    assert_eq!(fx.data_api_check("public").await, "f", "no stamp");
+    fx.assert_quarantined_by_bootstrap("escape hatch").await;
+
+    // 5. AC 3, 4: a trigger the owner made, with the owner's comment, is no stamp.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl; CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    let forge = "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';";
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    assert_eq!(fx.data_api_check("public").await, "f", "owner-forged");
+    fx.assert_quarantined_by_bootstrap("owner-forged, schema present").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin(worker::data_api::REMOVE_DATA_API_SQL).await;
+    assert_eq!(fx.value("SELECT to_regnamespace('chelabase') IS NULL").await, "t");
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    let before = fx.quarantines().await;
+    bootstrap(fx).await;
+    assert_eq!(fx.quarantines().await, before, "nothing to quarantine");
+    fx.assert_current("owner-forged, schema removed").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin("CREATE FUNCTION public.other_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+DROP EVENT TRIGGER chelabase_schema_version_ddl;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.other_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "f", "another function");
+    fx.assert_quarantined_by_bootstrap("a superuser's trigger on another function").await;
+    fx.admin("DROP FUNCTION public.other_evt()").await;
+
+    // 6. AC 6, 7, 8: a real tamper quarantines whatever the stamp says.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE FUNCTION chelabase.owners() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; ALTER FUNCTION chelabase.owners() OWNER TO postgres;")
+        .await;
+    fx.assert_quarantined_by_bootstrap("newer, a function the owner owns").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE ROLE dsv_member LOGIN; GRANT chelabase_admin TO dsv_member;").await;
+    fx.assert_quarantined_by_bootstrap("newer, a member").await;
+    assert_eq!(
+        fx.value("SELECT pg_has_role('dsv_member', 'chelabase_admin', 'MEMBER')").await,
+        "f",
+        "the membership is revoked"
+    );
+    fx.admin("DROP ROLE dsv_member").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.owner("CREATE EXTENSION hstore SCHEMA chelabase")
+        .await
+        .expect("the owner installs a trusted extension in chelabase");
+    assert_eq!(
+        fx.value("SELECT extnamespace = 'chelabase'::regnamespace FROM pg_extension WHERE extname = 'hstore'").await,
+        "t"
+    );
+    fx.assert_quarantined_by_bootstrap("newer, a trusted extension").await;
+    fx.admin("DROP EXTENSION hstore").await;
+
+    // 7. AC 5: older, missing and unparseable stamps are installed over.
+    for (what, comment) in [
+        ("older", "'chelabase data api schema 0'"),
+        ("missing", "NULL"),
+        ("unparseable", "'chelabase data api schema x'"),
+    ] {
+        fx.admin(&format!(
+            "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment};
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;"
+        ))
+        .await;
+        assert_eq!(fx.data_api_check("public").await, "f", "{what}");
+        fx.assert_quarantined_by_bootstrap(what).await;
+    }
+}
+
+// --- data-api-schema-stamp m2 (#199): the app users scripts refuse a newer chelabase -------
+
+/// `chelabase_auth_sync`'s attributes and password (`<none>` without the role).
+const AUTH_SYNC_SQL: &str = "SELECT coalesce((SELECT rolcanlogin || ' ' || rolinherit || ' ' || rolbypassrls || ' ' || rolconnlimit || ' ' || coalesce(rolpassword, '<none>')
+  FROM pg_authid WHERE rolname = 'chelabase_auth_sync'), '<none>')";
+
+/// The claim helpers' definitions. They're `BEGIN ATOMIC`, so `prosrc` is empty (the body is
+/// in `prosqlbody`): compare the whole definition, as [`CHELABASE_SHAPE_SQL`] does.
+const HELPERS_DEF_SQL: &str = "SELECT string_agg(proname || ':' || md5(pg_get_functiondef(oid)), ',' ORDER BY proname) FROM pg_proc
+  WHERE pronamespace = 'chelabase'::regnamespace AND proname IN ('claims', 'user_id', 'user_email')";
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn app_users_newer_schema_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { app_users_newer_schema(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn app_users_newer_schema(fx: &Fx) {
+    use worker::app_users_sql::{claim_helpers_sql, newer_data_api_error, users_bootstrap_sql};
+    // The scripts as the worker runs them (admin_sql, as cloud_admin, in the auth database).
+    let enable = |password: &str| {
+        users_bootstrap_sql("public", "users", &chelabase_neon::scram::verifier(password), OWNER)
+    };
+    let helpers = claim_helpers_sql();
+
+    // 1. AC 3, current stamp: both scripts run as today.
+    fx.assert_current("fresh").await;
+    fx.admin(&enable("first-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, "<none>", "the enable made chelabase_auth_sync");
+
+    // 2. AC 1, 2: a valid newer stamp, and helper bodies this worker would rewrite (the
+    // bootstrap superuser's, so no tamper). Each script errors naming both versions and
+    // changes nothing: not chelabase, not the role, not the helpers.
+    fx.admin(MAKE_NEWER_SQL).await;
+    let unrewritten = fx.value(CHELABASE_SHAPE_SQL).await;
+    fx.admin(
+        "CREATE OR REPLACE FUNCTION chelabase.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT 'v99'; END;
+CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT '{\"v\": 99}'::jsonb; END;",
+    )
+    .await;
+    let shape = fx.value(CHELABASE_SHAPE_SQL).await;
+    assert_ne!(shape, unrewritten, "the shape hash sees a BEGIN ATOMIC helper's body");
+    let auth_sync = fx.value(AUTH_SYNC_SQL).await;
+    let prosrc = fx.value(HELPERS_DEF_SQL).await;
+    let why = format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}");
+    for (what, script) in [("enable", enable("second-password")), ("claim helpers", helpers.clone())] {
+        let e = fx.admin_on(&fx.ep, &script).await.expect_err(what);
+        assert_eq!(newer_data_api_error(&e), Some(why.as_str()), "{what}: {e}");
+        assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape, "{what} changed a newer chelabase");
+        assert_eq!(fx.value(AUTH_SYNC_SQL).await, auth_sync, "{what} changed chelabase_auth_sync");
+        assert_eq!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what} rewrote the claim helpers");
+    }
+    // The protect triggers are still there and enabled (the guard runs before their drop).
+    assert_eq!(
+        fx.value("SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_users_protect_%' AND evtenabled <> 'D'").await,
+        "2"
+    );
+    // m1 audit nit: the data API bootstrap left the newer schema alone; with one of its event
+    // triggers disabled the machinery check still fails, and the script says so.
+    let data_api = worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, &fx.elevated_verifier().await, "public");
+    let flagged = |out: &str| out.lines().any(|l| l.trim_end() == worker::data_api::NEWER_MACHINERY_OFF);
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && !flagged(&out), "{out}");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions DISABLE").await;
+    assert_eq!(fx.data_api_check("public").await, "f");
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && flagged(&out), "{out}");
+    assert_eq!(fx.data_api_check("public").await, "f", "left disabled: the loop the warning names");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions ENABLE").await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape);
+
+    // 3. AC 3: older and missing stamps run as today.
+    for (what, comment) in [("older", "'chelabase data api schema 0'"), ("missing", "NULL")] {
+        fx.admin(&format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment}")).await;
+        fx.admin(&enable(&format!("{what}-password"))).await;
+        fx.admin(&helpers).await;
+        assert_ne!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what}: the helpers are this worker's");
+    }
+
+    // 4. AC 3: an owner-forged stamp never blocks either script.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl").await;
+    fx.owner(
+        "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';",
+    )
+    .await
+    .expect("the owner makes an event trigger");
+    let before = fx.value(AUTH_SYNC_SQL).await;
+    fx.admin(&enable("forged-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, before, "the enable set the new password");
+}
+
+// --- Which of chelabase_storage's sessions are void is a record on the login -----------------
+
+/// `chelabase_storage` keeps the lockdown's record (`worker::login_lockdown`): a lockdown
+/// that found it changed leaves a cut-off; a session opened under the stored password
+/// afterwards stays open through the next bootstrap, which keeps the record (one whose
+/// cut-off is from before the postmaster started is cleared); a record left pending fails
+/// the health check, and the next bootstrap ends the sessions from before it.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn sessions_of_the_storage_login_from_before_a_drifted_lockdown_are_void() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { void_sessions(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn void_sessions(fx: &Fx) {
+    let check = || async {
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await)
+    };
+    let record = || async {
+        fx.value("SELECT coalesce(shobj_description('chelabase_storage'::regrole, 'pg_authid'), 'none')").await
+    };
+    let is_cutoff = |record: &str| {
+        record
+            .strip_prefix("chelabase lockdown ")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    };
+    fx.admin(&format!("ALTER ROLE chelabase_storage PASSWORD '{TAMPER_PASSWORD}'")).await;
+    bootstrap(fx).await;
+    let cutoff = record().await;
+    assert!(is_cutoff(&cutoff), "the drifted lockdown left its cut-off: {cutoff}");
+    assert_eq!(check().await, "t");
+
+    // A session from after the cut-off stays open through a routine bootstrap.
+    let mut current = session(fx, "chelabase_storage", &fx.storage_password().await).await;
+    send(&mut current, "SELECT 'pid ' || pg_backend_pid();").await;
+    let pid = read_line(&mut current).await;
+    assert!(pid.starts_with("pid "), "{pid}");
+    bootstrap(fx).await;
+    send(&mut current, "SELECT 'pid ' || pg_backend_pid();").await;
+    assert_eq!(read_line(&mut current).await, pid, "the session stays open");
+    assert_eq!(record().await, cutoff, "a cut-off on this postmaster is kept");
+    assert_eq!(check().await, "t");
+
+    // A cut-off from before this postmaster started covers no session that is left: a routine
+    // bootstrap clears the record and the session stays open.
+    fx.admin(
+        "DO $$ BEGIN EXECUTE format('COMMENT ON ROLE chelabase_storage IS %L', 'chelabase lockdown ' || \
+         ((extract(epoch from pg_postmaster_start_time() - interval '2 seconds') * 1000000)::bigint)::text); END $$",
+    )
+    .await;
+    assert_eq!(check().await, "t");
+    bootstrap(fx).await;
+    assert_eq!(record().await, "none", "the record clears");
+    send(&mut current, "SELECT 'pid ' || pg_backend_pid();").await;
+    assert_eq!(read_line(&mut current).await, pid, "the session stays open");
+    assert_eq!(check().await, "t");
+
+    // What a drifted lockdown commits, with the step after its commit not run: unhealthy,
+    // and the next bootstrap ends the sessions from before it.
+    fx.admin(&format!("COMMENT ON ROLE chelabase_storage IS '{}'", worker::login_lockdown::PENDING)).await;
+    assert_eq!(check().await, "f", "a pending record is never healthy");
+    bootstrap(fx).await;
+    send(&mut current, "SELECT 'pid ' || pg_backend_pid();").await;
+    let out = finish(current).await;
+    assert!(!out.contains("pid "), "the session from before the lockdown was ended: {out}");
+    let after = record().await;
+    assert!(is_cutoff(&after) && after != cutoff, "{after}");
+    assert_eq!(check().await, "t");
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
+    fx.direct("chelabase_storage", &fx.storage_password().await, "SELECT 1")
+        .await
+        .expect("the stored password logs in");
+}
+
+const B2: &str = "00000000-0000-0000-0000-0000000000b2";
+const K1: &str = "00000000-0000-0000-0000-0000000000c1";
+const K2: &str = "00000000-0000-0000-0000-0000000000c2";
+const O2: &str = "00000000-0000-0000-0000-0000000000a2";
+
+/// `n` sessions for a key, owner (`NULL` or a quoted uuid) and bucket, as storage opens them;
+/// `names` keeps their names apart, `after` runs inside the same transaction.
+fn open_sessions(n: u32, key: &str, owner: &str, bucket: &str, names: &str, after: &str) -> String {
+    format!(
+        "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) SELECT gen_random_uuid(), '{bucket}', '{names}' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', {owner}, '{key}', '{{}}', clock_timestamp() + interval '1 hour' FROM generate_series(1, {n}) g; {after} COMMIT;"
+    )
+}
+
+/// m14, AC 5 and 6: a key, owner and bucket have at most 100 live sessions (`CB006` past it),
+/// another bucket, owner or key still opens one, an expired session isn't counted, and two
+/// concurrent opens at 99 leave exactly one winner (each holds its transaction open for a
+/// second, so a count outside the advisory lock would let both in).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_sessions_are_capped_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move {
+        let fx = &*task;
+        for (id, name) in [(B1, "one"), (B2, "two")] {
+            fx.as_role_commit("chelabase_storage", &format!("INSERT INTO storage.buckets (id, name) VALUES ('{id}', '{name}')")).await;
+        }
+        let owner = format!("'{A1}'");
+        let count = format!("SELECT count(*) FROM storage.upload_sessions WHERE key_id = '{K1}' AND bucket_id = '{B1}' AND owner = '{A1}'");
+        fx.admin(&open_sessions(99, K1, &owner, B1, "s", "")).await;
+        assert_eq!(fx.value(&count).await, "99");
+        let (first, second) = (
+            open_sessions(1, K1, &owner, B1, "a", "SELECT pg_sleep(1);"),
+            open_sessions(1, K1, &owner, B1, "b", "SELECT pg_sleep(1);"),
+        );
+        let (a, b) = tokio::join!(fx.admin_on(&fx.ep, &first), fx.admin_on(&fx.ep, &second));
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(), 1, "{a:?} {b:?}");
+        let refused = a.err().or(b.err()).unwrap();
+        assert!(refused.contains("too many live upload sessions"), "{refused}");
+        assert_eq!(fx.value(&count).await, "100");
+        let open = |key: &str, owner: &str, bucket: &str| {
+            open_sessions(1, key, owner, bucket, "z", "").replace("BEGIN; SET LOCAL ROLE chelabase_storage; ", "").replace(" COMMIT;", "")
+        };
+        // At the cap: the same triple is refused, and nothing is written.
+        assert_eq!(fx.code("chelabase_storage", &open(K1, &owner, B1)).await, "CB006");
+        assert_eq!(fx.value(&count).await, "100");
+        // Another bucket, owner (also none) or key still opens one.
+        for (key, own, bucket) in [(K1, owner.as_str(), B2), (K1, &format!("'{O2}'"), B1), (K1, "NULL", B1), (K2, owner.as_str(), B1)] {
+            assert_eq!(fx.code("chelabase_storage", &open(key, own, bucket)).await, "ok", "{key} {own} {bucket}");
+        }
+        // An expired session isn't counted.
+        fx.as_role_commit("chelabase_storage", &format!("UPDATE storage.upload_sessions SET expires_at = clock_timestamp() - interval '1 second' WHERE id = (SELECT id FROM storage.upload_sessions WHERE key_id = '{K1}' AND bucket_id = '{B1}' AND owner = '{A1}' LIMIT 1)")).await;
+        assert_eq!(fx.code("chelabase_storage", &open(K1, &owner, B1)).await, "ok");
+        // Updates (parts, an earlier expiry) are never held to the cap.
+        assert_eq!(fx.code("chelabase_storage", &format!("UPDATE storage.upload_sessions SET parts = '{{\"1\": {{\"size\": 1, \"etag\": \"e\"}}}}' WHERE key_id = '{K1}' AND bucket_id = '{B1}' AND owner = '{A1}'")).await, "ok");
+    })
+    .await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+/// m14, AC 7 and 8: `storage.record_part` refuses a part that takes the session's recorded
+/// total over the bucket's `file_size_limit` (the part it replaces isn't counted; no limit,
+/// no refusal), and two parts of one session recorded at once that fit alone but not together
+/// leave exactly one (each holds its transaction open for a second).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn record_part_holds_the_bucket_limit_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move {
+        let fx = &*task;
+        fx.as_role_commit("chelabase_storage", &format!("INSERT INTO storage.buckets (id, name, file_size_limit) VALUES ('{B1}', 'limited', 100); INSERT INTO storage.buckets (id, name) VALUES ('{B2}', 'free')")).await;
+        let session = async |id: u32, bucket: &str| {
+            let uuid = format!("00000000-0000-0000-0000-{id:012}");
+            fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) VALUES ('{uuid}', '{bucket}', 'n{id}', gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', NULL, '{K1}', '{{}}', clock_timestamp() + interval '1 hour'); COMMIT;")).await;
+            uuid
+        };
+        let record = |s: &str, part: u32, size: i64| format!("SELECT storage.record_part('{s}', {part}, {size}, 'e{part}')");
+        let parts = |s: &str| format!("SELECT coalesce(string_agg(key || '=' || (value->>'size'), ',' ORDER BY key), '') FROM storage.upload_sessions, jsonb_each(parts) WHERE id = '{s}'");
+        let one = session(1, B1).await;
+        for (sql, want) in [
+            (record(&one, 1, 60), "1=60"),
+            // 60 + 50 > 100: refused, `parts` unchanged.
+            (record(&one, 2, 50), "1=60"),
+            (record(&one, 2, 40), "1=60,2=40"),
+            // A part sent again replaces its earlier size: 40 + 60 fits, 40 + 61 doesn't.
+            (record(&one, 1, 60), "1=60,2=40"),
+            (record(&one, 1, 61), "1=60,2=40"),
+        ] {
+            fx.as_role_commit("chelabase_storage", &sql).await;
+            assert_eq!(fx.value(&parts(&one)).await, want, "{sql}");
+        }
+        let said = |part: u32, size: i64| format!("SELECT 'answer:' || coalesce(storage.record_part('{one}', {part}, {size}, 'e')::text, 'refused')");
+        assert!(fx.as_role(  "chelabase_storage", &said(3, 1)).await.unwrap().contains("answer:refused"), "no row: refused");
+        assert!(fx.as_role("chelabase_storage", &said(2, 40)).await.unwrap().contains("answer:true"));
+        assert!(fx.as_role("chelabase_storage", &said(2, 41)).await.unwrap().contains("answer:refused"));
+        // No limit: any size.
+        let free = session(2, B2).await;
+        fx.as_role_commit("chelabase_storage", &record(&free, 1, 1 << 40)).await;
+        assert_eq!(fx.value(&parts(&free)).await, format!("1={}", 1i64 << 40));
+        // Two parts at once, each fits alone (60 of 100) but not together.
+        let racing = session(3, B1).await;
+        let hold = |part: u32| format!("BEGIN; SET LOCAL ROLE chelabase_storage; {}; SELECT pg_sleep(1); COMMIT;", record(&racing, part, 60));
+        let (first, second) = (hold(1), hold(2));
+        let (a, b) = tokio::join!(fx.admin_on(&fx.ep, &first), fx.admin_on(&fx.ep, &second));
+        a.unwrap();
+        b.unwrap();
+        let recorded = fx.value(&parts(&racing)).await;
+        assert!(recorded == "1=60" || recorded == "2=60", "exactly one part is recorded: {recorded}");
+    })
+    .await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
     }
 }

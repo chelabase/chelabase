@@ -6,8 +6,11 @@
  */
 
 export * from './acceptInviteBody.ts';
+export * from './appChangeEmailBody.ts';
+export * from './appChangeEmailConfirmBody.ts';
 export * from './appChangePasswordBody.ts';
 export * from './appEmailBody.ts';
+export * from './appEmailChangePending.ts';
 export * from './appJwk.ts';
 export * from './appJwks.ts';
 export * from './appPasswordResetConfirmBody.ts';

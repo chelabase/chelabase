@@ -25,9 +25,29 @@ export interface StorageContext {
   resume: ResumeStore;
 }
 
-/** A bucket or object name as a URL path: each `/`-separated segment percent-encoded. */
+/** `.` and every code point NFKC folds to dots; the same set as `is_dot` in the storage service. */
+const DOTS = new Set([".", "\u{ff0e}", "\u{2024}", "\u{2025}", "\u{2026}", "\u{fe52}"]);
+const isDotOnly = (segment: string) => [...segment].every((c) => DOTS.has(c));
+
+/** Throws a `TypeError` unless `name` is non-empty and none of its `/`-separated segments is empty or dots only. */
+export function assertNameSegments(name: string, what: string): void {
+  if (name === "" || name.split("/").some((s) => s === "" || isDotOnly(s))) {
+    throw new TypeError(`${what} ${JSON.stringify(name)} is not valid: it must be non-empty and have no empty or dot-only "/"-separated segment`);
+  }
+}
+
+/** An object name as a URL path: checked, then each `/`-separated segment percent-encoded. */
 export function encodeName(name: string): string {
+  assertNameSegments(name, "object name");
   return name.split("/").map(encodeURIComponent).join("/");
+}
+
+/** A bucket name as one URL path segment: checked, then percent-encoded. */
+export function encodeBucket(bucket: string, what = "bucket name"): string {
+  if (bucket === "" || isDotOnly(bucket)) {
+    throw new TypeError(`${what} ${JSON.stringify(bucket)} is not valid: it must be non-empty and not dots only`);
+  }
+  return encodeURIComponent(bucket);
 }
 
 /** `?database=…&download=…` (only those given), or "". */
@@ -118,7 +138,7 @@ export function lazyStorage(ctx: StorageContext): StorageClient {
         if (ctx.branch === undefined) {
           throw new Error("storage getPublicUrl needs the branch id: create the client with `storage: { branch }`");
         }
-        return `${ctx.base}/storage/v1/object/public/${encodeURIComponent(ctx.branch)}/${encodeURIComponent(bucket)}/${encodeName(path)}${queryOf({ database: ctx.database, download: downloadParam(opts?.download) })}`;
+        return `${ctx.base}/storage/v1/object/public/${encodeBucket(ctx.branch, "storage branch")}/${encodeBucket(bucket)}/${encodeName(path)}${queryOf({ database: ctx.database, download: downloadParam(opts?.download) })}`;
       },
     };
     for (const m of BUCKET_METHODS) {

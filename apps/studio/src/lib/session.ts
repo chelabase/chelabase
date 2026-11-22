@@ -1,4 +1,5 @@
 import { ApiError } from "@chelabase/management-client";
+import { clearAllSqlStorage } from "@/components/sql-editor/run-history";
 import { mintMemberToken } from "./login-client/generated/endpoints";
 import type { SessionEvents } from "./realtime/types";
 
@@ -112,6 +113,9 @@ export function createSession({ mint }: SessionOptions): Session {
   }
 
   function clear() {
+    // Every way the session ends (sign-out, a 401 on refresh, a refused re-auth) passes through
+    // here, so the previous user's stored SQL never outlives it.
+    clearAllSqlStorage();
     epoch++;
     cancelTimer();
     inFlight = undefined;

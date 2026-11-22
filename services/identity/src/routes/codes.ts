@@ -2,8 +2,10 @@
 // SMTP), check one, and report SMTP status. Storage and its invariants: email/codes.ts.
 //
 // Imports from ../routes.ts are only called inside handlers (routes.ts imports this module).
+import * as z from "zod";
 import type { Caller } from "../config.ts";
-import { CODE_KINDS, CODE_TTL_TEXT, type CodeKind } from "../email/codes.ts";
+import { CODE_KINDS, CODE_TTL_TEXT, type CodeBinding, type CodeKind } from "../email/codes.ts";
+import type { Mailer } from "../email/mailer.ts";
 import { render } from "../email/templates.ts";
 import { HttpError } from "../http.ts";
 import {
@@ -12,6 +14,7 @@ import {
   hasPassword,
   ID_PATTERN,
   isUuid,
+  MAX_EMAIL,
   requireUser,
   userOut,
   type BaUser,
@@ -29,7 +32,10 @@ const CODE_PATTERN = /^[0-9]{6}$/;
 /** Control characters (C0, DEL, C1) and line/paragraph separators: never in a header or a link. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
-/** The kinds each caller may create. auth: all; orchestrator: invites (member invites); none else. */
+/**
+ * The kinds each caller may create. auth: all (it alone runs the change-email flow);
+ * orchestrator: invites (member invites); none else.
+ */
 const CREATE_KINDS: Record<Caller, readonly CodeKind[]> = {
   auth: CODE_KINDS,
   orchestrator: ["invite"],
@@ -76,6 +82,44 @@ function optLink(body: Record<string, unknown>): string | undefined {
   return v;
 }
 
+/**
+ * `new_email` of an `email_change` request, checked as `users.set_email` checks an address:
+ * lowercased, at most MAX_EMAIL characters, `z.email()`. Refused for every other kind.
+ */
+function newEmail(body: Record<string, unknown>, kind: CodeKind): string | undefined {
+  const v = body.new_email;
+  if (kind !== "email_change") {
+    if (v !== undefined) throw new HttpError(400, "invalid_request", "new_email is only for email_change codes");
+    return undefined;
+  }
+  if (typeof v !== "string" || v === "" || v.length > MAX_EMAIL) {
+    throw new HttpError(400, "invalid_request", `new_email must be a non-empty string of at most ${MAX_EMAIL} characters`);
+  }
+  const email = v.toLowerCase();
+  if (!z.email().safeParse(email).success) throw new HttpError(400, "invalid_email", "invalid email");
+  return email;
+}
+
+/** Whether another user than `id` holds `email` (stored lowercase and unique). */
+async function heldByOther(ctx: Context, email: string, id: string): Promise<boolean> {
+  const holder = await ctx.internalAdapter.findUserByEmail(email);
+  return holder !== null && holder.user.id !== id;
+}
+
+/**
+ * Tells the previous address its account's email was changed. The change is already done, so
+ * without SMTP nothing is sent, and a refused send is logged (code-free, by the mailer) rather
+ * than failing the request.
+ */
+export async function notifyEmailChanged(mailer: Mailer, previous: string, project = DEFAULT_PROJECT): Promise<void> {
+  if (!mailer.configured) return;
+  try {
+    await mailer.send(previous, render("email_changed", { project }));
+  } catch {
+    console.error("identity: the email change notice was not sent");
+  }
+}
+
 /** Every refused guess, whatever the reason, is this one reply. */
 function invalidCode(): HttpError {
   return new HttpError(400, "invalid_code", "the code is wrong, expired, used up or was replaced");
@@ -120,6 +164,11 @@ export function codeRoutes(): Route[] {
         if (!CREATE_KINDS[caller].includes(kind)) {
           throw new HttpError(403, "forbidden", `${caller} may not create ${kind} codes`);
         }
+        const next = newEmail(body, kind);
+        // The code proves the new mailbox, so only that mailbox may ever see it.
+        if (kind === "email_change" && delivery !== "email") {
+          throw new HttpError(400, "invalid_request", "email_change codes are only delivered by email");
+        }
         if (delivery === "email" && !mailer.configured) {
           throw new HttpError(409, "email_not_configured", "no SMTP server is configured; use delivery \"return\"");
         }
@@ -129,11 +178,29 @@ export function codeRoutes(): Route[] {
           if (kind === "invite" && !(await inviteAllowed(ctx, user))) {
             throw new HttpError(409, "invite_refused", "the user already has a password and a verified email; use a reset code");
           }
-          const { code, expiresAt } = await auth.codes.issue(user.id, user.email, kind);
+          let binding: CodeBinding = user.email;
+          if (next !== undefined) {
+            if (next === user.email.toLowerCase()) throw new HttpError(409, "conflict", "this is already the user's email");
+            if (await heldByOther(ctx, next, user.id)) throw new HttpError(409, "conflict", "another user has this email");
+            binding = { current: user.email, next };
+          }
+          const issued = await auth.codes.issue(user.id, binding, kind);
+          // The earlier code stands and keeps working; nothing is sent.
+          if (!issued) throw new HttpError(429, "code_recently_sent", "a code was sent less than a minute ago; use it or wait");
+          const { code, expiresAt } = issued;
           const out = { kind, delivery, expires_at: expiresAt.toISOString() };
           if (delivery === "return") return { status: 201, body: { ...out, code } };
           const email = render(kind, { project, code, expires: CODE_TTL_TEXT[kind], ...(link === undefined ? {} : { link }) });
-          await mailer.send(user.email, email);
+          try {
+            await mailer.send(next ?? user.email, email);
+          } catch (err) {
+            // Nobody received it: withdraw it, so a retry within the minute issues and mails a
+            // new one instead of being told one was just sent.
+            await auth.codes.withdraw(user.id, binding, kind, code).catch(() => {
+              console.error("identity: withdrawing an undelivered code failed; it stands until replaced or expired");
+            });
+            throw err;
+          }
           return { status: 201, body: out };
         });
       },
@@ -142,18 +209,20 @@ export function codeRoutes(): Route[] {
       id: "codes.verify",
       method: "POST",
       rest: ["codes", "verify"],
-      async handle({ registry, pool, body }) {
+      async handle({ mailer, registry, pool, body }) {
         const id = userId(body);
         const kind = oneOf(body, "kind", CODE_KINDS);
         const code = body.code;
         if (typeof code !== "string" || !CODE_PATTERN.test(code)) {
           throw new HttpError(400, "invalid_request", "code must be six digits");
         }
+        const next = newEmail(body, kind);
+        const takesPassword = kind === "reset" || kind === "invite";
         const password = body.new_password;
-        if (kind === "verify" && password !== undefined) {
+        if (!takesPassword && password !== undefined) {
           throw new HttpError(400, "invalid_request", "new_password is only for reset and invite codes");
         }
-        if (kind !== "verify" && (typeof password !== "string" || password === "" || password.length > MAX_PASSWORD)) {
+        if (takesPassword && (typeof password !== "string" || password === "" || password.length > MAX_PASSWORD)) {
           throw new HttpError(400, "invalid_request", `new_password must be a non-empty string of at most ${MAX_PASSWORD} characters`);
         }
         return registry.use(pool, async (auth) => {
@@ -165,12 +234,30 @@ export function codeRoutes(): Route[] {
           // is counted, so neither costs an attempt nor tells the cases apart.
           const holder = isUuid(id) ? ((await ctx.internalAdapter.findUserById(id)) as BaUser | null) : null;
           if (!holder || (kind === "invite" && !(await inviteAllowed(ctx, holder)))) throw invalidCode();
-          if (!(await auth.codes.consume(id, holder.email, kind, code))) throw invalidCode();
+          const binding: CodeBinding = next === undefined ? holder.email : { current: holder.email, next };
+          const guess = await auth.codes.consume(id, binding, kind, code);
+          // A spent budget is refused before the code is compared, so the answer says nothing
+          // about the code.
+          if (guess === "budget_spent") {
+            throw new HttpError(429, "code_budget_spent", "too many wrong codes; try again later");
+          }
+          if (guess !== "ok") throw invalidCode();
           // The row cascades with its user, so the user existed when the code was consumed; a
           // concurrent delete since then is a plain 404. An email changed since the read above
           // means the code proved the old address only.
           let user = await requireUser(ctx, id);
           if (user.email.toLowerCase() !== holder.email.toLowerCase()) throw invalidCode();
+          if (next !== undefined) {
+            // The code is spent. The new address may have been taken since it was issued; the
+            // unique index on email also refuses a take that lands after this check (409).
+            if (await heldByOther(ctx, next, id)) throw new HttpError(409, "conflict", "another user has this email");
+            // Only while the current address is still the one the code was bound to. The swap
+            // revokes the user's other outstanding codes in the same statement.
+            const swapped = await auth.codes.changeEmail(id, next, true, user.email);
+            if (!swapped) throw invalidCode();
+            await notifyEmailChanged(mailer, swapped.previous);
+            return { status: 200, body: { user: userOut(await requireUser(ctx, id)) } };
+          }
           if (kind === "verify") {
             if (!user.emailVerified) user = (await ctx.internalAdapter.updateUser(id, { emailVerified: true })) as BaUser;
           } else {

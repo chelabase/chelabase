@@ -619,6 +619,17 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.set_storage_password(branch, sealed, salt).await
     }
 
+    async fn set_authenticator_elevated_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .set_authenticator_elevated_password(branch, sealed, salt)
+            .await
+    }
+
     async fn branch_databases(
         &self,
         branch: BranchId,
@@ -737,6 +748,10 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
 
     async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
         self.inner.branches_missing_data_api().await
+    }
+
+    async fn branches_missing_elevated_login(&self) -> Result<Vec<BranchId>, MetadataError> {
+        self.inner.branches_missing_elevated_login().await
     }
 
     async fn branch_connection(

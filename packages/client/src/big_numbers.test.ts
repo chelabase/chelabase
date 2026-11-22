@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { createClient, UnsafeIntegerError, type TypeMap } from "./index.ts";
+import { createClient, op, UnsafeIntegerError, type TypeMap } from "./index.ts";
 import { type Database, types } from "./test-db.ts";
 import { fakeFetch } from "./test-fetch.ts";
 
@@ -248,7 +248,7 @@ describe("writing", () => {
     await db
       .from("events")
       .update({ seq: -9223372036854775808n })
-      .where({ id: { in: [9007199254740993n] }, seq: 9007199254740995n });
+      .where({ id: op.in([9007199254740993n]), seq: 9007199254740995n });
     expect(sentBody(fetch)).toBe(
       '{"v":1,"op":"update","table":"events","set":{"seq":-9223372036854775808},' +
         '"where":{"and":[{"col":"id","in":[9007199254740993]},{"col":"seq","eq":9007199254740995}]}}',

@@ -14,6 +14,12 @@ pub const MAX_ALIAS_BYTES: usize = 63;
 
 /// Most operations one batch may hold.
 pub const MAX_BATCH: usize = 50;
+/// The most conditions and combinators (`and`, `or`, `not`) together in one operation's
+/// filter. Values (`in` lists) are binds and aren't counted.
+pub const MAX_FILTER_NODES: usize = 256;
+/// The most terms in one `select`, `returning`, `orderBy` or `set` list (and the columns of
+/// an insert's rows): Postgres's column limit.
+pub const MAX_LIST_TERMS: usize = 1_600;
 
 /// The most values a console `in` list (`"text": true` or `"parse": true`) holds.
 pub const MAX_CONSOLE_IN: usize = 1000;
@@ -614,7 +620,67 @@ fn parse_op(tree: Value, in_batch: bool) -> Result<Op, QueryError> {
     Ok(op)
 }
 
+/// The conditions and combinators in `f`.
+fn filter_nodes(f: &Filter) -> usize {
+    match f {
+        Filter::Cond { .. } => 1,
+        Filter::Not(inner) => 1 + filter_nodes(inner),
+        Filter::And(items) | Filter::Or(items) => 1 + items.iter().map(filter_nodes).sum::<usize>(),
+    }
+}
+
+/// Refuses an operation whose filter or lists are over [`MAX_FILTER_NODES`] or
+/// [`MAX_LIST_TERMS`], so the size of a plan doesn't depend on the request's body alone.
+fn check_sizes(op: &Op) -> Result<(), QueryError> {
+    let filter = |f: &Option<Filter>| {
+        let nodes = f.as_ref().map_or(0, filter_nodes);
+        if nodes > MAX_FILTER_NODES {
+            return Err(QueryError::new(format!(
+                "a \"where\" holds at most {MAX_FILTER_NODES} conditions and combinators (and, or, not), got {nodes}"
+            )));
+        }
+        Ok(())
+    };
+    let list = |name: &str, len: usize| {
+        if len > MAX_LIST_TERMS {
+            return Err(QueryError::new(format!(
+                "\"{name}\" holds at most {MAX_LIST_TERMS} terms, got {len}"
+            )));
+        }
+        Ok(())
+    };
+    let returning = |r: &Option<Returning>| match r {
+        Some(Returning::Columns(cols)) => list("returning", cols.len()),
+        _ => Ok(()),
+    };
+    match op {
+        Op::Select(s) => {
+            filter(&s.filter)?;
+            list("select", s.select.as_ref().map_or(0, Vec::len))?;
+            list("orderBy", s.order_by.len())
+        }
+        Op::Insert(i) => {
+            if let Some(Value::Object(row)) = i.values.as_array().and_then(|rows| rows.first()) {
+                list("values", row.len())?;
+            }
+            returning(&i.returning)
+        }
+        Op::Update(u) => {
+            filter(&u.filter)?;
+            list("set", u.set.as_object().map_or(0, Map::len))?;
+            returning(&u.returning)
+        }
+        Op::Delete(d) => {
+            filter(&d.filter)?;
+            returning(&d.returning)
+        }
+        Op::Count(c) => filter(&c.filter),
+        Op::Call(_) | Op::Batch(_) => Ok(()),
+    }
+}
+
 fn validate(op: &Op) -> Result<(), QueryError> {
+    check_sizes(op)?;
     let need_where = |filter: &Option<Filter>, all: bool, verb: &str| {
         if filter.is_none() && !all {
             return Err(QueryError::new(format!(

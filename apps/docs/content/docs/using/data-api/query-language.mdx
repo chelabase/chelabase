@@ -116,6 +116,10 @@ Combine conditions with `{ "and": [...] }`, `{ "or": [...] }` (both need at leas
 { "or": [{ "col": "region", "in": ["eu"] }, { "and": [{ "col": "vip", "eq": true }, { "col": "qty", "gt": 2 }] }] }
 ```
 
+## Size limits
+
+Beside the 50-operation batch limit, one operation's `where` holds at most 256 conditions and combinators (`and`, `or`, `not`) together, and one `select`, `returning`, `orderBy` or `set` list holds at most 1,600 terms (an insert's rows, at most 1,600 columns). Values, such as the items of an `in` list or the rows of an insert, aren't counted. A request over a limit is refused with `400 invalid_query`, naming the limit.
+
 ## Numbers keep every digit
 
 A big JSON number in a request body (say a 30-digit `numeric`) reaches Postgres exactly. Responses carry `int8` and `numeric` values with every digit too; the TypeScript client reads them exactly (see [Big numbers](/using/client/big-numbers)).

@@ -210,13 +210,15 @@ Chelabase limits how often anyone can try to sign in (for example, 10 sign-ins a
 
 With `serverKey`, your server proves the call comes from your app. Chelabase then skips the per-IP limits for it and keeps the ones that follow a person: wrong passwords are still counted per email address, and the other limits per email or per user. Refreshes have no per-user limit, which is safe: a refresh token can't be guessed, and reusing an old one is detected and ends the session.
 
+Failed sign-ins are limited per email address and per client: 5 a minute from one client on one email, and 30 a minute on one email from all clients together. Without `clientIp`, the client Chelabase sees is your server, so every user of your app shares the one per-client limit for an email. Five wrong passwords on an account, from anyone, then turn away that account's owner for the rest of the minute. Forwarding the client address (`clientIp`, next section) is what gives each person their own per-client limit.
+
 The per-person limits stay, but your app's sign-in and sign-up route is then limited only per account. So someone could try one password across many accounts, or create many sign-ups, without an IP limit. If that worries you, add `clientIp` (next section), or your own limit or CAPTCHA on that route.
 
 The secret key is only sent on auth calls, never on data requests, and only counts when it belongs to the same project and branch as the public key; any other key is ignored. A blank `CHELABASE_SECRET_KEY=` is treated as unset.
 
 ### Also limit per IP
 
-If you want per-IP limits as well, pass the user's IP address as `clientIp` next to `serverKey`. Limits then apply per email, per user and per address.
+If you want per-IP limits as well, pass the user's IP address as `clientIp` next to `serverKey`. Limits then apply per email, per user and per address, and each client gets its own per-client sign-in limit for an email instead of sharing your server's. Without it, a few wrong passwords from one person can block everyone else's sign-in to that account for a minute.
 
 ```ts
 // The auth route

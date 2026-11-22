@@ -8,6 +8,19 @@
 	root * /srv
 	encode zstd gzip
 
+	# The API origin is runtime config, so connect-src names schemes rather than one origin.
+	# http: and ws: are there because self-hosted mode serves the API over plain http on any
+	# host name (CHELABASE_PUBLIC_SCHEME=http), a different origin from Studio's; https:
+	# already allows any host, and an https page still never loads http (mixed content).
+	# media-src names the same schemes: storage previews stream audio and video from a signed
+	# URL on the API host. Images and PDFs preview from a fetched blob: URL instead, so img-src
+	# stays narrow and frame-src admits only blob: beside Studio's own origin.
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: http: https:; frame-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' https: wss: http: ws:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
 	# Hashed build output never changes under the same name.
 	@hashed path /assets/*
 	header @hashed Cache-Control "public, max-age=31536000, immutable"

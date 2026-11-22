@@ -8,7 +8,8 @@
 //! - **Part** (`PUT /upload/session/{id}/{n}`): 5 MiB to 100 MiB (the last may be smaller),
 //!   counted as it arrives and held to the bucket's limit less the other parts' bytes (413);
 //!   part 1's first bytes are sniffed (415). The part's buffer is reserved from the process's
-//!   [`crate::limits::InFlight`] cap first (503 `busy`). A resent part replaces the earlier one.
+//!   [`crate::limits::InFlight`] cap and its branch's share first (503 `busy`), and the body must
+//!   finish within the part deadline (408). A resent part replaces the earlier one.
 //! - **Complete** (`POST /upload/session/{id}/complete`): parts 1..n with no gap, the total
 //!   against the bucket's current limit (413, the S3 upload aborted), the pre-check again
 //!   (403, aborted), then the session is claimed (its row deleted: a losing concurrent
@@ -169,6 +170,10 @@ fn over(budget: u64, limit: Option<u64>) -> Failure {
         _ => Failure::too_large(MAX_PART as i64),
     }
 }
+
+/// The most live (unexpired) resumable uploads one key and caller may hold in one bucket
+/// (429 `too_many_uploads` past it); `guard_sessions` counts them under an advisory lock.
+pub const MAX_LIVE_SESSIONS: u32 = 100;
 
 /// A session row, written as storage itself; `timeline_id` is stamped by `guard_sessions`.
 const OPEN: NamedStatement = named_statement!(
@@ -427,6 +432,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         (status = 403, description = "`not_allowed`: no policy allows the write, or the caller can't see the bucket", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert); `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
+        (status = 429, description = "`too_many_uploads`: 100 resumable uploads are already open for this key and caller in the bucket", body = StorageErrorEnvelope),
         (status = 503, description = "`storage_unavailable`, `unavailable`", body = StorageErrorEnvelope),
     ),
 )]
@@ -508,6 +514,39 @@ pub async fn create<S: ConnSource, M: ConnSource>(
     .into_response())
 }
 
+/// One part's body, whole: its bytes come out of the process's upload cap and `branch`'s share
+/// of it as they arrive (503 `busy` past either), within the bucket's `budget` (413), and the
+/// body must finish within the part deadline in all (408), however steadily it arrives. A
+/// failure frees the bytes. A part comes back with its [`Held`](crate::limits::Held) share:
+/// the buffer counts against the cap and the branch for as long as the caller keeps the
+/// share, which must be until the buffer has been handed on and let go.
+async fn read_part<E: std::fmt::Display + Send + 'static>(
+    inflight: &crate::limits::InFlight,
+    body: impl futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    budget: u64,
+    limit: Option<u64>,
+    branch: Uuid,
+) -> Result<(BytesMut, crate::limits::Held), Failure> {
+    let deadline = inflight.part_deadline();
+    let (body, _) = until_idle(body, inflight.body_idle());
+    let (mut body, held) = inflight.metered(body, budget, branch);
+    let read = async {
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| e.failure())?;
+            if (buf.len() + chunk.len()) as u64 > budget {
+                return Err(over(budget, limit));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    };
+    let buf = tokio::time::timeout(deadline, read)
+        .await
+        .unwrap_or_else(|_| Err(Failure::part_deadline(deadline)))?;
+    Ok((buf, held))
+}
+
 #[utoipa::path(
     put,
     path = "/storage/v1/upload/session/{session}/{part}",
@@ -521,9 +560,9 @@ pub async fn create<S: ConnSource, M: ConnSource>(
     responses(
         (status = 200, description = "`part_number`, `size`, `etag`", body = Value),
         (status = 404, description = "`upload_not_found`: missing, finished, or another caller's", body = StorageErrorEnvelope),
-        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
+        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default), or did not finish within `CHELABASE_STORAGE_PART_DEADLINE_SECS` (900 s by default)", body = StorageErrorEnvelope),
         (status = 410, description = "`upload_expired`", body = StorageErrorEnvelope),
-        (status = 413, description = "`too_large`: over 100 MiB or the bucket's limit", body = StorageErrorEnvelope),
+        (status = 413, description = "`too_large`: over 100 MiB or the bucket's limit (with the parts uploaded at the same time)", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
         (status = 503, description = "`busy`: too many uploads in flight; `storage_unavailable`", body = StorageErrorEnvelope),
     ),
@@ -551,27 +590,27 @@ pub async fn upload_part<S: ConnSource, M: ConnSource>(
     if declared.is_some_and(|d| d > budget) {
         return Err(over(budget, limit));
     }
-    let mut buf = BytesMut::new();
-    // The whole part is held: its bytes come out of the process's cap as they arrive (503
-    // `busy` past it). A body that stalls fails the part (408), which frees its share.
-    let (body, _) = until_idle(request.into_data_stream(), state.inflight.body_idle());
-    let (mut body, _held) = state.inflight.metered(body, budget);
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|e| e.failure())?;
-        if (buf.len() + chunk.len()) as u64 > budget {
-            return Err(over(budget, limit));
-        }
-        buf.extend_from_slice(&chunk);
-    }
+    // The whole part is held; `read_part` takes its bytes from the process's cap and the
+    // branch's share as they arrive. `held` keeps them taken until the store has the part
+    // (or has failed), and every earlier return frees them by dropping it.
+    let (buf, held) = read_part(
+        &state.inflight,
+        request.into_data_stream(),
+        budget,
+        limit,
+        data.branch_id,
+    )
+    .await?;
     if part == 1 {
         s.limits.check_sniffed(&buf)?;
     }
     let size = buf.len() as u64;
-    let etag = state
+    let stored = state
         .store
         .multipart_part(&s.key, &s.upload_id, part, buf.freeze())
-        .await
-        .map_err(|e| store_failure(&e, &rid))?;
+        .await;
+    drop(held);
+    let etag = stored.map_err(|e| store_failure(&e, &rid))?;
     let mut session = s.session.clone();
     session.accept(
         part,
@@ -593,6 +632,13 @@ pub async fn upload_part<S: ConnSource, M: ConnSource>(
         )
         .await?;
     if recorded.first().and_then(|r| r.get::<_, Option<bool>>(0)) != Some(true) {
+        // No row: the session is gone or expired, or (a live session still there) the schema
+        // refused the part for taking the recorded total over the bucket's limit, which
+        // concurrent parts can do though each fit the snapshot read above.
+        let live = state.session(&data, &at, &id, &rid).await;
+        if live.is_ok_and(|l| l.session.expires_at > now()) {
+            return Err(over(budget, limit));
+        }
         return Err(unrecorded(s.session.expires_at, now()));
     }
     Ok(Json(json!({ "part_number": part, "size": size, "etag": etag })).into_response())
@@ -1019,6 +1065,89 @@ mod tests {
             let open = store.list_uploads(&key).await.unwrap();
             assert_eq!(open.is_empty(), ends, "{status}: {open:?}");
         }
+    }
+
+    /// AC 1: a body that keeps arriving (each chunk well within the idle period) but isn't done
+    /// at the part deadline fails 408 `request_timeout` naming the deadline, and its bytes are
+    /// back in the process cap and the branch's share.
+    #[tokio::test(start_paused = true)]
+    async fn part_past_its_deadline_is_408() {
+        let inflight = crate::limits::InFlight::new(1 << 20)
+            .with_body_idle(std::time::Duration::from_secs(60))
+            .with_part_deadline(std::time::Duration::from_secs(100));
+        let branch = Uuid::from_u128(7);
+        let trickle = futures_util::stream::unfold(0u32, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Some((Ok::<_, String>(bytes::Bytes::from_static(b"abcd")), n + 1))
+        });
+        let f = read_part(&inflight, trickle, 1 << 20, None, branch)
+            .await
+            .err().unwrap();
+        assert_eq!((f.0.status.as_u16(), f.0.code), (408, "request_timeout"));
+        assert!(f.0.message.contains("100 s"), "{}", f.0.message);
+        assert_eq!(inflight.available(), 1 << 20);
+        assert_eq!(inflight.branch_held(branch), 0);
+        assert_eq!(inflight.branches_in_flight(), 0);
+    }
+
+    /// AC 2: a part that finishes within the deadline is read whole, however slowly it came.
+    /// Its share stays taken while the part is held and is returned when it is let go.
+    #[tokio::test(start_paused = true)]
+    async fn part_within_its_deadline_records() {
+        let inflight = crate::limits::InFlight::new(1 << 20)
+            .with_part_deadline(std::time::Duration::from_secs(100));
+        let branch = Uuid::from_u128(7);
+        let slow = futures_util::stream::unfold(0u32, |n| async move {
+            if n == 5 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Some((Ok::<_, String>(bytes::Bytes::from_static(b"abcd")), n + 1))
+        });
+        let (got, held) = read_part(&inflight, slow, 1 << 20, None, branch).await.unwrap();
+        assert_eq!(&got[..], b"abcdabcdabcdabcdabcd");
+        // W1: the part is in memory, so it still counts against the cap and the branch.
+        assert_eq!(inflight.available(), (1 << 20) - 20);
+        assert_eq!(inflight.branch_held(branch), 20);
+        drop(held);
+        assert_eq!(inflight.available(), 1 << 20);
+        assert_eq!(inflight.branches_in_flight(), 0);
+        // A part over its budget is still 413, a branch past its share 503.
+        let f = read_part(&inflight, futures_util::stream::iter([Ok::<_, String>(bytes::Bytes::from(vec![0u8; 9]))]), 8, Some(8), branch)
+            .await
+            .err().unwrap();
+        assert_eq!(f.0.status.as_u16(), 413);
+        let small = crate::limits::InFlight::new(1 << 20).with_branch_limit(4);
+        let f = read_part(&small, futures_util::stream::iter([Ok::<_, String>(bytes::Bytes::from(vec![0u8; 9]))]), 1 << 20, None, branch)
+            .await
+            .err().unwrap();
+        assert_eq!((f.0.status.as_u16(), f.0.code), (503, "busy"));
+    }
+
+    /// AC 5's mapping: the schema's session-cap code is 429 `too_many_uploads` with the
+    /// service's fixed text, never the raised one; and a session open that fails this way
+    /// aborts the store's multipart upload as every open failure does.
+    #[tokio::test]
+    async fn session_cap_is_429_too_many_uploads() {
+        let mut raised = chelabase_query::QueryFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "a user trigger's own text",
+        );
+        raised.sqlstate = Some("CB006".into());
+        let f = crate::engine::managed_failure(raised, "r");
+        assert_eq!((f.0.status.as_u16(), f.0.code), (429, "too_many_uploads"));
+        assert_eq!(f, Failure::too_many_uploads());
+        assert!(!f.0.message.contains("trigger"));
+        assert_eq!(MAX_LIVE_SESSIONS, 100);
+        // The abort: `create` aborts on any open failure (the `Err` arm of its `managed` call).
+        use chelabase_storage::ObjectStore;
+        let store = chelabase_storage::MemoryStore::default();
+        let key = "db/k";
+        let upload = store.multipart_create(key, None).await.unwrap();
+        assert_eq!(store.list_uploads(key).await.unwrap().len(), 1);
+        store.multipart_abort(key, &upload).await.unwrap();
+        assert!(store.list_uploads(key).await.unwrap().is_empty());
     }
 
     #[derive(Debug, Clone)]

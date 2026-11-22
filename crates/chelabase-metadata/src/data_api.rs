@@ -215,6 +215,10 @@ pub struct BranchConnectionRow {
     /// (`Purpose::FunctionsDispatch`) and its SCRAM salt: both or neither.
     pub functions_password_enc: Option<String>,
     pub functions_password_salt: Option<Vec<u8>>,
+    /// The `chelabase_authenticator_elevated` login's sealed password
+    /// (`Purpose::AuthenticatorElevated`) and its SCRAM salt: both or neither.
+    pub authenticator_elevated_password_enc: Option<String>,
+    pub authenticator_elevated_password_salt: Option<Vec<u8>>,
     pub settings: DataApiSettings,
     /// The branch's databases in state `on`, main first.
     pub databases: Vec<ServedDatabase>,
@@ -711,6 +715,29 @@ impl MetadataClient {
         Ok(())
     }
 
+    /// Records the sealed `chelabase_authenticator_elevated` password of a live branch that
+    /// has none, with its verifier's SCRAM salt; the first one stored stays, as
+    /// [`Self::set_storage_password`].
+    pub async fn set_authenticator_elevated_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE branches SET authenticator_elevated_password_enc = $2,
+                    authenticator_elevated_password_salt = $3, updated_at = now()
+             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
+               AND authenticator_elevated_password_enc IS NULL",
+        )
+        .bind(branch.as_uuid())
+        .bind(sealed)
+        .bind(salt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Everything the REST and storage services need to connect to `branch`, whatever its status.
     pub async fn branch_connection(
         &self,
@@ -720,6 +747,7 @@ impl MetadataClient {
             "SELECT b.id, b.database_id, b.status, b.endpoint_id, b.authenticator_password_enc,
                     b.storage_password_enc, b.storage_password_salt,
                     b.functions_password_enc, b.functions_password_salt,
+                    b.authenticator_elevated_password_enc, b.authenticator_elevated_password_salt,
                     d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
                     d.storage_max_connections
              FROM branches b
@@ -744,6 +772,8 @@ impl MetadataClient {
             storage_password_salt: r.get("storage_password_salt"),
             functions_password_enc: r.get("functions_password_enc"),
             functions_password_salt: r.get("functions_password_salt"),
+            authenticator_elevated_password_enc: r.get("authenticator_elevated_password_enc"),
+            authenticator_elevated_password_salt: r.get("authenticator_elevated_password_salt"),
             settings: DataApiSettings {
                 max_rows: r.get("max_rows"),
                 statement_timeout_ms: r.get("statement_timeout_ms"),
@@ -752,6 +782,23 @@ impl MetadataClient {
             },
             databases,
         }))
+    }
+
+    /// Ready branches whose data API was set up before the elevated login existed: an
+    /// authenticator password and no `chelabase_authenticator_elevated` password. Oldest
+    /// first. (A branch without an authenticator password is
+    /// [`Self::branches_missing_data_api`]'s.)
+    pub async fn branches_missing_elevated_login(&self) -> Result<Vec<BranchId>, MetadataError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT b.id FROM branches b
+             WHERE b.status = 'ready' AND b.kind = 'normal'
+               AND b.authenticator_password_enc IS NOT NULL
+               AND b.authenticator_elevated_password_enc IS NULL
+             ORDER BY b.created_at, b.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().map(BranchId).collect())
     }
 
     /// Ready branches (backups have no compute and are skipped) that still need the data API

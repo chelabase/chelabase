@@ -25,14 +25,14 @@ The key is sent as a bearer token. A public key (role `anon`) is safe in a brows
 `db.from(table)` starts a query; `"billing.invoices"` is a qualified name, and a bare name means the database's default schema. Builders are immutable and lazy: nothing is sent until you `await` (each `await` sends the request once). They also have `.catch()` and `.finally()`.
 
 ```ts twoslash
-import { createClient } from "@chelabase/client";
+import { createClient, op } from "@chelabase/client";
 import { type Database, types } from "./db";
 const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
 // ---cut---
 const rows = await db
   .from("orders")
   .select("id", "total", { col: "slug", as: "handle" })
-  .where({ status: "paid", total: { gte: "100" }, or: [{ qty: { gt: 2 } }, { vip: true }] })
+  .where({ status: "paid", total: op.gte("100"), or: [{ qty: op.gt(2) }, { vip: true }] })
   .orderBy("created_at", "desc", "last")
   .limit(50);
 
