@@ -527,11 +527,27 @@ fn newer_data_api_guard() -> String {
 }
 
 /// Whether a script stopped at [`newer_data_api_guard`]: the reason (naming both versions),
-/// from the `ERROR:` line psql printed, up to the end of that line.
+/// from the `ERROR:` line psql printed, up to the end of that line. The marker counts only
+/// where psql's error starts: at the start of a line, after the compute's
+/// `… exited with N: ` and psql's `psql:<stdin>:N: `, each optional. Inside another
+/// error's text (an identifier the project chose), it doesn't.
 pub fn newer_data_api_error(error: &str) -> Option<&str> {
     let marker = format!("ERROR:  {NEWER_DATA_API_MARK}: ");
-    let start = error.find(&marker)? + marker.len();
-    Some(error[start..].lines().next().unwrap_or("").trim_end())
+    error.lines().find_map(|line| {
+        let line = strip_numbered(line, " exited with ").unwrap_or(line);
+        let line = line
+            .strip_prefix("psql:<stdin>:")
+            .and_then(|rest| strip_numbered(rest, ""))
+            .unwrap_or(line);
+        line.strip_prefix(marker.as_str()).map(str::trim_end)
+    })
+}
+
+/// `line` after its first `<before><digits>: ` (`before` empty: at its start), or `None`.
+fn strip_numbered<'a>(line: &'a str, before: &str) -> Option<&'a str> {
+    let rest = if before.is_empty() { line } else { &line[line.find(before)? + before.len()..] };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0).then(|| rest[digits..].strip_prefix(": ")).flatten()
 }
 
 /// Whether `schema.table` exists (psql prints `t` or `f`).
@@ -1262,6 +1278,13 @@ COMMIT;
             format!("ERROR: {NEWER_DATA_API_MARK}: {why}"),
             format!("NOTICE:  {NEWER_DATA_API_MARK}: {why}"),
             format!("ERROR:  {}: the storage schema is version 99", crate::storage_schema::NEWER_SCHEMA_MARK),
+            // m2 audit nit 1: the marker inside another error's text (a users-table name the
+            // project admin chose) is not the guard's error.
+            format!(
+                "psql in compute ep exited with 3: psql:<stdin>:40: ERROR:  column banned_at of public.\"x ERROR:  {NEWER_DATA_API_MARK}: y\" is managed by Chelabase app users"
+            ),
+            format!("psql:<stdin>:40: ERROR:  relation \"ERROR:  {NEWER_DATA_API_MARK}: y\" does not exist"),
+            format!("CONTEXT:  ERROR:  {NEWER_DATA_API_MARK}: {why}"),
         ] {
             assert_eq!(newer_data_api_error(&other), None, "{other:?}");
         }
