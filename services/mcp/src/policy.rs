@@ -67,14 +67,14 @@ pub const TABLE: &[(&str, &str, Class)] = &[
     ("createFunctionDeployment", "POST", Excluded),
     ("getServiceLogs", "GET", Read),
     ("listFunctionSchedules", "GET", Read),
-    ("createFunctionSchedule", "POST", Write),
+    ("createFunctionSchedule", "POST", Destructive),
     ("deleteFunctionSchedule", "DELETE", Destructive),
-    ("updateFunctionSchedule", "PATCH", Write),
+    ("updateFunctionSchedule", "PATCH", Destructive),
     ("listFunctionSecrets", "GET", Read),
-    ("putFunctionSecret", "PUT", Write),
+    ("putFunctionSecret", "PUT", Destructive),
     ("deleteFunctionSecret", "DELETE", Destructive),
     ("listFunctionTriggers", "GET", Read),
-    ("createFunctionTrigger", "POST", Write),
+    ("createFunctionTrigger", "POST", Destructive),
     ("deleteFunctionTrigger", "DELETE", Destructive),
     ("updateFunctionTrigger", "PATCH", Destructive),
     ("listGuardExemptions", "GET", Read),
@@ -166,7 +166,7 @@ pub const TABLE: &[(&str, &str, Class)] = &[
     ("createInvite", "POST", Destructive),
     ("getInviteDelivery", "GET", Read),
     ("revokeInvite", "DELETE", Destructive),
-    ("resendInvite", "POST", Write),
+    ("resendInvite", "POST", Destructive),
     ("getMe", "GET", Read),
     ("listMembers", "GET", Read),
     ("removeMember", "DELETE", Destructive),
@@ -234,7 +234,7 @@ pub const RULES: &[(&str, &str, Rule)] = &[
     ),
     (
         "applySchemaChanges",
-        "Read with `dry_run: true`; destructive when any operation drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type or identity or lifts NOT NULL, or isn't known; otherwise write.",
+        "A dry run (`dry_run: true`) is read, or write when any operation carries a SQL expression (a default, generated column, check, exclusion, index expression or predicate, policy, or `using`). A real run is destructive when any operation carries one, drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type, default or identity or lifts NOT NULL, or isn't known; otherwise write.",
         schema_changes,
     ),
 ];
@@ -393,27 +393,42 @@ fn storage_create_bucket(body: &Value) -> Class {
     }
 }
 
-/// `applySchemaChanges`: a dry run always rolls back; otherwise the strictest operation.
+/// `applySchemaChanges`. A dry run rolls back, but the expressions it evaluates keep their
+/// effects outside the transaction (`nextval`, `setval`, dblink), so a dry run is `read` only
+/// when no operation runs caller code, and `write` otherwise. A real run is the strictest of
+/// its operations; one that runs caller code is destructive.
 fn schema_changes(body: &Value) -> Class {
     let Some(body) = body.as_object() else {
         return Destructive;
     };
+    let operations = body.get("operations").and_then(Value::as_array);
     if body.get("dry_run") == Some(&Value::Bool(true)) {
-        return Read;
+        return match operations {
+            Some(ops) if !ops.iter().any(runs_code) => Read,
+            _ => Write,
+        };
     }
-    let Some(operations) = body.get("operations").and_then(Value::as_array) else {
+    let Some(operations) = operations else {
         return Destructive;
     };
-    operations.iter().map(schema_change).max().unwrap_or(Write)
+    operations
+        .iter()
+        .map(|op| {
+            if runs_code(op) {
+                Destructive
+            } else {
+                schema_change(op)
+            }
+        })
+        .max()
+        .unwrap_or(Write)
 }
 
 /// One operation of a schema change: `{"<kind>": {...}}`. Only kinds known to add or rename
 /// without changing access are `write`; every other kind, known or not, is destructive.
+/// Whether it runs caller code is [`runs_code`]'s question.
 fn schema_change(op: &Value) -> Class {
-    let Some(op) = op.as_object().filter(|o| o.len() == 1) else {
-        return Destructive;
-    };
-    let Some((kind, fields)) = op.iter().next() else {
+    let Some((kind, fields)) = single_entry(op) else {
         return Destructive;
     };
     match kind.as_str() {
@@ -443,20 +458,124 @@ fn schema_change(op: &Value) -> Class {
         }
         // A comment or a new NOT NULL loses nothing; a new type, a `USING`, an identity, a
         // default, a collation or a lifted NOT NULL may.
-        "alter_column" => {
-            let Some(change) = fields.get("change").and_then(Value::as_object) else {
-                return Destructive;
-            };
-            let harmless = change.iter().all(|(key, value)| match key.as_str() {
-                _ if value.is_null() => true,
-                "comment" => true,
-                "not_null" => value == &Value::Bool(true),
-                _ => false,
-            });
-            if harmless { Write } else { Destructive }
-        }
+        "alter_column" if harmless_column_change(fields) => Write,
         _ => Destructive,
     }
+}
+
+/// Whether an operation makes Postgres run code the caller wrote or picked: a SQL expression
+/// (a column's `default` or `generated`, a check, an exclusion's predicate, an index's
+/// expression key or predicate, a policy's `using` or `with_check`, an `alter_column`'s
+/// `using` or new default) or an exclusion's operators. These are the expression slots of
+/// `chelabase_schema::ddl::expressions`, which only checks that each is one expression: a
+/// function call with arguments of the caller's choosing passes, and Postgres runs it over
+/// the table's rows. A shape this doesn't recognise counts as running code.
+fn runs_code(op: &Value) -> bool {
+    let Some((kind, fields)) = single_entry(op) else {
+        return true;
+    };
+    match kind.as_str() {
+        "add_column" => column_runs_code(fields.get("column")),
+        "add_constraint" => constraint_runs_code(fields.get("constraint")),
+        "create_table" => {
+            let columns = match fields.get("columns") {
+                Some(Value::Array(columns)) => columns.iter().any(|c| column_runs_code(Some(c))),
+                _ => true,
+            };
+            let constraints = match fields.get("constraints") {
+                None | Some(Value::Null) => false,
+                Some(Value::Array(cs)) => cs.iter().any(|c| constraint_runs_code(Some(c))),
+                Some(_) => true,
+            };
+            columns || constraints || !empty(fields.get("policies"))
+        }
+        "create_index" => {
+            let keys = match fields.get("keys") {
+                None | Some(Value::Null) => false,
+                Some(Value::Array(keys)) => !keys.iter().all(|k| {
+                    single_entry(k).is_some_and(|(kind, key)| kind == "column" && key.is_object())
+                }),
+                Some(_) => true,
+            };
+            keys || !matches!(fields.get("predicate"), None | Some(Value::Null))
+        }
+        "alter_column" => !harmless_column_change(fields),
+        // These name tables, columns, roles, types and values; none holds an expression.
+        "rename_table"
+        | "set_table_schema"
+        | "drop_table"
+        | "set_table_comment"
+        | "set_table_owner"
+        | "rename_column"
+        | "drop_column"
+        | "validate_constraint"
+        | "rename_constraint"
+        | "drop_constraint"
+        | "drop_index"
+        | "rename_index"
+        | "set_rls"
+        | "rename_policy"
+        | "drop_policy"
+        | "grant"
+        | "revoke"
+        | "create_enum"
+        | "add_enum_value"
+        | "rename_enum_value"
+        | "rename_enum"
+        | "drop_enum"
+        | "grant_schema"
+        | "revoke_schema"
+        | "grant_sequence"
+        | "revoke_sequence"
+        | "grant_function"
+        | "revoke_function"
+        | "alter_default_privileges"
+        | "set_all_rows" => false,
+        // `create_policy` and `alter_policy` carry `using` and `with_check`; anything else is
+        // a kind this grammar doesn't know.
+        _ => true,
+    }
+}
+
+/// A column spec with a `default` or `generated` expression, or one that isn't an object.
+fn column_runs_code(column: Option<&Value>) -> bool {
+    let Some(column) = column.and_then(Value::as_object) else {
+        return true;
+    };
+    ["default", "generated"]
+        .iter()
+        .any(|key| !matches!(column.get(*key), None | Some(Value::Null)))
+}
+
+/// A constraint other than a primary key, unique or foreign key: a check runs its expression
+/// and an exclusion its operators (and predicate) on the table's rows.
+fn constraint_runs_code(constraint: Option<&Value>) -> bool {
+    let Some(kind) = constraint.and_then(|c| c.get("kind")) else {
+        return true;
+    };
+    !single_entry(kind)
+        .is_some_and(|(kind, _)| matches!(kind.as_str(), "primary_key" | "unique" | "foreign_key"))
+}
+
+/// An `alter_column` that only sets a comment or adds NOT NULL.
+fn harmless_column_change(fields: &Value) -> bool {
+    let Some(change) = fields.get("change").and_then(Value::as_object) else {
+        return false;
+    };
+    change.iter().all(|(key, value)| match key.as_str() {
+        _ if value.is_null() => true,
+        "comment" => true,
+        "not_null" => value == &Value::Bool(true),
+        _ => false,
+    })
+}
+
+/// The one entry of an externally tagged value: `{"<kind>": fields}`.
+fn single_entry(value: &Value) -> Option<(&String, &Value)> {
+    value
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.iter().next())
 }
 
 /// Absent, null or an empty list.
@@ -755,6 +874,104 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// Every operation that carries a caller-written SQL expression, or makes Postgres run an
+    /// operator the caller names, over the table's rows.
+    fn code_carrying_operations() -> Vec<Value> {
+        let t = json!({"name": "orders"});
+        let int4 = json!({"name": "int4"});
+        let col = |extra: Value| {
+            let mut c = json!({"name": "x", "data_type": int4});
+            for (k, v) in extra.as_object().unwrap() {
+                c[k] = v.clone();
+            }
+            c
+        };
+        vec![
+            // The audit's four cases (B1).
+            json!({"add_column": {"table": t, "column": col(json!({
+                "default": "public.delete_account('00000000-0000-0000-0000-000000000001')"}))}}),
+            json!({"add_column": {"table": t, "column": col(json!({"generated": "public.purge(id)"}))}}),
+            json!({"add_constraint": {"table": t, "constraint": {"name": "k",
+                "kind": {"check": {"expression": "public.purge(id) IS NOT NULL"}}}}}),
+            json!({"create_index": {"table": t,
+                "keys": [{"expression": {"sql": "public.purge(id)"}}]}}),
+            // The other expression slots.
+            json!({"add_column": {"table": t, "column": col(json!({"default": "0"}))}}),
+            json!({"create_index": {"table": t, "keys": [{"column": {"name": "id"}}],
+                "predicate": "public.purge(id)"}}),
+            json!({"add_constraint": {"table": t, "constraint": {"kind": {"exclusion": {
+                "method": "gist", "elements": [{"column": "c", "operator": {"name": "&&"}}],
+                "predicate": "public.purge(id)"}}}}}),
+            // An exclusion runs the operators it names on every pair of rows.
+            json!({"add_constraint": {"table": t, "constraint": {"kind": {"exclusion": {
+                "method": "gist", "elements": [{"column": "c",
+                    "operator": {"schema": "public", "name": "===="}}]}}}}}),
+            json!({"create_table": {"table": t, "columns": [col(json!({"default": "now()"}))]}}),
+            json!({"create_table": {"table": t, "columns": [col(json!({"generated": "id * 2"}))]}}),
+            json!({"create_table": {"table": t, "columns": [col(json!({}))],
+                "constraints": [{"kind": {"check": {"expression": "x > 0"}}}]}}),
+            json!({"alter_column": {"table": t, "column": "x",
+                "change": {"default": {"set": "public.purge(1)"}}}}),
+            json!({"alter_column": {"table": t, "column": "x",
+                "change": {"data_type": int4, "using": "public.purge(x)"}}}),
+            json!({"create_policy": {"table": t, "policy": {"name": "p", "using": "true"}}}),
+            json!({"alter_policy": {"table": t, "name": "p", "with_check": "true"}}),
+            // A shape this grammar doesn't know may hold an expression.
+            json!({"add_column": {"table": t, "column": "x"}}),
+            json!({"add_constraint": {"table": t, "constraint": {"kind": "check"}}}),
+            json!({"create_index": {"table": t, "keys": [{"other": {"sql": "f()"}}]}}),
+            json!({"create_index": {"table": t, "keys": "public.purge(id)"}}),
+            json!({"create_table": {"table": t, "columns": "x"}}),
+            json!({"future_kind": {"table": t}}),
+        ]
+    }
+
+    #[test]
+    fn schema_change_with_a_caller_expression_is_destructive() {
+        for op in code_carrying_operations() {
+            assert_eq!(changes(json!([op])), Class::Destructive, "{op}");
+            let body = json!({"dry_run": false, "operations": [op]});
+            assert_eq!(class(CHANGES, body), Class::Destructive, "{op}");
+        }
+        // Without an expression the same kinds stay writes.
+        let t = json!({"name": "orders"});
+        let column = json!({"name": "x", "data_type": {"name": "int4"},
+            "default": null, "generated": null, "not_null": true});
+        for op in [
+            json!({"add_column": {"table": t, "column": column}}),
+            json!({"create_table": {"table": t, "columns": [column], "constraints": [
+                {"kind": {"primary_key": {"columns": ["x"]}}},
+                {"kind": {"unique": {"columns": ["x"]}}},
+                {"kind": {"foreign_key": {"columns": ["x"], "references": {"name": "o"},
+                    "referenced_columns": ["id"]}}}]}}),
+            json!({"add_constraint": {"table": t, "constraint": {"kind": {"unique": {
+                "columns": ["x"]}}}}}),
+            json!({"create_index": {"table": t, "keys": [{"column": {"name": "x"}}],
+                "predicate": null}}),
+        ] {
+            assert_eq!(changes(json!([op])), Class::Write, "{op}");
+        }
+    }
+
+    #[test]
+    fn a_dry_run_with_an_expression_is_write() {
+        let dry = |ops: Value| class(CHANGES, json!({"dry_run": true, "operations": ops}));
+        for op in code_carrying_operations() {
+            assert_eq!(dry(json!([op])), Class::Write, "{op}");
+        }
+        let setval = json!({"add_column": {"table": {"name": "orders"}, "column": {
+            "name": "x", "data_type": {"name": "int8"}, "default": "setval('orders_id_seq', 1)"}}});
+        let drop = json!({"drop_table": {"table": {"name": "orders"}}});
+        assert_eq!(dry(json!([drop, setval])), Class::Write);
+        // With no expression a dry run is still a read, whatever it would change.
+        assert_eq!(dry(json!([drop])), Class::Read);
+        assert_eq!(dry(json!([])), Class::Read);
+        // A dry run whose operations can't be read is never a read.
+        assert_eq!(dry(json!("drop")), Class::Write);
+        assert_eq!(class(CHANGES, json!({"dry_run": true})), Class::Write);
+        assert_eq!(dry(json!(["add_column"])), Class::Write);
     }
 
     #[test]
