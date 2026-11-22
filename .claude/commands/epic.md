@@ -19,6 +19,9 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
    invalidation, reconciles), weigh a NATS event (`crates/chelabase-nats`) against polling,
    reconcile loops or direct database reads, and record the choice in the design sketch
    (Approach or Rejected).
+   For a hard plan (cross-service design, auth, privileges, migrations, lock ordering, or
+   unclear scope), call the `advisor` now, before cutting milestones, and once more before
+   step 7 (`AGENTS.md`, Advisor). Skip it for routine epics.
 2. Pick a kebab-case slug (≤ 30 chars) and an epic title `type(area): summary`.
 3. Cut milestones. Each one:
    - lands in one build run (aim ≤ ~400 changed lines);

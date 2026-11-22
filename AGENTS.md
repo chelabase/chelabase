@@ -74,6 +74,21 @@ Three kinds of call still belong to others or never change:
 - an audit doesn't loop: if fix rounds keep narrowing one criterion, the auditor recommends
   the end state it judges best and moves the rest to the backlog.
 
+## Advisor
+
+When the `advisor` tool is available, each role uses it only at its decision points, not on
+every step:
+
+| Role | Call the advisor |
+|---|---|
+| Planner (`/epic`, `/epic-security` propose) | Only for hard plans: cross-service designs, auth, privileges, migrations, lock ordering, or unclear scope. Call it before cutting milestones, and once more before presenting the draft. |
+| Builder (`/build` milestones and fix rounds, `/quick`) | Only when the same error or test failure comes back after you tried to fix it. Don't call it on the first failure. |
+| Auditor | Only when stuck: you can't tell whether a finding is real, a reproduction won't converge, or the verdict is unclear. |
+| Coordinator (`/build` itself) | Before the epic gate, and when a milestone needs a second fix round. |
+
+Give the advice real weight. If it conflicts with evidence you have, such as a file, a test
+result or a doc, raise the conflict in one more call instead of switching silently.
+
 ## Git and safety
 
 - Stage explicit paths only; never `git add -A`.

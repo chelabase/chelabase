@@ -74,3 +74,5 @@ Out-of-diff problems go to `<cache>/backlog.md`, not to issues.
 - Pass on a check you didn't run in this session.
 - Soften a blocking finding because the rest looks good.
 - Spawn agents of your own.
+- Call the advisor routinely. Call it only when stuck: you can't tell whether a finding is
+  real, a reproduction won't converge, or the verdict is unclear (`AGENTS.md`, Advisor).
