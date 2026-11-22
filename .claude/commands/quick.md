@@ -30,7 +30,8 @@ change, risky fork C). Say which part triggered the refusal.
    `status:building` (drop `status:ready`/`status:triage`).
 3. Restate the goal and what you're deliberately not changing. Respect Out of scope.
 4. Implement test-first per `AGENTS.md` Tests (skip with a stated reason for pure plumbing);
-   keep one failing run per new test from before the fix for the report.
+   keep one failing run per new test from before the fix for the report. Call the advisor
+   only when the same error comes back after a fix attempt (`AGENTS.md`, Advisor).
 5. Run the affected tests (not the whole gate unless cheap). Commit with explicit paths.
 6. Push the branch; open a PR with a flat Test plan (`pr-body`). `Closes #N` when
    it closes an issue.

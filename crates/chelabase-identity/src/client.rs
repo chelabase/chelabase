@@ -274,6 +274,29 @@ impl Identity {
         email_verified: bool,
     ) -> Result<User, IdentityError> {
         let body = json!({ "email": email, "email_verified": email_verified });
+        self.put_email(pool, user_id, body).await
+    }
+
+    /// As [`set_email`](Self::set_email), and the previous address is told it was replaced
+    /// (when SMTP is configured and the address changes; a refused send is not an error).
+    pub async fn set_email_notifying(
+        &self,
+        pool: &Pool,
+        user_id: &str,
+        email: &str,
+        email_verified: bool,
+    ) -> Result<User, IdentityError> {
+        let body =
+            json!({ "email": email, "email_verified": email_verified, "notify_previous": true });
+        self.put_email(pool, user_id, body).await
+    }
+
+    async fn put_email(
+        &self,
+        pool: &Pool,
+        user_id: &str,
+        body: Value,
+    ) -> Result<User, IdentityError> {
         let out: UserBody = self
             .call(&ops::SET_EMAIL, Some(pool), Some(user_id), &[], Some(body))
             .await?;

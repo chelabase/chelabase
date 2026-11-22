@@ -168,6 +168,13 @@ struct FakeMetadata {
     /// or approval's teams (`teams_seen_hold`), apart from `race_before_write` so a checked
     /// grant write's `settle` never takes it.
     race_before_teams_seen: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
+    /// m10: a write "another request" commits just before the next invite write takes its
+    /// locks (`create_invited_member`, or an invite's `put_project_grants`), as a tenant
+    /// admin's removal landing between the invite's reads and its write.
+    race_before_invite_write: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
+    /// O2: a write "another request" commits just before the next function secret write takes
+    /// its locks, as a kind change landing between the route's read of the kind and the write.
+    race_before_secret_write: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
     /// Edge functions m3: functions, deployments, branch state and secrets.
     functions: Arc<Mutex<FakeFunctions>>,
 }
@@ -175,6 +182,11 @@ struct FakeMetadata {
 impl orchestrator::functions_triggers::TriggersPort for FakeMetadata {
     async fn add_trigger(&self, t: &chelabase_metadata::NewTrigger<'_>) -> Result<uuid::Uuid, MetadataError> {
         self.fn_scope(t.branch_id, t.function_id)?;
+        if self.functions.lock().unwrap().triggers.iter().filter(|r| r.branch_id == t.branch_id && r.function_id == t.function_id).count() as i64
+            >= chelabase_metadata::MAX_TRIGGERS_PER_FUNCTION
+        {
+            return Err(MetadataError::FunctionLimit("a function has at most 20 triggers on a branch".into()));
+        }
         let id = uuid::Uuid::new_v4();
         let table = t.source == chelabase_metadata::TriggerSource::Table;
         self.functions.lock().unwrap().triggers.push(chelabase_metadata::TriggerRecord {
@@ -3777,6 +3789,19 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(self.members.lock().unwrap().iter().find(|m| m.id == member).cloned())
     }
 
+    async fn removed_member_with_email(&self, tenant: TenantId, email: &str) -> Result<bool, MetadataError> {
+        let email = email.trim().to_lowercase();
+        if email.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .members
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Removed && m.email.as_deref() == Some(email.as_str())))
+    }
+
     async fn member_by_email(&self, tenant: TenantId, email: &str) -> Result<Option<MemberRecord>, MetadataError> {
         let email = email.trim().to_lowercase();
         if email.is_empty() {
@@ -4402,6 +4427,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         if !grants.iter().all(|(p, _)| seen.insert(*p)) {
             return Err(AccessWriteError::Conflict("a project twice".into()));
         }
+        self.run_invite_write_race();
         let m = self.writable_member(member)?;
         if grants.iter().any(|(p, _)| !self.project_active_in(m.tenant_id, *p)) {
             return Err(AccessWriteError::NotFound);
@@ -4497,7 +4523,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         new: chelabase_metadata::members::NewInvite<'_>,
     ) -> FakeWrite<(chelabase_metadata::members::MemberListing, uuid::Uuid)> {
         use chelabase_metadata::members::{AccessWriteError, NewInvite};
-        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams } = new;
+        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams, readmit_removed } = new;
+        self.run_invite_write_race();
         // P25: the teams must still be what the check read, or nothing is written.
         self.teams_seen_hold(tenant, teams)?;
         let email = email.trim().to_lowercase();
@@ -4510,6 +4537,15 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         });
         if taken {
             return Err(AccessWriteError::Conflict("email taken".into()));
+        }
+        // m10, as the store under the tenant lock: a removed row with this user or email.
+        let removed = self.members.lock().unwrap().iter().any(|m| {
+            m.tenant_id == tenant
+                && m.status == MemberStatus::Removed
+                && (m.identity_user_id == identity_user_id || m.email.as_deref() == Some(email.as_str()))
+        });
+        if removed && !readmit_removed {
+            return Err(AccessWriteError::RemovedMember);
         }
         let id = existing.as_ref().map_or_else(uuid::Uuid::new_v4, |m| m.id);
         self.insert_member_grants(tenant, id, grants)?;
@@ -5155,6 +5191,35 @@ impl FakeMetadata {
         self.race_before_teams_seen.lock().unwrap().push_back(Box::new(write));
     }
 
+    /// m10: a write that commits just before the next invite write takes its locks.
+    fn race_invite_write_once(&self, write: impl FnOnce(&FakeMetadata) + Send + 'static) {
+        self.race_before_invite_write.lock().unwrap().push_back(Box::new(write));
+    }
+
+    /// O2: a write that commits just before the next function secret write takes its locks.
+    pub fn race_secret_write_once(&self, write: impl FnOnce(&FakeMetadata) + Send + 'static) {
+        self.race_before_secret_write.lock().unwrap().push_back(Box::new(write));
+    }
+
+    /// The function's kind as a secret write reads it under its locks: the pending race first,
+    /// then the store's check ([`chelabase_metadata::secret_write_allowed`]).
+    fn secret_write_check(&self, branch: BranchId, function: uuid::Uuid, tenant_admin: bool, setting: Option<&str>) -> Result<(), MetadataError> {
+        let race = self.race_before_secret_write.lock().unwrap().pop_front();
+        if let Some(write) = race {
+            write(self);
+        }
+        self.fn_scope(branch, function)?;
+        let kind = self.functions.lock().unwrap().functions.iter().find(|f| f.id == function).map(|f| f.kind);
+        chelabase_metadata::secret_write_allowed(kind.ok_or(MetadataError::FunctionNotFound)?, tenant_admin, setting)
+    }
+
+    fn run_invite_write_race(&self) {
+        let race = self.race_before_invite_write.lock().unwrap().pop_front();
+        if let Some(write) = race {
+            write(self);
+        }
+    }
+
     /// P25 under the tenant lock: runs the pending teams race (`race_teams_once`), then
     /// `Changed` unless every team is still a team of `tenant` with the grants the check read.
     fn teams_seen_hold(&self, tenant: TenantId, teams: &[chelabase_metadata::members::TeamSeen]) -> FakeWrite<()> {
@@ -5649,14 +5714,14 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
         Ok(out)
     }
 
-    async fn put_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str, value: &str) -> Result<(), MetadataError> {
+    async fn put_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str, value: &str, tenant_admin: bool) -> Result<(), MetadataError> {
         if !chelabase_metadata::valid_secret_name(name) {
             return Err(MetadataError::InvalidFunction("a secret name is a letter or _, then A-Z, a-z, 0-9 and _".into()));
         }
         if value.len() > chelabase_metadata::MAX_SECRET_BYTES {
             return Err(MetadataError::InvalidFunction("a secret is at most 65536 bytes".into()));
         }
-        self.fn_scope(branch, function)?;
+        self.secret_write_check(branch, function, tenant_admin, Some(name))?;
         let mut fs = self.functions.lock().unwrap();
         let total = chelabase_metadata::secrets_env_bytes(
             fs.secrets
@@ -5675,8 +5740,8 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
         Ok(())
     }
 
-    async fn delete_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str) -> Result<bool, MetadataError> {
-        self.fn_scope(branch, function)?;
+    async fn delete_secret(&self, branch: BranchId, function: uuid::Uuid, name: &str, tenant_admin: bool) -> Result<bool, MetadataError> {
+        self.secret_write_check(branch, function, tenant_admin, None)?;
         Ok(self.functions.lock().unwrap().secrets.remove(&(branch.as_uuid(), function, name.to_string())).is_some())
     }
 
@@ -5705,6 +5770,11 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
 impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
     async fn add_schedule(&self, s: &chelabase_metadata::NewSchedule<'_>) -> Result<uuid::Uuid, MetadataError> {
         self.fn_scope(s.branch_id, s.function_id)?;
+        if self.functions.lock().unwrap().schedules.iter().filter(|r| r.branch_id == s.branch_id && r.function_id == s.function_id).count() as i64
+            >= chelabase_metadata::MAX_SCHEDULES_PER_FUNCTION
+        {
+            return Err(MetadataError::FunctionLimit("a function has at most 20 schedules on a branch".into()));
+        }
         let id = uuid::Uuid::new_v4();
         self.functions.lock().unwrap().schedules.push(chelabase_metadata::ScheduleRecord {
             id,

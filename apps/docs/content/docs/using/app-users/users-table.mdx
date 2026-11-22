@@ -27,7 +27,7 @@ rows of public.users are created and deleted by Chelabase app users
 column email is managed by Chelabase app users
 ```
 
-Your own columns can be updated, by the owner or by users through their policy.
+Your own columns can be updated by the owner, and by users on their own row for each column you grant them (see below).
 
 ## Its shape is protected
 
@@ -45,23 +45,41 @@ On a new table:
 
 - `anon` has no privileges;
 - row-level security is on;
-- `authenticated` can select and update, narrowed by two own-row policies: `chelabase_users_select_own` (`USING (id = chelabase.user_id())`) and `chelabase_users_update_own`. (It holds a `DELETE` grant too, but the guard refuses every delete.)
+- `authenticated` can select its own row (`chelabase_users_select_own`, `USING (id = chelabase.user_id())`). It holds a `DELETE` grant too, but the guard refuses every delete;
+- `authenticated` has no `UPDATE`: no user can change any column until you grant it.
+
+To let users edit one of your columns on their own row, grant it per column:
+
+```sql
+GRANT UPDATE (nickname) ON users TO authenticated;
+```
+
+The `chelabase_users_update_own` policy keeps that grant to the user's own row. Managed columns stay refused by the guard whatever you grant.
+
+Grant `UPDATE` per column, not on the whole table: every time Chelabase sets the users table up again (re-enabling app users, a repair, a new branch, or the branch's compute being re-created, reset or restored), it removes a table-level `UPDATE` held by `authenticated` and keeps its column-level `UPDATE` grants. A table-level `UPDATE` granted to `PUBLIC` or to a role `authenticated` belongs to isn't removed, and opens every column you add to every user: don't grant one.
 
 The policies aren't protected: change or drop them like any policy. Studio's [RLS warning](/using/studio) names the users table while RLS is off.
 
 ## Sign-up data is opt-in per column
 
-`signUp`'s `data` reaches a column only when `authenticated` may insert into it:
+`signUp`'s `data` reaches a column only when that column is granted `INSERT` straight to `authenticated`:
 
 ```sql
 GRANT INSERT (display_name) ON users TO authenticated;
 ```
 
-Any other key is 422 `unknown_column`. That includes managed columns, generated columns and `GENERATED ALWAYS` identity columns. `REVOKE INSERT (display_name) ON users FROM authenticated` takes a column out again.
+Only this column-level grant to `authenticated` counts. A table-level `GRANT INSERT ON users …`, a grant to `PUBLIC`, or a grant to a role `authenticated` is a member of doesn't open a column to sign-up data. Any other key is 422 `unknown_column`. That includes managed columns, generated columns and `GENERATED ALWAYS` identity columns. `REVOKE INSERT (display_name) ON users FROM authenticated` takes a column out again.
 
 The values go through your column types and constraints. A failure is 422 `constraint_violation` with Postgres' message (and the constraint's name when it has one), and no identity user is created.
 
 The generated `db.ts` (Studio's **Download types**, `curl` of `/data/v1/types`; they produce the same module) marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
+
+## Changes for existing projects
+
+Projects whose users table was created before this change:
+
+- **Table-level `UPDATE` is removed.** Earlier users tables gave `authenticated` `UPDATE` on the whole table. The next time Chelabase sets the users table up again (see above), that grant is removed. Column-level `UPDATE` grants you made to `authenticated` are kept. A table-level `INSERT` held by `authenticated` or `anon` is removed the same way, and their column-level `INSERT` grants are kept. A kept column grant that the removal cleared comes back without grant option and with the table's owner as its grantor, and grants that `authenticated` passed on to other roles are removed with the table-level grant. If a table-level grant was made by a role that no longer has `USAGE` on the table's schema, the setup fails and names the table and that role: revoke the grant as that role, or give it `USAGE` again. If users edit their own columns through the data API, grant each such column before then: `GRANT UPDATE (nickname) ON users TO authenticated;`.
+- **Sign-up data needs a column-level grant.** A sign-up's `data` no longer reaches a column through a table-level, `PUBLIC` or inherited `INSERT` grant, only through `GRANT INSERT (col) ON users TO authenticated`. Through the SDK, a key for any other column is 422 `unknown_column`.
 
 ## Defaults and triggers run as `chelabase_auth_sync`
 

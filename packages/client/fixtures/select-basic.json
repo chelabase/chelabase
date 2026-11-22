@@ -1,5 +1,5 @@
 {
-  "call": "db.from(\"orders\").select(\"id\", \"total\", { col: \"customer_name\", as: \"customer\" }).where({ status: \"paid\", total: { gte: \"100\" } }).orderBy(\"created_at\", \"desc\").limit(50)",
+  "call": "db.from(\"orders\").select(\"id\", \"total\", { col: \"customer_name\", as: \"customer\" }).where({ status: \"paid\", total: op.gte(\"100\") }).orderBy(\"created_at\", \"desc\").limit(50)",
   "tree": {
     "v": 1,
     "op": "select",

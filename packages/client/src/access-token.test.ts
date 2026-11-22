@@ -73,7 +73,8 @@ describe("accessToken callback", () => {
       () => a.resendCode({ email: "a@b.co" }),
       () => a.requestPasswordReset({ email: "a@b.co" }),
       () => a.confirmPasswordReset({ email: "a@b.co", code: "1", password: "pw" }),
-      () => a.changeEmail({ email: "a@b.co" }),
+      () => a.changeEmail({ email: "a@b.co", currentPassword: "pw" }),
+      () => a.confirmEmailChange({ email: "a@b.co", code: "1" }),
       () => a.changePassword({ currentPassword: "pw", password: "pw2" }),
     ];
     for (const c of calls) await expect(c()).rejects.toThrow(/accessToken/);

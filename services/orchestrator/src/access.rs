@@ -179,6 +179,18 @@ pub fn deny_to_api(d: Deny) -> ApiError {
     }
 }
 
+/// Whether the caller is a tenant admin: its member row says so. A caller without a member
+/// row (a key, the operator) never is.
+pub(crate) fn is_tenant_admin(principal: &AuthPrincipal) -> bool {
+    principal.member.as_ref().is_some_and(|m| m.tenant_admin)
+}
+
+/// 403 `forbidden`, `required: "tenant admin"`: the one answer for anything only a tenant admin
+/// may do, the same as the route gate of a tenant admin's endpoint ([`Access::TenantAdmin`]).
+pub(crate) fn tenant_admin_needed() -> ApiError {
+    deny_to_api(Deny::Forbidden { required: "tenant admin".to_string() })
+}
+
 fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
     error!("authorize: {what}: {err}");
     ApiError::internal()

@@ -5508,6 +5508,14 @@ async fn webhook_urls_must_reach_only_public_addresses() {
         assert!(message_of(&body).contains("url"), "{url}: {body}");
         // The answer names the host, never the address it resolved to (internal DNS).
         assert!(!body.to_string().contains("10.0.0.7"), "{url}: {body}");
+        // A resolution-dependent refusal is one message for all; a form error says which.
+        let msg = message_of(&body);
+        let generic = "the URL's host must resolve only to public addresses";
+        let form_error = ["http://", "user:pw@", "ftp://", "not a url"].iter().any(|f| url.contains(f));
+        assert_eq!(msg.contains(generic), !form_error, "{url}: {body}");
+        for leak in ["does not resolve", "non-public", "part of the platform", "not a public address", "example.test"] {
+            assert!(!msg.contains(leak), "{url}: {body}");
+        }
     }
     // Within the cap as sent, over it once normalized (each é is percent-encoded to 6 bytes):
     // refused as too long, not stored past the column's limit.
@@ -9466,7 +9474,7 @@ async fn merge_with_security_steps_needs_admin() {
 
     // Without a security step a Developer applies it.
     w.metadata.merges.lock().unwrap().iter_mut().find(|r| r.id == w.merge).unwrap().status = MergeStatus::Draft;
-    set(json!({ "steps": [{ "id": "t1", "data_loss": false, "security": false }] }));
+    set(json!({ "steps": [{ "id": "t1", "kind": "generated", "data_loss": false, "security": false }] }));
     assert_eq!(w.app.send_as("dev1", "org-1", Method::POST, &apply, Some(json!({}))).await.status(), 202);
 }
 
@@ -9783,7 +9791,7 @@ async fn merge_security_retry_and_acknowledgements_need_admin() {
     let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await, 403).await;
     assert_eq!(err["error"]["required"], "admin");
     assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await.status(), 202);
-    set_plan(&w, MergeStatus::Failed, json!({ "steps": [{ "id": "t1", "security": false }] }));
+    set_plan(&w, MergeStatus::Failed, json!({ "steps": [{ "id": "t1", "kind": "generated", "security": false }] }));
     assert_eq!(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/retry"), Some(json!({}))).await.status(), 202);
 
     // Acknowledgements.
@@ -9801,6 +9809,178 @@ async fn merge_security_retry_and_acknowledgements_need_admin() {
     set_plan(&w, MergeStatus::Rehearsed, json!({ "steps": [{ "wat": 1 }] }));
     let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, &format!("{merge}/apply"), Some(json!({}))).await, 403).await;
     assert_eq!(err["error"]["required"], "admin");
+}
+
+// Merges with user SQL (`user` and `own_sql` steps): the worker runs them as the branch owner,
+// so rehearsing, applying, retrying and resuming such a plan is an Admin's, on any target.
+
+/// A plan step as the engine writes it.
+fn plan_step(id: &str, kind: &str, phase: &str) -> Value {
+    json!({
+        "id": id, "kind": kind, "phase": phase, "sql": "SELECT 1", "items": [],
+        "data_loss": false, "rewrite": false, "security": false, "locks": [],
+        "role_op": null, "online": null,
+    })
+}
+
+/// `set_plan`, with the merge's recorded user steps and failed phase.
+fn set_merge_sql(w: &MemberWorld, status: MergeStatus, plan: Value, user_steps: Value, failed_phase: Option<&str>) {
+    set_plan(w, status, plan);
+    let mut rows = w.metadata.merges.lock().unwrap();
+    let m = rows.iter_mut().find(|r| r.id == w.merge).unwrap();
+    m.user_steps = user_steps;
+    if status == MergeStatus::Failed {
+        m.failed_phase = failed_phase.map(str::to_string);
+    }
+}
+
+fn merge_status(w: &MemberWorld) -> MergeStatus {
+    w.metadata.merges.lock().unwrap().iter().find(|r| r.id == w.merge).unwrap().status
+}
+
+/// The world with a Developer `dev1` and an Admin `ada` on its project.
+async fn user_sql_world() -> MemberWorld {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "dev1", w.project, PlatformRole::Developer, &[]);
+    w.metadata.add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    w
+}
+
+async fn expect_admin_only(w: &MemberWorld, path: &str, what: &str) {
+    let err = error_of(w.app.send_as("dev1", "org-1", Method::POST, path, Some(json!({}))).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "{what}");
+}
+
+#[tokio::test]
+async fn merge_with_user_steps_needs_admin_to_rehearse() {
+    let w = user_sql_world().await;
+    let rehearse = format!("/v1/databases/{}/merges/{}/rehearse", w.db, w.merge);
+    for kind in ["user", "own_sql"] {
+        let plan = json!({ "steps": [plan_step("g1", "generated", "tx"), plan_step("u1", kind, "tx")] });
+        set_merge_sql(&w, MergeStatus::Draft, plan, json!([]), None);
+        expect_admin_only(&w, &rehearse, kind).await;
+        assert_eq!(merge_status(&w), MergeStatus::Draft, "{kind}");
+        assert!(w.jobs.merge_jobs.lock().unwrap().is_empty(), "{kind}");
+        assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &rehearse, Some(json!({}))).await.status(), 202, "{kind}");
+        w.jobs.merge_jobs.lock().unwrap().clear();
+    }
+}
+
+#[tokio::test]
+async fn merge_with_user_steps_needs_admin_to_apply() {
+    let w = user_sql_world().await;
+    let apply = format!("/v1/databases/{}/merges/{}/apply", w.db, w.merge);
+    for kind in ["user", "own_sql"] {
+        let plan = json!({ "steps": [plan_step("u1", kind, "tx")] });
+        set_merge_sql(&w, MergeStatus::Rehearsed, plan, json!([]), None);
+        expect_admin_only(&w, &apply, kind).await;
+        assert_eq!(merge_status(&w), MergeStatus::Rehearsed, "{kind}");
+        assert!(w.jobs.merge_jobs.lock().unwrap().is_empty(), "no job on a Developer's 403: {kind}");
+        assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &apply, Some(json!({}))).await.status(), 202, "{kind}");
+        w.jobs.merge_jobs.lock().unwrap().clear();
+    }
+}
+
+#[tokio::test]
+async fn merge_with_user_steps_needs_admin_to_retry_and_resume() {
+    let w = user_sql_world().await;
+    let retry = format!("/v1/databases/{}/merges/{}/retry", w.db, w.merge);
+    // `tx` applies again from the start; `online` resumes the online steps (user SQL can be one).
+    for (phase, step_phase) in [("tx", "tx"), ("online", "online")] {
+        let plan = json!({ "steps": [plan_step("g1", "generated", "tx"), plan_step("u1", "user", step_phase)] });
+        set_merge_sql(&w, MergeStatus::Failed, plan, json!([]), Some(phase));
+        expect_admin_only(&w, &retry, phase).await;
+        assert_eq!(merge_status(&w), MergeStatus::Failed, "{phase}");
+        assert!(w.jobs.merge_jobs.lock().unwrap().is_empty(), "no job on a Developer's 403: {phase}");
+        assert_eq!(w.app.send_as("ada", "org-1", Method::POST, &retry, Some(json!({}))).await.status(), 202, "{phase}");
+        w.jobs.merge_jobs.lock().unwrap().clear();
+    }
+}
+
+// O9 (m2 nit 1): a retry runs the plan that was checked: a write landing between the read and
+// the move (a newer version) refuses it with 409, publishing nothing, as rehearse and apply do.
+#[tokio::test]
+async fn retry_is_guarded_by_the_version() {
+    let w = user_sql_world().await;
+    let retry = format!("/v1/databases/{}/merges/{}/retry", w.db, w.merge);
+    for phase in ["tx", "online"] {
+        let plan = json!({ "steps": [plan_step("g1", "generated", "tx")] });
+        set_merge_sql(&w, MergeStatus::Failed, plan, json!([]), Some(phase));
+        *w.metadata.bump_merge_version_on_write.lock().unwrap() = true;
+        let resp = w.app.send_as("ada", "org-1", Method::POST, &retry, Some(json!({}))).await;
+        assert_eq!(resp.status(), 409, "{phase}");
+        assert_eq!(merge_status(&w), MergeStatus::Failed, "{phase}");
+        assert!(w.jobs.merge_jobs.lock().unwrap().is_empty(), "{phase}");
+    }
+}
+
+#[tokio::test]
+async fn unreadable_plan_steps_need_admin() {
+    let w = user_sql_world().await;
+    let merge = format!("/v1/databases/{}/merges/{}", w.db, w.merge);
+    let plans = [json!({ "steps": "nope" }), json!({ "steps": [{ "id": "x", "kind": "mystery" }] }), json!({ "steps": [{ "id": "x" }] })];
+    for plan in plans {
+        set_merge_sql(&w, MergeStatus::Draft, plan.clone(), json!([]), None);
+        expect_admin_only(&w, &format!("{merge}/rehearse"), &format!("rehearse {plan}")).await;
+        set_merge_sql(&w, MergeStatus::Rehearsed, plan.clone(), json!([]), None);
+        expect_admin_only(&w, &format!("{merge}/apply"), &format!("apply {plan}")).await;
+    }
+}
+
+#[tokio::test]
+async fn recorded_user_steps_need_admin_without_plan_steps() {
+    let w = user_sql_world().await;
+    let apply = format!("/v1/databases/{}/merges/{}/apply", w.db, w.merge);
+    let plan = json!({ "steps": [plan_step("g1", "generated", "tx")] });
+    let recorded = json!([{ "id": "u1", "after": null, "sql": "SELECT 1" }]);
+    set_merge_sql(&w, MergeStatus::Rehearsed, plan, recorded, None);
+    expect_admin_only(&w, &apply, "apply").await;
+    assert_eq!(merge_status(&w), MergeStatus::Rehearsed);
+}
+
+#[tokio::test]
+async fn generated_only_plan_is_run_by_a_developer() {
+    let w = user_sql_world().await;
+    let merge = format!("/v1/databases/{}/merges/{}", w.db, w.merge);
+    let plan = json!({ "steps": [plan_step("g1", "generated", "tx"), plan_step("g2", "generated", "online")] });
+    let as_dev = |path: String| {
+        let app = &w.app;
+        async move { app.send_as("dev1", "org-1", Method::POST, &path, Some(json!({}))).await.status() }
+    };
+    set_merge_sql(&w, MergeStatus::Draft, plan.clone(), json!([]), None);
+    assert_eq!(as_dev(format!("{merge}/rehearse")).await, 202);
+    set_merge_sql(&w, MergeStatus::Rehearsed, plan.clone(), json!([]), None);
+    assert_eq!(as_dev(format!("{merge}/apply")).await, 202);
+    for phase in ["tx", "online"] {
+        set_merge_sql(&w, MergeStatus::Failed, plan.clone(), json!([]), Some(phase));
+        assert_eq!(as_dev(format!("{merge}/retry")).await, 202, "{phase}");
+    }
+}
+
+#[tokio::test]
+async fn drafting_user_steps_stays_developer() {
+    let w = user_sql_world().await;
+    let merge = format!("/v1/databases/{}/merges/{}", w.db, w.merge);
+    let plan = json!({ "steps": [plan_step("u1", "user", "tx")] });
+    let recorded = json!([{ "id": "u1", "after": null, "sql": "SELECT 1" }]);
+    let send = |method: Method, path: String, body: Value| {
+        let app = &w.app;
+        async move { app.send_as("dev1", "org-1", method, &path, Some(body)).await.status() }
+    };
+
+    set_merge_sql(&w, MergeStatus::Draft, plan.clone(), recorded.clone(), None);
+    let version = w.metadata.merges.lock().unwrap().iter().find(|r| r.id == w.merge).unwrap().version;
+    let save = json!({ "version": version, "steps": [{ "id": "u2", "after": null, "sql": "SELECT 2" }] });
+    assert_eq!(send(Method::PATCH, merge.clone(), save).await, 200);
+
+    set_merge_sql(&w, MergeStatus::Draft, plan.clone(), recorded.clone(), None);
+    assert_eq!(send(Method::POST, format!("{merge}/recompute"), json!({})).await, 202);
+
+    set_merge_sql(&w, MergeStatus::Rehearsed, plan.clone(), recorded.clone(), None);
+    assert_eq!(send(Method::POST, format!("{merge}/cancel"), json!({})).await, 202);
+
+    set_merge_sql(&w, MergeStatus::Failed, plan, recorded, Some("online"));
+    assert_eq!(send(Method::POST, format!("{merge}/abandon"), json!({})).await, 200);
 }
 
 // I2: the database that holds a project's app users can't be deleted from under them.
@@ -10495,8 +10675,9 @@ async fn grant_put_rechecks_existing_overrides() {
     assert_eq!(err["error"]["role"], "login");
 }
 
-// I2 (R29): a removed member comes back only as `invited`, with a notice (they have an
-// account); the ban stays until they accept, and the event names the inviter.
+// I2 (R29): a removed member comes back only as `invited` (a tenant admin's invite, m10), with a
+// notice (they have an account); the ban stays until they accept, and the event names the
+// inviter.
 #[tokio::test]
 async fn removed_member_is_reinvited_with_a_notice() {
     let t = mw(Mode::SelfHosted).await;
@@ -10505,10 +10686,9 @@ async fn removed_member_is_reinvited_with_a_notice() {
     t.w.metadata.set_member(t.w.tenant, &z, |m| m.email = Some("rae@x.com".into()));
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{rae}"), None).await.status(), 204);
     assert!(t.identity.user(&Pool::Members, &z).unwrap().banned);
-    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[]);
-    let padmin = t.w.metadata.member(t.w.tenant, "padmin").unwrap().id;
+    let inviter = t.w.metadata.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
     let body = json!({ "email": "rae@x.com", "platform_role": "viewer", "pg_roles": [] });
-    let resp = t.send("padmin", Method::POST, &format!("/v1/projects/{}/invites", t.w.project), Some(body)).await;
+    let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/projects/{}/invites", t.w.project), Some(body)).await;
     assert_eq!(resp.status(), 201);
     let body = body_of(resp).await;
     assert_eq!((body["outcome"].as_str(), body["member"]["status"].as_str()), (Some("invited"), Some("invited")));
@@ -10523,7 +10703,7 @@ async fn removed_member_is_reinvited_with_a_notice() {
     let event = t.w.metadata.events.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
         (event.action.as_str(), event.actor_member_id, event.project_id),
-        ("invite_created", Some(padmin), Some(t.w.project.as_uuid()))
+        ("invite_created", Some(inviter), Some(t.w.project.as_uuid()))
     );
     // Revoking it never deletes an account with a password.
     let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
@@ -16792,4 +16972,206 @@ async fn revoke_invite_retries_the_identity_step() {
     assert_eq!(code_of(&err), "identity_unavailable");
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
     assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.io"), None);
+}
+
+// --- m10: links and re-admitting removed members are a tenant admin's ------------------------
+
+fn project_invite_path(t: &Mw) -> String {
+    format!("/v1/projects/{}/invites", t.w.project)
+}
+
+fn project_invite_body(email: &str, delivery: &str) -> Value {
+    json!({ "email": email, "platform_role": "viewer", "pg_roles": [], "delivery": delivery })
+}
+
+/// A project Admin who is not a tenant admin.
+fn padmin(t: &Mw) -> uuid::Uuid {
+    t.w.metadata.add_granted(t.w.tenant, "padmin", t.w.project, PlatformRole::Admin, &[])
+}
+
+fn assert_tenant_admin_needed(err: &Value) {
+    assert_eq!((code_of(err), err["error"]["required"].as_str()), ("forbidden", Some("tenant admin")), "{err}");
+}
+
+/// What no refused invite may leave behind: no identity call that makes a user or a code, no
+/// mail, no invite.
+fn assert_nothing_sent(t: &Mw) {
+    let calls = t.identity.calls();
+    assert!(!calls.iter().any(|c| c == "POST /internal/v1/pools/members/users" || c == CODES_ROUTE), "{calls:?}");
+    assert!(t.identity.codes_sent().is_empty() && t.identity.notices_sent().is_empty());
+    assert!(t.w.metadata.invites.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn project_link_invite_needs_tenant_admin() {
+    let t = mw(Mode::SelfHosted).await;
+    padmin(&t);
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("new@x.com", "link"))).await;
+    assert_tenant_admin_needed(&error_of(resp, 403).await);
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.com"), None, "no members-pool user");
+    assert!(!t.w.metadata.members.lock().unwrap().iter().any(|m| m.email.as_deref() == Some("new@x.com")), "no member row");
+    assert_nothing_sent(&t);
+    assert!(t.actions().is_empty(), "{:?}", t.actions());
+}
+
+#[tokio::test]
+async fn tenant_admin_project_link_invite_still_works() {
+    let t = mw(Mode::SelfHosted).await;
+    let resp = t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("new@x.com", "link"))).await;
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    let body = created(resp).await;
+    let sub = t.identity.user_by_email(&Pool::Members, "new@x.com").expect("an identity user");
+    let url = body["invite_url"].as_str().expect("the link");
+    assert!(url.starts_with(&format!("http://studio.test/accept-invite?user={sub}&code=")), "{url}");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Invited);
+}
+
+#[tokio::test]
+async fn project_admin_cannot_reinvite_a_removed_member() {
+    for delivery in ["email", "link"] {
+        let t = mw(Mode::SelfHosted).await;
+        // Passwordless and unverified, so a tenant admin's link would be allowed for them.
+        let sub = t.identity.with_invited_user(&Pool::Members, "back@x.com");
+        let member = t.w.metadata.add_granted(t.w.tenant, &sub, t.w.project, PlatformRole::Developer, &["app"]);
+        t.w.metadata.set_member(t.w.tenant, &sub, |m| m.email = Some("back@x.com".into()));
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+        padmin(&t);
+        let events = t.actions().len();
+        let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("back@x.com", delivery))).await;
+        assert_tenant_admin_needed(&error_of(resp, 403).await);
+        let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+        assert_eq!((stored.status, stored.offboarded), (MemberStatus::Removed, true), "{delivery}");
+        assert_nothing_sent(&t);
+        assert_eq!(t.actions().len(), events, "{delivery}: {:?}", t.actions());
+    }
+}
+
+#[tokio::test]
+async fn tenant_admin_reinvites_a_removed_member() {
+    for path in ["project", "tenant"] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "back@x.com");
+        t.w.metadata.set_member(t.w.tenant, &sub, |m| m.email = Some("back@x.com".into()));
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+        let resp = if path == "project" {
+            t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("back@x.com", "email"))).await
+        } else {
+            t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "viewer", &[]))).await
+        };
+        let body = created(resp).await;
+        assert_eq!(body["member"]["id"], member.to_string(), "{path}: the same row");
+        let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+        assert_eq!((stored.status, stored.offboarded), (MemberStatus::Invited, false), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn project_admin_email_invite_and_grant_unchanged() {
+    let t = mw(Mode::SelfHosted).await;
+    padmin(&t);
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("new@x.com", "email"))).await;
+    let body = created(resp).await;
+    assert_eq!(body["outcome"], "invited");
+    assert_eq!(t.identity.codes_sent().len(), 1, "the code is mailed");
+    // A live member just gets the grant.
+    let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, "bob", |m| m.email = Some("bob@x.com".into()));
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("bob@x.com", "email"))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["outcome"], "existing_member");
+    assert_eq!(t.grant_of(bob).map(|g| g.platform_role), Some(PlatformRole::Viewer));
+}
+
+// The removed row's members-pool user is gone (a passwordless user deleted when its invite was
+// revoked): the invite finds no user and no live member, and the store refuses it by email.
+#[tokio::test]
+async fn project_admin_cannot_readmit_a_removed_member_under_a_new_account() {
+    let t = mw(Mode::SelfHosted).await;
+    let gone = t.w.metadata.add_member(t.w.tenant, "gone-user", MemberStatus::Removed, false);
+    t.w.metadata.set_member(t.w.tenant, "gone-user", |m| {
+        m.email = Some("gone@x.com".into());
+        m.offboarded = true;
+    });
+    padmin(&t);
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("gone@x.com", "email"))).await;
+    assert_tenant_admin_needed(&error_of(resp, 403).await);
+    let rows: Vec<MemberRecord> =
+        t.w.metadata.members.lock().unwrap().iter().filter(|m| m.email.as_deref() == Some("gone@x.com")).cloned().collect();
+    assert_eq!(rows.len(), 1, "no new row: {rows:?}");
+    assert_eq!((rows[0].id, rows[0].status, rows[0].offboarded), (gone, MemberStatus::Removed, true));
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "gone@x.com"), None, "no user made");
+    // O4: refused before any identity call, so no members-pool user was ever made.
+    assert!(!t.identity.calls().iter().any(|c| c == "POST /internal/v1/pools/members/users"), "{:?}", t.identity.calls());
+    assert!(t.identity.codes_sent().is_empty() && t.w.metadata.invites.lock().unwrap().is_empty());
+    // A tenant admin may: a new row for the new account, as before.
+    created(t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("gone@x.com", "email"))).await).await;
+}
+
+// O4: a refused project-Admin invite of a removed row's email, now another account's, has no
+// side effects: no identity call reads, makes or mails anyone, and the person's hourly invite
+// budget is untouched, so a tenant admin's invite right after still goes out.
+#[tokio::test]
+async fn refused_invites_of_a_removed_email_spend_no_invite_budget() {
+    let t = mw(Mode::SelfHosted).await;
+    t.w.metadata.add_member(t.w.tenant, "gone-user", MemberStatus::Removed, false);
+    t.w.metadata.set_member(t.w.tenant, "gone-user", |m| {
+        m.email = Some("gone@x.com".into());
+        m.offboarded = true;
+    });
+    t.identity.with_user(&Pool::Members, "gone@x.com", "Secret-pass1");
+    padmin(&t);
+    let before = t.identity.calls().len();
+    for email in ["gone@x.com", "  GONE@X.Com "] {
+        for _ in 0..5 {
+            let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body(email, "email"))).await;
+            assert_tenant_admin_needed(&error_of(resp, 403).await);
+        }
+    }
+    let calls = t.identity.calls();
+    assert_eq!(&calls[before..], &[] as &[String], "no identity call");
+    assert_nothing_sent(&t);
+    created(t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("gone@x.com", "email"))).await).await;
+}
+
+// A tenant admin's removal commits between the invite's reads and its write: the write's own
+// check refuses it, for a live member found at read time and for a person found nowhere then.
+#[tokio::test]
+async fn removal_racing_a_project_invite_stays_removed() {
+    // Live at the read, removed before the grants write.
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "rae@x.com");
+    t.w.metadata.set_member(t.w.tenant, &sub, |m| m.email = Some("rae@x.com".into()));
+    padmin(&t);
+    let tenant = t.w.tenant;
+    let removed = sub.clone();
+    t.w.metadata.race_invite_write_once(move |md| {
+        md.set_member(tenant, &removed, |m| {
+            m.status = MemberStatus::Removed;
+            m.offboarded = true;
+        })
+    });
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("rae@x.com", "email"))).await;
+    assert_tenant_admin_needed(&error_of(resp, 403).await);
+    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+    assert_eq!((stored.id, stored.status, stored.offboarded), (member, MemberStatus::Removed, true));
+    assert_eq!(t.grant_of(member).map(|g| g.platform_role), Some(PlatformRole::Developer), "no grant written");
+
+    // Found nowhere at the read; a removed row with the email is there at the write.
+    let t = mw(Mode::SelfHosted).await;
+    padmin(&t);
+    let tenant = t.w.tenant;
+    t.w.metadata.race_invite_write_once(move |md| {
+        md.add_member(tenant, "late-user", MemberStatus::Removed, false);
+        md.set_member(tenant, "late-user", |m| {
+            m.email = Some("late@x.com".into());
+            m.offboarded = true;
+        });
+    });
+    let resp = t.send("padmin", Method::POST, &project_invite_path(&t), Some(project_invite_body("late@x.com", "email"))).await;
+    assert_tenant_admin_needed(&error_of(resp, 403).await);
+    let rows: Vec<MemberRecord> =
+        t.w.metadata.members.lock().unwrap().iter().filter(|m| m.email.as_deref() == Some("late@x.com")).cloned().collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].status, rows[0].offboarded), (MemberStatus::Removed, true));
+    assert!(t.w.metadata.invites.lock().unwrap().is_empty());
 }

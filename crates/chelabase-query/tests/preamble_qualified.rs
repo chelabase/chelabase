@@ -5,7 +5,8 @@
 //! database's owner controls can shadow them.
 
 use chelabase_query::engine::{
-    GUARDED_PREAMBLE_SQL, OWNER_GUARDED_PREAMBLE_SQL, OWNER_PREAMBLE_SQL, PREAMBLE_SQL,
+    GUARDED_PREAMBLE_SQL, NO_SQL_PREPARED_SQL, OWNER_GUARDED_PREAMBLE_SQL, OWNER_PREAMBLE_SQL,
+    POOLED_RESET_SQL, PREAMBLE_SQL, SESSION_CHECK_SQL,
 };
 
 /// Words that are grammar, not functions, when an opening parenthesis follows them.
@@ -84,6 +85,10 @@ fn every_preamble_is_qualified() {
         ("OWNER_PREAMBLE_SQL", OWNER_PREAMBLE_SQL),
         ("GUARDED_PREAMBLE_SQL", GUARDED_PREAMBLE_SQL),
         ("OWNER_GUARDED_PREAMBLE_SQL", OWNER_GUARDED_PREAMBLE_SQL),
+        // The session check and the reset run under the same `search_path`.
+        ("SESSION_CHECK_SQL", SESSION_CHECK_SQL),
+        ("NO_SQL_PREPARED_SQL", NO_SQL_PREPARED_SQL),
+        ("POOLED_RESET_SQL", POOLED_RESET_SQL),
     ] {
         let found = unqualified(sql);
         assert!(found.is_empty(), "{name}: {found:?}\n{sql}");

@@ -197,6 +197,8 @@ After the rehearsal, the preview shows what your SQL actually produced, so you c
 
 All merge SQL runs as the branch's **owner** role, never as a superuser, so your SQL can't do more than the owner could.
 
+Because it runs as the owner, a plan with your own SQL (a step, or own SQL in a resolution) is rehearsed, applied and retried only by an **Admin** of the project, on every branch, protected or not. A Developer can still write and save the steps, recompute, cancel and abandon the merge; rehearse, apply and retry answer 403 `forbidden` with `required: "admin"`. A plan made only of generated steps stays a Developer's.
+
 ## Rehearse
 
 ```

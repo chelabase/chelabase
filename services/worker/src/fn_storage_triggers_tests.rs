@@ -473,3 +473,199 @@ async fn fn_storage_triggers_consumers_follow_the_triggers() {
     assert!(running.is_empty());
     assert_eq!(bus.deleted.lock().unwrap().len(), 3);
 }
+
+/// Counts the invocations in flight at once; each waits to be released.
+struct Blocking {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl Invoker for Blocking {
+    async fn invoke(&self, _: BranchId, _: &str, _: serde_json::Value) -> Result<u16, String> {
+        let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(n, Ordering::SeqCst);
+        self.release.acquire().await.unwrap().forget();
+        self.now.fetch_sub(1, Ordering::SeqCst);
+        Ok(200)
+    }
+}
+
+/// Deliveries of any number of triggers share one in-flight bound: with more ready than
+/// [`MAX_STORAGE_TRIGGER_IN_FLIGHT`] no more than that many invocations run at once, and the
+/// rest go ahead as the first end.
+#[tokio::test]
+async fn deliveries_share_one_in_flight_bound() {
+    use crate::fn_storage_triggers::MAX_STORAGE_TRIGGER_IN_FLIGHT as BOUND;
+    let blocking = Arc::new(Blocking {
+        now: 0.into(),
+        most: 0.into(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let recorder = Arc::new(FakeRecorder::default());
+    let d = Arc::new(Delivery::new(blocking.clone(), recorder));
+    let total = BOUND + 10;
+    let now = Utc::now();
+    let tasks: Vec<_> = (0..total)
+        .map(|i| {
+            let d = d.clone();
+            // Each its own trigger, spread over databases so no database's share binds.
+            let mut t = target(&["object.created"], None, None);
+            t.database_id = DatabaseId(Uuid::from_u128(100 + (i % 8) as u128));
+            let mut e = event(ObjectEventType::Created, "a", &format!("{i}"), now);
+            e.database_id = t.database_id.0;
+            let payload = serde_json::to_vec(&e).unwrap();
+            tokio::spawn(async move { d.process(&t, &payload, 1, now, 0.0).await })
+        })
+        .collect();
+    while blocking.now.load(Ordering::SeqCst) < BOUND {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(blocking.now.load(Ordering::SeqCst), BOUND, "no invocation past the bound");
+    blocking.release.add_permits(total);
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), Next::Ack);
+    }
+    assert_eq!(blocking.most.load(Ordering::SeqCst), BOUND);
+}
+
+/// Counts invocations in flight per branch (each test database has its own branch).
+struct PerBranch {
+    now: Mutex<HashMap<BranchId, (usize, usize)>>,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl Invoker for PerBranch {
+    async fn invoke(&self, branch: BranchId, _: &str, _: serde_json::Value) -> Result<u16, String> {
+        {
+            let mut now = self.now.lock().unwrap();
+            let e = now.entry(branch).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(e.0);
+        }
+        self.release.acquire().await.unwrap().forget();
+        self.now.lock().unwrap().get_mut(&branch).unwrap().0 -= 1;
+        Ok(200)
+    }
+}
+
+/// W5: one database's deliveries hold at most their share of the in-flight bound. With that
+/// database's invocations blocked and many more of them queued (more than the whole shared
+/// bound), another database's delivery still starts at once; the first never has more than
+/// its share in flight; and a database with nothing in flight keeps no entry.
+#[tokio::test]
+async fn one_database_holds_at_most_its_share() {
+    use crate::fn_storage_triggers::{
+        MAX_STORAGE_TRIGGER_IN_FLIGHT as BOUND, MAX_STORAGE_TRIGGER_IN_FLIGHT_PER_DATABASE as SHARE,
+    };
+    let invoker = Arc::new(PerBranch {
+        now: Mutex::default(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let d = Arc::new(Delivery::new(invoker.clone(), Arc::new(FakeRecorder::default())));
+    let now = Utc::now();
+    let spawn = |database: u128, i: usize| {
+        let d = d.clone();
+        let mut t = target(&["object.created"], None, None);
+        t.database_id = DatabaseId(Uuid::from_u128(database));
+        t.branch_id = BranchId(Uuid::from_u128(database));
+        let mut e = event(ObjectEventType::Created, "a", &format!("{i}"), now);
+        (e.database_id, e.branch_id) = (t.database_id.0, t.branch_id.0);
+        let payload = serde_json::to_vec(&e).unwrap();
+        tokio::spawn(async move { d.process(&t, &payload, 1, now, 0.0).await })
+    };
+    let in_flight = |database: u128| {
+        let now = invoker.now.lock().unwrap();
+        now.get(&BranchId(Uuid::from_u128(database))).map_or(0, |e| e.0)
+    };
+    let settle = async || {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let busy: Vec<_> = (0..BOUND + 10).map(|i| spawn(7, i)).collect();
+    settle().await;
+    assert_eq!(in_flight(7), SHARE, "the busy database runs its share and no more");
+    let other = spawn(8, 0);
+    settle().await;
+    assert_eq!(in_flight(8), 1, "another database's delivery starts while the first is blocked");
+    assert_eq!(in_flight(7), SHARE);
+    assert_eq!(d.databases_in_flight(), 2);
+    invoker.release.add_permits(BOUND + 11);
+    for t in busy.into_iter().chain([other]) {
+        assert_eq!(t.await.unwrap(), Next::Ack);
+    }
+    let most = invoker.now.lock().unwrap().values().map(|e| e.1).max().unwrap();
+    assert_eq!(most, SHARE);
+    assert_eq!(d.databases_in_flight(), 0, "no entry is kept for an idle database");
+    // A delivery cancelled while it waits for a share leaves no entry either.
+    let held: Vec<_> = (0..SHARE + 1).map(|i| spawn(9, i)).collect();
+    settle().await;
+    for t in &held {
+        t.abort();
+    }
+    for t in held {
+        let _ = t.await;
+    }
+    assert_eq!(d.databases_in_flight(), 0);
+}
+
+/// W6: a message is covered by progress acks from the moment it is received, also while it
+/// waits for one of its trigger's four slots, and the trigger never runs more than four at
+/// once. With six messages and the function blocked for three times the ack wait, every one
+/// of the six gets a progress ack at least every `ACK_WAIT / 3`, only four are being worked
+/// on, and no ack is sent for a message after it ended.
+#[tokio::test(start_paused = true)]
+async fn every_delivered_message_is_covered_while_it_waits() {
+    use crate::fn_storage_triggers::{ACK_WAIT, CONCURRENCY, covered};
+    use std::sync::atomic::AtomicUsize;
+    let slots = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let acks: Vec<Arc<AtomicUsize>> = (0..6).map(|_| Arc::default()).collect();
+    let tasks: Vec<_> = acks
+        .iter()
+        .cloned()
+        .map(|acks| {
+            let (slots, started, release) = (slots.clone(), started.clone(), release.clone());
+            tokio::spawn(async move {
+                covered(
+                    &slots,
+                    ACK_WAIT / 3,
+                    || async {
+                        acks.fetch_add(1, Ordering::SeqCst);
+                    },
+                    async {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        release.acquire().await.unwrap().forget();
+                    },
+                )
+                .await
+            })
+        })
+        .collect();
+    let mut last = vec![0; acks.len()];
+    for third in 1..=9 {
+        tokio::time::sleep(ACK_WAIT / 3 + Duration::from_millis(1)).await;
+        assert_eq!(started.load(Ordering::SeqCst), CONCURRENCY, "four at once per trigger");
+        for (i, a) in acks.iter().enumerate() {
+            let n = a.load(Ordering::SeqCst);
+            assert!(n > last[i], "message {i} got no progress ack in third {third}");
+            last[i] = n;
+        }
+    }
+    release.add_permits(6);
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 6);
+    let done: Vec<usize> = acks.iter().map(|a| a.load(Ordering::SeqCst)).collect();
+    tokio::time::sleep(ACK_WAIT).await;
+    let after: Vec<usize> = acks.iter().map(|a| a.load(Ordering::SeqCst)).collect();
+    assert_eq!(after, done, "no progress ack after a message ended");
+}
