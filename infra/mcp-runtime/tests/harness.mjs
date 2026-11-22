@@ -17,7 +17,8 @@ export const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 
 // The stub host. `spec` is the JSON text /internal/spec serves; `requests` records every request
 // as "METHOD /path" with its parsed JSON body; `reply` answers an exec callback
-// ({status, headers, body} by default 200 with an echo of what the runner sent).
+// ({status, headers, body} by default 200 with an echo of what the runner sent). With `stallSpec`
+// set, /internal/spec never answers.
 export async function startHost({ spec = { paths: {} } } = {}) {
   const host = {
     specText: JSON.stringify(spec),
@@ -38,6 +39,7 @@ export async function startHost({ spec = { paths: {} } } = {}) {
       }
       host.requests.push({ line: `${req.method} ${req.url}`, headers: req.headers, body });
       if (req.method === "GET" && req.url === "/internal/spec") {
+        if (host.stallSpec) return;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(host.specText);
         return;
@@ -54,7 +56,11 @@ export async function startHost({ spec = { paths: {} } } = {}) {
   await new Promise((resolve) => server.listen(0, "0.0.0.0", resolve));
   host.port = server.address().port;
   host.specHash = () => sha256(host.specText);
-  host.close = () => new Promise((resolve) => server.close(resolve));
+  host.close = () =>
+    new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    });
   return host;
 }
 
@@ -71,7 +77,8 @@ export async function startRuntime(host, { restart = "no", memory = "512m" } = {
   const id = await docker(
     "run", "-d", "--restart", restart,
     "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-    "--memory", memory, "--pids-limit", "256",
+    // Swap equal to memory, as compose runs it: the memory limit is the whole bound.
+    "--memory", memory, "--memory-swap", memory, "--pids-limit", "256",
     ...hosts, "-p", "127.0.0.1::8080",
     IMAGE,
     // The image's command, with the host moved to the stub's port.

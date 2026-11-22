@@ -9,7 +9,7 @@
 // The answer (200) is {ok: true, result, logs} or {ok: false, error: {code, message, stack?},
 // logs}, with codes invalid_code (does not parse, or is not a function), threw, timeout and
 // not_serializable (a function, symbol, bigint or cycle in the value, or over 4 MiB). A request
-// the runner can't take is 400/405/413; a spec it can't get from the host is 502.
+// the runner can't take is 400/405/413; a spec it can't get from the host (within 10 s) is 502.
 //
 // Each run goes through LOADER.load(): an anonymous worker, never cached or reused, so no
 // isolate, global or module state is shared between runs or callers, and the isolate is
@@ -24,8 +24,9 @@
 //            host's 200 answer {status, headers, body}. The code chooses none of host, path or
 //            id; the request's own headers (a caller's credential) never reach the sandbox.
 // The pinned workerd accepts the loader's `limits` but doesn't enforce them, and offers no
-// memory limit for loaded workers; the timeout, the watchdog (busy loops) and the V8 heap cap in
-// config.capnp (unbounded allocation) bound a run instead.
+// memory limit for loaded workers; the timeout, the watchdog (busy loops), the V8 heap cap in
+// config.capnp (unbounded JS heap) and the container's memory limit (ArrayBuffer memory, which
+// the heap cap doesn't count) bound a run instead.
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 const MAX_CODE_BYTES = 256 << 10;
@@ -36,6 +37,7 @@ const MAX_ANSWER_BYTES = 6 << 20; // a 4 MiB result plus logs
 const MAX_HOST_REQUEST_BYTES = 1 << 20;
 const MAX_HOST_ANSWER_BYTES = 8 << 20;
 const MAX_TIMEOUT_MS = 60_000;
+const SPEC_TIMEOUT_MS = 10_000;
 const EXEC_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 const COMPAT_DATE = "2026-10-01";
@@ -120,12 +122,23 @@ function specText(env, hash) {
 }
 
 async function fetchSpec(env, hash) {
-  const res = await env.HOST.fetch("http://mcp-internal/internal/spec", { redirect: "manual" });
-  if (res.status !== 200) {
-    await res.body?.cancel();
-    throw new Refused(502, `the host answered ${res.status} for the spec`);
+  // The whole exchange, body included, within SPEC_TIMEOUT_MS: a stalled host fails the run.
+  const signal = AbortSignal.timeout(SPEC_TIMEOUT_MS);
+  const stalled = () => new Refused(502, `the host did not send the spec within ${SPEC_TIMEOUT_MS / 1000} s`);
+  let res;
+  let bytes;
+  try {
+    res = await env.HOST.fetch("http://mcp-internal/internal/spec", { redirect: "manual", signal });
+    if (res.status !== 200) {
+      await res.body?.cancel();
+      throw new Refused(502, `the host answered ${res.status} for the spec`);
+    }
+    bytes = await readCapped(res.body, MAX_SPEC_BYTES, new Refused(502, "the spec is over 16 MiB"));
+  } catch (e) {
+    if (e instanceof Refused) throw e;
+    if (signal.aborted) throw stalled();
+    throw new Refused(502, `the spec request failed: ${String(e?.message ?? e).slice(0, 256)}`);
   }
-  const bytes = await readCapped(res.body, MAX_SPEC_BYTES, new Refused(502, "the spec is over 16 MiB"));
   if (hex(await crypto.subtle.digest("SHA-256", bytes)) !== hash) throw new Refused(502, "the spec does not match spec_hash");
   let text;
   try {
@@ -259,9 +272,10 @@ async function run(env, ctx, job, spec) {
     } catch (e) {
       if (abort.signal.aborted) return null;
       // workerd ends a run early when it can prove it never settles (awaiting nothing that can
-      // resolve): that is the timeout too, just known sooner.
+      // resolve): that is the timeout too, just known sooner. A run that calls abortIsolate()
+      // gets the very same error, so the message names both.
       if (/detected that your Worker's code had hung/.test(String(e?.message))) {
-        return { ok: false, error: { code: "timeout", message: "the run never settles" }, logs: [] };
+        return { ok: false, error: { code: "timeout", message: "the run never settles, or ended its own isolate" }, logs: [] };
       }
       // A remote exception is the loaded worker's handler failing (the code broke main.js's
       // builtins); anything else is the worker failing to start: a syntax error, or a throw at

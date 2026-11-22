@@ -56,7 +56,7 @@ expect 'brand-new-dir/file.txt' $'rust=full\nweb=full'
 expect 'crates/brand-new-crate/src/lib.rs' $'rust=full\nweb=full'
 expect 'packages/design/tokens.css' $'rust=none\nweb=@chelabase/studio @chelabase/design @chelabase/docs @chelabase/landing'
 expect 'packages/neon-e2e/check.mjs' $'rust=none\nweb=none'
-expect_has 'openapi/management.json' rust= orchestrator
+expect_has 'openapi/management.json' rust= orchestrator mcp
 expect_has 'openapi/management.json' web= @chelabase/management-client @chelabase/studio
 expect_has 'packages/client/fixtures/gen/db.ts' rust= chelabase-query chelabase-typegen chelabase
 # A file only a dependency reads selects its dependents too.
@@ -67,8 +67,10 @@ expect 'packages/client/README.md' $'rust=none\nweb=@chelabase/client @chelabase
 expect 'apps/docs/content/docs/architecture/gateway.mdx' $'rust=none\nweb=@chelabase/docs'
 expect 'apps/docs/content/docs/reference/access.mdx' $'rust=chelabase-routes\nweb=@chelabase/studio @chelabase/docs'
 expect 'packages/client/fixtures/gen/db.ts' $'rust=chelabase-query chelabase-typegen chelabase\nweb=@chelabase/client @chelabase/docs'
-expect 'openapi/management.json' $'rust=orchestrator\nweb=@chelabase/management-client @chelabase/studio @chelabase/docs'
-expect 'openapi/data.json' $'rust=chelabase-query rest\nweb=@chelabase/studio @chelabase/docs'
+expect 'openapi/management.json' $'rust=orchestrator mcp\nweb=@chelabase/management-client @chelabase/studio @chelabase/docs'
+expect 'openapi/data.json' $'rust=chelabase-query rest mcp\nweb=@chelabase/studio @chelabase/docs'
+# The MCP spec bundle: built into the mcp library, read by no web package.
+expect 'openapi/mcp.json' $'rust=mcp\nweb=none'
 # The docs build renders all three documents as its API reference (api-source.server.ts).
 expect_has 'openapi/login.json' web= @chelabase/docs
 expect 'infra/compose/.env.example' $'rust=realtime chelabase\nweb=@chelabase/studio @chelabase/docs @chelabase/landing'
