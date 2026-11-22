@@ -37,6 +37,7 @@ dotenvy = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+chelabase-time = { workspace = true }
 chelabase-neon = { workspace = true, features = ["metadata"] }
 getrandom = { workspace = true }
 hex = { workspace = true }

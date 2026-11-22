@@ -58,6 +58,7 @@ zeroize = { workspace = true }
 [dev-dependencies]
 # ResolvedFunction's compatibility date, in the metadata fake.
 chrono = { workspace = true }
+chelabase-time = { workspace = true }
 # The dispatcher model test (m13b, moved from the worker).
 proptest = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }

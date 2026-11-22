@@ -25,6 +25,7 @@ chelabase-routes = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true, features = ["axum", "openapi"] }
 chrono = { workspace = true }
+chelabase-time = { workspace = true }
 dotenvy = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
