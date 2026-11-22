@@ -20,6 +20,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use serde_json::json;
 
 use crate::auth::{Authenticator, Caller};
+use crate::limits::{Admission, Limits};
 use crate::protocol::{SUPPORTED_REVISIONS, Server};
 use crate::sandbox::Sandbox;
 
@@ -39,6 +40,8 @@ pub struct Settings {
     pub allowed_origins: Vec<String>,
     /// Log each call's code in its audit line (`CHELABASE_MCP_LOG_CODE=1`).
     pub log_code: bool,
+    /// What bounds each tool call.
+    pub limits: Limits,
 }
 
 struct Gate {
@@ -86,7 +89,12 @@ pub fn router(
     config.legacy_session_mode = false;
     config.sse_keep_alive = None;
     config.max_request_body_bytes = MAX_BODY;
-    let server = Server::new(sandbox, settings.log_code);
+    let server = Server::new(
+        sandbox,
+        Admission::new(&settings.limits),
+        settings.limits.result_max_bytes,
+        settings.log_code,
+    );
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),
@@ -191,7 +199,12 @@ pub struct Audit<'a> {
     pub destructive: bool,
     pub duration_ms: u64,
     pub outcome: &'a str,
+    /// Bytes of the tool result's text (after any cut).
     pub result_bytes: usize,
+    /// Whether the result was cut to the cap.
+    pub truncated: bool,
+    /// The run's id (empty when nothing ran).
+    pub exec_id: &'a str,
 }
 
 /// Writes `record`'s one `info` line (target `mcp::audit`).
@@ -211,6 +224,8 @@ pub fn audit(record: &Audit<'_>, log_code: bool) {
         duration_ms = record.duration_ms,
         outcome = record.outcome,
         result_bytes = record.result_bytes,
+        truncated = record.truncated,
+        exec_id = record.exec_id,
         code,
         "tool call"
     );
@@ -259,11 +274,15 @@ mod tests {
             duration_ms: 3,
             outcome: "ok",
             result_bytes: 2,
+            truncated: false,
+            exec_id: "ab12",
         };
         let line = captured(false, &record);
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(!line.contains("secret-code-marker"), "{line}");
         assert!(line.contains("code_bytes=32"), "{line}");
+        assert!(line.contains("truncated=false"), "{line}");
+        assert!(line.contains("exec_id=\"ab12\""), "{line}");
         let line = captured(true, &record);
         assert!(line.contains("secret-code-marker"), "{line}");
     }

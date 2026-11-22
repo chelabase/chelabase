@@ -12,13 +12,25 @@ use sha2::{Digest, Sha256};
 
 use crate::app::{Audit, audit};
 use crate::auth::Caller;
-use crate::sandbox::{ErrorCode, Kind, Outcome, Run, Sandbox};
+use crate::limits::{self, Admission};
+use crate::runtime::new_exec_id;
+use crate::sandbox::{ErrorCode, Kind, Outcome, Ran, Run, Sandbox};
+
+/// What a tool call needs: where code runs, what admits it, and how results are capped.
+pub struct Toolbox {
+    pub sandbox: Arc<dyn Sandbox>,
+    pub admission: Admission,
+    /// `CHELABASE_MCP_RESULT_MAX_BYTES`.
+    pub result_max_bytes: usize,
+    /// Log each call's code in its audit line.
+    pub log_code: bool,
+}
 
 /// The largest `code` a tool takes (64 KiB).
 pub const MAX_CODE_BYTES: usize = 64 * 1024;
 
 /// The committed spec bundle the server describes (m1, #345).
-const BUNDLE: &str = include_str!("../../../openapi/mcp.json");
+pub const BUNDLE: &str = include_str!("../../../openapi/mcp.json");
 
 struct BundleFacts {
     hash: String,
@@ -269,20 +281,25 @@ fn parse(name: &str, arguments: Option<JsonObject>) -> Result<Call, ErrorData> {
     }
 }
 
-fn error_body(code: ErrorCode, message: &str) -> String {
-    json!({"error": {"code": code.as_str(), "message": message}}).to_string()
+fn error_body(code: ErrorCode, message: &str, retry_after_ms: Option<u64>) -> String {
+    let mut error = json!({"code": code.as_str(), "message": message});
+    if let Some(ms) = retry_after_ms {
+        error["retry_after_ms"] = ms.into();
+    }
+    json!({ "error": error }).to_string()
 }
 
 /// Runs one `tools/call`: checks the arguments, hands the code to the sandbox and writes the
 /// audit line. A bad tool name or argument is a protocol error (`-32602`) and nothing runs.
 pub async fn call(
-    sandbox: &dyn Sandbox,
+    toolbox: &Toolbox,
     caller: &Caller,
     request_id: &str,
-    log_code: bool,
     name: &str,
     arguments: Option<JsonObject>,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<CallToolResult, ErrorData> {
+    let log_code = toolbox.log_code;
     let call = match parse(name, arguments) {
         Ok(call) => call,
         Err(error) => {
@@ -303,6 +320,8 @@ pub async fn call(
                     duration_ms: 0,
                     outcome: "invalid_params",
                     result_bytes: 0,
+                    truncated: false,
+                    exec_id: "",
                 },
                 log_code,
             );
@@ -310,33 +329,81 @@ pub async fn call(
         }
     };
     let started = Instant::now();
-    let outcome = if call.code.len() > MAX_CODE_BYTES {
-        Outcome::Error {
-            code: ErrorCode::InvalidCode,
-            message: format!("code is over {MAX_CODE_BYTES} bytes"),
-        }
+    let exec_id = new_exec_id();
+    let mut retry_after_ms = None;
+    let ran: Option<Ran> = if call.code.len() > MAX_CODE_BYTES {
+        Some(
+            Outcome::Error {
+                code: ErrorCode::InvalidCode,
+                message: format!("code is over {MAX_CODE_BYTES} bytes"),
+            }
+            .into(),
+        )
     } else {
-        sandbox
-            .run(Run {
-                kind: call.kind,
-                code: call.code.clone(),
-                destructive: call.destructive,
-                caller: caller.clone(),
-            })
-            .await
+        match toolbox.admission.admit(caller.member()) {
+            Err(wait) => {
+                retry_after_ms = Some(wait);
+                Some(
+                    Outcome::Error {
+                        code: ErrorCode::RateLimited,
+                        message: "too many tool calls; retry after retry_after_ms".into(),
+                    }
+                    .into(),
+                )
+            }
+            Ok(slot) => {
+                let run = toolbox.sandbox.run(Run {
+                    kind: call.kind,
+                    code: call.code.clone(),
+                    destructive: call.destructive,
+                    caller: caller.clone(),
+                    exec_id: exec_id.clone(),
+                });
+                // A client that goes away ends the run: dropping its future drops the runtime
+                // request, the exec_id registration and the slot.
+                let ran = tokio::select! {
+                    ran = run => Some(ran),
+                    () = cancelled => None,
+                };
+                drop(slot);
+                ran
+            }
+        }
     };
-    let (result, outcome_name, result_bytes) = match outcome {
+    let Some(ran) = ran else {
+        audit(
+            &Audit {
+                request_id,
+                caller,
+                tool: call.kind.as_str(),
+                code_sha256: hex(&Sha256::digest(call.code.as_bytes())),
+                code: &call.code,
+                destructive: call.destructive,
+                duration_ms: started.elapsed().as_millis() as u64,
+                outcome: "client_disconnected",
+                result_bytes: 0,
+                truncated: false,
+                exec_id: &exec_id,
+            },
+            log_code,
+        );
+        return Err(ErrorData::internal_error("the client went away", None));
+    };
+    let mut truncated = false;
+    let (mut result, outcome_name, result_bytes) = match ran.outcome {
         Outcome::Value(value) => {
-            let text = value.to_string();
+            let (text, cut) = limits::truncate(value.to_string(), toolbox.result_max_bytes);
+            truncated = cut;
             let bytes = text.len();
             let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            if value.is_object() {
+            // A cut value has no structured form: the whole would bypass the cap.
+            if value.is_object() && !cut {
                 result.structured_content = Some(value);
             }
             (result, "ok", bytes)
         }
         Outcome::Error { code, message } => {
-            let body = error_body(code, &message);
+            let body = error_body(code, &message, retry_after_ms);
             let bytes = body.len();
             (
                 CallToolResult::error(vec![ContentBlock::text(body)]),
@@ -344,6 +411,16 @@ pub async fn call(
                 bytes,
             )
         }
+    };
+    if let Some(logs) = limits::logs_text(&ran.logs) {
+        result
+            .content
+            .push(ContentBlock::text(format!("console output:\n{logs}")));
+    }
+    let exec_id = if retry_after_ms.is_some() || call.code.len() > MAX_CODE_BYTES {
+        ""
+    } else {
+        exec_id.as_str()
     };
     audit(
         &Audit {
@@ -356,6 +433,8 @@ pub async fn call(
             duration_ms: started.elapsed().as_millis() as u64,
             outcome: outcome_name,
             result_bytes,
+            truncated,
+            exec_id,
         },
         log_code,
     );
