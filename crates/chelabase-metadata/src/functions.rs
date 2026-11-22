@@ -67,8 +67,10 @@ use chelabase_types::{BranchId, DatabaseId};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
+use tracing::warn;
 use uuid::Uuid;
 
+use crate::schedule::{Schedule, advance};
 use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
@@ -272,104 +274,15 @@ pub struct ScheduleRecord {
     pub enabled: bool,
 }
 
-/// A schedule's part a caller got wrong ([`Schedule::parse`]).
+/// One schedule as the startup report reads it ([`MetadataClient::list_schedules_for_report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScheduleError {
-    Cron(String),
-    Timezone(String),
-}
-
-impl ScheduleError {
-    /// The request field it names: `cron` or `timezone`.
-    pub fn field(&self) -> &'static str {
-        match self {
-            ScheduleError::Cron(_) => "cron",
-            ScheduleError::Timezone(_) => "timezone",
-        }
-    }
-}
-
-impl std::fmt::Display for ScheduleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScheduleError::Cron(why) | ScheduleError::Timezone(why) => {
-                write!(f, "{}: {why}", self.field())
-            }
-        }
-    }
-}
-
-/// A checked schedule: a 5-field cron (minute granularity, no seconds or years) in an IANA
-/// time zone. Times in a DST gap run at the first instant after it; times a fall-back repeats
-/// run once.
-#[derive(Debug, Clone)]
-pub struct Schedule {
-    cron: croner::Cron,
-    tz: chrono_tz::Tz,
-}
-
-impl Schedule {
-    pub fn parse(cron: &str, timezone: &str) -> Result<Schedule, ScheduleError> {
-        use croner::parser::{CronParser, Seconds, Year};
-        if cron.is_empty() || cron.len() > 100 {
-            return Err(ScheduleError::Cron("1 to 100 characters".into()));
-        }
-        if timezone.is_empty() || timezone.len() > 64 {
-            return Err(ScheduleError::Timezone("1 to 64 characters".into()));
-        }
-        let parsed = CronParser::builder()
-            .seconds(Seconds::Disallowed)
-            .year(Year::Disallowed)
-            .build()
-            .parse(cron)
-            .map_err(|e| ScheduleError::Cron(format!("not a 5-field cron ({e})")))?;
-        let tz = timezone
-            .parse::<chrono_tz::Tz>()
-            .map_err(|_| ScheduleError::Timezone(format!("unknown IANA time zone {timezone:?}")))?;
-        Ok(Schedule { cron: parsed, tz })
-    }
-
-    /// The first time strictly after `after`; `None` when there is none (a date that never
-    /// comes).
-    pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.cron
-            .find_next_occurrence(&after.with_timezone(&self.tz), false)
-            .ok()
-            .map(|t| t.with_timezone(&Utc))
-    }
-}
-
-/// What a claim does with one due schedule ([`advance`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Advance {
-    /// The new `next_run_at`.
-    pub next: Option<DateTime<Utc>>,
-    /// Run the function for this tick (the `scheduledTime`): the due `next_run_at`, once, however
-    /// many ticks were missed; `None` for a disabled or undeployed function, or a schedule that
-    /// had no time yet.
-    pub run: Option<DateTime<Utc>>,
-    /// The schedule stays enabled; false when its cron or time zone no longer parses or it has
-    /// no time left.
+pub struct ScheduleReportRow {
+    pub id: Uuid,
+    pub branch_id: BranchId,
+    pub function_name: String,
+    pub cron: String,
+    pub timezone: String,
     pub enabled: bool,
-}
-
-/// A due schedule's step at `now`: missed ticks coalesce into one run, and `next_run_at` moves
-/// to the first tick after `now`, whether the function runs or not.
-pub fn advance(
-    cron: &str,
-    timezone: &str,
-    due: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    function_enabled: bool,
-) -> Advance {
-    let next = Schedule::parse(cron, timezone)
-        .ok()
-        .and_then(|s| s.next_after(now));
-    Advance {
-        next,
-        run: due.filter(|_| function_enabled && next.is_some()),
-        enabled: next.is_some(),
-    }
 }
 
 /// A schedule a claim advanced ([`MetadataClient::claim_due_schedules`]).
@@ -2040,6 +1953,34 @@ impl MetadataClient {
         .collect())
     }
 
+    /// Every schedule on every branch, for the startup report: id order, `limit` rows after
+    /// `after` (the last id of the previous page; `None` for the first). Reads only.
+    pub async fn list_schedules_for_report(
+        &self,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ScheduleReportRow>, MetadataError> {
+        Ok(sqlx::query(
+            "SELECT s.id, s.branch_id, f.name, s.cron, s.timezone, s.enabled
+             FROM function_schedules s JOIN functions f ON f.id = s.function_id
+             WHERE ($1::uuid IS NULL OR s.id > $1) ORDER BY s.id LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| ScheduleReportRow {
+            id: r.get("id"),
+            branch_id: BranchId(r.get("branch_id")),
+            function_name: r.get("name"),
+            cron: r.get("cron"),
+            timezone: r.get("timezone"),
+            enabled: r.get("enabled"),
+        })
+        .collect())
+    }
+
     /// Changes a schedule of the function on the branch: what is given of `cron`, `timezone`
     /// and `enabled`. A changed cron or time zone, or turning it on, moves `next_run_at` to the
     /// first tick after now. `None` when the branch has no such schedule for the function.
@@ -2188,6 +2129,15 @@ impl MetadataClient {
                 r.get("function_enabled"),
             );
             let id: Uuid = r.get("id");
+            if !step.enabled {
+                // Said once: the row is disabled below, so no later claim sees it.
+                let timezone: String = r.get("timezone");
+                let reason = match Schedule::parse(&cron, &timezone) {
+                    Err(e) => e.to_string(),
+                    Ok(_) => "no later time".to_owned(),
+                };
+                warn!(schedule = %id, %cron, %timezone, %reason, "disabling a schedule that can no longer run");
+            }
             ids.push(id);
             nexts.push(step.next);
             enabled.push(step.enabled);

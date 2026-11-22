@@ -353,7 +353,17 @@ where
                     request.enabled,
                 )
                 .await
-                .map_err(|e| metadata_error("update schedule", e))?
+                .map_err(|e| match e {
+                    // The stored cron or zone no longer parses (a PATCH without it): the same
+                    // 422 naming the field as a bad value in the request.
+                    MetadataError::InvalidFunction(m) if m.starts_with("cron: ") => {
+                        invalid(ScheduleError::Cron(m["cron: ".len()..].to_owned()))
+                    }
+                    MetadataError::InvalidFunction(m) if m.starts_with("timezone: ") => {
+                        invalid(ScheduleError::Timezone(m["timezone: ".len()..].to_owned()))
+                    }
+                    e => metadata_error("update schedule", e),
+                })?
                 .ok_or_else(schedule_not_found)?;
             info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, schedule = %schedule_id, "function schedule changed");
             Ok(Json(ScheduleView::from(changed)).into_response())

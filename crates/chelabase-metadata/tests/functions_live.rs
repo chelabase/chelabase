@@ -2187,6 +2187,112 @@ mod functions {
         s.finish().await;
     }
 
+    /// m4: a stored schedule whose cron no longer parses is disabled by the claim with no run
+    /// and `next_run_at` cleared, the other due schedules in the same claim still run, and the
+    /// next claim finds nothing.
+    #[tokio::test]
+    #[ignore]
+    async fn a_schedule_whose_cron_stopped_parsing_is_disabled_not_run() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let d = s.deployment(f, &sha('a')).await;
+        s.client.set_active_deployment(main, f, d).await.unwrap();
+        assert!(s.client.set_enabled(main, f, true).await.unwrap());
+        let c = &s.client;
+        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::hours(1), 6);
+        let mut ids = Vec::new();
+        for cron in ["0 0 * * jan", "* * * * *"] {
+            let id = c
+                .add_schedule(&NewSchedule { branch_id: main, function_id: f, cron: "* * * * *", timezone: "UTC", next_run_at: Some(past) })
+                .await
+                .unwrap();
+            // Written directly: the API refuses a cron that doesn't parse.
+            sqlx::query("UPDATE function_schedules SET cron = $2 WHERE id = $1")
+                .bind(id)
+                .bind(cron)
+                .execute(s.pool())
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let claimed = c.claim_due_schedules(50, &[]).await.unwrap();
+        assert_eq!(claimed.len(), 2, "{claimed:?}");
+        let by = |id: Uuid| claimed.iter().find(|x| x.id == id).unwrap();
+        assert_eq!((by(ids[0]).run, by(ids[0]).next_run_at), (None, None));
+        assert_eq!(by(ids[1]).run, Some(past), "the others still run");
+        assert!(by(ids[1]).next_run_at.is_some());
+        let listed = c.list_schedules(main).await.unwrap();
+        let row = |id: Uuid| listed.iter().find(|x| x.id == id).unwrap();
+        assert_eq!((row(ids[0]).enabled, row(ids[0]).next_run_at), (false, None));
+        assert!(row(ids[1]).enabled);
+        assert!(c.claim_due_schedules(50, &[]).await.unwrap().is_empty(), "disabled once");
+        s.finish().await;
+    }
+
+    /// m4: an update of a schedule whose stored cron no longer parses, with no `cron` of its
+    /// own, is the same `cron:` invalid answer a bad cron gets; GET still lists it; a valid
+    /// `cron` repairs and re-enables it.
+    #[tokio::test]
+    #[ignore]
+    async fn updating_a_schedule_whose_cron_stopped_parsing_is_invalid_and_a_new_cron_repairs_it() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let id = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        sqlx::query("UPDATE function_schedules SET cron = '0 0 * * jan', enabled = false, next_run_at = NULL WHERE id = $1")
+            .bind(id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        for (tz, enabled) in [(None, Some(true)), (Some("Europe/London"), None)] {
+            let err = c.update_schedule(main, f, id, None, tz, enabled).await.unwrap_err();
+            assert!(matches!(&err, MetadataError::InvalidFunction(m) if m.starts_with("cron: ")), "{err:?}");
+        }
+        assert_eq!(c.list_schedules(main).await.unwrap().len(), 1, "still listed");
+        let fixed = c.update_schedule(main, f, id, Some("0 9 * * MON"), None, Some(true)).await.unwrap().unwrap();
+        assert!(fixed.enabled && fixed.next_run_at.is_some(), "{fixed:?}");
+        s.finish().await;
+    }
+
+    /// m4: the report listing pages through every schedule once, enabled or not, on every
+    /// branch, and an empty table gives an empty page.
+    #[tokio::test]
+    #[ignore]
+    async fn the_report_listing_returns_every_schedule_once() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let c = &s.client;
+        assert!(c.list_schedules_for_report(None, 10).await.unwrap().is_empty());
+        let f = s.function(db, "hello").await;
+        let g = s.function(db, "other").await;
+        let mut want = Vec::new();
+        for (i, func) in [f, f, f, g, g].into_iter().enumerate() {
+            let id = c.add_schedule(&a_schedule(main, func)).await.unwrap();
+            if i % 2 == 1 {
+                c.update_schedule(main, func, id, None, None, Some(false)).await.unwrap();
+            }
+            want.push((id, i % 2 == 0));
+        }
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = c.list_schedules_for_report(after, 2).await.unwrap();
+            assert!(page.len() <= 2);
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            seen.extend(page);
+        }
+        let mut got: Vec<_> = seen.iter().map(|r| (r.id, r.enabled)).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(seen.iter().all(|r| r.cron == "0 * * * *" && r.timezone == "UTC" && r.branch_id == main));
+        assert_eq!(seen.iter().filter(|r| r.function_name == "other").count(), 2);
+        s.finish().await;
+    }
+
     /// m3: a function's deployments for the management API, newest first; another
     /// function's never appear.
     #[tokio::test]
