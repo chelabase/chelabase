@@ -190,9 +190,16 @@ mod policy {
         "resetRolePassword",
         "createStorageWebhook",
         "rotateStorageWebhookSecret",
-        // Invites carry grants.
+        // Invites carry grants; a resend mints a new link and voids the old one.
         "createInvite",
         "createProjectInvite",
+        "resendInvite",
+        // One PUT creates or overwrites a secret whose value never comes back.
+        "putFunctionSecret",
+        // Each makes deployed code run on a schedule or on every matching event.
+        "createFunctionSchedule",
+        "updateFunctionSchedule",
+        "createFunctionTrigger",
         // Builder's calls beyond the plan: a copy or move can put an object in a public bucket
         // (and a move removes its old name), a trigger turned off drops its queued events, and a
         // new app user is a new principal with a password.
@@ -228,12 +235,7 @@ mod policy {
         "storageDownloadObject",
     ];
 
-    const WRITE: &[&str] = &[
-        "cancelSqlRun",
-        "putFunctionSecret",
-        "storageSignObject",
-        "resendInvite",
-    ];
+    const WRITE: &[&str] = &["cancelSqlRun", "storageSignObject"];
 
     #[test]
     fn named_destructive_operations() {

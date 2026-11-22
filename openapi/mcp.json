@@ -6,7 +6,7 @@
       "data": "b0eb5eecd27edf53307bd8cc1d4755ba25a860c16f4715c3455cfbdf9387f464",
       "management": "7b862bf015f69ffde4770668424796f5a8e1a8d529d55e56b4f0c103c32088af"
     },
-    "x-spec-hash": "9a76f07857f64743d254674b1cde21b4cfce2c60440a888e89077304bd828173"
+    "x-spec-hash": "cbfae84effcf2829b25cc7a4db45558dcc88012c3fdad34b6231c64d5db4dc44"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -6598,7 +6598,7 @@
         "tags": [
           "functions"
         ],
-        "x-class": "write",
+        "x-class": "destructive",
         "x-errors": {
           "400": [
             "invalid_request"
@@ -6837,7 +6837,7 @@
         "tags": [
           "functions"
         ],
-        "x-class": "write",
+        "x-class": "destructive",
         "x-errors": {
           "400": [
             "invalid_request"
@@ -7099,7 +7099,7 @@
         "tags": [
           "functions"
         ],
-        "x-class": "write",
+        "x-class": "destructive",
         "x-errors": {
           "400": [
             "invalid_request"
@@ -7531,7 +7531,7 @@
         "tags": [
           "functions"
         ],
-        "x-class": "write",
+        "x-class": "destructive",
         "x-errors": {
           "400": [
             "invalid_request"
@@ -15821,7 +15821,7 @@
           "tables"
         ],
         "x-class": "destructive",
-        "x-class-rule": "Read with `dry_run: true`; destructive when any operation drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type or identity or lifts NOT NULL, or isn't known; otherwise write.",
+        "x-class-rule": "A dry run (`dry_run: true`) is read, or write when any operation carries a SQL expression (a default, generated column, check, exclusion, index expression or predicate, policy, or `using`). A real run is destructive when any operation carries one, drops something, changes a privilege, owner, schema, policy or row-level security, changes a column's type, default or identity or lifts NOT NULL, or isn't known; otherwise write.",
         "x-errors": {
           "400": [
             "invalid_request",
@@ -25768,7 +25768,7 @@
         "tags": [
           "members"
         ],
-        "x-class": "write",
+        "x-class": "destructive",
         "x-errors": {
           "400": [
             "invalid_request"
