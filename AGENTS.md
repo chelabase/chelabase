@@ -27,12 +27,20 @@ GitHub issues and epic PRs.
 ## Tooling
 
 - **just**: `just check`, `just test`, `just workbench up|down|status|test|run`, `just wt-add`,
-  `just wt-remove`, and the `*-e2e` recipes. See `CONTRIBUTING.md`.
+  `just wt-remove`, `just wt-claim|wt-release|wt-slots|wt-warm`, and the `*-e2e` recipes. See
+  `CONTRIBUTING.md`.
 - **Workbench**: one isolated stack per checkout. `/build` brings it up in the epic worktree
   only when a milestone needs live tests; task worktrees reuse it via `.workbench-stack`.
   Builders and auditors never run `workbench up`/`down`.
 - **Worktrees**: main checkout stays on `main`. Every branch lives in `.worktrees/<branch>`
   (`just wt-add <branch>`). Never `EnterWorktree` and never harness `isolation: "worktree"`.
+- **Slots**: builders and auditors (`/build`, `/audit`, `/quick`) don't make a worktree each
+  (a new `target/` is a cold build). They claim a reused one from the shared pool,
+  `.worktrees/slot-<k>`: `just wt-claim <ref> [branch]` prints its directory,
+  `just wt-release <name>` gives it back clean. One agent per claimed slot, one cargo command
+  at a time in it. Slots outlive epics and are never removed at epic close. The coordinator
+  clears a claim whose agent is gone (`just wt-slots` says how) and shrinks the pool when
+  disk runs short (`CONTRIBUTING.md`, Slots).
 
 ## Product rules
 
@@ -52,6 +60,34 @@ GitHub issues and epic PRs.
 Product, design, wording or scope choices you're unsure about go to the human: one question,
 2–4 concrete options, recommended first and marked "(Recommended)", each option's trade-off
 in its description. No mandated brainstorming ritual beyond that.
+
+## Judgment over the letter
+
+Issue criteria, design sketches and briefs describe the ideal outcome. They are not a script
+to follow at any cost. Builders and auditors explore and decide for themselves: a better
+design than the sketch, a different test that proves the same thing, or accepting a residual
+gap whose practical risk is low. Each such call is stated with its reason in the report.
+Three kinds of call still belong to others or never change:
+
+- product, wording and scope calls go to the human (above);
+- the rules under Product rules, Git and safety, and Tests are never relaxed;
+- an audit doesn't loop: if fix rounds keep narrowing one criterion, the auditor recommends
+  the end state it judges best and moves the rest to the backlog.
+
+## Advisor
+
+When the `advisor` tool is available, each role uses it only at its decision points, not on
+every step:
+
+| Role | Call the advisor |
+|---|---|
+| Planner (`/epic`, `/epic-security` propose) | Only for hard plans: cross-service designs, auth, privileges, migrations, lock ordering, or unclear scope. Call it before cutting milestones, and once more before presenting the draft. |
+| Builder (`/build` milestones and fix rounds, `/quick`) | Only when the same error or test failure comes back after you tried to fix it. Don't call it on the first failure. |
+| Auditor | Only when stuck: you can't tell whether a finding is real, a reproduction won't converge, or the verdict is unclear. |
+| Coordinator (`/build` itself) | Before the epic gate, and when a milestone needs a second fix round. |
+
+Give the advice real weight. If it conflicts with evidence you have, such as a file, a test
+result or a doc, raise the conflict in one more call instead of switching silently.
 
 ## Git and safety
 
@@ -118,6 +154,9 @@ Each milestone issue declares one review level with a one-line reason:
 3. **Close.** Whole-epic review, one `just check`, one live pass → mark the PR ready.
    Human merges.
 4. **Small change.** `/quick <change|#issue>`: one worktree, one PR, affected tests, squash.
+5. **Security fixes.** `/epic-security` instead of `/epic` for unfixed vulnerabilities: plan,
+   build and audit stay local (no issues, PRs or pushes); fixes ship through a GitHub
+   security advisory's private fork. Write fixes and acceptance criteria, never exploits.
 
 | Command | Args | What it does |
 |---|---|---|
@@ -125,6 +164,7 @@ Each milestone issue declares one review level with a one-line reason:
 | `/build` | `<slug> [n]` | Build ready milestones; audit whiteroom; finish with epic review + gate |
 | `/audit` | `<slug> <n>` | White-room audit of a landed milestone (issue + diff only) |
 | `/quick` | `<change>` \| `#<issue>` | Small change → one conventional PR |
+| `/epic-security` | `<goal>` \| `<slug>` \| `APPROVED <slug>` \| `PUBLISH <slug>` | Local-only security epic → squash → advisory private fork PR |
 
 Issue bodies follow the `issue-spec` skill; PR bodies follow `pr-body`. Labels:
 `epic:<slug>`, `type:*`, `area:*`, `status:{ready,blocked,building,landed,audited,changes-requested}`,

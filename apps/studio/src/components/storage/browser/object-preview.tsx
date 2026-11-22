@@ -3,13 +3,30 @@ import { errorText } from "@/lib/errors";
 import { DOWNLOAD_PREVIEW_BYTES, IMAGE_PREVIEW_BYTES, TEXT_PREVIEW_BYTES, essenceOf, prettyText, previewKind } from "./preview-kind";
 
 /**
- * Where a preview's bytes come from: a signed URL (Developer and above: media streams from the
- * API host), or Studio's console download route as the role (a Viewer: the bytes come back as a
- * Blob and play from a `blob:` URL typed as the preview's own type).
+ * Where a preview's bytes come from: a signed URL on the API host, or Studio's console download
+ * route as the role (the bytes come back as a Blob and show from a `blob:` URL typed as the
+ * preview's own type).
  */
 export type PreviewSource =
   | { kind: "signed"; sign: () => Promise<string> }
   | { kind: "download"; fetch: (range: string | undefined, signal: AbortSignal) => Promise<Blob> };
+
+/**
+ * The source for an object's preview. Studio's CSP admits images and frames only from its own
+ * origin and `blob:`, so images and PDFs always come through the download route as a typed
+ * `blob:` URL. Audio and video stream from a signed URL when the role can sign (`media-src`
+ * admits the API host), and text is fetched from one; a role that can't sign (a Viewer) reads
+ * everything through the download route.
+ */
+export function previewSource(
+  contentType: string | null,
+  sign: (() => Promise<string>) | null,
+  fetchObject: (range: string | undefined, signal: AbortSignal) => Promise<Blob>,
+): PreviewSource {
+  const kind = previewKind(contentType);
+  if (sign && kind !== "image" && kind !== "pdf") return { kind: "signed", sign };
+  return { kind: "download", fetch: fetchObject };
+}
 
 export interface ObjectPreviewProps {
   name: string;
@@ -28,8 +45,8 @@ function Note({ children }: { children: ReactNode }) {
 const TEXT_RANGE = `bytes=0-${TEXT_PREVIEW_BYTES - 1}`;
 
 /**
- * A side-panel preview: images (never SVG), video, audio and PDF from a signed URL or a typed
- * `blob:` URL; text and JSON read as text (at most the first 2 MiB, by range) and shown as source,
+ * A side-panel preview: images (never SVG) and PDF from a typed `blob:` URL, video and audio
+ * from a signed URL or a typed `blob:` URL; text and JSON read as text (at most the first 2 MiB, by range) and shown as source,
  * so stored HTML never renders here. Unknown types get no preview.
  */
 export function ObjectPreview({ name, contentType, size, source }: ObjectPreviewProps) {

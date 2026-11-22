@@ -40,14 +40,10 @@ pub fn qualified(schema: &str, name: &str) -> String {
 
 /// `quote_literal`: single-quoted with `'` doubled; a string with a backslash gets the `E`
 /// prefix and its backslashes doubled, so it reads the same whatever
-/// `standard_conforming_strings` is.
+/// `standard_conforming_strings` is. The one implementation is
+/// [`chelabase_types::role_name::quote_literal`].
 pub fn literal(s: &str) -> String {
-    let quoted = s.replace('\'', "''");
-    if s.contains('\\') {
-        format!("E'{}'", quoted.replace('\\', "\\\\"))
-    } else {
-        format!("'{quoted}'")
-    }
+    chelabase_types::role_name::quote_literal(s)
 }
 
 #[cfg(test)]
@@ -78,6 +74,67 @@ mod tests {
         assert_eq!(qualified("public", "users"), "public.users");
         assert_eq!(qualified("Billing", "my table"), "\"Billing\".\"my table\"");
         assert_eq!(qualified("a.b", "user"), "\"a.b\".\"user\"");
+    }
+
+    /// One literal quoter: `literal` and `role_name::quote_literal` return the same text, and
+    /// that text holds the input under either `standard_conforming_strings` setting.
+    #[test]
+    fn literal_matches_role_name_quote_literal() {
+        for input in [
+            "",
+            "plain",
+            "it's",
+            "''",
+            "\\",
+            "a\\b",
+            "a\\'b",
+            "\\'; x",
+            "trailing\\",
+            "\\\\double",
+            "é\\ü'ß",
+            "表\\示'能",
+            "line\nbreak\\n",
+        ] {
+            let quoted = literal(input);
+            assert_eq!(
+                quoted,
+                chelabase_types::role_name::quote_literal(input),
+                "{input:?}"
+            );
+            assert_eq!(read_back(&quoted).as_deref(), Some(input), "{quoted}");
+        }
+    }
+
+    /// What Postgres reads `quoted` as, when both `standard_conforming_strings` settings read
+    /// it the same: `'…'` takes `''` as a quote and may hold no backslash (the one byte the
+    /// two settings read differently); `E'…'` takes `''` as a quote and `\\` as a backslash,
+    /// and no other escape appears. `None` for anything else.
+    fn read_back(quoted: &str) -> Option<String> {
+        let (escapes, body) = match quoted.strip_prefix('E') {
+            Some(rest) => (true, rest),
+            None => (false, quoted),
+        };
+        let body = body.strip_prefix('\'')?.strip_suffix('\'')?;
+        let mut out = String::new();
+        let mut chars = body.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => {
+                    if chars.next() != Some('\'') {
+                        return None;
+                    }
+                    out.push('\'');
+                }
+                '\\' => {
+                    if !escapes || chars.next() != Some('\\') {
+                        return None;
+                    }
+                    out.push('\\');
+                }
+                c => out.push(c),
+            }
+        }
+        Some(out)
     }
 
     #[test]

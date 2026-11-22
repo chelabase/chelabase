@@ -8,6 +8,7 @@
 //! nothing on their own, and every download is `nosniff` and sandboxed. So HTML declared as
 //! `image/png` is refused, and a real PNG declared as `image/png` passes.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -16,6 +17,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use uuid::Uuid;
 
 use crate::error::Failure;
 
@@ -229,17 +231,49 @@ pub fn until_idle<E: std::fmt::Display + Send + 'static>(
 /// worth. A body that needs more than is free fails 503 `busy`. A share lasts as long as its
 /// request, and a body that delivers nothing for [`InFlight::body_idle`] fails
 /// ([`until_idle`]).
+///
+/// **Invariants.** (1) Every byte a body takes is charged to the process cap and to its
+/// branch's counter together, and both are returned when the request's [`Held`] (every clone
+/// of it, including the one the body stream owns) is dropped, on every path. (2) A branch's
+/// counter never exceeds [`InFlight::branch_limit`], so one branch can't hold the whole cap.
+/// (3) The branch map holds only branches with bytes in flight: an entry is removed at zero.
 #[derive(Clone)]
 pub struct InFlight {
     permits: Arc<Semaphore>,
     capacity: usize,
     body_idle: Duration,
+    part_deadline: Duration,
+    branch_limit: u64,
+    branches: Arc<std::sync::Mutex<HashMap<Uuid, u64>>>,
+}
+
+/// What a request holds of the cap: the process permits and its branch's bytes.
+struct Charge {
+    permit: Option<OwnedSemaphorePermit>,
+    branch: Uuid,
+    branch_bytes: u64,
+    branches: Arc<std::sync::Mutex<HashMap<Uuid, u64>>>,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if self.branch_bytes == 0 {
+            return;
+        }
+        let mut map = self.branches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = map.get_mut(&self.branch) {
+            *held = held.saturating_sub(self.branch_bytes);
+            if *held == 0 {
+                map.remove(&self.branch);
+            }
+        }
+    }
 }
 
 /// A request's share of the in-flight cap ([`InFlight::metered`]), freed on drop.
 #[derive(Clone)]
 pub struct Held {
-    permit: Arc<std::sync::Mutex<Option<OwnedSemaphorePermit>>>,
+    charge: Arc<std::sync::Mutex<Charge>>,
     refused: Arc<AtomicBool>,
 }
 
@@ -250,6 +284,10 @@ impl Held {
     }
 }
 
+/// The default total deadline of one part's body (`CHELABASE_STORAGE_PART_DEADLINE_SECS`):
+/// 100 MiB at about 115 KiB/s.
+pub const DEFAULT_PART_DEADLINE: Duration = Duration::from_secs(900);
+
 impl InFlight {
     pub fn new(bytes: usize) -> Self {
         let capacity = bytes.min(Semaphore::MAX_PERMITS);
@@ -257,6 +295,9 @@ impl InFlight {
             permits: Arc::new(Semaphore::new(capacity)),
             capacity,
             body_idle: DEFAULT_BODY_IDLE,
+            part_deadline: DEFAULT_PART_DEADLINE,
+            branch_limit: (capacity as u64 / 4).max(1),
+            branches: Arc::default(),
         }
     }
 
@@ -266,9 +307,43 @@ impl InFlight {
         self
     }
 
+    /// With a part's body failing once it has run `deadline` in all
+    /// ([`DEFAULT_PART_DEADLINE`] otherwise).
+    pub fn with_part_deadline(mut self, deadline: Duration) -> Self {
+        self.part_deadline = deadline;
+        self
+    }
+
+    /// With one branch holding at most `bytes` of the cap (a quarter of it otherwise).
+    pub fn with_branch_limit(mut self, bytes: u64) -> Self {
+        self.branch_limit = bytes;
+        self
+    }
+
     /// How long an upload's body may deliver nothing.
     pub fn body_idle(&self) -> Duration {
         self.body_idle
+    }
+
+    /// How long one part's body may take in all.
+    pub fn part_deadline(&self) -> Duration {
+        self.part_deadline
+    }
+
+    /// The most one branch may hold.
+    pub fn branch_limit(&self) -> u64 {
+        self.branch_limit
+    }
+
+    /// Bytes `branch` holds now (tests).
+    pub fn branch_held(&self, branch: Uuid) -> u64 {
+        let map = self.branches.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&branch).copied().unwrap_or(0)
+    }
+
+    /// Branches with bytes in flight (tests).
+    pub fn branches_in_flight(&self) -> usize {
+        self.branches.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Holds `bytes` of the cap until the permit drops; 503 `busy` when they aren't free.
@@ -284,21 +359,29 @@ impl InFlight {
     }
 
     /// `body`, taking each chunk's bytes from the cap as it arrives, up to `hold` in all (what
-    /// the request can have in memory at once). A chunk that doesn't fit fails the body with
-    /// [`BodyError::Busy`] and ends it. The share is held while the returned [`Held`] lives.
+    /// the request can have in memory at once), and from `branch`'s share of it. A chunk that
+    /// fits neither fails the body with [`BodyError::Busy`] and ends it. The share is held
+    /// while the returned [`Held`] lives.
     pub fn metered(
         &self,
         body: BoxStream<'static, Result<Bytes, BodyError>>,
         hold: u64,
+        branch: Uuid,
     ) -> (BoxStream<'static, Result<Bytes, BodyError>>, Held) {
         let held = Held {
-            permit: Arc::new(std::sync::Mutex::new(None)),
+            charge: Arc::new(std::sync::Mutex::new(Charge {
+                permit: None,
+                branch,
+                branch_bytes: 0,
+                branches: self.branches.clone(),
+            })),
             refused: Arc::new(AtomicBool::new(false)),
         };
         let share = held.clone();
         let permits = self.permits.clone();
+        let (branches, limit) = (self.branches.clone(), self.branch_limit);
         let stream = futures_util::stream::unfold(Some((body, 0u64)), move |state| {
-            let (share, permits) = (share.clone(), permits.clone());
+            let (share, permits, branches) = (share.clone(), permits.clone(), branches.clone());
             async move {
                 let (mut body, taken) = state?;
                 match body.next().await? {
@@ -308,14 +391,29 @@ impl InFlight {
                             let got = u32::try_from(want)
                                 .ok()
                                 .and_then(|n| permits.try_acquire_many_owned(n).ok());
-                            let Some(got) = got else {
+                            let mut charge = share.charge.lock().unwrap_or_else(|e| e.into_inner());
+                            // The branch's counter, under the map's lock: its limit holds
+                            // however many requests of the branch race.
+                            let fits = got.is_some() && {
+                                let mut map = branches.lock().unwrap_or_else(|e| e.into_inner());
+                                let held = map.entry(branch).or_insert(0);
+                                let fits = *held + want <= limit;
+                                if fits {
+                                    *held += want;
+                                } else if *held == 0 {
+                                    map.remove(&branch);
+                                }
+                                fits
+                            };
+                            let Some(got) = got.filter(|_| fits) else {
+                                drop(charge);
                                 share.refused.store(true, Ordering::SeqCst);
                                 return Some((Err(BodyError::Busy), None));
                             };
-                            let mut slot = share.permit.lock().unwrap_or_else(|e| e.into_inner());
-                            match slot.as_mut() {
+                            charge.branch_bytes += want;
+                            match charge.permit.as_mut() {
                                 Some(p) => p.merge(got),
-                                None => *slot = Some(got),
+                                None => charge.permit = Some(got),
                             }
                         }
                         Some((Ok(chunk), Some((body, taken + want))))
@@ -589,16 +687,16 @@ mod tests {
     /// is free fails 503 `busy`, and the share returns when the handle drops.
     #[tokio::test]
     async fn the_cap_grows_with_the_bytes_received() {
-        let cap = InFlight::new(100);
+        let cap = InFlight::new(100).with_branch_limit(100);
         let idle = Duration::from_secs(5);
         let chunk = |n: usize| Ok::<_, &str>(Bytes::from(vec![b'x'; n]));
         let (body, _) = until_idle(futures_util::stream::once(async move { chunk(10) }).chain(futures_util::stream::pending()), idle);
-        let (mut trickle, held) = cap.metered(body, 100);
+        let (mut trickle, held) = cap.metered(body, 100, Uuid::nil());
         trickle.next().await.unwrap().unwrap();
         assert_eq!(cap.available(), 90);
         // Past `hold` nothing more is taken: the bytes beyond it went out already.
         let (body, _) = until_idle(futures_util::stream::iter([chunk(30), chunk(30), chunk(30)]), idle);
-        let (mut big, big_held) = cap.metered(body, 40);
+        let (mut big, big_held) = cap.metered(body, 40, Uuid::nil());
         while let Some(c) = big.next().await {
             c.unwrap();
         }
@@ -610,7 +708,7 @@ mod tests {
         // More than is free: 503 `busy`, and the stream ends.
         let _most = cap.reserve(85).unwrap();
         let (body, _) = until_idle(futures_util::stream::iter([chunk(3), chunk(3)]), idle);
-        let (mut late, late_held) = cap.metered(body, 100);
+        let (mut late, late_held) = cap.metered(body, 100, Uuid::nil());
         late.next().await.unwrap().unwrap();
         let f = late.next().await.unwrap().unwrap_err().failure();
         assert_eq!((f.0.status.as_u16(), f.0.code), (503, "busy"));
@@ -622,6 +720,121 @@ mod tests {
         drop(held);
         drop(_most);
         assert_eq!(cap.available(), 100);
+    }
+
+    /// A body of `n` chunks of `size` bytes that then waits (the request stays open).
+    fn open_body(chunks: usize, size: usize) -> BoxStream<'static, Result<Bytes, BodyError>> {
+        futures_util::stream::iter((0..chunks).map(move |_| Ok::<_, BodyError>(Bytes::from(vec![b'x'; size]))))
+            .chain(futures_util::stream::pending())
+            .boxed()
+    }
+
+    /// AC 3: a branch holding its whole share gets 503 `busy` on its next upload while another
+    /// branch, with the process cap still free, uploads.
+    #[tokio::test]
+    async fn branch_share_refuses_past_its_limit() {
+        let cap = InFlight::new(100).with_branch_limit(30);
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let (mut first, first_held) = cap.metered(open_body(3, 10), 100, a);
+        for _ in 0..3 {
+            first.next().await.unwrap().unwrap();
+        }
+        assert_eq!(cap.branch_held(a), 30);
+        let (mut more, more_held) = cap.metered(open_body(1, 1), 100, a);
+        let f = more.next().await.unwrap().unwrap_err().failure();
+        assert_eq!((f.0.status.as_u16(), f.0.code), (503, "busy"));
+        assert!(more_held.refused());
+        assert_eq!(cap.branch_held(a), 30, "the refused chunk is not charged");
+        let (mut other, _other_held) = cap.metered(open_body(1, 10), 100, b);
+        assert!(other.next().await.unwrap().is_ok());
+        assert_eq!(cap.branch_held(b), 10);
+        // The process cap still refuses on its own.
+        let _rest = cap.reserve(60).unwrap();
+        let (mut full, _full_held) = cap.metered(open_body(1, 5), 100, Uuid::from_u128(3));
+        assert!(full.next().await.unwrap().is_err());
+        assert_eq!(cap.branch_held(Uuid::from_u128(3)), 0);
+        drop(first);
+        drop(first_held);
+    }
+
+    /// AC 4: whichever way a request ends (finished, refused, dropped mid-body), its bytes
+    /// leave the branch's counter and the map entry goes at zero; the process cap is whole.
+    #[tokio::test]
+    async fn branch_share_released_on_drop() {
+        let cap = InFlight::new(100).with_branch_limit(30);
+        let a = Uuid::from_u128(1);
+        let (mut done, done_held) = cap.metered(
+            futures_util::stream::iter([Ok::<_, BodyError>(Bytes::from(vec![0u8; 10]))]).boxed(),
+            100,
+            a,
+        );
+        while done.next().await.is_some() {}
+        let (mut mid, mid_held) = cap.metered(open_body(1, 15), 100, a);
+        mid.next().await.unwrap().unwrap();
+        let (mut refused, refused_held) = cap.metered(open_body(1, 20), 100, a);
+        assert!(refused.next().await.unwrap().is_err());
+        assert_eq!(cap.branch_held(a), 25);
+        assert_eq!(cap.branches_in_flight(), 1);
+        // The stream owns a clone of the handle: both must go.
+        drop(done);
+        drop(done_held);
+        assert_eq!(cap.branch_held(a), 15);
+        drop(refused);
+        drop(refused_held);
+        drop(mid_held);
+        assert_eq!(cap.branch_held(a), 15, "the open body's stream still holds its share");
+        drop(mid);
+        assert_eq!(cap.branch_held(a), 0);
+        assert_eq!(cap.branches_in_flight(), 0);
+        assert_eq!(cap.available(), 100);
+    }
+
+    /// The invariants against a model, over random interleavings of bodies of several
+    /// branches: the counters equal the model's sums, never pass the branch limit, the
+    /// semaphore's taken bytes equal the sum of the counters, and everything returns.
+    #[test]
+    fn branch_accounting_follows_the_model() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+        let mut runner = TestRunner::new(Config { cases: 64, ..Config::default() });
+        let strategy = proptest::collection::vec((0u8..3, 1usize..12, any::<bool>()), 1..30);
+        runner
+            .run(&strategy, |ops| {
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let cap = InFlight::new(60).with_branch_limit(20);
+                    /// An open body: its branch, its size, the stream and its share.
+                    type Open = (u8, u64, BoxStream<'static, Result<Bytes, BodyError>>, Held);
+                    let mut live: Vec<Open> = Vec::new();
+                    for (branch, size, close) in ops {
+                        let id = Uuid::from_u128(branch as u128 + 1);
+                        let (mut s, h) = cap.metered(open_body(1, size), 100, id);
+                        let ok = s.next().await.unwrap().is_ok();
+                        let model_held: u64 = live.iter().filter(|l| l.0 == branch).map(|l| l.1).sum();
+                        let model_all: u64 = live.iter().map(|l| l.1).sum();
+                        let fits = model_held + size as u64 <= 20 && model_all + size as u64 <= 60;
+                        prop_assert_eq!(ok, fits);
+                        if ok {
+                            live.push((branch, size as u64, s, h));
+                        }
+                        if close && !live.is_empty() {
+                            drop(live.remove(0));
+                        }
+                        for b in 0u8..3 {
+                            let want: u64 = live.iter().filter(|l| l.0 == b).map(|l| l.1).sum();
+                            prop_assert_eq!(cap.branch_held(Uuid::from_u128(b as u128 + 1)), want);
+                            prop_assert!(want <= 20);
+                        }
+                        let all: u64 = live.iter().map(|l| l.1).sum();
+                        prop_assert_eq!(cap.available() as u64, 60 - all);
+                    }
+                    live.clear();
+                    prop_assert_eq!(cap.branches_in_flight(), 0);
+                    prop_assert_eq!(cap.available(), 60);
+                    Ok(())
+                })
+            })
+            .unwrap();
     }
 
     /// AC 6: the cap holds concurrent buffers to its bytes; past it is 503 `busy` at once,

@@ -315,17 +315,20 @@ pub async fn code_strictness(id: &Identity, pool: &Pool) {
     id.verify_code(pool, &uid, CodeKind::Reset, &code, Some("n3w password!"))
         .await
         .unwrap();
-    // A new code replaces the old one.
+    // The used code is replaced at once; the live new one is not replaced within a minute,
+    // and keeps working.
     let a = issue(id, pool, &uid, CodeKind::Reset).await;
-    let b = issue(id, pool, &uid, CodeKind::Reset).await;
-    if a != b {
-        assert_eq!(
-            id.verify_code(pool, &uid, CodeKind::Reset, &a, Some("n3w password!"))
-                .await
-                .unwrap_err(),
-            IdentityError::CodeInvalid
-        );
-    }
+    let e = id
+        .create_code(
+            pool,
+            &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Return),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeRecentlySent);
+    id.verify_code(pool, &uid, CodeKind::Reset, &a, Some("n3w password!"))
+        .await
+        .unwrap();
 }
 
 /// A code, delivered by `return`.

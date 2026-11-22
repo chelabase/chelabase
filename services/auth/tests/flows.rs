@@ -26,6 +26,8 @@ pub struct Harness {
     pub _keys: tempfile::TempDir,
     pub base: String,
     pub http: reqwest::Client,
+    /// The service's state: its limiter's clock moves with identity's in `advance`.
+    pub state: Arc<AppState>,
 }
 
 pub async fn harness_with(skip: bool, min_ms: u64) -> Harness {
@@ -110,10 +112,11 @@ pub async fn harness_on_identity(
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let served = state.clone();
     tokio::spawn(async move {
         axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            router(served).into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .unwrap()
@@ -127,6 +130,7 @@ pub async fn harness_on_identity(
         _keys: keys,
         base: format!("http://{addr}"),
         http: reqwest::Client::new(),
+        state,
     }
 }
 
@@ -350,28 +354,16 @@ async fn sign_in_answers_take_the_minimum_time() {
     assert!(start.elapsed() >= Duration::from_millis(300));
 }
 
+// m9b AC 6: thirty failed sign-ins for an email in a minute, from any addresses, stop every
+// address (the per-client five are in `member_sign_in_from_another_client_is_not_locked_out`).
 #[tokio::test]
-async fn the_sixth_sign_in_per_email_per_minute_is_refused_even_from_new_ips() {
+async fn sign_in_stops_at_the_per_email_ceiling_even_from_new_ips() {
     let h = harness().await;
-    for i in 0..5 {
-        let a = h
-            .post(
-                "/auth/v1/sign-in",
-                signin("ada@example.com", "x"),
-                None,
-                &format!("1.1.1.{i}"),
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    for i in 0..30 {
+        let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "x"), None, &format!("1.1.{i}.1")).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{i}");
     }
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin("ada@example.com", "x"),
-            None,
-            "7.7.7.7",
-        )
-        .await;
+    let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "x"), None, "7.7.7.7").await;
     assert_eq!(
         (a.status, a.body),
         (
@@ -1151,33 +1143,34 @@ async fn hang_up_sign_in(h: &Harness, stub: &PasswordStub, body: Value, ip: &str
     }
 }
 
-/// Sends `n` wrong-password sign-ins for ada one at a time, each from its own address, and
-/// returns their statuses.
+/// Sends `n` wrong-password sign-ins for ada one at a time, all from one address, and returns
+/// their statuses.
 async fn wrong_sign_ins(h: &Harness, n: usize, tag: &str) -> Vec<StatusCode> {
     let mut out = Vec::new();
-    for i in 0..n {
+    for _ in 0..n {
         let body = signin("ada@example.com", "Wrong-pass1");
-        out.push(h.post("/auth/v1/sign-in", body, None, &format!("6.{tag}.{i}.1")).await.status);
+        out.push(h.post("/auth/v1/sign-in", body, None, &format!("6.{tag}.0.1")).await.status);
     }
     out
 }
 
-/// The budget is whole: five wrong passwords are checked (401), and the sixth is refused.
+/// The budget is whole: five wrong passwords from one client are checked (401), and the sixth
+/// is refused.
 async fn assert_budget_unspent(h: &Harness, tag: &str) {
     let got = wrong_sign_ins(h, 6, tag).await;
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{tag}: {got:?}");
     assert_eq!(got[5], StatusCode::TOO_MANY_REQUESTS, "{tag}: {got:?}");
 }
 
-// AC 1: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
-// AC 1: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
+// AC 1 (m9b's ceiling): 40 wrong passwords at once from 40 addresses get at most 30 password
+// checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 64)]
 async fn sign_in_email_limit_holds_under_concurrency() {
     // A slow password check, so every request is in flight before the first answer.
     let stub = PasswordStub::start(Some(Duration::from_millis(300))).await;
     let h = Arc::new(harness_on_identity(false, 1, auth::config::Mode::SelfHosted, |_| {}, Some(stub.base.clone())).await);
     let mut tasks = Vec::new();
-    for i in 0..30 {
+    for i in 0..40 {
         let h = h.clone();
         tasks.push(tokio::spawn(async move {
             let body = signin("ada@example.com", "Wrong-pass1");
@@ -1193,8 +1186,8 @@ async fn sign_in_email_limit_holds_under_concurrency() {
         }
     }
     let checks = stub.checks();
-    assert!(checks <= 5, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
-    assert_eq!((refused, limited), (5, 25));
+    assert!(checks <= 30, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (30, 10));
 }
 
 // AC 3: a client that hangs up while identity checks the password still spends the attempt.
@@ -1204,11 +1197,11 @@ async fn sign_in_cancelled_password_checks_still_count() {
     // Identity holds each password check, so each client hangs up in the middle of it.
     let stub = PasswordStub::start(None).await;
     let h = harness_on_identity(false, 1, auth::config::Mode::SelfHosted, |_| {}, Some(stub.base.clone())).await;
-    for i in 0..5 {
-        hang_up_sign_in(&h, &stub, signin("ada@example.com", "Wrong-pass1"), &format!("1.3.{i}.1")).await;
+    for _ in 0..5 {
+        hang_up_sign_in(&h, &stub, signin("ada@example.com", "Wrong-pass1"), "1.3.0.1").await;
     }
     // A patient client (no timeout).
-    let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "Wrong-pass1"), None, "1.3.9.1").await;
+    let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "Wrong-pass1"), None, "1.3.0.1").await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
     assert_eq!(stub.checks(), 5);
 }
@@ -1566,6 +1559,8 @@ async fn unverified_sign_in_sends_a_code() {
     let a = h.post("/auth/v1/sign-up", json!({"email": "new@example.com", "password": PW, "givenName": "A", "familyName": "B"}), None, "1.1.1.1").await;
     assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "verify"})));
     assert!(a.cookie("chelabase_login").is_some() && a.cookie("chelabase_session").is_none());
+    // Past identity's minute, so the sign-in's code replaces the sign-up's.
+    h.identity.advance(WINDOW);
     let b = h.sign_in("", "new@example.com", PW, "1.1.1.1").await;
     assert_eq!((b.status, &b.body), (StatusCode::OK, &json!({"next": "verify"})));
     assert!(b.cookie("chelabase_login").is_some() && b.cookie("chelabase_session").is_none());
@@ -1578,8 +1573,8 @@ async fn unverified_sign_in_sends_a_code() {
     assert!(sent.iter().all(|c| c.kind == chelabase_identity::CodeKind::Verify && c.email == "new@example.com"));
 }
 
-// m2's audit: a new code resets the guess counter, so issuing has to be capped per user and
-// kind, however many addresses ask. 5 codes × 5 guesses = at most 25 guesses an hour.
+// m2's audit: issuing is capped per user and kind, however many addresses ask: 5 codes an
+// hour. Each ask is past identity's minute, so only auth's hourly cap holds them back.
 #[tokio::test]
 async fn code_issuance_is_limited_per_user_and_kind() {
     let h = harness().await;
@@ -1587,6 +1582,7 @@ async fn code_issuance_is_limited_per_user_and_kind() {
     let a = h.post("/auth/v1/sign-up", json!({"email": "new@example.com", "password": PW, "givenName": "A", "familyName": "B"}), None, "1.1.1.1").await;
     assert_eq!(a.status, StatusCode::OK);
     for i in 0..9 {
+        h.identity.advance(WINDOW);
         let b = h.sign_in("", "new@example.com", PW, &format!("4.4.4.{i}")).await;
         assert_eq!((b.status, b.body), (StatusCode::OK, json!({"next": "verify"})), "same answer once capped");
     }
@@ -1727,13 +1723,13 @@ async fn sign_in_rate_limits_kept() {
     }
     let a = h.sign_in("", "ada@example.com", PW, "5.5.5.5").await;
     assert_eq!((a.status, a.body), (StatusCode::TOO_MANY_REQUESTS, err("rate_limited", messages::TOO_MANY)));
-    // Per email, across addresses; a no-membership sign-in counts like a wrong password.
+    // Per email from one client; a no-membership sign-in counts like a wrong password.
     h.member("none@example.com", &[]);
-    for i in 0..5 {
-        let a = h.sign_in("", "none@example.com", PW, &format!("5.5.6.{i}")).await;
+    for _ in 0..5 {
+        let a = h.sign_in("", "none@example.com", PW, "5.5.6.1").await;
         assert_eq!(a.status, StatusCode::UNAUTHORIZED);
     }
-    assert_eq!(h.sign_in("", "none@example.com", PW, "5.5.6.9").await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.sign_in("", "none@example.com", PW, "5.5.6.1").await.status, StatusCode::TOO_MANY_REQUESTS);
     // Right passwords spend nothing, and neither does an outage.
     h.member("bob@example.com", &[T1]);
     for i in 0..6 {
@@ -2198,13 +2194,19 @@ async fn member_code_limits_kept() {
     assert_eq!(h.post("/auth/v1/resend-code", json!({}), None, "3.3.3.3").await.status, StatusCode::TOO_MANY_REQUESTS);
 
     let ann = h.member("ann@example.com", &[T1]);
+    // Each ask is past identity's minute (and its background send has landed), so only auth's
+    // limits hold them back.
+    let before = h.code_requests();
     for i in 0..5 {
+        h.identity.advance(WINDOW);
         let a = h.post("/auth/v1/password-reset", json!({"email": "ann@example.com"}), None, &format!("4.4.4.{i}")).await;
         assert_eq!(a.status, StatusCode::OK, "{i}");
+        h.code_requests_reach(before + i + 1).await;
     }
     let a = h.post("/auth/v1/password-reset", json!({"email": "ann@example.com"}), None, "4.4.5.5").await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
     // The decoy's reset (a sign-up for her email) shares her per-user code budget.
+    h.identity.advance(WINDOW);
     h.post("/auth/v1/sign-up", signup("ann@example.com", PW), None, "4.4.6.6").await;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2228,6 +2230,8 @@ async fn resend_codes_are_limited_per_user() {
     let a = h.post("/auth/v1/sign-up", signup("new@example.com", PW), None, "1.1.1.1").await;
     let login = a.cookie("chelabase_login").unwrap();
     for i in 0..6 {
+        // Past identity's minute each time, so only auth's hourly cap holds them back.
+        h.identity.advance(WINDOW);
         h.post("/auth/v1/resend-code", json!({}), Some(&login), &format!("6.6.6.{i}")).await;
     }
     let sent = h.identity.codes_sent();
@@ -2429,4 +2433,198 @@ async fn an_active_member_with_a_foreign_token_is_refused() {
     let a = h.accept(accept_notice(&t, "ann@example.com", PW), "1.1.1.2").await;
     assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
     assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+}
+
+// ---- m9b: identity's code budget and replacement window, and the sign-in slots ----------------
+
+const WINDOW: Duration = Duration::from_secs(61);
+
+impl Harness {
+    /// Spends `user`'s stored failure budget for `kind` in identity (10 wrong guesses over two
+    /// codes), directly against the fake.
+    async fn spend_code_budget(&self, user: &str, kind: CodeKind) {
+        let client = self.identity.client();
+        let pw = matches!(kind, CodeKind::Reset | CodeKind::Invite).then_some(NEW_PW);
+        for _ in 0..2 {
+            self.identity.advance(WINDOW);
+            let code = self.code_for(user, kind).await;
+            let wrong = if code == "000000" { "111111" } else { "000000" };
+            for _ in 0..5 {
+                let e = client.verify_code(&Pool::Members, user, kind, wrong, pw).await.unwrap_err();
+                assert!(matches!(e, chelabase_identity::IdentityError::CodeInvalid), "{e:?}");
+            }
+        }
+        let e = client.verify_code(&Pool::Members, user, kind, "000000", pw).await.unwrap_err();
+        assert_eq!(e, chelabase_identity::IdentityError::CodeBudgetSpent);
+        self.identity.advance(WINDOW);
+    }
+
+    /// How many code requests reached identity.
+    fn code_requests(&self) -> usize {
+        self.identity.calls().iter().filter(|c| c.as_str() == "POST /internal/v1/pools/members/codes").count()
+    }
+
+    /// Waits (up to a second) for a background code request to reach identity.
+    async fn code_requests_reach(&self, n: usize) {
+        for _ in 0..100 {
+            if self.code_requests() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} code requests, wanted {n}", self.code_requests());
+    }
+}
+
+/// Answers to one email's reset confirms over two days: two codes (a known member) or none,
+/// five wrong guesses after each minute; after two hours a guess with a fresh code (a right one
+/// for the member); and one wrong guess a day later.
+async fn member_reset_history(known: bool) -> Vec<(StatusCode, Value)> {
+    let h = harness().await;
+    let ann = h.member("ann@example.com", &[T1]);
+    let email = if known { "ann@example.com" } else { "nobody@example.com" };
+    let advance = |by: Duration| {
+        h.identity.advance(by);
+        h.state.limiter.advance(by);
+    };
+    let check = async |code: &str| {
+        let body = json!({"email": email, "code": code, "password": NEW_PW});
+        let a = h.post("/auth/v1/password-reset/confirm", body, None, "1.1.1.1").await;
+        (a.status, a.body)
+    };
+    let wrong_for = |code: &str| if code == "000000" { "111111" } else { "000000" }.to_string();
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        advance(WINDOW);
+        let wrong = if known { wrong_for(&h.code_for(&ann, CodeKind::Reset).await) } else { "000000".into() };
+        for _ in 0..5 {
+            answers.push(check(&wrong).await);
+        }
+    }
+    advance(Duration::from_secs(2 * 3600));
+    let next = if known { h.code_for(&ann, CodeKind::Reset).await } else { "123456".into() };
+    answers.push(check(&next).await);
+    advance(Duration::from_secs(24 * 3600));
+    let wrong = if known { wrong_for(&h.code_for(&ann, CodeKind::Reset).await) } else { "000000".into() };
+    answers.push(check(&wrong).await);
+    answers
+}
+
+// A1: the member reset confirm answers a known and an unknown email alike, a member whose
+// stored guess budget is spent included.
+#[tokio::test]
+async fn member_reset_confirm_answers_a_known_and_an_unknown_email_alike() {
+    let known = member_reset_history(true).await;
+    let unknown = member_reset_history(false).await;
+    assert_eq!(known, unknown);
+    assert_eq!((known[10].0, known[10].1.clone()), rate_limited());
+    assert_eq!(known[11].1["error"]["code"], "invalid_code", "{known:?}");
+}
+
+fn rate_limited() -> (StatusCode, Value) {
+    (StatusCode::TOO_MANY_REQUESTS, err("rate_limited", messages::TOO_MANY))
+}
+
+// m9b AC 2: a spent reset budget answers 429, even for the right code, and changes nothing.
+#[tokio::test]
+async fn member_reset_with_a_spent_budget_is_rate_limited() {
+    let h = harness().await;
+    let ann = h.member("ann@example.com", &[T1]);
+    h.spend_code_budget(&ann, CodeKind::Reset).await;
+    let code = h.code_for(&ann, CodeKind::Reset).await;
+    let body = json!({"email": "ann@example.com", "code": code, "password": NEW_PW});
+    let a = h.post("/auth/v1/password-reset/confirm", body, None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), rate_limited());
+    assert!(h.signs_in("ann@example.com", PW).await, "the password is unchanged");
+    assert!(!h.signs_in("ann@example.com", NEW_PW).await);
+}
+
+// m9b AC 2: member verify and invite accept answer a spent budget as 429, not 503 and not
+// `invalid_code`.
+#[tokio::test]
+async fn member_verify_and_invite_accept_answer_a_spent_budget() {
+    let h = harness().await;
+    let id = h.identity.with_unverified_user(&Pool::Members, "ann@example.com", PW);
+    h.internal.set_memberships(&id, &[T1], &[]);
+    let step = h.sign_in("", "ann@example.com", PW, "1.1.1.1").await;
+    assert_eq!(step.body, json!({"next": "verify"}));
+    h.spend_code_budget(&id, CodeKind::Verify).await;
+    let code = h.code_for(&id, CodeKind::Verify).await;
+    let a = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&step.cookie("chelabase_login").unwrap()), "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), rate_limited());
+    assert!(!session_set(&a));
+    assert!(!h.identity.user(&Pool::Members, &id).unwrap().verified);
+
+    let (bob, _) = h.invitee("bob@example.com", &link_token(9)).await;
+    h.spend_code_budget(&bob, CodeKind::Invite).await;
+    let code = h.code_for(&bob, CodeKind::Invite).await;
+    let a = h.accept(accept_code(&bob, &link_token(9), &code, NEW_PW), "2.2.2.2").await;
+    assert_eq!((a.status, a.body.clone()), rate_limited());
+    assert!(!session_set(&a));
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+    assert!(!h.signs_in("bob@example.com", NEW_PW).await);
+}
+
+// m9b AC 3: a reset asked for while a code sent under a minute ago stands answers as always,
+// sends nothing and spends none of the hour's five.
+#[tokio::test]
+async fn member_reset_request_within_the_window_spends_no_budget() {
+    let h = harness().await;
+    let ann = h.member("ann@example.com", &[T1]);
+    let resets = || h.identity.codes_sent().iter().filter(|c| c.user_id == ann && c.kind == CodeKind::Reset).count();
+    let reset = async |i: usize| {
+        let a = h.post("/auth/v1/password-reset", json!({"email": "ann@example.com"}), None, &format!("4.4.4.{i}")).await;
+        assert_eq!(a.status, StatusCode::OK, "{i}");
+        h.code_requests_reach(i).await;
+    };
+    reset(1).await;
+    assert_eq!(resets(), 1);
+    // Within the minute: the same answer, and nothing mailed.
+    reset(2).await;
+    assert_eq!(resets(), 1, "identity kept the earlier code");
+    // The hour still has four more: three resets and a decoy sign-up (its notice is a reset).
+    for i in 3..=5 {
+        h.identity.advance(WINDOW);
+        reset(i).await;
+    }
+    h.identity.advance(WINDOW);
+    h.post("/auth/v1/sign-up", signup("ann@example.com", PW), None, "4.4.6.6").await;
+    h.code_requests_reach(6).await;
+    assert_eq!(resets(), 5, "five codes in the hour");
+}
+
+// m9b AC 5: failures from one client don't lock the owner out from another.
+#[tokio::test]
+async fn member_sign_in_from_another_client_is_not_locked_out() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    for i in 0..5 {
+        let a = h.sign_in("", "ada@example.com", "Wrong-pass1", "1.1.1.1").await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let a = h.sign_in("", "ada@example.com", "Wrong-pass1", "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), rate_limited());
+    let a = h.sign_in("", "ada@example.com", PW, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "client A is held");
+    let a = h.sign_in("", "ada@example.com", PW, "2.2.2.2").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})));
+    assert!(session_set(&a));
+}
+
+// m9b AC 4: an IPv6 /64 is one client for the per-address limits; another /64 and IPv4 are
+// not, and an IPv4-mapped address is its IPv4 address.
+#[tokio::test]
+async fn ipv6_clients_in_one_64_share_the_sign_in_limit() {
+    let h = harness().await;
+    let attempt = async |n: u32, ip: &str| h.sign_in("", &format!("u{n}@example.com"), "Wrong-pass1", ip).await.status;
+    for i in 0..10 {
+        assert_eq!(attempt(i, &format!("2001:db8:1:2::{i:x}")).await, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    assert_eq!(attempt(10, "2001:db8:1:2:ffff:ffff:ffff:ffff").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(attempt(11, "2001:db8:1:3::1").await, StatusCode::UNAUTHORIZED, "another /64");
+    for i in 0..10 {
+        assert_eq!(attempt(20 + i, "203.0.113.7").await, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    assert_eq!(attempt(30, "::ffff:203.0.113.7").await, StatusCode::TOO_MANY_REQUESTS, "mapped is its IPv4");
+    assert_eq!(attempt(31, "203.0.113.8").await, StatusCode::UNAUTHORIZED, "IPv4 isn't grouped");
 }

@@ -631,10 +631,13 @@ END",
 /// Marks the member role password read after a hand-over (M-e).
 pub const PASSWORD_MARK: &str = "-- chelabase: member role password";
 
-/// The member role's `rolpassword` (M-e: a run may have changed it).
+/// The member role's `rolpassword` (M-e: a run may have changed it). The search path is pinned
+/// after the mark, like the restore that may follow.
 pub fn member_password_sql(role: &str) -> String {
     format!(
-        "{PASSWORD_MARK}\nSELECT coalesce(rolpassword, '') FROM pg_catalog.pg_authid WHERE rolname = {};",
+        "{PASSWORD_MARK}\nSET search_path = pg_catalog, pg_temp;\n\
+         SELECT coalesce(rolpassword, '') FROM pg_catalog.pg_authid \
+         WHERE rolname OPERATOR(pg_catalog.=) {};",
         literal(role)
     )
 }
@@ -1204,6 +1207,15 @@ pub fn unsafe_node(catalog: &MemberCatalog, role: &str) -> bool {
     reach(&catalog.all_edges, role)
         .iter()
         .any(|n| bad_alone(catalog, n))
+}
+
+/// Whether the data API serves `role` through its elevated login
+/// (`crate::data_api::AUTHENTICATOR_ELEVATED`): a role only an Admin may key or act as, because
+/// it or a role it reaches through any membership is LOGIN, owner-level (BYPASSRLS included)
+/// or holds ADMIN on some role. That is [`unsafe_node`], and nothing else: one rule for what a
+/// member may be granted and for which login holds a role.
+pub fn is_elevated(catalog: &MemberCatalog, role: &str) -> bool {
+    unsafe_node(catalog, role)
 }
 
 /// The granted roles a member role holds (pure; R16, R21–R23, N2): those of `candidate` that

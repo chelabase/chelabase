@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { addHistory, clearHistory, loadBuffer, loadHistory, loadTimeout, saveBuffer, saveTimeout, type HistoryEntry } from "./run-history";
+import { addHistory, clearAllSqlStorage, clearHistory, loadBuffer, loadHistory, loadTimeout, saveBuffer, saveTimeout, type HistoryEntry } from "./run-history";
 
 const entry = (n: number): HistoryEntry => ({ sql: `select ${n}`, branchId: "b1", database: null, role: null, at: `2026-10-03T00:00:${String(n % 60).padStart(2, "0")}Z`, outcome: "ok", durationMs: n });
 
@@ -56,5 +56,33 @@ describe("run history", () => {
     expect(loadHistory("u1", "d1")).toEqual([]);
     localStorage.setItem("chelabase.sql.history.u1.d1", JSON.stringify([{ bad: 1 }, entry(2)]));
     expect(loadHistory("u1", "d1")).toEqual([entry(2)]);
+  });
+
+  it("clear_all_removes_every_sql_key_and_keeps_others", () => {
+    saveBuffer("u1", "d1", "select 1");
+    addHistory("u2", "d9", entry(1));
+    saveTimeout(300000);
+    localStorage.setItem("chelabase.theme", "dark");
+    clearAllSqlStorage();
+    expect(Object.keys(localStorage)).toEqual(["chelabase.theme"]);
+  });
+
+  it("clear_all_survives_throwing_storage", () => {
+    saveBuffer("u1", "d1", "select 1");
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    vi.spyOn(Storage.prototype, "key").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    expect(() => clearAllSqlStorage()).not.toThrow();
+  });
+
+  it("statements_that_set_passwords_are_not_recorded", () => {
+    const existing = addHistory("u1", "d1", entry(1));
+    for (const sql of ["alter role app password 'x'", "ALTER ROLE app WITH PASSWORD 'x'", "create user a PassWord 'y'"]) {
+      expect(addHistory("u1", "d1", { ...entry(2), sql })).toEqual(existing);
+    }
+    expect(loadHistory("u1", "d1")).toEqual(existing);
   });
 });

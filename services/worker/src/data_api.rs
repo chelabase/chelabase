@@ -2,6 +2,8 @@
 //! `authenticator` login, default privileges and the branch's public key), and the check a
 //! secret key's role must pass.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, bail};
 use chelabase_metadata::{
     BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseOrigin,
@@ -9,29 +11,41 @@ use chelabase_metadata::{
 };
 use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest, DataApiDatabaseRequest};
 use chelabase_neon::ComputeBackend;
+use chelabase_schema::sql::literal;
 use chelabase_secrets::{Purpose, open_credential, seal_credential};
 use chelabase_types::BranchId;
 use chelabase_types::data_key::{self, DataKeyKind};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::member_roles::{MemberCatalog, is_elevated, member_catalog_sql, parse_member_catalog};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{OWNER_ROLE, Worker, credentials};
 
 /// The login role the data API connects as; never a secret key's role.
 const AUTHENTICATOR: &str = "authenticator";
-/// Whether `authenticator` can log in and the three event triggers are present and enabled:
-/// what this worker repairs whatever the `chelabase` schema's version.
+/// The data API's second login: the one that holds the roles only an Admin may key or act as
+/// (the elevated ones, [`crate::member_roles::is_elevated`]) and no other role. Reserved by
+/// its `chelabase_` prefix. The bootstrap creates it, resets its attributes on every run and
+/// removes every membership in it; nothing is ever granted it but elevated key and console
+/// roles (never `anon` or `authenticated`).
+pub const AUTHENTICATOR_ELEVATED: &str = "chelabase_authenticator_elevated";
+/// Whether `authenticator` and [`AUTHENTICATOR_ELEVATED`] can log in and the three event
+/// triggers are present and enabled: what this worker repairs whatever the `chelabase`
+/// schema's version (the logins are outside the version gate).
 const MACHINERY_CHECK_SQL: &str = "EXISTS (SELECT FROM pg_catalog.pg_roles r \
        WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin) \
+     AND EXISTS (SELECT FROM pg_catalog.pg_roles r \
+       WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND r.rolcanlogin) \
      AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger \
        WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', \
          'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) \
          AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3";
 
 /// Whether this worker's version of the `chelabase` schema is installed: the schema,
-/// `authenticator` with `USAGE` on it and `SELECT` on `schema_version`, the guard functions
-/// `assert_schema_version(uuid)` and `cap_response(text,bigint)`, and this worker's stamp.
+/// `authenticator` and [`AUTHENTICATOR_ELEVATED`] each with `USAGE` on it and `SELECT` on
+/// `schema_version`, the guard functions `assert_schema_version(uuid)` and
+/// `cap_response(text,bigint)`, and this worker's stamp.
 fn installed_check_sql() -> String {
     format!(
         "to_regclass('chelabase.schema_version') IS NOT NULL \
@@ -40,6 +54,13 @@ fn installed_check_sql() -> String {
        JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid \
          AND c.relname OPERATOR(pg_catalog.=) 'schema_version' \
        WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
+         AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE') \
+         AND pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT')) \
+     AND EXISTS (SELECT FROM pg_catalog.pg_roles r \
+       JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) 'chelabase' \
+       JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid \
+         AND c.relname OPERATOR(pg_catalog.=) 'schema_version' \
+       WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' \
          AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE') \
          AND pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT')) \
      AND pg_catalog.to_regprocedure('chelabase.assert_schema_version(uuid)') IS NOT NULL \
@@ -52,32 +73,70 @@ fn installed_check_sql() -> String {
 /// Whether a branch's data API machinery is intact in a database whose default schema is
 /// `schema` (psql prints `t` or `f`). Anything else is what the bootstrap repairs:
 ///
-/// - `authenticator` able to log in, and the three event triggers present and enabled;
-/// - `authenticator`'s `USAGE` on the default schema. The data API prepares its statements
-///   as `authenticator` (NOINHERIT) before it switches role, and Postgres checks `USAGE` on
+/// - `authenticator` and [`AUTHENTICATOR_ELEVATED`] able to log in, and the three event
+///   triggers present and enabled;
+/// - both logins' `USAGE` on the default schema. The data API prepares its statements as
+///   `authenticator` (NOINHERIT) before it switches role, and Postgres checks `USAGE` on
 ///   every schema a statement names while parsing it, so without it every pipelined request
 ///   falls back to the sequential path. A default schema that doesn't exist passes: the
 ///   bootstrap skips it too. The literal is the quoted identifier (`to_regnamespace` parses
 ///   identifier syntax);
-/// - and either a valid stamp newer than this worker's (a newer worker's schema, which this
-///   one leaves alone) or this worker's version, stamped [`DATA_API_SCHEMA_STAMP`].
+/// - either a valid stamp newer than this worker's (a newer worker's schema, which this one
+///   leaves alone) or this worker's version, stamped [`DATA_API_SCHEMA_STAMP`];
+/// - and [`AUTHENTICATOR_ELEVATED`] as the bootstrap's lockdown leaves it, whatever the
+///   schema's version, so reconcile repairs a changed login before the next compute start
+///   ([`elevated_drift_sql`]: its attributes and settings, exactly `elevated_verifier` as its
+///   password, no membership in it, no session the last drifted lockdown voided). `None`
+///   (the branch has no elevated login stored yet) is never healthy: the bootstrap stores
+///   one. The roles the login holds aren't checked here; they are classified in Rust, by the
+///   bootstrap's [`Worker::resync_elevated_grants`].
 ///
 /// Operators are schema-qualified and the search path is pinned first (it runs as the
 /// superuser `cloud_admin` in a database the owner controls; `to_regclass` is unqualified).
 /// `storage_verifier`: the branch's `chelabase_storage` verifier
 /// ([`crate::storage_schema::storage_check_sql`]).
-pub fn schema_check_sql(schema: &str, storage_verifier: Option<&str>) -> String {
-    let schema_literal = quote_literal(&quote_ident(schema));
+pub fn schema_check_sql(schema: &str, storage_verifier: Option<&str>, elevated_verifier: Option<&str>) -> String {
+    let schema_literal = literal(&quote_ident(schema));
     let storage = crate::storage_schema::storage_check_sql(crate::OWNER_ROLE, storage_verifier);
+    let elevated = elevated_verifier.map_or_else(
+        || " AND false".to_owned(),
+        |verifier| format!(" AND NOT {}", elevated_drift_sql(ELEVATED_LOGIN_OID, verifier)),
+    );
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT {MACHINERY_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
-       JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
+       JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['authenticator', 'chelabase_authenticator_elevated']::pg_catalog.name[]) \
        WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace({schema_literal})::pg_catalog.oid \
          AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')) \
-     AND (COALESCE({newer}, false) OR ({installed})){storage}",
+     AND (COALESCE({newer}, false) OR ({installed})){elevated}{storage}",
         newer = valid_newer_sql(),
         installed = installed_check_sql(),
+    )
+}
+
+/// [`AUTHENTICATOR_ELEVATED`]'s oid, as an expression (NULL when the role is missing).
+const ELEVATED_LOGIN_OID: &str =
+    "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated')";
+
+/// Whether [`AUTHENTICATOR_ELEVATED`] (`login`, an oid expression) has drifted from what the
+/// bootstrap's lockdown leaves: any attribute but `LOGIN`, a password other than exactly
+/// `verifier`, a connection limit, an expiry, any setting, any membership in it, or a
+/// session of it that the last drifted lockdown voided
+/// ([`crate::login_lockdown::void_sessions_sql`]: the record is pending, or the session
+/// started at or before its cut-off). The bootstrap reads it before the lockdown (a drifted
+/// login's own sessions are ended); the health check requires it false. Operators are
+/// schema-qualified.
+fn elevated_drift_sql(login: &str, verifier: &str) -> String {
+    let verifier = literal(verifier);
+    let void = crate::login_lockdown::void_sessions_sql(login);
+    format!(
+        "(EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) {login}
+      AND (NOT a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls OR a.rolinherit
+        OR a.rolpassword IS DISTINCT FROM {verifier} OR a.rolconnlimit OPERATOR(pg_catalog.<>) -1
+        OR a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz))
+    OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {login})
+    OR EXISTS (SELECT FROM pg_catalog.pg_auth_members x WHERE x.roleid OPERATOR(pg_catalog.=) {login})
+    OR {void})"
     )
 }
 
@@ -279,15 +338,15 @@ enum Lookup {
 /// SCRAM's iteration count for the storage login's verifier (Postgres's default).
 const STORAGE_SCRAM_ITERATIONS: u32 = 4096;
 
+/// The [`AUTHENTICATOR_ELEVATED`] verifier of `password` with its stored `salt`.
+fn elevated_verifier(password: &str, salt: &[u8]) -> String {
+    chelabase_neon::scram::verifier_with_salt(password, salt, STORAGE_SCRAM_ITERATIONS)
+}
+
 /// The `chelabase_storage` verifier of `password` with its stored `salt`: computed here, so
 /// the health check can require exactly it.
 fn storage_verifier(password: &str, salt: &[u8]) -> String {
     chelabase_neon::scram::verifier_with_salt(password, salt, STORAGE_SCRAM_ITERATIONS)
-}
-
-/// `s` as an SQL string literal (`quote_literal`): single quotes doubled.
-pub(crate) fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// `s` as a quoted SQL identifier (`quote_ident`, always quoted): double quotes doubled.
@@ -318,7 +377,8 @@ pub fn valid_role_name(name: &str) -> bool {
 /// database's first bootstrap only) the same grants on what exists. The tamper check allows
 /// what app users adds to `chelabase` (P4).
 ///
-/// The script is one transaction (`BEGIN … COMMIT`) that first takes
+/// The script is one transaction (`BEGIN … COMMIT`, followed only by a second run of the
+/// session termination and the step that completes the elevated login's record) that first takes
 /// [`BOOTSTRAP_LOCK_KEY`] (after `SET LOCAL lock_timeout`, [`LOCK_TIMEOUT_SECS`]), so a reader
 /// never sees the event triggers dropped and not yet recreated, and concurrent bootstraps
 /// serialize. A failure (psql runs with `ON_ERROR_STOP`; the closed connection aborts the open
@@ -339,19 +399,58 @@ pub fn valid_role_name(name: &str) -> bool {
 /// as the bootstrap superuser, so its functions are owned by cloud_admin and keep
 /// Postgres's PUBLIC `EXECUTE`. It's kept for a Neon where owners own their extensions'
 /// functions, when the owner's default privilege would strip PUBLIC from them.
-pub fn data_api_sql(owner_role: &str, authenticator_password: &str, schema: &str) -> String {
-    data_api_script(owner_role, authenticator_password, schema, false)
+///
+/// [`AUTHENTICATOR_ELEVATED`] is made (`NOLOGIN` first) when missing, and on every run: its
+/// attributes are set back (`LOGIN NOINHERIT`, nothing else, `elevated_verifier` as its
+/// password), its settings are reset, every membership *in* it is revoked (whoever granted
+/// it, `ADMIN` grants included), the sessions of its former members are ended with
+/// `chelabase_admin`'s, and it loses `anon` and `authenticated` if it held them. It gets the
+/// machinery privileges `authenticator` has. Its other memberships are the worker's
+/// (`Worker::resync_elevated_grants`).
+///
+/// The login's own sessions are ended only when it had drifted ([`elevated_drift_sql`], read
+/// before the lockdown: a password other than `elevated_verifier`, changed attributes or
+/// settings, a member, or a session the last drifted lockdown voided), inside the
+/// transaction and again after the commit. Those two runs end the sessions Postgres lists
+/// under the login. A connection whose handshake read the replaced verifier and has not
+/// finished is not listed yet, so a drifted run also records on the login that its earlier
+/// sessions are void ([`crate::login_lockdown`], where the invariant is written down): the
+/// record is committed with the lockdown, the step after the commit takes a cut-off and ends
+/// every session of the login that started at or before it, and the drift predicate stays
+/// true while the record is pending or such a session is open. So a session authenticated
+/// against a replaced verifier is ended by this run, or fails the health check and is ended
+/// by the bootstrap that follows, whether or not this run's own session reached its last
+/// step. A login found as the last run left it keeps its sessions: a routine bootstrap
+/// doesn't drop the data API's connections.
+///
+/// Unlike `chelabase_storage`'s lockdown there is no `REASSIGN OWNED`: leftover ownership
+/// gives no role anything it lacked. After the lockdown no role is a member of the login,
+/// tenant SQL never runs with it as the current user, and the worker's grants to it carry
+/// neither `INHERIT` nor `ADMIN`.
+pub fn data_api_sql(owner_role: &str, authenticator_password: &str, elevated_verifier: &str, schema: &str) -> String {
+    data_api_script(owner_role, authenticator_password, elevated_verifier, schema, false)
 }
 
 /// [`data_api_sql`] for a rebootstrap that was asked to grant the schema's existing objects
 /// (`grant_existing`): the first-grants statements run whether or not `chelabase.bootstrap`
 /// has its row (still only when the schema exists). Grants only: no `REVOKE`, so a role never
 /// loses a privilege to it.
-pub fn data_api_sql_granting_existing(owner_role: &str, authenticator_password: &str, schema: &str) -> String {
-    data_api_script(owner_role, authenticator_password, schema, true)
+pub fn data_api_sql_granting_existing(
+    owner_role: &str,
+    authenticator_password: &str,
+    elevated_verifier: &str,
+    schema: &str,
+) -> String {
+    data_api_script(owner_role, authenticator_password, elevated_verifier, schema, true)
 }
 
-fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str, grant_existing: bool) -> String {
+fn data_api_script(
+    owner_role: &str,
+    authenticator_password: &str,
+    elevated_verifier: &str,
+    schema: &str,
+    grant_existing: bool,
+) -> String {
     // The asked-for variant only adds grants: no REVOKE, so it never narrows what a role has.
     let (first_grants_guard, record_grant, revoke_public) = if grant_existing {
         ("", " ON CONFLICT DO NOTHING", "")
@@ -362,15 +461,35 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
             "      EXECUTE pg_catalog.format('REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC', r.f);\n",
         )
     };
-    let password = quote_literal(authenticator_password);
+    let password = literal(authenticator_password);
+    let elevated_verifier_text = elevated_verifier;
+    let elevated_verifier = literal(elevated_verifier);
     let schema_ident = quote_ident(schema);
     // `regnamespace` and `to_regnamespace` parse identifier syntax, so the literal is the
     // quoted identifier.
-    let schema_literal = quote_literal(&schema_ident);
-    let owner = quote_literal(owner_role);
+    let schema_literal = literal(&schema_ident);
+    let owner = literal(owner_role);
     let claim_helpers = crate::app_users_sql::claim_helpers_body();
     let newer = valid_newer_sql();
     let stamp_version = stamp_version_sql();
+    // Read inside the login's block, before its lockdown (`login` is the block's variable).
+    let elevated_drift = elevated_drift_sql("login", elevated_verifier_text);
+    // The durable record of the drift: written in the transaction, completed after it.
+    let elevated_record = crate::login_lockdown::record_sql(AUTHENTICATOR_ELEVATED, "login", "drifted");
+    let elevated_finish = crate::login_lockdown::finish_sql(AUTHENTICATOR_ELEVATED);
+    // Run twice: inside the transaction, and again once it has committed. A session that
+    // authenticated before the commit (under the password or the membership the transaction
+    // replaces) is ended by the second run.
+    let end_sessions = "DO $$ BEGIN
+  PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'
+        OR (r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND pg_catalog.current_setting('chelabase.elevated_end_sessions', true) OPERATOR(pg_catalog.=) 'true')
+        OR a.usesysid OPERATOR(pg_catalog.=) ANY
+        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
+      AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+END $$;
+";
     // A reserved default schema gets neither default privileges nor grants.
     let schema_present = if reserved_default_schema(schema) {
         "false".to_string()
@@ -469,18 +588,50 @@ BEGIN
   PERFORM pg_catalog.set_config('chelabase.leave_alone', (ns IS NOT NULL AND untrusted IS FALSE AND COALESCE(newer, false))::pg_catalog.text, true);
   PERFORM pg_catalog.set_config('chelabase.newer_version', COALESCE({stamp_version}::pg_catalog.text, ''), true);
 END $$;
-DO $$ BEGIN
-  PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
-    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
-        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
-      AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+DO $$ DECLARE
+  login pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');
+  members pg_catalog.oid[];
+  drifted boolean;
+  m record;
+BEGIN
+  IF login IS NULL THEN
+    CREATE ROLE chelabase_authenticator_elevated NOLOGIN NOINHERIT PASSWORD NULL;
+    login := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');
+  END IF;
+  members := ARRAY(WITH RECURSIVE reach(oid) AS (
+      SELECT a.member FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) login
+      UNION SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid)
+    SELECT oid FROM reach);
+  drifted := {elevated_drift};
+{elevated_record}  ALTER ROLE chelabase_authenticator_elevated LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT -1 VALID UNTIL 'infinity' PASSWORD {elevated_verifier};
+  FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
+    WHERE s.setrole OPERATOR(pg_catalog.=) login
+  LOOP
+    EXECUTE pg_catalog.format('ALTER ROLE chelabase_authenticator_elevated IN DATABASE %I RESET ALL', m.datname);
+  END LOOP;
+  ALTER ROLE chelabase_authenticator_elevated RESET ALL;
+  FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.roleid OPERATOR(pg_catalog.=) login
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE chelabase_authenticator_elevated FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+  END LOOP;
+  FOR m IN SELECT r.rolname AS granted, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.roleid JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.member OPERATOR(pg_catalog.=) login AND r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['anon', 'authenticated']::pg_catalog.name[])
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE %I FROM chelabase_authenticator_elevated GRANTED BY %I CASCADE', m.granted, m.grantor);
+  END LOOP;
+  PERFORM pg_catalog.set_config('chelabase.former_members', pg_catalog.concat_ws(',',
+    NULLIF(pg_catalog.current_setting('chelabase.former_members', true), ''), NULLIF(pg_catalog.array_to_string(members, ','), '')), false);
+  PERFORM pg_catalog.set_config('chelabase.elevated_end_sessions', drifted::pg_catalog.text, false);
 END $$;
-SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<>) 'true' AS chelabase_install \\gset
+{end_sessions}SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<>) 'true' AS chelabase_install \\gset
 \\if :chelabase_install
 CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
 REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
 GRANT USAGE ON SCHEMA chelabase TO authenticator;
+GRANT USAGE ON SCHEMA chelabase TO chelabase_authenticator_elevated;
 CREATE TABLE IF NOT EXISTS chelabase.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
 INSERT INTO chelabase.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS chelabase.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
@@ -488,6 +639,7 @@ ALTER TABLE chelabase.schema_version OWNER TO chelabase_admin;
 ALTER TABLE chelabase.bootstrap OWNER TO chelabase_admin;
 REVOKE ALL ON chelabase.schema_version, chelabase.bootstrap FROM PUBLIC;
 GRANT SELECT ON chelabase.schema_version TO authenticator;
+GRANT SELECT ON chelabase.schema_version TO chelabase_authenticator_elevated;
 GRANT USAGE ON SCHEMA chelabase TO {owner_role};
 GRANT SELECT ON chelabase.schema_version TO {owner_role};
 {claim_helpers}CREATE OR REPLACE FUNCTION chelabase.bump_schema_version() RETURNS event_trigger
@@ -556,6 +708,7 @@ DO $$ BEGIN
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT EXECUTE ON FUNCTIONS TO authenticated;
     GRANT USAGE ON SCHEMA {schema_ident} TO anon, authenticated, authenticator;
+    GRANT USAGE ON SCHEMA {schema_ident} TO chelabase_authenticator_elevated;
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
@@ -581,7 +734,7 @@ SELECT '{NEWER_MACHINERY_OFF}' WHERE pg_catalog.current_setting('chelabase.leave
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace({schema_literal}) IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
-"
+{end_sessions}{elevated_finish}"
     )
 }
 
@@ -609,7 +762,7 @@ fn system_roles() -> String {
     chelabase_types::data_key::KEY_ROLE_REFUSED_GROUPS
         .iter()
         .filter(|g| **g != "neon_superuser")
-        .map(|g| quote_literal(g))
+        .map(|g| literal(g))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -636,7 +789,7 @@ fn role_check_sql(role: &str) -> String {
          ELSE 'ok ' || r.oid::text || CASE WHEN r.rolbypassrls THEN ' t' ELSE ' f' END END \
          FROM pg_roles r WHERE r.rolname = {};",
         system_roles(),
-        quote_literal(role),
+        literal(role),
         marker = chelabase_types::role_name::PERSONAL_LOGIN_MARKER,
     )
 }
@@ -737,7 +890,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// The bootstrap of every served database of `branch` on `ep` (`main_database` is the
     /// main one), then the secret keys' roles (cluster-wide, so through the main database
-    /// only) and the public key. The main database's failure fails the call; another
+    /// only), the elevated login's memberships ([`Self::resync_elevated_grants`]) and the
+    /// public key. The main database's failure fails the call; another
     /// database's is logged (reconcile heals it), so a broken database can't keep the compute
     /// from starting. `done` lists databases (with the schema) an earlier call already
     /// bootstrapped: they're skipped, and the keys are left to that call. Returns the databases
@@ -774,6 +928,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         if done.is_empty() {
             self.regrant_secret_key_roles(branch, ep, main_database).await?;
+            self.resync_elevated_grants(branch, ep, main_database).await?;
             self.ensure_public_key(branch).await?;
         }
         Ok(bootstrapped)
@@ -806,7 +961,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, %ep, database = %database_name, schema, "the stored default schema is reserved; the data API grants nothing on it");
         }
         let password = self.authenticator_password(branch).await?;
-        let script = data_api_script(OWNER_ROLE, &password, schema, grant_existing);
+        let (elevated_password, elevated_salt) = self.elevated_login(branch).await?;
+        let script = data_api_script(
+            OWNER_ROLE,
+            &password,
+            &elevated_verifier(&elevated_password, &elevated_salt),
+            schema,
+            grant_existing,
+        );
         let output = self.computes.admin_sql(ep, database_name, &script).await?;
         if missing_schema(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, schema, "the default schema doesn't exist; its default privileges and grants were skipped (the machinery is installed)");
@@ -867,8 +1029,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .collect();
         roles.sort();
         roles.dedup();
+        if roles.is_empty() {
+            return Ok(());
+        }
+        // One read classifies every key's role here; the resync that follows reads afresh.
+        let catalog = self
+            .role_catalog(ep, database_name)
+            .await
+            .context("reading the roles to classify the secret keys' roles")?;
         for (role, role_oid) in roles {
-            match self.check_and_grant(branch, ep, database_name, &role, role_oid).await {
+            match self
+                .check_and_grant_classified(branch, ep, database_name, &role, role_oid, Some(&catalog))
+                .await
+            {
                 RoleCheck::Ok(..) => {}
                 other => {
                     warn!(branch_id = %branch, %role, "not granting a secret key's role to {AUTHENTICATOR}: {other:?}");
@@ -918,6 +1091,156 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .transpose()
     }
 
+    /// The branch's [`AUTHENTICATOR_ELEVATED`] login: its password and the SCRAM salt of its
+    /// verifier. A new one (sealed `Purpose::AuthenticatorElevated`, AAD = branch id, with a
+    /// random 16-byte salt) is stored when the branch has none; like
+    /// [`Self::authenticator_password`] it is read back, so a racing run's wins and a later
+    /// bootstrap sets the same password again.
+    async fn elevated_login(&self, branch: BranchId) -> anyhow::Result<(String, Vec<u8>)> {
+        if let Some(login) = self.stored_elevated_login(branch).await? {
+            return Ok(login);
+        }
+        let password = credentials::generate_password();
+        let salt: [u8; 16] = rand::random();
+        let sealed = seal_credential(
+            &self.key,
+            &branch.to_string(),
+            Purpose::AuthenticatorElevated,
+            &password,
+        );
+        self.metadata
+            .set_authenticator_elevated_password(branch, &sealed, &salt)
+            .await
+            .context("storing the elevated login's password")?;
+        info!(branch_id = %branch, "made the branch's {AUTHENTICATOR_ELEVATED} login");
+        self.stored_elevated_login(branch)
+            .await?
+            .context("the elevated login's password wasn't stored (is the branch being deleted?)")
+    }
+
+    async fn stored_elevated_login(
+        &self,
+        branch: BranchId,
+    ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let row = self
+            .metadata
+            .branch_connection(branch)
+            .await
+            .context("reading the elevated login's password")?;
+        row.and_then(|r| {
+            r.authenticator_elevated_password_enc
+                .zip(r.authenticator_elevated_password_salt)
+        })
+        .map(|(sealed, salt)| {
+            open_credential(
+                &self.key,
+                &branch.to_string(),
+                Purpose::AuthenticatorElevated,
+                &sealed,
+            )
+            .context("opening the elevated login's password")
+            .map(|password| (password, salt))
+        })
+        .transpose()
+    }
+
+    /// The compute's roles and memberships ([`member_catalog_sql`]), read through `database`
+    /// (they are cluster-wide): what [`is_elevated`] classifies a role from.
+    async fn role_catalog(&self, ep: &str, database: &str) -> anyhow::Result<MemberCatalog> {
+        let out = self
+            .computes
+            .admin_sql(ep, database, &member_catalog_sql())
+            .await?;
+        parse_member_catalog(&out).map_err(|e| anyhow::anyhow!("the role catalog's answer: {e}"))
+    }
+
+    /// Puts every role the data API's two logins hold directly on the login it belongs to,
+    /// from the catalog as it is now (cluster-wide, so through any database):
+    /// [`plan_login_grants`], with one key-role check ([`role_check_sql`]) per role that could
+    /// be a key's. An elevated role moves from `authenticator` to
+    /// [`AUTHENTICATOR_ELEVATED`], an ordinary one the other way; `anon` and `authenticated`
+    /// stay on `authenticator` (elevated ones are warned about).
+    ///
+    /// It runs in the bootstrap (after [`Self::regrant_secret_key_roles`]) and whenever the
+    /// worker applies or learns of a role change (a roles API write, the login-role resync a
+    /// forwarded role statement asks for), so a role made elevated after its grant is moved
+    /// then.
+    ///
+    /// Nothing to move sends no SQL beyond the reads. A check that errors fails the resync.
+    /// On a branch whose elevated login isn't in the catalog (its bootstrap hasn't run, or
+    /// the data API isn't there at all) nothing is touched: nothing is taken from
+    /// `authenticator` before the login exists.
+    pub(crate) async fn resync_elevated_grants(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        database_name: &str,
+    ) -> anyhow::Result<()> {
+        let catalog = self
+            .role_catalog(ep, database_name)
+            .await
+            .context("reading the roles to resync the data API's logins")?;
+        // No `r` line at all: nothing was read (a compute that answers nothing).
+        if !catalog.roles.contains(AUTHENTICATOR_ELEVATED) {
+            // The health check ([`schema_check_sql`]) finds it missing and reconcile
+            // bootstraps; a compute's start isn't held up for it.
+            if catalog.roles.contains(AUTHENTICATOR) {
+                warn!(branch_id = %branch, %ep, "the {AUTHENTICATOR_ELEVATED} login isn't in the role catalog; the logins' memberships were left for the next bootstrap");
+            }
+            return Ok(());
+        }
+        let none = BTreeSet::new();
+        let mut passes = BTreeSet::new();
+        for role in [AUTHENTICATOR, AUTHENTICATOR_ELEVATED]
+            .iter()
+            .flat_map(|login| catalog.all_edges.get(*login).unwrap_or(&none))
+            .filter(|role| !chelabase_types::access::data_api_role(role) && refuse_by_name(role).is_none())
+        {
+            if passes.contains(role) {
+                continue;
+            }
+            // The classification and the name rules alone would keep a role no key or console
+            // session may use; a held role passes the same check a granted one does.
+            let answer = self
+                .computes
+                .admin_sql(ep, database_name, &role_check_sql(role))
+                .await
+                .with_context(|| format!("checking the role {role}"))?;
+            if parse_role_ok(answer.trim()).is_some() {
+                passes.insert(role.clone());
+            } else if is_elevated(&catalog, role) {
+                warn!(branch_id = %branch, %role, "a role the data API's logins hold doesn't pass a key role's check ({:?}): neither login keeps it", answer.trim());
+            }
+        }
+        let (plan, own_elevated) = plan_login_grants(&catalog, &passes);
+        for role in own_elevated {
+            warn!(branch_id = %branch, %role, "the data API's own role is elevated (it reaches a role only an Admin may act as); it stays on {AUTHENTICATOR}");
+        }
+        if plan.is_empty() {
+            return Ok(());
+        }
+        self.computes
+            .admin_sql(ep, database_name, &login_grants_sql(ELEVATED_RESYNC_MARK, &plan))
+            .await
+            .context("resyncing the data API's logins' memberships")?;
+        info!(branch_id = %branch, granted = ?plan.grant, revoked = ?plan.revoke, "resynced the data API's logins' memberships");
+        Ok(())
+    }
+
+    /// [`Self::resync_elevated_grants`] after a role change the worker applied or learnt of.
+    /// A failure is logged: the next role change, bootstrap or resync runs it again, and
+    /// until then the data API refuses an elevated role `authenticator` still holds.
+    pub(crate) async fn resync_elevated_grants_after_role_change(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        database_name: &str,
+    ) {
+        if let Err(e) = self.resync_elevated_grants(branch, ep, database_name).await {
+            warn!(branch_id = %branch, endpoint_id = %ep, "moving roles between the data API's logins after a role change: {e:#}");
+        }
+    }
+
     /// The branch's `chelabase_storage` login (the storage service's own): its password and
     /// the SCRAM salt of its verifier. A new one (sealed `Purpose::Storage`, AAD = branch id,
     /// with a random 16-byte salt) is stored when the branch has none; like
@@ -955,6 +1278,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     .map(|password| (password, salt))
             })
             .transpose()
+    }
+
+    /// The verifier the branch's [`AUTHENTICATOR_ELEVATED`] must carry (`None`: no login
+    /// stored yet).
+    pub async fn elevated_verifier(&self, branch: BranchId) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .stored_elevated_login(branch)
+            .await?
+            .map(|(password, salt)| elevated_verifier(&password, &salt)))
     }
 
     /// The verifier the branch's `chelabase_storage` must carry (`None`: no login stored yet).
@@ -1094,9 +1426,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         schema: &str,
     ) -> anyhow::Result<bool> {
         let verifier = self.storage_verifier(branch).await?;
+        let elevated = self.elevated_verifier(branch).await?;
         let out = self
             .computes
-            .admin_sql(ep, database, &schema_check_sql(schema, verifier.as_deref()))
+            .admin_sql(
+                ep,
+                database,
+                &schema_check_sql(schema, verifier.as_deref(), elevated.as_deref()),
+            )
             .await?;
         match out.trim() {
             "t" => Ok(true),
@@ -1272,7 +1609,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// built-in (`pg_*`), existing, not a superuser, without CREATEROLE, CREATEDB or
     /// REPLICATION, and not a member (at any depth) of a superuser role, `neon_superuser` or
     /// the other system roles. BYPASSRLS is allowed (E33) and reported. On success it's
-    /// granted to `authenticator` (`set_config('role', …)` needs the membership).
+    /// granted to the one login its attributes choose: [`AUTHENTICATOR_ELEVATED`] when it is
+    /// elevated, `authenticator` otherwise (`set_config('role', …)` needs the membership).
+    ///
+    /// Invariant (W4): the role's classification is read and its grant sent under the
+    /// endpoint's lock, the lock every role change the worker applies holds across its
+    /// statement and its move step (`roles.rs`, the role resync). So no such change lands
+    /// between the read and the grant: a role is granted to the login its attributes at
+    /// grant time choose, and a change after it moves the role itself. A lock that can't be
+    /// had in time answers [`RoleCheck::NotReady`] and grants nothing. (The bootstrap's
+    /// re-grant runs where its caller may already hold the lock; the resync that follows it
+    /// in the same run reads afresh and repairs it. A change made in SQL over a direct
+    /// connection isn't the worker's to order: the next resync moves it.)
     pub async fn check_data_role(&self, branch: BranchId, role: &str) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
             return refusal;
@@ -1289,6 +1637,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .and_then(|r| Some((r.endpoint_id?, r.database_name?)))
         else {
             return RoleCheck::NotReady;
+        };
+        let _lock = match self.metadata.lock_endpoint(&ep).await {
+            Ok(lock) => lock,
+            Err(e) => {
+                warn!(branch_id = %branch, endpoint_id = %ep, "locking the endpoint to check role {role}: {e}");
+                return RoleCheck::NotReady;
+            }
         };
         self.check_and_grant(branch, &ep, &database_name, role, None)
             .await
@@ -1324,7 +1679,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
     }
 
-    /// The name rules, the check query on `ep`, then the grant.
+    /// The name rules, the check query on `ep`, then the grant: to [`AUTHENTICATOR_ELEVATED`]
+    /// alone when the role is elevated, to `authenticator` alone otherwise.
     pub(crate) async fn check_and_grant(
         &self,
         branch: BranchId,
@@ -1332,6 +1688,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         database_name: &str,
         role: &str,
         expected_oid: Option<i64>,
+    ) -> RoleCheck {
+        self.check_and_grant_classified(branch, ep, database_name, role, expected_oid, None)
+            .await
+    }
+
+    /// [`Self::check_and_grant`], classifying the role from `catalog` when the caller has
+    /// just read one (a loop over many roles), else from a fresh read. A role
+    /// [`held_by_elevated_login`] is granted to [`AUTHENTICATOR_ELEVATED`] and revoked from
+    /// `authenticator`; any other role is granted to `authenticator` and revoked from the
+    /// elevated login. A catalog that can't be read, or that doesn't list the role, grants
+    /// nothing ([`RoleCheck::Failed`]). On a branch whose
+    /// bootstrap hasn't made the login yet, the role goes to `authenticator` alone and the
+    /// next bootstrap's [`Self::resync_elevated_grants`] moves it.
+    async fn check_and_grant_classified(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        database_name: &str,
+        role: &str,
+        expected_oid: Option<i64>,
+        catalog: Option<&MemberCatalog>,
     ) -> RoleCheck {
         if let Some(refusal) = refuse_by_name(role) {
             return refusal;
@@ -1378,17 +1755,195 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         {
             return refused("is now a different role than the key was bound to");
         }
-        let grant = format!("GRANT {} TO {AUTHENTICATOR};", quote_ident(role));
-        if let Err(e) = self.computes.admin_sql(ep, database_name, &grant).await {
-            warn!(branch_id = %branch, endpoint_id = %ep, "granting {role} to {AUTHENTICATOR}: {e:#}");
+        // Classified before anything is granted: without a classification nothing is.
+        let read;
+        let catalog = match catalog {
+            Some(catalog) => catalog,
+            None => match self.role_catalog(ep, database_name).await {
+                Ok(catalog) => {
+                    read = catalog;
+                    &read
+                }
+                Err(e) => {
+                    warn!(branch_id = %branch, endpoint_id = %ep, "classifying role {role}: {e:#}");
+                    return RoleCheck::Failed(format!("classifying the role {role}: {e:#}"));
+                }
+            },
+        };
+        // A catalog that doesn't list the role (it changed since the check, or the read
+        // answered nothing) classifies nothing: the role would count as ordinary unread.
+        if !catalog.roles.contains(role) {
+            warn!(branch_id = %branch, endpoint_id = %ep, "classifying role {role}: the role catalog doesn't list it");
             return RoleCheck::Failed(format!(
-                "granting the role {role} to {AUTHENTICATOR}: {e:#}"
+                "classifying the role {role}: the role catalog doesn't list it"
             ));
         }
-        info!(branch_id = %branch, %role, bypass_rls, "granted to {AUTHENTICATOR}");
+        // The login that holds the role, and only it: the grant, then the other login's
+        // membership revoked, in one transaction ([`login_grants_sql`]). On a branch whose
+        // bootstrap hasn't made the elevated login yet nothing is taken from `authenticator`:
+        // the role goes to it alone and the bootstrap's resync moves it.
+        let elevated = held_by_elevated_login(catalog, role);
+        let has_login = catalog.roles.contains(AUTHENTICATOR_ELEVATED);
+        let plan = key_grant_plan(role, elevated, has_login);
+        let login = plan.grant[0].1;
+        if let Err(e) = self
+            .computes
+            .admin_sql(ep, database_name, &login_grants_sql(KEY_GRANT_MARK, &plan))
+            .await
+        {
+            warn!(branch_id = %branch, endpoint_id = %ep, "granting {role} to {login}: {e:#}");
+            return RoleCheck::Failed(format!("granting the role {role} to {login}: {e:#}"));
+        }
+        info!(branch_id = %branch, %role, bypass_rls, "granted to {login}");
+        if elevated && !has_login {
+            info!(branch_id = %branch, %role, "{AUTHENTICATOR_ELEVATED} isn't there yet; the next bootstrap moves the role to it");
+        }
         RoleCheck::Ok(oid, bypass_rls)
     }
 }
+
+/// A key role's grant: to the one login its classification chooses, with the other login's
+/// membership removed. Without the elevated login (`has_login`) the role goes to
+/// `authenticator` alone and nothing is taken from it.
+fn key_grant_plan(role: &str, elevated: bool, has_login: bool) -> LoginGrants {
+    let role = role.to_owned();
+    match (elevated, has_login) {
+        (true, true) => LoginGrants {
+            grant: vec![(role.clone(), AUTHENTICATOR_ELEVATED)],
+            revoke: vec![(role, AUTHENTICATOR)],
+        },
+        (false, true) => LoginGrants {
+            grant: vec![(role.clone(), AUTHENTICATOR)],
+            revoke: vec![(role, AUTHENTICATOR_ELEVATED)],
+        },
+        (_, false) => LoginGrants {
+            grant: vec![(role, AUTHENTICATOR)],
+            revoke: Vec::new(),
+        },
+    }
+}
+
+/// Whether [`AUTHENTICATOR_ELEVATED`] may hold `role`: an elevated role ([`is_elevated`], the
+/// one classification) that could be a key's or a console session's by name
+/// ([`refuse_by_name`]: never a reserved or built-in role), and never the data API's own
+/// `anon` or `authenticated`, which stay with `authenticator` whatever they were made
+/// members of.
+fn held_by_elevated_login(catalog: &MemberCatalog, role: &str) -> bool {
+    !chelabase_types::access::data_api_role(role)
+        && refuse_by_name(role).is_none()
+        && is_elevated(catalog, role)
+}
+
+/// Memberships of the data API's two logins to make and to remove: `(role, login)` each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoginGrants {
+    grant: Vec<(String, &'static str)>,
+    revoke: Vec<(String, &'static str)>,
+}
+
+impl LoginGrants {
+    fn is_empty(&self) -> bool {
+        self.grant.is_empty() && self.revoke.is_empty()
+    }
+}
+
+/// Where each role the two logins hold directly belongs ([`Worker::resync_elevated_grants`];
+/// pure). `held`: the roles `authenticator` and [`AUTHENTICATOR_ELEVATED`] hold directly.
+/// `passes`: the roles that pass a key role's check ([`role_check_sql`]).
+///
+/// - `anon` and `authenticated` stay where they are (on `authenticator`), elevated or not;
+///   the elevated ones are returned to be warned about.
+/// - A role that could never be a key's or a console session's by name ([`refuse_by_name`])
+///   is the platform's own on `authenticator` and left there; the elevated login never
+///   keeps one.
+/// - An elevated role leaves `authenticator`, and goes to the elevated login when it passes
+///   the check. One that doesn't pass is held by neither.
+/// - An ordinary role leaves the elevated login, and goes to `authenticator`.
+///
+/// Afterwards `authenticator` holds no elevated key or console role, and the elevated login
+/// holds nothing else. A role already in place plans nothing.
+fn plan_login_grants(
+    catalog: &MemberCatalog,
+    passes: &BTreeSet<String>,
+) -> (LoginGrants, Vec<String>) {
+    let none = BTreeSet::new();
+    let on_authenticator = catalog.all_edges.get(AUTHENTICATOR).unwrap_or(&none);
+    let on_elevated = catalog.all_edges.get(AUTHENTICATOR_ELEVATED).unwrap_or(&none);
+    let mut plan = LoginGrants::default();
+    let mut own_elevated = Vec::new();
+    for role in on_authenticator {
+        if chelabase_types::access::data_api_role(role) {
+            if is_elevated(catalog, role) {
+                own_elevated.push(role.clone());
+            }
+            continue;
+        }
+        if !held_by_elevated_login(catalog, role) {
+            continue;
+        }
+        if passes.contains(role) && !on_elevated.contains(role) {
+            plan.grant.push((role.clone(), AUTHENTICATOR_ELEVATED));
+        }
+        plan.revoke.push((role.clone(), AUTHENTICATOR));
+    }
+    for role in on_elevated {
+        if held_by_elevated_login(catalog, role) && passes.contains(role) {
+            continue;
+        }
+        let ordinary = !chelabase_types::access::data_api_role(role)
+            && refuse_by_name(role).is_none()
+            && !is_elevated(catalog, role);
+        if ordinary && passes.contains(role) && !on_authenticator.contains(role) {
+            plan.grant.push((role.clone(), AUTHENTICATOR));
+        }
+        plan.revoke.push((role.clone(), AUTHENTICATOR_ELEVATED));
+    }
+    (plan, own_elevated)
+}
+
+/// The one transaction that changes the two logins' memberships: every grant of `plan`
+/// first, then each membership to remove, revoked from the grantor that made it (a
+/// superuser's plain `REVOKE` only removes its own). The revoke never runs before the grant
+/// it follows, and neither is visible without the other, so a role is at no moment held by
+/// neither login. `mark`, the first line, tells the script apart in logs and tests.
+fn login_grants_sql(mark: &str, plan: &LoginGrants) -> String {
+    let mut sql = format!("{mark}\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\n");
+    for (role, login) in &plan.grant {
+        sql.push_str(&format!("GRANT {} TO {login};\n", quote_ident(role)));
+    }
+    for login in [AUTHENTICATOR, AUTHENTICATOR_ELEVATED] {
+        let names: Vec<String> = plan
+            .revoke
+            .iter()
+            .filter(|(_, from)| *from == login)
+            .map(|(role, _)| literal(role))
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        sql.push_str(&format!(
+            "DO $$ DECLARE m record; BEGIN
+  FOR m IN SELECT r.rolname AS granted, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles l ON l.oid OPERATOR(pg_catalog.=) a.member
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.roleid JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE l.rolname OPERATOR(pg_catalog.=) '{login}' AND r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY[{}]::pg_catalog.name[])
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE %I FROM {login} GRANTED BY %I CASCADE', m.granted, m.grantor);
+  END LOOP;
+END $$;
+",
+            names.join(", ")
+        ));
+    }
+    sql.push_str("COMMIT;\n");
+    sql
+}
+
+/// The first line of [`Worker::check_and_grant`]'s grant script.
+pub const KEY_GRANT_MARK: &str = "-- chelabase: key role grant";
+
+/// The first line of [`Worker::resync_elevated_grants`]'s script.
+pub const ELEVATED_RESYNC_MARK: &str = "-- chelabase: elevated login resync";
 
 /// The timeline a role check ran on, from the branch's timeline before and after it: the
 /// timeline when both readings agree; otherwise why the check can't be trusted.
@@ -1433,6 +1988,13 @@ mod tests {
         FakeWorker, Journal, entries, position, ready_branch, ready_database, worker,
     };
 
+    /// A verifier for scripts built without a branch (the exact script's literal).
+    const ELEVATED_VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdA==$a:b";
+
+    /// What only the role check's SQL contains ([`role_check_sql`]); the role catalog's
+    /// read has `pg_has_role` too.
+    const ROLE_CHECK: &str = "THEN 'personal_login'";
+
     /// The data API script's first line, as the fake backend journals it (the transaction's `BEGIN;`).
     const DATA_API: &str = "BEGIN;";
 
@@ -1474,6 +2036,26 @@ mod tests {
                 .expect("an authenticator password"),
         )
         .unwrap()
+    }
+
+    /// The branch's stored elevated login, opened: its password and salt.
+    fn elevated_login(w: &FakeWorker, branch: BranchId) -> (String, Vec<u8>) {
+        let (sealed, salt) = w
+            .metadata
+            .state()
+            .elevated_logins
+            .get(&branch)
+            .cloned()
+            .expect("an elevated login");
+        let password =
+            open_credential(&w.key, &branch.to_string(), Purpose::AuthenticatorElevated, &sealed).unwrap();
+        (password, salt)
+    }
+
+    /// The verifier the bootstrap sets on the branch's elevated login.
+    fn verifier(w: &FakeWorker, branch: BranchId) -> String {
+        let (password, salt) = elevated_login(w, branch);
+        elevated_verifier(&password, &salt)
     }
 
     fn keys_of(w: &FakeWorker, branch: BranchId) -> Vec<NewDataKey> {
@@ -1579,10 +2161,63 @@ BEGIN
   PERFORM pg_catalog.set_config('chelabase.leave_alone', (ns IS NOT NULL AND untrusted IS FALSE AND COALESCE(newer, false))::pg_catalog.text, true);
   PERFORM pg_catalog.set_config('chelabase.newer_version', COALESCE((SELECT pg_catalog.substring(pg_catalog.obj_description(e.oid, 'pg_event_trigger'), '^chelabase data api schema ([0-9]{1,9})$')::pg_catalog.int4 FROM pg_catalog.pg_event_trigger e JOIN pg_catalog.pg_roles eo ON eo.oid OPERATOR(pg_catalog.=) e.evtowner AND eo.rolsuper JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid AND p.proname OPERATOR(pg_catalog.=) 'bump_schema_version' AND p.pronargs OPERATOR(pg_catalog.=) 0 JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace AND n.nspname OPERATOR(pg_catalog.=) 'chelabase' JOIN pg_catalog.pg_roles po ON po.oid OPERATOR(pg_catalog.=) p.proowner AND po.rolsuper WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_version_ddl')::pg_catalog.text, ''), true);
 END $$;
+DO $$ DECLARE
+  login pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');
+  members pg_catalog.oid[];
+  drifted boolean;
+  m record;
+BEGIN
+  IF login IS NULL THEN
+    CREATE ROLE chelabase_authenticator_elevated NOLOGIN NOINHERIT PASSWORD NULL;
+    login := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');
+  END IF;
+  members := ARRAY(WITH RECURSIVE reach(oid) AS (
+      SELECT a.member FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) login
+      UNION SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid)
+    SELECT oid FROM reach);
+  drifted := (EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) login
+      AND (NOT a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls OR a.rolinherit
+        OR a.rolpassword IS DISTINCT FROM 'SCRAM-SHA-256$4096:c2FsdA==$a:b' OR a.rolconnlimit OPERATOR(pg_catalog.<>) -1
+        OR a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz))
+    OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) login)
+    OR EXISTS (SELECT FROM pg_catalog.pg_auth_members x WHERE x.roleid OPERATOR(pg_catalog.=) login)
+    OR (pg_catalog.shobj_description(login, 'pg_authid') IS NOT NULL
+      AND (pg_catalog.substring(pg_catalog.shobj_description(login, 'pg_authid'), '^chelabase lockdown ([0-9]{1,18})$')::pg_catalog.int8 IS NULL OR EXISTS (SELECT FROM pg_catalog.pg_stat_activity v WHERE v.usesysid OPERATOR(pg_catalog.=) login
+        AND pg_catalog.ceil(pg_catalog.date_part('epoch', v.backend_start) OPERATOR(pg_catalog.*) 1000000)::pg_catalog.int8 OPERATOR(pg_catalog.<=) pg_catalog.substring(pg_catalog.shobj_description(login, 'pg_authid'), '^chelabase lockdown ([0-9]{1,18})$')::pg_catalog.int8))));
+  IF drifted THEN
+    COMMENT ON ROLE chelabase_authenticator_elevated IS 'chelabase lockdown pending';
+  ELSIF pg_catalog.substring(pg_catalog.shobj_description(login, 'pg_authid'), '^chelabase lockdown ([0-9]{1,18})$')::pg_catalog.int8 OPERATOR(pg_catalog.<) pg_catalog.ceil(pg_catalog.date_part('epoch', pg_catalog.pg_postmaster_start_time()) OPERATOR(pg_catalog.*) 1000000)::pg_catalog.int8 THEN
+    COMMENT ON ROLE chelabase_authenticator_elevated IS NULL;
+  END IF;
+  ALTER ROLE chelabase_authenticator_elevated LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT -1 VALID UNTIL 'infinity' PASSWORD 'SCRAM-SHA-256$4096:c2FsdA==$a:b';
+  FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
+    WHERE s.setrole OPERATOR(pg_catalog.=) login
+  LOOP
+    EXECUTE pg_catalog.format('ALTER ROLE chelabase_authenticator_elevated IN DATABASE %I RESET ALL', m.datname);
+  END LOOP;
+  ALTER ROLE chelabase_authenticator_elevated RESET ALL;
+  FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.roleid OPERATOR(pg_catalog.=) login
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE chelabase_authenticator_elevated FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+  END LOOP;
+  FOR m IN SELECT r.rolname AS granted, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.roleid JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.member OPERATOR(pg_catalog.=) login AND r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['anon', 'authenticated']::pg_catalog.name[])
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE %I FROM chelabase_authenticator_elevated GRANTED BY %I CASCADE', m.granted, m.grantor);
+  END LOOP;
+  PERFORM pg_catalog.set_config('chelabase.former_members', pg_catalog.concat_ws(',',
+    NULLIF(pg_catalog.current_setting('chelabase.former_members', true), ''), NULLIF(pg_catalog.array_to_string(members, ','), '')), false);
+  PERFORM pg_catalog.set_config('chelabase.elevated_end_sessions', drifted::pg_catalog.text, false);
+END $$;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin' OR a.usesysid OPERATOR(pg_catalog.=) ANY
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'
+        OR (r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND pg_catalog.current_setting('chelabase.elevated_end_sessions', true) OPERATOR(pg_catalog.=) 'true')
+        OR a.usesysid OPERATOR(pg_catalog.=) ANY
         (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
@@ -1591,6 +2226,7 @@ SELECT pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.<
 CREATE SCHEMA IF NOT EXISTS chelabase AUTHORIZATION chelabase_admin;
 REVOKE ALL ON SCHEMA chelabase FROM PUBLIC;
 GRANT USAGE ON SCHEMA chelabase TO authenticator;
+GRANT USAGE ON SCHEMA chelabase TO chelabase_authenticator_elevated;
 CREATE TABLE IF NOT EXISTS chelabase.schema_version (one boolean PRIMARY KEY DEFAULT true CHECK (one), version uuid NOT NULL);
 INSERT INTO chelabase.schema_version (version) VALUES (pg_catalog.gen_random_uuid()) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS chelabase.bootstrap (one boolean PRIMARY KEY DEFAULT true CHECK (one), existing_granted boolean NOT NULL);
@@ -1598,6 +2234,7 @@ ALTER TABLE chelabase.schema_version OWNER TO chelabase_admin;
 ALTER TABLE chelabase.bootstrap OWNER TO chelabase_admin;
 REVOKE ALL ON chelabase.schema_version, chelabase.bootstrap FROM PUBLIC;
 GRANT SELECT ON chelabase.schema_version TO authenticator;
+GRANT SELECT ON chelabase.schema_version TO chelabase_authenticator_elevated;
 GRANT USAGE ON SCHEMA chelabase TO postgres;
 GRANT SELECT ON chelabase.schema_version TO postgres;
 GRANT USAGE ON SCHEMA chelabase TO PUBLIC;
@@ -1683,6 +2320,7 @@ DO $$ BEGIN
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA \"public\" GRANT EXECUTE ON FUNCTIONS TO authenticated;
     GRANT USAGE ON SCHEMA \"public\" TO anon, authenticated, authenticator;
+    GRANT USAGE ON SCHEMA \"public\" TO chelabase_authenticator_elevated;
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
@@ -1705,14 +2343,39 @@ SELECT pg_catalog.format('chelabase_data_api_newer: the chelabase schema is vers
     pg_catalog.current_setting('chelabase.newer_version'))
   WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true';
 SELECT 'chelabase_data_api_newer_machinery_off' WHERE pg_catalog.current_setting('chelabase.leave_alone') OPERATOR(pg_catalog.=) 'true'
-  AND NOT (EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin) AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', 'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3);
+  AND NOT (EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'authenticator' AND r.rolcanlogin) AND EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND r.rolcanlogin) AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_event_trigger WHERE evtname OPERATOR(pg_catalog.=) ANY (ARRAY['chelabase_schema_version_ddl', 'chelabase_schema_version_drop', 'chelabase_extension_functions']::pg_catalog.name[]) AND evtenabled OPERATOR(pg_catalog.<>) 'D') OPERATOR(pg_catalog.=) 3);
 SELECT 'chelabase_missing_schema' WHERE pg_catalog.to_regnamespace('\"public\"') IS NULL;
 SELECT pg_catalog.current_setting('chelabase.quarantined', true);
 COMMIT;
+DO $$ BEGIN
+  PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'
+        OR (r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND pg_catalog.current_setting('chelabase.elevated_end_sessions', true) OPERATOR(pg_catalog.=) 'true')
+        OR a.usesysid OPERATOR(pg_catalog.=) ANY
+        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')::pg_catalog.oid[]))
+      AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+END $$;
+DO $$ DECLARE
+  locked pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');
+  cutoff pg_catalog.int8;
+BEGIN
+  SET LOCAL lock_timeout = '20s';
+  PERFORM pg_catalog.pg_advisory_xact_lock(7163086723497615873);
+  IF pg_catalog.shobj_description(locked, 'pg_authid') IS NULL THEN RETURN; END IF;
+  cutoff := pg_catalog.substring(pg_catalog.shobj_description(locked, 'pg_authid'), '^chelabase lockdown ([0-9]{1,18})$')::pg_catalog.int8;
+  IF cutoff IS NULL THEN
+    cutoff := pg_catalog.ceil(pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) OPERATOR(pg_catalog.*) 1000000)::pg_catalog.int8 OPERATOR(pg_catalog.+) 1;
+    EXECUTE pg_catalog.format('COMMENT ON ROLE chelabase_authenticator_elevated IS %L', 'chelabase lockdown ' OPERATOR(pg_catalog.||) cutoff::pg_catalog.text);
+  END IF;
+  PERFORM pg_catalog.pg_terminate_backend(v.pid, 5000) FROM pg_catalog.pg_stat_activity v
+    WHERE v.usesysid OPERATOR(pg_catalog.=) locked AND pg_catalog.ceil(pg_catalog.date_part('epoch', v.backend_start) OPERATOR(pg_catalog.*) 1000000)::pg_catalog.int8 OPERATOR(pg_catalog.<=) cutoff
+      AND v.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+END $$;
 ";
-        assert_eq!(data_api_sql("postgres", "s3cretPassw0rd", "public"), expected);
+        assert_eq!(data_api_sql("postgres", "s3cretPassw0rd", ELEVATED_VERIFIER, "public"), expected);
         // A quoted literal, quotes doubled.
-        assert!(data_api_sql("postgres", "it's", "public").contains("PASSWORD 'it''s';\n"));
+        assert!(data_api_sql("postgres", "it's", ELEVATED_VERIFIER, "public").contains("PASSWORD 'it''s';\n"));
     }
 
     /// The whole script is one transaction under a transaction-scoped advisory lock: a reader
@@ -1722,16 +2385,25 @@ COMMIT;
     #[test]
     fn the_bootstrap_script_runs_in_one_transaction_under_an_advisory_lock() {
         for sql in [
-            data_api_sql("postgres", "pw", "public"),
-            data_api_sql_granting_existing("postgres", "pw", "public"),
+            data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public"),
+            data_api_sql_granting_existing("postgres", "pw", ELEVATED_VERIFIER, "public"),
         ] {
             assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
-            assert!(sql.ends_with("COMMIT;\n"), "{sql}");
+            // After the commit: only the second run of the session termination, then the
+            // step that completes the elevated login's record.
+            let after = &sql[sql.rfind("COMMIT;\n").expect("the commit") + "COMMIT;\n".len()..];
+            assert!(after.starts_with("DO $$ BEGIN\n  PERFORM pg_catalog.pg_terminate_backend(a.pid)"), "{after}");
+            let after = after
+                .strip_suffix(&crate::login_lockdown::finish_sql(AUTHENTICATOR_ELEVATED))
+                .expect("the record's step is the last statement");
+            assert!(after.ends_with("END $$;\n") && after.matches(';').count() == 2, "{after}");
             let lock = format!("SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n");
             let lock_at = sql.find(&lock).expect("the advisory lock");
             let timeout_at = sql.find("SET LOCAL lock_timeout = '20s';\n").expect("the lock timeout");
             assert!(sql.find("BEGIN;").unwrap() < timeout_at && timeout_at < lock_at, "lock_timeout before the lock");
-            assert_eq!(sql.matches("pg_advisory").count(), 1);
+            // The transaction's lock, and the same one for the step after the commit.
+            assert_eq!(sql.matches("pg_advisory").count(), 2);
+            assert_eq!(sql[..sql.rfind("COMMIT;\n").unwrap()].matches("pg_advisory").count(), 1);
             let first_change = sql.find("CREATE ROLE chelabase_admin").unwrap();
             assert!(lock_at < first_change, "the lock comes before anything changes");
             // Exactly one transaction, and nothing in it that can't run inside one.
@@ -1754,7 +2426,7 @@ COMMIT;
     /// one tampered with) is renamed aside before anything touches it.
     #[test]
     fn the_script_pins_the_search_path_and_vets_chelabase_first() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         assert!(sql.starts_with("BEGIN;\nSET search_path = pg_catalog, pg_temp;\n"), "{sql}");
         let rename = sql.find("ALTER SCHEMA chelabase RENAME TO %I").expect("the rename aside");
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
@@ -1767,7 +2439,14 @@ COMMIT;
         }
         assert_eq!(sql.matches("SET search_path = pg_catalog, pg_temp AS").count(), 2);
         assert!(!sql.contains(" format("), "every function qualified");
-        assert!(sql.ends_with("SELECT pg_catalog.current_setting('chelabase.quarantined', true);\nCOMMIT;\n"));
+        // The last statement that prints: the output's last line is the quarantine's name.
+        assert!(sql.contains("SELECT pg_catalog.current_setting('chelabase.quarantined', true);\nCOMMIT;\nDO $$ BEGIN\n"));
+        // After the commit there are only `DO` blocks: no statement that prints.
+        let after = &sql[sql.rfind("COMMIT;\n").unwrap() + "COMMIT;\n".len()..];
+        assert_eq!(after.matches("DO $$").count(), 2, "{after}");
+        assert_eq!(after.matches("END $$;\n").count(), 2, "{after}");
+        assert!(after.starts_with("DO $$") && after.ends_with("END $$;\n"), "{after}");
+        assert!(after.lines().all(|l| !l.starts_with("SELECT")), "{after}");
     }
 
     /// `chelabase_admin` owns the schema: an owner who made it first (with a login, a
@@ -1776,7 +2455,7 @@ COMMIT;
     /// is set aside.
     #[test]
     fn chelabase_admin_is_locked_down_before_the_schema_is_trusted() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let locked = sql
             .find("ALTER ROLE chelabase_admin NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;")
             .expect("the role is locked down");
@@ -1796,7 +2475,7 @@ COMMIT;
     /// they own, and never fails their command.
     #[test]
     fn grant_extension_functions_runs_as_the_invoker_and_never_fails() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let start = sql.find("CREATE OR REPLACE FUNCTION chelabase.grant_extension_functions()").unwrap();
         let end = sql[start..].find("ALTER FUNCTION chelabase.grant_extension_functions()").unwrap();
         let body = &sql[start..start + end];
@@ -1813,25 +2492,28 @@ COMMIT;
     /// are granted, and never a superuser's.
     #[test]
     fn grant_extension_functions_only_touches_the_owner_roles_functions() {
-        let sql = data_api_sql("app_owner", "pw", "public");
+        let sql = data_api_sql("app_owner", "pw", ELEVATED_VERIFIER, "public");
         assert!(sql.contains(
             "AND p.proowner OPERATOR(pg_catalog.=) (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) 'app_owner' AND NOT r.rolsuper)"
         ));
-        assert!(data_api_sql("it's", "pw", "public").contains("OPERATOR(pg_catalog.=) 'it''s' AND NOT r.rolsuper"));
+        assert!(data_api_sql("it's", "pw", ELEVATED_VERIFIER, "public").contains("OPERATOR(pg_catalog.=) 'it''s' AND NOT r.rolsuper"));
     }
 
     /// A session of a former member that started before the REVOKE committed could still
     /// SET ROLE chelabase_admin: sessions are ended again once it has.
     #[test]
     fn former_members_sessions_are_ended_again_after_the_revoke_commits() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let vet_end = sql.find("PERFORM pg_catalog.set_config('chelabase.quarantined', aside, false);").unwrap();
         let again = sql
             .find("current_setting('chelabase.former_members', true)")
             .expect("a second termination");
         let create = sql.find("CREATE SCHEMA IF NOT EXISTS chelabase").unwrap();
         assert!(vet_end < again && again < create);
-        assert_eq!(sql.matches("pg_catalog.pg_terminate_backend(a.pid)").count(), 2);
+        // chelabase_admin's block, the run after the lockdowns, and the run after the commit.
+        assert_eq!(sql.matches("pg_catalog.pg_terminate_backend(a.pid)").count(), 3);
+        let commit = sql.rfind("COMMIT;").unwrap();
+        assert!(sql[commit..].contains("current_setting('chelabase.former_members', true)"), "ended again once the revoke has committed");
     }
 
     #[test]
@@ -1868,7 +2550,7 @@ COMMIT;
     /// chelabase_admin.
     #[test]
     fn event_trigger_functions_are_owned_by_the_bootstrap_superuser() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         for function in [
             "chelabase.bump_schema_version()",
             "chelabase.grant_extension_functions()",
@@ -1890,7 +2572,7 @@ COMMIT;
     /// first so the grant is explicit.
     #[test]
     fn guard_functions_are_granted_to_public_and_owned_by_the_bootstrap_user() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let both = "chelabase.assert_schema_version(uuid), chelabase.cap_response(text, bigint)";
         for function in ["chelabase.assert_schema_version(uuid)", "chelabase.cap_response(text, bigint)"] {
             assert!(sql.contains(&format!("ALTER FUNCTION {function} OWNER TO CURRENT_USER;\n")), "{function}");
@@ -1906,7 +2588,7 @@ COMMIT;
     /// `pg_catalog.nullif(...)` fails at run time (plpgsql parses bodies lazily).
     #[test]
     fn script_does_not_qualify_syntax_constructs() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         for construct in ["nullif", "coalesce", "greatest", "least"] {
             assert!(!sql.contains(&format!("pg_catalog.{construct}")), "pg_catalog.{construct}");
         }
@@ -1924,7 +2606,7 @@ COMMIT;
         assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
         let scripts = data_api_scripts(&w, &ep);
         assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0], data_api_sql("postgres", &password, "public"));
+        assert_eq!(scripts[0], data_api_sql("postgres", &password, &verifier(&w, main.id), "public"));
         assert!(
             pos(&journal, "metadata.set_authenticator_password")
                 < pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
@@ -1958,7 +2640,7 @@ COMMIT;
         assert_ne!(new_password, password);
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", &new_password, "public")
+            &data_api_sql("postgres", &new_password, &verifier(&w, fresh.id), "public")
         );
         w.bootstrap_data_api(&fresh, "app").await.unwrap();
         assert_eq!(
@@ -2004,7 +2686,7 @@ COMMIT;
         );
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", "theirs-password", "public")
+            &data_api_sql("postgres", "theirs-password", &verifier(&w, main.id), "public")
         );
     }
 
@@ -2012,7 +2694,7 @@ COMMIT;
     /// grants that let `authenticator` read the version, the event triggers and the stamp.
     #[test]
     fn the_health_check_covers_the_login_grants_and_triggers() {
-        let check = schema_check_sql("public", Some("v"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
         let stamp = format!("'{DATA_API_SCHEMA_STAMP}'");
         for part in [
             "to_regclass('chelabase.schema_version')",
@@ -2039,7 +2721,7 @@ COMMIT;
     /// it too, so it can't repair it).
     #[test]
     fn the_health_check_asks_for_authenticator_usage_on_the_default_schema() {
-        let sql = schema_check_sql("my\"schema", Some("v"));
+        let sql = schema_check_sql("my\"schema", Some("v"), Some("e"));
         // Fix round 1 (I3): the superuser session searches only pg_catalog.
         let sql = sql
             .strip_prefix("SET search_path = pg_catalog, pg_temp; ")
@@ -2048,12 +2730,12 @@ COMMIT;
         let rest = &sql[MACHINERY_CHECK_SQL.len()..];
         for part in [
             "pg_catalog.to_regnamespace('\"my\"\"schema\"')",
-            "r.rolname OPERATOR(pg_catalog.=) 'authenticator'",
+            "r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['authenticator', 'chelabase_authenticator_elevated']::pg_catalog.name[])",
             "NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')",
         ] {
             assert!(rest.contains(part), "{part}: {rest}");
         }
-        assert!(schema_check_sql("public", Some("v")).contains("to_regnamespace('\"public\"')"));
+        assert!(schema_check_sql("public", Some("v"), Some("e")).contains("to_regnamespace('\"public\"')"));
     }
 
     #[tokio::test]
@@ -2141,7 +2823,7 @@ COMMIT;
         assert_ne!(password, authenticator_password(&w, &main));
         assert_eq!(
             data_api_scripts(&w, &ep),
-            [data_api_sql("postgres", &password, "public")]
+            [data_api_sql("postgres", &password, &verifier(&w, dev.id), "public")]
         );
         assert_eq!(keys_of(&w, dev.id).len(), 1);
         assert_eq!(keys_of(&w, main.id).len(), 1);
@@ -2172,7 +2854,7 @@ COMMIT;
         let password = authenticator_password(&w, &dev);
         assert_eq!(
             data_api_scripts(&w, &ep).last().unwrap(),
-            &data_api_sql("postgres", &password, "public")
+            &data_api_sql("postgres", &password, &verifier(&w, dev.id), "public")
         );
         assert_eq!(count(&journal, "metadata.set_authenticator_password"), 0);
     }
@@ -2220,6 +2902,739 @@ COMMIT;
         assert!(err.starts_with(PREFIX), "{err:?}");
     }
 
+    // --- The elevated login ----------------------------------------------------------------
+
+    const CATALOG: &str = "chelabase: member roles";
+
+    /// A role catalog's answer ([`member_catalog_sql`]): `roles` as `(name, flags)` with
+    /// flags of `o` (owner-level: BYPASSRLS and the like), `a` (holds ADMIN on a role) and
+    /// `l` (LOGIN); `edges` as `(member, role)`. Both data API logins are always listed.
+    fn catalog(roles: &[(&str, &str)], edges: &[(&str, &str)]) -> String {
+        let h = |name: &str| name.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let flag = |flags: &str, f: char| if flags.contains(f) { "t" } else { "f" };
+        let mut out = String::new();
+        for (name, flags) in [(AUTHENTICATOR, "l"), (AUTHENTICATOR_ELEVATED, "l"), ("anon", ""), ("authenticated", "")]
+            .iter()
+            .chain(roles)
+        {
+            out.push_str(&format!(
+                "r {} f {} {} {}\n",
+                h(name),
+                flag(flags, 'o'),
+                flag(flags, 'a'),
+                flag(flags, 'l')
+            ));
+        }
+        for (member, role) in edges {
+            out.push_str(&format!("a {} {}\n", h(member), h(role)));
+        }
+        out
+    }
+
+    /// The compute's role catalog lists `roles` as ordinary roles (with both logins, `anon`
+    /// and `authenticated`): a role is granted only when the catalog lists it.
+    fn list_roles(w: &FakeWorker, roles: &[&str]) {
+        let roles: Vec<(&str, &str)> = roles.iter().map(|r| (*r, "")).collect();
+        w.computes.answer(CATALOG, &catalog(&roles, &[]));
+    }
+
+    /// The resync's membership scripts that ran.
+    fn resyncs(w: &FakeWorker) -> Vec<String> {
+        w.computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, s)| s.starts_with(ELEVATED_RESYNC_MARK))
+            .map(|(_, _, s)| s.clone())
+            .collect()
+    }
+
+    /// A ready database whose compute answers the role catalog with `catalog`, the SQL
+    /// journal cleared: `(worker, main branch, endpoint)`.
+    async fn with_catalog(catalog: &str) -> (FakeWorker, BranchRecord, String) {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        w.computes.answer_at(&ep, CATALOG, catalog);
+        w.computes.sql.lock().unwrap().clear();
+        (w, main, ep)
+    }
+
+    const LOCKDOWN: &str = "ALTER ROLE chelabase_authenticator_elevated LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT -1 VALID UNTIL 'infinity' PASSWORD ";
+
+    // AC 1: the bootstrap makes the login (NOLOGIN first, so it never exists able to log in
+    // without its password), gives it the machinery privileges `authenticator` has and no
+    // role, and stores its password sealed with its own purpose.
+    #[tokio::test]
+    async fn bootstrap_creates_the_elevated_login() {
+        let (w, journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        let (password, salt) = elevated_login(&w, main.id);
+        assert_eq!(salt.len(), 16);
+        let script = &data_api_scripts(&w, &ep)[0];
+        let create = script
+            .find("CREATE ROLE chelabase_authenticator_elevated NOLOGIN NOINHERIT PASSWORD NULL;")
+            .expect("made without a login");
+        let lockdown = script
+            .find(&format!("{LOCKDOWN}{};", literal(&elevated_verifier(&password, &salt))))
+            .expect("the login with the stored password's verifier");
+        assert!(create < lockdown);
+        // The password itself never reaches the compute, only its verifier.
+        assert!(!script.contains(&password));
+        for grant in [
+            "GRANT USAGE ON SCHEMA chelabase TO chelabase_authenticator_elevated;",
+            "GRANT SELECT ON chelabase.schema_version TO chelabase_authenticator_elevated;",
+            "GRANT USAGE ON SCHEMA \"public\" TO chelabase_authenticator_elevated;",
+        ] {
+            assert!(lockdown < script.find(grant).unwrap_or_else(|| panic!("{grant}: {script}")));
+        }
+        // Nothing is granted to it but those: no role, and never `anon` or `authenticated`.
+        let to_login: Vec<&str> = script
+            .lines()
+            .filter(|l| l.trim_start().starts_with("GRANT") && l.contains("chelabase_authenticator_elevated"))
+            .collect();
+        assert_eq!(to_login.len(), 3, "{to_login:?}");
+        assert!(to_login.iter().all(|l| l.contains(" ON ")), "{to_login:?}");
+        // Sealed for the branch with its own purpose: `authenticator`'s doesn't open it, and
+        // the two logins have different passwords.
+        let sealed = w.metadata.state().elevated_logins[&main.id].0.clone();
+        assert!(open_credential(&w.key, &main.id.to_string(), Purpose::Authenticator, &sealed).is_err());
+        assert!(open_credential(&w.key, &BranchId::new().to_string(), Purpose::AuthenticatorElevated, &sealed).is_err());
+        assert_ne!(password, authenticator_password(&w, &main));
+        assert!(
+            pos(&journal, "metadata.set_authenticator_elevated_password")
+                < pos(&journal, &format!("compute.sql {ep} app {DATA_API}")),
+            "stored before it's used: {:?}",
+            entries(&journal)
+        );
+    }
+
+    // AC 3: every run sets the login's attributes back, resets its settings and takes `anon`
+    // and `authenticated` from it; a role it holds that isn't elevated is revoked after the
+    // script, from the catalog.
+    #[tokio::test]
+    async fn bootstrap_resets_the_elevated_login() {
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
+        let existing = sql.find("IF login IS NULL THEN").unwrap();
+        let lockdown = sql.find(&format!("{LOCKDOWN}{};", literal(ELEVATED_VERIFIER))).unwrap();
+        // The lockdown is outside the "made now" branch: an existing role gets it too.
+        let end_if = existing + sql[existing..].find("END IF;").unwrap();
+        assert!(end_if < lockdown);
+        for part in [
+            "EXECUTE pg_catalog.format('ALTER ROLE chelabase_authenticator_elevated IN DATABASE %I RESET ALL', m.datname);",
+            "ALTER ROLE chelabase_authenticator_elevated RESET ALL;",
+            "WHERE a.member OPERATOR(pg_catalog.=) login AND r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['anon', 'authenticated']::pg_catalog.name[])",
+            "EXECUTE pg_catalog.format('REVOKE %I FROM chelabase_authenticator_elevated GRANTED BY %I CASCADE', m.granted, m.grantor);",
+        ] {
+            assert!(lockdown < sql.find(part).unwrap_or_else(|| panic!("{part}")), "{part}");
+        }
+        assert_eq!(sql, data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public"), "every run is the same script");
+
+        // It holds an ordinary role, an elevated one, and the data API's own: the bootstrap
+        // revokes all but the elevated one.
+        let (w, main, _ep) = with_catalog(&catalog(
+            &[("plain", ""), ("service", "o")],
+            &[
+                (AUTHENTICATOR_ELEVATED, "plain"),
+                (AUTHENTICATOR_ELEVATED, "service"),
+                (AUTHENTICATOR_ELEVATED, "authenticated"),
+            ],
+        ))
+        .await;
+        answer_check(&w, "ok 16390\n");
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        let resyncs = resyncs(&w);
+        assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+        assert!(resyncs[0].contains("ANY (ARRAY['authenticated', 'plain']::pg_catalog.name[])"), "{}", resyncs[0]);
+        assert!(
+            resyncs[0].contains("'REVOKE %I FROM chelabase_authenticator_elevated GRANTED BY %I CASCADE'"),
+            "{}",
+            resyncs[0]
+        );
+// The ordinary role goes to `authenticator`; the elevated one stays where it is.
+        assert!(resyncs[0].contains("GRANT \"plain\" TO authenticator;\n"), "{}", resyncs[0]);
+        assert!(!resyncs[0].contains("service") && !resyncs[0].contains("TO chelabase_authenticator_elevated;"), "{}", resyncs[0]);
+    }
+
+    // AC 2: a second bootstrap stores nothing and sets the same password again.
+    #[tokio::test]
+    async fn elevated_password_is_stored_once() {
+        let (w, journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        let stored = w.metadata.state().elevated_logins[&main.id].clone();
+        assert_eq!(count(&journal, "metadata.set_authenticator_elevated_password"), 1);
+        let first = data_api_scripts(&w, &ep)[0].clone();
+        journal.lock().unwrap().clear();
+
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+
+        assert_eq!(count(&journal, "metadata.set_authenticator_elevated_password"), 0);
+        assert_eq!(w.metadata.state().elevated_logins[&main.id], stored);
+        let scripts = data_api_scripts(&w, &ep);
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[1], first, "the same attributes, password and grants");
+        // A store that finds one already there keeps it.
+        w.metadata
+            .set_authenticator_elevated_password(main.id, "v1:other", &[9; 16])
+            .await
+            .unwrap();
+        assert_eq!(w.metadata.state().elevated_logins[&main.id], stored);
+    }
+
+    // AC 8: every membership in the login is revoked from the grantor that made it, with or
+    // without ADMIN, a role that existed before the first bootstrap included; the sessions
+    // of the roles that could reach it end with `chelabase_admin`'s former members'.
+    #[test]
+    fn bootstrap_revokes_memberships_in_the_elevated_login() {
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
+        let block_start = sql
+            .find("login pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');")
+            .unwrap();
+        let block = &sql[block_start..];
+        let block = &block[..block.find("END $$;").unwrap()];
+        let members = "FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.roleid OPERATOR(pg_catalog.=) login
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE chelabase_authenticator_elevated FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+  END LOOP;";
+        // Every row whose `roleid` is the login: no filter on the options, so ADMIN grants go
+        // too, and it runs for a role that was already there (after the `IF login IS NULL`).
+        let revoke = block.find(members).expect("the revoke of every membership in the login");
+        assert!(block.find("END IF;").unwrap() < revoke);
+        // The roles that reached it (at any depth) are read before the revoke, and their
+        // sessions are ended by the termination that follows the block.
+        let reach = block.find("SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid").unwrap();
+        let former = block.find("PERFORM pg_catalog.set_config('chelabase.former_members', pg_catalog.concat_ws(',',").unwrap();
+        assert!(reach < revoke && revoke < former);
+        assert!(block.contains("NULLIF(pg_catalog.current_setting('chelabase.former_members', true), '')"), "chelabase_admin's stay listed");
+        let terminate = sql[block_start..].find("pg_catalog.pg_terminate_backend(a.pid)").expect("a termination after it");
+        assert!(block.len() < terminate);
+        assert!(sql[block_start + terminate..].contains("string_to_array(pg_catalog.current_setting('chelabase.former_members', true), ',')"));
+    }
+
+    // A role only an Admin may key (BYPASSRLS; LOGIN; a NOLOGIN member of a LOGIN role; one
+    // holding ADMIN) goes to the elevated login alone: granted to it, then revoked from
+    // `authenticator`, in one transaction.
+    #[tokio::test]
+    async fn check_and_grant_moves_an_elevated_role_off_authenticator() {
+        /// A role, the catalog's roles with their flags, and its memberships.
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [(&'a str, &'a str)]);
+        let cases: [Case; 4] = [
+            ("bypasser", &[("bypasser", "o")], &[]),
+            ("signer", &[("signer", "l")], &[]),
+            ("group", &[("group", ""), ("signer", "l")], &[("group", "signer")]),
+            ("granter", &[("granter", "a")], &[]),
+        ];
+        for (role, roles, edges) in cases {
+            let (w, main, _ep) = with_catalog(&catalog(roles, edges)).await;
+            answer_check(&w, "ok 16390\n");
+            assert_eq!(w.check_data_role(main.id, role).await, RoleCheck::Ok(16390, false), "{role}");
+            assert_eq!(grants(&w), [format!("GRANT \"{role}\" TO chelabase_authenticator_elevated;")], "{role}");
+            let scripts = grant_scripts(&w);
+            assert_eq!(scripts.len(), 1, "{scripts:?}");
+            let script = &scripts[0];
+            let (begin, grant) = (script.find("BEGIN;").unwrap(), script.find("GRANT \"").unwrap());
+            let revoke = revokes_from(script, AUTHENTICATOR, &[role]).expect("revoked from authenticator");
+            assert!(begin < grant && grant < revoke && script.ends_with("COMMIT;\n"), "{script}");
+            assert_eq!(revokes_from(script, AUTHENTICATOR_ELEVATED, &[role]), None);
+        }
+        // A key's role granted again by the bootstrap goes to its one login as well.
+        let (w, main, _ep) = with_catalog(&catalog(&[("bypasser", "o"), ("plain", "")], &[])).await;
+        {
+            let mut state = w.metadata.state();
+            state.data_keys.push(secret_key(main.id, "bypasser"));
+            state.data_keys.push(secret_key(main.id, "plain"));
+        }
+        answer_check(&w, "ok 16390 t\n");
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        assert_eq!(
+            grants(&w),
+            [
+                "GRANT \"bypasser\" TO chelabase_authenticator_elevated;",
+                "GRANT \"plain\" TO authenticator;",
+            ]
+        );
+    }
+
+    // An ordinary NOLOGIN role goes to `authenticator` alone, and is revoked from the
+    // elevated login. So do `anon` and `authenticated`, whatever they were made members of.
+    #[tokio::test]
+    async fn check_and_grant_moves_an_ordinary_role_off_the_elevated_login() {
+        let (w, main, _ep) = with_catalog(&catalog(
+            &[("reporting", ""), ("readers", ""), ("bypasser", "o")],
+            &[("reporting", "readers"), ("anon", "bypasser"), ("authenticated", "bypasser")],
+        ))
+        .await;
+        answer_check(&w, "ok 16390\n");
+        for role in ["reporting", "anon", "authenticated"] {
+            assert_eq!(w.check_data_role(main.id, role).await, RoleCheck::Ok(16390, false), "{role}");
+        }
+        assert_eq!(
+            grants(&w),
+            [
+                "GRANT \"reporting\" TO authenticator;",
+                "GRANT \"anon\" TO authenticator;",
+                "GRANT \"authenticated\" TO authenticator;",
+            ]
+        );
+        for (script, role) in grant_scripts(&w).iter().zip(["reporting", "anon", "authenticated"]) {
+            let grant = script.find("GRANT \"").unwrap();
+            let revoke = revokes_from(script, AUTHENTICATOR_ELEVATED, &[role]).expect("revoked from the elevated login");
+            assert!(grant < revoke, "{script}");
+            assert_eq!(revokes_from(script, AUTHENTICATOR, &[role]), None, "{script}");
+        }
+    }
+
+    // On a branch whose bootstrap hasn't made the elevated login yet, nothing is taken from
+    // `authenticator`: an elevated role is granted to it alone, as before, and nothing is
+    // revoked.
+    #[tokio::test]
+    async fn a_branch_without_the_elevated_login_keeps_the_grant_on_authenticator() {
+        let with_login = catalog(&[("bypasser", "o")], &[]);
+        let h: String = AUTHENTICATOR_ELEVATED.bytes().map(|b| format!("{b:02x}")).collect();
+        let without: String = with_login
+            .lines()
+            .filter(|l| !l.contains(&h))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(with_login, without);
+        let (w, main, ep) = with_catalog(&without).await;
+        answer_check(&w, "ok 16390 t\n");
+        assert_eq!(w.check_data_role(main.id, "bypasser").await, RoleCheck::Ok(16390, true));
+        assert_eq!(grants(&w), ["GRANT \"bypasser\" TO authenticator;"]);
+        assert!(!grant_scripts(&w)[0].contains("REVOKE"), "{:?}", grant_scripts(&w));
+        // The resync leaves such a branch alone too.
+        w.computes.sql.lock().unwrap().clear();
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+        assert_eq!(w.computes.sql.lock().unwrap().len(), 1, "the catalog read only");
+    }
+
+    // Without a classification nothing is granted, to either login.
+    #[tokio::test]
+    async fn a_role_that_cannot_be_classified_is_not_granted() {
+        let (w, main, _ep) = with_catalog("not a catalog\n").await;
+        answer_check(&w, "ok 16390\n");
+        assert!(matches!(w.check_data_role(main.id, "reporting").await, RoleCheck::Failed(_)));
+        assert_eq!(grants(&w), Vec::<String>::new());
+    }
+
+    // A branch where earlier releases left roles on the wrong login, or on both: every
+    // direct membership of either login is put on the login it belongs to. Elevated roles
+    // leave `authenticator` (granted to the elevated login first when it lacks them and they
+    // pass a key role's check), ordinary ones leave the elevated login; the data API's own
+    // roles and the platform's stay on `authenticator`.
+    #[tokio::test]
+    async fn resync_moves_misplaced_grants() {
+        let (w, main, ep) = with_catalog(&catalog(
+            &[("bypasser", "o"), ("group", ""), ("signer", "l"), ("plain", ""), ("held", "o"), ("now_owner", "o"), ("stray", "")],
+            &[
+                (AUTHENTICATOR, "anon"),
+                (AUTHENTICATOR, "authenticated"),
+                (AUTHENTICATOR, "bypasser"),
+                (AUTHENTICATOR, "group"),
+                (AUTHENTICATOR, "plain"),
+                (AUTHENTICATOR, "held"),
+                (AUTHENTICATOR, "now_owner"),
+                (AUTHENTICATOR, "chelabase_admin"),
+                ("group", "signer"),
+                ("anon", "bypasser"),
+                (AUTHENTICATOR_ELEVATED, "held"),
+                (AUTHENTICATOR_ELEVATED, "stray"),
+            ],
+        ))
+        .await;
+        answer_check(&w, "ok 16390\n");
+        // A role that no longer passes a key role's check is held by neither login.
+        w.computes.answer_at(&ep, "rolname = 'now_owner'", "owner_level\n");
+
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+
+        let resyncs = resyncs(&w);
+        assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+        let script = &resyncs[0];
+        let head = format!(
+            "{ELEVATED_RESYNC_MARK}\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\n\
+             GRANT \"bypasser\" TO chelabase_authenticator_elevated;\n\
+             GRANT \"group\" TO chelabase_authenticator_elevated;\n\
+             GRANT \"stray\" TO authenticator;\nDO $$"
+        );
+        assert!(script.starts_with(&head) && script.ends_with("COMMIT;\n"), "{script}");
+        // Every revoke follows every grant, in the same transaction.
+        let last_grant = script.rfind("GRANT \"").unwrap();
+        let from_authenticator = revokes_from(script, AUTHENTICATOR, &["bypasser", "group", "held", "now_owner"])
+            .expect("the elevated roles leave authenticator");
+        let from_elevated = revokes_from(script, AUTHENTICATOR_ELEVATED, &["stray"])
+            .expect("the ordinary role leaves the elevated login");
+        assert!(last_grant < from_authenticator && last_grant < from_elevated, "{script}");
+        // `anon`, `authenticated`, the ordinary role and the platform's own stay.
+        for kept in ["'anon'", "'authenticated'", "'plain'", "'chelabase_admin'"] {
+            assert!(!script.contains(kept), "{kept}: {script}");
+        }
+        // The bootstrap runs it after the keys' roles are granted again.
+        w.computes.sql.lock().unwrap().clear();
+        w.metadata.state().data_keys.push(secret_key(main.id, "plain"));
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        let sql = w.computes.sql.lock().unwrap().clone();
+        let regrant = sql
+            .iter()
+            .position(|(_, _, s)| s.starts_with(KEY_GRANT_MARK) && s.contains("GRANT \"plain\" TO authenticator;"))
+            .unwrap();
+        let resync = sql.iter().position(|(_, _, s)| s.starts_with(ELEVATED_RESYNC_MARK)).unwrap();
+        assert!(regrant < resync);
+    }
+
+    /// [`plan_login_grants`] over every way one key role can be held (by neither, either or
+    /// both logins), elevated or not, passing the key role's check or not: afterwards
+    /// `authenticator` holds no elevated key role, the elevated login nothing but elevated
+    /// roles that pass, a role that passes and was held is still held by exactly one login,
+    /// each revoke has its grant in the same plan when the role moves, and a second run
+    /// plans nothing.
+    #[test]
+    fn the_plan_leaves_each_role_on_one_login() {
+        for bits in 0..16u8 {
+            let (elevated, passes, on_auth, on_elev) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            // An ordinary role always passes the key role's check.
+            if !elevated && !passes {
+                continue;
+            }
+            let mut edges = vec![(AUTHENTICATOR, "anon")];
+            if on_auth {
+                edges.push((AUTHENTICATOR, "svc"));
+            }
+            if on_elev {
+                edges.push((AUTHENTICATOR_ELEVATED, "svc"));
+            }
+            let text = catalog(&[("svc", if elevated { "o" } else { "" })], &edges);
+            let mut cat = parse_member_catalog(&text).unwrap();
+            let ok: BTreeSet<String> = passes.then(|| "svc".to_owned()).into_iter().collect();
+            let (plan, _) = plan_login_grants(&cat, &ok);
+            let case = format!("elevated={elevated} passes={passes} on_auth={on_auth} on_elev={on_elev}: {plan:?}");
+            // Apply it.
+            for (role, login) in &plan.grant {
+                cat.all_edges.entry((*login).to_owned()).or_default().insert(role.clone());
+            }
+            for (role, login) in &plan.revoke {
+                assert!(cat.all_edges.get_mut(*login).is_some_and(|held| held.remove(role)), "revokes a held role; {case}");
+            }
+            let holds = |login: &str| cat.all_edges.get(login).is_some_and(|held| held.contains("svc"));
+            let (auth, elev) = (holds(AUTHENTICATOR), holds(AUTHENTICATOR_ELEVATED));
+            assert!(!(auth && elevated), "authenticator holds an elevated role; {case}");
+            assert!(!(elev && !(elevated && passes)), "the elevated login holds a role it may not; {case}");
+            if on_auth || on_elev {
+                assert_eq!(auth || elev, passes, "a held role that passes stays usable; {case}");
+            } else {
+                assert!(plan.is_empty(), "a role neither login holds is left alone; {case}");
+            }
+            assert!(cat.all_edges[AUTHENTICATOR].contains("anon"), "{case}");
+            assert!(plan_login_grants(&cat, &ok).0.is_empty(), "a second run plans nothing; {case}");
+        }
+    }
+
+    // A keyed role an Admin later makes elevated (BYPASSRLS set through the roles API or in
+    // SQL): the step that runs when the worker applies or learns of a role change moves it
+    // to the elevated login, not only the bootstrap.
+    #[tokio::test]
+    async fn role_made_elevated_later_moves_off_authenticator() {
+        let (w, main, ep) = with_catalog(&catalog(
+            &[("svc", "o")],
+            &[(AUTHENTICATOR, "anon"), (AUTHENTICATOR, "authenticated"), (AUTHENTICATOR, "svc")],
+        ))
+        .await;
+        answer_check(&w, "ok 16390 t\n");
+        w.resync_elevated_grants_after_role_change(main.id, &ep, "app").await;
+        let resyncs = resyncs(&w);
+        assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+        let grant = resyncs[0].find("GRANT \"svc\" TO chelabase_authenticator_elevated;").expect("granted to the elevated login");
+        let revoke = revokes_from(&resyncs[0], AUTHENTICATOR, &["svc"]).expect("revoked from authenticator");
+        assert!(grant < revoke);
+        // The login-role resync (what a forwarded role statement asks for) runs it.
+        w.computes.sql.lock().unwrap().clear();
+        let _ = w.resync_locked(main.id, &ep, "app").await;
+        assert_eq!(self::resyncs(&w).len(), 1, "the role resync moves misplaced grants");
+    }
+
+    #[tokio::test]
+    async fn resync_with_nothing_misplaced_changes_nothing() {
+        let (w, main, ep) = with_catalog(&catalog(
+            &[("bypasser", "o"), ("plain", "")],
+            &[
+                (AUTHENTICATOR, "anon"),
+                (AUTHENTICATOR, "authenticated"),
+                (AUTHENTICATOR, "plain"),
+                (AUTHENTICATOR_ELEVATED, "bypasser"),
+            ],
+        ))
+        .await;
+        answer_check(&w, "ok 16390 t\n");
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert_eq!(sql.len(), 3, "the catalog read and each held role's check: {sql:?}");
+        assert!(sql[0].2.contains(CATALOG) && sql[1..].iter().all(|(_, _, s)| s.contains(ROLE_CHECK)), "{sql:?}");
+        // A catalog without the login (nothing was read) changes nothing either.
+        w.computes.sql.lock().unwrap().clear();
+        let (w, main, ep) = with_catalog("").await;
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+        assert_eq!(w.computes.sql.lock().unwrap().len(), 1);
+    }
+
+    // The health check asks for the elevated login as it asks for `authenticator`.
+    #[test]
+    fn the_health_check_covers_the_elevated_login() {
+        // Its login, whatever the chelabase schema's version (the lockdown is outside the gate).
+        assert!(MACHINERY_CHECK_SQL
+            .contains("r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND r.rolcanlogin"));
+        // Its grants on this worker's chelabase.
+        let installed = installed_check_sql();
+        let at = installed
+            .find("r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated'")
+            .expect("the elevated login");
+        let rest = &installed[at..];
+        assert!(rest.contains("has_schema_privilege(r.oid, n.oid, 'USAGE')"));
+        assert!(rest.contains("has_table_privilege(r.oid, c.oid, 'SELECT')"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
+        assert!(check.contains(MACHINERY_CHECK_SQL) && check.contains(&installed), "{check}");
+    }
+
+    // Fix round 1 (S3): the check of a database requires the login as the lockdown leaves
+    // it (attributes, settings, exactly its verifier, no member) and its `USAGE` on the
+    // default schema, so reconcile runs the bootstrap for a changed login.
+    #[test]
+    fn the_health_check_requires_the_elevated_login_as_the_lockdown_leaves_it() {
+        let sql = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
+        let drift = elevated_drift_sql(ELEVATED_LOGIN_OID, ELEVATED_VERIFIER);
+        assert!(sql.contains(&format!(" AND NOT {drift}")), "{sql}");
+        for part in [
+            format!("a.rolpassword IS DISTINCT FROM {}", literal(ELEVATED_VERIFIER)),
+            "NOT a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR a.rolbypassrls OR a.rolinherit".to_owned(),
+            "a.rolconnlimit OPERATOR(pg_catalog.<>) -1".to_owned(),
+            "a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz".to_owned(),
+            format!("s.setrole OPERATOR(pg_catalog.=) {ELEVATED_LOGIN_OID}"),
+            format!("x.roleid OPERATOR(pg_catalog.=) {ELEVATED_LOGIN_OID}"),
+        ] {
+            assert!(drift.contains(&part), "{part}: {drift}");
+        }
+        // The bootstrap's flag and the check are the one predicate.
+        assert!(data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public")
+            .contains(&format!("drifted := {};", elevated_drift_sql("login", ELEVATED_VERIFIER))));
+        // A branch with no elevated login stored yet is never healthy: its bootstrap stores one.
+        let none = schema_check_sql("public", Some("v"), None);
+        assert!(none.contains(&format!("OR ({})) AND false AND ", installed_check_sql())), "{none}");
+    }
+
+    // Fix round 1 (B1): the login's own sessions end when it had drifted (a password other
+    // than the stored one's verifier, changed attributes or settings, or a member), and only
+    // then. The flag is read before the lockdown; the sessions end inside the transaction
+    // and again once it has committed.
+    #[test]
+    fn bootstrap_ends_the_elevated_logins_sessions_when_its_password_changed() {
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
+        let block_start = sql
+            .find("login pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated');")
+            .unwrap();
+        let block = &sql[block_start..];
+        let block = &block[..block.find("END $$;").unwrap()];
+        let drift = block.find("drifted := ").expect("the drift flag");
+        let lockdown = block.find(LOCKDOWN).unwrap();
+        assert!(drift < lockdown, "read before the ALTER ROLE");
+        let flag = &block[drift..lockdown];
+        for part in [
+            format!("a.rolpassword IS DISTINCT FROM {}", literal(ELEVATED_VERIFIER)),
+            "NOT a.rolcanlogin".to_owned(),
+            "a.rolbypassrls".to_owned(),
+            "a.rolinherit".to_owned(),
+            "pg_catalog.pg_db_role_setting".to_owned(),
+            "x.roleid OPERATOR(pg_catalog.=) login".to_owned(),
+        ] {
+            assert!(flag.contains(&part), "{part}: {flag}");
+        }
+        assert!(block.contains(
+            "PERFORM pg_catalog.set_config('chelabase.elevated_end_sessions', drifted::pg_catalog.text, false);"
+        ));
+        // Both terminations name the login, each only when the flag is set.
+        let ends = "(r.rolname OPERATOR(pg_catalog.=) 'chelabase_authenticator_elevated' AND pg_catalog.current_setting('chelabase.elevated_end_sessions', true) OPERATOR(pg_catalog.=) 'true')";
+        let commit = sql.rfind("COMMIT;").unwrap();
+        let first = block_start + sql[block_start..].find(ends).expect("the login's sessions end in the transaction");
+        assert!(block_start + block.len() < first && first < commit);
+        assert!(sql[commit..].contains(ends), "and again after the commit");
+        assert_eq!(sql.matches(ends).count(), 2);
+    }
+
+    // Fix round 2 (B2): "the login's sessions from before the last drifted lockdown are void"
+    // is a record on the login ([`crate::login_lockdown`]), not a setting of the worker's
+    // session. It is written in the transaction that finds the drift, the cut-off is taken
+    // after the commit, and the one drift predicate reads it for the bootstrap's flag and
+    // for the health check.
+    #[test]
+    fn the_drift_predicate_counts_sessions_older_than_the_last_lockdown() {
+        use crate::login_lockdown::{finish_sql, record_sql, void_sessions_sql};
+        // The one predicate reads the record, for the health check and for the bootstrap.
+        let drift = elevated_drift_sql(ELEVATED_LOGIN_OID, ELEVATED_VERIFIER);
+        assert!(drift.contains(&format!("OR {}", void_sessions_sql(ELEVATED_LOGIN_OID))), "{drift}");
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
+        assert!(check.contains(&void_sessions_sql(ELEVATED_LOGIN_OID)), "{check}");
+        for sql in [
+            data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public"),
+            data_api_sql_granting_existing("postgres", "pw", ELEVATED_VERIFIER, "public"),
+        ] {
+            let flag = format!("drifted := {};\n", elevated_drift_sql("login", ELEVATED_VERIFIER));
+            assert!(flag.contains(&void_sessions_sql("login")), "{flag}");
+            // Written in the transaction, right after the flag is read and before the login changes.
+            let record = record_sql(AUTHENTICATOR_ELEVATED, "login", "drifted");
+            let read = sql.find(&flag).expect("the flag");
+            let written = sql.find(&record).expect("the record");
+            let commit = sql.rfind("COMMIT;\n").unwrap();
+            assert_eq!(written, read + flag.len(), "{sql}");
+            assert!(written < sql.find(LOCKDOWN).unwrap() && written < commit);
+            // The cut-off is taken after the commit, by the script's last statement.
+            let finish = finish_sql(AUTHENTICATOR_ELEVATED);
+            assert!(sql.ends_with(&finish), "{sql}");
+            assert!(commit < sql.len() - finish.len());
+            assert_eq!(sql.matches("pg_catalog.clock_timestamp()").count() - sql[..commit].matches("pg_catalog.clock_timestamp()").count(), 1);
+            assert!(finish.contains("pg_catalog.clock_timestamp()") && finish.contains("COMMENT ON ROLE chelabase_authenticator_elevated IS %L"));
+        }
+    }
+
+    // Fix round 1 (S1): a role the login already holds is kept only while it passes the
+    // check a key's role passes; one that passes costs the reads and nothing else.
+    #[tokio::test]
+    async fn resync_revokes_a_held_role_that_fails_the_key_role_check() {
+        let (w, main, ep) = with_catalog(&catalog(
+            &[("kept", "o"), ("creator", "o")],
+            &[(AUTHENTICATOR_ELEVATED, "kept"), (AUTHENTICATOR_ELEVATED, "creator")],
+        ))
+        .await;
+        answer_check(&w, "ok 16390\n");
+        w.computes.answer_at(&ep, "rolname = 'creator'", "owner_level\n");
+
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+
+        let resyncs = resyncs(&w);
+        assert_eq!(resyncs.len(), 1, "{resyncs:?}");
+        assert!(resyncs[0].contains("ANY (ARRAY['creator']::pg_catalog.name[])"), "{}", resyncs[0]);
+        assert!(!resyncs[0].contains("kept") && !resyncs[0].contains("GRANT \""), "{}", resyncs[0]);
+
+        let (w, main, ep) = with_catalog(&catalog(&[("kept", "o")], &[(AUTHENTICATOR_ELEVATED, "kept")])).await;
+        answer_check(&w, "ok 16390\n");
+        w.resync_elevated_grants(main.id, &ep, "app").await.unwrap();
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert_eq!(sql.len(), 2, "the catalog read and the role's check: {sql:?}");
+        assert!(sql[0].2.contains(CATALOG) && sql[1].2.contains("rolname = 'kept'"), "{sql:?}");
+    }
+
+    // Fix round 1 (S2): a role the catalog read doesn't list has no classification, so
+    // nothing is granted.
+    #[tokio::test]
+    async fn a_role_missing_from_the_catalog_is_not_granted() {
+        let (w, main, _ep) = with_catalog(&catalog(&[("other", "")], &[])).await;
+        answer_check(&w, "ok 16390\n");
+        let check = w.check_data_role(main.id, "reporting").await;
+        assert!(matches!(check, RoleCheck::Failed(_)), "{check:?}");
+        assert_eq!(grants(&w), Vec::<String>::new());
+    }
+
+    /// W4: a key grant reads the role and grants it under the endpoint's lock. While
+    /// another holder has it (a role change with its move step) the grant sends nothing, not
+    /// even its reads; they are made once the lock is free.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_grant_waits_for_the_endpoint_lock() {
+        let (w, main, ep) = with_catalog(&catalog(&[("reporting", "o")], &[])).await;
+        answer_check(&w, "ok 16390 t\n");
+        let before = w.computes.sql.lock().unwrap().len();
+        let held = w.metadata.lock_endpoint(&ep).await.unwrap();
+        {
+            let check = w.check_data_role(main.id, "reporting");
+            tokio::pin!(check);
+            let waited = tokio::time::timeout(std::time::Duration::from_secs(1), &mut check).await;
+            assert!(waited.is_err(), "the grant ran while the endpoint's lock was held");
+            assert_eq!(w.computes.sql.lock().unwrap().len(), before, "no read or grant under another holder");
+            drop(held);
+            assert!(matches!(check.await, RoleCheck::Ok(16390, true)));
+        }
+        let grants = grants(&w);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert!(grants[0].contains(&format!("GRANT \"reporting\" TO {AUTHENTICATOR_ELEVATED};")), "{grants:?}");
+        // A lock that can't be had in time grants nothing and is retryable.
+        let _held = w.metadata.lock_endpoint(&ep).await.unwrap();
+        let before = w.computes.sql.lock().unwrap().len();
+        assert_eq!(w.check_data_role(main.id, "reporting").await, RoleCheck::NotReady);
+        assert_eq!(w.computes.sql.lock().unwrap().len(), before);
+    }
+
+    /// W4's model. A key grant is two steps (read the role's class; grant by that class,
+    /// [`key_grant_plan`]) and a role change the worker applies is two (change the class;
+    /// move the role to the login the class now chooses). Every interleaving of the two:
+    ///
+    /// - with each pair run under one lock (the two serial orders), the role always ends on
+    ///   exactly the login its final class chooses;
+    /// - without the lock some interleaving ends with an elevated role on `authenticator`,
+    ///   so the model does see what the lock prevents.
+    ///
+    /// Assumptions: the worker's role changes hold the endpoint's lock across both of their
+    /// steps (`roles::tests`' lock tests, `resync` in `resync.rs`); the move step leaves
+    /// one login holding the role (`the_plan_leaves_each_role_on_one_login`); the grant
+    /// script is one transaction ([`login_grants_sql`]).
+    #[test]
+    fn a_key_grant_and_a_role_change_never_split_a_role() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Step {
+            GrantRead,
+            GrantApply,
+            Change,
+            Move,
+        }
+        use Step::*;
+        // (elevated, on authenticator, on the elevated login), and the class the grant read.
+        let run = |order: &[Step], start_elevated: bool| {
+            let (mut elevated, mut on_auth, mut on_elev) = (start_elevated, !start_elevated, start_elevated);
+            let mut read = None;
+            for step in order {
+                match step {
+                    GrantRead => read = Some(elevated),
+                    GrantApply => {
+                        let plan = key_grant_plan("svc", read.expect("read first"), true);
+                        for (_, login) in &plan.grant {
+                            if *login == AUTHENTICATOR { on_auth = true } else { on_elev = true }
+                        }
+                        for (_, login) in &plan.revoke {
+                            if *login == AUTHENTICATOR { on_auth = false } else { on_elev = false }
+                        }
+                    }
+                    Change => elevated = !elevated,
+                    Move => (on_auth, on_elev) = (!elevated, elevated),
+                }
+            }
+            (elevated, on_auth, on_elev)
+        };
+        let serial: [[Step; 4]; 2] = [[GrantRead, GrantApply, Change, Move], [Change, Move, GrantRead, GrantApply]];
+        let unlocked: [[Step; 4]; 6] = [
+            serial[0],
+            serial[1],
+            [GrantRead, Change, GrantApply, Move],
+            [GrantRead, Change, Move, GrantApply],
+            [Change, GrantRead, GrantApply, Move],
+            [Change, GrantRead, Move, GrantApply],
+        ];
+        let mut split = 0;
+        for start in [false, true] {
+            for order in serial {
+                let (elevated, on_auth, on_elev) = run(&order, start);
+                assert_eq!((on_auth, on_elev), (!elevated, elevated), "{order:?} from {start}");
+            }
+            for order in unlocked {
+                let (elevated, on_auth, _) = run(&order, start);
+                split += usize::from(elevated && on_auth);
+            }
+        }
+        assert!(split > 0, "the model can't see an elevated role left on authenticator");
+    }
+
     // --- Secret-key roles after a rewind ---------------------------------------------------
 
     fn secret_key(branch: BranchId, role: &str) -> NewDataKey {
@@ -2244,6 +3659,7 @@ COMMIT;
     async fn bootstrap_regrants_the_roles_of_live_secret_keys() {
         let (w, journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["reporting"]);
         // The provision's own SQL (its resync reads the catalog in `postgres`) isn't checked.
         w.computes.sql.lock().unwrap().clear();
         let main = w.metadata.main(id);
@@ -2279,7 +3695,7 @@ COMMIT;
             .unwrap();
         let grant = sql
             .iter()
-            .position(|(_, _, s)| s.starts_with("GRANT"))
+            .position(|(_, _, s)| s.starts_with(KEY_GRANT_MARK))
             .unwrap();
         assert!(script < grant, "after the script");
         assert!(sql.iter().all(|(e, d, _)| e == &ep && d == "app"));
@@ -2297,6 +3713,7 @@ COMMIT;
     async fn bootstrap_does_not_regrant_a_role_with_another_oid() {
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["impostor", "same", "unbound"]);
         w.computes.sql.lock().unwrap().clear();
         let main = w.metadata.main(id);
         {
@@ -2343,6 +3760,7 @@ COMMIT;
 
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["reader"]);
         let main = BranchId::from(id);
         answer_check(&w, "ok 16390\n");
         w.metadata.state().branches.get_mut(&main).unwrap().timeline_id = None;
@@ -2356,18 +3774,44 @@ COMMIT;
 
     /// The check query's answer, as psql prints it.
     fn answer_check(w: &FakeWorker, stdout: &str) {
-        w.computes.answer("pg_has_role", stdout);
+        w.computes.answer(ROLE_CHECK, stdout);
     }
 
+    /// Every role grant sent, one statement each: a bare `GRANT …;` call, or the grants of a
+    /// key role's script ([`KEY_GRANT_MARK`]).
     fn grants(w: &FakeWorker) -> Vec<String> {
         w.computes
             .sql
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, _, s)| s.starts_with("GRANT"))
+            .filter(|(_, _, s)| s.starts_with("GRANT") || s.starts_with(KEY_GRANT_MARK))
+            .flat_map(|(_, _, s)| s.lines().filter(|l| l.starts_with("GRANT")).map(str::to_owned).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// The key role grant scripts sent, whole.
+    fn grant_scripts(w: &FakeWorker) -> Vec<String> {
+        w.computes
+            .sql
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, s)| s.starts_with(KEY_GRANT_MARK))
             .map(|(_, _, s)| s.clone())
             .collect()
+    }
+
+    /// Where a script revokes `roles` from `login`: the loop that reads that login's
+    /// memberships in exactly those roles.
+    fn revokes_from(script: &str, login: &str, roles: &[&str]) -> Option<usize> {
+        let names: Vec<String> = roles.iter().map(|r| format!("'{r}'")).collect();
+        let read = format!(
+            "WHERE l.rolname OPERATOR(pg_catalog.=) '{login}' AND r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY[{}]::pg_catalog.name[])",
+            names.join(", ")
+        );
+        let revoke = format!("EXECUTE pg_catalog.format('REVOKE %I FROM {login} GRANTED BY %I CASCADE', m.granted, m.grantor);");
+        script.find(&read).filter(|at| script[*at..].contains(&revoke))
     }
 
     fn refused(message: &str) -> RoleCheck {
@@ -2429,6 +3873,7 @@ COMMIT;
     async fn check_role_returns_the_roles_oid() {
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["reader"]);
         answer_check(&w, "ok 16390 f\n");
         let main = BranchId::from(id);
         assert_eq!(w.check_data_role(main, "reader").await, RoleCheck::Ok(16390, false));
@@ -2487,6 +3932,7 @@ COMMIT;
     async fn a_bypassrls_role_may_back_a_key_and_is_marked() {
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["service"]);
         let main = BranchId::from(id);
         w.computes.sql.lock().unwrap().clear();
         answer_check(&w, "ok 16390 t\n");
@@ -2624,6 +4070,7 @@ COMMIT;
         use chelabase_nats::{CheckDataRoleReply, CheckDataRoleRequest};
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["reporting"]);
         let main = BranchId::from(id);
         let ask = |role: &str, branch| CheckDataRoleRequest { branch_id: branch, role: role.into() };
 
@@ -2722,6 +4169,7 @@ COMMIT;
         assert_eq!(count(&journal, "compute.sql"), 0, "{:?}", entries(&journal));
         // The edges that are fine.
         let longest = format!("a{}", "b".repeat(62));
+        list_roles(&w, &["_", "a$1", "Ab_9", longest.as_str()]);
         for good in ["_", "a$1", "Ab_9", longest.as_str()] {
             assert_eq!(
                 w.check_data_role(BranchId::from(id), good).await,
@@ -2734,6 +4182,7 @@ COMMIT;
     async fn check_role_grants_to_authenticator() {
         let (w, _journal) = worker();
         let id = ready_database(&w).await;
+        list_roles(&w, &["app_user", "AppUser"]);
         let ep = w.metadata.main(id).endpoint_id.unwrap();
         answer_check(&w, "ok 16384\n");
         for role in ["app_user", "AppUser", "anon", "authenticated"] {
@@ -2816,7 +4265,7 @@ COMMIT;
         // Its own script, with its schema, only in that database; the row is `on`.
         assert_eq!(
             scripts_in(&w, &ep, "analytics"),
-            [data_api_sql("postgres", &password, "reporting")]
+            [data_api_sql("postgres", &password, &verifier(&w, main.id), "reporting")]
         );
         assert_eq!(scripts_in(&w, &ep, "app").len(), 1, "main is not bootstrapped again");
         let r = row(&w, main.id, "analytics");
@@ -2849,7 +4298,7 @@ COMMIT;
 
         assert_eq!(
             scripts_in(&w, &ep, "analytics"),
-            [data_api_sql("postgres", &password, "reporting"), data_api_sql("postgres", &password, "stats")]
+            [data_api_sql("postgres", &password, &verifier(&w, main.id), "reporting"), data_api_sql("postgres", &password, &verifier(&w, main.id), "stats")]
         );
         let r = row(&w, main.id, "analytics");
         assert_eq!((r.state, r.schema.as_str()), (DataApiState::On, "stats"));
@@ -3030,7 +4479,7 @@ END $$;
     /// data API bootstrap set the schema aside.
     #[test]
     fn tamper_check_allows_app_users_objects() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let array = |column: &str| {
             let start = sql.find(&format!("{column} OPERATOR(pg_catalog.<>) ALL (ARRAY[")).unwrap();
             sql[start..start + sql[start..].find("]::").unwrap()].to_string()
@@ -3048,7 +4497,7 @@ END $$;
         // The claim helpers come with every bootstrap, right after the owner's grants.
         let helpers = format!("GRANT SELECT ON chelabase.schema_version TO postgres;\n{}", crate::app_users_sql::claim_helpers_body());
         assert!(sql.contains(&helpers));
-        assert!(data_api_sql_granting_existing("postgres", "pw", "public").contains(&helpers));
+        assert!(data_api_sql_granting_existing("postgres", "pw", ELEVATED_VERIFIER, "public").contains(&helpers));
     }
 
     /// C1: the claim helpers (and the app users objects) go before `DROP SCHEMA … RESTRICT`,
@@ -3141,7 +4590,7 @@ END $$;
         let reply = w.rebootstrap_data_api(&request(main.id, "analytics", false)).await;
 
         assert_eq!(reply, CheckDataRoleReply::ok());
-        assert_eq!(scripts_in(&w, &ep, "analytics"), [data_api_sql("postgres", &password, "reporting")]);
+        assert_eq!(scripts_in(&w, &ep, "analytics"), [data_api_sql("postgres", &password, &verifier(&w, main.id), "reporting")]);
         let reply = w.rebootstrap_data_api(&request(main.id, "off", false)).await;
         assert_eq!(reply.kind.as_deref(), Some("refused"));
         *w.computes.fail_sql_containing.lock().unwrap() = Some(("chelabase_admin".into(), "boom".into()));
@@ -3167,8 +4616,8 @@ END $$;
 
         let scripts = scripts_in(&w, &ep, "analytics");
         assert_eq!(scripts.len(), 2);
-        assert_eq!(scripts[0], data_api_sql("postgres", &password, "reporting"));
-        assert_eq!(scripts[1], data_api_sql_granting_existing("postgres", &password, "reporting"));
+        assert_eq!(scripts[0], data_api_sql("postgres", &password, &verifier(&w, main.id), "reporting"));
+        assert_eq!(scripts[1], data_api_sql_granting_existing("postgres", &password, &verifier(&w, main.id), "reporting"));
         let grants = "GRANT SELECT ON ALL TABLES IN SCHEMA \"reporting\" TO anon;";
         assert!(scripts[0].contains(grants) && scripts[1].contains(grants));
         let guard = "IF pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL AND NOT EXISTS (SELECT FROM chelabase.bootstrap) THEN";
@@ -3212,10 +4661,10 @@ END $$;
 
         w.recreate_compute(main.id, &ep).await.unwrap();
 
-        assert_eq!(scripts_in(&w, &ep, "app"), [data_api_sql("postgres", &password, "public")]);
+        assert_eq!(scripts_in(&w, &ep, "app"), [data_api_sql("postgres", &password, &verifier(&w, main.id), "public")]);
         assert_eq!(
             scripts_in(&w, &ep, "analytics"),
-            [data_api_sql("postgres", &password, "reporting")]
+            [data_api_sql("postgres", &password, &verifier(&w, main.id), "reporting")]
         );
         assert!(scripts_in(&w, &ep, "off").is_empty() && scripts_in(&w, &ep, "broken").is_empty());
 
@@ -3229,13 +4678,13 @@ END $$;
 
     #[test]
     fn bootstrap_grants_the_owner_the_version_table() {
-        let sql = data_api_sql("postgres", "pw", "public");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public");
         let version = sql.find("GRANT SELECT ON chelabase.schema_version TO postgres;\n").expect("P5 table grant");
         let usage = sql.find("GRANT USAGE ON SCHEMA chelabase TO postgres;\n").expect("P5 schema grant");
         let created = sql.find("CREATE TABLE IF NOT EXISTS chelabase.schema_version").unwrap();
         assert!(created < usage && usage < version);
         // The schema is quoted wherever the script names it.
-        let sql = data_api_sql("postgres", "pw", "my\"schema");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "my\"schema");
         assert!(sql.contains("IN SCHEMA \"my\"\"schema\" GRANT SELECT ON TABLES TO anon;"));
         assert!(sql.contains("GRANT USAGE ON SCHEMA \"my\"\"schema\" TO anon, authenticated, authenticator;"));
         // `regnamespace` and `to_regnamespace` parse identifier syntax: the literal is the quoted
@@ -3258,6 +4707,8 @@ END $$;
             format!("d|{}||{}|{}|||||||\n", hex::encode(name), hex::encode("postgres"), if system { "t" } else { "f" })
         };
         let catalog = [d("postgres", true), d("app", false), d("analytics", false), d("pending", false)].concat();
+        // The role catalog's read has `FROM pg_authid` too: it answers nothing here.
+        w.computes.answer(CATALOG, "");
         w.computes.answer("FROM pg_authid", &catalog);
         journal.lock().unwrap().clear();
 
@@ -3272,7 +4723,7 @@ END $$;
         let password = authenticator_password(&w, &w.metadata.branch(dev));
         assert_eq!(
             scripts_in(&w, &ep, "analytics"),
-            [data_api_sql("postgres", &password, "reporting")]
+            [data_api_sql("postgres", &password, &verifier(&w, w.metadata.branch(dev).id), "reporting")]
         );
         assert!(scripts_in(&w, &ep, "pending").is_empty());
         // Order: the resync wrote the rows, the flags were copied, then the bootstrap ran.
@@ -3286,7 +4737,7 @@ END $$;
 
     #[test]
     fn bootstrap_skips_a_missing_default_schema() {
-        let sql = data_api_sql("postgres", "pw", "reporting");
+        let sql = data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "reporting");
         let guard = "pg_catalog.to_regnamespace('\"reporting\"') IS NOT NULL";
         // Every statement that names the schema sits inside a guard, so a schema that's gone
         // (a restore to before it existed, a DROP SCHEMA) doesn't fail the bootstrap.
@@ -3294,7 +4745,7 @@ END $$;
         let usage = sql.find("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated, authenticator;").unwrap();
         // The asked-for rebootstrap grants it too (it's what a branch bootstrapped before
         // authenticator needed it gets on its next run).
-        let existing = data_api_sql_granting_existing("postgres", "pw", "reporting");
+        let existing = data_api_sql_granting_existing("postgres", "pw", ELEVATED_VERIFIER, "reporting");
         assert!(existing.contains("GRANT USAGE ON SCHEMA \"reporting\" TO anon, authenticated, authenticator;"));
         let end = first + sql[first..].find("  END IF;").unwrap();
         assert!(first < usage && usage < end);
@@ -3364,8 +4815,8 @@ END $$;
 
     fn both_scripts() -> [String; 2] {
         [
-            data_api_sql("postgres", "pw", "public"),
-            data_api_sql_granting_existing("postgres", "pw", "public"),
+            data_api_sql("postgres", "pw", ELEVATED_VERIFIER, "public"),
+            data_api_sql_granting_existing("postgres", "pw", ELEVATED_VERIFIER, "public"),
         ]
     }
 
@@ -3417,7 +4868,7 @@ END $$;
         for sql in both_scripts() {
             assert!(sql.contains(&newer), "{sql}");
         }
-        let check = schema_check_sql("public", Some("v"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
         assert!(check.contains(&newer), "{check}");
         // The current-stamp test in the check reads the same trigger, under the same rules.
         let current = current_stamp_sql();
@@ -3442,12 +4893,16 @@ END $$;
         }
         let [plain, granting] = both_scripts();
         // The data API's part of the check (storage's carries its functions' bodies).
-        let check = schema_check_sql("public", Some("v"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
         let storage = crate::storage_schema::storage_check_sql(OWNER_ROLE, Some("v"));
         let check = check.strip_suffix(&storage).unwrap().to_string();
         for sql in [newer.clone(), plain, granting, check] {
             for name in ["substring(", "obj_description(", "int4"] {
                 for (at, _) in sql.match_indices(name) {
+                    // A longer name that ends in this one (`shobj_description(`) is its own.
+                    if sql[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                        continue;
+                    }
                     assert!(sql[..at].ends_with("pg_catalog."), "bare {name} in {sql}");
                 }
             }
@@ -3482,7 +4937,7 @@ END $$;
             // `newer boolean := …` and the set_config of the version are the other two.
             assert_eq!(uses, guarded + 2, "{vet}");
         }
-        let check = schema_check_sql("public", Some("v"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
         assert_eq!(check.matches(&newer).count(), 1, "{check}");
         assert!(check.contains(&wrapped), "{check}");
     }
@@ -3578,13 +5033,23 @@ END $$;
             ] {
                 assert!(gated.contains(part), "{part} is gated: {gated}");
             }
-            for every in ["CREATE OR REPLACE FUNCTION", "ALTER FUNCTION", "CREATE EVENT TRIGGER", "CREATE TABLE", "CREATE SCHEMA", "COMMENT ON", "ALTER TABLE"] {
+            for every in ["CREATE OR REPLACE FUNCTION", "ALTER FUNCTION", "CREATE EVENT TRIGGER", "CREATE TABLE", "CREATE SCHEMA", "COMMENT ON EVENT TRIGGER", "COMMENT ON SCHEMA", "ALTER TABLE"] {
                 assert_eq!(gated.matches(every).count(), sql.matches(every).count(), "{every} outside the gate");
             }
-            // Before the gate, only the vet block's quarantine touches chelabase.
+            // The only comments outside the gate are the elevated login's lockdown record.
+            assert_eq!(
+                sql.matches("COMMENT ON").count() - gated.matches("COMMENT ON").count(),
+                sql.matches("COMMENT ON ROLE chelabase_authenticator_elevated").count(),
+                "{sql}"
+            );
+            assert!(!gated.contains("COMMENT ON ROLE"), "{gated}");
+            // Before the gate, only the vet block's quarantine touches chelabase; the elevated
+            // login's lockdown runs there, whatever the schema's version.
             for part in ["GRANT ", "REVOKE ALL", "ALTER ROLE authenticator", "ALTER DEFAULT PRIVILEGES", "chelabase.bootstrap"] {
                 assert!(!before.contains(part), "{part} before the gate");
             }
+            assert!(before.contains(LOCKDOWN), "the elevated login's lockdown is not gated: {before}");
+            assert!(!gated.contains(LOCKDOWN), "{gated}");
             // After it: authenticator, the default schema and the first grants, and nothing
             // that changes chelabase.
             for part in [
@@ -3602,7 +5067,9 @@ END $$;
                 .replace("chelabase.bootstrap", "")
                 .replace("'chelabase.quarantined'", "")
                 .replace("'chelabase.leave_alone'", "")
-                .replace("'chelabase.newer_version'", "");
+                .replace("'chelabase.newer_version'", "")
+                .replace("'chelabase.former_members'", "")
+                .replace("'chelabase.elevated_end_sessions'", "");
             for part in ["chelabase.", "SCHEMA chelabase", "EVENT TRIGGER"] {
                 assert!(!rest.contains(part), "{part} after the gate: {after}");
             }
@@ -3615,7 +5082,7 @@ END $$;
         for sql in both_scripts() {
             let comment = format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS '{DATA_API_SCHEMA_STAMP}';\n");
             assert_eq!(sql.matches(&comment).count(), 1, "{sql}");
-            assert_eq!(sql.matches("COMMENT ON").count(), 1, "{sql}");
+            assert_eq!(sql.matches("COMMENT ON EVENT TRIGGER").count(), 1, "{sql}");
             let create = sql.find("CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION chelabase.bump_schema_version();\n").unwrap();
             assert!(create < sql.find(&comment).unwrap(), "{sql}");
         }
@@ -3626,7 +5093,7 @@ END $$;
     /// current version needs this worker's stamp.
     #[test]
     fn the_health_check_counts_a_newer_stamp_healthy_and_requires_the_current_one() {
-        let check = schema_check_sql("public", Some("v"));
+        let check = schema_check_sql("public", Some("v"), Some(ELEVATED_VERIFIER));
         let branch = format!("COALESCE({}, false) OR (", valid_newer_sql());
         let branch_at = check.find(&branch).unwrap_or_else(|| panic!("{check}"));
         let open = check[..branch_at].rfind('(').unwrap();

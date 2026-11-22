@@ -111,18 +111,22 @@ pub trait FunctionsPort: Send + Sync {
         &self,
         branch: BranchId,
     ) -> impl Future<Output = Result<Vec<BranchFunction>, MetadataError>> + Send;
+    /// `tenant_admin`: whether the caller is one. The store decides who may write on the kind
+    /// it reads under the function row's lock ([`chelabase_metadata::secret_write_allowed`]).
     fn put_secret(
         &self,
         branch: BranchId,
         function: Uuid,
         name: &str,
         value: &str,
+        tenant_admin: bool,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     fn delete_secret(
         &self,
         branch: BranchId,
         function: Uuid,
         name: &str,
+        tenant_admin: bool,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn secret_names(
         &self,
@@ -249,16 +253,18 @@ impl FunctionsPort for MetadataClient {
         function: Uuid,
         name: &str,
         value: &str,
+        tenant_admin: bool,
     ) -> Result<(), MetadataError> {
-        MetadataClient::put_secret(self, branch, function, name, value).await
+        MetadataClient::put_secret(self, branch, function, name, value, tenant_admin).await
     }
     async fn delete_secret(
         &self,
         branch: BranchId,
         function: Uuid,
         name: &str,
+        tenant_admin: bool,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::delete_secret(self, branch, function, name).await
+        MetadataClient::delete_secret(self, branch, function, name, tenant_admin).await
     }
     async fn secret_names(
         &self,
@@ -474,7 +480,7 @@ use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::access::{Authorized, Target, authorize};
+use crate::access::{Authorized, Target, authorize, is_tenant_admin, tenant_admin_needed};
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::data_keys::{checked_key_identity, present};
 use crate::{ApiBytes, AppState, AuthPrincipal, JobPort, MetadataPort};
@@ -817,7 +823,10 @@ where
         .services
         .check_resolved(spec_url)
         .await
-        .map_err(|refused| unprocessable(&format!("url: {refused}")))?;
+        .map_err(|refused| {
+            tracing::info!("service url refused: {}", refused.log_detail());
+            unprocessable(&format!("url: {}", refused.public_message()))
+        })?;
     if url.query().is_some() || url.fragment().is_some() {
         return Err(unprocessable("url: no query or fragment"));
     }
@@ -827,14 +836,24 @@ where
     Ok(serde_json::json!({"backend": "external", "url": url.as_str(), "health_path": path}))
 }
 
-fn is_tenant_admin(principal: &AuthPrincipal) -> bool {
-    principal.member.as_ref().is_some_and(|m| m.tenant_admin)
-}
-
-fn tenant_admin_needed() -> ApiError {
-    crate::access::deny_to_api(chelabase_types::access::Deny::Forbidden {
-        required: "tenant_admin".to_string(),
-    })
+/// Who may write a function's secrets, checked after `begin` and `find` (so another project's
+/// member still hears 404) and before any metadata write or `fn.changed` publish.
+///
+/// Invariant: a secret on a service (`FunctionKind::Service`) becomes its container's process
+/// environment, and only a tenant admin may run a service, so only a tenant admin may set or
+/// delete one (403 `forbidden`, `required: "tenant admin"`, otherwise). A name the runner
+/// reserves ([`reserved_container_env_name`](chelabase_types::container_env::reserved_container_env_name): `PORT`, any `LD_` name, a runtime's start-up
+/// loader variable) is refused on a service at set time (422) whoever asks; deleting one stays
+/// open to the tenant admin so an old one can be removed. A plain function keeps the
+/// endpoint's own rule (Developer) and any valid name: workerd passes secrets as bindings, not
+/// a process environment.
+///
+/// This is the store's own predicate ([`chelabase_metadata::secret_write_allowed`]) on the
+/// kind `find` read, for an early answer; the store applies it again on the kind it reads under
+/// the function row's lock in the write's transaction, which a kind change waits for. That
+/// second check is the authority.
+fn secret_write_allowed(kind: FunctionKind, tenant_admin: bool, setting: Option<&str>) -> Result<(), ApiError> {
+    chelabase_metadata::secret_write_allowed(kind, tenant_admin, setting).map_err(|e| metadata_error("secret write", e))
 }
 
 /// A new signing secret for the service, stored sealed; the secret.
@@ -947,11 +966,13 @@ pub(crate) fn metadata_error(what: &str, err: MetadataError) -> ApiError {
     match err {
         MetadataError::FunctionNotFound => not_found(),
         MetadataError::InvalidFunction(message) => unprocessable(&message),
+        MetadataError::FunctionLimit(message) => conflict(ErrorCode::Conflict, message),
         MetadataError::FunctionActiveOnProtectedBranch => refused(
             "function_active_on_protected_branch",
             "the function is active on a protected branch; remove it there first",
         ),
         MetadataError::ManagedKey => refused("managed_key", "the key is managed by a function"),
+        MetadataError::ServiceSecretNeedsTenantAdmin => tenant_admin_needed(),
         MetadataError::Conflict => {
             conflict(ErrorCode::Conflict, "a function with this name exists")
         }
@@ -1143,7 +1164,7 @@ where
         (status = 201, description = "The function, created", body = Function),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`forbidden` (`required` names what's missing): Developer on the branch (Admin when it's protected), Admin to change the kind, a tenant admin to make a service or turn a function into one; `not_available_in_platform_mode`", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden` (`required` names what's missing): Developer on the branch (Admin when it's protected), Admin to change the kind, a tenant admin (`required`: `tenant admin`) to make a service or change a kind to or from a service; `not_available_in_platform_mode`", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: `reason` `function_active_on_protected_branch` (a kind change), `not_deployed` (auth for a function with no deployment on the branch), or a concurrent create took the name", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1190,9 +1211,15 @@ where
         if request.auth.is_some() && !deployed_here {
             return Err(refused("not_deployed", "deploy the function on this branch before setting its auth"));
         }
-        // m9: a service (made, or a function turned into one) needs a tenant admin.
+        // m9, O1: a service made, a function turned into one, or a service turned into a
+        // function needs a tenant admin. A service's secrets are its container's environment
+        // and only a tenant admin writes them; were a service to leave that kind below a
+        // tenant admin, a Developer could write its secrets and the service would come back
+        // holding them.
         let becomes_service = request.kind == Some(Kind::Service) && existing.as_ref().is_none_or(|f| f.kind != FunctionKind::Service);
-        if becomes_service && !is_tenant_admin(&principal) {
+        let leaves_service = existing.as_ref().is_some_and(|f| f.kind == FunctionKind::Service)
+            && request.kind.is_some_and(|k| FunctionKind::from(k) != FunctionKind::Service);
+        if (becomes_service || leaves_service) && !is_tenant_admin(&principal) {
             return Err(tenant_admin_needed());
         }
         let (function, created) = match existing {
@@ -2025,7 +2052,7 @@ where
     operation_id = "putFunctionSecret",
     tag = "functions",
     summary = "Set a function's secret on the branch",
-    description = "The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.",
+    description = "The function sees it in `env`. On a service it becomes the container's environment, so only a tenant admin may set it, and reserved names are refused. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -2037,9 +2064,10 @@ where
         (status = 204, description = "Set"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't `{\"value\": string}`", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: the function is a service and the caller isn't a tenant admin (`required`: `tenant admin`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the function doesn't exist", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: a bad name, a value over 64 KiB, or the function's secrets on the branch over 128 KiB together (as the JSON env they travel in)", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: a bad name, a value over 64 KiB, the function's secrets on the branch over 128 KiB together (as the JSON env they travel in), or, on a service, a reserved name (`PORT`, any `LD_` name, or a runtime's start-up variable such as `NODE_OPTIONS` or `PYTHONPATH`; matched case-sensitively)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -2055,13 +2083,15 @@ where
 {
     respond(async {
         let (_, record, branch) = begin(&state, &principal, ep::PUT_FUNCTION_SECRET.policy.access, id, branch_id).await?;
+        let function = find(&state, &record, &name).await?;
+        // Who may write comes before what was sent, as on delete.
+        secret_write_allowed(function.kind, is_tenant_admin(&principal), Some(&secret))?;
         // A fixed message: serde's could quote the value.
         let request: PutSecretRequest = serde_json::from_slice(&body)
             .map_err(|_| ApiError::invalid_request(400, "the body must be {\"value\": string}"))?;
-        let function = find(&state, &record, &name).await?;
         state
             .metadata
-            .put_secret(branch.id, function.id, &secret, &request.value)
+            .put_secret(branch.id, function.id, &secret, &request.value, is_tenant_admin(&principal))
             .await
             .map_err(|e| metadata_error("put secret", e))?;
         changed(&state, branch.id, &name).await;
@@ -2077,6 +2107,7 @@ where
     operation_id = "deleteFunctionSecret",
     tag = "functions",
     summary = "Delete a function's secret on the branch",
+    description = "On a service, only a tenant admin may delete a secret.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -2087,6 +2118,7 @@ where
         (status = 204, description = "Deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: the function is a service and the caller isn't a tenant admin (`required`: `tenant admin`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch, the function or the secret doesn't exist", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -2111,9 +2143,10 @@ where
             )
             .await?;
             let function = find(&state, &record, &name).await?;
+            secret_write_allowed(function.kind, is_tenant_admin(&principal), None)?;
             match state
                 .metadata
-                .delete_secret(branch.id, function.id, &secret)
+                .delete_secret(branch.id, function.id, &secret, is_tenant_admin(&principal))
                 .await
             {
                 Ok(true) => {}
@@ -2130,6 +2163,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_types::container_env::reserved_container_env_name;
+
+    /// Exhaustive over kind x tenant admin x (delete, set with a plain, reserved or other-case
+    /// name): the gate is the invariant on `secret_write_allowed`.
+    #[test]
+    fn secret_writes_on_a_service_need_a_tenant_admin_and_an_unreserved_name() {
+        let kinds = [FunctionKind::Function, FunctionKind::Service];
+        let settings = [None, Some("API_KEY"), Some("LD_PRELOAD"), Some("NODE_OPTIONS"), Some("PORT"), Some("ld_preload")];
+        for kind in kinds {
+            for admin in [false, true] {
+                for setting in settings {
+                    let got = secret_write_allowed(kind, admin, setting).map_err(|e| e.status);
+                    let want = if kind != FunctionKind::Service {
+                        Ok(())
+                    } else if !admin {
+                        Err(403)
+                    } else if setting.is_some_and(reserved_container_env_name) {
+                        Err(422)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(got, want, "{kind:?} admin={admin} {setting:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn unreachable_functions_service_is_functions_unavailable() {

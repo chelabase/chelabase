@@ -24,6 +24,7 @@ curl -X DELETE "$BASE/$SCHEDULE_ID" -H "Authorization: Bearer $MEMBER_TOKEN"
 - `timezone`: an IANA name such as `Europe/London`. Default `UTC`. The cron is read in that zone, including its daylight-saving changes.
 - `enabled`: a disabled schedule never runs. A schedule lists its `next_run_at`.
 - An invalid cron or time zone answers 422 naming the field.
+- A function has at most 20 schedules on a branch; adding a 21st answers 409 `conflict`.
 
 From the CLI:
 
@@ -38,6 +39,7 @@ chelabase functions schedule list NAME
 ## How runs happen
 
 - The worker looks for due schedules every 5 seconds. Several worker replicas never run the same tick twice.
+- **One database never takes all the run slots.** A worker runs at most 64 scheduled runs at once, and at most 8 of them for one database. Due schedules left out stay due and run, coalesced, at a later look. A database's share is refilled when the worker next looks, not the moment a run ends, so one database starts at most 8 scheduled runs every 5 seconds.
 - **Missed ticks coalesce.** If the worker was down for five minutes, it runs the function once when it returns, not five times.
 - **A disabled function skips the run**, and the schedule's `next_run_at` still advances, so enabling it later doesn't replay what it missed.
 - A run is an internal call: the function's [auth mode](/using/functions/auth-and-limits) doesn't apply. If the function has a [run-as role](/using/functions/environment#acting-as-the-function), the handler's `env.CHELABASE_SERVICE_KEY` acts as that role; if not, the run still happens, without a key.

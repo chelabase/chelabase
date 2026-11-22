@@ -6,7 +6,7 @@ import { errorText } from "@/lib/errors";
 import { formatBytes } from "@/lib/table-editor/dry-run";
 import type { StorageItem } from "@/lib/storage-api";
 import { updatedText } from "./object-list";
-import { ObjectPreview } from "./object-preview";
+import { ObjectPreview, previewSource } from "./object-preview";
 import { baseName } from "./paths";
 
 /** Signed URLs minted for a preview live this long. */
@@ -85,7 +85,7 @@ export function ObjectDetails({ item, publicUrl, sign, fetchObject, canWrite, on
         </Button>
       </div>
       <div className="space-y-4 p-4 text-sm">
-        <ObjectPreview key={`${item.name}\n${item.etag ?? ""}`} name={name} contentType={item.contentType} size={item.size} source={sign ? { kind: "signed", sign: async () => (await sign(PREVIEW_TTL)).url } : { kind: "download", fetch: fetchObject }} />
+        <ObjectPreview key={`${item.name}\n${item.etag ?? ""}`} name={name} contentType={item.contentType} size={item.size} source={previewSource(item.contentType, sign && (async () => (await sign(PREVIEW_TTL)).url), fetchObject)} />
         <div className="flex flex-wrap gap-2">
           <Button size="sm" disabled={downloading} onClick={() => void download()}>
             Download

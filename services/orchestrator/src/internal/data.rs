@@ -76,6 +76,10 @@ fn parse_hash(hash: &str) -> Option<[u8; 32]> {
     hex::decode(hash).ok()?.try_into().ok()
 }
 
+/// The data API's second login (the worker's `data_api::AUTHENTICATOR_ELEVATED`): it alone is
+/// meant to hold the roles only an Admin may key or act as.
+const ELEVATED_LOGIN: &str = "chelabase_authenticator_elevated";
+
 /// Who a connection route answers as: the data API's `authenticator` (rest, realtime and
 /// storage's role sessions) or the storage service's own `chelabase_storage` login.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,7 +92,9 @@ enum Login {
 
 /// Where and as whom the REST service connects to a branch, and which databases it serves. 404 for an unknown or deleted
 /// branch; 409 `{"status"}` when the branch isn't ready, has no endpoint, has no published
-/// Postgres address or has no `authenticator` password yet.
+/// Postgres address or has no `authenticator` password yet. With a stored
+/// `chelabase_authenticator_elevated` password the answer also has
+/// `"elevated": {"user", "password"}`; without one the field is absent.
 pub(super) async fn branch_connection<M, L>(
     State(state): State<Arc<InternalState<M, L>>>,
     Path(id): Path<Uuid>,
@@ -220,6 +226,19 @@ where
     });
     if login == Login::Authenticator {
         answer["replication_host"] = replication_host(state, branch, endpoint).await.into();
+        // The data API's second login, once the worker stored its password. This answer
+        // only: the storage and functions routes never carry it.
+        if let Some(sealed) = row.authenticator_elevated_password_enc.as_deref() {
+            match open_credential(&state.secrets, &branch.to_string(), Purpose::AuthenticatorElevated, sealed) {
+                Ok(password) => {
+                    answer["elevated"] = json!({ "user": ELEVATED_LOGIN, "password": password });
+                }
+                Err(err) => {
+                    error!(branch_id = %branch, "opening the {ELEVATED_LOGIN} password: {err}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
     }
     let mut response = Json(answer).into_response();
     response.headers_mut().insert(

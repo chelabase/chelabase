@@ -942,6 +942,41 @@ async fn rt_slots(fx: &Fx, database: &str) -> usize {
     .unwrap()
 }
 
+/// A table whose rows each role sees only on the data API login that holds it: `rt_el` (it can
+/// log in, so it is elevated) on the elevated login, `rt_pl` on `authenticator`.
+const LOGIN_SETUP: &str = "CREATE ROLE rt_el LOGIN; CREATE ROLE rt_pl NOLOGIN; \
+    CREATE TABLE rt_who (id int PRIMARY KEY, tag text); \
+    ALTER TABLE rt_who ENABLE ROW LEVEL SECURITY; \
+    CREATE POLICY own_login_el ON rt_who FOR SELECT TO rt_el USING (session_user = 'chelabase_authenticator_elevated'); \
+    CREATE POLICY own_login_pl ON rt_who FOR SELECT TO rt_pl USING (session_user = 'authenticator'); \
+    GRANT SELECT ON rt_who TO rt_el, rt_pl;";
+
+/// A viewer's check runs on the data API login that holds its role: an elevated role's on the
+/// elevated login, an ordinary role's on `authenticator`. Each role's policy shows the row
+/// only on its own login, so a check on the other login would send no key.
+#[tokio::test]
+#[ignore = "needs the workbench stack (just workbench test -p realtime --test realtime_live -- --run-ignored only)"]
+async fn a_check_runs_on_the_login_that_holds_its_role() {
+    with_database(|fx| async move {
+        fx.psql(&fx.pg_database, LOGIN_SETUP).await;
+        let live = live_one().await;
+        let mut elevated = live.socket(&fx.token).await;
+        let mut plain = live.socket(&fx.token).await;
+        let ch = join_live(&mut elevated, "1", join_in("1", &fx, &fx.pg_database, "public", "rt_who", Some("rt_el")), Duration::from_secs(60)).await;
+        join_live(&mut plain, "1", join_in("1", &fx, &fx.pg_database, "public", "rt_who", Some("rt_pl")), Duration::from_secs(60)).await;
+        fx.psql(&fx.pg_database, "INSERT INTO rt_who VALUES (10, 'x')").await;
+        let (e, p) = tokio::join!(
+            collect_rows(&mut elevated, &ch, Duration::from_secs(8)),
+            collect_rows(&mut plain, &ch, Duration::from_secs(8)),
+        );
+        assert_eq!(e.inserts, keys(&["10"]), "the elevated role, on the elevated login: {e:?}");
+        assert_eq!(p.inserts, keys(&["10"]), "the ordinary role, on authenticator: {p:?}");
+        assert_eq!((e.changed, p.changed), (0, 0), "{e:?} {p:?}");
+        live.rt.shutdown();
+    })
+    .await;
+}
+
 const RLS_SETUP: &str = "CREATE TABLE rt_acl (id int PRIMARY KEY, tag text); \
     ALTER TABLE rt_acl ENABLE ROW LEVEL SECURITY; \
     CREATE POLICY shown ON rt_acl FOR SELECT USING (tag = 'shown'); \

@@ -816,6 +816,182 @@ async fn forwarding_is_off_in_admin_sql() {
     .await;
 }
 
+/// Gives the main database, and `cloud_admin` in it, settings of their own for the three
+/// things the admin session pins: a client encoding other than UTF8, backslash escapes in plain
+/// literals and a search path that lists `pg_catalog` last.
+async fn set_database_defaults(fx: &Fx) {
+    let db = ident(&fx.database);
+    fx.sql(&format!(
+        "ALTER DATABASE {db} SET client_encoding = 'SJIS';
+         ALTER DATABASE {db} SET standard_conforming_strings = off;
+         ALTER DATABASE {db} SET search_path = public, pg_catalog;
+         ALTER ROLE cloud_admin IN DATABASE {db} SET standard_conforming_strings = off;
+         ALTER ROLE cloud_admin IN DATABASE {db} SET search_path = public, pg_catalog;"
+    ))
+    .await;
+}
+
+/// The session's client encoding, `standard_conforming_strings` and search path, then the
+/// last two again after `RESET ALL`.
+const SESSION_SETTINGS_SQL: &str = "SHOW client_encoding; SHOW standard_conforming_strings; \
+     SHOW search_path; RESET ALL; SHOW client_encoding; SHOW standard_conforming_strings; \
+     SHOW search_path;";
+
+/// The non-empty lines of a psql answer, without spaces (`SHOW search_path` prints the value
+/// as it was given).
+fn shown(out: &str) -> Vec<String> {
+    out.lines()
+        .map(|l| l.replace(' ', ""))
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `s` as hex of its UTF8 bytes, as `encode(convert_to(…, 'UTF8'), 'hex')` prints it.
+fn hex_of(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The `cloud_admin` session reads its script as UTF8 with standard-conforming strings and
+/// resolves names in `pg_catalog` only, whatever the database and the role are set to; a
+/// `RESET ALL` in a script returns to the same values.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn admin_session_ignores_database_settings() {
+    live(|fx| async move {
+        set_database_defaults(&fx).await;
+        let out = fx.sql(SESSION_SETTINGS_SQL).await;
+        let pinned = ["UTF8", "on", "pg_catalog,pg_temp"];
+        assert_eq!(shown(&out), [pinned, pinned].concat(), "{out}");
+        // The system database has no settings of its own: the same there.
+        let out = fx.sql_in(&fx.ep, "postgres", SESSION_SETTINGS_SQL).await;
+        assert_eq!(shown(&out), [pinned, pinned].concat(), "{out}");
+        // The database's own settings are in place: a session that pins nothing gets them.
+        assert_eq!(
+            fx.value_in_db(
+                "SELECT pg_catalog.string_agg(s, '|' ORDER BY s) \
+                 FROM pg_catalog.pg_db_role_setting d, pg_catalog.unnest(d.setconfig) s \
+                 WHERE d.setrole OPERATOR(pg_catalog.=) 0 AND d.setdatabase OPERATOR(pg_catalog.=) \
+                 (SELECT oid FROM pg_catalog.pg_database \
+                  WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database());"
+            )
+            .await,
+            "client_encoding=SJIS|search_path=public, pg_catalog|standard_conforming_strings=off"
+        );
+        // A literal with a multibyte character, a quote and a backslash reads back as written.
+        let text = "表\\'能\\";
+        assert_eq!(
+            fx.value_in_db(&format!(
+                "SELECT encode(convert_to({}, 'UTF8'), 'hex');",
+                chelabase_types::role_name::quote_literal(text)
+            ))
+            .await,
+            hex_of(text)
+        );
+    })
+    .await;
+}
+
+/// The owner's session (merge user steps) gets the same encoding and literal pins and keeps
+/// the database's search path.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn owner_session_pins_encoding_keeps_search_path() {
+    live(|fx| async move {
+        set_database_defaults(&fx).await;
+        let owner = chelabase_neon::SqlOpts {
+            user: Some("postgres".into()),
+            ..chelabase_neon::SqlOpts::admin_default()
+        };
+        let out = fx
+            .worker
+            .computes
+            .admin_sql_with(
+                &fx.ep,
+                &fx.database,
+                &format!("SELECT current_user; {SESSION_SETTINGS_SQL}"),
+                &owner,
+            )
+            .await
+            .expect("the owner's session");
+        let kept = ["UTF8", "on", "public,pg_catalog"];
+        assert_eq!(shown(&out), [&["postgres"][..], &kept, &kept].concat(), "{out}");
+    })
+    .await;
+}
+
+/// A role whose name holds a quote and a backslash, in a database with settings of its own:
+/// the worker's existence check, name listing and session read each find exactly that role.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn role_names_with_quotes_and_backslashes_round_trip() {
+    live(|fx| async move {
+        let name = "o'r\\x";
+        // A second role, so a read that matched more than the one name would show.
+        fx.owner_ok(&format!("CREATE ROLE {} LOGIN PASSWORD 'quoted-pass-444'", ident(name)))
+            .await;
+        fx.owner_ok("CREATE ROLE other_444 LOGIN PASSWORD 'other-pass-444'").await;
+        assert_eq!(
+            fx.copies(&fx.ep).await,
+            [(name.to_string(), RoleOrigin::Sql), ("other_444".to_string(), RoleOrigin::Sql)]
+        );
+        set_database_defaults(&fx).await;
+        let quoted = chelabase_types::role_name::quote_literal(name);
+
+        // The name listing's read: the worker's own text (`role_names_sql`).
+        let names = fx
+            .sql(&worker::roles::role_names_sql(&[name, "no such\\role'"]))
+            .await;
+        assert_eq!(shown(&names), [hex_of(name)], "{names}");
+
+        // Its sessions: none, then the one held open as the role; the other role's don't count.
+        let ask = chelabase_nats::RoleRequest { branch_id: fx.main, name: name.into() };
+        let none = fx.worker.role_sessions_reply(&ask).await;
+        assert!(none.ok && none.compute_running, "{none:?}");
+        assert!(none.sessions.is_empty(), "{none:?}");
+        let mut held = psql_command(&fx.ep, &fx.database, name, "quoted-pass-444", "SELECT pg_sleep(60)");
+        held.env("PGAPPNAME", "round-trip-live").env("PGCLIENTENCODING", "UTF8");
+        let mut child = held.spawn().expect("spawn psql");
+        let mut other = psql_command(&fx.ep, &fx.database, "other_444", "other-pass-444", "SELECT pg_sleep(60)");
+        other.env("PGAPPNAME", "round-trip-other").env("PGCLIENTENCODING", "UTF8");
+        let mut other_child = other.spawn().expect("spawn psql");
+        let other_ask = chelabase_nats::RoleRequest { branch_id: fx.main, name: "other_444".into() };
+        let started = Instant::now();
+        let reply = loop {
+            let reply = fx.worker.role_sessions_reply(&ask).await;
+            let other = fx.worker.role_sessions_reply(&other_ask).await;
+            if (!reply.sessions.is_empty() && !other.sessions.is_empty())
+                || !reply.ok
+                || started.elapsed() > Duration::from_secs(20)
+            {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert!(reply.ok && reply.compute_running, "{reply:?}");
+        assert_eq!(reply.sessions.len(), 1, "{reply:?}");
+        assert_eq!(reply.sessions[0].application_name, "round-trip-live");
+        child.kill().await.ok();
+        other_child.kill().await.ok();
+
+        // Reset and delete name it too: the delete's existence check finds it, so it goes.
+        assert_eq!(fx.worker.reset_role(fx.main, name).await, RoleOutcome::Ok);
+        assert_eq!(
+            fx.value_in_db(&format!("SELECT count(*) FROM pg_roles WHERE rolname = {quoted};")).await,
+            "1"
+        );
+        assert_eq!(fx.worker.delete_role(fx.main, name, QUARANTINE_ROLE).await, deleted_nothing());
+        assert_eq!(
+            fx.value_in_db(&format!(
+                "SELECT count(*) FROM pg_roles WHERE rolname IN ({quoted}, 'other_444');"
+            ))
+            .await,
+            "1"
+        );
+        assert_eq!(fx.copies(&fx.ep).await, [("other_444".to_string(), RoleOrigin::Sql)]);
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn migration_script_runs_through_the_proxy() {
@@ -1401,7 +1577,7 @@ async fn recreated_role_kills_its_key_and_the_resync_revokes_it() {
 
         fx.sql(
             "DROP OWNED BY twin; DROP ROLE twin; CREATE ROLE twin NOLOGIN; \
-             GRANT SELECT ON notes TO twin; GRANT twin TO authenticator;",
+             GRANT SELECT ON public.notes TO twin; GRANT twin TO authenticator;",
         )
         .await;
         // At once: the gateway's key cache still has the key, the preamble refuses the OID.
@@ -2145,7 +2321,7 @@ async fn delete_reaches_a_hyphenated_database() {
         fx.sql_in(
             &fx.ep,
             "my-app",
-            "GRANT CREATE ON SCHEMA public TO app; SET ROLE app; CREATE TABLE app_t (n int);",
+            "GRANT CREATE ON SCHEMA public TO app; SET ROLE app; CREATE TABLE public.app_t (n int);",
         )
         .await;
 
@@ -2554,7 +2730,7 @@ async fn delete_to_the_quarantine_role_needs_no_token() {
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn restore_before_the_role_brings_it_back() {
     live(|fx| async move {
-        fx.sql("CREATE TABLE t (v text); INSERT INTO t VALUES ('A');")
+        fx.sql("CREATE TABLE public.t (v text); INSERT INTO public.t VALUES ('A');")
             .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         let noted = chrono::Utc::now();
@@ -2585,7 +2761,7 @@ async fn restore_before_the_role_brings_it_back() {
         // The restore really rewound: a row written after the noted time would be gone; the
         // role was made after it and is back, plain, with the same password.
         assert_eq!(
-            fx.sql("SELECT string_agg(v, ',') FROM t;").await.trim(),
+            fx.sql("SELECT string_agg(v, ',') FROM public.t;").await.trim(),
             "A"
         );
         fx.assert_plain(&fx.ep, "app").await;

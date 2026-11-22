@@ -4,8 +4,8 @@
 //! It behaves like the service on what callers rely on: pools are separate (the same email can
 //! live in two), a ban refuses sign-in and kills sessions, `revoke_all` leaves other users
 //! alone, and codes (see [`codes`]) are single use, locked after 5 wrong attempts, bound to
-//! pool, user and kind, and expire per kind. It does not model caller tokens beyond "a bearer
-//! is present", nor Better Auth's hashing.
+//! pool, user and kind, expire per kind, and are all revoked when the user's email changes. It
+//! does not model caller tokens beyond "a bearer is present", nor Better Auth's hashing.
 
 mod codes;
 
@@ -64,6 +64,8 @@ pub(crate) struct PoolState {
     pub users: Vec<FUser>,
     pub sessions: Vec<FSession>,
     pub codes: HashMap<(String, CodeKind), codes::CodeRow>,
+    /// Failure budgets per (user, kind); they outlive codes, as the service's row columns do.
+    pub budgets: HashMap<(String, CodeKind), codes::Budget>,
 }
 
 /// A code the fake "mailed" (`delivery: "email"`).
@@ -96,6 +98,15 @@ pub struct SentNotice {
     pub link: String,
 }
 
+/// A notice the fake "mailed" to a previous address after an email change. It holds no code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeNotice {
+    pub pool: String,
+    pub user_id: String,
+    /// The previous address, which the notice went to.
+    pub email: String,
+}
+
 struct Fault {
     pattern: String,
     status: u16,
@@ -114,6 +125,7 @@ pub(crate) struct Inner {
     pub email_configured: bool,
     pub sent: Vec<SentCode>,
     pub notices: Vec<SentNotice>,
+    pub change_notices: Vec<ChangeNotice>,
     faults: Vec<Fault>,
 }
 
@@ -187,7 +199,7 @@ pub(crate) fn check_password(p: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn check_email(email: &str) -> Result<String, Refusal> {
+pub(crate) fn check_email(email: &str) -> Result<String, Refusal> {
     let email = email.to_lowercase();
     let ok = email.len() <= 320
         && email
@@ -294,6 +306,8 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
         return reply;
     }
     let mut next = i.next;
+    let configured = i.email_configured;
+    let mut change_notice = None;
     let p = pool_mut(i, &name)?;
     let mut tick = || {
         next += 1;
@@ -427,18 +441,32 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             p.users.remove(at);
             p.sessions.retain(|s| s.user_id != *id);
             p.codes.retain(|(uid, _), _| uid != id);
+            p.budgets.retain(|(uid, _), _| uid != id);
             (204, None)
         }
         ("PUT", ["users", id, "email"]) => {
             let email = check_email(str_field(body, "email")?)?;
             let verified = bool_field(body, "email_verified")?;
+            let notify = bool_field(body, "notify_previous")?;
             if p.users.iter().any(|u| u.email == email && u.id != *id) {
                 return Err(refuse(409, "conflict", "another user has this email"));
             }
             let at = user_idx(p, id)?;
             let u = &mut p.users[at];
-            (u.email, u.verified, u.updated) = (email, verified, now);
-            (200, Some(json!({ "user": user_out(u) })))
+            let previous = std::mem::replace(&mut u.email, email);
+            (u.verified, u.updated) = (verified, now);
+            let (changed, out) = (previous != u.email, user_out(u));
+            if changed {
+                codes::revoke_codes(p, id);
+            }
+            if notify && changed && configured {
+                change_notice = Some(ChangeNotice {
+                    pool: name.clone(),
+                    user_id: id.to_string(),
+                    email: previous,
+                });
+            }
+            (200, Some(json!({ "user": out })))
         }
         ("PUT", ["users", id, "password"]) => {
             let password = str_field(body, "password")?;
@@ -525,6 +553,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
         _ => return Err(refuse(404, "not_found", "no such route")),
     };
     i.next = next;
+    i.change_notices.extend(change_notice);
     Ok(reply)
 }
 
@@ -618,6 +647,7 @@ impl FakeIdentity {
             email_configured: true,
             sent: Vec::new(),
             notices: Vec::new(),
+            change_notices: Vec::new(),
             faults: Vec::new(),
         }));
         let app = Router::new().fallback(handle).with_state(inner.clone());
@@ -766,6 +796,11 @@ impl FakeIdentity {
     /// Every invite notice the fake mailed, oldest first.
     pub fn notices_sent(&self) -> Vec<SentNotice> {
         self.with(|i| i.notices.clone())
+    }
+
+    /// Every email-change notice the fake mailed to a previous address, oldest first.
+    pub fn change_notices_sent(&self) -> Vec<ChangeNotice> {
+        self.with(|i| i.change_notices.clone())
     }
 
     /// The user's state, for assertions: `None` when they are gone.

@@ -42,10 +42,14 @@ async fn main() -> anyhow::Result<()> {
             &config.internal_token,
         ))),
         inflight: storage::limits::InFlight::new(config.max_inflight_bytes)
-            .with_body_idle(config.body_idle),
+            .with_body_idle(config.body_idle)
+            .with_part_deadline(config.part_deadline)
+            .with_branch_limit(config.max_inflight_bytes_per_branch),
         // m18: object events, published on the NATS connection `events::spawn` makes.
         events: storage::events::ObjectEvents::nats(),
     });
+    // #154: a totals line while events go unpublished.
+    state.events.spawn_totals();
     // m9: NATS cache invalidation as storage's own user (`CHELABASE_NATS_*`), in the
     // background: storage serves on its cache lifetimes while NATS is away.
     storage::events::spawn(

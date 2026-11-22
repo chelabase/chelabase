@@ -1,6 +1,9 @@
 //! One request, one transaction: pick the database (main when the tree names none; it must
-//! be served and on the key's list, else 404 `unknown_database`); for a secret key, refuse
-//! an owner-level role ([`owner_level`], asked before the transaction and cached); run
+//! be served and on the key's list, else 404 `unknown_database`); read the role's facts
+//! ([`owner_level`], asked before the transaction and cached), refuse an owner-level role
+//! for a secret key, and take a connection of the login that holds the role
+//! ([`Pools::acquire_for_role`]: `authenticator`, or the elevated login for an elevated
+//! role; never the other); run
 //! the request through [`chelabase_query::run`] (`[ROLLBACK;] BEGIN; RESET_SQL`, preamble,
 //! schema cache, shape cache, plans, response cap, `COMMIT`, `RESET_SQL`) with that
 //! database's `default_schema`, on a leased connection ([`chelabase_query::Lease`]: a
@@ -27,7 +30,9 @@ use tokio_postgres::error::ErrorPosition;
 use tokio_postgres::types::{ToSql, Type};
 use uuid::Uuid;
 
-use crate::conn::owner_level::{self, OwnerLevelCache, RoleRefused, owner_level_cache};
+use crate::conn::owner_level::{
+    self, OwnerLevelCache, RoleAcquireError, RoleRefused, owner_level_cache,
+};
 use crate::conn::{
     AcquireError, ConnError, ConnInfo, ConnSource, NoRole, Pools, RoleSession, ServedDatabase,
 };
@@ -35,61 +40,15 @@ use crate::error::ApiError;
 
 #[cfg(test)]
 use chelabase_query::engine::SchemaKey;
-pub use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
-
-/// The session's owner-level check ([`RoleSession::owner_level`]), its failure as the API's.
-async fn fetch_owner_level(
-    session: &RoleSession,
-    role: &str,
-    request_id: &str,
-) -> Result<Option<bool>, ApiError> {
-    session
-        .owner_level(role, request_id)
-        .await
-        .map_err(|e| ApiError::from_pg(&e, request_id))
-}
+pub use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE_BYTES};
 
 /// A refused role as the API's error.
-fn refused(e: RoleRefused<ApiError>) -> ApiError {
+fn refused(e: RoleRefused) -> ApiError {
     match e {
         RoleRefused::OwnerLevel(role) => ApiError::role_not_allowed(&role),
         RoleRefused::Reserved(role) => ApiError::role_reserved(&role),
         RoleRefused::UnknownRole(role) => ApiError::unknown_role(&role),
-        RoleRefused::Check(e) => e,
     }
-}
-
-/// For a secret key only: refuses a role that is owner-level
-/// ([`owner_level::ensure_not_owner_level`]).
-async fn ensure_not_owner_level<F, Fut>(
-    cache: &OwnerLevelCache,
-    data: &DataIdentity,
-    fetch: F,
-) -> Result<(), ApiError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Option<bool>, ApiError>>,
-{
-    owner_level::ensure_not_owner_level(cache, data, fetch)
-        .await
-        .map_err(refused)
-}
-
-/// The console's role must exist and not be owner-level (the secret key's 403;
-/// [`owner_level::ensure_console_role`]).
-async fn ensure_console_role<F, Fut>(
-    cache: &OwnerLevelCache,
-    branch: Uuid,
-    role: &str,
-    fetch: F,
-) -> Result<(), ApiError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Option<bool>, ApiError>>,
-{
-    owner_level::ensure_console_role(cache, branch, role, fetch)
-        .await
-        .map_err(refused)
 }
 
 /// Who a console request runs as: `role`, through the secret-key path, with no claims and
@@ -138,7 +97,7 @@ enum Guard<'a> {
     /// A secret key: its role mustn't be owner-level.
     Key(&'a DataIdentity),
     /// The console's role: it must exist and not be owner-level.
-    Console(&'a str),
+    Console,
 }
 
 impl Guard<'_> {
@@ -146,7 +105,16 @@ impl Guard<'_> {
     fn role_oid(&self) -> Option<i64> {
         match self {
             Guard::Key(data) => data.role_oid,
-            Guard::None | Guard::Console(_) => None,
+            Guard::None | Guard::Console => None,
+        }
+    }
+
+    /// The check the role passes before its connection is taken.
+    fn check(&self) -> owner_level::Guard {
+        match self {
+            Guard::None => owner_level::Guard::None,
+            Guard::Key(data) => owner_level::Guard::of_key(data),
+            Guard::Console => owner_level::Guard::Console,
         }
     }
 }
@@ -389,6 +357,7 @@ impl<S: ConnSource> Engine<S> {
         Ok((info, database))
     }
 
+    /// `authenticator`'s connection, for its own session (the internal schema route).
     async fn acquire(
         &self,
         branch: Uuid,
@@ -401,37 +370,20 @@ impl<S: ConnSource> Engine<S> {
             .map_err(|e| acquire_failure(e, branch, request_id))
     }
 
-    /// The owner-level check (cached), before the request's transaction.
-    async fn check_owner_level(
+    /// A connection for a session as `role`, after `guard` (the owner-level check, cached,
+    /// before the request's transaction), on the login that holds the role.
+    async fn acquire_for(
         &self,
-        session: &RoleSession,
-        data: &DataIdentity,
-        request_id: &str,
-    ) -> Result<(), ApiError> {
-        ensure_not_owner_level(&self.owner_level, data, || {
-            fetch_owner_level(session, &data.role, request_id)
-        })
-        .await
-    }
-
-    /// The check a request on `branch` passes before its transaction.
-    async fn guard(
-        &self,
-        session: &RoleSession,
         branch: Uuid,
+        database: &str,
+        role: &str,
         guard: Guard<'_>,
         request_id: &str,
-    ) -> Result<(), ApiError> {
-        match guard {
-            Guard::None => Ok(()),
-            Guard::Key(data) => self.check_owner_level(session, data, request_id).await,
-            Guard::Console(role) => {
-                ensure_console_role(&self.owner_level, branch, role, || {
-                    fetch_owner_level(session, role, request_id)
-                })
-                .await
-            }
-        }
+    ) -> Result<crate::conn::Conn, Failure> {
+        self.pools
+            .acquire_for_role(&self.owner_level, branch, database, role, guard.check(), request_id)
+            .await
+            .map_err(|e| role_failure(e, branch, request_id))
     }
 
     /// `POST /data/v1/query`: the JSON result, unparsed.
@@ -496,10 +448,13 @@ impl<S: ConnSource> Engine<S> {
         let (_, served) = self
             .database(branch, request.database.as_deref(), None)
             .await?;
-        let conn = self.acquire(branch, &served.name, request_id).await?;
+        let guard = Guard::Console;
+        let conn = self
+            .acquire_for(branch, &served.name, &request.role, guard, request_id)
+            .await?;
         let claims = Value::Object(Default::default());
         conn.with_role_session(&request.role, &claims, None, async |session| {
-            self.cell_on(session, &served, branch, request, request_id)
+            self.cell_on(session, &served, request, request_id)
                 .await
         })
         .await
@@ -510,12 +465,9 @@ impl<S: ConnSource> Engine<S> {
         &self,
         session: &RoleSession,
         served: &ServedDatabase,
-        branch: Uuid,
         request: &ConsoleCellRequest,
         request_id: &str,
     ) -> Result<CellValue, CellError> {
-        self.guard(session, branch, Guard::Console(&request.role), request_id)
-            .await?;
         // The table's model is its own transaction (`BEGIN … COMMIT`), so it is read before the
         // session's, under the cell read's statement timeout; the catalog is readable by every
         // role.
@@ -572,15 +524,15 @@ impl<S: ConnSource> Engine<S> {
         request_id: &str,
     ) -> Result<String, Failure> {
         let branch = data.branch_id;
-        let conn = self.acquire(branch, &database.name, request_id).await?;
         let guard = if console {
-            Guard::Console(&data.role)
+            Guard::Console
         } else {
             Guard::Key(data)
         };
+        let conn = self
+            .acquire_for(branch, &database.name, &data.role, guard, request_id)
+            .await?;
         conn.with_role_session(&data.role, &data.claims, guard.role_oid(), async |session| {
-            self.guard(session, branch, guard, request_id)
-                .await?;
             // `run` sends `[ROLLBACK;] BEGIN; RESET_SQL`, `COMMIT` and `RESET_SQL` itself.
             Ok::<_, Failure>(
                 session
@@ -622,7 +574,7 @@ impl<S: ConnSource> Engine<S> {
         request_id: &str,
     ) -> Result<Value, Failure> {
         let data = console_identity(branch, role);
-        self.role_schema_with(&data, database, Guard::Console(role), request_id)
+        self.role_schema_with(&data, database, Guard::Console, request_id)
             .await
     }
 
@@ -665,7 +617,7 @@ impl<S: ConnSource> Engine<S> {
     ) -> Result<Value, Failure> {
         let (_, served) = self.database(branch, database, None).await?;
         let names = internal_schema_roles(role);
-        let guard = role.map_or(Guard::None, Guard::Console);
+        let guard = role.map_or(Guard::None, |_| Guard::Console);
         let (schema, views, default_schema, _) = self
             .schemas_for(branch, &served, None, &names, guard, request_id)
             .await?;
@@ -689,12 +641,28 @@ impl<S: ConnSource> Engine<S> {
         guard: Guard<'_>,
         request_id: &str,
     ) -> Result<Schemas, Failure> {
-        let conn = self.acquire(branch, &database.name, request_id).await?;
+        let conn = match role {
+            Some(role) => {
+                self.acquire_for(branch, &database.name, role, guard, request_id)
+                    .await?
+            }
+            None => {
+                // The login's own session describes the roles; a guarded one (the console's)
+                // passes its check first, though nothing runs as it.
+                if guard.check() != owner_level::Guard::None {
+                    for described in roles {
+                        self.pools
+                            .check_role(&self.owner_level, branch, &database.name, described, guard.check(), request_id)
+                            .await
+                            .map_err(|e| role_failure(e, branch, request_id))?;
+                    }
+                }
+                self.acquire(branch, &database.name, request_id).await?
+            }
+        };
         let info = conn.info.clone();
         let claims = Value::Object(Default::default());
         let work = async |session: &RoleSession| {
-                self.guard(session, branch, guard, request_id)
-                    .await?;
                 Ok::<_, Failure>(
                     session
                         .schema(
@@ -718,10 +686,24 @@ impl<S: ConnSource> Engine<S> {
                 .with_role_session(role, &claims, guard.role_oid(), work)
                 .await
                 .map_err(no_role)?,
-            None => conn.with_login_session(work).await,
+            // `acquire` hands out `authenticator`'s connection, which has a login session.
+            None => conn
+                .with_login_session(work)
+                .await
+                .ok_or_else(|| ApiError::unavailable("no connection of the data API's own login"))?,
         };
         let (schema, views) = out?;
         Ok((schema, views, database.default_schema.clone(), info))
+    }
+}
+
+/// Why no connection for a role's session could be had, as the client sees it.
+fn role_failure(e: RoleAcquireError, branch: Uuid, request_id: &str) -> Failure {
+    match e {
+        RoleAcquireError::Refused(e) => refused(e).into(),
+        RoleAcquireError::Unavailable(role) => ApiError::from(engine::role_unusable(&role)).into(),
+        RoleAcquireError::Acquire(e) => acquire_failure(e, branch, request_id),
+        RoleAcquireError::Check(e) => ApiError::from_pg(&e, request_id).into(),
     }
 }
 
@@ -741,6 +723,10 @@ fn acquire_failure(e: AcquireError, branch: Uuid, request_id: &str) -> Failure {
         AcquireError::NotServed => ApiError::unknown_database().into(),
         AcquireError::Busy => {
             ApiError::unavailable("too many connections in use; try again").into()
+        }
+        AcquireError::NoElevatedLogin => {
+            ApiError::unavailable("the branch's database can't run the request right now; try again")
+                .into()
         }
         AcquireError::Db(e) => {
             tracing::warn!(request_id, branch_id = %branch, "connecting: {e}");
@@ -814,62 +800,26 @@ mod tests {
         assert_eq!(Guard::Key(&data).role_oid(), None, "a key not backfilled yet");
         data.role_oid = Some(16390);
         assert_eq!(Guard::Key(&data).role_oid(), Some(16390));
-        assert_eq!(Guard::Console("reader").role_oid(), None);
+        assert_eq!(Guard::Console.role_oid(), None);
         assert_eq!(Guard::None.role_oid(), None);
     }
 
-    fn owner_cache() -> moka::future::Cache<(Uuid, String), bool> {
-        owner_level_cache()
-    }
-
-    #[tokio::test]
-    async fn owner_level_check_is_cached_per_branch_and_role() {
-        let cache = owner_cache();
-        let branch = Uuid::new_v4();
-        let queries = std::cell::Cell::new(0);
-        let check = |branch: Uuid, role: &'static str, answer: bool| {
-            let data = identity(DataKeyKind::Secret, branch, role);
-            let cache = &cache;
-            let queries = &queries;
-            async move {
-                ensure_not_owner_level(cache, &data, || async {
-                    queries.set(queries.get() + 1);
-                    Ok(Some(answer))
-                })
-                .await
-            }
-        };
-        assert!(check(branch, "svc", false).await.is_ok());
-        assert!(check(branch, "svc", false).await.is_ok());
-        assert_eq!(queries.get(), 1);
-        // Another role asks again; an owner-level answer is cached and refused.
-        let e = check(branch, "boss", true).await.unwrap_err();
-        assert_eq!((e.status, e.code), (axum::http::StatusCode::FORBIDDEN, "role_not_allowed"));
-        assert_eq!(queries.get(), 2);
-        assert!(check(branch, "boss", true).await.is_err());
-        assert_eq!(queries.get(), 2);
-        // Another branch asks again.
-        assert!(check(Uuid::new_v4(), "svc", false).await.is_ok());
-        assert_eq!(queries.get(), 3);
-    }
-
-    #[tokio::test]
-    async fn publishable_keys_skip_the_check() {
-        let cache = owner_cache();
-        let data = identity(DataKeyKind::Public, Uuid::new_v4(), "anon");
-        let r = ensure_not_owner_level(&cache, &data, || async {
-            panic!("a publishable key must not be checked");
-            #[allow(unreachable_code)]
-            Ok(Some(true))
-        })
-        .await;
-        assert!(r.is_ok());
+    /// A key's guard checks a secret key's role only; the console's role is always checked.
+    #[test]
+    fn publishable_keys_skip_the_check() {
+        let public = identity(DataKeyKind::Public, Uuid::new_v4(), "anon");
+        assert_eq!(Guard::Key(&public).check(), owner_level::Guard::None);
+        let secret = identity(DataKeyKind::Secret, Uuid::new_v4(), "svc");
+        assert_eq!(Guard::Key(&secret).check(), owner_level::Guard::SecretKey);
+        assert_eq!(Guard::Console.check(), owner_level::Guard::Console);
+        assert_eq!(Guard::None.check(), owner_level::Guard::None);
     }
 
     /// The console runs as the role it names, through the secret-key path: an owner-level
     /// role gets the same 403 as a secret key's, and a missing role is refused.
-    #[tokio::test]
-    async fn console_route_runs_as_the_role_and_refuses_owner_level() {
+    #[test]
+    fn console_route_runs_as_the_role_and_refuses_owner_level() {
+        use chelabase_query::roles::RoleFacts;
         let branch = Uuid::new_v4();
         let id = console_identity(branch, "editor");
         assert_eq!(id.branch_id, branch);
@@ -878,20 +828,15 @@ mod tests {
         assert_eq!(id.databases, None);
         assert_eq!(id.claims, serde_json::json!({}));
 
-        let cache = owner_cache();
-        let plain = ensure_console_role(&cache, branch, "editor", || async { Ok(Some(false)) });
-        assert!(plain.await.is_ok());
-        let e = ensure_console_role(&cache, branch, "boss", || async { Ok(Some(true)) })
-            .await
-            .unwrap_err();
+        let facts = |owner_level| RoleFacts { owner_level, elevated: owner_level, held_by_elevated: false };
+        let console = owner_level::Guard::Console;
+        assert_eq!(console.check_facts("editor", Some(&facts(false))), Ok(()));
+        let e = refused(console.check_facts("boss", Some(&facts(true))).unwrap_err());
         assert_eq!(e, ApiError::role_not_allowed("boss"));
-        let e = ensure_console_role(&cache, branch, "ghost", || async { Ok(None) })
-            .await
-            .unwrap_err();
+        let e = refused(console.check_facts("ghost", None).unwrap_err());
         assert_eq!((e.status.as_u16(), e.code), (404, "unknown_role"));
-        // A missing role isn't cached: created a moment later, it's found.
-        let found = ensure_console_role(&cache, branch, "ghost", || async { Ok(Some(false)) });
-        assert!(found.await.is_ok());
+        let e = refused(owner_level::Guard::SecretKey.check_facts("boss", Some(&facts(true))).unwrap_err());
+        assert_eq!((e.status, e.code), (axum::http::StatusCode::FORBIDDEN, "role_not_allowed"));
     }
 
     /// The internal schema route describes `anon` and `authenticated` by default, or the one
