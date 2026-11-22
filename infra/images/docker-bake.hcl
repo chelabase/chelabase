@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "compute-egress", "init", "server", "studio", "identity", "functions-runtime"]
 }
 
 target "_app" {
@@ -89,6 +89,12 @@ target "service-runner" {
   inherits = ["_app"]
   target   = "service-runner"
   tags     = ["${REPO}/service-runner:${TAG}"]
+}
+# Compute egress (compute-network-reach): profile `compute-egress`. Unpublished until its first pin.
+target "compute-egress" {
+  inherits = ["_app"]
+  target   = "compute-egress"
+  tags     = ["${REPO}/compute-egress:${TAG}"]
 }
 target "init" {
   inherits = ["_app"]

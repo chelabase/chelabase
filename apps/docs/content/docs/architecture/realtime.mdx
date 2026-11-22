@@ -37,7 +37,7 @@ Realtime listens on two ports inside the stack's network. Neither is published o
 | `realtime:8087` | `CHELABASE_REALTIME_ADDR` | The ticket route and the socket, reached through the gateway (`CHELABASE_REALTIME_URL`). A socket needs a ticket. |
 | `realtime:8088` | `CHELABASE_REALTIME_INTERNAL_ADDR` | `/health` only, without authentication. |
 
-Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`; the stack binds `0.0.0.0` inside its network. Realtime is on both the default and the [compute network](/architecture/neon#the-compute-network), because it dials computes.
+Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`; the stack binds `0.0.0.0` inside its network. Realtime is on the default network and on the [compute and control networks](/architecture/neon#the-compute-network) (`<project>_compute-internal` and `<project>_control-internal`), because it dials computes.
 
 ## Settings
 
@@ -100,7 +100,7 @@ On the next `just workbench up` of a stack that predates realtime:
 
 1. The new secrets are created and the NATS and Valkey credential files and the storage tokens are rendered, before any container starts. Existing secrets are untouched.
 2. NATS and Valkey restart with credentials; the apps are recreated with their per-service login.
-3. `safekeeper2` and `safekeeper3` start, and computes that aren't on the `<project>_compute` network are removed. The worker's reconcile creates each again within 30 seconds, with the new replication settings (compute settings version 4) and a fresh spec. Data is not lost: it lives in the pageserver and safekeepers.
+3. `safekeeper2` and `safekeeper3` start, and computes that aren't on the `<project>_compute-internal` and `<project>_control-internal` networks are removed. The worker's reconcile creates each again within 30 seconds, with the new replication settings (compute settings version 4) and a fresh spec. Data is not lost: it lives in the pageserver and safekeepers.
 4. The Neon services run as the stack's uid; an older root-owned data directory is re-owned once.
 
 ## When realtime is unavailable

@@ -58,7 +58,7 @@ CHELABASE_SERVICES_ALLOW_HTTP=true
 
 The allow-list never lifts a **hard deny**: the platform's own services by name (`metadata-db`, `nats`, `orchestrator`, `worker`, `gateway`, `functions`, `functions-runtime`, `storage`, `seaweedfs`, `service-runner`, …, compared without case or a trailing dot, container names `<project>-<name>-<n>` included), loopback, link-local, `0.0.0.0/8`, and every network the functions container is attached to (IPv4 and IPv6, read at start). An allowlisted name that resolves into one of those is refused too. `CHELABASE_INTERNAL_SUBNETS` (comma-separated CIDRs; the compose files don't set it) adds networks to the deny.
 
-The compute and control networks are also kept apart from the functions service by Docker's bridge isolation, which this check doesn't replace.
+The compute and control networks are internal and have no route to the host, so they are kept apart from the functions service by the networks themselves, which this check doesn't replace.
 
 ## Paths
 

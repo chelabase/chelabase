@@ -1,7 +1,7 @@
 //! T5 review fix round (W2): one failing test per finding, written before the fix.
 
 use super::commands::{
-    alive_ps_args, borrowed_stack_message, check_purge, compose_command, is_legacy_compute,
+    borrowed_stack_message, check_purge, compose_command_for_test, is_legacy_compute,
     missing_services, nextest_bin_for_env, stop_processes,
 };
 use super::registry::{Entry, with_registry};
@@ -63,7 +63,7 @@ fn compose_runs_with_the_stack_env() {
     let dir = tempfile::tempdir().unwrap();
     let env = dir.path().join("stack.env");
     std::fs::write(&env, "# c\nCHELABASE_STACK_DIR=/s\nCHELABASE_GATEWAY_PORT=8137\n").unwrap();
-    let cmd = compose_command(&env, vec!["compose".into(), "ps".into()]).unwrap();
+    let cmd = compose_command_for_test(&env, vec!["compose".into(), "ps".into()]).unwrap();
     let envs: HashMap<String, Option<String>> = cmd
         .get_envs()
         .map(|(k, v)| {
@@ -99,15 +99,19 @@ fn missing_services_are_found() {
 // slot after the builds so a long build isn't reaped.
 #[test]
 fn liveness_needs_no_compose_file() {
+    // One builder for liveness and for whether the stack runs (compute-network-reach review A2).
     assert_eq!(
-        alive_ps_args("chelabase-feat-x"),
+        super::networks::running_ps_args("chelabase-feat-x"),
         [
             "ps",
-            "-q",
             "--filter",
             "label=com.docker.compose.project=chelabase-feat-x",
             "--filter",
-            "status=running"
+            "label=com.docker.compose.oneoff=False",
+            "--filter",
+            "status=running",
+            "--format",
+            "{{.Label \"com.docker.compose.service\"}}"
         ]
     );
 }

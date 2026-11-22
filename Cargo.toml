@@ -10,6 +10,7 @@ members = [
     "services/storage",
     "services/functions",
     "services/service-runner",
+    "services/compute-egress",
     "services/init",
     "tools/cli",
     "tools/bench-data-api",
@@ -111,6 +112,12 @@ ed25519-dalek = { version = "3.0.0", features = ["pem"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
 libc = "0.2.189"
+# compute-egress: TCP keepalive on forwarded connections (already in the tree through tokio).
+socket2 = "0.6.5"
+# compute-egress: DNS message parsing and building for its resolver. No defaults: no
+# resolver, client or networking, and no DNSSEC until it is used (then `dnssec-aws-lc-rs`,
+# never `dnssec-ring`).
+hickory-proto = { version = "0.26.3", default-features = false }
 # Our fork of 0.7.18, branch chelabase/replication (on top of chelabase/sasl-verified, which
 # sits on chelabase/transaction-status, step 6e, and step 6d's simple-query tags): simple
 # queries expose command tags, the empty-query marker and column types,

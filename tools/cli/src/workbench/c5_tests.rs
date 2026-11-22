@@ -39,22 +39,22 @@ fn env_of(slot: u8) -> HashMap<String, String> {
         .collect()
 }
 
-// SP10, C4's audit: realtime's address on `control` (CHELABASE_REALTIME_CONTROL_IP), the two
+// SP10, C4's audit: realtime's address on `control` (CHELABASE_REALTIME_CONTROL_INTERNAL_IP), the two
 // addresses the `chelabase_realtime` login is allowed from (CHELABASE_REALTIME_LOGIN_CIDRS,
 // realtime first, then the runner, which runs realtime in-process) and the client-pair directory.
 #[test]
 fn the_stack_env_carries_the_realtime_settings() {
     let env = env_of(1);
     for (k, v) in [
-        ("CHELABASE_REALTIME_CONTROL_IP", "10.213.4.12"),
+        ("CHELABASE_REALTIME_CONTROL_INTERNAL_IP", "10.213.4.12"),
         ("CHELABASE_REALTIME_LOGIN_CIDRS", "10.213.4.12/32,10.213.4.11/32"),
         ("CHELABASE_REALTIME_TLS_DIR", "/m/.chelabase/realtime-tls"),
     ] {
         assert_eq!(env.get(k).map(String::as_str), Some(v), "{k}");
     }
     // The orchestrator's and the runner's settings are untouched.
-    assert_eq!(env["CHELABASE_ORCHESTRATOR_CONTROL_IP"], "10.213.4.10");
-    assert_eq!(env["CHELABASE_RUNNER_CONTROL_IP"], "10.213.4.11");
+    assert_eq!(env["CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP"], "10.213.4.10");
+    assert_eq!(env["CHELABASE_RUNNER_CONTROL_INTERNAL_IP"], "10.213.4.11");
     assert_eq!(env["CHELABASE_MEMBER_LOGIN_CIDRS"], "10.213.4.10/32,10.213.4.11/32");
 }
 
@@ -67,21 +67,21 @@ fn realtimes_control_address_is_outside_the_compute_range_for_every_slot() {
         let env = env_of(slot);
         let base = u16::from(slot) * 4;
         let ip = env
-            .get("CHELABASE_REALTIME_CONTROL_IP")
-            .unwrap_or_else(|| panic!("slot {slot}: no CHELABASE_REALTIME_CONTROL_IP"));
+            .get("CHELABASE_REALTIME_CONTROL_INTERNAL_IP")
+            .unwrap_or_else(|| panic!("slot {slot}: no CHELABASE_REALTIME_CONTROL_INTERNAL_IP"));
         assert_eq!(ip, &format!("10.213.{base}.12"), "slot {slot}");
         let host = format!("{ip}/32");
-        assert!(cidr_overlaps(&host, &env["CHELABASE_CONTROL_SUBNET"]), "slot {slot}: {ip} is in the subnet");
+        assert!(cidr_overlaps(&host, &env["CHELABASE_CONTROL_INTERNAL_SUBNET"]), "slot {slot}: {ip} is in the subnet");
         assert!(
-            !cidr_overlaps(&host, &env["CHELABASE_CONTROL_COMPUTE_RANGE"]),
+            !cidr_overlaps(&host, &env["CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE"]),
             "slot {slot}: {ip} must be outside the compute range {}",
-            env["CHELABASE_CONTROL_COMPUTE_RANGE"]
+            env["CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE"]
         );
-        assert_ne!(ip, &env["CHELABASE_ORCHESTRATOR_CONTROL_IP"], "slot {slot}");
-        assert_ne!(ip, &env["CHELABASE_RUNNER_CONTROL_IP"], "slot {slot}");
+        assert_ne!(ip, &env["CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP"], "slot {slot}");
+        assert_ne!(ip, &env["CHELABASE_RUNNER_CONTROL_INTERNAL_IP"], "slot {slot}");
         assert_eq!(
             env["CHELABASE_REALTIME_LOGIN_CIDRS"],
-            format!("{ip}/32,{}/32", env["CHELABASE_RUNNER_CONTROL_IP"]),
+            format!("{ip}/32,{}/32", env["CHELABASE_RUNNER_CONTROL_INTERNAL_IP"]),
             "slot {slot}"
         );
     }

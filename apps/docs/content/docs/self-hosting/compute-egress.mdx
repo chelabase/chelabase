@@ -1,0 +1,145 @@
+---
+title: Compute egress
+description: Databases have no outbound network access by default; the compute-egress profile lets them reach hosts you list, and nothing else.
+---
+
+A database's compute has no route off the stack's compute and control networks. It can reach the storage services it needs and nothing else: not the host, not the internet. That doesn't depend on the engine's routing settings or on where you publish the gateway. See [The compute network](/architecture/security#the-compute-network).
+
+That also means features that connect out from a database, such as `postgres_fdw`, `dblink`, or a subscription to an external publisher, find no route by default. The `compute-egress` service is the one controlled way out. It is off by default. When you turn it on, computes can reach the destinations you list, by name and port, and nothing else.
+
+## Turn it on
+
+The image has no pin until its first release; build it as the [install page](/self-hosting/install#build-from-source) describes. Then set the profile and the list in `.env` and bring the stack up:
+
+```bash
+COMPOSE_PROFILES=compute-egress
+CHELABASE_COMPUTE_EGRESS_ALLOW=db.example.com:5432
+```
+
+```bash
+docker compose up -d --wait
+```
+
+If you already set `COMPOSE_PROFILES` (for example `services`), add `compute-egress` to the comma-separated list. With a blank list, the service runs and nothing leaves.
+
+Computes are created with the service as their resolver. Names of the stack's own services resolve as before.
+
+## The allow-list
+
+`CHELABASE_COMPUTE_EGRESS_ALLOW` is a comma-separated list of entries of the form `[alias=]host:port[@listen-port]`:
+
+| Entry | Meaning |
+|---|---|
+| `db.example.com:5432` | Computes dial `db.example.com` on port 5432 |
+| `warehouse.example.com=8.8.8.8:5432` | A destination known only by address. The alias is the name computes dial. |
+| `pg.example.com=db.example.com:6432` | Computes dial `pg.example.com`; the service connects to `db.example.com` on port 6432 |
+| `b.example.com:5432@15432` | Computes dial `b.example.com` on port 15432; the service connects to its port 5432 |
+
+Rules, each checked when the service starts (a bad entry stops the whole service and the log names the entry):
+
+- **Names only.** A host name has at least two labels (`db.example.com`; `db` alone is refused), made of letters, digits and inner hyphens. There are no wildcards, address ranges (CIDRs) or port ranges. A destination known only by address needs an alias, which is the name computes dial.
+- **IPv4 and TCP only.** The service dials IPv4 addresses and forwards TCP. An IPv6 address is refused, and UDP isn't forwarded.
+- **Public addresses only.** Every connection is checked against the address it is actually made to. Every non-public address is refused: loopback, private ranges, shared (carrier-grade NAT) space, link-local, documentation and multicast ranges, and the stack's own networks. A listed name that resolves to one of them is refused too, so a database on your own network is not reachable in this release.
+- **A listed name is dialled wherever it resolves in public address space**, including the host's own public address, unless that address is in the deny list (below). List only names you control or trust.
+- **One listener per entry, nothing else.** A port that no entry listens on has no listener. The service answers DNS for the listed names only.
+- **Platform names are refused**, such as `gateway` or `nats`.
+- **A change needs a restart.** Edit `CHELABASE_COMPUTE_EGRESS_ALLOW` in `.env` and run `docker compose up -d --wait`: Compose sees the changed setting and recreates the service, which reads the list again.
+
+### Two destinations on one port
+
+Computes reach each destination by its listen port, so two destinations that share a port need different listen ports. Give the second one with `@`; nothing is assigned for you, so editing the list never moves a destination. Two entries that listen on the same port stop the service at start and the log names both.
+
+```bash
+CHELABASE_COMPUTE_EGRESS_ALLOW=a.example.com:5432,b.example.com:5432@15432
+```
+
+Computes keep the real host name and use the listen port. In a connection string that is `host=b.example.com port=15432`; the same host and port go in a foreign server's options and in a subscription's `CONNECTION`.
+
+The health port (`8080`) and the resolver's port (`53`) are taken: an entry can't listen on either, so give it another with `@`.
+
+### Examples
+
+`postgres_fdw`, with `CHELABASE_COMPUTE_EGRESS_ALLOW=a.example.com:5432,b.example.com:5432@15432`:
+
+```sql
+create extension postgres_fdw;
+
+create server remote_a foreign data wrapper postgres_fdw
+  options (host 'a.example.com', port '5432', dbname 'app', sslmode 'verify-full');
+
+create server remote_b foreign data wrapper postgres_fdw
+  options (host 'b.example.com', port '15432', dbname 'app', sslmode 'verify-full');
+```
+
+`dblink`:
+
+```sql
+create extension dblink;
+
+select * from dblink(
+  'host=b.example.com port=15432 dbname=app user=reader password=<password> sslmode=verify-full',
+  'select 1'
+) as t(x int);
+```
+
+A subscription to an external publisher:
+
+```sql
+create subscription from_b
+  connection 'host=b.example.com port=15432 dbname=app user=replicator password=<password> sslmode=verify-full'
+  publication app_pub;
+```
+
+### Verify the name
+
+The name a compute dials is the destination's real name, so `sslmode=verify-full` checks the certificate against it, and the service never terminates TLS. Use `verify-full`. The service picks the destination by the port a compute connects to, so only a client that checks the name is sure which host answered.
+
+### Deny addresses
+
+`CHELABASE_COMPUTE_EGRESS_DENY` lists public addresses the service never dials, whatever a listed name resolves to: comma-separated IPv4 addresses (`203.0.113.7`) or networks (`198.51.100.0/24`). It is blank by default. Put this host's own public addresses in it, so a listed name that resolves to the host (by mistake, or because someone changed its DNS record) can't reach a port the host publishes:
+
+```bash
+CHELABASE_COMPUTE_EGRESS_DENY=203.0.113.7
+```
+
+The list only adds refusals on top of the built-in ones; nothing in it can allow an address. It is checked on every connection, like the built-in refusals, and a refused connection logs `refused` with the reason `denied by CHELABASE_COMPUTE_EGRESS_DENY`. An address entry of the allow-list (`alias=address:port`) that falls in the list stops the service at start. An invalid entry also stops it at start, naming the entry: something that isn't an IPv4 address or network, a prefix outside 0 to 32, a network with bits set below its prefix (`203.0.113.7/24`; write `203.0.113.0/24`), or any IPv6 address (the service dials IPv4 only). Like the allow-list, a change needs `docker compose up -d --wait`.
+
+## Settings
+
+| Setting | Default | What it is |
+|---|---|---|
+| `COMPOSE_PROFILES` | none | Include `compute-egress` to run the service |
+| `CHELABASE_COMPUTE_EGRESS_ALLOW` | blank | The allow-list above; blank: nothing leaves |
+| `CHELABASE_COMPUTE_EGRESS_DENY` | blank | IPv4 addresses and networks never dialled (above); list the host's public addresses |
+| `CHELABASE_COMPUTE_EGRESS_IP` | `10.214.8.2` | The service's address on the compute network. It must be in `CHELABASE_COMPUTE_SUBNET` and outside `CHELABASE_COMPUTE_RANGE`. |
+| `CHELABASE_COMPUTE_EGRESS_DIAL_TIMEOUT_SECS` | `10` | Seconds the service waits to resolve and connect to a destination, 1 to 300 |
+| `CHELABASE_COMPUTE_EGRESS_HEALTH_PORT` | `8080` | The health port, on the service's loopback only. Change it only if an entry needs that port. |
+| `CHELABASE_COMPUTE_EGRESS_MEMORY` | `256m` | The service's memory limit |
+
+The service allows 1024 forwarded connections at once, and 64 from one compute. It sets no idle timeout, so a quiet connection stays open until a side closes it.
+
+The compose file fixes the other settings the service reads: the resolver listens on port 53 (`CHELABASE_COMPUTE_EGRESS_DNS_PORT`), it answers with its own address on the compute network (`CHELABASE_COMPUTE_EGRESS_ADVERTISE`, unset), and the two limits above are its defaults (`CHELABASE_COMPUTE_EGRESS_MAX_CONNECTIONS` and `CHELABASE_COMPUTE_EGRESS_MAX_CONNECTIONS_PER_CLIENT`). They are there for deployments that run the service on another platform, and the compose file passes none of them on.
+
+## What it runs as
+
+The service has no secret, no volume, no Docker socket and no published port. It runs as an unprivileged user with a read-only root filesystem and every capability dropped, on the compute network and on one more network of its own (IPv4 only) that nothing else joins. It is the only member of that network, and the only container of the stack that has a way out on behalf of computes.
+
+## Read the log
+
+```bash
+docker compose logs compute-egress
+```
+
+At start it logs `compute-egress started` and one `listening` line per entry. Every connection logs one line with the source address (`client`), the entry and the outcome: `opened` when the connection to the destination is made (with the address dialled), `forwarded` when it ends (with bytes sent and received), or `refused` with the reason (a non-public address, an address in the deny list, the connection limit, a dial timeout). The start line also counts the deny list's entries (`denied_networks`).
+
+## Turn it off
+
+With the profile removed from `COMPOSE_PROFILES`, `docker compose up -d` does not stop a service that is already running, with or without `--remove-orphans`: the container keeps running with its old allow-list, and computes keep their way out. To turn egress off, remove the container:
+
+```bash
+docker compose rm -sf compute-egress
+```
+
+`rm -sf` stops the service and removes it, and it works whether or not the profile is still set. The equivalent with the profile named is `docker compose --profile compute-egress stop compute-egress && docker compose --profile compute-egress rm -f compute-egress`. Also remove `compute-egress` from `COMPOSE_PROFILES` (and clear `CHELABASE_COMPUTE_EGRESS_ALLOW`), so the next `up` doesn't start it again. Do not use `docker compose down` for this: it stops the whole stack.
+
+With the service gone, a lookup of an outside name from a database ends by timeout, and nothing leaves.

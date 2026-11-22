@@ -9,7 +9,8 @@ This page installs Chelabase from its release images with Docker Compose. It is 
 
 ## Requirements
 
-- Docker Engine 26.0 or newer and Compose 2.30 or newer: the stack mounts volume sub-paths, which both need. Check with `docker version` and `docker compose version`.
+- Docker Engine 28.0 or newer and Compose 2.30 or newer. The stack mounts volume sub-paths, which Compose and the engine need, and the engine's isolated bridge mode (28.0) is what keeps the databases' networks away from the host. Check with `docker version` and `docker compose version`.
+- Subnets for the stack's own networks that no other Docker network or route on the host uses. The defaults are `10.214.4.0/22` (control) and `10.214.8.0/22` (computes); change them in `.env` if they overlap (`CHELABASE_CONTROL_INTERNAL_SUBNET`, `CHELABASE_COMPUTE_SUBNET`).
 - A machine that can run about 26 containers. The worker starts each database's compute as a further container, so it needs the Docker socket.
 - The repository checkout, for `infra/compose`.
 
@@ -127,7 +128,7 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_PROXY_ADDR` | `127.0.0.1` | The host address the proxy (Postgres and SQL over HTTP) is published on |
 | `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT` | `5432`, `4444` | The host ports of the proxy's Postgres and SQL-over-HTTP listeners |
 | `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the images come from. The compose file pins each release image by digest. Setting either variable replaces every pin: one tag for all images, with no digest check. For testing or images you built only (see [Upgrade](#upgrade)) |
-| `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
+| `CHELABASE_CONTROL_INTERNAL_SUBNET`, `CHELABASE_COMPUTE_SUBNET` | `10.214.4.0/22`, `10.214.8.0/22` | The control network and the computes' network; change one if it overlaps a network of the host. A custom control subnet also needs `CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE` (its upper /23), `CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP` and `CHELABASE_REALTIME_CONTROL_INTERNAL_IP` (in its lower /23); a custom compute subnet needs `CHELABASE_COMPUTE_RANGE` and `CHELABASE_COMPUTE_EGRESS_IP` (see `.env.example`) |
 | `CHELABASE_SMTP_*` | unset | The identity service's email (below) |
 | `CHELABASE_WEBHOOKS_ALLOW_HOSTS`, `CHELABASE_WEBHOOKS_ALLOW_HTTP` | empty, `false` | Where storage webhooks may be delivered. By default only `https` URLs whose host resolves to public addresses. List host names (no port) that may resolve to private addresses, such as a receiver on your own network, and set `true` to also accept `http` URLs |
 | `CHELABASE_SERVICES_ALLOW_HOSTS`, `CHELABASE_SERVICES_ALLOW_HTTP` | empty, `false` | Where [external services](/using/services/external#the-allow-list) may point: the same rules as the webhooks' pair, checked separately |
@@ -263,11 +264,23 @@ docker compose up -d --wait
 
 `docker compose pull` alone fetches the same pinned digests again and upgrades nothing. `up` recreates the containers, not the volumes: `init-secrets` creates only the secrets that are missing and never replaces one (an upgrade that adds a service, such as `storage`, adds that service's secrets and NATS login; Compose restarts `nats` after an updated `init-secrets` so the new login works), the orchestrator applies any new metadata migrations when it starts, and `init-bootstrap` can safely run again. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
 
+### Upgrading onto the isolated networks
+
+The first upgrade onto the release that made the databases' networks internal uses the same command, `docker compose up -d --wait`. Databases then have no route off the stack's compute and control networks, which are now `<project>_compute-internal` and `<project>_control-internal` ([how this works](/architecture/security#the-compute-network)). What happens:
+
+- `up` creates the two new networks beside the old ones (`<project>_compute` and `<project>_control`), because Compose can't replace networks that running computes hold.
+- The worker then replaces every compute that isn't on exactly the two new networks, and removes the old networks once nothing is attached to them. This takes about a minute after the worker starts, plus a few seconds to a minute for each database (the worker replaces computes one at a time, and waits for each new one to be ready), and it doesn't wait for the metadata database. Open connections to a database are interrupted briefly while its compute is replaced. Data isn't affected: it lives in the pageserver and the safekeepers.
+- Databases lose outbound network access that they had before (`postgres_fdw`, `dblink`, subscriptions to external publishers, other extensions that connect out). To let them reach chosen hosts, turn on [compute egress](/self-hosting/compute-egress).
+
+**Breaking change: the control network's settings were renamed.** This release no longer reads `CHELABASE_CONTROL_SUBNET`, `CHELABASE_CONTROL_COMPUTE_RANGE`, `CHELABASE_ORCHESTRATOR_CONTROL_IP` or `CHELABASE_REALTIME_CONTROL_IP`. If your `.env` sets them, they are ignored and the new networks take the defaults, `10.214.4.0/22` (control) and `10.214.8.0/22` (computes), clear of the old network's range unless that range overlaps them. If it does, or another Docker network holds part of a default, or you still need a custom range, set all four new settings together to a free range before the first `up` of this release (a failed `up` can leave services stopped): `CHELABASE_CONTROL_INTERNAL_SUBNET`, `CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE`, `CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP` and `CHELABASE_REALTIME_CONTROL_INTERNAL_IP` (pick a range that isn't the old one: the old network keeps it until the worker removes it). Either way, check the new subnets against your host's routes before you upgrade: Docker refuses a subnet that overlaps another Docker network, but not one that overlaps a route of the host, such as a VPN or a LAN.
+
+To roll back, an older release doesn't know the new networks, so it can't move computes back. Stop the stack, remove its computes (the middle command of the uninstall below), check out the older release and run `up -d --wait`. Its worker creates the computes again on the old networks. Remove the unused `<project>_compute-internal` and `<project>_control-internal` networks afterwards with `docker network rm`.
+
 `CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
 
 ## Stop, tear down and uninstall
 
-Each database runs in a compute container that the worker starts. Computes are not Compose services, so Compose neither stops nor removes them, and while one runs, the Docker networks it is attached to stay.
+Each database runs in a compute container that the worker starts. Computes are not Compose services, so Compose neither stops nor removes them, and while one runs, the Docker networks it is attached to (`<project>_compute-internal` and `<project>_control-internal`) stay.
 
 - **Stop and keep everything:** `docker compose stop`, later `docker compose start` (or `up -d --wait`). Computes keep running while the rest is stopped; that is harmless. `docker compose down` without `-v` keeps the data too: it reports the networks the computes hold as still in use, and the next `up` reuses them.
 - **Uninstall, deleting every database and every secret:**
@@ -277,9 +290,10 @@ Each database runs in a compute container that the worker starts. Computes are n
   docker compose stop
   docker ps -aq --filter label=chelabase.dev/stack=compose | xargs -r docker rm -f
   docker compose down -v
+  docker network rm <project>_compute <project>_control <project>_compute-egress 2>/dev/null || true
   ```
 
-  `compose` in the label is the Compose project name: the directory's name, unless you set another with `-p` or `COMPOSE_PROJECT_NAME` (`docker compose ls -a` lists it). The stack is stopped first so the worker starts no compute in the meantime. A plain `docker compose down -v` without the middle line removes the services and volumes but leaves the computes and their networks behind (it reports the networks as still in use); run the middle line and `down -v` again to finish. `--remove-orphans` does not help: Compose does not count the computes as its own.
+  The last line is for networks `down -v` doesn't know about: an old network that an install upgraded from an earlier release kept (the worker keeps one that a stopped container is still attached to), and the [compute egress](/self-hosting/compute-egress) network of an install that ran egress and then turned it off (`down` leaves out a profile that isn't set). `<project>` is the Compose project name; a fresh install without egress has none of them. `compose` in the label is the Compose project name: the directory's name, unless you set another with `-p` or `COMPOSE_PROJECT_NAME` (`docker compose ls -a` lists it). The stack is stopped first so the worker starts no compute in the meantime. A plain `docker compose down -v` without the middle line removes the services and volumes but leaves the computes and their networks behind (it reports the networks as still in use); run the middle line and `down -v` again to finish. `--remove-orphans` does not help: Compose does not count the computes as its own.
 
   Deleting the databases in Studio first removes their computes too, but the commands above don't depend on it.
 

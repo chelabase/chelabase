@@ -1,11 +1,19 @@
 //! `chelabase workbench …`: one stack's lifecycle (W2 spec sections 4 and 6). Every
-//! `docker compose` call goes through [`Compose`], so it names the stack's project.
+//! `docker compose` call goes through [`Compose`], so it names the stack's project, and through
+//! an [`Engine`], so the lifecycle runs against a model in the tests. Every Compose call keeps
+//! W-ENV (`engine.rs`): it never runs with an incomplete `stack.env` (one lacking a variable the compose files require).
 
 use super::argv::{Compose, nextest_archive_args, nextest_run_args};
+use super::engine::{DockerOut, Engine, docker_output, missing_required, required_vars};
 use super::env::{
-    StackEnvInput, check_control_subnet, example_scheme, parse_network_inspect, render_stack_env,
+    StackEnvInput, check_stack_subnets, compute_network, control_network, example_scheme,
+    legacy_networks, parse_network_inspect, render_stack_env,
 };
 use super::migrate::migrate_main_layout;
+use super::networks::{
+    MigrationStep, check_engine_version, check_live_networks, legacy_member_ps_format, may_skip_up,
+    plan_legacy_migration, precheck_existing_networks, running_ps_args, worker_ps_args,
+};
 use super::registry::{Entry, Registry, port_is_free, with_registry};
 use super::slots::{
     SlotOptions, acquire_slot, cap_from_env, drop_tickets, queued, release_slot, touch_slot,
@@ -39,16 +47,11 @@ impl Site {
     }
 }
 
-/// The Rust apps the stack runs from `<checkout>/target/debug`.
-pub(super) const RUST_APPS: [&str; 8] =
-    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage", "functions"];
-/// Rust binaries `up` builds for a compose profile that is off by default (edge functions m10:
-/// the service runner, profile `services`): built with the apps, never started, recorded or
-/// restarted with them; `docker compose --profile services up -d service-runner` runs it.
-pub(super) const PROFILE_RUST_APPS: [&str; 1] = ["service-runner"];
-/// Every app container (the Rust apps, Studio and the identity service; the sites are added by
-/// `--with`).
-pub(super) const APPS: [&str; 10] = [
+/// The Rust apps the stack runs from `<checkout>/target/debug`. `compute-egress` is in the base
+/// file's compose profile `compute-egress`, which naming the service on `up` or `restart` turns
+/// on: it always runs in the workbench, so the live tests have the one way out of the compute
+/// network to probe.
+pub(super) const RUST_APPS: [&str; 9] = [
     "orchestrator",
     "worker",
     "gateway",
@@ -57,6 +60,28 @@ pub(super) const APPS: [&str; 10] = [
     "realtime",
     "storage",
     "functions",
+    "compute-egress",
+];
+/// Rust binaries `up` builds for a compose profile that is off by default (edge functions m10:
+/// the service runner, profile `services`): built with the apps, never started, recorded or
+/// restarted with them; `docker compose --profile services up -d service-runner` runs it.
+pub(super) const PROFILE_RUST_APPS: [&str; 1] = ["service-runner"];
+/// The compose profile of `compute-egress`. `up` turns it on by naming the service; every call
+/// that lists, stops or removes the stack's containers names it, or Compose leaves that
+/// container out (`down` would not remove it, `ps` would not list it).
+const COMPUTE_EGRESS_PROFILE: &str = "compute-egress";
+/// Every app container (the Rust apps, Studio and the identity service; the sites are added by
+/// `--with`).
+pub(super) const APPS: [&str; 11] = [
+    "orchestrator",
+    "worker",
+    "gateway",
+    "auth",
+    "rest",
+    "realtime",
+    "storage",
+    "functions",
+    "compute-egress",
     "studio",
     "identity",
 ];
@@ -86,7 +111,7 @@ pub(super) const FRONT: &[&str] = &["mailpit", "gateway", "identity"];
 /// Started before the bootstrap, which waits on the orchestrator and (the dev member's sign-up)
 /// auth.
 pub(super) const LATE_APPS: &[&str] =
-    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "functions", "studio"];
+    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "functions", "compute-egress", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -146,45 +171,80 @@ impl Stack {
         }
     }
 
-    /// `docker compose -p … <rest…>` with the stack's env (see [`compose_command`]).
+    /// Why `stack.env` is incomplete for the checkout's compose files (W-ENV, `engine.rs`), or
+    /// `None` when it is complete. A compose file that can't be read requires nothing here: Compose reports it.
+    pub(crate) fn env_staleness(&self) -> Option<String> {
+        let Ok(env) = std::fs::read_to_string(&self.env_file) else {
+            return Some("it has no stack.env".to_string());
+        };
+        let texts: Vec<String> = [&self.compose_file, &self.overlay_file]
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let missing = missing_required(&env, &required_vars(&texts));
+        (!missing.is_empty()).then(|| {
+            format!(
+                "its stack.env is from an earlier release (it lacks {}, which the compose files require)",
+                missing.join(", ")
+            )
+        })
+    }
+
+    /// W-ENV's check before a Compose call: a stale or missing env is refused with the one command
+    /// that renders it.
+    pub(crate) fn require_current_env(&self) -> anyhow::Result<()> {
+        match self.env_staleness() {
+            None => Ok(()),
+            Some(why) => bail!(
+                "stack {}: {why}; run `just workbench up` in {}",
+                self.slug,
+                self.checkout.display()
+            ),
+        }
+    }
+
+    /// `docker compose -p … <rest…>` with the stack's env (see [`compose_command`]), once the env
+    /// is complete (W-ENV).
     fn compose_cmd(&self, rest: &[&str]) -> anyhow::Result<Command> {
+        self.require_current_env()?;
         compose_command(&self.env_file, self.compose().args(rest))
     }
 
     /// `docker compose -p … <rest…>`, stdio inherited; a failure is an error.
-    fn compose_run(&self, rest: &[&str]) -> anyhow::Result<()> {
-        run(self.compose_cmd(rest)?)
+    fn compose_run(&self, eng: &dyn Engine, rest: &[&str]) -> anyhow::Result<()> {
+        self.compose_output_or_run(eng, rest, false).map(drop)
     }
 
     /// `docker compose -p … <rest…>`'s stdout; a failure is an error.
-    fn compose_output(&self, rest: &[&str]) -> anyhow::Result<String> {
-        output(self.compose_cmd(rest)?)
+    fn compose_output(&self, eng: &dyn Engine, rest: &[&str]) -> anyhow::Result<String> {
+        self.compose_output_or_run(eng, rest, true)
     }
 
-    /// Whether any of the stack's containers is running.
-    fn has_running_containers(&self) -> anyhow::Result<bool> {
-        Ok(!self.running_services()?.is_empty())
+    fn compose_output_or_run(&self, eng: &dyn Engine, rest: &[&str], capture: bool) -> anyhow::Result<String> {
+        self.require_current_env()?;
+        let args: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        eng.compose(self, &args, capture)
     }
 
-    /// The services with a running container (none before the first `up`).
-    fn running_services(&self) -> anyhow::Result<Vec<String>> {
-        if !self.env_file.is_file() {
-            return Ok(Vec::new());
-        }
-        Ok(self
-            .compose_output(&[
-                "--profile",
-                "sites",
-                "ps",
-                "--services",
-                "--status",
-                "running",
-            ])?
+    /// Whether any of the stack's services runs.
+    fn has_running_containers(&self, eng: &dyn Engine) -> anyhow::Result<bool> {
+        Ok(!self.running_services(eng)?.is_empty())
+    }
+
+    /// The services with a running container (none before the first `up`). Asked of Docker by
+    /// the project label, never through Compose (W-ENV: the env may be stale); one-off
+    /// containers (`compose run`: the runner) are not services.
+    fn running_services(&self, eng: &dyn Engine) -> anyhow::Result<Vec<String>> {
+        let mut services: Vec<String> = docker_output(eng, &running_ps_args(&self.project))?
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .collect())
+            .collect();
+        services.sort();
+        services.dedup();
+        Ok(services)
     }
 
     fn binaries_file(&self) -> PathBuf {
@@ -375,7 +435,7 @@ pub fn borrowed_stack_message(
 /// A `docker <args…>` command with every `KEY=VALUE` of the stack's env file set in its
 /// environment, so a variable the calling shell exports can't override the stack's own in
 /// Compose's interpolation (T5 review I5).
-pub fn compose_command(env_file: &Path, args: Vec<String>) -> anyhow::Result<Command> {
+fn compose_command(env_file: &Path, args: Vec<String>) -> anyhow::Result<Command> {
     if !env_file.is_file() {
         bail!(
             "{} doesn't exist: the stack hasn't been up yet (`just workbench up`)",
@@ -385,6 +445,13 @@ pub fn compose_command(env_file: &Path, args: Vec<String>) -> anyhow::Result<Com
     let mut cmd = docker(args);
     cmd.envs(crate::paths::load_dotenv_file(env_file));
     Ok(cmd)
+}
+
+/// [`compose_command`] for the test of what it sets. Test-only: the production path is
+/// `Stack::compose_cmd`, which checks the env first (W-ENV).
+#[cfg(test)]
+pub(super) fn compose_command_for_test(env_file: &Path, args: Vec<String>) -> anyhow::Result<Command> {
+    compose_command(env_file, args)
 }
 
 /// Creates the stack's bootstrap dir private to the stack user (0700): the bootstrap runs as that
@@ -567,20 +634,6 @@ pub fn missing_services(expected: &[&str], running: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// `docker` arguments listing a project's running containers by Compose's project label: no
-/// compose file is needed, so a stack whose checkout changed is still seen (T5 review M4).
-pub fn alive_ps_args(project: &str) -> Vec<String> {
-    [
-        "ps".to_string(),
-        "-q".to_string(),
-        "--filter".to_string(),
-        format!("label=com.docker.compose.project={project}"),
-        "--filter".to_string(),
-        "status=running".to_string(),
-    ]
-    .into()
-}
-
 /// Stops `pids`: SIGTERM, then a wait of up to `grace` for each to exit (gone, or a zombie), then
 /// SIGKILL for the rest and a short wait. A pid that doesn't exist is fine (T5 review I3).
 pub fn stop_processes(pids: &[u32], grace: Duration) -> anyhow::Result<()> {
@@ -750,6 +803,61 @@ fn fmt_uptime(secs: u64) -> String {
 
 // --- process helpers ---
 
+/// The host's `docker`, `docker compose`, builds and key files.
+pub(super) struct RealEngine;
+
+impl Engine for RealEngine {
+    fn docker(&self, args: &[String]) -> anyhow::Result<DockerOut> {
+        let mut cmd = docker(args.to_vec());
+        let out = cmd
+            .output()
+            .with_context(|| format!("running {}", describe(&cmd)))?;
+        Ok(DockerOut {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    fn compose(&self, stack: &Stack, args: &[String], capture: bool) -> anyhow::Result<String> {
+        let rest: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cmd = stack.compose_cmd(&rest)?;
+        if capture {
+            output(cmd)
+        } else {
+            run(cmd).map(|()| String::new())
+        }
+    }
+
+    fn workbench_image(&self, stack: &Stack) -> anyhow::Result<String> {
+        ensure_image(stack)
+    }
+
+    fn neon_images(&self, stack: &Stack) -> anyhow::Result<Vec<(String, String)>> {
+        neon_images(stack)
+    }
+
+    fn functions_runtime_image(&self, stack: &Stack) -> anyhow::Result<String> {
+        ensure_functions_runtime_image(stack)
+    }
+
+    fn cargo_build(&self, stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
+        cargo_build(stack, apps, cli)
+    }
+
+    fn secrets(&self, stack: &Stack) -> anyhow::Result<chelabase_init::kinds::service_auth::AuthFilesChanged> {
+        ensure_stack_secrets(&stack.main, &stack.state)
+    }
+
+    fn bootstrap(&self, stack: &Stack) -> anyhow::Result<()> {
+        bootstrap(stack, None)
+    }
+
+    fn docker_gid(&self) -> anyhow::Result<u32> {
+        docker_gid()
+    }
+}
+
 fn docker(args: Vec<String>) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(args);
@@ -867,10 +975,10 @@ impl Phases {
 pub fn up(with: &[Site]) -> anyhow::Result<()> {
     let stack = current_stack()?;
     check_up_allowed(read_recorded(&stack.checkout)?.as_deref(), &stack.slug)?;
-    up_stack(&stack, with)
+    up_stack(&RealEngine, &stack, with)
 }
 
-fn up_stack(stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
+pub(super) fn up_stack(eng: &dyn Engine, stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
     let phases = Phases;
     let started = Instant::now();
     if stack.slug == MAIN {
@@ -881,7 +989,7 @@ fn up_stack(stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
             }
             // Before any app container starts: main's worker no longer sees unlabelled computes
             // and would start a second compute on the same timeline (T1 review).
-            remove_legacy_computes()
+            remove_legacy_computes(eng)
         })?;
     }
 
@@ -894,9 +1002,9 @@ fn up_stack(stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
         r.ensure(&stack.slug, &stack.checkout, now(), port_is_free)
     })?;
 
-    phases.run("taking a workbench slot", || take_slot(stack))?;
+    phases.run("taking a workbench slot", || take_slot(eng, stack))?;
 
-    let result = start_stack(stack, &entry, &example, with, &phases);
+    let result = start_stack(eng, stack, &entry, &example, with, &phases);
     match result {
         Ok(()) => {
             eprintln!(
@@ -918,9 +1026,15 @@ fn up_stack(stack: &Stack, with: &[Site]) -> anyhow::Result<()> {
     }
 }
 
-/// Before anything is built: no other Docker network may overlap the slot's control subnet.
-fn check_control_network(stack: &Stack, slot: u8) -> anyhow::Result<()> {
-    let ids = output(docker(vec!["network".into(), "ls".into(), "-q".into()]))?;
+/// Before anything is built: the engine can make the stack's internal networks (Docker Engine 28
+/// or later), and no other Docker network overlaps the slot's control or compute subnet.
+fn check_stack_networks(eng: &dyn Engine, stack: &Stack, slot: u8) -> anyhow::Result<()> {
+    let version = docker_output(
+        eng,
+        &["version".into(), "--format".into(), "{{.Server.Version}}".into()],
+    )?;
+    check_engine_version(version.trim())?;
+    let ids = docker_output(eng, &["network".into(), "ls".into(), "-q".into()])?;
     let ids: Vec<String> = ids.split_whitespace().map(str::to_string).collect();
     if ids.is_empty() {
         return Ok(());
@@ -928,32 +1042,113 @@ fn check_control_network(stack: &Stack, slot: u8) -> anyhow::Result<()> {
     // One network at a time: one removed since `ls` must not fail `up`.
     let mut networks = Vec::new();
     for id in ids {
-        let out = docker(vec!["network".into(), "inspect".into(), id.clone()])
-            .output()
-            .context("running docker network inspect")?;
-        networks.extend(parse_network_inspect(
-            &id,
-            out.status.success(),
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        )?);
+        let out = eng.docker(&["network".into(), "inspect".into(), id.clone()])?;
+        networks.extend(parse_network_inspect(&id, out.ok, &out.stdout, &out.stderr)?);
     }
-    check_control_subnet(
-        &stack.slug,
-        slot,
-        &format!("{}_control", stack.project),
-        &networks,
-    )
+    check_stack_subnets(&stack.slug, slot, &stack.project, &networks)
 }
 
-fn take_slot(stack: &Stack) -> anyhow::Result<()> {
+/// The stack's internal networks that already exist are internal and isolated.
+fn check_existing_stack_networks(eng: &dyn Engine, stack: &Stack) -> anyhow::Result<()> {
+    let names = docker_output(eng, &network_names_args())?;
+    precheck_existing_networks(&stack.project, &names, |existing| {
+        let mut args: Vec<String> = vec!["network".into(), "inspect".into()];
+        args.extend(existing.iter().cloned());
+        docker_output(eng, &args)
+    })
+}
+
+fn network_names_args() -> Vec<String> {
+    vec!["network".into(), "ls".into(), "--format".into(), "{{.Name}}".into()]
+}
+
+/// The stack's legacy networks (`<project>_compute`, `<project>_control`) that exist, by exact name.
+fn present_legacy_networks(eng: &dyn Engine, project: &str) -> anyhow::Result<Vec<String>> {
+    let names = docker_output(eng, &network_names_args())?;
+    let names: Vec<&str> = names.lines().map(str::trim).collect();
+    Ok(legacy_networks(project)
+        .into_iter()
+        .filter(|l| names.contains(&l.as_str()))
+        .collect())
+}
+
+/// Moves a stack started by an earlier release off its legacy networks before Compose creates the
+/// internal ones on the same control subnet ([`plan_legacy_migration`] has the order). A foreign
+/// member stops `up` before anything is stopped, the worker included (AC 9).
+fn leave_legacy_networks(eng: &dyn Engine, stack: &Stack) -> anyhow::Result<()> {
+    let present = present_legacy_networks(eng, &stack.project)?;
+    if present.is_empty() {
+        return Ok(());
+    }
+    // A first snapshot for the foreign-member check alone, before anything is stopped.
+    let ps = docker_output(eng, &legacy_member_ps_args())?;
+    plan_legacy_migration(&stack.slug, &stack.project, &ps, &present)?;
+    // Then the worker, then the snapshot the steps come from: a compute the worker creates
+    // meanwhile would be missing from an earlier one and keep its network alive.
+    let workers = docker_output(eng, &worker_ps_args(&stack.project))?;
+    let workers: Vec<String> = workers.split_whitespace().map(str::to_string).collect();
+    if !workers.is_empty() {
+        docker_do(eng, "stop", &[], &workers)?;
+        eprintln!("[workbench]   stopped the worker");
+    }
+    let ps = docker_output(eng, &legacy_member_ps_args())?;
+    for step in plan_legacy_migration(&stack.slug, &stack.project, &ps, &present)? {
+        match step {
+            MigrationStep::StopWorker(names) if !names.is_empty() => {
+                docker_do(eng, "stop", &[], &names)?;
+                eprintln!("[workbench]   stopped the worker");
+            }
+            MigrationStep::RemoveProjectContainers(names) if !names.is_empty() => {
+                docker_do(eng, "rm", &["-f"], &names)?;
+                eprintln!("[workbench]   removed {} container(s) of the stack (volumes stay)", names.len());
+            }
+            MigrationStep::RemoveComputes(names) => remove_containers(eng, &names)?,
+            MigrationStep::RemoveNetworks(names) => {
+                docker_do(eng, "network", &["rm"], &names)?;
+                eprintln!("[workbench]   removed {}", names.join(", "));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `docker ps -a` of every container, in [`legacy_member_ps_format`].
+fn legacy_member_ps_args() -> Vec<String> {
+    vec![
+        "ps".into(),
+        "-a".into(),
+        "--no-trunc".into(),
+        "--format".into(),
+        legacy_member_ps_format(),
+    ]
+}
+
+/// `docker <verb> <flags…> <names…>`; a failure is an error carrying Docker's message.
+fn docker_do(eng: &dyn Engine, verb: &str, flags: &[&str], names: &[String]) -> anyhow::Result<()> {
+    let mut args = vec![verb.to_string()];
+    args.extend(flags.iter().map(|f| f.to_string()));
+    args.extend(names.iter().cloned());
+    docker_output(eng, &args).map(drop)
+}
+
+/// After the apps: the live compute and control networks are internal with an isolated bridge
+/// gateway (a network left over under the same name isn't trusted because the file is right).
+fn check_live_stack_networks(eng: &dyn Engine, stack: &Stack) -> anyhow::Result<()> {
+    let wanted = [compute_network(&stack.project), control_network(&stack.project)];
+    let mut args: Vec<String> = vec!["network".into(), "inspect".into()];
+    args.extend(wanted.iter().cloned());
+    check_live_networks(&docker_output(eng, &args)?, &wanted)
+}
+
+fn take_slot(eng: &dyn Engine, stack: &Stack) -> anyhow::Result<()> {
     let opts = SlotOptions {
         cap: cap_from_env(std::env::var("CHELABASE_WORKBENCH_SLOTS").ok().as_deref())?,
         timeout: wait_from_env(std::env::var("CHELABASE_WORKBENCH_WAIT").ok().as_deref())?,
         poll: Duration::from_secs(5),
         status_every: Duration::from_secs(60),
     };
-    let alive = |e: &Entry| entry_alive(e);
+    let alive = |e: &Entry| entry_alive(eng, e);
     acquire_slot(
         &stack.stacks_dir,
         &stack.slug,
@@ -966,9 +1161,9 @@ fn take_slot(stack: &Stack) -> anyhow::Result<()> {
 
 /// W-1: a running entry is alive while its checkout exists and it either took its slot less
 /// than [`REAP_GRACE`] ago (`up` refreshes it after each long build) or its project has a running
-/// container, asked of Docker by project label ([`alive_ps_args`]). A failed check counts as
+/// container, asked of Docker by project label ([`running_ps_args`]). A failed check counts as
 /// alive (a slot is never taken away on an error).
-fn entry_alive(e: &Entry) -> bool {
+fn entry_alive(eng: &dyn Engine, e: &Entry) -> bool {
     if !e.checkout.exists() {
         return false;
     }
@@ -977,30 +1172,37 @@ fn entry_alive(e: &Entry) -> bool {
     {
         return true;
     }
-    output(docker(alive_ps_args(&project_name(&e.slug))))
+    docker_output(eng, &running_ps_args(&project_name(&e.slug)))
         .map_or(true, |ids| !ids.trim().is_empty())
 }
 
 fn start_stack(
+    eng: &dyn Engine,
     stack: &Stack,
     entry: &Entry,
     example: &str,
     with: &[Site],
     phases: &Phases,
 ) -> anyhow::Result<()> {
-    phases.run("control network", || {
+    phases.run("Docker networks", || {
         let slot = entry
             .control_slot
             .context("the registry entry has no control slot")?;
-        check_control_network(stack, slot)
+        check_stack_networks(eng, stack, slot)?;
+        // Compose reuses a network of the same name without checking it: refuse one that
+        // already exists but isn't internal and isolated, before anything starts on it.
+        check_existing_stack_networks(eng, stack)
     })?;
+    // Before anything reads whether the stack is running: a stack of an earlier release is
+    // stopped here, once, so Compose can create the internal networks on its control subnet.
+    phases.run("leaving the legacy networks", || leave_legacy_networks(eng, stack))?;
     // Whether the apps were already running: `compose up` leaves a running container as it is,
     // so its binary and env files are only picked up by a recreate (T5 review I2).
-    let was_running = stack.has_running_containers()?;
-    let image = phases.run("workbench image", || ensure_image(stack))?;
+    let was_running = stack.has_running_containers(eng)?;
+    let image = phases.run("workbench image", || eng.workbench_image(stack))?;
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
-    let mut extra = phases.run("Neon images", || neon_images(stack))?;
-    let runtime_tag = phases.run("functions runtime image", || ensure_functions_runtime_image(stack))?;
+    let mut extra = phases.run("Neon images", || eng.neon_images(stack))?;
+    let runtime_tag = phases.run("functions runtime image", || eng.functions_runtime_image(stack))?;
     extra.push(("CHELABASE_FUNCTIONS_RUNTIME_TAG".into(), runtime_tag));
     let nextest = host_nextest();
     if nextest.is_none() {
@@ -1030,7 +1232,7 @@ fn start_stack(
             proxy_port: entry.proxy_port,
             uid: id("-u")?,
             gid: id("-g")?,
-            docker_gid: docker_gid()?,
+            docker_gid: eng.docker_gid()?,
             image: &image,
             extra: &extra,
             control_slot: entry
@@ -1047,15 +1249,15 @@ fn start_stack(
     // Studio's build values (the workbench's Vite server reads them when it starts).
     let studio_changed = phases.run("studio.env", || write_studio_env(stack))?;
 
-    phases.run("cargo build", || cargo_build(stack, &RUST_APPS, true))?;
+    phases.run("cargo build", || eng.cargo_build(stack, &RUST_APPS, true))?;
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
 
-    let auth_changed = phases.run("machine keys", || ensure_stack_secrets(&stack.main, &stack.state))?;
+    let auth_changed = phases.run("machine keys", || eng.secrets(stack))?;
 
     let mut front: Vec<&str> = INFRA.to_vec();
     front.extend_from_slice(FRONT);
     phases.run("infra, Mailpit, the gateway and identity", || {
-        compose_up(stack, &[], &front)
+        compose_up(eng, stack, &[], &front)
     })?;
     // R9: a running NATS reads its auth.conf, and a running Valkey its users.acl, through a
     // single-file bind mount, which keeps the old inode after the rename above: only a restart
@@ -1066,14 +1268,14 @@ fn start_stack(
     // and a restart only empties them.
     if nats_needs_restart(was_running, auth_changed.nats) {
         phases.run("restarting NATS (its auth.conf changed)", || {
-            stack.compose_run(&["restart", "nats"])?;
-            compose_up(stack, &[], &["nats"])
+            stack.compose_run(eng, &["restart", "nats"])?;
+            compose_up(eng, stack, &[], &["nats"])
         })?;
     }
     if valkey_needs_restart(was_running, auth_changed.valkey) {
         phases.run("restarting Valkey (its users.acl changed)", || {
-            stack.compose_run(&["restart", "valkey"])?;
-            compose_up(stack, &[], &["valkey"])
+            stack.compose_run(eng, &["restart", "valkey"])?;
+            compose_up(eng, stack, &[], &["valkey"])
         })?;
     }
 
@@ -1084,11 +1286,12 @@ fn start_stack(
         late.extend(with.iter().map(|s| s.service()));
         vec!["--profile", "sites"]
     };
-    phases.run("apps", || compose_start(stack, &profiles, &late))?;
+    phases.run("apps", || compose_start(eng, stack, &profiles, &late))?;
+    phases.run("internal networks", || check_live_stack_networks(eng, stack))?;
     // After the apps: the worker that would recreate a removed compute is now the one that
     // starts computes on the compute network.
     phases.run("computes off the compute network", || {
-        remove_computes_off_network(&stack.slug, &super::env::compute_network(&stack.project))
+        remove_computes_off_network(eng, &stack.slug, &compute_network(&stack.project))
     })?;
 
     // What the bootstrap waits on must not run an old binary: an old orchestrator never
@@ -1099,19 +1302,19 @@ fn start_stack(
     let rebuilt = recreate_before_bootstrap(was_running, &recorded, &current, &env_changed);
     if !rebuilt.is_empty() {
         phases.run(&format!("recreating {}", rebuilt.join(", ")), || {
-            recreate(stack, &rebuilt)
+            recreate(eng, stack, &rebuilt)
         })?;
     }
 
     // One run, after the apps: it waits for the orchestrator (the metadata migrations) and auth
     // (the dev member's sign-up) itself.
-    phases.run("bootstrap", || bootstrap(stack, None))?;
+    phases.run("bootstrap", || eng.bootstrap(stack))?;
 
-    phases.run("apps healthy", || compose_up(stack, &profiles, &late))?;
+    phases.run("apps healthy", || compose_up(eng, stack, &profiles, &late))?;
 
     phases.run("proxy CA", || {
         let to = stack.state.join("neon/proxy-ca.crt");
-        stack.compose_run(&["cp", "proxy:/tls/ca.crt", &to.display().to_string()])
+        stack.compose_run(eng, &["cp", "proxy:/tls/ca.crt", &to.display().to_string()])
     })?;
 
     record_binaries(stack, &RUST_APPS)?;
@@ -1251,6 +1454,7 @@ fn package_of(app: &str) -> &str {
         "storage" => "chelabase-storage-service",
         "functions" => "chelabase-functions",
         "service-runner" => "chelabase-service-runner",
+        "compute-egress" => "chelabase-compute-egress",
         other => other,
     }
 }
@@ -1277,12 +1481,12 @@ pub fn never_healthy(services: &[String]) -> String {
 
 /// Runs a waiting `compose` call; on failure shows `ps` and the failing services' last 50 log
 /// lines, and names them in the error.
-fn run_waiting(stack: &Stack, args: &[String]) -> anyhow::Result<()> {
+fn run_waiting(eng: &dyn Engine, stack: &Stack, args: &[String]) -> anyhow::Result<()> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    stack.compose_run(&refs).map_err(|e| {
-        show_failure(stack);
+    stack.compose_run(eng, &refs).map_err(|e| {
+        show_failure(eng, stack);
         let failed = stack
-            .compose_output(&["--profile", "sites", "ps", "-a", "--format", "json"])
+            .compose_output(eng, &["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "ps", "-a", "--format", "json"])
             .map(|json| failed_services(&json))
             .unwrap_or_default();
         e.context(never_healthy(&failed))
@@ -1299,45 +1503,54 @@ pub fn compose_up_args(profiles: &[&str], services: &[&str]) -> Vec<String> {
 }
 
 /// `compose [profiles] up -d --wait <services>`, bounded by [`WAIT_SECS`].
-fn compose_up(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
-    run_waiting(stack, &compose_up_args(profiles, services))
+fn compose_up(eng: &dyn Engine, stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
+    run_waiting(eng, stack, &compose_up_args(profiles, services))
 }
 
 /// `compose [profiles] up -d <services>`, not waiting for them to be healthy.
-fn compose_start(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
+fn compose_start(eng: &dyn Engine, stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
     let mut args: Vec<&str> = profiles.to_vec();
     args.extend(["up", "-d"]);
     args.extend_from_slice(services);
     stack
-        .compose_run(&args)
-        .inspect_err(|_| show_failure(stack))
+        .compose_run(eng, &args)
+        .inspect_err(|_| show_failure(eng, stack))
 }
 
 /// `compose up -d --force-recreate --no-deps --wait <apps>` (bounded by [`WAIT_SECS`]): env files are read when a container
 /// is created, so a restart would keep the old ones (T4 review M3).
-fn recreate(stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
-    run_waiting(stack, &recreate_args(apps))
+fn recreate(eng: &dyn Engine, stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
+    run_waiting(eng, stack, &recreate_args(apps))
 }
 
-/// `--profile sites up -d --force-recreate --no-deps --wait --wait-timeout … <apps>`.
+/// `--profile sites --profile compute-egress up -d --force-recreate --no-deps --wait --wait-timeout … <apps>`.
 pub fn recreate_args(apps: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = ["--profile", "sites", "up", "-d", "--force-recreate", "--no-deps"]
-        .map(str::to_string)
-        .to_vec();
+    let mut args: Vec<String> = [
+        "--profile",
+        "sites",
+        "--profile",
+        COMPUTE_EGRESS_PROFILE,
+        "up",
+        "-d",
+        "--force-recreate",
+        "--no-deps",
+    ]
+    .map(str::to_string)
+    .to_vec();
     args.extend(wait_args());
     args.extend(apps.iter().cloned());
     args
 }
 
-fn show_failure(stack: &Stack) {
-    let _ = stack.compose_run(&["--profile", "sites", "ps", "-a"]);
-    let Ok(json) = stack.compose_output(&["--profile", "sites", "ps", "-a", "--format", "json"])
+fn show_failure(eng: &dyn Engine, stack: &Stack) {
+    let _ = stack.compose_run(eng, &["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "ps", "-a"]);
+    let Ok(json) = stack.compose_output(eng, &["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "ps", "-a", "--format", "json"])
     else {
         return;
     };
     for service in failed_services(&json) {
         eprintln!("[workbench] last 50 log lines of {service}:");
-        let _ = stack.compose_run(&["logs", "--no-color", "--tail", "50", &service]);
+        let _ = stack.compose_run(eng, &["logs", "--no-color", "--tail", "50", &service]);
     }
 }
 
@@ -1581,19 +1794,18 @@ fn stop_legacy_dev_processes(main: &Path) -> anyhow::Result<()> {
 }
 
 /// Removes the computes the W1 layout started (see [`is_legacy_compute`]).
-fn remove_legacy_computes() -> anyhow::Result<()> {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "ps",
-        "-a",
-        "--filter",
-        &format!("label={ENDPOINT_LABEL}"),
-        "--format",
-        &format!(
+fn remove_legacy_computes(eng: &dyn Engine) -> anyhow::Result<()> {
+    let args: Vec<String> = vec![
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        format!("label={ENDPOINT_LABEL}"),
+        "--format".into(),
+        format!(
             "{{{{.Names}}}}\t{{{{.Label \"{ENDPOINT_LABEL}\"}}}}\t{{{{.Label \"{STACK_LABEL}\"}}}}"
         ),
-    ]);
-    let legacy: Vec<String> = output(cmd)?
+    ];
+    let legacy: Vec<String> = docker_output(eng, &args)?
         .lines()
         .filter_map(|l| {
             let mut fields = l.split('\t');
@@ -1609,7 +1821,7 @@ fn remove_legacy_computes() -> anyhow::Result<()> {
                 .then(|| name.trim_start_matches('/').to_string())
         })
         .collect();
-    remove_containers(&legacy)
+    remove_containers(eng, &legacy)
 }
 
 /// The computes in `ps` (`docker ps` lines `<name>\t<network,network…>`) that aren't attached to
@@ -1631,46 +1843,42 @@ pub fn computes_off_network(ps: &str, network: &str) -> Vec<String> {
 /// compute network, such a compute can neither read its pages nor be reached. The worker's
 /// reconcile (every 30 s) creates each missing compute again, on the compute network and with
 /// a fresh spec; its data is in the pageserver and safekeepers, not in the container.
-fn remove_computes_off_network(slug: &str, network: &str) -> anyhow::Result<()> {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "ps",
-        "-a",
-        "--filter",
-        &format!("label={ENDPOINT_LABEL}"),
-        "--filter",
-        &format!("label={STACK_LABEL}={slug}"),
-        "--format",
-        "{{.Names}}\t{{.Networks}}",
-    ]);
-    remove_containers(&computes_off_network(&output(cmd)?, network))
+fn remove_computes_off_network(eng: &dyn Engine, slug: &str, network: &str) -> anyhow::Result<()> {
+    let args: Vec<String> = vec![
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        format!("label={ENDPOINT_LABEL}"),
+        "--filter".into(),
+        format!("label={STACK_LABEL}={slug}"),
+        "--format".into(),
+        "{{.Names}}\t{{.Networks}}".into(),
+    ];
+    remove_containers(eng, &computes_off_network(&docker_output(eng, &args)?, network))
 }
 
 /// Removes every compute of `slug` (by the stack label), running or not.
-fn remove_stack_computes(slug: &str) -> anyhow::Result<()> {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "ps",
-        "-aq",
-        "--filter",
-        &format!("label={ENDPOINT_LABEL}"),
-        "--filter",
-        &format!("label={STACK_LABEL}={slug}"),
-    ]);
-    let ids: Vec<String> = output(cmd)?
+fn remove_stack_computes(eng: &dyn Engine, slug: &str) -> anyhow::Result<()> {
+    let args: Vec<String> = vec![
+        "ps".into(),
+        "-aq".into(),
+        "--filter".into(),
+        format!("label={ENDPOINT_LABEL}"),
+        "--filter".into(),
+        format!("label={STACK_LABEL}={slug}"),
+    ];
+    let ids: Vec<String> = docker_output(eng, &args)?
         .split_whitespace()
         .map(str::to_string)
         .collect();
-    remove_containers(&ids)
+    remove_containers(eng, &ids)
 }
 
-fn remove_containers(names: &[String]) -> anyhow::Result<()> {
+fn remove_containers(eng: &dyn Engine, names: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         return Ok(());
     }
-    let mut cmd = Command::new("docker");
-    cmd.args(["rm", "-f"]).args(names).stdout(Stdio::null());
-    run(cmd)?;
+    docker_do(eng, "rm", &["-f"], names)?;
     eprintln!("[workbench]   removed {} compute(s)", names.len());
     Ok(())
 }
@@ -1680,8 +1888,13 @@ fn remove_containers(names: &[String]) -> anyhow::Result<()> {
 /// `workbench restart [app…]`: rebuild the named Rust apps (all five when none) and recreate
 /// their containers; Studio and the sites are recreated without a build.
 pub fn restart(apps: &[String]) -> anyhow::Result<()> {
-    let stack = current_stack()?;
+    restart_stack(&RealEngine, &current_stack()?, apps)
+}
+
+pub(super) fn restart_stack(eng: &dyn Engine, stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
     let targets = restart_targets(apps)?;
+    // Before the build: a recreate on a stale env can only fail (W-ENV).
+    stack.require_current_env()?;
     let rust: Vec<&str> = targets
         .iter()
         .map(String::as_str)
@@ -1689,17 +1902,20 @@ pub fn restart(apps: &[String]) -> anyhow::Result<()> {
         .collect();
     let phases = Phases;
     if !rust.is_empty() {
-        phases.run("cargo build", || cargo_build(&stack, &rust, false))?;
+        phases.run("cargo build", || eng.cargo_build(stack, &rust, false))?;
     }
-    phases.run("recreating", || recreate(&stack, &targets))?;
-    record_binaries(&stack, &rust)
+    phases.run("recreating", || recreate(eng, stack, &targets))?;
+    record_binaries(stack, &rust)
 }
 
 /// `workbench down [--stack s]`: the stack's containers and computes go (volumes stay) and its
 /// slot is released.
 pub fn down(slug: Option<&str>) -> anyhow::Result<()> {
-    let here = current_stack()?;
-    let (stack, entry) = chosen_stack(&here, slug)?;
+    down_stack(&RealEngine, &current_stack()?, slug)
+}
+
+pub(super) fn down_stack(eng: &dyn Engine, here: &Stack, slug: Option<&str>) -> anyhow::Result<()> {
+    let (stack, entry) = chosen_stack(here, slug)?;
     if entry.is_none() {
         let known = read_registry(&here.stacks_dir)?;
         bail!(
@@ -1708,7 +1924,7 @@ pub fn down(slug: Option<&str>) -> anyhow::Result<()> {
             describe_known(&known)
         );
     }
-    stop_stack(&stack, false)?;
+    stop_stack(eng, &stack, false)?;
     release_slot(&stack.stacks_dir, &stack.slug)?;
     eprintln!(
         "[workbench] {} is down (its data stays; purge removes it)",
@@ -1718,25 +1934,78 @@ pub fn down(slug: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// Stops the apps (so the worker starts no compute), removes the stack's computes, then
-/// `compose down` (with `-v` when `volumes`).
-fn stop_stack(stack: &Stack, volumes: bool) -> anyhow::Result<()> {
-    if stack.env_file.is_file() {
-        stack.compose_run(&["--profile", "sites", "stop"])?;
+/// `compose down` (with `-v` when `volumes`). On a stale or missing env (W-ENV: the first command
+/// after an upgrade, or after an `up` that stopped before it rendered the env) the same is done by
+/// the project's Docker labels instead ([`stop_stack_by_label`]).
+fn stop_stack(eng: &dyn Engine, stack: &Stack, volumes: bool) -> anyhow::Result<()> {
+    if let Some(why) = stack.env_staleness() {
+        eprintln!("[workbench] {}: {why}; stopping it by its Docker labels", stack.slug);
+        return stop_stack_by_label(eng, stack, volumes);
     }
-    remove_stack_computes(&stack.slug)?;
-    if stack.env_file.is_file() {
-        let mut args = vec![
-            "--profile",
-            "sites",
-            "--profile",
-            "runner",
-            "down",
-            "--remove-orphans",
-        ];
-        if volumes {
-            args.push("-v");
+    stack.compose_run(eng, &["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "stop"])?;
+    remove_stack_computes(eng, &stack.slug)?;
+    let mut args = vec![
+        "--profile",
+        "sites",
+        "--profile",
+        "runner",
+        "--profile",
+        COMPUTE_EGRESS_PROFILE,
+        "down",
+        "--remove-orphans",
+    ];
+    if volumes {
+        args.push("-v");
+    }
+    stack.compose_run(eng, &args)
+}
+
+/// `compose down` without Compose: every container with the project's label is stopped (the
+/// worker with them, so it starts no compute), the stack's computes and then those containers
+/// are removed, then the project's networks (one with someone else's container on it, running or
+/// stopped, is kept: the next `up` names that container) and, when `volumes`, its
+/// volumes.
+fn stop_stack_by_label(eng: &dyn Engine, stack: &Stack, volumes: bool) -> anyhow::Result<()> {
+    let project = format!("label=com.docker.compose.project={}", stack.project);
+    let list = |args: &[&str]| -> anyhow::Result<Vec<String>> {
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        all.extend(["--filter".to_string(), project.clone()]);
+        Ok(docker_output(eng, &all)?
+            .split_whitespace()
+            .map(str::to_string)
+            .collect())
+    };
+    let containers = list(&["ps", "-aq"])?;
+    if !containers.is_empty() {
+        docker_do(eng, "stop", &[], &containers)?;
+    }
+    remove_stack_computes(eng, &stack.slug)?;
+    if !containers.is_empty() {
+        docker_do(eng, "rm", &["-f"], &containers)?;
+        eprintln!("[workbench]   removed {} container(s) of the stack", containers.len());
+    }
+    // What is still on a network now is nobody's of the stack's: Docker would remove a network
+    // whose only member is stopped (and that container could never start again), so a network
+    // with any member, running or not, is kept.
+    let held: String = docker_output(
+        eng,
+        &["ps".into(), "-a".into(), "--format".into(), "{{.Networks}}".into()],
+    )?;
+    let held: Vec<&str> = held.lines().flat_map(|l| l.split(',')).map(str::trim).collect();
+    for network in list(&["network", "ls", "--format", "{{.Name}}"])? {
+        if held.contains(&network.as_str()) {
+            eprintln!("[workbench]   kept network {network}: a container of someone else's is on it");
+            continue;
         }
-        stack.compose_run(&args)?;
+        if let Err(e) = docker_do(eng, "network", &["rm"], std::slice::from_ref(&network)) {
+            eprintln!("[workbench]   kept a network of the stack: {e:#}");
+        }
+    }
+    if volumes {
+        let names = list(&["volume", "ls", "-q"])?;
+        if !names.is_empty() {
+            docker_do(eng, "volume", &["rm"], &names)?;
+        }
     }
     Ok(())
 }
@@ -1753,8 +2022,11 @@ fn describe_known(registry: &Registry) -> String {
 /// `workbench purge [--stack s] [--yes]`: `down`, then the volumes, the computes, the state dir,
 /// the registry entry and any queue ticket go. Main needs `--stack main --yes` ([`check_purge`]).
 pub fn purge(slug: Option<&str>, yes: bool) -> anyhow::Result<()> {
-    let here = current_stack()?;
-    let (stack, entry) = chosen_stack(&here, slug)?;
+    purge_stack(&RealEngine, &current_stack()?, slug, yes)
+}
+
+pub(super) fn purge_stack(eng: &dyn Engine, here: &Stack, slug: Option<&str>, yes: bool) -> anyhow::Result<()> {
+    let (stack, entry) = chosen_stack(here, slug)?;
     check_purge(&stack.slug, slug, yes)?;
     if let Some(msg) = borrowed_stack_message(&stack.slug, slug, &here.checkout, entry.as_ref()) {
         eprintln!("[workbench] {msg}");
@@ -1768,7 +2040,7 @@ pub fn purge(slug: Option<&str>, yes: bool) -> anyhow::Result<()> {
             describe_known(&known)
         );
     }
-    stop_stack(&stack, true)?;
+    stop_stack(eng, &stack, true)?;
     if stack.state.exists() {
         std::fs::remove_dir_all(&stack.state)
             .with_context(|| format!("removing {}", stack.state.display()))?;
@@ -1851,7 +2123,7 @@ pub fn env() -> anyhow::Result<()> {
 /// `workbench logs [-f] [service…]`.
 pub fn logs(follow: bool, services: &[String]) -> anyhow::Result<()> {
     let stack = followed_stack()?;
-    let mut args = vec!["--profile", "sites", "logs"];
+    let mut args = vec!["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "logs"];
     if follow {
         args.push("-f");
     }
@@ -1877,7 +2149,7 @@ pub fn psql(db: Option<&str>) -> anyhow::Result<()> {
 /// `workbench exec <service> <cmd…>`.
 pub fn exec(service: &str, cmd: &[String]) -> anyhow::Result<()> {
     let stack = followed_stack()?;
-    let mut args = vec!["--profile", "sites", "exec", service];
+    let mut args = vec!["--profile", "sites", "--profile", COMPUTE_EGRESS_PROFILE, "exec", service];
     args.extend(cmd.iter().map(String::as_str));
     pass_through(stack.compose_cmd(&args)?)
 }
@@ -1897,7 +2169,7 @@ pub fn test(
 ) -> anyhow::Result<()> {
     let pairs = parse_env_pairs(env)?;
     let here = current_stack()?;
-    let (target, entry) = stack_for_run(&here, stack)?;
+    let (target, entry) = stack_for_run(&RealEngine, &here, stack)?;
     let archive = archive_path(&target.state, &target.slug, &here.slug);
     let phases = Phases;
     phases.run("nextest archive", || {
@@ -1920,7 +2192,7 @@ pub fn run_script(
 ) -> anyhow::Result<()> {
     let pairs = parse_env_pairs(env)?;
     let here = current_stack()?;
-    let (target, entry) = stack_for_run(&here, stack)?;
+    let (target, entry) = stack_for_run(&RealEngine, &here, stack)?;
     let mut cmd = vec![script.to_string()];
     cmd.extend(args.iter().cloned());
     in_runner(&target, &here.checkout, &entry, &pairs, &cmd)
@@ -1928,9 +2200,9 @@ pub fn run_script(
 
 /// The stack a `test`/`run` uses, with its registry entry: this checkout's own (started or brought
 /// current), or another checkout's, checked ready and left untouched.
-fn stack_for_run(here: &Stack, flag: Option<&str>) -> anyhow::Result<(Stack, Entry)> {
-    match resolve_stack_target(here, flag)? {
-        None => Ok((here.clone(), ensure_current(here)?)),
+pub(super) fn stack_for_run(eng: &dyn Engine, here: &Stack, flag: Option<&str>) -> anyhow::Result<(Stack, Entry)> {
+    match resolve_stack_target(eng, here, flag)? {
+        None => Ok((here.clone(), ensure_current(eng, here)?)),
         Some(other) => Ok(other),
     }
 }
@@ -1938,6 +2210,7 @@ fn stack_for_run(here: &Stack, flag: Option<&str>) -> anyhow::Result<(Stack, Ent
 /// `None` for this checkout's own stack; else another stack, checked ready (registered, holding
 /// its slot, every app running), with its registry entry.
 fn resolve_stack_target(
+    eng: &dyn Engine,
     here: &Stack,
     flag: Option<&str>,
 ) -> anyhow::Result<Option<(Stack, Entry)>> {
@@ -1947,12 +2220,23 @@ fn resolve_stack_target(
         Target::Other(slug) => {
             let (stack, entry) = chosen_stack(here, Some(&slug))?;
             let running = if entry.is_some() {
-                stack.running_services()?
+                stack.running_services(eng)?
             } else {
                 Vec::new()
             };
             check_ready(&slug, entry.as_ref(), &APPS, &running)?;
             let entry = entry.with_context(|| format!("stack {slug} isn't registered"))?;
+            // Another checkout's stack is never started here, so one that only its own `up` can
+            // move or bring current is refused, naming that command (W-ENV).
+            let legacy = present_legacy_networks(eng, &stack.project)?;
+            if !legacy.is_empty() {
+                bail!(
+                    "stack {slug} is still on its legacy networks ({}); run `just workbench up` in {}",
+                    legacy.join(", "),
+                    stack.checkout.display()
+                );
+            }
+            stack.require_current_env()?;
             Ok(Some((stack, entry)))
         }
     }
@@ -1969,31 +2253,47 @@ pub fn slug_of(branch: &str) -> anyhow::Result<()> {
 /// W-6: up (idempotent) when the stack isn't running or any app service is missing (a half-up
 /// stack, T5 review M3); else rebuild the apps and recreate the ones whose binary changed since
 /// their start.
-fn ensure_current(stack: &Stack) -> anyhow::Result<Entry> {
+fn ensure_current(eng: &dyn Engine, stack: &Stack) -> anyhow::Result<Entry> {
     let registry = read_registry(&stack.stacks_dir)?;
     let slot = registry
         .get(&stack.slug)
         .is_some_and(|e| e.running_since.is_some());
+    // Legacy networks and a stale env first, before anything is asked of Compose (W-ENV): only
+    // `up` moves the stack and renders the env.
+    let legacy = present_legacy_networks(eng, &stack.project)?;
+    let stale = stack.env_staleness();
     let running = slot && {
-        let missing = missing_services(&APPS, &stack.running_services()?);
-        if !missing.is_empty() {
+        if !legacy.is_empty() {
             eprintln!(
-                "[workbench] {} is only partly up (not running: {}): running up",
+                "[workbench] {} is still on its legacy networks ({}): running up to move it",
                 stack.slug,
-                missing.join(", ")
+                legacy.join(", ")
             );
+            false
+        } else if let Some(why) = stale {
+            eprintln!("[workbench] {}: {why}: running up", stack.slug);
+            false
+        } else {
+            let missing = missing_services(&APPS, &stack.running_services(eng)?);
+            if !missing.is_empty() {
+                eprintln!(
+                    "[workbench] {} is only partly up (not running: {}): running up",
+                    stack.slug,
+                    missing.join(", ")
+                );
+            }
+            may_skip_up(true, &missing, &legacy)
         }
-        missing.is_empty()
     };
     if !running {
-        up_stack(stack, &[])?;
+        up_stack(eng, stack, &[])?;
     } else {
         let phases = Phases;
-        phases.run("cargo build", || cargo_build(stack, &RUST_APPS, true))?;
+        phases.run("cargo build", || eng.cargo_build(stack, &RUST_APPS, true))?;
         let stale = stale_apps(&read_binaries(stack), &current_binaries(stack, &RUST_APPS));
         if !stale.is_empty() {
             phases.run(&format!("recreating {}", stale.join(", ")), || {
-                recreate(stack, &stale)
+                recreate(eng, stack, &stale)
             })?;
             record_binaries(stack, &RUST_APPS)?;
         }

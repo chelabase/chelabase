@@ -53,6 +53,18 @@ jobs:
       - name: Compose version (the workbench needs 2.30 or newer)
         run: docker compose version
 
+      # Docker Engine 28 or newer: the compute networks' `isolated` gateway mode (no host address
+      # on the bridge) is what keeps a compute off the host's published ports.
+      - name: Docker Engine version (28.0 or newer)
+        run: |
+          docker version
+          server="$(docker version --format '{{.Server.Version}}')"
+          major="${server%%.*}"
+          if ! [[ "$major" =~ ^[0-9]+$ ]] || ((major < 28)); then
+            echo "::error::Docker Engine $server is older than 28.0"
+            exit 1
+          fi
+
       - run: pnpm install --frozen-lockfile
 
       - name: Stack up
@@ -62,7 +74,7 @@ jobs:
       - name: Live suites
         run: |
           failed=()
-          for recipe in neon-smoke neon-e2e branch-e2e storage-leak-e2e compute-network-e2e \
+          for recipe in neon-smoke neon-e2e branch-e2e storage-leak-e2e compute-network-e2e compute-egress-e2e \
                         auth-e2e role-e2e members-e2e personal-logins-e2e teams-e2e \
                         data-e2e console-e2e app-users-e2e sql-editor-e2e merge-e2e sweep-dbs-test; do
             echo "::group::$recipe"

@@ -46,6 +46,8 @@ pub struct WorkerConfig {
     /// `1=http://127.0.0.1:7676`, the Compose safekeeper).
     pub safekeeper_http: Vec<(u64, reqwest::Url)>,
     pub compute_jwt_dir: PathBuf,
+    /// `CHELABASE_COMPUTE_NETWORK` (default `chelabase_compute-internal`): the network computes
+    /// run on.
     pub compute_network: String,
     pub control_plane_uri: String,
     /// `CHELABASE_STACK` (default `main`): the stack this worker's computes belong to.
@@ -74,11 +76,21 @@ pub struct WorkerConfig {
     pub member_roles_sweep_every: Duration,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes this stack's compute
     /// containers no endpoint row records. Listing is scoped to the stack, so this is an
-    /// opt-out for debugging, not a guard against other stacks.
+    /// opt-out for debugging, not a guard against other stacks. It does not cover the compute
+    /// network migration: a compute of this stack that is off the configured networks is
+    /// removed (and legacy networks are cleaned up) even when this is off, because network
+    /// isolation outranks a debugging opt-out.
     pub remove_orphans: bool,
-    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control`): the network the
-    /// orchestrator reaches computes on; member logins come from its addresses there.
+    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control-internal`): the network
+    /// the orchestrator reaches computes on; member logins come from its addresses there.
     pub compute_control_network: String,
+    /// `CHELABASE_LEGACY_COMPUTE_NETWORKS` (comma separated; default none): the networks computes
+    /// ran on before they became internal. The worker moves computes off them and removes each
+    /// once nothing is attached. Never the compute or control network.
+    pub legacy_compute_networks: Vec<String>,
+    /// `CHELABASE_COMPUTE_EGRESS_DNS`: the resolver computes are created with (the
+    /// compute-egress service's address). An IP address; unset leaves Docker's default.
+    pub compute_egress_dns: Option<std::net::IpAddr>,
     /// `CHELABASE_COMPUTE_CA_DIR` (default `.chelabase/compute-ca`): `ca.crt` and `ca.key`.
     pub compute_ca_dir: PathBuf,
     /// `CHELABASE_COMPUTE_TLS_DIR` (default `.chelabase/orchestrator-tls`): where the worker
@@ -136,7 +148,7 @@ impl WorkerConfig {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
             compute_jwt_dir: PathBuf::from(or_default("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
-            compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_compute"),
+            compute_network: or_default("CHELABASE_COMPUTE_NETWORK", "chelabase_compute-internal"),
             control_plane_uri: or_default(
                 "CHELABASE_CONTROL_PLANE_URI",
                 "http://orchestrator:8083",
@@ -168,8 +180,13 @@ impl WorkerConfig {
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
             compute_control_network: or_default(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
-                "chelabase_control",
+                "chelabase_control-internal",
             ),
+            legacy_compute_networks: legacy_compute_networks(non_blank(
+                &get,
+                LEGACY_COMPUTE_NETWORKS,
+            )),
+            compute_egress_dns: compute_egress_dns(non_blank(&get, COMPUTE_EGRESS_DNS))?,
             compute_ca_dir: PathBuf::from(or_default(
                 "CHELABASE_COMPUTE_CA_DIR",
                 ".chelabase/compute-ca",
@@ -199,6 +216,16 @@ impl WorkerConfig {
                 .map(PathBuf::from),
         };
         check_control_plane_uri(&config.control_plane_uri)?;
+        // A legacy network is removed once empty: it must never be one computes run on.
+        for live in [&config.compute_network, &config.compute_control_network] {
+            if config.legacy_compute_networks.contains(live) {
+                return Err(anyhow!(
+                    "{LEGACY_COMPUTE_NETWORKS} lists {live}, which is the compute or control \
+                     network (CHELABASE_COMPUTE_NETWORK, CHELABASE_COMPUTE_CONTROL_NETWORK); list \
+                     only the networks computes ran on before"
+                ));
+            }
+        }
         // The sweep writes realtime's pair and the orchestrator's pair each into its own
         // directory: one directory for both would make each pair replace the other.
         if same_dir(&config.realtime_tls_dir, &config.compute_tls_dir) {
@@ -232,6 +259,35 @@ impl WorkerConfig {
     /// Requested, and in self-hosted mode: platform mode ignores the switch.
     pub fn owner_superuser(&self) -> bool {
         self.owner_superuser_requested && self.policy.owner_superuser_allowed()
+    }
+}
+
+const LEGACY_COMPUTE_NETWORKS: &str = "CHELABASE_LEGACY_COMPUTE_NETWORKS";
+const COMPUTE_EGRESS_DNS: &str = "CHELABASE_COMPUTE_EGRESS_DNS";
+
+/// `CHELABASE_LEGACY_COMPUTE_NETWORKS`: network names, comma separated; blanks are skipped and
+/// each name is kept once.
+fn legacy_compute_networks(value: Option<String>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in value.iter().flat_map(|v| v.split(',')).map(str::trim) {
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// `CHELABASE_COMPUTE_EGRESS_DNS`: one IP address (not the unspecified one), or unset.
+fn compute_egress_dns(value: Option<String>) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => Ok(Some(ip)),
+        _ => Err(anyhow!(
+            "{COMPUTE_EGRESS_DNS}={value:?} is not a resolver address: give one IP address, the \
+             compute-egress service's (e.g. 10.214.8.2)"
+        )),
     }
 }
 
@@ -472,6 +528,8 @@ pub fn build_with(
                 DockerSettings {
                     network: config.compute_network.clone(),
                     control_network: config.compute_control_network.clone(),
+                    legacy_networks: config.legacy_compute_networks.clone(),
+                    egress_dns: config.compute_egress_dns,
                 },
             )?,
             metadata,
@@ -771,6 +829,8 @@ mod tests {
             member_roles_sweep_every: _,
             remove_orphans: _,
             compute_control_network: _,
+            legacy_compute_networks: _,
+            compute_egress_dns: _,
             compute_ca_dir: _,
             compute_tls_dir: _,
             member_login_cidrs: _,
@@ -795,7 +855,9 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
-        assert_eq!(c.compute_network, "chelabase_compute");
+        assert_eq!(c.compute_network, "chelabase_compute-internal");
+        assert_eq!(c.legacy_compute_networks, Vec::<String>::new());
+        assert_eq!(c.compute_egress_dns, None);
         assert_eq!(c.control_plane_uri, "http://orchestrator:8083");
         assert_eq!(c.stack, "main");
         assert_eq!(c.valkey_url, "redis://127.0.0.1:6379");
@@ -1176,9 +1238,60 @@ mod tests {
     }
 
     #[test]
+    fn config_reads_the_legacy_networks() {
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_LEGACY_COMPUTE_NETWORKS", " chelabase_compute, chelabase_control ,,chelabase_compute"),
+        ]))
+        .unwrap();
+        assert_eq!(c.legacy_compute_networks, ["chelabase_compute", "chelabase_control"]);
+        let blank = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_LEGACY_COMPUTE_NETWORKS", " ")])).unwrap();
+        assert_eq!(blank.legacy_compute_networks, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_legacy_name_equal_to_a_live_network_is_refused() {
+        for (compute, control, legacy) in [
+            ("s_compute-internal", "s_control-internal", "s_old,s_compute-internal"),
+            ("s_compute-internal", "s_control-internal", "s_control-internal"),
+            // The defaults count too.
+            ("", "", "chelabase_control-internal"),
+        ] {
+            let mut env = vec![IMAGE, ("CHELABASE_LEGACY_COMPUTE_NETWORKS", legacy)];
+            if !compute.is_empty() {
+                env.push(("CHELABASE_COMPUTE_NETWORK", compute));
+                env.push(("CHELABASE_COMPUTE_CONTROL_NETWORK", control));
+            }
+            let err = WorkerConfig::from_lookup(lookup(&env)).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("CHELABASE_LEGACY_COMPUTE_NETWORKS"), "{text}");
+            assert!(text.contains("-internal"), "names the network: {text}");
+        }
+    }
+
+    #[test]
+    fn config_reads_the_egress_resolver() {
+        for (raw, ip) in [("10.214.8.2", "10.214.8.2"), (" fd00::53 ", "fd00::53")] {
+            let c = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_COMPUTE_EGRESS_DNS", raw)])).unwrap();
+            assert_eq!(c.compute_egress_dns, Some(ip.parse().unwrap()), "{raw}");
+        }
+        let blank = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_COMPUTE_EGRESS_DNS", "")])).unwrap();
+        assert_eq!(blank.compute_egress_dns, None);
+    }
+
+    #[test]
+    fn an_egress_resolver_that_is_not_an_address_is_refused() {
+        for bad in ["compute-egress", "10.214.8.2:53", "10.214.8.2,10.214.8.3", "10.214.8.0/24", "0.0.0.0", "::", "999.1.1.1"] {
+            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_COMPUTE_EGRESS_DNS", bad)])).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("CHELABASE_COMPUTE_EGRESS_DNS"), "{bad}: {text}");
+        }
+    }
+
+    #[test]
     fn config_reads_the_round_3_settings() {
         let d = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
-        assert_eq!(d.compute_control_network, "chelabase_control");
+        assert_eq!(d.compute_control_network, "chelabase_control-internal");
         assert_eq!(d.compute_ca_dir, PathBuf::from(".chelabase/compute-ca"));
         assert_eq!(d.compute_tls_dir, PathBuf::from(".chelabase/orchestrator-tls"));
         assert_eq!(d.member_login_cidrs, None, "unset: build() refuses to start");

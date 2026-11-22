@@ -48,20 +48,43 @@ With TLS in front, the public URLs only work from outside: inside the network no
 
 By default the gateway takes the client's address from the TCP connection and sets `X-Forwarded-For` to that address alone, replacing whatever the client sent. Behind a reverse proxy that address is the proxy's, so every client shares one per-IP bucket: sign-up is limited to 20 an hour per client address, and one noisy client could use up the hour's sign-ups for everybody, including the setup-code claim.
 
-Tell the gateway which proxies to believe:
+Tell the gateway which proxies to believe, by the address it sees them at. The recommended setup for a proxy on the same machine is a container on the stack's own network, with a fixed address, and that one address as the only entry. The proxy reaches the gateway by its service name (`http://gateway:8000`), so it does not go through the published port at all, and the gateway sees the proxy at the address you gave it.
+
+Give the stack's default network a subnet that is free on your host, and the proxy a fixed address in it. Save this as `docker-compose.override.yml` next to `docker-compose.yml` (Compose reads it automatically; the image and the proxy's own configuration are yours to choose):
+
+```yaml
+services:
+  reverse-proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      default:
+        ipv4_address: 172.29.0.2
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+```
+
+Then list that address:
 
 ```bash
-# The address the gateway sees your proxy at. For a proxy on the same machine, the "Gateway"
-# address that `docker network inspect <project>_default` prints (the project is `compose`
-# unless you named it).
-CHELABASE_GATEWAY_TRUSTED_PROXIES=172.18.0.1
+CHELABASE_GATEWAY_TRUSTED_PROXIES=172.29.0.2
 ```
+
+Adding a subnet to the default network of a stack that is already running makes Compose recreate that network, so the services restart on the next `docker compose up -d --wait`. `docker compose config` prints the merged file if you want to check it first.
 
 It takes a comma-separated list of CIDRs (`10.0.0.0/8`, `fd00::/8`) or single addresses (`192.168.1.5`), written as the gateway sees the proxy. When a request comes from one of them, the gateway reads the proxy's `X-Forwarded-For` (or `Forwarded`, its `for=`), walks it from right to left past the trusted addresses, and takes the first one that isn't trusted as the client. Requests from anyone else are handled as before, so a forged header from a client that reaches the gateway directly changes nothing. The services still get exactly one address in `X-Forwarded-For`.
 
 - **Set your proxy to add the client's address, and to clear the other header.** nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Caddy and Traefik add it on their own. Use one of the two headers, and have the proxy remove the one you don't use (nginx: `proxy_set_header Forwarded "";`): most proxies, nginx included, pass a client's own `Forwarded` through unchanged.
-- **Which address to list.** With Compose and a proxy on the same machine connecting to the published port, the gateway sees the Docker network's gateway address rather than `127.0.0.1`; `docker network inspect <project>_default` shows it. List that one address. A range such as `172.16.0.0/12` would also cover it, but it trusts every container on every Docker network of the host, and any of them could then set any client's address; use it only if the address keeps changing, and know what it lets in. A proxy on another machine is seen at its own address.
-- **List only what can't be forged.** Anything listed can name any client address. Never list a range your users' traffic arrives from directly; a prefix of `/0` is refused. On Docker Desktop and with rootless Docker, every connection to a published port can appear to come from one internal address, whoever made it. If you trust that address while the port is published beyond loopback, clients that connect to the port directly can forge `X-Forwarded-For`: keep `CHELABASE_HTTP_ADDR=127.0.0.1` there, so only your proxy on the same machine reaches the gateway.
+- **Which address to list.** The proxy container's own fixed address, as above, or, for a proxy on another machine, the address the gateway sees it at. Do not list a Docker network's gateway address (the "Gateway" that `docker network inspect` prints) or a range that contains one. That address is what the gateway sees for every connection that the host forwards to a published port, including connections from containers on other Docker networks of the host, such as the functions runtime's network and the [compute egress](/self-hosting/compute-egress) network, so it doesn't identify your proxy. If you run compute egress, also list this host's public addresses in `CHELABASE_COMPUTE_EGRESS_DENY`, so a listed name that resolves to the host can't reach its published ports through it ([Deny addresses](/self-hosting/compute-egress#deny-addresses)). A broad range such as `172.16.0.0/12` has the same problem for every container on the host.
+- **List only what can't be forged.** Anything listed can name any client address. Never list a range your users' traffic arrives from directly; a prefix of `/0` is refused. On Docker Desktop, with rootless Docker and on other engines that route published ports through one internal address, every connection to a published port can appear to come from that address, whoever made it. Never list it. Run the proxy as a container on the stack's network as above, so the gateway sees the proxy at its own address, and keep `CHELABASE_HTTP_ADDR=127.0.0.1`, so only a proxy on the same machine reaches the published port.
 - **When the header can't be trusted, the gateway falls back to the proxy's address.** That happens when a trusted proxy sends both headers or neither, a header over 4096 bytes or 32 hops, or an entry the walk reaches that isn't an address (`unknown`, an obfuscated name). The request is never refused for it. A client behind the proxy can force this fallback on purpose: by sending its own `Forwarded` header (so the gateway sees both), or by padding `X-Forwarded-For` past 32 hops or 4096 bytes before the proxy appends to it. It then shares the proxy's bucket with every other request that fell back, and can use up that bucket's sign-ups and sign-ins. Clearing the header you don't use at the proxy (above) closes the first way. When your proxy is the first one clients reach, closing the second means it replaces the header with the address it sees instead of appending to it (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`).
 - Keep `CHELABASE_AUTH_TRUSTED_PROXY=gateway` as the install sets it. Auth then believes the `X-Forwarded-For` the gateway sets and nobody else's.
 
