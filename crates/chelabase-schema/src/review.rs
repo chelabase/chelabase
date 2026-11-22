@@ -18,15 +18,18 @@
 //! - rules (not a view's `_RETURN`) on a relation owned by a non-Admin role.
 //!
 //! Skipped: extension members and objects in `pg_catalog`, `information_schema`, `pg_toast`,
-//! `pg_temp_*`, `pg_toast_temp_*`, `chelabase_guard`, `storage` when `chelabase_admin` owns it
-//! (object storage's own schema), and `chelabase_functions` when `chelabase_functions_owner`
-//! owns it (edge functions' outbox), plus the function triggers (`chelabase_fn_*` running a
-//! function in that `chelabase_functions`). Both schema skips rest on the owner: no other role can
-//! join `chelabase_admin` (the data API bootstrap revokes every membership) or
-//! `chelabase_functions_owner` (NOLOGIN, no members; the trigger install refuses a role or schema
-//! it didn't create), or give either a schema, and neither install grants anyone else CREATE
-//! there. A `storage` or `chelabase_functions` schema anyone else owns (one the owner made, or a
-//! database no bootstrap reached) is reviewed like any other.
+//! `pg_temp_*`, `pg_toast_temp_*`, `chelabase_guard` when a superuser owns it (the DDL guard's
+//! schema), `storage` when `chelabase_admin` owns it (object storage's own schema), and
+//! `chelabase_functions` when `chelabase_functions_owner` owns it (edge functions' outbox), plus
+//! the function triggers (`chelabase_fn_*` running a function in that `chelabase_functions`).
+//! Every schema skip rests on the owner. The guard script runs as `cloud_admin` and takes
+//! `chelabase_guard` back (`OWNER TO CURRENT_USER`, every grant revoked); a non-superuser can't
+//! make a schema a superuser's (that needs membership in the superuser, which only a superuser
+//! can grant). No other role can join `chelabase_admin` (the data API bootstrap revokes every
+//! membership) or `chelabase_functions_owner` (NOLOGIN, no members; the trigger install refuses a
+//! role or schema it didn't create), or give either a schema, and neither install grants anyone
+//! else CREATE there. A `chelabase_guard`, `storage` or `chelabase_functions` schema anyone else
+//! owns (one the owner made, or a database no bootstrap reached) is reviewed like any other.
 //!
 //! Every name part of a key, a `via` and a hash line is quoted as an identifier, so no name
 //! can make two items share a key or forge a hash line. Each item carries the md5 hex of its
@@ -63,7 +66,9 @@ skipped AS (
   WHERE n.nspname OPERATOR(pg_catalog.=) 'pg_catalog'
      OR n.nspname OPERATOR(pg_catalog.=) 'information_schema'
      OR n.nspname OPERATOR(pg_catalog.=) 'pg_toast'
-     OR n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
+     OR (n.nspname OPERATOR(pg_catalog.=) 'chelabase_guard'
+         AND n.nspowner OPERATOR(pg_catalog.=) ANY (SELECT r.oid FROM pg_catalog.pg_roles r
+           WHERE r.rolsuper))
      OR (n.nspname OPERATOR(pg_catalog.=) 'storage'
          AND n.nspowner OPERATOR(pg_catalog.=) (SELECT r.oid FROM pg_catalog.pg_roles r
            WHERE r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin'))
