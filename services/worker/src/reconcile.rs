@@ -2473,7 +2473,7 @@ mod tests {
         assert!(
             position(
                 &journal,
-                &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass")
+                &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r")
             )
             .is_some()
         );
@@ -2489,7 +2489,7 @@ mod tests {
         w.reconcile_once().await.unwrap();
         let checked = pos(
             &journal,
-            &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass"),
+            &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r"),
         );
         assert!(checked < pos(&journal, &format!("compute.sql {ep} app BEGIN;")));
     }
@@ -3870,7 +3870,7 @@ mod tests {
 
         w.reconcile_once().await.unwrap();
 
-        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp; SELECT to_regclass")).is_some();
+        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r")).is_some();
         assert!(checked("app") && checked("healthy") && checked("broken") && !checked("off"));
         // Each database is checked against its own default schema.
         let check_in = |db: &str| {
