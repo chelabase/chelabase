@@ -866,6 +866,18 @@ async fn publish_sync(app: &AppUsers, req: SyncRequest) {
     }
 }
 
+/// The project's name for its app users' mail, from the caller's own branch info. A name
+/// identity would refuse as `project_name` (blank, over 128 UTF-16 units, or holding a control
+/// character or line separator) is left out, and the mail names the service's default rather
+/// than not going at all.
+fn mail_name(info: &AppBranchInfo) -> Option<&str> {
+    info.project_name.as_deref().filter(|name| {
+        !name.trim().is_empty()
+            && name.encode_utf16().count() <= 128
+            && !name.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+    })
+}
+
 /// Mails the user a code of `kind`, within [`reserve_code_issue`]: at most five of a kind an
 /// hour per user, whatever flow asks. The answer never says whether one went out; a failure is
 /// only logged. Identity keeps a live code sent under a minute ago (`CodeRecentlySent`): nothing
@@ -876,7 +888,8 @@ async fn send_code(s: &AppState, info: &AppBranchInfo, user_id: Uuid, kind: Code
         info!(kind = kind.as_str(), "an app user's code limit is used up; nothing sent");
         return;
     };
-    let request = CodeRequest::new(&user, kind, Delivery::Email);
+    let mut request = CodeRequest::new(&user, kind, Delivery::Email);
+    request.project_name = mail_name(info);
     match s.identity.create_code(&pool(info), &request).await {
         Ok(_) => {}
         Err(IdentityError::CodeRecentlySent) => {
@@ -1570,7 +1583,7 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
         let Some(slot) = reserve_code_issue(&s.limiter, CodeKind::EmailChange, &sub) else {
             return Err(too_many());
         };
-        return match s.identity.create_email_change_code(&pool, &sub, &email, None).await {
+        return match s.identity.create_email_change_code(&pool, &sub, &email, mail_name(&info)).await {
             Ok(_) => {
                 let body = EmailChangePending { confirmation_required: true };
                 Ok((StatusCode::ACCEPTED, Json(body)).into_response())
@@ -1585,7 +1598,7 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
             Err(e) => Err(email_write_refused(e)),
         };
     }
-    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true).await {
+    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true, mail_name(&info)).await {
         return Err(email_write_refused(e));
     }
     publish_sync(
@@ -1651,7 +1664,7 @@ async fn change_email_confirm(
     }
     match s
         .identity
-        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim())
+        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim(), mail_name(&info))
         .await
     {
         Ok(_) => {}

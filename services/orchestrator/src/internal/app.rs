@@ -216,9 +216,10 @@ async fn end_identity_sessions<M, L>(state: &InternalState<M, L>, sessions: &[Ap
 
 // --- Branch info -----------------------------------------------------------------------------
 
-/// What `auth` needs for a branch: the project's app-user settings, the branch the users table
-/// lives on (`target_branch_id`, R5) and how to reach it as the sync role (`sync`, or null
-/// when that branch has no running compute or no sync password yet).
+/// What `auth` needs for a branch: the project's app-user settings and name (app-user mail
+/// shows it), the branch the users table lives on (`target_branch_id`, R5) and how to reach it
+/// as the sync role (`sync`, or null when that branch has no running compute or no sync
+/// password yet).
 async fn branch_info<M, L>(State(state): AppState<M, L>, Path(branch_id): Path<Uuid>) -> Response
 where
     M: NeonMetadataPort,
@@ -235,11 +236,11 @@ where
         Ok(None) => return disabled(),
         Err(e) => return internal("app branch info", e),
     };
-    match m.project_by_id(project).await {
-        Ok(Some(p)) if p.status == ProjectStatus::Active => {}
+    let project_name = match m.project_by_id(project).await {
+        Ok(Some(p)) if p.status == ProjectStatus::Active => p.name,
         Ok(_) => return disabled(),
         Err(e) => return internal("app branch info", e),
-    }
+    };
     let auth = match m.project_auth(project).await {
         Ok(Some(a)) => a,
         Ok(None) => return disabled(),
@@ -271,6 +272,7 @@ where
         "schema": auth.schema_name,
         "table": auth.table_name,
         "target_branch_id": target.id,
+        "project_name": project_name,
         "sync": sync,
     }))
     .into_response()

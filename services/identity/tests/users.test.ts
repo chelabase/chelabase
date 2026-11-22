@@ -239,6 +239,20 @@ describeDb("users", () => {
       expect((await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${user.id}/email`, { body: { email: at("x"), notify_previous: "yes" } })).status).toBe(400);
     });
 
+    it("set_email notice names the project", async () => {
+      const user = await mkUser();
+      const before = sink.messages.length;
+      await setEmail(user.id, { email: at("new"), notify_previous: true, project_name: "Acme" });
+      expect(sink.messages.length).toBe(before + 1);
+      expect(sink.messages.at(-1)!.data).toContain("Your Acme email address was changed");
+      // A name that isn't one line is refused before anything changes.
+      const r = await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${user.id}/email`, {
+        body: { email: at("x"), notify_previous: true, project_name: "Acme\nInc" },
+      });
+      expect(r.status).toBe(400);
+      expect(sink.messages.length).toBe(before + 1);
+    });
+
     it("set_email without notify_previous mails nothing", async () => {
       const user = await mkUser();
       const before = sink.messages.length;

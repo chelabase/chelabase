@@ -66,6 +66,11 @@ function optText(body: Record<string, unknown>, key: string, max: number): strin
   return v;
 }
 
+/** `project_name`: shown in the mail; a single line of at most MAX_PROJECT characters. */
+export function optProjectName(body: Record<string, unknown>): string | undefined {
+  return optText(body, "project_name", MAX_PROJECT);
+}
+
 /** An absolute http(s) URL, as given. */
 function optLink(body: Record<string, unknown>): string | undefined {
   const v = optText(body, "link", MAX_LINK);
@@ -217,6 +222,8 @@ export function codeRoutes(): Route[] {
           throw new HttpError(400, "invalid_request", "code must be six digits");
         }
         const next = newEmail(body, kind);
+        // Named in the email-changed notice an `email_change` sends.
+        const project = optProjectName(body) ?? DEFAULT_PROJECT;
         const takesPassword = kind === "reset" || kind === "invite";
         const password = body.new_password;
         if (!takesPassword && password !== undefined) {
@@ -255,7 +262,7 @@ export function codeRoutes(): Route[] {
             // revokes the user's other outstanding codes in the same statement.
             const swapped = await auth.codes.changeEmail(id, next, true, user.email);
             if (!swapped) throw invalidCode();
-            await notifyEmailChanged(mailer, swapped.previous);
+            await notifyEmailChanged(mailer, swapped.previous, project);
             return { status: 200, body: { user: userOut(await requireUser(ctx, id)) } };
           }
           if (kind === "verify") {
