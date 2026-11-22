@@ -174,7 +174,9 @@ psql_on "$db_id" -c "ALTER TABLE users ADD COLUMN display_name text NOT NULL" >/
 export GATEWAY_URL="$GATEWAY" PUBLIC_KEY STATE_DIR="$tmp" STAMP="$(hex 3)"
 sdk signup-refused
 pass "sign-up without the NOT NULL column: 422 constraint_violation"
-psql_on "$db_id" -c "GRANT INSERT (display_name) ON users TO authenticated" >/dev/null
+# Sign-up data needs INSERT on the column; editing it on the own row needs UPDATE on it (the
+# users table grants authenticated UPDATE per column, never on the whole table).
+psql_on "$db_id" -c "GRANT INSERT (display_name), UPDATE (display_name) ON users TO authenticated" >/dev/null
 sdk signup
 user_a="$(jq -r '.a.id' "$tmp/users.json")"
 user_b="$(jq -r '.b.id' "$tmp/users.json")"
