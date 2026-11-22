@@ -42,7 +42,8 @@
 #   9. the MCP server and its sandbox runtime (mcp-core m8): profile `mcp` only (a render without
 #      it has neither); `mcp-runtime` alone with `mcp` on the internal `mcp-sandbox` network, with
 #      no secret, volume, port or setting; `mcp` mounts only the member public key and binds its
-#      public listener on the default network's alias, its internal one on `mcp-sandbox`'s.
+#      public listener on the default network's alias, its internal one on `mcp-sandbox`'s; each
+#      has an exact set of compose keys (nothing like cap_add, pid or devices can be added).
 # Every render takes every profile (sites, runner, services, mcp), so profiled services
 # are checked.
 set -euo pipefail
@@ -611,6 +612,17 @@ for render in "${renders[@]}"; do
     | select(.value | tojson | test("mcp-internal|mcp-runtime:")) | .key' "$f" | sort | tr '\n' ' ')"
   [[ -z "$got" ]] || err "$render: [$got] names the runtime or mcp's internal listener"
 done
+# Exact key sets in the base file (audit S2, N1): a key outside these (cap_add, privileged, pid,
+# ipc, devices, extra_hosts, dns, tmpfs, env_file, ports, …) fails here, whatever its value; the
+# checks above pin the values of the keys that are allowed. The runtime keeps its image's
+# entrypoint (the watchdog).
+got="$(jq -c '.services["mcp-runtime"] // {} | keys' "$tmp/base.json")"
+[[ "$got" == '["cap_drop","command","entrypoint","healthcheck","image","mem_limit","memswap_limit","networks","pids_limit","profiles","read_only","restart","security_opt","user"]' ]] ||
+  err "mcp-runtime has other compose keys than the allowed set: got $got"
+[[ "$(jq -c '.services["mcp-runtime"].entrypoint' "$tmp/base.json")" == null ]] || err "mcp-runtime keeps its image's entrypoint (the watchdog)"
+got="$(jq -c '.services.mcp // {} | keys' "$tmp/base.json")"
+[[ "$got" == '["cap_drop","command","depends_on","entrypoint","environment","healthcheck","image","networks","profiles","read_only","restart","security_opt","volumes"]' ]] ||
+  err "mcp has other compose keys than the allowed set: got $got"
 # mcp's mounts in the base file: exactly the member public key, read-only, from the volume; no
 # other volume, bind or secret. The runtime is in check 1's table with no line (it mounts nothing).
 got="$(jq -c '.services.mcp // {} | [(.volumes // [])[] | {type, source, target, read_only, subpath: .volume.subpath}] + [(.secrets // [])[]]' "$tmp/base.json")"
