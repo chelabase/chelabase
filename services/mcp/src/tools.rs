@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app::{Audit, audit};
 use crate::auth::Caller;
+use crate::host::Journal;
 use crate::limits::{self, Admission};
 use crate::runtime::new_exec_id;
 use crate::sandbox::{ErrorCode, Kind, Outcome, Ran, Run, Sandbox};
@@ -330,6 +331,7 @@ pub async fn call(
     };
     let started = Instant::now();
     let exec_id = new_exec_id();
+    let journal = Arc::new(Journal::new(request_id));
     let mut retry_after_ms = None;
     let ran: Option<Ran> = if call.code.len() > MAX_CODE_BYTES {
         Some(
@@ -358,6 +360,7 @@ pub async fn call(
                     destructive: call.destructive,
                     caller: caller.clone(),
                     exec_id: exec_id.clone(),
+                    journal: journal.clone(),
                 });
                 // A client that goes away ends the run: dropping its future drops the runtime
                 // request, the exec_id registration and the slot.
@@ -390,7 +393,21 @@ pub async fn call(
         return Err(ErrorData::internal_error("the client went away", None));
     };
     let mut truncated = false;
-    let (mut result, outcome_name, result_bytes) = match ran.outcome {
+    // An execute run's refusal, or the calls a timed-out run made, replace what the code gave.
+    let host_error = match call.kind {
+        Kind::Execute => execute_error(&journal, &ran.outcome),
+        Kind::Search => None,
+    };
+    let (mut result, outcome_name, result_bytes) = match host_error {
+        Some((body, code)) => {
+            let bytes = body.len();
+            (
+                CallToolResult::error(vec![ContentBlock::text(body)]),
+                code,
+                bytes,
+            )
+        }
+        None => match ran.outcome {
         Outcome::Value(value) => {
             let (text, cut) = limits::truncate(value.to_string(), toolbox.result_max_bytes);
             truncated = cut;
@@ -411,6 +428,7 @@ pub async fn call(
                 bytes,
             )
         }
+        },
     };
     if let Some(logs) = limits::logs_text(&ran.logs) {
         result
@@ -439,6 +457,49 @@ pub async fn call(
         log_code,
     );
     Ok(result)
+}
+
+/// The tool error that replaces an `execute` run's outcome, with its code: the run's sticky
+/// refusal (whatever the code returned, so a `try` cannot hide it), or for a timed-out run the
+/// calls it already made with their statuses (`unknown` for one cut), so a write that happened
+/// is never silent.
+fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'static str)> {
+    if let Some(refusal) = journal.refusal() {
+        let body = json!({"error": {
+            "code": refusal.code.as_str(),
+            "message": refusal.code.message(),
+            "operations": refusal.operations,
+        }});
+        return Some((body.to_string(), refusal.code.as_str()));
+    }
+    let Outcome::Error {
+        code: ErrorCode::Timeout,
+        message,
+    } = outcome
+    else {
+        return None;
+    };
+    let made = journal.made();
+    if made.is_empty() {
+        return None;
+    }
+    let calls: Vec<Value> = made
+        .iter()
+        .map(|m| {
+            let status = m.status.map_or_else(|| json!("unknown"), |s| json!(s));
+            json!({"operation": m.operation, "status": status})
+        })
+        .collect();
+    let mut message = message.clone();
+    if journal.sql_cut() {
+        message.push_str(
+            "; a SQL run was cut at the deadline: its earlier statements may have been applied",
+        );
+    } else if made.iter().any(|m| m.status.is_none()) {
+        message.push_str("; a call was cut at the deadline: it may have been applied");
+    }
+    let body = json!({"error": {"code": ErrorCode::Timeout.as_str(), "message": message, "calls": calls}});
+    Some((body.to_string(), ErrorCode::Timeout.as_str()))
 }
 
 fn hex(bytes: &[u8]) -> String {

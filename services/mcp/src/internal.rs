@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::Query;
@@ -16,6 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::auth::Caller;
+use crate::host::Journal;
 use crate::sandbox::Kind;
 use crate::tools::BUNDLE;
 
@@ -42,6 +44,38 @@ pub struct Exec {
     pub kind: Kind,
     pub caller: Caller,
     pub destructive: bool,
+    /// What the run's API calls did, shared with the tool call that started it.
+    pub journal: Arc<Journal>,
+    /// When the run's time is up: no API call is forwarded after it.
+    pub deadline: Instant,
+    /// Set when the run's registration drops: a call in flight is cut then.
+    ended: tokio::sync::watch::Sender<bool>,
+}
+
+impl Exec {
+    pub fn new(
+        kind: Kind,
+        caller: Caller,
+        destructive: bool,
+        journal: Arc<Journal>,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            kind,
+            caller,
+            destructive,
+            journal,
+            deadline,
+            ended: tokio::sync::watch::Sender::new(false),
+        }
+    }
+
+    /// Resolves once the run has ended (at once if it already has).
+    pub async fn ended(&self) {
+        let mut ended = self.ended.subscribe();
+        // The sender lives in `self`, so this only returns when the flag is set.
+        let _ = ended.wait_for(|e| *e).await;
+    }
 }
 
 /// The runs in flight, by `exec_id`. Cheap to clone.
@@ -89,7 +123,10 @@ impl Registry {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.registry.map().remove(&self.exec_id);
+        let exec = self.registry.map().remove(&self.exec_id);
+        if let Some(exec) = exec {
+            exec.ended.send_replace(true);
+        }
     }
 }
 

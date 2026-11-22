@@ -170,11 +170,13 @@ impl Sandbox for Runtime {
     async fn run(&self, run: Run) -> Ran {
         let registration = self.registry.register(
             &run.exec_id,
-            Exec {
-                kind: run.kind,
-                caller: run.caller.clone(),
-                destructive: run.destructive,
-            },
+            Exec::new(
+                run.kind,
+                run.caller.clone(),
+                run.destructive,
+                run.journal.clone(),
+                std::time::Instant::now() + self.timeout,
+            ),
         );
         let ran = match tokio::time::timeout(self.timeout + GRACE, self.post(&run)).await {
             Ok(ran) => ran,

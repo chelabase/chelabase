@@ -39,3 +39,6 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 chelabase-auth = { workspace = true, features = ["test-support"] }
+# The gateway's own route matcher: the property test checks the host's matcher against it.
+chelabase-routes = { workspace = true }
+proptest = { workspace = true }
