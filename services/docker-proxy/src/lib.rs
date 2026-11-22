@@ -1,0 +1,51 @@
+//! The policy core of the workbench's Docker API proxy (workbench-stack-isolation).
+//!
+//! Four workbench services talk to Docker. Each gets its own socket on a per-stack proxy, and
+//! this crate decides, with pure functions and no I/O:
+//!
+//! - which API call a request is ([`classify`]): a closed [`Op`] enum, so anything not listed
+//!   is denied;
+//! - whether a client may make it ([`Profile::allows`], [`Profile::allows_target`],
+//!   [`Profile::allows_connect_container`]);
+//! - whether an object belongs to the stack ([`in_scope`]), and how creates and lists are
+//!   confined to it ([`force_labels`], [`reserved_image_labels`], [`scope_list_query`],
+//!   [`post_filter_list`]).
+//!
+//! - whether a create, exec, connect or volume body is safe to forward ([`body`]): a strict
+//!   parser and byte-exact allowlists at every level, labels forced.
+//!
+//! The server that forwards (m4) builds on this.
+
+pub mod body;
+pub mod ops;
+pub mod profile;
+pub mod scope;
+
+pub use body::{
+    NetworkConnect, RefKind, Scope, parse_strict, validate_container_create, validate_exec_create,
+    validate_network_connect, validate_network_create, validate_volume_create,
+};
+pub use ops::{ImagePull, ImageRef, Op, OpKind, classify, parse_query};
+pub use profile::{LabelMatch, MountType, OpRule, Preset, PresetConfig, Profile};
+pub use scope::{
+    COMPOSE_PROJECT_LABEL, Labels, STACK_LABEL, Stack, force_labels, in_scope, post_filter_list,
+    reserved_image_labels, scope_list_query,
+};
+
+/// A refusal, with the reason the proxy logs and returns (403).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deny(pub String);
+
+impl Deny {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self(reason.into())
+    }
+}
+
+impl std::fmt::Display for Deny {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Deny {}

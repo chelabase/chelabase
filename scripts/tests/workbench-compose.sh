@@ -94,6 +94,18 @@ for s in orchestrator worker gateway auth rest realtime studio; do
     | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/(storage|functions)-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
+# Stack isolation (#110): the state dirs of every stack live under the shared keys dir, which
+# every checkout mount covers. Every service that binds the whole checkout also has the read-only
+# tmpfs mask at the keys dir, and no service binds anything under another stack's state dir.
+for s in $(q '.services | to_entries[] | select(any(.value.volumes[]?; .type == "bind" and .target == "/w/feat-x")) | .key'); do
+  [[ -n "$(q ".services[\"$s\"].volumes[] | select(.type == \"tmpfs\" and .target == \"/m/.chelabase\" and (.read_only // false))
+    | .target")" ]] || fail "$s binds the whole checkout without the read-only keys-dir mask (another stack's state dir would show)"
+done
+foreign="$(q '[.services | to_entries[] | .key as $s | .value.volumes[]?
+  | select((.source // "") | startswith("/m/.chelabase/stacks/"))
+  | select((.source | . == "/m/.chelabase/stacks/feat-x" or startswith("/m/.chelabase/stacks/feat-x/")) | not)
+  | "\($s) \(.source)"] | .[]')"
+[[ -z "$foreign" ]] || fail "a service binds another stack's state dir: $foreign"
 for s in mailpit identity orchestrator worker gateway auth rest functions service-runner; do
   [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
 done
