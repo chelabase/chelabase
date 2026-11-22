@@ -40,6 +40,10 @@ Because the schema is written by hand next to a hand-written parser, a fidelity 
 - the schema and the parser reject the same invalid inputs, and accept the same edge inputs;
 - the known gaps (inputs the schema accepts but the parser rejects, such as keys that differ between insert rows or an alias of 32 multi-byte characters) are exactly the listed ones.
 
+### The MCP spec bundle
+
+`openapi/mcp.json` is not a fifth public document. It is the single resolved document the MCP server's `search` tool queries and `execute` checks calls against, built by `services/mcp/src/spec.rs` from `management.json` and `data.json`: every `$ref` is inlined (a schema that reaches itself ends in an `x-circular` marker), error responses fold into `x-errors`, and the console query route's `tree` carries the data API's query schema. `info` records `x-spec-hash` and the hash of each source document. The `spec_bundle_is_current` test in the `mcp` crate keeps it current, and `just api-gen` rewrites it.
+
 ## Regenerating
 
 After changing any route, its request or response types, or an error code, run:

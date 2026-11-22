@@ -1,0 +1,14 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase MCP server: the spec bundle a model searches and calls are checked against"
+
+[lib]
+name = "mcp"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+sha2 = { workspace = true }
