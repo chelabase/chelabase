@@ -1113,7 +1113,7 @@ where
         let secure = security_items(&merge);
         let old: HashSet<&str> = merge.acknowledgements.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let new: HashSet<&str> = acks.iter().map(String::as_str).collect();
-        if new.symmetric_difference(&old).any(|item| secure.contains(*item)) {
+        if new.symmetric_difference(&old).any(|item| secure.covers(item)) {
             return Err(admin_only());
         }
     }
@@ -1140,26 +1140,50 @@ where
 // ---- actions ------------------------------------------------------------------------------
 
 /// Whether the plan has a security step (BYPASSRLS, owner-level; E28): applying it needs Admin.
+/// Fails closed: a plan whose `steps` isn't a list counts.
 fn has_security_steps(merge: &MergeRecord) -> bool {
-    merge
-        .plan
-        .as_ref()
-        .and_then(|p| p["steps"].as_array())
-        .into_iter()
-        .flatten()
-        .any(|step| match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
-            Ok(s) => s.security,
-            // A step this build can't read: by its flag, as the engine writes it; without one it
-            // counts as a security step (an access check fails closed).
-            Err(_) => step["security"].as_bool().unwrap_or(true),
-        })
+    let Some(plan) = merge.plan.as_ref() else {
+        return false;
+    };
+    let Some(steps) = plan["steps"].as_array() else {
+        return true;
+    };
+    steps.iter().any(|step| match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
+        Ok(s) => s.security,
+        // A step this build can't read: by its flag, as the engine writes it; without one it
+        // counts as a security step (an access check fails closed).
+        Err(_) => step["security"].as_bool().unwrap_or(true),
+    })
+}
+
+/// The items acknowledging which is an Admin's act (R25).
+#[derive(Debug, PartialEq, Eq)]
+enum SecurityItems {
+    /// The plan's `steps` can't be read: every item counts (an access check fails closed).
+    Unreadable,
+    /// The security steps' items, or a step's id when it has none.
+    Listed(HashSet<String>),
+}
+
+impl SecurityItems {
+    fn covers(&self, item: &str) -> bool {
+        match self {
+            SecurityItems::Unreadable => true,
+            SecurityItems::Listed(items) => items.contains(item),
+        }
+    }
 }
 
 /// The items an acknowledgement of a security step goes by: the step's items, or its id when
 /// it has none (as `unacknowledged` reads them).
-fn security_items(merge: &MergeRecord) -> HashSet<String> {
+fn security_items(merge: &MergeRecord) -> SecurityItems {
+    let steps = match merge.plan.as_ref().map(|p| p["steps"].as_array()) {
+        None => return SecurityItems::Listed(HashSet::new()),
+        Some(None) => return SecurityItems::Unreadable,
+        Some(Some(steps)) => steps,
+    };
     let mut items = HashSet::new();
-    for step in merge.plan.as_ref().and_then(|p| p["steps"].as_array()).into_iter().flatten() {
+    for step in steps {
         let secure = match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
             Ok(s) => s.security,
             Err(_) => step["security"].as_bool().unwrap_or(true),
@@ -1174,7 +1198,7 @@ fn security_items(merge: &MergeRecord) -> HashSet<String> {
             items.extend(listed.into_iter().map(str::to_string));
         }
     }
-    items
+    SecurityItems::Listed(items)
 }
 
 fn admin_only() -> ApiError {
@@ -1910,5 +1934,93 @@ where
         )
             .into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn merge_with(plan: Option<Value>) -> MergeRecord {
+        let now = Utc::now();
+        MergeRecord {
+            id: Uuid::new_v4(),
+            database_id: Uuid::new_v4(),
+            source_branch_id: Uuid::new_v4(),
+            target_branch_id: Uuid::new_v4(),
+            direction: MergeDirection::IntoParent,
+            database_name: "app".into(),
+            status: MergeStatus::Draft,
+            failed_phase: None,
+            version: 1,
+            base_fingerprint: None,
+            source_fingerprint: None,
+            target_fingerprint: None,
+            analysis: None,
+            resolutions: json!([]),
+            user_steps: json!([]),
+            acknowledgements: json!([]),
+            options: json!({}),
+            plan,
+            rehearsal: None,
+            result: None,
+            rebaselined: false,
+            error: None,
+            claimed_at: None,
+            created_by: "test".into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// A step this build reads, with the given security flag.
+    fn step(id: &str, security: bool) -> Value {
+        let step = json!({
+            "id": id, "kind": "generated", "phase": "tx", "sql": "SELECT 1", "items": [],
+            "data_loss": false, "rewrite": false, "security": security, "locks": [],
+            "role_op": null, "online": null,
+        });
+        serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()).expect("a readable step");
+        step
+    }
+
+    fn malformed_plans() -> Vec<Value> {
+        vec![
+            json!({ "steps": { "s1": step("s1", false) } }),
+            json!({ "steps": null }),
+            json!({}),
+            json!({ "steps": "s1" }),
+            json!([step("s1", false)]),
+        ]
+    }
+
+    #[test]
+    fn malformed_plan_counts_as_security_steps() {
+        for plan in malformed_plans() {
+            assert!(has_security_steps(&merge_with(Some(plan.clone()))), "{plan}");
+        }
+    }
+
+    #[test]
+    fn plain_plan_has_no_security_steps() {
+        let plain = merge_with(Some(json!({ "steps": [step("s1", false), step("s2", false)] })));
+        assert!(!has_security_steps(&plain));
+        assert_eq!(security_items(&plain), SecurityItems::Listed(HashSet::new()));
+        let none = merge_with(Some(json!({ "steps": [] })));
+        assert!(!has_security_steps(&none));
+        // No plan yet: nothing to apply, as `has_user_sql_steps` reads it.
+        assert!(!has_security_steps(&merge_with(None)));
+        let secure = merge_with(Some(json!({ "steps": [step("s1", false), step("s2", true)] })));
+        assert!(has_security_steps(&secure));
+        assert_eq!(security_items(&secure), SecurityItems::Listed(HashSet::from(["s2".to_string()])));
+    }
+
+    #[test]
+    fn malformed_plan_makes_every_item_a_security_item() {
+        for plan in malformed_plans() {
+            let items = security_items(&merge_with(Some(plan.clone())));
+            assert_eq!(items, SecurityItems::Unreadable, "{plan}");
+            assert!(items.covers("s1") && items.covers("any item"), "{plan}");
+        }
     }
 }
