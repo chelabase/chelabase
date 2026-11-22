@@ -6608,10 +6608,41 @@ async fn sql_confirm_required_is_audited_without_sql() {
         format!("sql_sha256={sha}"),
         "protected=false".to_string(),
         "confirmed=false".to_string(),
+        "read_only=false".to_string(),
     ] {
         assert!(line.contains(&field), "{field} missing from {line}");
     }
     assert!(!text.contains("secret_table_4111"), "SQL reached the log:\n{text}");
+}
+
+#[tokio::test]
+async fn read_only_script_refusal_is_audited_without_sql() {
+    use sha2::Digest;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let t = sql_app().await;
+    let main = t.main();
+    let sql = "SELECT 1; DELETE FROM secret_table_4112";
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, with(json!({ "run_id": id, "sql": sql }), "read_only", json!(true))).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "read_only_script_refused");
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 1, "{text}");
+    let sha = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+    for field in [
+        "user=user-1".to_string(),
+        format!("branch_id={}", main.as_uuid()),
+        "role=owner".to_string(),
+        format!("run_id={id}"),
+        "outcome=read_only_script_refused".to_string(),
+        "refused=DeleteStmt".to_string(),
+        "read_only=true".to_string(),
+        format!("sql_sha256={sha}"),
+    ] {
+        assert!(audit[0].contains(&field), "{field} missing from {}", audit[0]);
+    }
+    assert!(!text.contains("secret_table_4112"), "SQL reached the log:\n{text}");
 }
 
 #[tokio::test]
