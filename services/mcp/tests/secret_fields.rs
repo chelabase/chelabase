@@ -139,8 +139,16 @@ fn walk(schema: &Value, at: &str, name: &str, desc: &str, out: &mut Vec<Finding>
     if let Some(items) = map.get("items") {
         walk(items, &format!("{at}/*"), name, desc, out);
     }
-    if let Some(values) = map.get("additionalProperties").filter(|v| v.is_object()) {
-        walk(values, &format!("{at}/{{}}"), name, desc, out);
+    // `true` is as untyped as a schema-less value: any extra key could hold anything.
+    if let Some(values) = map
+        .get("additionalProperties")
+        .filter(|v| v.is_object() || **v == Value::Bool(true))
+    {
+        if values.is_object() {
+            walk(values, &format!("{at}/{{}}"), name, desc, out);
+        } else {
+            out.push(Finding::Opaque(format!("{at}/{{}}")));
+        }
     }
     if types(map).contains("string") && (looks_like_credential(name) || looks_like_credential(desc))
     {
@@ -318,10 +326,30 @@ fn untyped_answers_are_hand_classified() {
             json!({"type": "object", "properties": {"loop": {"x-circular": "Node"}}}),
             "/loop",
         ),
+        // Named properties next to free-form extra keys: the extra keys are untyped.
+        (
+            json!({"type": "object", "properties": {"id": {"type": "string"}},
+                "additionalProperties": true}),
+            "/{}",
+        ),
+        (
+            json!({"type": "object", "properties": {"id": {"type": "string"}},
+                "additionalProperties": {}}),
+            "/{}",
+        ),
     ] {
         assert_eq!(
             unlisted(&fixture("fixtureUntyped", schema)),
             [format!("fixtureUntyped application/json Opaque({at:?})")]
+        );
+    }
+    // `additionalProperties: false` or a typed schema leaves nothing unchecked.
+    for extra in [json!(false), json!({"type": "string", "format": "uuid"})] {
+        let schema = json!({"type": "object", "properties": {"id": {"type": "string"}},
+            "additionalProperties": extra});
+        assert_eq!(
+            unlisted(&fixture("fixtureClosed", schema)),
+            Vec::<String>::new()
         );
     }
     // A success answer that isn't JSON is classified as a whole.

@@ -110,6 +110,9 @@ pub static CREDENTIAL_FIELDS: &[(&str, &[(Pointer, Kind)])] = &[
 /// spec's `url`. The role routes take no password (the API generates them).
 pub static SECRET_INPUTS: &[(&str, &[Pointer])] = &[
     // `PutSecretRequest.value` (functions.rs): `listFunctionSecrets` answers names only.
+    // Not truly write-only: the value reaches the function's environment, and the same caller
+    // can deploy and run that function's code, which can read it back. Whether to keep it
+    // here is decided in epic `mcp-sealed` (#378).
     ("putFunctionSecret", &["/value"]),
     // `CreateAppUserRequest.password` (app_user_admin.rs): the identity service keeps a hash.
     ("createAppUser", &["/password"]),
