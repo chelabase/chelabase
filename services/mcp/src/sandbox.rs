@@ -4,7 +4,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use std::sync::Arc;
+
 use crate::auth::Caller;
+use crate::host::Journal;
 
 /// Which tool the code was sent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub struct Run {
     /// The run's random id (256 bits, hex): it names the run in the runtime's callbacks and
     /// in the audit line.
     pub exec_id: String,
+    /// What the run's API calls do (`execute`), read by the tool call once the run ends.
+    pub journal: Arc<Journal>,
 }
 
 /// Why a run gave no value.

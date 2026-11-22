@@ -105,11 +105,27 @@ pub enum Refusal {
 #[derive(Clone)]
 pub struct Authenticator {
     verifier: MemberTokenVerifier,
+    min_remaining: u64,
 }
 
 impl Authenticator {
     pub fn new(verifier: MemberTokenVerifier) -> Self {
-        Self { verifier }
+        Self {
+            verifier,
+            min_remaining: MIN_REMAINING_SECS,
+        }
+    }
+
+    /// Requires `secs` left on a token (never less than [`MIN_REMAINING_SECS`]): a run plus
+    /// its margin must fit in what the credential has left (m11, #355).
+    pub fn with_min_remaining(mut self, secs: u64) -> Self {
+        self.min_remaining = secs.max(MIN_REMAINING_SECS);
+        self
+    }
+
+    /// The least lifetime a token must have left.
+    pub fn min_remaining(&self) -> u64 {
+        self.min_remaining
     }
 
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, Refusal> {
@@ -123,7 +139,7 @@ impl Authenticator {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .map_err(|_| Refusal::Invalid)?;
-        if claims.exp < now.saturating_add(MIN_REMAINING_SECS) {
+        if claims.exp < now.saturating_add(self.min_remaining) {
             return Err(Refusal::ExpiresSoon);
         }
         // Only the exact value narrows, and any one of repeated headers is enough; nothing here

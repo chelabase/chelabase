@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use mcp::app::router;
 use mcp::config::{Config, resolve_all};
+use mcp::host::Host;
 use mcp::internal::Registry;
 use mcp::runtime::Runtime;
 use mcp::sandbox::{Sandbox, Unavailable};
@@ -50,6 +51,14 @@ async fn main() -> anyhow::Result<()> {
         internal_addrs.iter().all(|a| !public_addrs.contains(a)),
         "CHELABASE_MCP_LISTEN and CHELABASE_MCP_INTERNAL_LISTEN must name different addresses"
     );
+    let host = Arc::new(Host::new(
+        &config.host,
+        &config.settings.api_base,
+        registry.clone(),
+    )?);
+    if config.host.api_url.is_none() {
+        warn!("CHELABASE_MCP_API_URL is unset: every API call from execute answers upstream_unavailable");
+    }
     let app = router(config.settings, config.verifier, sandbox);
     let mut servers = tokio::task::JoinSet::new();
     for addr in &public_addrs {
@@ -59,11 +68,9 @@ async fn main() -> anyhow::Result<()> {
     }
     for addr in &internal_addrs {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        let app = mcp::internal::router();
+        let app = mcp::internal::router().merge(mcp::host::router(host.clone()));
         servers.spawn(async move { axum::serve(listener, app).await });
     }
-    // m11 (#355)'s callback reads the registry.
-    let _ = registry;
     info!("mcp listening on {public_addrs:?}, internal {internal_addrs:?}");
     // The first listener to end ends the service.
     if let Some(ended) = servers.join_next().await {

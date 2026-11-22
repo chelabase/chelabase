@@ -7,6 +7,7 @@ use chelabase_auth::member_token::MemberTokenVerifier;
 use chelabase_types::entry::Entry;
 
 use crate::app::Settings;
+use crate::host::HostConfig;
 use crate::limits::Limits;
 
 pub struct Config {
@@ -20,6 +21,9 @@ pub struct Config {
     /// `runtime_unavailable`.
     pub runtime_url: Option<String>,
     pub settings: Settings,
+    /// `CHELABASE_MCP_API_URL`, `CHELABASE_MCP_MAX_CALLS`, `CHELABASE_MCP_RESPONSE_MAX_BYTES`:
+    /// where and how `execute`'s API calls are forwarded.
+    pub host: HostConfig,
     /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` with the issuer from `CHELABASE_AUTH_HOST`. Required:
     /// without it no request could be authenticated.
     pub verifier: MemberTokenVerifier,
@@ -56,6 +60,7 @@ impl Config {
             );
         }
         let limits = Limits::from_lookup(&get)?;
+        let host = HostConfig::from_lookup(&get)?;
         // The same entry the gateway reads, so the challenge it sends and this one agree.
         let entry = Entry::from_lookup(&get).map_err(|e| anyhow::anyhow!(e.0))?;
         let verifier = MemberTokenVerifier::from_lookup(&get)
@@ -84,6 +89,7 @@ impl Config {
                 log_code,
                 limits,
             },
+            host,
             verifier,
         })
     }

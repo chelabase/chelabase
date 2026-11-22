@@ -29,6 +29,8 @@ pub const MAX_BODY: usize = 256 * 1024;
 pub const ENDPOINT_PATH: &str = "/mcp";
 pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 pub const METADATA_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
+/// What a member token must have left past a run's timeout (the client mints a new one).
+pub const EXECUTE_MARGIN_SECS: u64 = 10;
 
 /// What the router needs from the configuration.
 pub struct Settings {
@@ -46,6 +48,8 @@ pub struct Settings {
 
 struct Gate {
     auth: Authenticator,
+    /// The 401 message, naming the least lifetime a token needs.
+    unauthorized: String,
     challenge: HeaderValue,
     allowed_origins: Vec<String>,
 }
@@ -69,8 +73,15 @@ pub fn router(
 ) -> Router {
     let api_base = settings.api_base.trim_end_matches('/').to_owned();
     let challenge = format!(r#"Bearer resource_metadata="{api_base}{METADATA_MCP_PATH}""#);
+    // An `execute` must not outlive its credential: the run's timeout plus 10 s.
+    let auth = Authenticator::new(verifier)
+        .with_min_remaining(settings.limits.timeout.as_secs_f64().ceil() as u64 + EXECUTE_MARGIN_SECS);
     let gate = Arc::new(Gate {
-        auth: Authenticator::new(verifier),
+        unauthorized: format!(
+            "a member token with at least {} seconds left is required",
+            auth.min_remaining()
+        ),
+        auth,
         challenge: HeaderValue::from_str(&challenge)
             .expect("the API origin is a valid header value"),
         allowed_origins: settings
@@ -146,7 +157,7 @@ async fn gate_request(State(gate): State<Arc<Gate>>, mut request: Request, next:
             let mut response = error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
-                "a member token with at least 60 seconds left is required",
+                &gate.unauthorized,
             );
             response
                 .headers_mut()
