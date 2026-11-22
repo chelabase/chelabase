@@ -60,6 +60,8 @@ struct Bridge {
     instance: String,
     read_only: bool,
     version: Mutex<Option<String>>,
+    /// Held while a token is read, refreshed or stored, so pipelined requests share one refresh.
+    tokens: tokio::sync::Mutex<()>,
     out: tokio::sync::Mutex<tokio::io::Stdout>,
 }
 
@@ -75,13 +77,19 @@ impl Bridge {
         let _ = out.flush().await;
     }
 
-    /// A fresh token: the kept one is dropped so the session mints another.
-    async fn fresh_bearer(&self) -> Result<String> {
-        let dir = login::config_dir();
-        let mut creds = login::load(&dir)?;
-        if let Some(l) = creds.get_mut(&self.instance) {
-            l.access_token = None;
-            login::store(&dir, &creds)?;
+    /// A member token. With `refused` (a token the instance rejected), the kept token is
+    /// dropped first, unless another request already replaced it.
+    async fn token(&self, refused: Option<&str>) -> Result<String> {
+        let _held = self.tokens.lock().await;
+        if let Some(refused) = refused {
+            let dir = login::config_dir();
+            let mut creds = login::load(&dir)?;
+            if let Some(l) = creds.get_mut(&self.instance)
+                && l.access_token.as_deref() == Some(refused)
+            {
+                l.access_token = None;
+                login::store(&dir, &creds)?;
+            }
         }
         login::bearer(&self.http, &self.instance).await
     }
@@ -90,7 +98,7 @@ impl Bridge {
     async fn post(&self, msg: &Value) -> Result<reqwest::Response> {
         let negotiated = self.version.lock().unwrap().clone();
         let headers = headers_for(msg, negotiated.as_deref());
-        let mut token = login::bearer(&self.http, &self.instance).await?;
+        let mut token = self.token(None).await?;
         for attempt in 0..2 {
             let mut req = self
                 .http
@@ -116,7 +124,7 @@ impl Bridge {
                 return Ok(resp);
             }
             if attempt == 0 {
-                token = self.fresh_bearer().await?;
+                token = self.token(Some(&token)).await?;
             }
         }
         anyhow::bail!(
@@ -148,15 +156,15 @@ impl Bridge {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"));
         if is_stream && status.is_success() {
-            let mut buffer = String::new();
+            let mut events = Events::default();
             while let Some(chunk) = resp.chunk().await.context("reading the event stream")? {
-                buffer.push_str(&String::from_utf8_lossy(&chunk).replace("\r\n", "\n"));
-                while let Some(end) = buffer.find("\n\n") {
-                    let event: String = buffer.drain(..end + 2).collect();
+                for event in events.push(&chunk) {
                     self.emit(sse_data(&event), initialize).await;
                 }
             }
-            self.emit(sse_data(&buffer), initialize).await;
+            if let Some(event) = events.finish() {
+                self.emit(sse_data(&event), initialize).await;
+            }
             return Ok(());
         }
         let body = resp.text().await.context("reading the answer")?;
@@ -189,6 +197,44 @@ impl Bridge {
     }
 }
 
+/// Splits an event stream's bytes into events (blank-line separated), decoding each whole event
+/// so a character split across chunks survives.
+#[derive(Default)]
+struct Events(Vec<u8>);
+
+impl Events {
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.0.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some((end, sep)) = self.boundary() {
+            let event: Vec<u8> = self.0.drain(..end + sep).collect();
+            out.push(String::from_utf8_lossy(&event[..end]).replace("\r\n", "\n"));
+        }
+        out
+    }
+
+    /// What is left when the stream ends (an event with no closing blank line).
+    fn finish(&mut self) -> Option<String> {
+        let rest = std::mem::take(&mut self.0);
+        let text = String::from_utf8_lossy(&rest).replace("\r\n", "\n");
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// The first blank line: its offset and length.
+    fn boundary(&self) -> Option<(usize, usize)> {
+        (0..self.0.len()).find_map(|i| {
+            let rest = &self.0[i..];
+            if rest.starts_with(b"\r\n\r\n") {
+                Some((i, 4))
+            } else if rest.starts_with(b"\n\n") {
+                Some((i, 2))
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// The `data:` payload of one SSE event (its lines joined), if any.
 fn sse_data(event: &str) -> Option<String> {
     let lines: Vec<&str> = event
@@ -212,6 +258,7 @@ pub async fn run(url: Option<String>, read_only: bool) -> Result<()> {
         instance,
         read_only,
         version: Mutex::new(None),
+        tokens: tokio::sync::Mutex::new(()),
         out: tokio::sync::Mutex::new(tokio::io::stdout()),
     });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -271,5 +318,24 @@ mod tests {
         let h = headers_for(&list, Some("2026-07-28"));
         assert_eq!(h.method.as_deref(), Some("tools/list"));
         assert_eq!(h.name, None);
+    }
+
+    #[test]
+    fn events_split_across_chunks_keep_their_characters() {
+        let text = "data: {\"t\":\"h\u{e9}llo \u{1f600}\"}\r\n\r\ndata: two\n\n";
+        let bytes = text.as_bytes();
+        // Every split point, including inside a multibyte character and inside "\r\n".
+        for cut in 0..bytes.len() {
+            let mut events = Events::default();
+            let mut got = events.push(&bytes[..cut]);
+            got.extend(events.push(&bytes[cut..]));
+            assert_eq!(events.finish(), None);
+            let data: Vec<_> = got.iter().map(|e| sse_data(e).unwrap()).collect();
+            assert_eq!(
+                data,
+                ["{\"t\":\"h\u{e9}llo \u{1f600}\"}", "two"],
+                "cut {cut}"
+            );
+        }
     }
 }
