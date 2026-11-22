@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chelabase_query::engine::{OWNER_PREAMBLE_SQL, PREAMBLE_SQL};
+use chelabase_query::engine::{OWNER_PREAMBLE_SQL, PREAMBLE_SQL, SESSION_CHECK_SQL};
 use chelabase_query::{QueryCache, QueryFailure, RunAs, RunSettings, console_session, schema_for};
 use http::StatusCode;
 use serde_json::json;
@@ -324,6 +324,11 @@ async fn a_role_session_sends_the_sequential_paths_statements() {
             begin(),
             format!("P {PREAMBLE_SQL}"),
             r#"B [Some("editor"), Some("{}"), Some("2000"), None]"#.to_owned(),
+            // Before the COMMIT: deferred work, then the check that the transaction still
+            // runs as the session's role.
+            "Q SET CONSTRAINTS ALL IMMEDIATE".to_owned(),
+            format!("P {SESSION_CHECK_SQL}"),
+            r#"B [Some("editor")]"#.to_owned(),
             "Q COMMIT".to_owned(),
             format!("Q {RESET}"),
         ]
@@ -359,6 +364,10 @@ async fn an_owner_session_sends_the_sequential_paths_statements() {
             begin(),
             format!("P {OWNER_PREAMBLE_SQL}"),
             r#"B [Some("2000")]"#.to_owned(),
+            // The owner's check names the owner's own user.
+            "Q SET CONSTRAINTS ALL IMMEDIATE".to_owned(),
+            format!("P {SESSION_CHECK_SQL}"),
+            r#"B [Some("owner")]"#.to_owned(),
             "Q COMMIT".to_owned(),
             format!("Q {RESET}"),
         ]

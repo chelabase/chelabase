@@ -3,7 +3,8 @@ import type { StorageRefDesc } from "@chelabase/management-client";
 import { File as FileIcon, FileAudio, FileImage, FileText, FileVideo } from "lucide-react";
 import { ObjectPreview, type PreviewSource } from "@/components/storage/browser/object-preview";
 import { baseName } from "@/components/storage/browser/paths";
-import { previewKind } from "@/components/storage/browser/preview-kind";
+import { useBlobUrl } from "@/components/storage/browser/blob-url";
+import { essenceOf, previewKind } from "@/components/storage/browser/preview-kind";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
@@ -78,6 +79,11 @@ export function StorageRefCell({ desc, value, resolved, canEdit, canSign, upload
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const request = refRequestOf(desc, value);
+  // An image (never SVG) from a URL that opens for the role, shown from a typed blob: URL (CSP).
+  const ok = !busy && resolved?.state === "ok" ? resolved : null;
+  const thumbType = ok ? guessContentType(ok.name) : null;
+  const thumb = ok !== null && previewKind(thumbType) === "image" && (ok.public || canSign);
+  const thumbUrl = useBlobUrl(thumb ? ok.url : null, essenceOf(thumbType));
 
   async function dropped(file: File) {
     const bucket = desc.kind === "path" ? desc.bucket : resolved?.state === "ok" ? resolved.bucket : null;
@@ -126,10 +132,9 @@ export function StorageRefCell({ desc, value, resolved, canEdit, canSign, upload
     );
   } else {
     const name = baseName(resolved.name);
-    const thumb = previewKind(guessContentType(resolved.name)) === "image" && (resolved.public || canSign);
     body = (
       <>
-        {thumb ? <img src={resolved.url} alt={name} loading="lazy" className="h-6 w-6 shrink-0 border border-line bg-ink object-cover" /> : <TypeIcon name={resolved.name} />}
+        {thumb ? thumbUrl ? <img src={thumbUrl} alt={name} className="h-6 w-6 shrink-0 border border-line bg-ink object-cover" /> : <span aria-hidden className="h-6 w-6 shrink-0 border border-line bg-ink" /> : <TypeIcon name={resolved.name} />}
         <span className="truncate">{name}</span>
         {!thumb && <span className="shrink-0 border border-line px-1 text-[10px] text-chalk-dim">{typeLabel(resolved.name)}</span>}
       </>

@@ -1,5 +1,5 @@
 {
-  "call": "db.from(\"orders\").select(\"id\").where({ and: [{ status: { eq: \"paid\" } }, { region: { neq: \"eu\" } }, { qty: { lt: 10 } }, { qty: { lte: 9 } }, { total: { gt: \"1.00\" } }, { total: { gte: \"1.50\" } }, { region: { in: [\"eu\", \"us\"] } }, { vip: { is: true } }, { customer_name: { like: \"A%\" } }, { region: { ilike: \"e%\" } }] })",
+  "call": "db.from(\"orders\").select(\"id\").where({ and: [{ status: op.eq(\"paid\") }, { region: op.neq(\"eu\") }, { qty: op.lt(10) }, { qty: op.lte(9) }, { total: op.gt(\"1.00\") }, { total: op.gte(\"1.50\") }, { region: op.in([\"eu\", \"us\"]) }, { vip: op.is(true) }, { customer_name: op.like(\"A%\") }, { region: op.ilike(\"e%\") }] })",
   "tree": {
     "v": 1,
     "op": "select",

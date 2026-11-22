@@ -25,14 +25,14 @@ const RECORDER: &str = r#"export default {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${env.CHELABASE_SERVICE_KEY}` },
       body: JSON.stringify({ v: 1, op: "insert", into: "seen",
-                             values: [{ event_id: e.id, kind: e.type, record: e.record, txid: e.txid }] }),
+                             values: [{ event_id: e.id, kind: e.type, record: e.truncated ? { truncated: true, primary_key: e.primary_key, record: e.record, old_record: e.old_record } : e.record, txid: e.txid }] }),
     });
     if (!res.ok) return new Response(`insert: ${res.status} ${await res.text()}`, { status: 500 });
     return new Response("ok");
   },
 };"#;
 
-async fn flow(api: &Api, project: &str) {
+async fn flow(api: &Api, project: &str, big: bool) {
     let stamp = &Uuid::new_v4().simple().to_string()[..8];
     let created = api
         .ok(
@@ -64,6 +64,8 @@ async fn flow(api: &Api, project: &str) {
                  kind text NOT NULL, record jsonb, txid bigint, at timestamptz NOT NULL DEFAULT now());
              CREATE ROLE fn_recorder NOLOGIN; GRANT fn_recorder TO authenticator;
              GRANT USAGE ON SCHEMA public TO fn_recorder; GRANT SELECT, INSERT ON seen TO fn_recorder;
+             -- m17: a table trigger installs only while the run-as role can SELECT the table.
+             GRANT SELECT ON orders TO fn_recorder;
              SELECT current_database();",
         )
         .await;
@@ -170,11 +172,72 @@ async fn flow(api: &Api, project: &str) {
         "{t}"
     );
     assert!(t["last_delivered_at"].is_string(), "{t}");
+    if big {
+        big_rows(api, db, &id).await;
+    }
+}
+
+/// Owner-written outbox rows over the size cap: the claim keeps only the allowlisted event
+/// fields, the records are null with `truncated`, a primary-key value over 1 KiB is null and a
+/// smaller one is intact; a row under the cap is delivered whole.
+async fn big_rows(api: &Api, db: DatabaseId, trigger: &str) {
+    let tl = api
+        .sql(db, "SELECT pg_catalog.current_setting('neon.timeline_id', true)")
+        .await[0][0]
+        .clone()
+        .expect("a timeline id");
+    let row = |id: &str, extra: &str| {
+        format!(
+            "INSERT INTO chelabase_functions.outbox (trigger_id, timeline_id, payload) VALUES ('{trigger}', '{tl}',
+               jsonb_build_object('type', 'INSERT', 'schema', 'public', 'table', 'orders', 'txid', 1,
+                 'record', jsonb_build_object('id', {id}, 'note', repeat('x', 300000)), 'old_record', NULL::jsonb {extra}));"
+        )
+    };
+    api.sql(
+        db,
+        &format!(
+            "{} {} {} NOTIFY chelabase_functions; SELECT 1;",
+            row("30", ", 'junk', repeat('y', 500000), 'extra_object', jsonb_build_object('a', repeat('z', 1000))"),
+            row("repeat('k', 5000)", ""),
+            "INSERT INTO orders VALUES (31, 'small');"
+        ),
+    )
+    .await;
+    let seen = until(60, "the three events", || async {
+        let r = api
+            .sql(db, "SELECT record::text FROM seen WHERE record->>'note' IS DISTINCT FROM 'a' AND record->>'note' IS DISTINCT FROM 'b' ORDER BY id")
+            .await;
+        (r.len() >= 3).then_some(r)
+    })
+    .await;
+    let records: Vec<Value> = seen
+        .iter()
+        .map(|r| serde_json::from_str(r[0].as_deref().unwrap()).unwrap())
+        .collect();
+    let small = records.iter().find(|r| r["note"] == "small").expect("the small row whole");
+    assert_eq!(small, &json!({ "id": 31, "note": "small" }));
+    let bigs: Vec<&Value> = records.iter().filter(|r| r["truncated"] == true).collect();
+    assert_eq!(bigs.len(), 2, "{records:?}");
+    for b in &bigs {
+        assert_eq!((&b["record"], &b["old_record"]), (&Value::Null, &Value::Null), "{b}");
+    }
+    assert!(bigs.iter().any(|b| b["primary_key"] == json!({ "id": 30 })), "{bigs:?}");
+    assert!(bigs.iter().any(|b| b["primary_key"] == json!({ "id": null })), "{bigs:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack running this branch's worker and functions service: just functions-e2e"]
+async fn big_row_claim_is_bounded() {
+    run_flow(true).await;
 }
 
 #[tokio::test]
 #[ignore = "needs the workbench stack running this branch's worker and functions service: just functions-e2e"]
 async fn an_insert_trigger_delivers_committed_rows_to_fetch() {
+    run_flow(false).await;
+}
+
+async fn run_flow(big: bool) {
     let api = Api::new();
     let name = format!("functions-db-{}", &Uuid::new_v4().simple().to_string()[..6]);
     let project = api
@@ -192,7 +255,7 @@ async fn an_insert_trigger_delivers_committed_rows_to_fetch() {
     let run = {
         let id = id.clone();
         let api = Api::new();
-        tokio::spawn(async move { flow(&api, &id).await })
+        tokio::spawn(async move { flow(&api, &id, big).await })
     };
     let result = run.await;
     let _ = api

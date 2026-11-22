@@ -1,6 +1,7 @@
 //! The service's refusals, typed. The codes come from `services/identity/src/http.ts` and
 //! `routes.ts` (m1); `invalid_code`, `email_not_configured`,
-//! `invite_refused` and `email_send_failed` are m2's.
+//! `invite_refused` and `email_send_failed` are m2's; `code_budget_spent` and
+//! `code_recently_sent` guard the code routes.
 
 use serde::Deserialize;
 
@@ -33,6 +34,14 @@ pub enum IdentityError {
     /// is unknown. The service answers all of them alike (`invalid_code`), so neither can this.
     #[error("code invalid")]
     CodeInvalid,
+    /// The user's failure budget for this kind is spent (10 wrong guesses in 24 hours, across
+    /// codes): 429 `code_budget_spent`. No guess of that kind is checked until the window ends.
+    #[error("code budget spent")]
+    CodeBudgetSpent,
+    /// A live code of this kind was issued less than a minute ago and still stands: 429
+    /// `code_recently_sent`. Nothing was sent; the earlier code keeps working.
+    #[error("code recently sent")]
+    CodeRecentlySent,
     /// An invite code was asked for an established account (a password and a verified email):
     /// 409 `invite_refused`. Send a reset code instead.
     #[error("invite refused: {0}")]
@@ -122,6 +131,8 @@ pub fn classify_status(status: u16, body: &str) -> Option<IdentityError> {
         "bad_credentials" => E::BadCredentials,
         "session_revoked" => E::SessionRevoked,
         "invalid_code" => E::CodeInvalid,
+        "code_budget_spent" => E::CodeBudgetSpent,
+        "code_recently_sent" => E::CodeRecentlySent,
         "unauthorized" => E::Unauthorized(message),
         "forbidden" => E::Forbidden(message),
         "invalid_request" | "invalid_pool" | "invalid_email" | "weak_password" | "bad_request"

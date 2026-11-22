@@ -196,10 +196,23 @@ pub enum RefreshOutcome {
     /// The previous token, within its grace: the session didn't change; `sealed` is the current
     /// token, sealed.
     Grace { session: AppSession, sealed: String },
-    /// The previous token after its grace: the session is now revoked.
+    /// The previous token after its grace, or a [`RefreshProof::Issued`] token that matches
+    /// neither the current nor the previous one: the session is now revoked.
     Reused(AppSession),
-    /// Unknown session, another project's, revoked, expired or a token that matches neither.
+    /// Unknown session, another project's, revoked, expired, or a [`RefreshProof::Unproven`]
+    /// token that matches neither.
     Invalid,
+}
+
+/// What the caller knows of a presented refresh token beyond its hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshProof {
+    /// The token carries a valid tag under the orchestrator's key for this session: it was
+    /// issued for it, so one that is neither current nor previous is an earlier one, reused.
+    Issued,
+    /// A token without a tag (issued before tags existed): a mismatch can't be told from a
+    /// made-up token, so it is only `Invalid`.
+    Unproven,
 }
 
 /// What presenting a refresh token would do, read without locking or writing anything
@@ -210,10 +223,28 @@ pub enum PeekOutcome {
     /// (`grace: true`): a refresh would answer. A grace token's refresh writes nothing, but
     /// it is reuse once the grace ends, so a caller acts on it before the grace runs out.
     Live { session: AppSession, grace: bool },
-    /// The previous token after its grace: a refresh would revoke the session.
+    /// The previous token after its grace, or a [`RefreshProof::Issued`] token that matches
+    /// neither: a refresh would revoke the session.
     Reused,
-    /// Unknown session, another project's, revoked, expired or a token that matches neither.
+    /// Unknown session, another project's, revoked, expired, or a [`RefreshProof::Unproven`]
+    /// token that matches neither.
     Invalid,
+}
+
+/// Revokes the session locked in `tx` for a reused refresh token.
+async fn revoke_reused(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> Result<RefreshOutcome, MetadataError> {
+    let row = sqlx::query(
+        "UPDATE app_sessions SET revoked_at = now() WHERE id = $1
+         RETURNING id, project_id, user_id, identity_session_id, created_at,
+                   last_used_at, expires_at, revoked_at",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(RefreshOutcome::Reused(session_from_row(&row)))
 }
 
 fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
@@ -650,13 +681,15 @@ impl MetadataClient {
     /// Unknown, another project's or revoked sessions are `Invalid` and nothing is written. A
     /// session past its expiry or its `cap` is revoked and `Invalid`. The current token rotates
     /// (`Rotated`); the previous one gets the new sealed token within the grace (`Grace`, no
-    /// change) and revokes the session after it (`Reused`); any other token is `Invalid` and
-    /// changes nothing.
+    /// change) and revokes the session after it (`Reused`). Any other token revokes the session
+    /// (`Reused`) when `proof` is [`RefreshProof::Issued`], and is `Invalid` and changes nothing
+    /// when it is [`RefreshProof::Unproven`].
     pub async fn refresh_app_session(
         &self,
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         next: &RefreshNext,
     ) -> Result<RefreshOutcome, MetadataError> {
         let mut tx = self.pool.begin().await?;
@@ -716,20 +749,13 @@ impl MetadataClient {
             let sealed: Option<String> = row.get("grace_refresh_sealed");
             match (grace_until, sealed) {
                 (Some(until), Some(sealed)) if until > now => RefreshOutcome::Grace { session, sealed },
-                _ => {
-                    let revoked = sqlx::query(
-                        "UPDATE app_sessions SET revoked_at = now() WHERE id = $1
-                         RETURNING id, project_id, user_id, identity_session_id, created_at,
-                                   last_used_at, expires_at, revoked_at",
-                    )
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    RefreshOutcome::Reused(session_from_row(&revoked))
-                }
+                _ => revoke_reused(&mut tx, id).await?,
             }
         } else {
-            RefreshOutcome::Invalid
+            match proof {
+                RefreshProof::Issued => revoke_reused(&mut tx, id).await?,
+                RefreshProof::Unproven => RefreshOutcome::Invalid,
+            }
         };
         tx.commit().await?;
         Ok(outcome)
@@ -739,12 +765,14 @@ impl MetadataClient {
     /// rules (project, revocation, expiry and `cap`, current token, previous token and grace),
     /// read in one statement: no lock, no rotation and no revocation. A session past its expiry
     /// or `cap` is `Invalid` but left for `refresh_app_session` to revoke; the previous token
-    /// after its grace is `Reused` and the session stays live.
+    /// after its grace, and any other [`RefreshProof::Issued`] token, is `Reused` and the
+    /// session stays live.
     pub async fn peek_app_session(
         &self,
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         cap: Duration,
     ) -> Result<PeekOutcome, MetadataError> {
         let row = sqlx::query(
@@ -784,7 +812,10 @@ impl MetadataClient {
                 _ => PeekOutcome::Reused,
             }
         } else {
-            PeekOutcome::Invalid
+            match proof {
+                RefreshProof::Issued => PeekOutcome::Reused,
+                RefreshProof::Unproven => PeekOutcome::Invalid,
+            }
         })
     }
 

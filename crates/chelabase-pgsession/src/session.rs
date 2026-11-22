@@ -9,22 +9,39 @@
 //! ([`chelabase_query::engine::begin_sql`]), sets the role, claims and timeouts in its
 //! preamble ([`RoleSession::run_as`]; sequential `PREAMBLE_SQL`, pipelined
 //! `GUARDED_PREAMBLE_SQL`) and ends with `COMMIT` (or `ROLLBACK`) and `RESET_SQL`
-//! ([`RoleSession::settings`] carries the reset and the timeouts). A reset that fails marks
-//! the lease broken, and a broken or unfinished lease closes its connection instead of
-//! pooling it.
+//! ([`RoleSession::settings`] carries the reset and the timeouts). Before the `COMMIT`,
+//! deferred constraints are made immediate and the session check runs
+//! (`SESSION_CHECK_SQL`): a transaction that no longer runs as the session's role, or a
+//! session holding a SQL-level prepared statement, commits nothing (a 500). A reset or a
+//! session check that fails marks the lease broken, and a broken or unfinished lease closes
+//! its connection instead of pooling it.
 //!
 //! No role, no run: a connection's client can't be read, a [`Conn`] is no
 //! [`chelabase_query::QueryClient`], and a [`RoleSession`] runs statements only through its
-//! own methods, which apply the preamble (apart from its two fixed pre-transaction reads).
+//! own methods, which apply the preamble (apart from its fixed pre-transaction read).
 //! A role session refuses `none` and the empty name (Postgres reads `none` as no role: the
 //! login itself). The one session as the login is explicit: [`Conn::with_login_session`].
 //! `tests/compile_fail.rs` holds what doesn't compile, with each expected error.
+//!
+//! Which login a role's session runs on is decided before the connection is taken
+//! ([`crate::Pools::acquire_for_role`]; the invariant is in [`chelabase_query::roles`]), and
+//! the connection is bound to that role: [`Conn::with_role_session`] refuses any other
+//! ([`NoRole`]), so a role never opens on a connection that wasn't routed for it.
+//!
+//! Statements sent outside a transaction ([`RoleSession::table_json`], the role facts read)
+//! are followed by the session's full reset before the connection is pooled, and it is
+//! pooled only when that reset passed.
 //!
 //! The one way in names the role and its claims:
 //!
 //! ```no_run
 //! # async fn f(pools: &chelabase_pgsession::Pools<chelabase_pgsession::InternalSource>) {
-//! let conn = pools.acquire(uuid::Uuid::nil(), "main").await.unwrap();
+//! # let cache = chelabase_pgsession::owner_level::owner_level_cache();
+//! # let guard = chelabase_pgsession::owner_level::Guard::None;
+//! let conn = pools
+//!     .acquire_for_role(&cache, uuid::Uuid::nil(), "main", "authenticated", guard, "rid")
+//!     .await
+//!     .unwrap();
 //! let claims = serde_json::json!({ "sub": "u1" });
 //! let settings = chelabase_query::RunSettings {
 //!     max_rows: 10,
@@ -47,9 +64,11 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use chelabase_query::roles::{Login, RoleFacts};
 use chelabase_query::engine::{
-    QueryCache, console_session, console_session_mapped, with_transaction,
+    QueryCache, console_session, console_session_mapped, with_checked_transaction,
 };
 use chelabase_query::{Lease, Op, QueryClient, QueryFailure, RunAs, RunSettings, Schema};
 use serde_json::Value;
@@ -72,8 +91,7 @@ pub fn run_settings(info: &ConnInfo, database: &ServedDatabase) -> RunSettings {
 /// A connection lent to one call as `role` with `claims` (see the module docs). Its
 /// statements run only through its own methods, each of which applies the role, claims and
 /// timeouts first ([`Self::run`], [`Self::transaction`], [`Self::schema`]), apart from the
-/// two fixed reads a request makes before its transaction ([`Self::owner_level`],
-/// [`Self::table_json`]). It holds its own copy of the role and claims (a borrowed one makes the session's future fail the
+/// fixed read a request makes before its transaction ([`Self::table_json`]). It holds its own copy of the role and claims (a borrowed one makes the session's future fail the
 /// `Send` check axum's handlers need).
 pub struct RoleSession {
     lease: Lease,
@@ -81,18 +99,26 @@ pub struct RoleSession {
     role: String,
     claims: Value,
     oid: Option<i64>,
+    /// A statement was sent outside a transaction and no transaction's trailing reset has
+    /// passed since: the session owes the full reset before its connection is pooled.
+    outside: AtomicBool,
+    /// A transaction's preamble found the role unusable on this connection's login.
+    unusable: AtomicBool,
 }
 
 impl RoleSession {
-    /// Whether `role` is owner-level (`None`: it doesn't exist), asked as the login before
-    /// the session's transaction, on the session's own connection
-    /// ([`crate::owner_level::fetch_owner_level`]).
-    pub async fn owner_level(
-        &self,
-        role: &str,
-        request_id: &str,
-    ) -> Result<Option<bool>, tokio_postgres::Error> {
-        crate::owner_level::fetch_owner_level(&self.lease, role, request_id).await
+    /// Records what a transaction of the session ended with: one that answered ran its
+    /// trailing reset (a failed reset marks the lease broken), so nothing is owed any more;
+    /// a preamble that refused the role is remembered for the session's end.
+    pub(crate) fn seen<T>(&self, out: Result<T, QueryFailure>) -> Result<T, QueryFailure> {
+        match &out {
+            Ok(_) => self.outside.store(false, Ordering::Relaxed),
+            Err(f) if *f == chelabase_query::engine::role_unusable(&self.role) => {
+                self.unusable.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {}
+        }
+        out
     }
 
     /// The table `schema.table`'s model as the catalog's JSON (empty when there's no such
@@ -105,6 +131,7 @@ impl RoleSession {
         statement_timeout_ms: u64,
     ) -> Result<String, tokio_postgres::Error> {
         let client = self.lease.client();
+        self.outside.store(true, Ordering::Relaxed);
         client
             .simple_query(&format!("SET statement_timeout = {statement_timeout_ms}"))
             .await?;
@@ -130,7 +157,7 @@ impl RoleSession {
         op: &Op,
         request_id: &str,
     ) -> Result<String, QueryFailure> {
-        chelabase_query::run(
+        let out = chelabase_query::run(
             &self.lease,
             cache,
             key,
@@ -140,7 +167,8 @@ impl RoleSession {
             op,
             request_id,
         )
-        .await
+        .await;
+        self.seen(out)
     }
 
     /// A transaction as the session's role ([`console_session`]): `f` runs after the
@@ -153,7 +181,7 @@ impl RoleSession {
         request_id: &str,
         f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
     ) -> Result<T, QueryFailure> {
-        console_session(
+        let out = console_session(
             &self.lease,
             database,
             self.run_as(),
@@ -161,7 +189,8 @@ impl RoleSession {
             request_id,
             f,
         )
-        .await
+        .await;
+        self.seen(out)
     }
 
     /// [`Self::transaction`], with a failed `COMMIT` mapped by `on_commit`
@@ -174,7 +203,7 @@ impl RoleSession {
         on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
         f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
     ) -> Result<T, QueryFailure> {
-        console_session_mapped(
+        let out = console_session_mapped(
             &self.lease,
             database,
             self.run_as(),
@@ -183,12 +212,15 @@ impl RoleSession {
             on_commit,
             f,
         )
-        .await
+        .await;
+        self.seen(out)
     }
 
     /// In its own transaction as the session's role: the schema of `key = (branch,
     /// database)` ([`chelabase_query::load_schema`], which runs the preamble), then `f` with
-    /// the connection and that schema.
+    /// the connection and that schema. Like every transaction of the session it ends with
+    /// the session check before its `COMMIT`
+    /// ([`chelabase_query::engine::with_checked_transaction`]).
     pub async fn schema<T>(
         &self,
         cache: &QueryCache,
@@ -197,7 +229,9 @@ impl RoleSession {
         request_id: &str,
         f: impl AsyncFnOnce(&Client, &Arc<Schema>) -> Result<T, QueryFailure>,
     ) -> Result<(Arc<Schema>, T), QueryFailure> {
-        with_transaction(&self.lease, RESET_SQL, request_id, async |client| {
+        let on_commit = |e: &tokio_postgres::Error| QueryFailure::from_pg(e, request_id);
+        let role = self.role.as_str();
+        let out = with_checked_transaction(&self.lease, RESET_SQL, role, request_id, on_commit, async |client| {
             let (schema, _, _) = chelabase_query::load_schema(
                 client,
                 cache,
@@ -210,7 +244,8 @@ impl RoleSession {
             let out = f(client, &schema).await?;
             Ok((schema, out))
         })
-        .await
+        .await;
+        self.seen(out)
     }
 
     /// The branch's connection info the connection was opened with.
@@ -234,7 +269,8 @@ impl RoleSession {
     }
 }
 
-/// A role session asked for no role: `none` (any case) or the empty name.
+/// A role session asked for no role: `none` (any case) or the empty name, or for a role
+/// other than the one its connection was routed for.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0:?} names no role")]
 pub struct NoRole(pub String);
@@ -250,7 +286,8 @@ impl Conn {
     /// identity a secret key is bound to, `None` to check the name only). When `f` returns
     /// (an error it answers with included), the connection goes back to its pool unless a
     /// reset failed; when `f` is cancelled or panics, the connection is closed. Its slots are
-    /// released after. A `role` that names no role ([`NoRole`]) runs nothing.
+    /// released after. A `role` that names no role, or isn't the role the connection was
+    /// acquired for ([`crate::Pools::acquire_for_role`]), runs nothing ([`NoRole`]).
     pub async fn with_role_session<T>(
         self,
         role: &str,
@@ -258,7 +295,7 @@ impl Conn {
         oid: Option<i64>,
         f: impl AsyncFnOnce(&RoleSession) -> T,
     ) -> Result<T, NoRole> {
-        if names_no_role(role) {
+        if names_no_role(role) || self.role.as_deref() != Some(role) {
             return Err(NoRole(role.to_owned()));
         }
         Ok(self.session(role, claims, oid, f).await)
@@ -268,8 +305,77 @@ impl Conn {
     /// with no claims: each transaction's preamble sets the role `none`. Only for reads
     /// every role may make and the login is meant to make itself (rest's internal schema
     /// route, which describes other roles' views); everything else is a role session.
-    pub async fn with_login_session<T>(self, f: impl AsyncFnOnce(&RoleSession) -> T) -> T {
-        self.session("none", &Value::Object(Default::default()), None, f)
+    ///
+    /// Only `authenticator`'s connection has one: on any other login `f` doesn't run
+    /// (`None`). The elevated login runs nothing but the role it was routed for.
+    pub async fn with_login_session<T>(self, f: impl AsyncFnOnce(&RoleSession) -> T) -> Option<T> {
+        if self.login != Login::Authenticator {
+            return None;
+        }
+        Some(
+            self.session("none", &Value::Object(Default::default()), None, f)
+                .await,
+        )
+    }
+
+    /// `role`'s facts ([`crate::owner_level::fetch_role_facts`]), read as the login on this
+    /// `authenticator` connection, which then goes back to its pool.
+    pub(crate) async fn read_role_facts(
+        self,
+        role: &str,
+        request_id: &str,
+    ) -> Result<Option<RoleFacts>, tokio_postgres::Error> {
+        debug_assert_eq!(self.login, Login::Authenticator);
+        self.session("none", &Value::Object(Default::default()), None, async |s| {
+            s.outside.store(true, Ordering::Relaxed);
+            crate::owner_level::fetch_role_facts(&s.lease, role, request_id).await
+        })
+        .await
+    }
+
+    /// `role`'s facts read now on this connection, before its role session: what a session
+    /// on the elevated login is held to ([`crate::Pools::acquire_for_role`]). The connection
+    /// then owes its session's full reset, and is closed at its end when the read's
+    /// clean-up or the read itself failed.
+    pub(crate) async fn confirm_role_facts(
+        &mut self,
+        role: &str,
+        request_id: &str,
+    ) -> Result<Option<RoleFacts>, tokio_postgres::Error> {
+        /// The connection before its session's [`Lease`] exists.
+        struct Unleased<'a> {
+            client: &'a Client,
+            broken: AtomicBool,
+        }
+        impl QueryClient for Unleased<'_> {
+            fn client(&self) -> &Client {
+                self.client
+            }
+            async fn prepare_cached(
+                &self,
+                sql: &str,
+                types: &[tokio_postgres::types::Type],
+            ) -> Result<tokio_postgres::Statement, tokio_postgres::Error> {
+                self.client.prepare_typed(sql, types).await
+            }
+            fn mark_broken(&self) {
+                self.broken.store(true, Ordering::Relaxed);
+            }
+        }
+        self.outside = true;
+        let probe = Unleased {
+            client: &self.client,
+            broken: AtomicBool::new(false),
+        };
+        let out = crate::owner_level::fetch_role_facts(&probe, role, request_id).await;
+        self.broken |= probe.broken.load(Ordering::Relaxed) || out.is_err();
+        out
+    }
+
+    /// Ends a connection no session will run on: after the full reset it owes it goes back
+    /// to its pool, or is closed when that failed.
+    pub(crate) async fn release(self) {
+        self.session("none", &Value::Object(Default::default()), None, async |_| ())
             .await
     }
 
@@ -284,17 +390,47 @@ impl Conn {
             client,
             info,
             permits,
+            login: _,
+            role: _,
+            facts,
+            outside,
+            broken,
         } = self;
+        let lease = Lease::new(client);
+        if broken {
+            lease.mark_broken();
+        }
         // Declared after `permits`: dropped (pooled or closed) before they're released.
         let mut session = RoleSession {
-            lease: Lease::new(client),
+            lease,
             info,
             role: role.to_owned(),
             claims: claims.clone(),
             oid,
+            outside: AtomicBool::new(outside),
+            unusable: AtomicBool::new(false),
         };
         let out = f(&session).await;
-        session.lease.done();
+        // A statement went out outside a transaction: the full reset is owed, and the
+        // connection is pooled only when it passed ([`Lease`]'s rule).
+        let clean = !session.outside.load(Ordering::Relaxed)
+            || match session.lease.client().batch_execute(RESET_SQL).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("the session's reset failed; the connection is discarded: {e}");
+                    false
+                }
+            };
+        if clean {
+            session.lease.done();
+        }
+        // The login chosen from cached facts doesn't hold the role (any more): the facts
+        // are dropped, and the next request reads them anew.
+        if session.unusable.load(Ordering::Relaxed)
+            && let Some((cache, key)) = &facts
+        {
+            cache.invalidate(key).await;
+        }
         drop(session);
         drop(permits);
         out
@@ -311,8 +447,15 @@ pub(crate) mod tests {
     use tokio_postgres::TransactionStatus;
     use uuid::Uuid;
 
-    /// The session's SQL as it was in `services/rest` before the move, byte for byte.
-    const PRE_MOVE_RESET: &str = "SET ROLE NONE; RESET ALL";
+    /// The session's reset, byte for byte: rest's from before the move, and what it has
+    /// cleared and refused since (advisory locks, temporary tables, cursors, `LISTEN`s,
+    /// sequence state, SQL-level prepared statements). The preambles below are the pre-move
+    /// text unchanged.
+    const PRE_MOVE_RESET: &str = "SET ROLE NONE; RESET ALL; \
+         SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP; CLOSE ALL; UNLISTEN *; \
+         DISCARD SEQUENCES; \
+         SELECT pg_catalog.set_config('role', CASE WHEN EXISTS \
+         (SELECT 1 FROM pg_catalog.pg_prepared_statement() p WHERE p.from_sql) THEN '' ELSE 'none' END, false)";
     const PRE_MOVE_PREAMBLE: &str = "SELECT pg_catalog.set_config('role', CASE WHEN $4::pg_catalog.int8 IS NULL OR \
      (SELECT r.oid::pg_catalog.int8 FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $1) OPERATOR(pg_catalog.=) $4::pg_catalog.int8 \
      THEN $1 ELSE '' END, true), \
@@ -332,8 +475,36 @@ pub(crate) mod tests {
     pub(crate) struct Recorder {
         pub(crate) port: u16,
         pub(crate) queries: Arc<Mutex<Vec<String>>>,
+        /// The user each connection logged in as, in order.
+        pub(crate) users: Arc<Mutex<Vec<String>>>,
         /// Sockets open now.
         pub(crate) open: Arc<AtomicUsize>,
+        /// What a role facts read is answered with (owner-level, elevated, held by the
+        /// elevated login). `None`, the default: the extended protocol is refused.
+        pub(crate) facts: Arc<Mutex<Option<[bool; 3]>>>,
+    }
+
+    /// The extended protocol's answer to one typed query: a row of three booleans.
+    fn facts_row(facts: [bool; 3]) -> Vec<u8> {
+        let mut out = message(b'1', &[]);
+        out.extend(message(b'2', &[]));
+        let mut desc = 3_i16.to_be_bytes().to_vec();
+        let mut row = 3_i16.to_be_bytes().to_vec();
+        for f in facts {
+            desc.extend_from_slice(b"b\0");
+            desc.extend_from_slice(&0_i32.to_be_bytes());
+            desc.extend_from_slice(&0_i16.to_be_bytes());
+            desc.extend_from_slice(&16_i32.to_be_bytes());
+            desc.extend_from_slice(&1_i16.to_be_bytes());
+            desc.extend_from_slice(&(-1_i32).to_be_bytes());
+            desc.extend_from_slice(&1_i16.to_be_bytes());
+            row.extend_from_slice(&1_i32.to_be_bytes());
+            row.push(u8::from(f));
+        }
+        out.extend(message(b'T', &desc));
+        out.extend(message(b'D', &row));
+        out.extend(message(b'C', b"SELECT 1\0"));
+        out
     }
 
     fn message(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -358,12 +529,15 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let queries = Arc::new(Mutex::new(Vec::new()));
+        let users = Arc::new(Mutex::new(Vec::new()));
         let open = Arc::new(AtomicUsize::new(0));
         let resets = Arc::new(AtomicUsize::new(0));
-        let (q, o) = (queries.clone(), open.clone());
+        let facts: Arc<Mutex<Option<[bool; 3]>>> = Arc::default();
+        let (q, o, u, fa) = (queries.clone(), open.clone(), users.clone(), facts.clone());
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (queries, open, resets) = (q.clone(), o.clone(), resets.clone());
+                let (queries, open, resets, users) = (q.clone(), o.clone(), resets.clone(), u.clone());
+                let facts = fa.clone();
                 tokio::spawn(async move {
                     open.fetch_add(1, Ordering::SeqCst);
                     let Ok(len) = socket.read_i32().await else {
@@ -372,6 +546,12 @@ pub(crate) mod tests {
                     };
                     let mut startup = vec![0; usize::try_from(len).unwrap() - 4];
                     let _ = socket.read_exact(&mut startup).await;
+                    let fields: Vec<&[u8]> = startup.get(4..).unwrap_or_default().split(|b| *b == 0).collect();
+                    if let Some(i) = fields.iter().position(|f| *f == b"user")
+                        && let Some(user) = fields.get(i + 1)
+                    {
+                        users.lock().unwrap().push(String::from_utf8_lossy(user).into_owned());
+                    }
                     let mut hello = message(b'R', &0_i32.to_be_bytes());
                     hello.extend(message(b'Z', b"I"));
                     let _ = socket.write_all(&hello).await;
@@ -384,9 +564,14 @@ pub(crate) mod tests {
                         if socket.read_exact(&mut body).await.is_err() || kind == b'X' {
                             break;
                         }
-                        // The extended protocol (a prepare) is refused at its `Sync`.
+                        // The extended protocol (a prepare) is refused at its `Sync`, unless
+                        // the stand-in was given role facts to answer with.
                         if kind == b'S' {
-                            let mut out = message(b'E', &error_body());
+                            let answer = *facts.lock().unwrap();
+                            let mut out = match answer {
+                                Some(f) => facts_row(f),
+                                None => message(b'E', &error_body()),
+                            };
                             out.extend(message(b'Z', &[status]));
                             if socket.write_all(&out).await.is_err() {
                                 break;
@@ -432,7 +617,9 @@ pub(crate) mod tests {
         Recorder {
             port,
             queries,
+            users,
             open,
+            facts,
         }
     }
 
@@ -447,7 +634,7 @@ pub(crate) mod tests {
     }
 
     /// Waits (bounded) until `open` sockets are open.
-    async fn settle(open: &AtomicUsize, want: usize) -> usize {
+    pub(crate) async fn settle(open: &AtomicUsize, want: usize) -> usize {
         for _ in 0..200 {
             if open.load(Ordering::SeqCst) == want {
                 break;
@@ -481,17 +668,18 @@ pub(crate) mod tests {
         assert_eq!(settings.statement_timeout_ms, 8000);
         assert_eq!(settings.max_rows, 1000);
         assert_eq!(settings.default_schema, "reporting");
+        assert!(PRE_MOVE_RESET.starts_with("SET ROLE NONE; RESET ALL; "));
         assert_eq!(
             begin_sql(settings.reset_sql, TransactionStatus::Idle),
-            "BEGIN; SET ROLE NONE; RESET ALL"
+            format!("BEGIN; {PRE_MOVE_RESET}")
         );
         assert_eq!(
             begin_sql(settings.reset_sql, TransactionStatus::InTransaction),
-            "ROLLBACK; BEGIN; SET ROLE NONE; RESET ALL"
+            format!("ROLLBACK; BEGIN; {PRE_MOVE_RESET}")
         );
         assert_eq!(
             crate::owner_level::owner_check_batch(TransactionStatus::Idle),
-            "SET ROLE NONE; RESET ALL"
+            PRE_MOVE_RESET
         );
         assert_eq!(PREAMBLE_SQL, PRE_MOVE_PREAMBLE);
         assert_eq!(GUARDED_PREAMBLE_SQL, PRE_MOVE_GUARDED_PREAMBLE);
@@ -510,7 +698,7 @@ pub(crate) mod tests {
         let fake = recorder(|_, _| false).await;
         let pools = Pools::new(At(fake.port), 10);
         let claims = serde_json::json!({ "sub": "u1" });
-        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap().bound_to("reader", None);
         let out = conn
             .with_role_session("reader", &claims, Some(16390), async |s| {
                 match s.run_as() {
@@ -534,10 +722,15 @@ pub(crate) mod tests {
         assert_eq!(
             *fake.queries.lock().unwrap(),
             vec![
-                "BEGIN; SET ROLE NONE; RESET ALL",
-                "SELECT 1",
-                "COMMIT",
-                "SET ROLE NONE; RESET ALL",
+                // A pooled connection that is idle and unbroken opens without the
+                // prepared-statement check; the reset after the COMMIT is the full text.
+                format!(
+                    "BEGIN; {}",
+                    chelabase_query::engine::opening_reset_sql(PRE_MOVE_RESET)
+                ),
+                "SELECT 1".to_owned(),
+                "COMMIT".to_owned(),
+                PRE_MOVE_RESET.to_owned(),
             ]
         );
         // The connection went back to its pool.
@@ -561,7 +754,7 @@ pub(crate) mod tests {
             let pools = Pools::new(At(fake.port), 10);
             let claims = serde_json::json!({});
             let branch = Uuid::new_v4();
-            let conn = pools.acquire(branch, "main").await.unwrap();
+            let conn = pools.acquire(branch, "main").await.unwrap().bound_to("reader", None);
             let _ = conn
                 .with_role_session("reader", &claims, None, async |s| {
                     chelabase_query::with_transaction(&s.lease, RESET_SQL, "rid", async |_| Ok(()))
@@ -574,7 +767,7 @@ pub(crate) mod tests {
                 "{name}: the socket is closed"
             );
             // The next request opens a new connection.
-            let conn = pools.acquire(branch, "main").await.unwrap();
+            let conn = pools.acquire(branch, "main").await.unwrap().bound_to("reader", None);
             conn.with_role_session("reader", &claims, None, async |_| ())
                 .await
                 .unwrap();
@@ -606,8 +799,49 @@ pub(crate) mod tests {
                 chelabase_query::RunAs::Role { role, .. } => role.to_owned(),
                 chelabase_query::RunAs::Owner { .. } => panic!("the owner"),
             })
-            .await;
+            .await
+            .expect("authenticator's connection has a login session");
         assert_eq!(role, "none");
+        // A connection opens a session only as the role it was routed for.
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
+        let unbound = conn.with_role_session("reader", &claims, None, async |_| ()).await;
+        assert_eq!(unbound.unwrap_err(), NoRole("reader".to_owned()));
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap().bound_to("reader", None);
+        let other = conn.with_role_session("writer", &claims, None, async |_| ()).await;
+        assert_eq!(other.unwrap_err(), NoRole("writer".to_owned()));
+    }
+
+    /// A statement sent outside a transaction ([`RoleSession::table_json`]) owes the
+    /// session's full reset: it is the session's last statement, and the connection is
+    /// pooled only when it passed.
+    #[tokio::test]
+    async fn a_statement_outside_a_transaction_owes_the_full_reset() {
+        for (fails, pooled) in [
+            ((|_, _| false) as fn(&str, usize) -> bool, 1),
+            (|sql, _| sql == RESET_SQL, 0),
+        ] {
+            let fake = recorder(fails).await;
+            let pools = Pools::new(At(fake.port), 10);
+            let claims = serde_json::json!({});
+            let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap().bound_to("reader", None);
+            conn.with_role_session("reader", &claims, None, async |s| {
+                s.table_json("public", "notes", 1000).await.unwrap();
+            })
+            .await
+            .unwrap();
+            let queries = fake.queries.lock().unwrap().clone();
+            assert_eq!(queries.last().map(String::as_str), Some(RESET_SQL), "{queries:?}");
+            assert_eq!(settle(&fake.open, pooled).await, pooled, "pooled only after a reset that passed");
+        }
+        // A session that sent nothing outside a transaction sends no reset of its own.
+        let fake = recorder(|_, _| false).await;
+        let pools = Pools::new(At(fake.port), 10);
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap().bound_to("reader", None);
+        conn.with_role_session("reader", &serde_json::json!({}), None, async |_| ())
+            .await
+            .unwrap();
+        assert!(fake.queries.lock().unwrap().is_empty());
+        assert_eq!(settle(&fake.open, 1).await, 1);
     }
 
     /// The owner check's clean-up failing on a role session's connection discards it too.
@@ -616,9 +850,9 @@ pub(crate) mod tests {
         let fake = recorder(|sql, _| sql == RESET_SQL).await;
         let pools = Pools::new(At(fake.port), 10);
         let claims = serde_json::json!({});
-        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap().bound_to("reader", None);
         conn.with_role_session("reader", &claims, None, async |s| {
-            let check = crate::owner_level::fetch_owner_level(&s.lease, "reader", "rid").await;
+            let check = crate::owner_level::fetch_role_facts(&s.lease, "reader", "rid").await;
             assert!(check.is_err());
             assert!(s.lease.is_broken());
         })

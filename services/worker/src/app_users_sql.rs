@@ -5,7 +5,9 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::data_api::{BOOTSTRAP_LOCK_KEY, LOCK_TIMEOUT_SECS, quote_ident, quote_literal};
+use chelabase_schema::sql::literal;
+
+use crate::data_api::{BOOTSTRAP_LOCK_KEY, LOCK_TIMEOUT_SECS, quote_ident};
 
 /// The login the sync connects as (`SET LOCAL ROLE` from the admin connection, or directly
 /// with its sealed password): the only role the guard trigger lets write the users table.
@@ -30,6 +32,84 @@ pub fn valid_identifier(s: &str) -> bool {
     }
 }
 
+/// One every-run block of [`users_bootstrap_sql`]: after it `grantee` (`anon` or
+/// `authenticated`) holds no table-level `privilege` (`INSERT` or `UPDATE`) on the users table
+/// (`qualified`: its quoted name as a SQL literal), whoever granted it, and holds a
+/// column-level one on exactly the columns it did before.
+///
+/// With no table-level grant it changes nothing. Otherwise it reads the column grants,
+/// revokes the table-level grant as each grantor `aclexplode(relacl)` lists (a superuser's
+/// `REVOKE` acts for the owner only, so the owner's needs no role switch; `CASCADE` takes
+/// grants passed on with it; a table-level `REVOKE` also clears that grantor's column
+/// grants), and grants the cleared columns again. A grantor the script can't act as (it has
+/// no `USAGE` on the schema, say) is skipped: its sub-block undoes the role switch. The
+/// block ends by failing the run with 42501, naming the table and the grantors left, if a
+/// table-level grant is still there; the script's transaction then leaves every ACL as it
+/// was.
+fn column_only_sql(qualified: &str, privilege: &str, grantee: &str) -> String {
+    debug_assert!(matches!(privilege, "INSERT" | "UPDATE") && matches!(grantee, "anon" | "authenticated"));
+    format!(
+        r#"DO $$ DECLARE
+  rel pg_catalog.oid := {qualified}::pg_catalog.regclass::pg_catalog.oid;
+  me pg_catalog.name := CURRENT_USER;
+  own pg_catalog.oid;
+  kept pg_catalog.name[];
+  done pg_catalog.oid[] := '{{}}';
+  gid pg_catalog.oid;
+  missing pg_catalog.text;
+  stuck pg_catalog.text;
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+      WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) '{privilege}'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) '{grantee}') THEN
+    RETURN;
+  END IF;
+  SELECT c.relowner INTO own FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) rel;
+  SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum) INTO kept FROM pg_catalog.pg_attribute a
+   WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+     AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                  WHERE x.privilege_type OPERATOR(pg_catalog.=) '{privilege}'
+                    AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) '{grantee}');
+  LOOP
+    SELECT x.grantor INTO gid FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+     WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) '{privilege}'
+       AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) '{grantee}'
+       AND x.grantor OPERATOR(pg_catalog.<>) ALL (done)
+     ORDER BY x.grantor LIMIT 1;
+    EXIT WHEN NOT FOUND;
+    done := pg_catalog.array_append(done, gid);
+    BEGIN
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));
+      END IF;
+      EXECUTE pg_catalog.format('REVOKE {privilege} ON %s FROM {grantee} CASCADE', rel::pg_catalog.regclass);
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', me);
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+  END LOOP;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k::pg_catalog.text), ', ') INTO missing FROM pg_catalog.unnest(kept) k
+   WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) x
+      WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attname OPERATOR(pg_catalog.=) k
+        AND x.privilege_type OPERATOR(pg_catalog.=) '{privilege}'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) '{grantee}');
+  IF missing IS NOT NULL THEN
+    EXECUTE pg_catalog.format('GRANT {privilege} (%s) ON %s TO {grantee}', missing, rel::pg_catalog.regclass);
+  END IF;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(x.grantor)::pg_catalog.text), ', ' ORDER BY x.grantor)
+    INTO stuck FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+   WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) '{privilege}'
+     AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) '{grantee}';
+  IF stuck IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = pg_catalog.format('{grantee} still holds a table-level {privilege} on %s, granted by %s: revoke it as that role (it needs USAGE on the schema), then grant {privilege} per column', rel::pg_catalog.regclass, stuck);
+  END IF;
+END $$;
+"#
+    )
+}
+
 /// The idempotent script run as the superuser in the auth database when app users are enabled
 /// (and on every repair): the `chelabase_auth_sync` login with `sync_verifier` (the password's
 /// SCRAM-SHA-256 verifier, so the password itself never reaches the compute), the claim
@@ -38,11 +118,22 @@ pub fn valid_identifier(s: &str) -> bool {
 /// since, which must not collide with one of the app's), its guard triggers, the sync
 /// functions, and the protect event triggers. One transaction under [`BOOTSTRAP_LOCK_KEY`].
 ///
-/// Sign-up data is opt-in per column (P34): every run takes a table-level `INSERT` away from
-/// `anon` and `authenticated` (row inserts are the guard's to refuse anyway), so
-/// `app_users_upsert` passes only the columns granted with `GRANT INSERT (col) … TO
-/// authenticated`. The first line is a marker comment, so the script is told apart from the
-/// data API bootstrap.
+/// Sign-up data is opt-in per column (P34): `app_users_upsert` passes a column only when the
+/// column's own ACL (`attacl`) grants `INSERT` straight to `authenticated`
+/// (`GRANT INSERT (col) … TO authenticated`): a table-level, `PUBLIC` or inherited grant
+/// doesn't count, because the write runs as the BYPASSRLS sync role.
+///
+/// Invariant: after every run, `anon` and `authenticated` hold no table-level `INSERT` on the
+/// users table and `authenticated` no table-level `UPDATE`, whoever granted them, and each
+/// keeps every column-level grant of that privilege it held before the run
+/// ([`column_only_sql`], one block per privilege and role). A new table grants `authenticated`
+/// `SELECT, DELETE` only. With no table-level grant to remove, a run changes no ACL. An app
+/// column is therefore self-updatable only after `GRANT UPDATE (col) … TO authenticated`,
+/// narrowed to the user's own row by the `chelabase_users_update_own` policy, and takes
+/// sign-up data only after `GRANT INSERT (col) … TO authenticated`.
+///
+/// The first line is a marker comment, so the script is told apart from the data API
+/// bootstrap.
 ///
 /// The protect event triggers are dropped right after the lock and re-created last, so a
 /// broken state (the table dropped with event triggers off) can't block the run that
@@ -56,12 +147,15 @@ pub fn users_bootstrap_sql(
 ) -> String {
     let s = quote_ident(schema);
     let t = quote_ident(table);
-    let qualified = quote_literal(&format!("{s}.{t}"));
-    let schema_lit = quote_literal(schema);
-    let table_lit = quote_literal(table);
-    let password = quote_literal(sync_verifier);
+    let qualified = literal(&format!("{s}.{t}"));
+    let schema_lit = literal(schema);
+    let table_lit = literal(table);
+    let password = literal(sync_verifier);
     let owner = quote_ident(owner_role);
     let claim_helpers = claim_helpers_body();
+    let insert_anon = column_only_sql(&qualified, "INSERT", "anon");
+    let insert_authenticated = column_only_sql(&qualified, "INSERT", "authenticated");
+    let update_authenticated = column_only_sql(&qualified, "UPDATE", "authenticated");
     format!(
         r#"-- chelabase:users-bootstrap
 BEGIN;
@@ -93,7 +187,7 @@ DO $$ BEGIN
     );
     ALTER TABLE {s}.{t} OWNER TO {owner};
     REVOKE ALL ON {s}.{t} FROM anon;
-    GRANT SELECT, UPDATE, DELETE ON {s}.{t} TO authenticated;
+    GRANT SELECT, DELETE ON {s}.{t} TO authenticated;
     ALTER TABLE {s}.{t} ENABLE ROW LEVEL SECURITY;
     CREATE POLICY chelabase_users_select_own ON {s}.{t} FOR SELECT TO authenticated
       USING (id OPERATOR(pg_catalog.=) chelabase.user_id());
@@ -112,17 +206,7 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE {s}.{t} ADD COLUMN IF NOT EXISTS banned_at timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key ON {s}.{t} (pg_catalog.lower(email)) WHERE deleted_at IS NULL;
-DO $$ DECLARE r pg_catalog.name; BEGIN
-  FOR r IN SELECT g.rolname FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
-      JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantee
-    WHERE c.oid OPERATOR(pg_catalog.=) {qualified}::pg_catalog.regclass
-      AND a.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
-      AND g.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['anon', 'authenticated']::pg_catalog.name[])
-  LOOP
-    EXECUTE pg_catalog.format('REVOKE INSERT ON %s FROM %I', {qualified}::pg_catalog.regclass, r);
-  END LOOP;
-END $$;
-GRANT USAGE ON SCHEMA {s} TO chelabase_auth_sync;
+{insert_anon}{insert_authenticated}{update_authenticated}GRANT USAGE ON SCHEMA {s} TO chelabase_auth_sync;
 GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.{t} TO chelabase_auth_sync;
 CREATE TABLE IF NOT EXISTS chelabase.app_users_table (one boolean PRIMARY KEY DEFAULT true CHECK (one),
   schema_name text NOT NULL, table_name text NOT NULL, table_oid oid NOT NULL);
@@ -202,7 +286,9 @@ BEGIN
      WHERE a.attrelid = tbl::regclass AND a.attnum > 0 AND NOT a.attisdropped
        AND a.attgenerated = '' AND a.attidentity <> 'a'
        AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])
-       AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')
+       AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                    WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                      AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated')
        AND p_data ? a.attname::text;
     IF cols IS NOT NULL THEN
       BEGIN
@@ -421,7 +507,7 @@ pub fn claim_helpers_sql() -> String {
 pub fn users_table_exists_sql(schema: &str, table: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT pg_catalog.to_regclass({}) IS NOT NULL;",
-        quote_literal(&format!("{}.{}", quote_ident(schema), quote_ident(table)))
+        literal(&format!("{}.{}", quote_ident(schema), quote_ident(table)))
     )
 }
 
@@ -436,12 +522,12 @@ pub fn upsert_call_sql(
     created: DateTime<Utc>,
     data: Option<&serde_json::Value>,
 ) -> String {
-    let data = data.map_or_else(|| "NULL".to_string(), |d| quote_literal(&d.to_string()));
+    let data = data.map_or_else(|| "NULL".to_string(), |d| literal(&d.to_string()));
     format!(
         "BEGIN; SET LOCAL ROLE {USERS_SYNC_ROLE}; SELECT chelabase.app_users_upsert({}, {}, {verified}, {banned}, {}, {data}); COMMIT;",
-        quote_literal(&id.to_string()),
-        quote_literal(email),
-        quote_literal(&created.to_rfc3339()),
+        literal(&id.to_string()),
+        literal(email),
+        literal(&created.to_rfc3339()),
     )
 }
 
@@ -450,7 +536,7 @@ pub fn upsert_call_sql(
 pub fn gone_call_sql(id: Uuid, mark: bool) -> String {
     format!(
         "BEGIN; SET LOCAL ROLE {USERS_SYNC_ROLE}; SELECT chelabase.app_users_gone({}, {mark}); COMMIT;",
-        quote_literal(&id.to_string())
+        literal(&id.to_string())
     )
 }
 
@@ -527,7 +613,7 @@ DO $$ BEGIN
     );
     ALTER TABLE "public"."users" OWNER TO "postgres";
     REVOKE ALL ON "public"."users" FROM anon;
-    GRANT SELECT, UPDATE, DELETE ON "public"."users" TO authenticated;
+    GRANT SELECT, DELETE ON "public"."users" TO authenticated;
     ALTER TABLE "public"."users" ENABLE ROW LEVEL SECURITY;
     CREATE POLICY chelabase_users_select_own ON "public"."users" FOR SELECT TO authenticated
       USING (id OPERATOR(pg_catalog.=) chelabase.user_id());
@@ -546,15 +632,176 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE "public"."users" ADD COLUMN IF NOT EXISTS banned_at timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key ON "public"."users" (pg_catalog.lower(email)) WHERE deleted_at IS NULL;
-DO $$ DECLARE r pg_catalog.name; BEGIN
-  FOR r IN SELECT g.rolname FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a
-      JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantee
-    WHERE c.oid OPERATOR(pg_catalog.=) '"public"."users"'::pg_catalog.regclass
-      AND a.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
-      AND g.rolname OPERATOR(pg_catalog.=) ANY (ARRAY['anon', 'authenticated']::pg_catalog.name[])
+DO $$ DECLARE
+  rel pg_catalog.oid := '"public"."users"'::pg_catalog.regclass::pg_catalog.oid;
+  me pg_catalog.name := CURRENT_USER;
+  own pg_catalog.oid;
+  kept pg_catalog.name[];
+  done pg_catalog.oid[] := '{}';
+  gid pg_catalog.oid;
+  missing pg_catalog.text;
+  stuck pg_catalog.text;
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+      WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'anon') THEN
+    RETURN;
+  END IF;
+  SELECT c.relowner INTO own FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) rel;
+  SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum) INTO kept FROM pg_catalog.pg_attribute a
+   WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+     AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                  WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                    AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'anon');
   LOOP
-    EXECUTE pg_catalog.format('REVOKE INSERT ON %s FROM %I', '"public"."users"'::pg_catalog.regclass, r);
+    SELECT x.grantor INTO gid FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+     WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+       AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'anon'
+       AND x.grantor OPERATOR(pg_catalog.<>) ALL (done)
+     ORDER BY x.grantor LIMIT 1;
+    EXIT WHEN NOT FOUND;
+    done := pg_catalog.array_append(done, gid);
+    BEGIN
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));
+      END IF;
+      EXECUTE pg_catalog.format('REVOKE INSERT ON %s FROM anon CASCADE', rel::pg_catalog.regclass);
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', me);
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
   END LOOP;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k::pg_catalog.text), ', ') INTO missing FROM pg_catalog.unnest(kept) k
+   WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) x
+      WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attname OPERATOR(pg_catalog.=) k
+        AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'anon');
+  IF missing IS NOT NULL THEN
+    EXECUTE pg_catalog.format('GRANT INSERT (%s) ON %s TO anon', missing, rel::pg_catalog.regclass);
+  END IF;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(x.grantor)::pg_catalog.text), ', ' ORDER BY x.grantor)
+    INTO stuck FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+   WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+     AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'anon';
+  IF stuck IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = pg_catalog.format('anon still holds a table-level INSERT on %s, granted by %s: revoke it as that role (it needs USAGE on the schema), then grant INSERT per column', rel::pg_catalog.regclass, stuck);
+  END IF;
+END $$;
+DO $$ DECLARE
+  rel pg_catalog.oid := '"public"."users"'::pg_catalog.regclass::pg_catalog.oid;
+  me pg_catalog.name := CURRENT_USER;
+  own pg_catalog.oid;
+  kept pg_catalog.name[];
+  done pg_catalog.oid[] := '{}';
+  gid pg_catalog.oid;
+  missing pg_catalog.text;
+  stuck pg_catalog.text;
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+      WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated') THEN
+    RETURN;
+  END IF;
+  SELECT c.relowner INTO own FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) rel;
+  SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum) INTO kept FROM pg_catalog.pg_attribute a
+   WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+     AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                  WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                    AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated');
+  LOOP
+    SELECT x.grantor INTO gid FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+     WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+       AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated'
+       AND x.grantor OPERATOR(pg_catalog.<>) ALL (done)
+     ORDER BY x.grantor LIMIT 1;
+    EXIT WHEN NOT FOUND;
+    done := pg_catalog.array_append(done, gid);
+    BEGIN
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));
+      END IF;
+      EXECUTE pg_catalog.format('REVOKE INSERT ON %s FROM authenticated CASCADE', rel::pg_catalog.regclass);
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', me);
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+  END LOOP;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k::pg_catalog.text), ', ') INTO missing FROM pg_catalog.unnest(kept) k
+   WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) x
+      WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attname OPERATOR(pg_catalog.=) k
+        AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated');
+  IF missing IS NOT NULL THEN
+    EXECUTE pg_catalog.format('GRANT INSERT (%s) ON %s TO authenticated', missing, rel::pg_catalog.regclass);
+  END IF;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(x.grantor)::pg_catalog.text), ', ' ORDER BY x.grantor)
+    INTO stuck FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+   WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+     AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated';
+  IF stuck IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = pg_catalog.format('authenticated still holds a table-level INSERT on %s, granted by %s: revoke it as that role (it needs USAGE on the schema), then grant INSERT per column', rel::pg_catalog.regclass, stuck);
+  END IF;
+END $$;
+DO $$ DECLARE
+  rel pg_catalog.oid := '"public"."users"'::pg_catalog.regclass::pg_catalog.oid;
+  me pg_catalog.name := CURRENT_USER;
+  own pg_catalog.oid;
+  kept pg_catalog.name[];
+  done pg_catalog.oid[] := '{}';
+  gid pg_catalog.oid;
+  missing pg_catalog.text;
+  stuck pg_catalog.text;
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+      WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated') THEN
+    RETURN;
+  END IF;
+  SELECT c.relowner INTO own FROM pg_catalog.pg_class c WHERE c.oid OPERATOR(pg_catalog.=) rel;
+  SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum) INTO kept FROM pg_catalog.pg_attribute a
+   WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
+     AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                  WHERE x.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+                    AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated');
+  LOOP
+    SELECT x.grantor INTO gid FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+     WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+       AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated'
+       AND x.grantor OPERATOR(pg_catalog.<>) ALL (done)
+     ORDER BY x.grantor LIMIT 1;
+    EXIT WHEN NOT FOUND;
+    done := pg_catalog.array_append(done, gid);
+    BEGIN
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));
+      END IF;
+      EXECUTE pg_catalog.format('REVOKE UPDATE ON %s FROM authenticated CASCADE', rel::pg_catalog.regclass);
+      IF gid OPERATOR(pg_catalog.<>) own THEN
+        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', me);
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+  END LOOP;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(k::pg_catalog.text), ', ') INTO missing FROM pg_catalog.unnest(kept) k
+   WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a, pg_catalog.aclexplode(a.attacl) x
+      WHERE a.attrelid OPERATOR(pg_catalog.=) rel AND a.attname OPERATOR(pg_catalog.=) k
+        AND x.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+        AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated');
+  IF missing IS NOT NULL THEN
+    EXECUTE pg_catalog.format('GRANT UPDATE (%s) ON %s TO authenticated', missing, rel::pg_catalog.regclass);
+  END IF;
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(x.grantor)::pg_catalog.text), ', ' ORDER BY x.grantor)
+    INTO stuck FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x
+   WHERE c.oid OPERATOR(pg_catalog.=) rel AND x.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
+     AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated';
+  IF stuck IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = pg_catalog.format('authenticated still holds a table-level UPDATE on %s, granted by %s: revoke it as that role (it needs USAGE on the schema), then grant UPDATE per column', rel::pg_catalog.regclass, stuck);
+  END IF;
 END $$;
 GRANT USAGE ON SCHEMA "public" TO chelabase_auth_sync;
 GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."users" TO chelabase_auth_sync;
@@ -636,7 +883,9 @@ BEGIN
      WHERE a.attrelid = tbl::regclass AND a.attnum > 0 AND NOT a.attisdropped
        AND a.attgenerated = '' AND a.attidentity <> 'a'
        AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])
-       AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')
+       AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                    WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                      AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated')
        AND p_data ? a.attname::text;
     IF cols IS NOT NULL THEN
       BEGIN
@@ -961,17 +1210,17 @@ COMMIT;
     #[test]
     fn sign_up_data_is_opt_in_per_column() {
         let sql = bootstrap();
-        assert!(sql.contains(
-            "    GRANT SELECT, UPDATE, DELETE ON \"public\".\"users\" TO authenticated;\n"
-        ));
+        assert!(sql.contains("    GRANT SELECT, DELETE ON \"public\".\"users\" TO authenticated;\n"));
         assert!(!sql.contains("INSERT, UPDATE, DELETE ON \"public\".\"users\" TO authenticated"));
         let revoke = sql
             .find("pg_catalog.aclexplode(c.relacl)")
             .expect("the table-level INSERT check");
-        let block = &sql[revoke..revoke + sql[revoke..].find("END $$;").unwrap()];
-        assert!(block.contains("a.privilege_type OPERATOR(pg_catalog.=) 'INSERT'"));
-        assert!(block.contains("ARRAY['anon', 'authenticated']::pg_catalog.name[]"));
-        assert!(block.contains("REVOKE INSERT ON %s FROM %I"));
+        for role in ["anon", "authenticated"] {
+            let block = revoke_block(&sql, "INSERT", role);
+            assert!(block.contains("x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'"));
+            assert!(block.contains(&format!("'REVOKE INSERT ON %s FROM {role} CASCADE'")));
+            assert!(block.contains(&format!("'GRANT INSERT (%s) ON %s TO {role}'")));
+        }
         // Outside the create-only block: every run checks it.
         assert!(
             sql.find("CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key")
@@ -979,10 +1228,7 @@ COMMIT;
                 < revoke
         );
         let f = function_text(&sql, "app_users_upsert");
-        assert_eq!(f.matches("has_column_privilege(").count(), 1);
-        assert!(f.contains(
-            "AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')"
-        ));
+        assert!(f.contains(SIGN_UP_GATE), "{f}");
     }
 
     /// The bootstrap's own-row policies call `chelabase.user_id()`: left behind, they'd make a
@@ -1064,11 +1310,113 @@ COMMIT;
     #[test]
     fn upsert_limits_data_to_columns_authenticated_may_insert() {
         let f = function_text(&bootstrap(), "app_users_upsert");
-        assert!(f.contains(
-            "AND has_column_privilege('authenticated', a.attrelid, a.attname::text, 'INSERT')"
-        ));
+        assert!(f.contains(SIGN_UP_GATE), "{f}");
         assert!(f.contains("AND a.attname <> ALL (ARRAY['id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at']::name[])"));
         assert!(f.contains("SECURITY INVOKER") && !f.contains("SECURITY DEFINER"));
+    }
+
+    /// The upsert's column gate: a direct column-level `INSERT` grant to `authenticated`.
+    const SIGN_UP_GATE: &str = "       AND EXISTS (SELECT FROM pg_catalog.aclexplode(a.attacl) x
+                    WHERE x.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
+                      AND pg_catalog.pg_get_userbyid(x.grantee) OPERATOR(pg_catalog.=) 'authenticated')
+";
+
+    /// The text of the every-run block that takes table-level `privilege` away from `role`.
+    fn revoke_block<'a>(sql: &'a str, privilege: &str, role: &str) -> &'a str {
+        let revoke = sql
+            .find(&format!("'REVOKE {privilege} ON %s FROM {role} CASCADE'"))
+            .expect("the table-level block");
+        let start = sql[..revoke].rfind("DO $$ DECLARE\n  rel pg_catalog.oid := ").unwrap();
+        let end = sql[start..].find("END $$;\n").unwrap();
+        &sql[start..start + end]
+    }
+
+    fn update_revoke_block(sql: &str) -> &str {
+        revoke_block(sql, "UPDATE", "authenticated")
+    }
+
+    /// W3, W11: the three every-run blocks (INSERT for `anon` and `authenticated`, UPDATE for
+    /// `authenticated`) are one text apart from the privilege and the role: each acts for
+    /// every grantor, switches role only for a grantor that isn't the owner, skips a grantor
+    /// it can't act as inside a sub-block, and names the table and the grantors left.
+    #[test]
+    fn every_table_level_block_is_the_same_text() {
+        let sql = bootstrap();
+        let norm = |p: &str, r: &str| revoke_block(&sql, p, r).replace(p, "<P>").replace(r, "<R>");
+        let update = norm("UPDATE", "authenticated");
+        assert_eq!(norm("INSERT", "authenticated"), update);
+        assert_eq!(norm("INSERT", "anon"), update);
+        assert_eq!(sql.matches("DO $$ DECLARE\n  rel pg_catalog.oid := ").count(), 3);
+        let b = update_revoke_block(&sql);
+        let own = b.find("      IF gid OPERATOR(pg_catalog.<>) own THEN\n        EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));").unwrap();
+        let caught = b.find("    EXCEPTION WHEN insufficient_privilege THEN NULL;\n    END;\n  END LOOP;").unwrap();
+        assert!(b.find("    BEGIN\n").unwrap() < own && own < caught);
+        assert!(b.contains("SELECT c.relowner INTO own"));
+        assert!(b.contains("still holds a table-level UPDATE on %s, granted by %s"));
+        assert!(b.contains("pg_catalog.pg_get_userbyid(x.grantor)"));
+    }
+
+    /// A new users table gives `authenticated` SELECT and DELETE (the guard refuses deletes),
+    /// never a table-level UPDATE: an app column is self-updatable only through a column grant.
+    #[test]
+    fn users_bootstrap_grants_no_table_update() {
+        let sql = bootstrap();
+        assert!(sql.contains("    GRANT SELECT, DELETE ON \"public\".\"users\" TO authenticated;\n"));
+        for line in sql.lines().filter(|l| l.contains("TO authenticated")) {
+            let grant = line.trim_start();
+            if grant.starts_with("GRANT ") && grant.contains("\"public\".\"users\"") {
+                assert!(!grant.contains("UPDATE"), "{line}");
+            }
+        }
+        // The own-row UPDATE policy stays: it narrows the column grants a developer adds.
+        assert!(sql.contains("CREATE POLICY chelabase_users_update_own ON \"public\".\"users\" FOR UPDATE TO authenticated"));
+    }
+
+    /// Every run (outside the create-only block) removes a table-level UPDATE held by
+    /// `authenticated`, whoever granted it, and keeps its column-level UPDATE grants: they are
+    /// read before the first REVOKE (a table-level REVOKE also clears that grantor's column
+    /// grants) and re-granted after. With no table-level grant the block returns before any
+    /// change. It ends by failing the run if a table-level UPDATE is still there.
+    #[test]
+    fn table_update_is_revoked_on_every_run_keeping_column_grants() {
+        let sql = bootstrap();
+        let b = update_revoke_block(&sql);
+        let at = sql.find(b).unwrap();
+        assert!(sql.find("CREATE UNIQUE INDEX IF NOT EXISTS chelabase_users_email_key").unwrap() < at);
+        assert!(sql.find("REVOKE INSERT ON %s FROM authenticated CASCADE").unwrap() < at);
+        let guard = b.find("  IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) x").unwrap();
+        let ret = b.find("    RETURN;\n  END IF;\n").unwrap();
+        let read = b.find("SELECT pg_catalog.array_agg(a.attname ORDER BY a.attnum) INTO kept").unwrap();
+        let set_role = b.find("EXECUTE pg_catalog.format('SET LOCAL ROLE %I', pg_catalog.pg_get_userbyid(gid));").unwrap();
+        let revoke = b.find("EXECUTE pg_catalog.format('REVOKE UPDATE ON %s FROM authenticated CASCADE', rel::pg_catalog.regclass);").unwrap();
+        let back = b.find("EXECUTE pg_catalog.format('SET LOCAL ROLE %I', me);").unwrap();
+        let regrant = b.find("EXECUTE pg_catalog.format('GRANT UPDATE (%s) ON %s TO authenticated', missing, rel::pg_catalog.regclass);").unwrap();
+        let check = b.find("authenticated still holds a table-level UPDATE on %s").unwrap();
+        assert!(guard < ret && ret < read && read < set_role && set_role < revoke && revoke < back);
+        assert!(back < regrant && regrant < check);
+        assert!(b[read..set_role].contains("pg_catalog.aclexplode(a.attacl)"));
+        assert!(b[read..set_role].contains("a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped"));
+        // Each grantor once, re-read after every REVOKE (a CASCADE can take later ones with it).
+        assert!(b.contains("AND x.grantor OPERATOR(pg_catalog.<>) ALL (done)"));
+        assert!(b.contains("done := pg_catalog.array_append(done, gid);"));
+        assert!(b.contains("    EXIT WHEN NOT FOUND;\n"));
+        assert!(b.contains("RAISE EXCEPTION USING ERRCODE = '42501',"));
+        // Every function and operator is schema-qualified (RAISE's `ERRCODE =` and
+        // `MESSAGE =` are PL/pgSQL syntax, not operators).
+        let b = b.replace("ERRCODE = ", "").replace("MESSAGE = ", "");
+        for bare in [" aclexplode(", " pg_get_userbyid(", " format(", " array_agg(", " string_agg(", " unnest(", " quote_ident(", " = ", " <> ", " > "] {
+            assert!(!b.contains(bare), "unqualified {bare:?} in {b}");
+        }
+    }
+
+    /// Sign-up data reaches a column only when the column's own ACL grants INSERT straight to
+    /// `authenticated`: table-level, PUBLIC and inherited grants don't count.
+    #[test]
+    fn sign_up_gate_reads_the_column_acl() {
+        let f = function_text(&bootstrap(), "app_users_upsert");
+        assert!(f.contains(SIGN_UP_GATE), "{f}");
+        assert!(!f.contains("has_column_privilege"), "{f}");
+        assert!(!f.contains("has_table_privilege"), "{f}");
     }
 
     /// I7: a deleted user's email can sign up again.

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { call, createPool, describeDb, newAppPool, startHarness, type Harness } from "./harness.ts";
+import { call, createPool, describeDb, newAppPool, startHarness, startSmtpSink, type Harness, type SmtpSink } from "./harness.ts";
 
 describeDb("users", () => {
   let h: Harness;
@@ -157,5 +157,63 @@ describeDb("users", () => {
     expect(await find("")).toEqual([]);
     expect((await call(h, "GET", `${base()}/users?email=${"x".repeat(321)}`)).status).toBe(400);
     expect((await call(h, "GET", `${base()}/users?email=a%40b.io&search=a`)).status).toBe(400);
+  });
+
+  // The previous address hears of a change only when the caller asks for it.
+  describeDb("set_email notices", () => {
+    let mailed: Harness;
+    let sink: SmtpSink;
+    let p: string;
+    beforeAll(async () => {
+      sink = await startSmtpSink();
+      mailed = await startHarness({
+        smtp: { host: "127.0.0.1", port: sink.port, tls: "none", from: "Chelabase <noreply@chelabase.test>" },
+      });
+      p = newAppPool().pool;
+      await createPool(mailed, p);
+    });
+    afterAll(async () => {
+      await mailed?.close();
+      await sink?.close();
+    });
+    let n = 0;
+    const at = (tag: string) => `${tag}-${++n}-${Date.now()}@x.io`;
+    const setEmail = async (id: string, body: Record<string, unknown>) => {
+      const r = await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${id}/email`, { body });
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      return r.body.user as { email: string };
+    };
+    const mkUser = async () => {
+      const r = await call(mailed, "POST", `/internal/v1/pools/${p}/users`, { body: { email: at("old") } });
+      expect(r.status).toBe(201);
+      return r.body.user as { id: string; email: string };
+    };
+
+    it("set_email notify_previous mails the old address", async () => {
+      const user = await mkUser();
+      const next = at("new");
+      const before = sink.messages.length;
+      expect((await setEmail(user.id, { email: next, email_verified: true, notify_previous: true })).email).toBe(next);
+      expect(sink.messages.length).toBe(before + 1);
+      const notice = sink.messages.at(-1)!;
+      expect(notice.to).toEqual([user.email]);
+      expect(notice.data).toContain("was changed");
+      // Neutral advice (A4): ask the app's support, not a password reset.
+      expect(notice.data).toContain("contact");
+      expect(notice.data).not.toMatch(/reset your password/i);
+      expect(notice.data).not.toContain(next);
+      // The same address again is no change, and mails nothing.
+      await setEmail(user.id, { email: next, notify_previous: true });
+      expect(sink.messages.length).toBe(before + 1);
+      expect((await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${user.id}/email`, { body: { email: at("x"), notify_previous: "yes" } })).status).toBe(400);
+    });
+
+    it("set_email without notify_previous mails nothing", async () => {
+      const user = await mkUser();
+      const before = sink.messages.length;
+      await setEmail(user.id, { email: at("new") });
+      await setEmail(user.id, { email: at("new"), notify_previous: false });
+      expect(sink.messages.length).toBe(before);
+    });
   });
 });

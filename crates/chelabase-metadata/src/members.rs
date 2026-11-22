@@ -464,6 +464,10 @@ pub enum AccessWriteError {
     /// its check read (I4): nothing was written; check again.
     #[error("the member's access changed since it was checked")]
     Changed,
+    /// An invite that may not re-admit a removed member found one (m10): only a tenant admin
+    /// brings back someone removed.
+    #[error("a removed member is re-admitted only by a tenant admin")]
+    RemovedMember,
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -967,6 +971,10 @@ pub struct NewInvite<'a> {
     pub grants: &'a [(Uuid, GrantRow)],
     /// The teams the invitee joins, as the invite's check read them (P25).
     pub teams: &'a [TeamSeen],
+    /// Whether the invite may bring back a removed member: only a tenant admin's may (m10).
+    /// When `false`, a `removed` row of the tenant with this identity user or this email is
+    /// [`AccessWriteError::RemovedMember`], decided under the tenant lock.
+    pub readmit_removed: bool,
 }
 
 /// One `access_events` row, written in the transaction of the change it records.
@@ -2230,6 +2238,28 @@ impl MetadataClient {
         .transpose()?)
     }
 
+    /// Whether the tenant has a `removed` member with this email (trimmed and case folded as
+    /// emails are stored; a blank email never matches). The invite path's early refusal for a
+    /// caller who may not bring a removed member back; the invite write's own check under the
+    /// tenant lock stays the authority.
+    pub async fn removed_member_with_email(
+        &self,
+        tenant: TenantId,
+        email: &str,
+    ) -> Result<bool, MetadataError> {
+        let Some(email) = claim_email(email) else {
+            return Ok(false);
+        };
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM members
+                            WHERE tenant_id = $1 AND status = 'removed' AND email = lower(btrim($2)))",
+        )
+        .bind(tenant.as_uuid())
+        .bind(email)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// The tenant's open invites (neither revoked nor accepted, expired ones included), by
     /// member then newest first.
     pub async fn open_invites(&self, tenant: TenantId) -> Result<Vec<OpenInvite>, MetadataError> {
@@ -2985,13 +3015,19 @@ impl MetadataClient {
     /// false, old grants gone). A live member with that identity user or email, an empty email,
     /// a grant naming `owner` (R7), or a project twice is `Conflict`; a project that isn't active
     /// in the tenant, or a missing tenant, `NotFound`.
+    ///
+    /// Invariant (m10): without `readmit_removed`, no `removed` row of the tenant whose identity
+    /// user or email is the invitee's becomes `invited`, and no new row is inserted beside one
+    /// (`RemovedMember`). The check runs under the tenant lock, after the live-member checks, so
+    /// a removal that commits before it is seen and one that hasn't is still a live member
+    /// (`Conflict`).
     pub async fn create_invited_member(
         &self,
         actor: Uuid,
         tenant: TenantId,
         new: NewInvite<'_>,
     ) -> Result<(MemberListing, Uuid), AccessWriteError> {
-        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams } = new;
+        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams, readmit_removed } = new;
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
         }
@@ -3026,6 +3062,21 @@ impl MetadataClient {
             return Err(AccessWriteError::Conflict(
                 "another member has this email".into(),
             ));
+        }
+        if !readmit_removed {
+            let removed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM members
+                                WHERE tenant_id = $1 AND status = 'removed'
+                                  AND (identity_user_id = $2 OR email = lower(btrim($3))))",
+            )
+            .bind(tenant_id)
+            .bind(identity_user_id)
+            .bind(email)
+            .fetch_one(&mut *tx)
+            .await?;
+            if removed {
+                return Err(AccessWriteError::RemovedMember);
+            }
         }
         require_teams_seen(&mut tx, tenant_id, teams).await?;
         let raw = match &existing {

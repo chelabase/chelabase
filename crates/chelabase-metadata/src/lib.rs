@@ -25,7 +25,7 @@ mod storage_webhooks;
 pub mod teams;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
-    PeekOutcome, ProjectAuth, RefreshNext, RefreshOutcome,
+    PeekOutcome, ProjectAuth, RefreshNext, RefreshOutcome, RefreshProof,
 };
 pub use projects::{
     BeginProjectDelete, ProjectRecord, ProjectStatus, RenameProject, slug_base, valid_project_name,
@@ -46,10 +46,10 @@ pub use storage_webhooks::{
 pub use ddl::DdlTx;
 pub use functions::{
     Advance, BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
-    FunctionRecord, MAX_BUNDLE_SIZE, MAX_LAST_ERROR_CHARS, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
+    FunctionRecord, MAX_BUNDLE_SIZE, MAX_IN_FLIGHT_PER_DATABASE, MAX_LAST_ERROR_CHARS, MAX_SCHEDULES_PER_FUNCTION, MAX_TRIGGERS_PER_FUNCTION, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
     ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
-    secrets_env_bytes, valid_function_name, valid_secret_name,
+    secret_write_allowed, secrets_env_bytes, valid_function_name, valid_secret_name,
 };
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
@@ -221,6 +221,10 @@ pub enum MetadataError {
     /// function, trigger columns that don't fit the source. Nothing was written.
     #[error("invalid function write: {0}")]
     InvalidFunction(String),
+    /// A function already has the most schedules or triggers a branch allows. Nothing was
+    /// written.
+    #[error("{0}")]
+    FunctionLimit(String),
     /// The function, or the branch or database a function write names, is missing,
     /// tombstoned, being deleted or another database's. Nothing was written.
     #[error("function, branch or database not found")]
@@ -233,6 +237,11 @@ pub enum MetadataError {
     /// written.
     #[error("the function is active on a protected branch")]
     FunctionActiveOnProtectedBranch,
+    /// A secret write on a service by a caller who isn't a tenant admin, decided on the kind
+    /// read under the function row's lock in the write's own transaction. Nothing was
+    /// written.
+    #[error("a service's secrets need a tenant admin")]
+    ServiceSecretNeedsTenantAdmin,
     /// The data key is a function's run-as key: only its function revokes or replaces it.
     /// Nothing was written.
     #[error("the key is managed by a function")]
@@ -304,6 +313,7 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 ///
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
+/// `authenticator_elevated_password_enc` (worker data API, `Purpose::AuthenticatorElevated`);
 /// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `functions_password_enc`
 /// (worker function triggers, `Purpose::FunctionsDispatch`); `data_api_keys.sealed`
 /// (orchestrator public keys, `Purpose::DataKey` with AAD the key id; and a function's run-as
@@ -320,6 +330,7 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
+    ("branches", "authenticator_elevated_password_enc", None),
     ("branches", "storage_password_enc", None),
     ("branches", "functions_password_enc", None),
     ("data_api_keys", "sealed", None),
@@ -486,7 +497,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261108000003).
+        // this file when adding one (last: 20261116000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,

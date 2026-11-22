@@ -38,12 +38,37 @@ What it can and can't trigger on:
 - **Not Chelabase's own or reserved schemas:** `chelabase*`, `pg_*`, `storage` and `information_schema` are refused (422).
 - Installing needs nothing from you in SQL, and nothing a database member creates ever runs with the install's rights. The trigger function does not evaluate your types' code.
 
+### The function's run-as role must be able to read the whole table
+
+A table trigger delivers every column of every changed row, so it is installed only while the function's [run-as role](/using/functions/environment#acting-as-the-function) on the branch could read all of those rows itself:
+
+- the function **has a run-as role** on the branch (the role identity a member approved when setting it; a role dropped and re-created under the same name is not that role);
+- that role has **table-level `SELECT`** on the table and **`USAGE` on its schema**, each granted directly or through a role it inherits (a grant on some columns is not enough);
+- when the table has **row level security** enabled, the role is outside it: it has `BYPASSRLS` itself (Postgres doesn't pass `BYPASSRLS` through membership; setting such a role as run-as needs Admin), or it owns the table (directly or through an inherited membership) and the table doesn't `FORCE ROW LEVEL SECURITY`. Rows aren't filtered through your policies; a role your policies apply to is refused.
+
+The worker checks this every time it syncs the branch's triggers, and the trigger function checks it again for every row change, so a revoked grant, newly enabled or forced row level security, a removed `BYPASSRLS` or a changed owner stops new events at once. At the next sync the trigger is uninstalled, its queued events are dropped (counted in `dropped_count`) and it settles `failed` with one of these `last_error` values:
+
+| `last_error` | Cause | Fix |
+|---|---|---|
+| `run_as_role_required` | The function has no run-as role on the branch, or its role has no approved identity. | Set the run-as role (again). |
+| `run_as_role_cannot_read_table` | The run-as role no longer exists (by identity), lacks table-level `SELECT`, or lacks `USAGE` on the table's schema. | `GRANT SELECT ON <table> TO <role>` and `GRANT USAGE ON SCHEMA <schema> TO <role>`, or set the run-as role again. |
+| `run_as_role_subject_to_rls` | The table has row level security that applies to the run-as role. | Use a `BYPASSRLS` run-as role, or the table's owner on a table without `FORCE ROW LEVEL SECURITY`. |
+
+A missing grant is reported before row level security. `failed` is final: after fixing the cause, turn the trigger off and on so it installs again.
+
+Changing or clearing the function's run-as role takes effect at the next sync, not at once: each trigger records the role it was installed for, and until the next sync it keeps capturing as long as that previously approved role could read the table, and those events can be delivered. The next sync checks the new role (or the missing one), and if it fails the rules above, the trigger is uninstalled, its queued events are dropped and it settles `failed`. The wait is at most one sweep, about 30 seconds, and longer when more than 20 branches have table triggers, since each sweep visits 20 branches.
+
+<Callout type="warn">
+**Upgrading:** table triggers that worked before this check fail at their next sync when the function has no run-as role, its role can't `SELECT` the table, or the table has row level security and the role is subject to it. Their queued events are dropped. Fix the cause as in the table above, then turn each trigger off and on.
+</Callout>
+
 Things to know:
 
 - **The compute stays awake** while a branch has an installed, enabled table trigger, so events can be delivered. A branch with a trigger doesn't scale to zero.
 - **Turning a trigger off uninstalls it** from the table and **drops its queued events** (counted in `dropped_count`). Turning it on installs it again. Deleting it does the same.
 - **A disabled function's events queue** and are delivered after you re-enable it. They aren't dropped.
 - The outbox is `chelabase_functions.outbox` in the branch's database. The database's owner-level roles can read it directly (and write to it, but every row is checked against the trigger metadata before delivery and a forged row is deleted, never delivered).
+- **Large rows:** an event over 256 KiB arrives with `record` and `old_record` null and `truncated: true` (see [handlers](/using/functions/handlers)). Its `primary_key` carries the key's values, except that a single key value over 1 KiB arrives as `null`; fetch the row by another column if you need it.
 - A reset or restore puts the branch's table triggers back to `pending_install` and empties the outbox, because the database came from another timeline.
 
 ## Storage triggers
@@ -66,14 +91,16 @@ A storage event says which object changed, not what is in it. A function that re
 
 ## Limits and counters
 
+A function has at most 20 triggers (table and storage together) on a branch; adding another answers 409 `conflict`. A worker delivers at most 32 storage-trigger events at once across all triggers, at most 8 of them for one database and 4 for one trigger; the rest wait their turn and are not redelivered for waiting.
+
 A trigger reports, besides its `state`:
 
 | Field | Meaning |
 |---|---|
-| `last_error` | Why the install failed. |
+| `last_error` | Why the install failed (for table triggers, including the run-as reasons above). |
 | `last_delivery_error` | Why the last failed delivery failed; cleared by a delivery. |
 | `last_delivered_at` | When the last event was delivered. |
 | `dead_count` | Database events that went dead after 10 failed attempts. |
-| `dropped_count` | Events removed undelivered: dead events past 10,000 per database or 7 days old, the queued events of a trigger turned off, and storage events that expired or were evicted. |
+| `dropped_count` | Events removed undelivered: dead events past 10,000 per database or 7 days old, the queued events of a trigger turned off or failed (its run-as role can no longer read the table), and storage events that expired or were evicted. |
 
 **The outbox caps apply to dead rows only.** A pending event is never removed by the cap: delivery is at least once, and a function that stays off keeps its events queued, bounded only by the database's own size. Dead rows beyond 10,000, or older than 7 days, are deleted oldest first and counted in `dropped_count`.

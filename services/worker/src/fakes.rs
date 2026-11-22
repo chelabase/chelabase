@@ -201,6 +201,8 @@ pub struct FakeState {
     pub before_set_authenticator_password: Option<StateHook>,
     /// Each branch's stored `chelabase_storage` login: the sealed password and its salt.
     pub storage_logins: HashMap<BranchId, (String, Vec<u8>)>,
+    /// The `chelabase_authenticator_elevated` logins: sealed password and SCRAM salt, by branch.
+    pub elevated_logins: HashMap<BranchId, (String, Vec<u8>)>,
     /// Runs once, just before the next `set_storage_password`: a concurrent run's write.
     pub before_set_storage_password: Option<StateHook>,
     /// The next N `apply_resync` calls answer `VersionMoved` (and bump the version, as a
@@ -2606,6 +2608,35 @@ impl WorkerMetadata for FakeMetadata {
         Ok(())
     }
 
+    async fn set_authenticator_elevated_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_authenticator_elevated_password")?;
+        let live = state.branches.get(&branch).is_some_and(|b| branch_live(b.status));
+        if live && !state.elevated_logins.contains_key(&branch) {
+            state
+                .elevated_logins
+                .insert(branch, (sealed.to_string(), salt.to_vec()));
+        }
+        Ok(())
+    }
+
+    async fn branches_missing_elevated_login(&self) -> Result<Vec<BranchId>, MetadataError> {
+        let state = self.read("branches_missing_elevated_login")?;
+        Ok(sorted(state.branches.values().filter(|b| {
+            b.status == BranchStatus::Ready
+                && b.kind == BranchKind::Normal
+                && b.authenticator_password_enc.is_some()
+                && !state.elevated_logins.contains_key(&b.id)
+        }))
+        .into_iter()
+        .map(|b| b.id)
+        .collect())
+    }
+
     async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
         let state = self.read("branches_missing_data_api")?;
         Ok(sorted(state.branches.values().filter(|b| {
@@ -2636,6 +2667,8 @@ impl WorkerMetadata for FakeMetadata {
                 storage_password_salt: state.storage_logins.get(&branch).map(|l| l.1.clone()),
                 functions_password_enc: None,
                 functions_password_salt: None,
+                authenticator_elevated_password_enc: state.elevated_logins.get(&branch).map(|l| l.0.clone()),
+                authenticator_elevated_password_salt: state.elevated_logins.get(&branch).map(|l| l.1.clone()),
                 settings: DataApiSettings {
                     max_rows: db.max_rows,
                     statement_timeout_ms: db.statement_timeout_ms,
@@ -4085,6 +4118,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
+        login_rollout_retry: Mutex::default(),
         recreate_backoff: Mutex::default(),
         fn_sweeps: Mutex::default(),
         identity: None,

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { sharedPgPool } from "../src/registry.ts";
 import {
@@ -161,19 +162,112 @@ describeDb("pools", () => {
     }
   });
 
-  // Better Auth's schema check still runs, against the pool's own schema: a missing column
-  // fails the pool's first request instead of a query halfway through it.
-  it("schema_check_reads_the_pools_own_schema", async () => {
+  // Additive schema changes reach pools created before them: a pool with every table but not
+  // every declared column is upgraded in place when it is first loaded.
+  const NEW_COLUMNS = ["failures", "failuresSince"];
+  async function codeColumns(schema: string): Promise<string[]> {
+    const r = await h.db.query(
+      `SELECT attname::text AS name FROM pg_attribute
+        WHERE attrelid = format('%I.email_code', $1::text)::regclass AND attnum > 0 AND NOT attisdropped
+          AND attname = ANY($2::text[]) ORDER BY attname`,
+      [schema, NEW_COLUMNS],
+    );
+    return r.rows.map((row) => row.name);
+  }
+  /** A pool as created before the budget columns existed, with a user and a live code in it. */
+  async function oldPool(secret: string) {
     const a = newAppPool();
-    await createPool(h, a.pool);
-    await h.db.query(`ALTER TABLE "${a.schema}"."user" DROP COLUMN "banReason"`);
-    const cold = await startHarness();
+    const first = await startHarness({ secret });
     try {
-      const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "g@x.io" } });
-      expect(r.status, JSON.stringify(r.body)).toBe(500);
+      await createPool(first, a.pool);
+      const up = await call(first, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "old@x.io" } });
+      expect(up.status, JSON.stringify(up.body)).toBe(201);
+      const code = await call(first, "POST", `/internal/v1/pools/${a.pool}/codes`, {
+        body: { user_id: up.body.user.id, kind: "verify", delivery: "return" },
+      });
+      expect(code.status, JSON.stringify(code.body)).toBe(201);
+      await h.db.query(`ALTER TABLE "${a.schema}".email_code DROP COLUMN failures, DROP COLUMN "failuresSince"`);
+      expect(await codeColumns(a.schema)).toEqual([]);
+      return { ...a, userId: up.body.user.id as string, code: code.body.code as string };
+    } finally {
+      await first.close();
+    }
+  }
+
+  it("a pool missing the new columns is upgraded on load and keeps its codes", async () => {
+    const secret = randomBytes(32).toString("hex");
+    const a = await oldPool(secret);
+    const cold = await startHarness({ secret });
+    try {
+      const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/codes/verify`, {
+        body: { user_id: a.userId, kind: "verify", code: a.code },
+      });
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      expect(await codeColumns(a.schema)).toEqual(NEW_COLUMNS);
+      expect((await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "new@x.io" } })).status).toBe(201);
     } finally {
       await cold.close();
     }
+  });
+
+  it("a pool missing a table is still not found", async () => {
+    const a = await oldPool(randomBytes(32).toString("hex"));
+    await h.db.query(`DROP TABLE "${a.schema}".verification`);
+    const cold = await startHarness();
+    try {
+      const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "h@x.io" } });
+      expect(r.status, JSON.stringify(r.body)).toBe(404);
+      expect(r.body.error).toBe("pool_not_found");
+      expect(await codeColumns(a.schema)).toEqual([]);
+    } finally {
+      await cold.close();
+    }
+  });
+
+  it("two registries upgrading one pool both succeed", async () => {
+    const secret = randomBytes(32).toString("hex");
+    for (let round = 0; round < 3; round++) {
+      const a = await oldPool(secret);
+      // Started one after the other (their fixture setup is not concurrent-safe); the loads race.
+      const colds = [await startHarness({ secret }), await startHarness({ secret })];
+      try {
+        const replies = await Promise.all(
+          colds.map((c, i) => call(c, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: `two-${i}@x.io` } })),
+        );
+        for (const r of replies) expect(r.status, JSON.stringify(r.body)).toBe(201);
+        expect(await codeColumns(a.schema)).toEqual(NEW_COLUMNS);
+        const r = await call(colds[0]!, "POST", `/internal/v1/pools/${a.pool}/codes/verify`, {
+          body: { user_id: a.userId, kind: "verify", code: a.code },
+        });
+        expect(r.status, JSON.stringify(r.body)).toBe(200);
+      } finally {
+        await Promise.all(colds.map((c) => c.close()));
+      }
+    }
+  });
+
+  // Better Auth's schema check still runs, against the pool's own schema: a column Better
+  // Auth can't fill (required, no default, not in its schema) fails the pool's first request
+  // instead of a query halfway through it. (A missing column is added on load instead.) The
+  // request writes nothing (a wrong password), so only the check can fail it: the same column
+  // with a default passes the check, and the request answers 401.
+  it("schema_check_reads_the_pools_own_schema", async () => {
+    const wrongPassword = async (column: string) => {
+      const a = newAppPool();
+      await createPool(h, a.pool);
+      await h.db.query(`ALTER TABLE "${a.schema}"."user" ADD COLUMN "unknownRequired" ${column}`);
+      const cold = await startHarness();
+      try {
+        const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/sessions`, {
+          body: { email: "g@x.io", password: "not-the-password-1" },
+        });
+        return r.status;
+      } finally {
+        await cold.close();
+      }
+    };
+    expect(await wrongPassword("text NOT NULL")).toBe(500);
+    expect(await wrongPassword("text NOT NULL DEFAULT ''")).toBe(401);
   });
 });
 

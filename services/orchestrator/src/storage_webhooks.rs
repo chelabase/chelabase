@@ -136,9 +136,10 @@ async fn valid_url<M, J>(state: &AppState<M, J>, url: &str) -> Result<String, Ap
         .await
         .map(|u| u.to_string())
         .map_err(|refused| {
-            // The address at fault goes to the log only: the answer names the host alone.
+            // The detail (host and address at fault) goes to the log only: the answer says
+            // one generic thing for every resolution-dependent refusal.
             info!("storage webhook url refused: {}", refused.log_detail());
-            unprocessable(&format!("`url` is refused: {refused}"))
+            unprocessable(&format!("`url` is refused: {}", refused.public_message()))
         })
 }
 

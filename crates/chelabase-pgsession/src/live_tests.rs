@@ -105,6 +105,7 @@ impl Scratch {
             database_id: None,
             user,
             password,
+            elevated: None,
             settings: Settings {
                 max_rows: 10,
                 statement_timeout_ms: 5000,
@@ -259,7 +260,7 @@ async fn a_session_for_a_missing_role_runs_nothing_live() {
     let run = |role: String, oid: Option<i64>| {
         let (pools, claims, ran, db) = (&pools, &claims, ran.clone(), db.clone());
         async move {
-            let conn = pools.acquire(branch, &db).await.unwrap();
+            let conn = pools.acquire(branch, &db).await.unwrap().bound_to(&role, None);
             conn.with_role_session(&role, claims, oid, async |s| {
                 let settings = s.settings(&s.info().databases[0]);
                 s.transaction(&db, &settings, "rid", async |c, _version| {
@@ -368,5 +369,266 @@ async fn a_role_session_for_none_runs_nothing_live() {
         assert_eq!(out.unwrap_err(), crate::session::NoRole(role.to_owned()));
     }
     drop(pools);
+    scratch.drop().await;
+}
+
+// --- session integrity of a pooled connection (m3) -----------------------------------------
+
+/// The data API's machinery in a scratch database (the guard functions the pipelined path
+/// needs, as the worker installs them) and a table the roles of a test may read and write.
+const DATA_API_SQL: &str = "CREATE FUNCTION chelabase.assert_schema_version(expected uuid) RETURNS uuid
+  LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = '' AS
+  $f$ DECLARE v uuid; BEGIN
+    SELECT version INTO v FROM chelabase.schema_version;
+    IF v IS DISTINCT FROM expected THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB001', MESSAGE = 'chelabase: stale schema version';
+    END IF;
+    RETURN v; END $f$;
+CREATE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text
+  LANGUAGE plpgsql VOLATILE SET search_path = '' AS
+  $f$ DECLARE n bigint := coalesce(pg_catalog.octet_length(result), 0); total bigint; BEGIN
+    IF n OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    total := coalesce(nullif(pg_catalog.current_setting('chelabase.response_bytes', true), '')::bigint, 0) OPERATOR(pg_catalog.+) n;
+    IF total OPERATOR(pg_catalog.>) budget THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB002', MESSAGE = 'chelabase: response too large';
+    END IF;
+    PERFORM pg_catalog.set_config('chelabase.response_bytes', total::text, true);
+    RETURN result; END $f$;
+CREATE TABLE public.items (id bigint, body text);
+GRANT SELECT, INSERT ON public.items TO PUBLIC;";
+
+/// A data API query tree, parsed.
+fn op(tree: serde_json::Value) -> chelabase_query::Op {
+    chelabase_query::parse(tree.to_string().as_bytes())
+        .unwrap()
+        .op
+}
+
+fn insert_item(id: i64) -> chelabase_query::Op {
+    op(serde_json::json!({
+        "v": 1, "op": "insert", "into": "items",
+        "values": [{"id": id, "body": "x"}], "returning": ["id"],
+    }))
+}
+
+/// What a session's connection is, read inside a transaction of the session: its backend
+/// pid, who it runs as, and how many protocol-level statements it holds (its cache).
+async fn connection_facts(
+    s: &crate::session::RoleSession,
+    db: &str,
+) -> Result<(i32, String, i64), chelabase_query::QueryFailure> {
+    let settings = s.settings(&s.info().databases[0]);
+    s.transaction(db, &settings, "rid", async |c, _version| {
+        let row = c
+            .query_one(
+                "SELECT pg_catalog.pg_backend_pid(), current_user::pg_catalog.text, \
+                 (SELECT pg_catalog.count(*) FROM pg_catalog.pg_prepared_statements p \
+                   WHERE NOT p.from_sql)",
+                &[],
+            )
+            .await
+            .map_err(|e| chelabase_query::QueryFailure::from_pg(&e, "rid"))?;
+        Ok((row.get(0), row.get(1), row.get(2)))
+    })
+    .await
+}
+
+/// The ids committed to `public.items`, as the admin sees them.
+async fn item_ids(scratch: &Scratch) -> Vec<i64> {
+    let mut url = scratch.url.clone();
+    url.set_path(&scratch.db);
+    let pool = PgPool::connect(url.as_str()).await.unwrap();
+    let ids = sqlx::query_scalar("SELECT id FROM public.items ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    ids
+}
+
+/// AC 6: ordinary requests back to back on one pool (reads, writes and a batch as two
+/// roles, a transaction, a schema read, the login's own session) each succeed and keep the
+/// connection: the backend pid never changes, and a repeated pipelined request prepares
+/// nothing new (its statements come from the connection's cache).
+#[tokio::test]
+#[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
+async fn clean_requests_keep_their_connection() {
+    let scratch = Scratch::new().await;
+    scratch.in_db(DATA_API_SQL).await;
+    let anon = scratch.role("pgs_anon", "NOLOGIN").await;
+    let app = scratch.role("pgs_app", "NOLOGIN").await;
+    let login = scratch.url.username().to_owned();
+    let pools = Pools::new(Fixed(scratch.info(None)), 10);
+    let cache = chelabase_query::QueryCache::default();
+    let branch = Uuid::new_v4();
+    let claims = serde_json::json!({ "sub": "u1" });
+    let db = scratch.db.clone();
+    let select = op(serde_json::json!({"v": 1, "op": "select", "from": "items"}));
+    let batch = op(serde_json::json!({"v": 1, "op": "batch", "ops": [
+        {"op": "select", "from": "items"},
+        {"op": "insert", "into": "items", "values": [{"id": 50, "body": "b"}]},
+    ]}));
+
+    let mut pids = Vec::new();
+    let mut cached = Vec::new();
+    // Twice through: the first pass plans and prepares, the second is all cache hits.
+    for pass in 0..3_i64 {
+        for role in [&anon, &app] {
+            let conn = pools.acquire(branch, &db).await.unwrap().bound_to(role, None);
+            let facts = conn
+                .with_role_session(role, &claims, None, async |s| {
+                    let settings = s.settings(&s.info().databases[0]);
+                    let key = (branch, db.as_str());
+                    s.run(&cache, key, &settings, 1 << 20, &select, "rid")
+                        .await
+                        .unwrap();
+                    s.run(&cache, key, &settings, 1 << 20, &insert_item(pass), "rid")
+                        .await
+                        .unwrap();
+                    s.run(&cache, key, &settings, 1 << 20, &batch, "rid")
+                        .await
+                        .unwrap();
+                    s.schema(&cache, key, 5000, "rid", async |_c, _schema| Ok(()))
+                        .await
+                        .unwrap();
+                    connection_facts(s, &db).await.unwrap()
+                })
+                .await
+                .unwrap();
+            assert_eq!(&facts.1, role, "the session runs as its role");
+            pids.push(facts.0);
+            if pass > 0 {
+                cached.push(facts.2);
+            }
+        }
+        // The login's own session, on the same pool.
+        let conn = pools.acquire(branch, &db).await.unwrap();
+        let facts = conn
+            .with_login_session(async |s| connection_facts(s, &db).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(facts.1, login, "the login session runs as the login");
+        pids.push(facts.0);
+    }
+    assert!(
+        pids.iter().all(|pid| *pid == pids[0]),
+        "every request ran on the same backend: {pids:?}"
+    );
+    assert!(
+        cache
+            .pipelined_runs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 12,
+        "the repeated requests ran pipelined"
+    );
+    assert!(
+        cached.iter().all(|n| *n == cached[0]) && cached[0] > 0,
+        "repeated requests prepare nothing new: {cached:?}"
+    );
+    assert_eq!(item_ids(&scratch).await, vec![0, 0, 1, 1, 2, 2, 50, 50, 50, 50, 50, 50]);
+    drop(pools);
+    scratch.drop().await;
+}
+
+/// AC 4: a deferred constraint trigger that creates a SQL-level prepared statement closes
+/// the connection it ran on, and the next request on the pool gets another backend and
+/// runs unchanged. In a role session the trigger fires before the session check, so nothing
+/// commits (a 500); on a service's own login (no check: it holds no role to switch to) the
+/// work commits and the reset after its `COMMIT` fails, which closes the connection.
+#[tokio::test]
+#[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
+async fn deferred_prepare_closes_the_connection() {
+    let scratch = Scratch::new().await;
+    scratch.in_db(DATA_API_SQL).await;
+    scratch
+        .in_db(
+            "CREATE FUNCTION public.at_commit() RETURNS trigger LANGUAGE plpgsql AS
+               $f$ BEGIN
+                 IF NEW.id = 1 THEN EXECUTE 'PREPARE pgs_left AS SELECT 1'; END IF;
+                 RETURN NULL; END $f$;
+             CREATE CONSTRAINT TRIGGER at_commit AFTER INSERT ON public.items
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.at_commit();",
+        )
+        .await;
+    let app = scratch.role("pgs_app", "NOLOGIN").await;
+    let branch = Uuid::new_v4();
+    let db = scratch.db.clone();
+
+    // A role session.
+    let pools = Pools::new(Fixed(scratch.info(None)), 10);
+    let cache = chelabase_query::QueryCache::default();
+    let claims = serde_json::json!({});
+    let request = async |id: i64| {
+        let conn = pools.acquire(branch, &db).await.unwrap().bound_to(&app, None);
+        conn.with_role_session(&app, &claims, None, async |s| {
+            let settings = s.settings(&s.info().databases[0]);
+            let (pid, _, _) = connection_facts(s, &db).await?;
+            let key = (branch, db.as_str());
+            let out = s
+                .run(&cache, key, &settings, 1 << 20, &insert_item(id), "rid")
+                .await;
+            Ok::<_, chelabase_query::QueryFailure>((pid, out))
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    };
+    // Sequential first (nothing cached), then pipelined. The table has a deferrable
+    // constraint trigger, so every request that writes it gives its connection up: each
+    // request here runs on a backend of its own.
+    let (warm_pid, out) = request(2).await;
+    out.unwrap();
+    let mut last_pid = warm_pid;
+    for round in ["sequential or pipelined", "pipelined"] {
+        let (pid, out) = request(1).await;
+        assert_ne!(pid, last_pid, "{round}: a write to the table isn't followed on its connection");
+        let e = out.unwrap_err();
+        assert_eq!(
+            (e.status.as_u16(), e.code),
+            (500, "internal"),
+            "{round}: {e:?}"
+        );
+        let (next_pid, out) = request(3).await;
+        assert_ne!(next_pid, pid, "{round}: the next request gets another backend");
+        out.unwrap();
+        last_pid = next_pid;
+    }
+    assert_eq!(item_ids(&scratch).await, vec![2, 3, 3], "the refused rows never committed");
+    drop(pools);
+
+    // A service's own login: no session check, so the reset after COMMIT is what refuses.
+    let bare = scratch.role("pgs_svc", "LOGIN PASSWORD 'pw'").await;
+    let (_roles, pool) = managed(&scratch, Some(&bare));
+    const PID: NamedStatement =
+        crate::named_statement!("pid", "SELECT pg_catalog.pg_backend_pid()", &[]);
+    let pid = async || {
+        pool.query(branch, &db, &PID, &[], "rid").await.unwrap()[0].get::<_, i32>(0)
+    };
+    let before = pid().await;
+    assert_eq!(pid().await, before, "the managed connection is pooled");
+    let on_commit =
+        |e: &tokio_postgres::Error| chelabase_query::QueryFailure::from_pg(e, "rid");
+    let ran_on = pool
+        .transaction(branch, &db, 5000, "rid", on_commit, async |c| {
+            let pg = |e: tokio_postgres::Error| chelabase_query::QueryFailure::from_pg(&e, "rid");
+            c.batch_execute("INSERT INTO public.items VALUES (1, 'svc')")
+                .await
+                .map_err(pg)?;
+            let row = c
+                .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+                .await
+                .map_err(pg)?;
+            Ok(row.get::<_, i32>(0))
+        })
+        .await
+        .unwrap();
+    assert_eq!(ran_on, before);
+    assert_eq!(item_ids(&scratch).await, vec![1, 2, 3, 3], "the service's work committed");
+    let after = pid().await;
+    assert_ne!(after, before, "the reset failed: the next request gets another backend");
+    assert_eq!(pid().await, after, "and that one is pooled");
+    drop(pool);
     scratch.drop().await;
 }

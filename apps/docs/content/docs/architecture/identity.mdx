@@ -33,6 +33,7 @@ Email verification, password reset and invites use six-digit codes:
 - verification and reset codes last 15 minutes, invite codes 7 days, though the invite itself expires after 72 hours, which is the limit an invitee meets; each takes at most 5 wrong guesses;
 - a code is stored only as an HMAC-SHA256 under `identity/secret`, bound to the pool, the user, the kind and the user's current email, so changing the email kills every outstanding code;
 - `auth` issues at most 5 verification or reset codes an hour per person and kind. Invite codes come from the orchestrator and are limited there instead, to 5 invite sends (first invites and resends together) an hour per person.
+- a reset confirm, and an app's email verification, that names an email takes at most 10 refused checks per email and kind in any 24 hours, for known and unknown emails alike; the 11th answers 429 `rate_limited`, before the account's own stored budget in the identity service (10 wrong guesses per 24 hours) can be spent, so the answer doesn't tell accounts apart. A right code doesn't count.
 
 These limits, like `auth`'s other sign-in limits, are kept in each process's memory: they apply per replica, not across replicas, and start again when the service restarts.
 
