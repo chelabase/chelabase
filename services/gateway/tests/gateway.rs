@@ -1558,3 +1558,96 @@ mod member_tokens {
         assert!(stack.upstream_saw().is_none());
     }
 }
+
+// ---- MCP core m2: `/mcp` through the gateway ----
+
+/// A raw upstream that answers one request with an event stream: a first event at once, the
+/// second only after `pause`. Returns the request head it saw.
+async fn spawn_mcp_stream_upstream(pause: Duration) -> (String, Arc<Mutex<Option<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let record = seen.clone();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let head = read_head(&mut sock).await;
+        *record.lock().unwrap() = Some(head);
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+              Transfer-Encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        sock.write_all(&chunk("event: message\ndata: {\"id\":1}\n\n")).await.unwrap();
+        tokio::time::sleep(pause).await;
+        sock.write_all(&chunk("event: message\ndata: {\"id\":2}\n\n")).await.unwrap();
+        sock.write_all(b"0\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn event_stream_from_mcp_is_not_buffered() {
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, seen) = spawn_mcp_stream_upstream(Duration::from_secs(6)).await;
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+    let mut resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("authorization", "Bearer x")
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "text/event-stream");
+    // The first event arrives while the upstream still holds the second.
+    let first = tokio::time::timeout(Duration::from_secs(3), resp.chunk())
+        .await
+        .expect("the first event reaches the client before the stream ends")
+        .unwrap()
+        .expect("a first chunk");
+    assert!(String::from_utf8_lossy(&first).contains(r#"data: {"id":1}"#), "{first:?}");
+    let head = seen.lock().unwrap().clone().expect("the upstream was called").to_ascii_lowercase();
+    assert!(head.contains("\r\nauthorization: bearer x\r\n"), "{head}");
+    assert!(!head.contains("x-chelabase-identity"), "{head}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn www_authenticate_from_mcp_reaches_the_client() {
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let challenge = r#"Bearer error="invalid_token", resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp""#;
+    let app = Router::new().fallback(move || async move {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [("www-authenticate", challenge)],
+            Json(serde_json::json!({ "error": "invalid_token" })),
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("authorization", "Bearer expired")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let got: Vec<_> = resp.headers().get_all("www-authenticate").iter().map(|v| v.to_str().unwrap().to_string()).collect();
+    assert_eq!(got, vec![challenge.to_string()]);
+
+    // Without a bearer the gateway answers itself, with the challenge naming the API origin.
+    let resp = reqwest::Client::new().post(format!("{base}/mcp")).body("{}").send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(
+        resp.headers()["www-authenticate"],
+        r#"Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp""#
+    );
+}
