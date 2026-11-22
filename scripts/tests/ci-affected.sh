@@ -71,6 +71,9 @@ expect 'openapi/management.json' $'rust=orchestrator mcp\nweb=@chelabase/managem
 expect 'openapi/data.json' $'rust=chelabase-query rest mcp\nweb=@chelabase/studio @chelabase/docs'
 # The MCP spec bundle: built into the mcp library, read by no web package.
 expect 'openapi/mcp.json' $'rust=mcp\nweb=none'
+# Handlers the MCP's secret-field table cites (services/mcp/src/secret_fields.rs).
+expect_has 'services/orchestrator/src/members.rs' rust= orchestrator mcp
+expect_has 'services/orchestrator/src/sql_editor/routes.rs' rust= orchestrator mcp
 # The docs build renders all three documents as its API reference (api-source.server.ts).
 expect_has 'openapi/login.json' web= @chelabase/docs
 expect 'infra/compose/.env.example' $'rust=realtime chelabase\nweb=@chelabase/studio @chelabase/docs @chelabase/landing'
@@ -160,9 +163,10 @@ eval "$(sed -n '/^rust_reads=(/,/^)/p' scripts/ci-affected.sh)"
 declare -A used=()
 # Check <package>'s <kind> reference to <path> against the table; prints the matching row index.
 check_row() { # <package> <kind> <path> <where>
-  local pkg="$1" kind="$2" p="$3" at="$4" i d pat mode pkgs ok=0
-  # Another member's files select it and its dependents; a full trigger selects everything.
-  for d in "${member_dirs[@]}"; do [[ "$p" != "$d"/* ]] || return 0; done
+  local pkg="$1" kind="$2" p="$3" at="$4" i d pat mode pkgs ok=0 member=0
+  # Another member's files select it and its dependents, so they need a row only when the
+  # reader isn't one of those (`covered` checks that); a full trigger selects everything.
+  for d in "${member_dirs[@]}"; do [[ "$p" != "$d"/* ]] || member=1; done
   [[ -d "$p" || "$(rust_of "$p")" != full ]] || return 0
   for i in "${!rust_reads[@]}"; do
     read -r pat mode pkgs <<<"${rust_reads[$i]}"
@@ -180,7 +184,7 @@ check_row() { # <package> <kind> <path> <where>
     fi
     ok=1
   done
-  ((ok)) || fail "$at reads $p ($kind), but no rust_reads row matching it names $pkg"
+  ((ok || member)) || fail "$at reads $p ($kind), but no rust_reads row matching it names $pkg"
 }
 
 mapfile -t member_dirs < <(cargo metadata --no-deps --format-version 1 |
