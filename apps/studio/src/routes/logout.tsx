@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
+import { clearAllSqlStorage } from "@/components/sql-editor/run-history";
 import { logout } from "@/lib/login-client/generated/endpoints";
 import { useLoginClient } from "@/lib/login-client/use-login-client";
 import { safeRedirect } from "@/lib/safe-redirect";
@@ -17,7 +18,10 @@ function LogoutPage() {
   useEffect(() => {
     const target = safeRedirect(post_logout_redirect, window.location.origin);
     // Leave even if auth is unreachable; an outage keeps the cookie, so the next visit is still signed in.
-    void logout({}).catch(() => undefined).finally(() => window.location.replace(target));
+    void logout({}).catch(() => undefined).finally(() => {
+      clearAllSqlStorage();
+      window.location.replace(target);
+    });
   }, [post_logout_redirect]);
   return <main className="p-8 text-muted-foreground">Signing you out…</main>;
 }

@@ -41,6 +41,12 @@
 //! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
 //! alone, skipping any another transaction holds, and takes nothing after them.
+//! `add_schedule` and `add_trigger` (m13b) take a transaction advisory lock, `fn-schedules:` /
+//! `fn-triggers:{branch}:{function}`, the same shape and place as `put_secret`'s: after the
+//! per-branch locks (1 to 3) and before anything else, so two adds can't each pass the
+//! per-function cap alone. Only the count of the function's rows and the insert of the new row
+//! (4a or 4b) follow it; no other writer takes these advisory locks, and a holder never waits
+//! on a row another holder of the same lock has, so they close no wait cycle.
 //! The worker's trigger settle ([`MetadataClient::settle_trigger_installs`]) updates trigger rows (4b)
 //! alone and takes nothing after them, as does the dispatcher's
 //! [`MetadataClient::record_trigger_deliveries`] (m13); the worker's
@@ -56,6 +62,7 @@
 //! seen by it.
 
 use chelabase_secrets::SecretKey;
+use chelabase_types::container_env::reserved_container_env_name;
 use chelabase_types::{BranchId, DatabaseId};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::PgRow;
@@ -66,6 +73,13 @@ use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
 pub const MAX_BUNDLE_SIZE: i64 = 10 * 1024 * 1024;
+/// A function has at most this many schedules on a branch.
+pub const MAX_SCHEDULES_PER_FUNCTION: i64 = 20;
+/// A function has at most this many triggers (table and storage together) on a branch.
+pub const MAX_TRIGGERS_PER_FUNCTION: i64 = 20;
+/// One database's share of the worker's schedule run slots: a claim returns at most this many
+/// due schedules per database.
+pub const MAX_IN_FLIGHT_PER_DATABASE: i64 = 8;
 /// A secret value may be at most 64 KiB.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 /// A function's secrets on one branch together may be at most 128 KiB, measured as the JSON
@@ -363,6 +377,8 @@ pub fn advance(
 pub struct ClaimedSchedule {
     pub id: Uuid,
     pub branch_id: BranchId,
+    /// The database the branch belongs to (the worker's per-database run limit).
+    pub database_id: DatabaseId,
     pub function_name: String,
     pub cron: String,
     /// The tick to run, `None` when nothing runs ([`Advance::run`]).
@@ -589,6 +605,48 @@ async fn lock_branch_function(
         None => None,
     };
     FunctionKind::parse(&kind.ok_or(MetadataError::FunctionNotFound)?)
+}
+
+/// Who may write a function's secret (set one when `setting` names it, else delete one),
+/// decided on the kind [`lock_branch_function`] read in the write's own transaction.
+///
+/// Invariant: a secret on a service becomes its container's process environment, so only a
+/// tenant admin writes one ([`MetadataError::ServiceSecretNeedsTenantAdmin`] otherwise), and a
+/// name the runner reserves ([`reserved_container_env_name`]) is never set on one (deleting it
+/// stays open so an old one can be removed). A plain function takes any valid name from
+/// anyone the route lets in. The kind is read under the function row's `FOR KEY SHARE` lock,
+/// which a kind change's `FOR UPDATE` waits for: a kind change either commits before this
+/// write reads the kind, or starts after the write committed. A write never lands on a
+/// service on the strength of a kind read earlier.
+pub fn secret_write_allowed(
+    kind: FunctionKind,
+    tenant_admin: bool,
+    setting: Option<&str>,
+) -> Result<(), MetadataError> {
+    if kind != FunctionKind::Service {
+        return Ok(());
+    }
+    if !tenant_admin {
+        return Err(MetadataError::ServiceSecretNeedsTenantAdmin);
+    }
+    match setting {
+        Some(name) if reserved_container_env_name(name) => Err(invalid(format!(
+            "secret name {name} is reserved on a service: the runner or a runtime's loader reads it"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Takes a transaction advisory lock named `key`, released at the transaction's end.
+async fn advisory_lock(
+    tx: &mut Transaction<'static, Postgres>,
+    key: &str,
+) -> Result<(), MetadataError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Why a service never gets a schedule or a trigger: the functions service only ever invokes
@@ -1766,12 +1824,15 @@ impl MetadataClient {
     }
 
     /// Sets a secret of the function on the branch, sealed for that branch, function and name.
+    /// `tenant_admin` is whether the caller is one; see [`secret_write_allowed`] for who may
+    /// write on which kind, decided here on the kind this transaction locked.
     pub async fn put_secret(
         &self,
         branch: BranchId,
         function_id: Uuid,
         name: &str,
         value: &str,
+        tenant_admin: bool,
     ) -> Result<(), MetadataError> {
         if !valid_secret_name(name) {
             return Err(invalid(
@@ -1789,7 +1850,8 @@ impl MetadataClient {
             value,
         );
         let mut tx = self.pool.begin().await?;
-        lock_branch_function(&mut tx, branch, function_id).await?;
+        let kind = lock_branch_function(&mut tx, branch, function_id).await?;
+        secret_write_allowed(kind, tenant_admin, Some(name))?;
         // One secret write at a time per branch and function, so two can't each fit the cap
         // alone and pass it together. Taken last, and only the secret rows follow it.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -1841,15 +1903,17 @@ impl MetadataClient {
         Ok(())
     }
 
-    /// Deletes a secret. False when there was none.
+    /// Deletes a secret. False when there was none. `tenant_admin` as for [`Self::put_secret`].
     pub async fn delete_secret(
         &self,
         branch: BranchId,
         function_id: Uuid,
         name: &str,
+        tenant_admin: bool,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
-        lock_branch_function(&mut tx, branch, function_id).await?;
+        let kind = lock_branch_function(&mut tx, branch, function_id).await?;
+        secret_write_allowed(kind, tenant_admin, None)?;
         let deleted = sqlx::query(
             "DELETE FROM branch_function_secrets
              WHERE branch_id = $1 AND function_id = $2 AND name = $3",
@@ -1917,6 +1981,21 @@ impl MetadataClient {
         let mut tx = self.pool.begin().await?;
         if lock_branch_function(&mut tx, s.branch_id, s.function_id).await? != FunctionKind::Function {
             return Err(invalid(SERVICE_NO_EVENTS));
+        }
+        // One add at a time per branch and function (as `put_secret`), taken last: only the
+        // count and the insert follow it.
+        advisory_lock(&mut tx, &format!("fn-schedules:{}:{}", s.branch_id, s.function_id)).await?;
+        let have: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM function_schedules WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(s.branch_id.as_uuid())
+        .bind(s.function_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if have >= MAX_SCHEDULES_PER_FUNCTION {
+            return Err(MetadataError::FunctionLimit(format!(
+                "a function has at most {MAX_SCHEDULES_PER_FUNCTION} schedules on a branch"
+            )));
         }
         let id = Uuid::new_v4();
         sqlx::query(
@@ -2043,30 +2122,58 @@ impl MetadataClient {
     }
 
     /// The worker's claim: up to `limit` enabled schedules due by the database's `now()` (or
-    /// with no time yet) on a live branch of a live database, locked `FOR UPDATE SKIP LOCKED`
-    /// so concurrent claimers never take the same row, each advanced by [`advance`] in the same
-    /// transaction. The caller runs the ones with [`ClaimedSchedule::run`] after this returns
-    /// (at most once: a failed run isn't retried).
+    /// with no time yet) on a live branch of a live database, oldest due first, so that no
+    /// database has more than [`MAX_IN_FLIGHT_PER_DATABASE`] runs in flight: it gets at most
+    /// that many minus its entry in `in_flight` (the runs the worker already has going per
+    /// database; a database at the limit gets none). Only the chosen rows are locked
+    /// `FOR UPDATE SKIP LOCKED` (so concurrent claimers never take the same row) and advanced
+    /// by [`advance`] in the same transaction; the rest stay due, untouched, for a later claim
+    /// (where they run coalesced). The caller runs the ones with [`ClaimedSchedule::run`] after
+    /// this returns (at most once: a failed run isn't retried).
     pub async fn claim_due_schedules(
         &self,
         limit: i64,
+        in_flight: &[(DatabaseId, usize)],
     ) -> Result<Vec<ClaimedSchedule>, MetadataError> {
         let mut tx = self.pool.begin().await?;
+        let (running_db, running_n): (Vec<Uuid>, Vec<i64>) = in_flight
+            .iter()
+            .map(|(d, n)| (d.as_uuid(), i64::try_from(*n).unwrap_or(i64::MAX)))
+            .unzip();
         let rows = sqlx::query(
-            "SELECT s.id, s.branch_id, f.name, s.cron, s.timezone, s.next_run_at,
-                    coalesce(bf.enabled, false) AS function_enabled, now() AS now
-             FROM function_schedules s
-             JOIN branches b ON b.id = s.branch_id AND b.status NOT IN ('deleting', 'deleted')
-             JOIN databases db ON db.id = b.database_id AND db.status NOT IN ('deleting', 'deleted')
-             JOIN functions f ON f.id = s.function_id AND f.database_id = db.id
+            "SELECT s.id, s.branch_id, ranked.database_id, f.name, s.cron, s.timezone,
+                    s.next_run_at, coalesce(bf.enabled, false) AS function_enabled, now() AS now
+             FROM (
+                 SELECT s.id, b.database_id,
+                        $2 - coalesce(r.n, 0) AS allowed,
+                        row_number() OVER (
+                            PARTITION BY b.database_id
+                            ORDER BY s.next_run_at NULLS FIRST, s.id
+                        ) AS rn
+                 FROM function_schedules s
+                 JOIN branches b ON b.id = s.branch_id AND b.status NOT IN ('deleting', 'deleted')
+                 JOIN databases db ON db.id = b.database_id
+                                  AND db.status NOT IN ('deleting', 'deleted')
+                 LEFT JOIN unnest($3::uuid[], $4::bigint[]) AS r(database_id, n)
+                   ON r.database_id = b.database_id
+                 WHERE s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+             ) ranked
+             JOIN function_schedules s ON s.id = ranked.id
+             JOIN functions f ON f.id = s.function_id AND f.database_id = ranked.database_id
              LEFT JOIN branch_functions bf
                ON bf.branch_id = s.branch_id AND bf.function_id = s.function_id
-             WHERE s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+             WHERE ranked.rn <= ranked.allowed
+               -- Due is checked again on the locked row: a claimer that advanced it since the
+               -- ranking read it leaves it out here, never claimed twice.
+               AND s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
              ORDER BY s.next_run_at NULLS FIRST, s.id
              LIMIT $1
              FOR UPDATE OF s SKIP LOCKED",
         )
         .bind(limit)
+        .bind(MAX_IN_FLIGHT_PER_DATABASE)
+        .bind(running_db)
+        .bind(running_n)
         .fetch_all(&mut *tx)
         .await?;
         let mut claimed = Vec::with_capacity(rows.len());
@@ -2087,6 +2194,7 @@ impl MetadataClient {
             claimed.push(ClaimedSchedule {
                 id,
                 branch_id: BranchId(r.get("branch_id")),
+                database_id: DatabaseId(r.get("database_id")),
                 function_name: r.get("name"),
                 cron,
                 run: step.run,
@@ -2124,6 +2232,19 @@ impl MetadataClient {
         let mut tx = self.pool.begin().await?;
         if lock_branch_function(&mut tx, t.branch_id, t.function_id).await? != FunctionKind::Function {
             return Err(invalid(SERVICE_NO_EVENTS));
+        }
+        advisory_lock(&mut tx, &format!("fn-triggers:{}:{}", t.branch_id, t.function_id)).await?;
+        let have: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM function_triggers WHERE branch_id = $1 AND function_id = $2",
+        )
+        .bind(t.branch_id.as_uuid())
+        .bind(t.function_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if have >= MAX_TRIGGERS_PER_FUNCTION {
+            return Err(MetadataError::FunctionLimit(format!(
+                "a function has at most {MAX_TRIGGERS_PER_FUNCTION} triggers on a branch"
+            )));
         }
         let id = Uuid::new_v4();
         let state = match t.source {
@@ -2499,8 +2620,41 @@ impl MetadataClient {
 }
 
 #[cfg(test)]
+#[path = "functions_lock_model.rs"]
+mod lock_model;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O2: exhaustive over kind x tenant admin x (delete, or set a plain, reserved or
+    /// other-case name): only a tenant admin writes a service's secret, a reserved name is
+    /// never set on one, and a plain function takes anyone's.
+    #[test]
+    fn secret_writes_follow_the_locked_kind() {
+        for kind in [FunctionKind::Function, FunctionKind::Service] {
+            for admin in [false, true] {
+                for setting in [None, Some("API_KEY"), Some("LD_PRELOAD"), Some("PORT"), Some("NODE_OPTIONS"), Some("ld_preload")] {
+                    let got = match secret_write_allowed(kind, admin, setting) {
+                        Ok(()) => "ok",
+                        Err(MetadataError::ServiceSecretNeedsTenantAdmin) => "tenant admin",
+                        Err(MetadataError::InvalidFunction(m)) => {
+                            assert!(m.contains(setting.unwrap()), "{m}");
+                            "reserved"
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    let want = match (kind, admin, setting) {
+                        (FunctionKind::Function, _, _) => "ok",
+                        (FunctionKind::Service, false, _) => "tenant admin",
+                        (FunctionKind::Service, true, Some(n)) if reserved_container_env_name(n) => "reserved",
+                        (FunctionKind::Service, true, _) => "ok",
+                    };
+                    assert_eq!(got, want, "{kind:?} admin={admin} {setting:?}");
+                }
+            }
+        }
+    }
 
     // Review fix: the secrets' total is their size as the env's JSON object, escapes included.
     #[test]

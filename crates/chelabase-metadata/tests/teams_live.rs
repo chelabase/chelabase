@@ -538,6 +538,7 @@ async fn invite_teams_are_deduplicated_and_revoking_drops_them() {
         token_hash: [7; 32],
         grants: &[],
         teams: &teams,
+        readmit_removed: true,
     };
     let (listing, invite_id) = c.create_invited_member(h.admin, h.t, invite).await.unwrap();
     assert!(listing.has_access, "a team with a grant gives access");

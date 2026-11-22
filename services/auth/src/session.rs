@@ -2,7 +2,7 @@
 //! email codes a user can be sent.
 
 use crate::app_users::internal::MemberTenants;
-use crate::guard::RateLimiter;
+use crate::guard::{RateLimiter, Slot};
 use chelabase_identity::CodeKind;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -28,15 +28,18 @@ impl Clock {
 /// expiry says the same (`session.expiresIn`); this holds even if a read there ever slid it.
 pub const ABSOLUTE_LIFETIME: chrono::Duration = chrono::Duration::days(30);
 
-/// Codes of one kind a user can be sent per hour. A new code resets the guess counter (5 wrong
-/// guesses lock a code), so this is what bounds the guesses: 25 an hour per user and kind.
+/// Codes of one kind a user can be sent per hour. Identity bounds the guesses itself (a stored
+/// failure budget per user and kind, and no new code within a minute of a live one); this bounds
+/// the mail.
 const CODES_PER_HOUR: u32 = 5;
 
-/// Counts one code of `kind` for `user`: `false` once the hour's are used. Every path that
-/// issues a code asks this first, whatever address it came from. Per auth process.
-pub fn may_issue_code(limiter: &RateLimiter, kind: CodeKind, user_id: &str) -> bool {
-    limiter.allow(
-        &format!("code:{}:{user_id}", kind.as_str()),
+/// Reserves one code of `kind` for `user`: `None` once the hour's are used. Every path that
+/// issues a code asks this first, whatever address it came from. The slot counts unless it is
+/// refunded, which only identity's `CodeRecentlySent` does (nothing was sent). Per auth process.
+pub fn reserve_code_issue<'a>(limiter: &'a RateLimiter, kind: CodeKind, user_id: &str) -> Option<Slot<'a>> {
+    Slot::reserve(
+        limiter,
+        format!("code:{}:{user_id}", kind.as_str()),
         CODES_PER_HOUR,
         Duration::from_secs(3600),
     )
@@ -111,10 +114,23 @@ mod tests {
     fn code_limits_are_per_user_and_kind() {
         let limiter = RateLimiter::default();
         for _ in 0..5 {
-            assert!(may_issue_code(&limiter, CodeKind::Verify, "u1"));
+            assert!(reserve_code_issue(&limiter, CodeKind::Verify, "u1").is_some());
         }
-        assert!(!may_issue_code(&limiter, CodeKind::Verify, "u1"));
-        assert!(may_issue_code(&limiter, CodeKind::Reset, "u1"));
-        assert!(may_issue_code(&limiter, CodeKind::Verify, "u2"));
+        assert!(reserve_code_issue(&limiter, CodeKind::Verify, "u1").is_none());
+        assert!(reserve_code_issue(&limiter, CodeKind::Reset, "u1").is_some());
+        assert!(reserve_code_issue(&limiter, CodeKind::Verify, "u2").is_some());
+    }
+
+    // m9b AC 3: an issue identity turned away (a code sent under a minute ago) is given back.
+    #[test]
+    fn a_refunded_issue_spends_no_hourly_budget() {
+        let limiter = RateLimiter::default();
+        for _ in 0..20 {
+            reserve_code_issue(&limiter, CodeKind::Reset, "u1").expect("a refunded issue frees its slot").refund();
+        }
+        for _ in 0..5 {
+            assert!(reserve_code_issue(&limiter, CodeKind::Reset, "u1").is_some());
+        }
+        assert!(reserve_code_issue(&limiter, CodeKind::Reset, "u1").is_none());
     }
 }

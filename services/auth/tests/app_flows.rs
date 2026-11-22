@@ -340,6 +340,8 @@ struct H {
     project: Uuid,
     branch: Uuid,
     key: Uuid,
+    /// The service's state: its limiter's clock moves with the fake's in [`H::advance`].
+    state: Arc<AppState>,
 }
 
 struct Ans {
@@ -430,10 +432,11 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let served = state.clone();
     tokio::spawn(async move {
         axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            router(served).into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .unwrap()
@@ -452,6 +455,7 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         project,
         branch,
         key: Uuid::new_v4(),
+        state,
     }
 }
 
@@ -2385,82 +2389,199 @@ async fn change_password_failing_before_the_change_changes_nothing_and_a_retry_w
     assert!(h.internal.session(h.session_id(&other)).unwrap().revoked);
 }
 
-#[tokio::test]
-async fn change_email_syncs() {
-    let h = harness().await;
-    let id = h.add_user("ada@example.com", true).await;
-    let s = h.sign_in("ada@example.com", PW).await;
-    let a = h
-        .post(
-            "change-email",
-            json!({"email": "Ada@New.example"}),
-            Some(access(&s)),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
-    let u = h.user(&id).await.unwrap();
-    assert_eq!(u.email, "ada@new.example");
-    assert!(u.email_verified, "verification is off: the new email is verified");
-    assert!(h.codes(CodeKind::Verify).is_empty());
-    let sync = h.internal.bodies("POST /internal/app/sync");
-    assert_eq!(sync, vec![json!({"project_id": h.project, "user_id": id})]);
-    // The same address again is not a change.
-    let a = h
-        .post("change-email", json!({"email": "ada@new.example"}), Some(access(&s)))
-        .await;
-    assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "conflict"), "{}", a.body);
+impl H {
+    /// `POST change-email` with the user's current password [`PW`].
+    async fn change_email(&self, email: &str, access: &str) -> Ans {
+        self.post("change-email", json!({"email": email, "current_password": PW}), Some(access))
+            .await
+    }
+
+    async fn confirm_email_change(&self, email: &str, code: &str, access: &str) -> Ans {
+        self.post("change-email/confirm", json!({"email": email, "code": code}), Some(access))
+            .await
+    }
+
+    /// The email-change codes the fake mailed, as `(user id, address it went to, code)`.
+    fn email_change_codes(&self) -> Vec<(String, String, String)> {
+        self.fake
+            .codes_sent()
+            .into_iter()
+            .filter(|c| c.kind == CodeKind::EmailChange)
+            .map(|c| (c.user_id, c.email, c.code))
+            .collect()
+    }
+
+    /// The previous addresses that got an email-changed notice.
+    fn change_notices(&self) -> Vec<String> {
+        self.fake.change_notices_sent().into_iter().map(|n| n.email).collect()
+    }
 }
 
-/// With verification on, the new email is unverified and gets a code; verifying it marks it.
 #[tokio::test]
-async fn change_email_resets_verification() {
+async fn change_email_requires_the_current_password() {
+    for verification in [false, true] {
+        let h = harness_opts(verification, 1, true).await;
+        let id = h.add_user("ada@example.com", true).await;
+        h.add_user("bob@example.com", true).await;
+        let s = h.sign_in("ada@example.com", PW).await;
+        assert_eq!(h.fake.session_count(&h.pool()), 1);
+        let a = h
+            .post(
+                "change-email",
+                json!({"email": "ada@new.example", "current_password": "Wr0ng!pass"}),
+                Some(access(&s)),
+            )
+            .await;
+        assert_eq!((a.status, code(&a)), (StatusCode::UNAUTHORIZED, "invalid_credentials"), "{}", a.body);
+        let a = h.post("change-email", json!({"email": "ada@new.example"}), Some(access(&s))).await;
+        assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"), "{}", a.body);
+        // The right password, refused afterwards: a taken address and the user's own.
+        let a = h.change_email("bob@example.com", access(&s)).await;
+        assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "email_taken"), "{}", a.body);
+        let a = h.change_email("ada@example.com", access(&s)).await;
+        assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "conflict"), "{}", a.body);
+        let u = h.user(&id).await.unwrap();
+        assert_eq!((u.email.as_str(), u.email_verified), ("ada@example.com", true));
+        assert!(h.email_change_codes().is_empty(), "no code is issued");
+        assert!(h.codes(CodeKind::Verify).is_empty());
+        assert!(h.change_notices().is_empty());
+        assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+        // Every check's identity session was ended: only the signed-in one is left.
+        assert_eq!(h.fake.session_count(&h.pool()), 1, "verification {verification}");
+    }
+}
+
+#[tokio::test]
+async fn change_email_with_verification_keeps_the_verified_address_until_confirmed() {
     let h = harness_opts(true, 1, true).await;
     let id = h.add_user("ada@example.com", true).await;
     let s = h.sign_in("ada@example.com", PW).await;
-    let a = h
-        .post("change-email", json!({"email": "ada@new.example"}), Some(access(&s)))
-        .await;
-    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
-    let u = h.user(&id).await.unwrap();
-    assert_eq!(u.email, "ada@new.example");
-    assert!(!u.email_verified, "the new address is unverified");
-    let sent = h.last_code(&id, CodeKind::Verify);
-    let a = h
-        .post("verify-email", json!({"email": "ada@new.example", "code": sent}), None)
-        .await;
-    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
-    assert!(h.user(&id).await.unwrap().email_verified);
+    let a = h.change_email("Ada@New.example", access(&s)).await;
+    assert_eq!(a.status, StatusCode::ACCEPTED, "{}", a.body);
+    assert_eq!(a.body, json!({"confirmation_required": true}));
+    let a = h.get("user", Some(access(&s))).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!((&a.body["email"], &a.body["email_verified"]), (&json!("ada@example.com"), &json!(true)));
+    let sent = h.email_change_codes();
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].0.as_str(), sent[0].1.as_str()), (id.as_str(), "ada@new.example"));
+    assert!(h.codes(CodeKind::Verify).is_empty(), "nothing goes to the current address");
+    assert!(h.change_notices().is_empty());
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+    assert_eq!(h.fake.session_count(&h.pool()), 1, "the check's identity session was ended");
+    // The old address still signs in.
+    assert_eq!(h.sign_in("ada@example.com", PW).await.status, StatusCode::OK);
 }
 
 #[tokio::test]
-async fn change_email_taken_409() {
-    let h = harness().await;
-    h.add_user("ada@example.com", true).await;
-    h.add_user("bob@example.com", true).await;
+async fn confirm_email_change_swaps_and_notifies_the_old_address() {
+    let h = harness_opts(true, 1, true).await;
+    let id = h.add_user("ada@example.com", true).await;
     let s = h.sign_in("ada@example.com", PW).await;
-    let a = h
-        .post(
-            "change-email",
-            json!({"email": "BOB@example.com"}),
-            Some(access(&s)),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
-    assert_eq!(code(&a), "email_taken");
-    // "bob@example.com" contains "ob@example.com": only an exact match is taken.
-    let a = h
-        .post("change-email", json!({"email": "ob@example.com"}), Some(access(&s)))
-        .await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let a = h.confirm_email_change("Ada@New.example", &format!(" {sent} "), access(&s)).await;
     assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
-    let a = h
-        .post("change-email", json!({"email": "x@example.com"}), None)
-        .await;
-    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(code(&a), "user_token_invalid");
+    let u = h.user(&id).await.unwrap();
+    assert_eq!((u.email.as_str(), u.email_verified), ("ada@new.example", true));
+    assert_eq!(h.change_notices(), vec!["ada@example.com".to_string()]);
+    let sync = h.internal.bodies("POST /internal/app/sync");
+    assert_eq!(sync, vec![json!({"project_id": h.project, "user_id": id})]);
+    let a = h.post("refresh", json!({"refresh_token": s.body["refresh_token"]}), None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let c = h.claims(access(&a));
+    assert_eq!((c.email.as_str(), c.email_verified), ("ada@new.example", true));
+    // The code is spent.
+    let a = h.confirm_email_change("ada@new.example", &sent, access(&s)).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_code"), "{}", a.body);
 }
 
-/// #123: change-email reads identity's refusals: a taken address (a race past the lookup), a
-/// user gone, its email check; anything else is unavailable, and nothing is synced.
+#[tokio::test]
+async fn confirm_email_change_refuses_another_address_and_wrong_codes() {
+    let h = harness_opts(true, 1, true).await;
+    let id = h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let wrong = if sent == "000000" { "111111" } else { "000000" };
+    for (email, code_) in [("other@new.example", sent.as_str()), ("ada@new.example", wrong), ("not an email", sent.as_str())] {
+        let a = h.confirm_email_change(email, code_, access(&s)).await;
+        assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_code"), "{email}: {}", a.body);
+    }
+    let a = h.post("change-email/confirm", json!({"email": "ada@new.example"}), Some(access(&s))).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"), "{}", a.body);
+    // Another user's code proves nothing for this one.
+    let bob = h.add_user("bob@example.com", true).await;
+    let b = h.sign_in("bob@example.com", PW).await;
+    assert_eq!(h.change_email("bob@new.example", access(&b)).await.status, StatusCode::ACCEPTED);
+    let bobs = h.email_change_codes().pop().unwrap();
+    assert_eq!(bobs.0, bob);
+    let a = h.confirm_email_change("bob@new.example", &bobs.2, access(&s)).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_code"), "{}", a.body);
+    let u = h.user(&id).await.unwrap();
+    assert_eq!((u.email.as_str(), u.email_verified), ("ada@example.com", true));
+    assert_eq!(h.user(&bob).await.unwrap().email, "bob@example.com");
+    assert!(h.change_notices().is_empty());
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+}
+
+#[tokio::test]
+async fn confirm_email_change_refuses_an_address_taken_meanwhile() {
+    let h = harness_opts(true, 1, true).await;
+    let id = h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let bob = h.add_user("ada@new.example", true).await;
+    let a = h.confirm_email_change("ada@new.example", &sent, access(&s)).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "email_taken"), "{}", a.body);
+    let u = h.user(&id).await.unwrap();
+    assert_eq!((u.email.as_str(), u.email_verified), ("ada@example.com", true));
+    assert_eq!(h.user(&bob).await.unwrap().email, "ada@new.example");
+    assert!(h.change_notices().is_empty());
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+}
+
+#[tokio::test]
+async fn change_email_without_verification_applies_at_once_behind_the_password() {
+    let h = harness().await;
+    let id = h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    let a = h.change_email("Ada@New.example", access(&s)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let u = h.user(&id).await.unwrap();
+    assert_eq!((u.email.as_str(), u.email_verified), ("ada@new.example", true));
+    assert!(h.email_change_codes().is_empty());
+    assert!(h.codes(CodeKind::Verify).is_empty());
+    assert_eq!(h.change_notices(), vec!["ada@example.com".to_string()]);
+    let sync = h.internal.bodies("POST /internal/app/sync");
+    assert_eq!(sync, vec![json!({"project_id": h.project, "user_id": id})]);
+    assert_eq!(h.fake.session_count(&h.pool()), 1, "the check's identity session was ended");
+    // The password now goes with the new address.
+    let a = h.change_email("ada@third.example", access(&s)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    assert_eq!(h.user(&id).await.unwrap().email, "ada@third.example");
+}
+
+#[tokio::test]
+async fn email_change_routes_need_the_user_token() {
+    let h = harness_opts(true, 1, true).await;
+    h.add_user("ada@example.com", true).await;
+    let a = h
+        .post("change-email", json!({"email": "x@example.com", "current_password": PW}), None)
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNAUTHORIZED, "user_token_invalid"), "{}", a.body);
+    let a = h
+        .post("change-email/confirm", json!({"email": "x@example.com", "code": "123456"}), None)
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNAUTHORIZED, "user_token_invalid"), "{}", a.body);
+    assert!(h.email_change_codes().is_empty());
+    assert_eq!(h.fake.session_count(&h.pool()), 0, "no password was checked");
+}
+
+/// #123: change-email reads identity's refusals of the write (verification off): a taken
+/// address (a race past the lookup), a user gone, its email check; anything else is
+/// unavailable, and nothing is synced.
 #[tokio::test]
 async fn change_email_maps_identity_refusals() {
     let h = harness().await;
@@ -2474,7 +2595,7 @@ async fn change_email_maps_identity_refusals() {
         if let Some((status, code)) = refusal {
             h.proxy.refuse(&format!("PUT {}/users/{id}/email", h.pool_path()), status, code, 1);
         }
-        h.post("change-email", json!({"email": "new@example.com"}), Some(access(&s))).await
+        h.change_email("new@example.com", access(&s)).await
     };
     let a = change(Some((409, "conflict"))).await;
     assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "email_taken"), "{}", a.body);
@@ -2485,6 +2606,46 @@ async fn change_email_maps_identity_refusals() {
     for (status, refusal) in [(404, "pool_not_found"), (403, "forbidden"), (412, "something_else"), (500, "internal")] {
         let a = change(Some((status, refusal))).await;
         assert_eq!((a.status, code(&a)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"), "{refusal}: {}", a.body);
+    }
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+}
+
+/// With verification on, identity's refusals of the code and of the swap: a taken address is
+/// 409, a code refused (including a swap that lost to a concurrent change) is 422, no SMTP or
+/// an outage is 503; nothing is synced.
+#[tokio::test]
+async fn email_change_with_verification_maps_identity_refusals() {
+    let h = harness_opts(true, 1, true).await;
+    let codes_path = format!("POST {}/codes", h.pool_path());
+    let verify_path = format!("POST {}/codes/verify", h.pool_path());
+    let mut n = 0;
+    let mut user = async || {
+        n += 1;
+        let own = format!("u{n}@example.com");
+        h.add_user(&own, true).await;
+        h.sign_in(&own, PW).await
+    };
+    for (status, refusal, want) in [
+        (409, "conflict", (StatusCode::CONFLICT, "email_taken")),
+        (400, "invalid_email", (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request")),
+        (409, "email_not_configured", (StatusCode::SERVICE_UNAVAILABLE, "unavailable")),
+        (500, "internal", (StatusCode::SERVICE_UNAVAILABLE, "unavailable")),
+    ] {
+        let s = user().await;
+        h.proxy.refuse(&codes_path, status, refusal, 1);
+        let a = h.change_email("new@example.com", access(&s)).await;
+        assert_eq!((a.status, code(&a)), want, "{refusal}: {}", a.body);
+    }
+    for (status, refusal, want) in [
+        (409, "conflict", (StatusCode::CONFLICT, "email_taken")),
+        (422, "invalid_code", (StatusCode::UNPROCESSABLE_ENTITY, "invalid_code")),
+        (404, "user_not_found", (StatusCode::UNAUTHORIZED, "user_token_invalid")),
+        (500, "internal", (StatusCode::SERVICE_UNAVAILABLE, "unavailable")),
+    ] {
+        let s = user().await;
+        h.proxy.refuse(&verify_path, status, refusal, 1);
+        let a = h.confirm_email_change("new@example.com", "123456", access(&s)).await;
+        assert_eq!((a.status, code(&a)), want, "{refusal}: {}", a.body);
     }
     assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
 }
@@ -2515,26 +2676,34 @@ async fn code_issuance_is_limited_per_user_and_kind() {
         };
         h.signer.sign(&claims).unwrap()
     };
-    // Verify codes: three resends (the email allows five), then three email changes (the user
-    // allows five): six asks, five codes.
+    // Each ask is past identity's minute, so only auth's limits hold them back.
+    // Verify codes: three resends.
     for _ in 0..3 {
+        h.fake.advance(WINDOW);
         let a = h.post("resend-code", json!({"email": "ada@example.com"}), None).await;
         assert_eq!(a.status, StatusCode::NO_CONTENT);
     }
-    for n in 0..3 {
-        let a = h
-            .post("change-email", json!({"email": format!("ada{n}@example.com")}), Some(&s))
-            .await;
-        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    assert_eq!(h.codes(CodeKind::Verify).iter().filter(|(u, _)| *u == ada).count(), 3);
+    // Email-change codes count apart from them, five an hour (the route allows a user ten): the
+    // sixth ask is refused by the code limit.
+    for n in 0..5 {
+        h.fake.advance(WINDOW);
+        let a = h.change_email(&format!("ada{n}@example.com"), &s).await;
+        assert_eq!(a.status, StatusCode::ACCEPTED, "{}", a.body);
     }
-    assert_eq!(h.codes(CodeKind::Verify).iter().filter(|(u, _)| *u == ada).count(), 5);
+    h.fake.advance(WINDOW);
+    let a = h.change_email("ada5@example.com", &s).await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    assert_eq!(h.email_change_codes().iter().filter(|(u, ..)| *u == ada).count(), 5);
     // Reset codes: three resets, then three sign-ups for the taken address (each a notice to
     // the owner): six asks, five codes.
     let bob = h.add_user("bob@example.com", true).await;
     for _ in 0..3 {
+        h.fake.advance(WINDOW);
         h.post("password-reset", json!({"email": "bob@example.com"}), None).await;
     }
     for _ in 0..3 {
+        h.fake.advance(WINDOW);
         let a = h
             .post("sign-up", json!({"email": "bob@example.com", "password": PW}), None)
             .await;
@@ -2542,7 +2711,7 @@ async fn code_issuance_is_limited_per_user_and_kind() {
     }
     assert_eq!(h.codes(CodeKind::Reset).iter().filter(|(u, _)| *u == bob).count(), 5);
     // Another kind, and another user, have their own five.
-    let a = h.post("password-reset", json!({"email": "ada2@example.com"}), None).await;
+    let a = h.post("password-reset", json!({"email": "ada@example.com"}), None).await;
     assert_eq!(a.status, StatusCode::NO_CONTENT);
     assert_eq!(h.codes(CodeKind::Reset).iter().filter(|(u, _)| *u == ada).count(), 1);
 }
@@ -2717,17 +2886,15 @@ async fn a_public_key_with_role_authenticated_is_still_anonymous() {
 #[tokio::test]
 async fn change_password_with_an_unverified_email_changes_nothing() {
     let h = harness_opts(true, 1, true).await;
-    h.add_user("ada@example.com", true).await;
+    let id = h.add_user("ada@example.com", true).await;
     let s = h.sign_in("ada@example.com", PW).await;
     assert_eq!(s.status, StatusCode::OK, "{}", s.body);
-    let a = h
-        .post(
-            "change-email",
-            json!({"email": "ada@new.example"}),
-            Some(access(&s)),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    // The email changed to an unverified one behind the session's back.
+    h.fake
+        .client()
+        .set_email(&h.pool(), &id, "ada@new.example", false)
+        .await
+        .unwrap();
     let a = h
         .post(
             "change-password",
@@ -2886,25 +3053,27 @@ async fn wrong_sign_in_burst(h: &Arc<H>, n: usize, vouched: bool) -> (usize, usi
     (refused, limited)
 }
 
-/// The budget is whole: five wrong passwords are checked (401), and the sixth is refused.
+/// The budget is whole: five wrong passwords from one client are checked (401), and the sixth
+/// is refused.
 async fn assert_app_budget_unspent(h: &H, tag: &str) {
     let mut got = Vec::new();
-    for i in 0..6 {
-        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.6.{tag}.{i}"), false).await.status);
+    for _ in 0..6 {
+        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.6.{tag}.1"), false).await.status);
     }
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{tag}: {got:?}");
     assert_eq!(got[5], LIMITED, "{tag}: {got:?}");
 }
 
-// AC 2: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
+// AC 2 (m9b's ceiling): 40 wrong passwords at once from 40 addresses get at most 30 password
+// checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 64)]
 async fn app_sign_in_email_limit_holds_under_concurrency() {
     let h = Arc::new(harness().await);
     h.add_user("ada@example.com", true).await;
-    let (refused, limited) = wrong_sign_in_burst(&h, 30, false).await;
+    let (refused, limited) = wrong_sign_in_burst(&h, 40, false).await;
     let checks = h.password_checks();
-    assert!(checks <= 5, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
-    assert_eq!((refused, limited), (5, 25));
+    assert!(checks <= 30, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (30, 10));
 }
 
 // AC 4: a server-vouched caller has no address limit; the email limit still holds at once.
@@ -2912,10 +3081,10 @@ async fn app_sign_in_email_limit_holds_under_concurrency() {
 async fn server_vouched_sign_in_burst_is_limited() {
     let h = Arc::new(harness().await);
     h.add_user("ada@example.com", true).await;
-    let (refused, limited) = wrong_sign_in_burst(&h, 30, true).await;
+    let (refused, limited) = wrong_sign_in_burst(&h, 40, true).await;
     let checks = h.password_checks();
-    assert!(checks <= 5, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
-    assert_eq!((refused, limited), (5, 25));
+    assert!(checks <= 30, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (30, 10));
 }
 
 // AC 3: a client that hangs up while identity checks the password still spends the attempt.
@@ -2930,7 +3099,7 @@ async fn app_sign_in_cancelled_password_checks_still_count() {
         let send = client
             .post(format!("{}/auth/v1/app/sign-in", h.base))
             .json(&json!({"email": "ada@example.com", "password": "Wr0ng!pass"}))
-            .header("x-forwarded-for", format!("10.3.{i}.1"))
+            .header("x-forwarded-for", "10.3.0.1")
             .header(IDENTITY_HEADER, h.identity_for(None, DataKeyKind::Public))
             .send();
         tokio::select! {
@@ -2943,7 +3112,7 @@ async fn app_sign_in_cancelled_password_checks_still_count() {
     drop(hold);
     h.proxy.clear();
     // A patient client (no timeout).
-    let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.3.9.1", false).await;
+    let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.3.0.1", false).await;
     assert_eq!(a.status, LIMITED, "{}", a.body);
     assert_eq!(h.password_checks(), 5);
 }
@@ -3041,8 +3210,8 @@ async fn app_sign_in_outages_do_not_spend_the_email_budget() {
     h.add_user("ada@example.com", true).await;
     h.proxy.refuse(&h.sign_in_call(), 400, "invalid_request", 5);
     let mut got = Vec::new();
-    for i in 0..6 {
-        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.7.1.{i}"), false).await.status);
+    for _ in 0..6 {
+        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.7.1.1", false).await.status);
     }
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], LIMITED, "{got:?}");
@@ -3054,8 +3223,8 @@ async fn app_sign_in_outages_do_not_spend_the_email_budget() {
 async fn app_unknown_email_counts_like_a_wrong_password() {
     let h = harness().await;
     let mut got = Vec::new();
-    for i in 0..6 {
-        got.push(h.sign_in_from("nobody@example.com", "Wr0ng!pass", &format!("10.9.0.{i}"), false).await.status);
+    for _ in 0..6 {
+        got.push(h.sign_in_from("nobody@example.com", "Wr0ng!pass", "10.9.0.1", false).await.status);
     }
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], LIMITED, "{got:?}");
@@ -3161,4 +3330,229 @@ async fn lookup_of_an_unknown_email_is_one_identity_call() {
         worst.iter().all(|&(_, email, lists, total)| lists <= 1 && total == usize::from(!email.is_empty())),
         "(route, email, user-list reads, identity calls) per request: {worst:?}"
     );
+}
+
+// ---- m9b: identity's code budget and replacement window, and the sign-in slots ----------------
+
+const WINDOW: Duration = Duration::from_secs(61);
+
+impl H {
+    /// A fresh code of `kind` for `user`, handed back (an `email_change` one goes to `next`).
+    async fn fresh_code(&self, user: &str, kind: CodeKind, next: &str) -> String {
+        let client = self.fake.client();
+        if kind == CodeKind::EmailChange {
+            client.create_email_change_code(&self.pool(), user, next, None).await.unwrap();
+            return self.email_change_codes().into_iter().rev().find(|(u, ..)| u == user).unwrap().2;
+        }
+        let request = chelabase_identity::CodeRequest::new(user, kind, chelabase_identity::Delivery::Return);
+        client.create_code(&self.pool(), &request).await.unwrap().code.unwrap()
+    }
+
+    /// Spends `user`'s stored failure budget for `kind` in identity (10 wrong guesses over two
+    /// codes), directly against the fake. `next` is the address an `email_change` code is for.
+    async fn spend_code_budget(&self, user: &str, kind: CodeKind, next: &str) {
+        use chelabase_identity::IdentityError as E;
+        let client = self.fake.client();
+        let pw = (kind == CodeKind::Reset).then_some(NEW_PW);
+        let guess = async |code: &str| match kind {
+            CodeKind::EmailChange => client.confirm_email_change(&self.pool(), user, next, code).await.unwrap_err(),
+            _ => client.verify_code(&self.pool(), user, kind, code, pw).await.unwrap_err(),
+        };
+        for _ in 0..2 {
+            self.fake.advance(WINDOW);
+            let code = self.fresh_code(user, kind, next).await;
+            let wrong = if code == "000000" { "111111" } else { "000000" };
+            for _ in 0..5 {
+                assert_eq!(guess(wrong).await, E::CodeInvalid);
+            }
+        }
+        assert_eq!(guess("000000").await, E::CodeBudgetSpent);
+        self.fake.advance(WINDOW);
+    }
+}
+
+// m9b AC 1: a spent reset budget answers 429 for a fresh, right code; the password stays.
+#[tokio::test]
+async fn app_reset_with_a_spent_budget_is_rate_limited() {
+    let h = harness().await;
+    let bob = h.add_user("bob@example.com", true).await;
+    h.spend_code_budget(&bob, CodeKind::Reset, "").await;
+    let code = h.fresh_code(&bob, CodeKind::Reset, "").await;
+    let a = h
+        .post("password-reset/confirm", json!({"email": "bob@example.com", "code": code, "password": NEW_PW}), None)
+        .await;
+    assert_eq!((a.status, code_of(&a)), (LIMITED, "rate_limited"), "{}", a.body);
+    assert!(h.password_is("bob@example.com", PW).await, "the password is unchanged");
+    assert!(!h.password_is("bob@example.com", NEW_PW).await);
+}
+
+// m9b AC 2: app verify and email-change confirm answer a spent budget as 429.
+#[tokio::test]
+async fn app_verify_and_email_change_confirm_answer_a_spent_budget() {
+    let h = harness_opts(true, 1, true).await;
+    let ada = h.add_user("ada@example.com", false).await;
+    h.spend_code_budget(&ada, CodeKind::Verify, "").await;
+    let code = h.fresh_code(&ada, CodeKind::Verify, "").await;
+    let a = h.post("verify-email", json!({"email": "ada@example.com", "code": code}), None).await;
+    assert_eq!((a.status, code_of(&a)), (LIMITED, "rate_limited"), "{}", a.body);
+    assert!(!h.user(&ada).await.unwrap().email_verified);
+
+    let bob = h.add_user("bob@example.com", true).await;
+    let s = h.sign_in("bob@example.com", PW).await;
+    assert_eq!(s.status, StatusCode::OK, "{}", s.body);
+    h.spend_code_budget(&bob, CodeKind::EmailChange, "bob2@example.com").await;
+    let code = h.fresh_code(&bob, CodeKind::EmailChange, "bob2@example.com").await;
+    let a = h.confirm_email_change("bob2@example.com", &code, access(&s)).await;
+    assert_eq!((a.status, code_of(&a)), (LIMITED, "rate_limited"), "{}", a.body);
+    assert_eq!(h.user(&bob).await.unwrap().email, "bob@example.com");
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+}
+
+// m9b AC 3: a code asked for while one sent under a minute ago stands answers as always, sends
+// nothing and spends none of the hour's five (reset, resend, the decoy sign-up). An email
+// change, asked by the signed-in user, is told to wait instead (429) and spends nothing either.
+#[tokio::test]
+async fn app_reset_request_within_the_window_spends_no_budget() {
+    let h = harness_opts(true, 1, true).await;
+    let bob = h.add_user("bob@example.com", true).await;
+    let resets = || h.codes(CodeKind::Reset).iter().filter(|(u, _)| *u == bob).count();
+    let reset = async || {
+        let a = h.post("password-reset", json!({"email": "bob@example.com"}), None).await;
+        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    };
+    reset().await;
+    reset().await;
+    assert_eq!(resets(), 1, "identity kept the earlier code");
+    let a = h.post("sign-up", json!({"email": "bob@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "the decoy answers the same: {}", a.body);
+    assert_eq!(resets(), 1);
+    // The hour still has four more.
+    for _ in 0..3 {
+        h.fake.advance(WINDOW);
+        reset().await;
+    }
+    h.fake.advance(WINDOW);
+    let a = h.post("sign-up", json!({"email": "bob@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(resets(), 5, "five codes in the hour");
+
+    // Resend: the same.
+    let ada = h.add_user("ada@example.com", false).await;
+    let verifies = || h.codes(CodeKind::Verify).iter().filter(|(u, _)| *u == ada).count();
+    for _ in 0..2 {
+        let a = h.post("resend-code", json!({"email": "ada@example.com"}), None).await;
+        assert_eq!(a.status, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(verifies(), 1);
+
+    // An email change within the minute.
+    let s = h.sign_in("bob@example.com", PW).await;
+    let a = h.change_email("bob2@example.com", access(&s)).await;
+    assert_eq!(a.status, StatusCode::ACCEPTED, "{}", a.body);
+    let a = h.change_email("bob3@example.com", access(&s)).await;
+    assert_eq!((a.status, code_of(&a)), (LIMITED, "rate_limited"), "{}", a.body);
+    assert_eq!(h.email_change_codes().len(), 1);
+    // The refused ask spent none of the hour's five codes: four more go out, then the sixth ask
+    // is refused by the code limit (the route allows ten).
+    for n in 0..4 {
+        h.fake.advance(WINDOW);
+        let a = h.change_email(&format!("bob-{n}@example.com"), access(&s)).await;
+        assert_eq!(a.status, StatusCode::ACCEPTED, "{n}: {}", a.body);
+    }
+    assert_eq!(h.email_change_codes().len(), 5);
+    h.fake.advance(WINDOW);
+    let a = h.change_email("bob-5@example.com", access(&s)).await;
+    assert_eq!((a.status, code_of(&a)), (LIMITED, "rate_limited"), "{}", a.body);
+    assert_eq!(h.email_change_codes().len(), 5);
+}
+
+// m9b AC 5: failures from one client don't lock the owner out from another.
+#[tokio::test]
+async fn app_sign_in_from_another_client_is_not_locked_out() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    for i in 0..5 {
+        let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.9.0.1", false).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.9.0.1", false).await;
+    assert_eq!(a.status, LIMITED);
+    assert_eq!(h.sign_in_from("ada@example.com", PW, "10.9.0.1", false).await.status, LIMITED, "client A is held");
+    let a = h.sign_in_from("ada@example.com", PW, "10.9.0.2", false).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+}
+
+// m9b AC 6: thirty failures for one email in a minute, from any clients, stop every client.
+#[tokio::test]
+async fn app_sign_in_stops_at_the_per_email_ceiling() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    for i in 0..30 {
+        let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.8.{i}.1"), false).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{i}");
+    }
+    assert_eq!(h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.8.99.1", false).await.status, LIMITED);
+    assert_eq!(h.sign_in_from("ada@example.com", PW, "10.8.98.1", false).await.status, LIMITED);
+    assert_eq!(h.password_checks(), 30);
+}
+
+impl H {
+    /// Moves identity's clock and auth's limiter clock forward together.
+    fn advance(&self, by: Duration) {
+        self.fake.advance(by);
+        self.state.limiter.advance(by);
+    }
+}
+
+/// Answers to one email's code checks on `route` over two days: two codes (a known email) or
+/// none, five wrong guesses after each minute; after two hours a guess with a fresh code (a
+/// right one for a known email); and one wrong guess a day later.
+async fn code_check_history(route: &str, known: bool) -> Vec<(StatusCode, String)> {
+    let h = harness_opts(true, 1, true).await;
+    let kind = if route == "verify-email" { CodeKind::Verify } else { CodeKind::Reset };
+    let user = h.add_user("bob@example.com", kind == CodeKind::Reset).await;
+    let email = if known { "bob@example.com" } else { "nobody@example.com" };
+    let mut answers = Vec::new();
+    let check = async |code: &str| {
+        let mut body = json!({"email": email, "code": code});
+        if kind == CodeKind::Reset {
+            body["password"] = json!(NEW_PW);
+        }
+        let a = h.post(route, body, None).await;
+        (a.status, code_of(&a).to_string())
+    };
+    let wrong_for = |code: &str| if code == "000000" { "111111" } else { "000000" }.to_string();
+    for _ in 0..2 {
+        h.advance(WINDOW);
+        let wrong = if known { wrong_for(&h.fresh_code(&user, kind, "").await) } else { "000000".into() };
+        for _ in 0..5 {
+            answers.push(check(&wrong).await);
+        }
+    }
+    h.advance(Duration::from_secs(2 * 3600));
+    let next = if known { h.fresh_code(&user, kind, "").await } else { "123456".into() };
+    answers.push(check(&next).await);
+    h.advance(Duration::from_secs(24 * 3600));
+    let wrong = if known { wrong_for(&h.fresh_code(&user, kind, "").await) } else { "000000".into() };
+    answers.push(check(&wrong).await);
+    answers
+}
+
+// A1: the unauthenticated code checks answer a known and an unknown email alike, a known
+// account whose stored guess budget is spent included: auth's own per-email bound answers
+// first, and both are free again a day later.
+#[tokio::test]
+async fn code_checks_answer_a_known_and_an_unknown_email_alike() {
+    for route in ["password-reset/confirm", "verify-email"] {
+        let known = code_check_history(route, true).await;
+        let unknown = code_check_history(route, false).await;
+        assert_eq!(known, unknown, "{route}");
+        assert_eq!(known[10].0, LIMITED, "{route}: {known:?}");
+        assert_eq!(known[11].1, "invalid_code", "{route}: {known:?}");
+    }
+}
+
+/// [`code`], for tests with a local `code`.
+fn code_of(a: &Ans) -> &str {
+    code(a)
 }

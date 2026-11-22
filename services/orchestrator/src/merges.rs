@@ -1155,6 +1155,33 @@ fn has_security_steps(merge: &MergeRecord) -> bool {
         })
 }
 
+/// Whether the plan runs SQL the user wrote (a `user` step, or own SQL from a resolution): the
+/// worker runs every step as the branch owner, so rehearsing, applying, retrying or resuming it
+/// needs an Admin, on any target. Fails closed: a plan whose `steps` isn't a list, or a step
+/// this build can't read whose `kind` isn't `generated`, counts; so do recorded user steps the
+/// plan doesn't list.
+fn has_user_sql_steps(merge: &MergeRecord) -> bool {
+    use chelabase_schema::plan::{Step, StepKind};
+    let recorded = match &merge.user_steps {
+        Value::Array(steps) => !steps.is_empty(),
+        Value::Null => false,
+        _ => true,
+    };
+    if recorded {
+        return true;
+    }
+    let Some(plan) = merge.plan.as_ref() else {
+        return false;
+    };
+    let Some(steps) = plan["steps"].as_array() else {
+        return true;
+    };
+    steps.iter().any(|step| match serde_json::from_value::<Step>(step.clone()) {
+        Ok(s) => s.kind != StepKind::Generated,
+        Err(_) => step["kind"].as_str() != Some("generated"),
+    })
+}
+
 /// The items an acknowledgement of a security step goes by: the step's items, or its id when
 /// it has none (as `unacknowledged` reads them).
 fn security_items(merge: &MergeRecord) -> HashSet<String> {
@@ -1248,13 +1275,14 @@ fn accepted(status: &MergeRecord, to: MergeStatus) -> Response {
     operation_id = "rehearseMerge",
     tag = "merges",
     summary = "Rehearse a draft merge",
-    description = "Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft.",
+    description = "Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft. Steps run as the branch's owner, so a plan with user SQL (a `user` step, or `own_sql` from a resolution) is rehearsed only by an Admin, on any target.",
     params(("id" = Uuid, Path, description = "Database id"), ("merge_id" = Uuid, Path, description = "Merge id")),
     request_body(content = RehearseRequest, description = "Optional; an empty body is `{}`"),
     responses(
         (status = 202, description = "Accepted; the merge is `rehearsing`", body = MergeSummary),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: a plan with user SQL (a `user` or `own_sql` step) needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`merge_version_conflict`: `version` isn't the merge's (the response carries the merge as `error.current`); `merge_conflicts_open`: a conflict has no resolution; `branch_not_ready`: either branch isn't ready; `conflict`: the merge isn't a draft, has no plan yet, or changed since it was read", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1274,8 +1302,13 @@ where
     J: JobPort,
 {
     let result = async {
-        let record = authorize_merge(&state, &principal, ep::REHEARSE_MERGE.policy.access, id, merge_id).await?;
+        let authorized = authorize_merge_full(&state, &principal, ep::REHEARSE_MERGE.policy.access, id, merge_id).await?;
+        let record = authorized.clone().into_record()?;
         let merge = load_merge(&state, &record, merge_id).await?;
+        // User SQL runs as the branch owner, on the rehearsal branch too: an Admin's, on any target.
+        if has_user_sql_steps(&merge) && !is_admin(&authorized) {
+            return Err(admin_only());
+        }
         let request: RehearseRequest = optional_body(&body)?;
         if merge.state().after(MergeAction::Rehearse).is_none() {
             return Err(wrong_state("rehearse", merge.status));
@@ -1323,14 +1356,14 @@ where
     operation_id = "applyMerge",
     tag = "merges",
     summary = "Apply a rehearsed merge to its target",
-    description = "Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.",
+    description = "Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). A plan with a security step or user SQL (a `user` step, or `own_sql` from a resolution; steps run as the branch's owner) is applied only by an Admin, on any target. The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.",
     params(("id" = Uuid, Path, description = "Database id"), ("merge_id" = Uuid, Path, description = "Merge id")),
     request_body(content = ApplyRequest, description = "Optional; an empty body is `{}`"),
     responses(
         (status = 202, description = "Accepted; the merge is `applying`", body = MergeSummary),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`forbidden`: a plan with a security step (BYPASSRLS, owner-level) needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: a plan with a security step (BYPASSRLS, owner-level) or user SQL (a `user` or `own_sql` step) needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`merge_not_rehearsed`, `merge_stale`, `merge_version_conflict` (`error.current`), `merge_conflicts_open`, `merge_drops_unacknowledged`, `merge_confirm_required`, `merge_busy` (`error.merge_id`): see the description; `branch_not_ready`: either branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -1353,8 +1386,9 @@ where
         let authorized = authorize_merge_full(&state, &principal, ep::APPLY_MERGE.policy.access, id, merge_id).await?;
         let record = authorized.clone().into_record()?;
         let merge = load_merge(&state, &record, merge_id).await?;
-        // Security steps (BYPASSRLS, owner-level) are acknowledged by an Admin, on any target.
-        if has_security_steps(&merge) && !is_admin(&authorized) {
+        // Security steps (BYPASSRLS, owner-level) are acknowledged by an Admin, and user SQL runs
+        // as the branch owner: both are an Admin's, on any target.
+        if (has_security_steps(&merge) || has_user_sql_steps(&merge)) && !is_admin(&authorized) {
             return Err(admin_only());
         }
         let request: ApplyRequest = optional_body(&body)?;
@@ -1545,13 +1579,13 @@ where
     operation_id = "retryMerge",
     tag = "merges",
     summary = "Retry a merge that failed while applying",
-    description = "For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again.",
+    description = "For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again. A plan with user SQL (a `user` or `own_sql` step) is retried only by an Admin, on either path.",
     params(("id" = Uuid, Path, description = "Database id"), ("merge_id" = Uuid, Path, description = "Merge id")),
     responses(
         (status = 202, description = "Accepted; the merge is `online` (after an online failure) or `applying` again", body = MergeSummary),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`forbidden`: a retry that runs a plan with a security step again needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: a retry of a plan with user SQL (a `user` or `own_sql` step), or one that runs a plan with a security step again, needs an Admin (`required: \"admin\"`)", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database or the merge doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the merge didn't fail while applying; `merge_busy`: another merge is applying to the target, or failed half applied on it (`error.merge_id`); `branch_not_ready`: either branch isn't ready (a retry before the online phase)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -1588,6 +1622,10 @@ where
         if matches!(job, MergeJob::Apply { .. }) && has_security_steps(&merge) && !is_admin(&authorized) {
             return Err(admin_only());
         }
+        // User SQL can sit in the online phase too, so both the apply and the resume rerun it.
+        if has_user_sql_steps(&merge) && !is_admin(&authorized) {
+            return Err(admin_only());
+        }
         if let Some(other) = applying_on(&state, &record, merge.target_branch_id, merge_id).await? {
             return Err(busy(Some(other)));
         }
@@ -1595,6 +1633,9 @@ where
             error: Some(None),
             failed_phase: Some(None),
             guard_failed_phase: Some(failed_phase.clone()),
+            // The plan the gates above checked is the plan that runs: a merge changed since it
+            // was read is 409, as for rehearse and apply.
+            guard_version: Some(merge.version),
             guard_branches_ready: to == MergeStatus::Applying,
             // I2: a new apply attempt starts.
             log_status: to == MergeStatus::Applying,
@@ -1910,5 +1951,74 @@ where
         )
             .into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(kind: &str) -> Value {
+        json!({
+            "id": "s1", "kind": kind, "phase": "tx", "sql": "SELECT 1", "items": [],
+            "data_loss": false, "rewrite": false, "security": false, "locks": [],
+            "role_op": null, "online": null,
+        })
+    }
+
+    fn record(plan: Option<Value>, user_steps: Value) -> MergeRecord {
+        let now = Utc::now();
+        MergeRecord {
+            id: Uuid::new_v4(),
+            database_id: Uuid::new_v4(),
+            source_branch_id: Uuid::new_v4(),
+            target_branch_id: Uuid::new_v4(),
+            direction: MergeDirection::IntoParent,
+            database_name: "app".into(),
+            status: MergeStatus::Draft,
+            failed_phase: None,
+            version: 1,
+            base_fingerprint: None,
+            source_fingerprint: None,
+            target_fingerprint: None,
+            analysis: None,
+            resolutions: json!([]),
+            user_steps,
+            acknowledgements: json!([]),
+            options: json!({}),
+            plan,
+            rehearsal: None,
+            result: None,
+            rebaselined: false,
+            error: None,
+            claimed_at: None,
+            created_by: "user-1".into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn has_user_sql_steps_reads_kinds() {
+        let plan = |steps: Value| record(Some(json!({ "steps": steps })), json!([]));
+        // The engine's step shape, so the typed path is the one tested.
+        assert!(serde_json::from_value::<chelabase_schema::plan::Step>(step("own_sql")).is_ok());
+
+        assert!(!has_user_sql_steps(&record(None, json!([]))));
+        assert!(!has_user_sql_steps(&plan(json!([]))));
+        assert!(!has_user_sql_steps(&plan(json!([step("generated"), step("generated")]))));
+        assert!(!has_user_sql_steps(&plan(json!([{ "id": "x", "kind": "generated" }]))));
+        assert!(!has_user_sql_steps(&record(Some(json!({ "steps": [step("generated")] })), Value::Null)));
+
+        assert!(has_user_sql_steps(&plan(json!([step("generated"), step("user")]))));
+        assert!(has_user_sql_steps(&plan(json!([step("own_sql")]))));
+        assert!(has_user_sql_steps(&plan(json!([{ "id": "x", "kind": "mystery" }]))));
+        assert!(has_user_sql_steps(&plan(json!([{ "id": "x" }]))));
+        assert!(has_user_sql_steps(&plan(json!([{ "id": "x", "kind": "user" }]))));
+        assert!(has_user_sql_steps(&record(Some(json!({ "steps": "nope" })), json!([]))));
+        assert!(has_user_sql_steps(&record(Some(json!({})), json!([]))));
+        let recorded = json!([{ "id": "u1", "after": null, "sql": "SELECT 1" }]);
+        assert!(has_user_sql_steps(&record(Some(json!({ "steps": [step("generated")] })), recorded)));
+        assert!(has_user_sql_steps(&record(None, json!({ "odd": true }))));
     }
 }

@@ -64,3 +64,90 @@ describeDb("concurrent pools", () => {
     expect(failures).toEqual([]);
   }, 120_000);
 });
+
+// The failure budget and the replacement window under concurrency. Invariants: concurrent
+// guesses never count past FAILURE_BUDGET, a right code racing wrong ones either clears the
+// budget or is refused (never both, never a lost count), and of concurrent issues for one
+// (user, kind) at most one replaces the code.
+describeDb("concurrent codes", () => {
+  const GUESSES = 24;
+  let h: Harness;
+  let p: { pool: string; schema: string };
+  beforeAll(async () => {
+    h = await startHarness();
+    p = newAppPool();
+    await createPool(h, p.pool);
+  });
+  afterAll(async () => {
+    await h?.close();
+  });
+
+  const base = () => `/internal/v1/pools/${p.pool}`;
+  let n = 0;
+  async function user(): Promise<string> {
+    const r = await call(h, "POST", `${base()}/users`, { body: { email: `c${++n}-${Date.now()}@x.io` } });
+    expect(r.status).toBe(201);
+    return r.body.user.id;
+  }
+  const issue = (id: string, kind = "reset") =>
+    call(h, "POST", `${base()}/codes`, { body: { user_id: id, kind, delivery: "return" } });
+  const guess = (id: string, code: string) =>
+    call(h, "POST", `${base()}/codes/verify`, { body: { user_id: id, kind: "reset", code, new_password: "password-conc-1" } });
+  const wrong = (code: string, k: number) => String((Number(code) + k) % 1_000_000).padStart(6, "0");
+  const row = async (id: string) =>
+    (await h.db.query(`SELECT failures, attempts, "consumedAt" AS consumed FROM "${p.schema}".email_code WHERE "userId" = $1`, [id]))
+      .rows[0] as { failures: number; attempts: number; consumed: Date | null };
+  /** Leaves one failure in the budget, as 9 earlier wrong guesses would. */
+  const nineFailures = (id: string) =>
+    h.db.query(`UPDATE "${p.schema}".email_code SET failures = 9, "failuresSince" = now() WHERE "userId" = $1`, [id]);
+  const count = (replies: { status: number }[], status: number) => replies.filter((r) => r.status === status).length;
+
+  it("concurrent wrong guesses never exceed the budget", async () => {
+    for (let round = 0; round < 3; round++) {
+      const id = await user();
+      const { code } = (await issue(id)).body;
+      await nineFailures(id);
+      const replies = await Promise.all(Array.from({ length: GUESSES }, (_, i) => guess(id, wrong(code, i + 1))));
+      expect(count(replies, 400), "exactly one guess is counted").toBe(1);
+      expect(count(replies, 429)).toBe(GUESSES - 1);
+      expect(replies.filter((r) => r.status === 429).every((r) => (r as any).body.error === "code_budget_spent")).toBe(true);
+      expect(await row(id)).toMatchObject({ failures: 10, attempts: 1, consumed: null });
+    }
+  });
+
+  it("a right code racing wrong ones either clears the budget or is refused", async () => {
+    for (let round = 0; round < 5; round++) {
+      const id = await user();
+      const { code } = (await issue(id)).body;
+      await nineFailures(id);
+      const guesses = Array.from({ length: GUESSES }, (_, i) => (i === round ? code : wrong(code, i + 1)));
+      const replies = await Promise.all(guesses.map((g) => guess(id, g)));
+      const right = replies[round]!;
+      const r = await row(id);
+      // One guess is counted, whichever came first.
+      expect(r.attempts).toBe(1);
+      if (right.status === 200) {
+        expect(r).toMatchObject({ failures: 0 });
+        expect(r.consumed).not.toBeNull();
+        expect(count(replies, 429)).toBe(0);
+      } else {
+        expect(right.status).toBe(429);
+        expect(r).toMatchObject({ failures: 10, consumed: null });
+        expect(count(replies, 400)).toBe(1);
+      }
+    }
+  });
+
+  it("concurrent issues replace at most once", async () => {
+    // No code yet, then a locked one: either way exactly one issue wins.
+    const id = await user();
+    for (const prepare of [async () => undefined, async () => h.db.query(`UPDATE "${p.schema}".email_code SET attempts = 5 WHERE "userId" = $1`, [id])]) {
+      await prepare();
+      const replies = await Promise.all(Array.from({ length: GUESSES }, () => issue(id)));
+      expect(count(replies, 201)).toBe(1);
+      expect(count(replies, 429)).toBe(GUESSES - 1);
+      const won = replies.find((r) => r.status === 201)!;
+      expect((await guess(id, won.body.code)).status).toBe(200);
+    }
+  });
+});

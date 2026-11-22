@@ -1,0 +1,10 @@
+Subject: Confirm your new {{project}} email address
+
+Your code to confirm this as your new {{project}} email address is:
+
+    {{code}}
+
+Enter it to finish changing your email. It expires in {{expires}} and works once.
+Enter it at: {{link}}
+
+If you didn't ask to use this address, you can ignore this email. Nothing changes until the code is entered.

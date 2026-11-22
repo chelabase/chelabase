@@ -109,7 +109,7 @@ impl Fx {
     async fn admin_in(&self, database: &str, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(&self.ep, database, sql)
+            .admin_sql(&self.ep, database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
     }
@@ -117,7 +117,7 @@ impl Fx {
     async fn admin(&self, sql: &str) -> String {
         self.worker
             .computes
-            .admin_sql(&self.ep, &self.database, sql)
+            .admin_sql(&self.ep, &self.database, &crate::common::tenant_sql(sql))
             .await
             .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
     }

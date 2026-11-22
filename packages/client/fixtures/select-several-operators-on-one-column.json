@@ -1,5 +1,5 @@
 {
-  "call": "db.from(\"orders\").select(\"id\").where({ qty: { gte: 1, lt: 10 } })",
+  "call": "db.from(\"orders\").select(\"id\").where({ qty: op.all(op.gte(1), op.lt(10)) })",
   "tree": {
     "v": 1,
     "op": "select",

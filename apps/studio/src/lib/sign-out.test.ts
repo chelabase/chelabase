@@ -47,4 +47,27 @@ describe("signOut", () => {
     expect(p.session.clear).toHaveBeenCalled();
     expect(p.leave).toHaveBeenCalled();
   });
+
+  it("sql_storage_is_cleared_on_sign_out", async () => {
+    localStorage.setItem("chelabase.sql.history.u1.d1", "[]");
+    localStorage.setItem("chelabase.sql.buffer.u1.d1", "select 1");
+    localStorage.setItem("chelabase.sql.timeout", "300000");
+    localStorage.setItem("chelabase.theme", "dark");
+    const p = parts();
+    const f = fakeFetch({ "POST /auth/v1/logout": () => jsonResponse({}) });
+    configureLoginClient({ baseUrl: "http://studio.test", fetchImpl: f });
+    await signOut(p.session, { disconnect: p.disconnect, leave: p.leave });
+    expect(Object.keys(localStorage)).toEqual(["chelabase.theme"]);
+    localStorage.clear();
+  });
+
+  it("a_failed_sign_out_keeps_sql_storage", async () => {
+    localStorage.setItem("chelabase.sql.buffer.u1.d1", "select 1");
+    const p = parts();
+    const f = fakeFetch({ "POST /auth/v1/logout": () => jsonResponse({ error: { code: "unavailable", message: "down" } }, 503) });
+    configureLoginClient({ baseUrl: "http://studio.test", fetchImpl: f });
+    await expect(signOut(p.session, { disconnect: p.disconnect, leave: p.leave })).rejects.toBeInstanceOf(ApiError);
+    expect(localStorage.getItem("chelabase.sql.buffer.u1.d1")).toBe("select 1");
+    localStorage.clear();
+  });
 });

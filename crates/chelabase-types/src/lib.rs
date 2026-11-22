@@ -13,6 +13,7 @@ pub mod api_error;
 pub mod table_api;
 pub mod entry;
 pub mod secret_env;
+pub mod container_env;
 pub mod file_value;
 pub mod dev_defaults;
 #[cfg(feature = "axum")]

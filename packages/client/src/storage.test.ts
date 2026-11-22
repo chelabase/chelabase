@@ -445,3 +445,72 @@ describe("app users", () => {
     expect(fetch.calls[0]!.headers.get("chelabase-user")).toBe("tok");
   });
 });
+
+describe("storage names", () => {
+  const client = (f: ReturnType<typeof routed>) => createClient({ url, key, fetch: f, storage: { branch } });
+  const refused = [".", "..", "a/./b", "a/../b", "a//b", "/a", "a/", "", "\uff0e", "\uff0e\uff0e", "a/\u2024/b", "\u2025", "\u2026", "\ufe52", "\uff0e/x"];
+
+  test("object_names_with_dot_segments_are_refused_before_a_request", async () => {
+    const f = routed(() => json({}));
+    const b = client(f).storage.from("b");
+    for (const name of refused) {
+      await expect(b.upload(name, new Blob(["x"]))).rejects.toBeInstanceOf(TypeError);
+      await expect(b.download(name)).rejects.toBeInstanceOf(TypeError);
+      await expect(b.createSignedUrl(name)).rejects.toBeInstanceOf(TypeError);
+      await expect(b.createSignedUploadUrl(name)).rejects.toBeInstanceOf(TypeError);
+      await expect(b.remove(name)).rejects.toBeInstanceOf(TypeError);
+      await expect(b.exists(name)).rejects.toBeInstanceOf(TypeError);
+      await expect(b.move(name, "ok")).rejects.toBeInstanceOf(TypeError);
+      await expect(b.copy("ok", name)).rejects.toBeInstanceOf(TypeError);
+      expect(() => b.getPublicUrl(name)).toThrow(TypeError);
+    }
+    expect(f.calls).toEqual([]);
+  });
+
+  test("ordinary_dotted_names_keep_their_path", async () => {
+    const f = routed(() => new Response("x"));
+    const b = client(f).storage.from("b");
+    for (const [name, path] of [
+      ["a.b", "a.b"],
+      [".hidden", ".hidden"],
+      ["a/b.c", "a/b.c"],
+      ["..x", "..x"],
+      ["\u00e9/\u00fc.txt", "%C3%A9/%C3%BC.txt"],
+    ] as const) {
+      await b.download(name);
+      expect(f.calls.at(-1)!.url.pathname).toBe(`/storage/v1/object/b/${path}`);
+      expect(b.getPublicUrl(name)).toContain(`/storage/v1/object/public/${branch}/b/${path}`);
+    }
+  });
+
+  test("bucket_names_that_are_dots_are_refused", async () => {
+    const f = routed(() => json({}));
+    const c = client(f);
+    for (const bucket of [".", "..", "", "\uff0e"]) {
+      const b = c.storage.from(bucket);
+      await expect(b.download("x")).rejects.toBeInstanceOf(TypeError);
+      await expect(b.list()).rejects.toBeInstanceOf(TypeError);
+      await expect(b.remove("x")).rejects.toBeInstanceOf(TypeError);
+      await expect(b.createSignedUrl("x")).rejects.toBeInstanceOf(TypeError);
+      await expect(b.upload("x", new Blob(["x"]))).rejects.toBeInstanceOf(TypeError);
+      expect(() => b.getPublicUrl("x")).toThrow(TypeError);
+      await expect(c.storage.updateBucket(bucket, { public: true })).rejects.toBeInstanceOf(TypeError);
+      await expect(c.storage.deleteBucket(bucket)).rejects.toBeInstanceOf(TypeError);
+    }
+    expect(f.calls).toEqual([]);
+  });
+
+  test("signed_urls_refuse_any_bad_path_before_any_request", async () => {
+    const f = routed(() => json({ signed_url: "/x", expires_at: 1 }));
+    const b = client(f).storage.from("b");
+    await expect(b.createSignedUrls(["ok", ".."])).rejects.toBeInstanceOf(TypeError);
+    expect(f.calls).toEqual([]);
+  });
+
+  test("public_urls_refuse_a_dot_only_branch", () => {
+    for (const br of ["", "..", "."]) {
+      const c = createClient({ url, key, fetch: routed(() => json({})), storage: { branch: br } });
+      expect(() => c.storage.from("b").getPublicUrl("x")).toThrow(TypeError);
+    }
+  });
+});

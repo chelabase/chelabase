@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    CLAIM_BATCH, Claimed, Deliverable, LEASE, MAX_EVENT_BYTES, OUTBOX_CAP, Outcome, Plan,
+    CLAIM_BATCH, Claimed, Deliverable, LEASE, MAX_EVENT_BYTES, MAX_EVENT_FIELD_BYTES, MAX_PK_VALUE_BYTES, OUTBOX_CAP, Outcome, Plan,
     RETENTION, SUPERVISE_EVERY, SWEEP_EVERY, Settle, event_body, plan, settle, vet,
 };
 
@@ -121,7 +121,7 @@ pub struct Session {
     /// The branch's timeline when the session opened: the compute's, by the guard.
     pub timeline: String,
     client: Client,
-    notifications: tokio::sync::mpsc::UnboundedReceiver<tokio_postgres::Notification>,
+    notifications: tokio::sync::mpsc::Receiver<()>,
     last_sweep: Option<Instant>,
     /// When the last pass started ([`NOTIFY_GAP`]).
     last_pass: Option<Instant>,
@@ -187,7 +187,23 @@ const NEXT_DUE_SQL: &str = "SELECT pg_catalog.date_part('epoch', pg_catalog.min(
 /// skip-locked, their attempt counted and leased for `$7` seconds; each as `(id, its JSON)`.
 /// The primary key of each delivered table (`$4`..`$6`: trigger id, schema, table) is found by
 /// name in the catalogs (which needs no privilege on the table).
+///
+/// Invariant: what a claim returns is bounded whatever the outbox row holds. A row over
+/// [`MAX_EVENT_BYTES`] yields a `payload` built only from an allowlist of the enqueue keys
+/// (`type`, `schema`, `table`, `txid`: each only when it has its expected JSON type and at most
+/// [`MAX_EVENT_FIELD_BYTES`] of text, else null, which [`vet`](super::vet) refuses), with the
+/// records null; never the stored payload minus some keys. Each `pk` value is capped at
+/// [`MAX_PK_VALUE_BYTES`] of JSON text (a larger one is null).
 fn claim_sql() -> String {
+    // A top-level payload key as text, if a string of at most the field cap, else null.
+    let text_key = |k: &str| {
+        format!(
+            "CASE WHEN pg_catalog.jsonb_typeof(o.payload OPERATOR(pg_catalog.->) '{k}') OPERATOR(pg_catalog.=) 'string'
+        AND pg_catalog.octet_length(o.payload OPERATOR(pg_catalog.->>) '{k}') OPERATOR(pg_catalog.<=) {MAX_EVENT_FIELD_BYTES}
+      THEN o.payload OPERATOR(pg_catalog.->) '{k}' END"
+        )
+    };
+    let (kind, schema, table) = (text_key("type"), text_key("schema"), text_key("table"));
     format!(
         "WITH c AS (SELECT o.id FROM chelabase_functions.outbox o
     WHERE o.status OPERATOR(pg_catalog.=) 'pending' AND o.next_attempt_at OPERATOR(pg_catalog.<=) pg_catalog.clock_timestamp()
@@ -210,10 +226,16 @@ RETURNING o.id, pg_catalog.jsonb_build_object(
   'id', o.id, 'trigger_id', o.trigger_id, 'attempts', o.attempts, 'timeline_id', o.timeline_id,
   'big', pg_catalog.octet_length(o.payload::pg_catalog.text) OPERATOR(pg_catalog.>) {MAX_EVENT_BYTES},
   'payload', CASE WHEN pg_catalog.octet_length(o.payload::pg_catalog.text) OPERATOR(pg_catalog.>) {MAX_EVENT_BYTES}
-    THEN o.payload OPERATOR(pg_catalog.-) 'record' OPERATOR(pg_catalog.-) 'old_record' ELSE o.payload END,
-  'pk', (SELECT pg_catalog.jsonb_object_agg(k.name, coalesce(o.payload OPERATOR(pg_catalog.->) 'record' OPERATOR(pg_catalog.->) k.name,
-      o.payload OPERATOR(pg_catalog.->) 'old_record' OPERATOR(pg_catalog.->) k.name))
-    FROM k WHERE k.trigger_id OPERATOR(pg_catalog.=) o.trigger_id))::pg_catalog.text"
+    THEN pg_catalog.jsonb_build_object('type', {kind}, 'schema', {schema}, 'table', {table},
+      'record', NULL::pg_catalog.jsonb, 'old_record', NULL::pg_catalog.jsonb,
+      'txid', CASE WHEN pg_catalog.jsonb_typeof(o.payload OPERATOR(pg_catalog.->) 'txid') OPERATOR(pg_catalog.=) 'number'
+        AND pg_catalog.octet_length((o.payload OPERATOR(pg_catalog.->) 'txid')::pg_catalog.text) OPERATOR(pg_catalog.<=) {MAX_EVENT_FIELD_BYTES}
+        THEN o.payload OPERATOR(pg_catalog.->) 'txid' END)
+    ELSE o.payload END,
+  'pk', (SELECT pg_catalog.jsonb_object_agg(k.name, CASE WHEN pg_catalog.octet_length(v.val::pg_catalog.text) OPERATOR(pg_catalog.<=) {MAX_PK_VALUE_BYTES} THEN v.val END)
+    FROM k CROSS JOIN LATERAL (SELECT coalesce(o.payload OPERATOR(pg_catalog.->) 'record' OPERATOR(pg_catalog.->) k.name,
+      o.payload OPERATOR(pg_catalog.->) 'old_record' OPERATOR(pg_catalog.->) k.name) AS val) v
+    WHERE k.trigger_id OPERATOR(pg_catalog.=) o.trigger_id))::pg_catalog.text"
     )
 }
 
@@ -587,8 +609,8 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
         {
             tokio::time::sleep(gap).await;
         }
-        // One pass serves every notification that came meanwhile.
-        while s.notifications.try_recv().is_ok() {}
+        // One pass serves every notification that came meanwhile (at most one wake is queued).
+        let _ = s.notifications.try_recv();
         Ok(woken)
     }
 
@@ -652,6 +674,24 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A big row's claimed payload is built from the allowlisted keys, never the stored
+    /// payload minus some keys, and each `pk` value is size-capped.
+    #[test]
+    fn big_claim_projects_only_event_fields() {
+        let sql = claim_sql();
+        assert!(!sql.contains("OPERATOR(pg_catalog.-) 'record'"), "{sql}");
+        assert!(!sql.contains("OPERATOR(pg_catalog.-) 'old_record'"), "{sql}");
+        assert!(sql.contains("pg_catalog.jsonb_build_object('type'"), "{sql}");
+        for key in ["'schema'", "'table'", "'record', NULL", "'old_record', NULL", "'txid'"] {
+            assert!(sql.contains(key), "{key} in {sql}");
+        }
+        assert!(
+            sql.contains(&format!("OPERATOR(pg_catalog.<=) {MAX_PK_VALUE_BYTES} THEN v.val")),
+            "{sql}"
+        );
+        assert!(sql.contains(&format!("OPERATOR(pg_catalog.<=) {MAX_EVENT_FIELD_BYTES}")), "{sql}");
+    }
 
     /// The statements as the login runs them: every name qualified and every operator
     /// `pg_catalog`'s; the bound touches dead rows only (B1); the claim is skip-locked and

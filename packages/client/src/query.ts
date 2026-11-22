@@ -1,7 +1,7 @@
 // The runtime builders. One immutable `Query` class backs every typed builder interface in
 // `types.ts`; each method returns a new `Query`.
 import { COUNT_SPEC, type ResultSpec } from "./json.ts";
-import type { PgExact, QueryTree, TypeMap } from "./types.ts";
+import type { Op, PgExact, QueryTree, TypeMap } from "./types.ts";
 
 /** What the builders need from their client. */
 export interface Runner {
@@ -30,6 +30,64 @@ interface State {
 }
 
 const OPERATORS = new Set(["eq", "neq", "lt", "lte", "gt", "gte", "in", "is", "like", "ilike"]);
+
+/**
+ * What the `op` helpers return. The only way to get an operator into `where()`: a bare
+ * object, whatever its keys, is an equality value. The `#ops` private field is the brand, so
+ * a value parsed from JSON (or built by hand) can never pass as one.
+ */
+class OpValue {
+  readonly #ops: readonly (readonly [string, unknown])[];
+
+  constructor(ops: readonly (readonly [string, unknown])[]) {
+    this.#ops = ops;
+    Object.freeze(this);
+  }
+
+  static is(v: unknown): v is OpValue {
+    return typeof v === "object" && v !== null && #ops in v;
+  }
+
+  static entries(v: OpValue): readonly (readonly [string, unknown])[] {
+    return v.#ops;
+  }
+}
+
+const single = (name: string, value: unknown): Op<never> => new OpValue([[name, value]]) as unknown as Op<never>;
+
+/**
+ * The operators for `where()`: `where({ total: op.gte("10") })`. Several on one column:
+ * `op.all(op.gte("10"), op.lt("20"))`, combined with `and`. A bare object in `where()` is
+ * always a value to compare with.
+ */
+export const op = Object.freeze({
+  eq: <V>(value: V): Op<V> => single("eq", value) as Op<V>,
+  neq: <V>(value: V): Op<V> => single("neq", value) as Op<V>,
+  lt: <V>(value: V): Op<V> => single("lt", value) as Op<V>,
+  lte: <V>(value: V): Op<V> => single("lte", value) as Op<V>,
+  gt: <V>(value: V): Op<V> => single("gt", value) as Op<V>,
+  gte: <V>(value: V): Op<V> => single("gte", value) as Op<V>,
+  /** `op.in([])` matches no rows. */
+  in: <V>(values: readonly V[]): Op<V> => single("in", values) as Op<V>,
+  /** `null` on any column; `true`/`false` on boolean columns. */
+  is: ((value: null | boolean) => single("is", value)) as {
+    (value: null): Op<never>;
+    (value: boolean): Op<boolean>;
+  },
+  /** Text columns only. */
+  like: (pattern: string): Op<string> => single("like", pattern) as Op<string>,
+  /** Text columns only. */
+  ilike: (pattern: string): Op<string> => single("ilike", pattern) as Op<string>,
+  /** Several operators on one column, combined with `and`. */
+  all: <V>(...ops: [Op<V>, ...Op<V>[]]): Op<V> => {
+    const entries = ops.flatMap((o) => {
+      if (!OpValue.is(o)) throw new TypeError("op.all() takes results of the `op` helpers");
+      return [...OpValue.entries(o)];
+    });
+    if (entries.length === 0) throw new TypeError("op.all() needs at least one operator");
+    return new OpValue(entries) as unknown as Op<V>;
+  },
+});
 
 export class Query implements PromiseLike<unknown> {
   readonly #runner: Runner;
@@ -248,11 +306,6 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function isOperatorObject(v: unknown): v is Record<string, unknown> {
-  if (!isPlainObject(v)) return false;
-  const keys = Object.keys(v);
-  return keys.length > 0 && keys.every((k) => OPERATORS.has(k));
-}
 
 /** `{ col: "x", <operator>: v, … }`: a condition object (reaches any column name). */
 function isCondition(v: unknown): v is Record<string, unknown> {
@@ -265,10 +318,13 @@ function both(parts: QueryTree[]): QueryTree | undefined {
   return parts.length === 0 ? undefined : parts.length === 1 ? parts[0] : { and: parts };
 }
 
-function conditions(col: string, ops: Record<string, unknown>, where: string): QueryTree[] {
-  return Object.entries(ops).map(([op, value]) => {
+function conditions(col: string, ops: Iterable<readonly [string, unknown]>, where: string): QueryTree[] {
+  return [...ops].map(([op, value]) => {
     if (value === undefined) {
       throw new TypeError(`${where}: \`${op}\` on "${col}" is undefined`);
+    }
+    if (OpValue.is(value)) {
+      throw new TypeError(`${where}: \`${op}\` on "${col}" is an \`op\` value; use it as the column's value, not inside another operator`);
     }
     return { col, [op]: value };
   });
@@ -289,8 +345,8 @@ function compileWhere(filter: object, where: string): QueryTree | undefined {
       parts.push({ not: compileItem(value, at) });
     } else if (value === null) {
       parts.push({ col: key, is: null });
-    } else if (isOperatorObject(value)) {
-      parts.push(...conditions(key, value, at));
+    } else if (OpValue.is(value)) {
+      parts.push(...conditions(key, OpValue.entries(value), at));
     } else {
       parts.push({ col: key, eq: value });
     }
@@ -302,7 +358,7 @@ function compileWhere(filter: object, where: string): QueryTree | undefined {
 function compileItem(item: unknown, where: string): QueryTree {
   if (isCondition(item)) {
     const { col, ...ops } = item as { col: string } & Record<string, unknown>;
-    return both(conditions(col, ops, where))!;
+    return both(conditions(col, Object.entries(ops), where))!;
   }
   if (!isPlainObject(item)) throw new TypeError(`${where} is not a filter object`);
   const compiled = compileWhere(item, where);

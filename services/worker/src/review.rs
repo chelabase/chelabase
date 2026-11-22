@@ -36,11 +36,11 @@ pub fn review_databases_sql() -> String {
     )
 }
 
-/// The fix in its own transaction with the fix's `lock_timeout`; errors verbose, so the
-/// SQLSTATE comes back with the message.
+/// The fix in its own transaction with the search path pinned and the fix's `lock_timeout`;
+/// errors verbose, so the SQLSTATE comes back with the message.
 pub fn fix_script(sql: &str) -> String {
     format!(
-        "\\set VERBOSITY verbose\nBEGIN;\nSET LOCAL lock_timeout = '{FIX_LOCK_TIMEOUT}';\n{sql}\nCOMMIT;\n"
+        "\\set VERBOSITY verbose\nBEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '{FIX_LOCK_TIMEOUT}';\n{sql}\nCOMMIT;\n"
     )
 }
 
@@ -217,9 +217,10 @@ mod sqlstate_tests {
     fn the_fix_script_is_one_transaction_with_the_lock_timeout() {
         let script = fix_script("DROP ROUTINE public.f() RESTRICT;");
         assert!(
-            script.starts_with("\\set VERBOSITY verbose\nBEGIN;\nSET LOCAL lock_timeout = '5s';\n"),
+            script.starts_with("\\set VERBOSITY verbose\nBEGIN;\n"),
             "{script}"
         );
+        assert!(script.contains("\nSET LOCAL lock_timeout = '5s';\n"), "{script}");
         assert!(
             script.ends_with("DROP ROUTINE public.f() RESTRICT;\nCOMMIT;\n"),
             "{script}"

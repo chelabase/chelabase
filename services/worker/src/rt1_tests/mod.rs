@@ -161,6 +161,7 @@ pub(crate) fn rt_worker() -> Rt {
         claim_refresh: w.claim_refresh,
         schema_check_cursor: w.schema_check_cursor,
         enabling_seen: w.enabling_seen,
+        login_rollout_retry: w.login_rollout_retry,
         recreate_backoff: w.recreate_backoff,
         fn_sweeps: w.fn_sweeps,
         identity: w.identity,

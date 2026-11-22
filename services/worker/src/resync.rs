@@ -1114,6 +1114,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 info!(branch_id = %branch, endpoint_id = %ep, roles = %names.join(","), "login roles resynced");
             }
             self.sync_key_roles(branch, ep, database).await;
+            // A role's attributes or memberships may have changed: each role the data API's
+            // logins hold goes to the login it now belongs to.
+            self.resync_elevated_grants_after_role_change(branch, ep, database).await;
             if !failed.is_empty() {
                 let failures: Vec<String> = failed.into_iter().map(|(_, what)| what).collect();
                 return Err(format!("syncing login roles: {}", failures.join("; ")));
@@ -3168,9 +3171,12 @@ mod tests {
             .iter()
             .map(|(_, db, s)| (db.clone(), s.clone()))
             .collect();
-        assert_eq!(sql.len(), 2, "{sql:?}");
+        assert_eq!(sql.len(), 3, "{sql:?}");
         assert_eq!(sql[0].0, SYSTEM_DATABASE);
         assert!(sql[0].1.contains("FROM pg_authid"));
+        // Last, the roles are read once more: each role the data API's logins hold goes to
+        // the login it now belongs to (nothing to move here).
+        assert!(sql[2].1.contains("chelabase: member roles"), "{sql:?}");
         assert!(
             sql[1].1.starts_with("SET search_path = pg_catalog, pg_temp;\nSET ROLE \"postgres\";\nCREATE ROLE \"app\""),
             "{sql:?}"
@@ -3224,7 +3230,8 @@ mod tests {
         );
         w.computes.sql.lock().unwrap().clear();
         w.resync(branch).await.unwrap();
-        assert_eq!(w.computes.sql.lock().unwrap().len(), 1);
+        // The read, and the role catalog's read for the data API's logins.
+        assert_eq!(w.computes.sql.lock().unwrap().len(), 2);
         assert!(
             position(&journal, "cache.password_updated").is_none(),
             "{:?}",

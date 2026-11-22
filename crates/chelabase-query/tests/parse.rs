@@ -307,3 +307,84 @@ fn count_is_listed_and_allowed_in_a_batch() {
         other => panic!("{other:?}"),
     }
 }
+
+/// `n` conditions under one `and`: `n + 1` nodes.
+fn and_of(n: usize) -> String {
+    let conds = vec![r#"{"col":"a","eq":1}"#; n].join(",");
+    format!(r#"{{"and":[{conds}]}}"#)
+}
+
+#[test]
+fn filter_over_the_node_limit_is_refused() {
+    let msg = rejected(&format!(
+        r#"{{"v":1,"op":"select","from":"t","where":{}}}"#,
+        and_of(256)
+    ));
+    assert!(msg.contains("256"), "{msg}");
+    // Nested combinators count too, in every operation that filters.
+    let nested = format!(r#"{{"not":{}}}"#, and_of(255));
+    rejected(&format!(r#"{{"v":1,"op":"count","from":"t","where":{nested}}}"#));
+    rejected(&format!(
+        r#"{{"v":1,"op":"delete","from":"t","where":{}}}"#,
+        and_of(256)
+    ));
+    rejected(&format!(
+        r#"{{"v":1,"op":"update","table":"t","set":{{"a":1}},"where":{}}}"#,
+        and_of(256)
+    ));
+    // In a batch's member.
+    rejected(&format!(
+        r#"{{"v":1,"op":"batch","ops":[{{"op":"count","from":"t","where":{}}}]}}"#,
+        and_of(256)
+    ));
+}
+
+#[test]
+fn filter_at_the_node_limit_is_accepted() {
+    accepted(&format!(
+        r#"{{"v":1,"op":"select","from":"t","where":{}}}"#,
+        and_of(255)
+    ));
+    // `in` values are binds, not nodes.
+    let values = vec!["1"; 5000].join(",");
+    accepted(&format!(
+        r#"{{"v":1,"op":"select","from":"t","where":{{"col":"a","in":[{values}]}}}}"#
+    ));
+}
+
+#[test]
+fn select_list_over_the_term_limit_is_refused() {
+    let list = |n: usize| {
+        let items: Vec<String> = (0..n).map(|i| format!(r#""c{i}""#)).collect();
+        items.join(",")
+    };
+    let msg = rejected(&format!(
+        r#"{{"v":1,"op":"select","from":"t","select":[{}]}}"#,
+        list(1601)
+    ));
+    assert!(msg.contains("1600") && msg.contains("select"), "{msg}");
+    accepted(&format!(
+        r#"{{"v":1,"op":"select","from":"t","select":[{}]}}"#,
+        list(1600)
+    ));
+    rejected(&format!(
+        r#"{{"v":1,"op":"insert","into":"t","values":[{{"a":1}}],"returning":[{}]}}"#,
+        list(1601)
+    ));
+    let order: Vec<String> = (0..1601).map(|i| format!(r#"{{"col":"c{i}"}}"#)).collect();
+    rejected(&format!(
+        r#"{{"v":1,"op":"select","from":"t","orderBy":[{}]}}"#,
+        order.join(",")
+    ));
+    let set: Vec<String> = (0..1601).map(|i| format!(r#""c{i}":1"#)).collect();
+    let msg = rejected(&format!(
+        r#"{{"v":1,"op":"update","table":"t","all":true,"set":{{{}}}}}"#,
+        set.join(",")
+    ));
+    assert!(msg.contains("set"), "{msg}");
+    let ok: Vec<String> = (0..1600).map(|i| format!(r#""c{i}":1"#)).collect();
+    accepted(&format!(
+        r#"{{"v":1,"op":"update","table":"t","all":true,"set":{{{}}}}}"#,
+        ok.join(",")
+    ));
+}

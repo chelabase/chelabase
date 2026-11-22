@@ -737,6 +737,8 @@ GRANT anon, authenticated TO authenticator;
                 if system { "t" } else { "f" }
             )
         };
+        // The role catalog's read has `FROM pg_authid` too: it answers nothing here.
+        w.computes.answer("chelabase: member roles", "");
         w.computes.answer(
             "FROM pg_authid",
             &format!(
@@ -768,6 +770,8 @@ GRANT anon, authenticated TO authenticator;
     #[tokio::test]
     async fn a_failed_resync_still_provisions() {
         let (w, _journal) = worker();
+        // The role catalog's read has `FROM pg_authid` too: it answers nothing here.
+        w.computes.answer("chelabase: member roles", "");
         w.computes.answer("FROM pg_authid", "garbage\n");
         let id = provision(&w, "app").await;
         assert_eq!(w.metadata.database(id).status, DatabaseStatus::Ready);

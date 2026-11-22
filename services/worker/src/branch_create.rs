@@ -1577,12 +1577,14 @@ mod tests {
             (RoleOrigin::Sql, None, None)
         );
         // Nothing was set in SQL: the child's catalog already has the parent's hashes (the
-        // storage schema's script sets only `chelabase_storage`'s own, the child's).
+        // storage schema's script sets only `chelabase_storage`'s own, the child's, and the
+        // data API's script only its elevated login's own, the child's).
         let sql = w.computes.sql.lock().unwrap().clone();
+        let elevated = format!("ALTER ROLE {} LOGIN", crate::data_api::AUTHENTICATOR_ELEVATED);
         assert!(
             !sql.iter().any(|(ep, _, s)| *ep == dev_ep
                 && !s.starts_with(crate::storage_schema::STORAGE_SCHEMA_MARK)
-                && s.contains("PASSWORD 'SCRAM")),
+                && s.lines().any(|l| l.contains("PASSWORD 'SCRAM") && !l.contains(&elevated))),
             "{sql:?}"
         );
     }

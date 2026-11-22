@@ -100,3 +100,15 @@ async fn a_failed_fix_says_so_with_the_current_list() {
     let reply = w.review(fix(branch, &items[0].key, FixAction::Drop, &review_hash(&items))).await;
     assert!(matches!(&reply, ReviewReply::FixFailed { items: now, .. } if *now == items), "{reply:?}");
 }
+
+/// The fix runs with the search path pinned for its transaction, set right after `BEGIN`.
+#[test]
+fn fix_script_pins_search_path() {
+    let script = super::fix_script("DROP ROUTINE public.f() RESTRICT;");
+    assert!(
+        script.starts_with(
+            "\\set VERBOSITY verbose\nBEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\n"
+        ),
+        "{script}"
+    );
+}

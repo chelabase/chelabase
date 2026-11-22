@@ -1,4 +1,5 @@
 import { logout } from "./login-client/generated/endpoints";
+import { clearAllSqlStorage } from "@/components/sql-editor/run-history";
 import { ApiError } from "@chelabase/management-client";
 
 export interface SignOutParts {
@@ -20,6 +21,7 @@ export async function signOut(session: { clear: () => void }, { disconnect, leav
   } catch (err) {
     if (!(err instanceof ApiError && err.status === 401)) throw err;
   }
+  clearAllSqlStorage();
   session.clear();
   disconnect();
   leave();

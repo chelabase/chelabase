@@ -3,7 +3,7 @@
 
 use super::AppUsers;
 use crate::app::AppState;
-use crate::guard::client_ip;
+use crate::guard::client_bucket;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chelabase_auth::internal::{AuthMethod, IDENTITY_HEADER};
@@ -34,6 +34,7 @@ pub struct AppCaller {
     pub key_id: Uuid,
     pub user: Option<AppUserClaims>,
     pub request_id: String,
+    /// The client's address as a rate-limit key ([`client_bucket`]: an IPv6 address is its /64).
     pub ip: String,
     /// The app's server vouched for this call with the branch's secret key and sent no client
     /// address (the gateway's `server_vouched`): the per-IP limits don't apply to it.
@@ -92,7 +93,7 @@ impl AppCaller {
             key_id: data.key_id,
             user,
             request_id: claims.rid,
-            ip: client_ip(headers),
+            ip: client_bucket(headers),
             server_vouched: data.server_vouched,
         })
     }

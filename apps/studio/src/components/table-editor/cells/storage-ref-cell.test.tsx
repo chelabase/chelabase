@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fakeApi } from "@/components/storage/upload/fake-api";
 import { cellUploader } from "./storage-ref-upload";
 import { StorageRefCell, StorageRefEditor, type StorageRefCellProps, type StorageRefEditorProps } from "./storage-ref-cell";
@@ -50,11 +50,25 @@ const dropOn = (el: Element, file: File) =>
   fireEvent.drop(el, { dataTransfer: { files: [file], types: ["Files"], items: [{ kind: "file", type: file.type, getAsFile: () => file }] } });
 
 describe("StorageRefCell", () => {
+  // O13: Studio's CSP admits images only from its own origin and blob:, so a thumbnail's bytes
+  // are fetched from the ref's URL and shown from a blob: URL typed as an image.
+  const thumbs: Blob[] = [];
+  beforeEach(() => {
+    thumbs.length = 0;
+    Object.assign(URL, { createObjectURL: vi.fn((b: Blob) => (thumbs.push(b), `blob:thumb-${thumbs.length}`)), revokeObjectURL: vi.fn() });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([137, 80]), { headers: { "content-type": "application/octet-stream" } })));
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
   // #106 AC2: an image ref renders a thumbnail from its URL.
-  it("an_image_ref_renders_a_thumbnail", () => {
-    cell();
-    const img = screen.getByRole("img", { name: "face.png" });
-    expect(img).toHaveAttribute("src", URL_OF("u/face.png"));
+  it("an_image_ref_renders_a_thumbnail", async () => {
+    const { unmount } = cell();
+    const img = await screen.findByRole("img", { name: "face.png" });
+    expect(img).toHaveAttribute("src", "blob:thumb-1");
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(URL_OF("u/face.png"));
+    expect(thumbs[0].type).toBe("image/png");
+    unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:thumb-1");
   });
 
   // #106 AC2: another type renders a typed chip, no image.
@@ -66,13 +80,13 @@ describe("StorageRefCell", () => {
   });
 
   // A Viewer's signed URLs don't open: no thumbnail from them (preview goes through the download route).
-  it("a_viewer_gets_a_chip_for_a_private_image_and_a_thumbnail_for_a_public_one", () => {
+  it("a_viewer_gets_a_chip_for_a_private_image_and_a_thumbnail_for_a_public_one", async () => {
     const { unmount } = cell({ canSign: false, canEdit: false });
     expect(screen.queryByRole("img")).toBeNull();
     expect(screen.getByText("face.png")).toBeInTheDocument();
     unmount();
     cell({ canSign: false, canEdit: false, resolved: ok("u/face.png", true) });
-    expect(screen.getByRole("img", { name: "face.png" })).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "face.png" })).toBeInTheDocument();
   });
 
   it("svg_never_renders_as_a_thumbnail", () => {
@@ -117,7 +131,7 @@ describe("StorageRefCell", () => {
     expect(await api.text("face (1).png")).toBe("new");
     expect(await api.text("face.png")).toBe("old");
     rerender(<StorageRefCell {...props} value={{ bucket_id: B, name: "face (1).png" }} resolved={ok("face (1).png")} />);
-    expect(screen.getByRole("img", { name: "face (1).png" })).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "face (1).png" })).toBeInTheDocument();
   });
 
   it("a_drop_into_a_path_column_goes_to_its_bucket", async () => {
