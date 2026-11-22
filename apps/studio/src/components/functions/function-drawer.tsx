@@ -4,7 +4,8 @@ import { X } from "lucide-react";
 import { useListFunctionDeployments, type Function as FunctionInfo } from "@chelabase/management-client";
 import { CopyButton } from "@/components/copy-button";
 import { Button } from "@/components/ui/button";
-import { curlFor, functionErrorText, invokeUrl, rolloutNotice } from "@/lib/functions";
+import { useProjectCaps } from "@/lib/capabilities";
+import { curlFor, functionErrorText, invokeUrl, rolloutNotice, serviceSecretsReason } from "@/lib/functions";
 import { deploymentTarget, serviceSpecOf } from "@/lib/functions-services";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_LOGS_REASON, VIEWER_REASON } from "./read-only-hint";
@@ -56,6 +57,7 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
   const deployments = useListFunctionDeployments(databaseId, branchId, fn.name);
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const secretsReason = serviceSecretsReason(fn.kind, useProjectCaps().tenantAdmin);
   const url = invokeUrl(apiUrl, fn.auth, branchId, fn.name, fn.kind);
   const curl = curlFor(apiUrl, fn.auth, branchId, fn.name, fn.kind);
   const service = fn.kind === "service";
@@ -205,7 +207,7 @@ export function FunctionDrawer({ fn, databaseId, branchId, apiUrl, canChange, up
           )}
 
           <Section title="Secrets">
-            <FunctionSecrets databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange} />
+            <FunctionSecrets databaseId={databaseId} branchId={branchId} name={fn.name} canChange={canChange && secretsReason === null} readOnlyReason={canChange ? secretsReason : null} />
           </Section>
         </DialogPrimitive.Popup>
       </DialogPrimitive.Portal>
