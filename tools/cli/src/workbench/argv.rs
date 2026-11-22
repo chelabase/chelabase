@@ -12,7 +12,7 @@ pub struct Compose<'a> {
 }
 
 impl Compose<'_> {
-    /// `docker` arguments: `compose -p <project> -f <file>… --env-file <env> <rest…>`.
+    /// `docker` arguments: `compose -p <project> -f <file>… --env-file <env> --profile mcp <rest…>`.
     pub fn args(&self, rest: &[&str]) -> Vec<String> {
         let mut args = vec![
             "compose".to_string(),
@@ -27,6 +27,9 @@ impl Compose<'_> {
             "--env-file".to_string(),
             self.env_file.display().to_string(),
         ]);
+        // The MCP server and its runtime (mcp-core m12) are in profile `mcp`: on for every call,
+        // so `up`, `ps`, `logs` and `stop` all see them.
+        args.extend(["--profile".to_string(), "mcp".to_string()]);
         args.extend(rest.iter().map(|s| s.to_string()));
         args
     }

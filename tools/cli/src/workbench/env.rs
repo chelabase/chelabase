@@ -179,6 +179,8 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     // Edge functions m11: the service runner (profile `services`); without it the name doesn't
     // resolve and container services answer `runner_unavailable`.
     ("CHELABASE_SERVICE_RUNNER_URL", "http://service-runner-control:8094"),
+    // mcp-core m2/m12: the gateway's MCP upstream (the public listener's alias).
+    ("CHELABASE_MCP_URL", "http://mcp-public:8095"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
@@ -337,6 +339,12 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
     }
     for (key, value) in SERVICE_KEYS {
         lines.set(key, *value);
+    }
+    // The MCP live tests' endpoint (the runner's `CHELABASE_MCP_LIVE_URL`); their token is
+    // `chelabase dev token`'s.
+    if let Some((_, api)) = lines.0.iter().find(|(k, _)| k == "CHELABASE_ENTRY_API_URL") {
+        let live = format!("{api}/mcp");
+        lines.set("CHELABASE_MCP_LIVE_URL", live);
     }
     // Ruling (e): only the gateway's X-Forwarded-For counts (computes reach auth directly).
     lines.set("CHELABASE_AUTH_TRUSTED_PROXY", "gateway");
