@@ -1,7 +1,9 @@
 //! App users (step 6b): the `auth` service's routes (branch info, sessions, sync) and the
 //! gateway's session liveness.
 //!
-//! A refresh token is `"{session_id}.{secret}"`: 32 random bytes, base64url without padding.
+//! A refresh token is `"{session_id}.{nonce}.{tag}"`: 32 random bytes and their HMAC-SHA256
+//! tag under the app-refresh key (bound to the session), both base64url without padding.
+//! Sessions from before tags have `"{session_id}.{secret}"` tokens until their next rotation.
 //! Only the SHA-256 of the whole token is stored.
 
 use std::sync::Arc;
@@ -17,18 +19,20 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chelabase_auth::app_token::APP_REFRESH_GRACE;
 use chelabase_metadata::{
     AppSession, BranchKind, BranchStatus, NewAppSession, PeekOutcome, ProjectStatus, RefreshNext,
-    RefreshOutcome,
+    RefreshOutcome, RefreshProof,
 };
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_neon::ComputeLocator;
-use chelabase_secrets::{open, open_role_password, seal};
+use chelabase_secrets::{Purpose, SecretKey, derive_key, open, open_role_password, seal};
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_identity::{IdentityError, Missing, Pool};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -122,24 +126,56 @@ fn refresh_invalid() -> Response {
 
 // --- Refresh tokens --------------------------------------------------------------------------
 
-/// A new token for `session`.
-fn new_refresh_token(session: Uuid) -> String {
-    let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret).expect("OS random number generator");
-    format!("{session}.{}", URL_SAFE_NO_PAD.encode(secret))
+/// What the tag of a refresh token is computed over, after the session and nonce.
+const REFRESH_TAG_LABEL: &[u8] = b"app-refresh v1";
+
+/// The key id the refresh tag's key is derived under ([`Purpose::AppRefresh`]). Changing it
+/// rotates the key, and every refresh token issued under the old one stops verifying.
+const REFRESH_KEY_ID: u32 = 0;
+
+/// The tag of a refresh token: HMAC-SHA256 under the app-refresh key over the label, the
+/// session id and the nonce. It binds the token to its session.
+fn refresh_tag(secrets: &SecretKey, session: Uuid, nonce: &[u8]) -> [u8; 32] {
+    let key = derive_key(secrets, Purpose::AppRefresh, REFRESH_KEY_ID);
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).expect("HMAC accepts any key size");
+    mac.update(REFRESH_TAG_LABEL);
+    mac.update(session.as_bytes());
+    mac.update(nonce);
+    mac.finalize().into_bytes().into()
+}
+
+/// A new token for `session`: `"{session}.{nonce}.{tag}"`.
+fn new_refresh_token(secrets: &SecretKey, session: Uuid) -> String {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).expect("OS random number generator");
+    let tag = refresh_tag(secrets, session, &nonce);
+    format!("{session}.{}.{}", URL_SAFE_NO_PAD.encode(nonce), URL_SAFE_NO_PAD.encode(tag))
 }
 
 fn token_hash(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
-/// The session id a token names; `None` for anything malformed.
-fn token_session(token: &str) -> Option<Uuid> {
-    let (id, secret) = token.split_once('.')?;
-    if secret.is_empty() {
+/// The session id a token names and what it proves: `Issued` for a three-part token whose tag
+/// verifies, `Unproven` for a two-part one from before tags. `None` for anything malformed,
+/// a three-part token whose tag doesn't verify included.
+fn token_session(secrets: &SecretKey, token: &str) -> Option<(Uuid, RefreshProof)> {
+    let mut parts = token.split('.');
+    let id_part = parts.next()?;
+    let id = Uuid::parse_str(id_part).ok()?;
+    let secret = parts.next().filter(|s| !s.is_empty())?;
+    let Some(tag) = parts.next() else {
+        return Some((id, RefreshProof::Unproven));
+    };
+    // Only the form `new_refresh_token` writes: another spelling of the same token would hash
+    // differently and read as an earlier one.
+    if parts.next().is_some() || id_part != id.to_string() {
         return None;
     }
-    Uuid::parse_str(id).ok()
+    let nonce = URL_SAFE_NO_PAD.decode(secret).ok()?;
+    let tag = URL_SAFE_NO_PAD.decode(tag).ok()?;
+    let expected = refresh_tag(secrets, id, &nonce);
+    bool::from(expected.as_slice().ct_eq(tag.as_slice())).then_some((id, RefreshProof::Issued))
 }
 
 /// What the grace answer's sealed token is bound to.
@@ -308,7 +344,7 @@ where
     L: ComputeLocator,
 {
     let id = Uuid::new_v4();
-    let token = new_refresh_token(id);
+    let token = new_refresh_token(&state.secrets, id);
     let ttl = state.app_refresh_ttl.min(APP_SESSION_CAP);
     let expires_at = Utc::now() + chrono::Duration::from_std(ttl).expect("ttl fits");
     let row = NewAppSession {
@@ -340,10 +376,10 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let Some(id) = token_session(&body.refresh_token) else {
+    let Some((id, proof)) = token_session(&state.secrets, &body.refresh_token) else {
         return refresh_invalid();
     };
-    let next_token = new_refresh_token(id);
+    let next_token = new_refresh_token(&state.secrets, id);
     let next = RefreshNext {
         new_hash: token_hash(&next_token),
         new_sealed: seal(&state.secrets, &grace_aad(id), &next_token),
@@ -356,7 +392,7 @@ where
     // The project is checked inside the locked transaction, before any write (I5).
     let outcome = match state
         .metadata
-        .refresh_app_session(id, body.project_id, token_hash(&body.refresh_token), &next)
+        .refresh_app_session(id, body.project_id, token_hash(&body.refresh_token), proof, &next)
         .await
     {
         Ok(outcome) => outcome,
@@ -371,7 +407,7 @@ where
             }
         }
         RefreshOutcome::Reused(session) => {
-            warn!(session_id = %id, "a replaced refresh token was reused; the session is revoked");
+            warn!(session_id = %id, "an earlier refresh token was reused; the session is revoked");
             end_identity_sessions_later(&state, vec![session]);
             return ApiError::new(
                 401,
@@ -401,7 +437,7 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let Some(id) = token_session(&body.refresh_token) else {
+    let Some((id, proof)) = token_session(&state.secrets, &body.refresh_token) else {
         return refresh_invalid();
     };
     // The project is checked in the same read (I5).
@@ -411,6 +447,7 @@ where
             id,
             body.project_id,
             token_hash(&body.refresh_token),
+            proof,
             APP_SESSION_CAP,
         )
         .await
@@ -475,7 +512,8 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let Some(id) = token_session(&body.refresh_token) else {
+    // Hash-only: a token that matches neither stored hash does nothing, whatever it proves.
+    let Some((id, _)) = token_session(&state.secrets, &body.refresh_token) else {
         return StatusCode::NO_CONTENT.into_response();
     };
     match state
@@ -568,13 +606,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refresh_tokens_name_their_session() {
+    fn issued_tokens_carry_a_valid_tag() {
+        let key = SecretKey::generate();
         let id = Uuid::new_v4();
-        let token = new_refresh_token(id);
-        assert_eq!(token_session(&token), Some(id));
-        assert_eq!(token.len(), 36 + 1 + 43);
-        assert_eq!(token_session(&id.to_string()), None);
-        assert_eq!(token_session(&format!("{id}.")), None);
-        assert_eq!(token_session("x.y"), None);
+        let token = new_refresh_token(&key, id);
+        assert_eq!(token.len(), 36 + 1 + 43 + 1 + 43, "{token}");
+        assert_eq!(token_session(&key, &token), Some((id, RefreshProof::Issued)));
+        assert_ne!(token, new_refresh_token(&key, id), "every token has its own nonce");
+        let (nonce, tag) = token[37..].split_once('.').unwrap();
+        let nonce = URL_SAFE_NO_PAD.decode(nonce).unwrap();
+        assert_eq!(URL_SAFE_NO_PAD.decode(tag).unwrap(), refresh_tag(&key, id, &nonce));
+    }
+
+    #[test]
+    fn a_token_with_a_wrong_tag_is_malformed() {
+        let key = SecretKey::generate();
+        let (id, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let token = new_refresh_token(&key, id);
+        let rest = &token[37..];
+        let (nonce, tag) = rest.split_once('.').unwrap();
+        let mut flipped = URL_SAFE_NO_PAD.decode(tag).unwrap();
+        flipped[0] ^= 1;
+        let bad = [
+            // Another key's token.
+            new_refresh_token(&SecretKey::generate(), id),
+            // The tag binds the session: moved to another id, it fails.
+            format!("{other}.{rest}"),
+            format!("{id}.{nonce}.{}", URL_SAFE_NO_PAD.encode(flipped)),
+            format!("{id}.{nonce}.{}", &tag[..42]),
+            format!("{id}.{nonce}."),
+            format!("{id}.{nonce}.not base64"),
+            format!("{id}..{tag}"),
+            format!("{token}.x"),
+            // Another spelling of the same session id.
+            format!("{}.{rest}", id.to_string().to_uppercase()),
+            format!("{}.{rest}", id.simple()),
+        ];
+        for t in bad {
+            assert_eq!(token_session(&key, &t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn legacy_tokens_are_unproven() {
+        let key = SecretKey::generate();
+        let id = Uuid::new_v4();
+        let legacy = format!("{id}.{}", URL_SAFE_NO_PAD.encode([7u8; 32]));
+        assert_eq!(token_session(&key, &legacy), Some((id, RefreshProof::Unproven)));
+        assert_eq!(token_session(&key, &format!("{id}.anything")), Some((id, RefreshProof::Unproven)));
+        assert_eq!(token_session(&key, &id.to_string()), None);
+        assert_eq!(token_session(&key, &format!("{id}.")), None);
+        assert_eq!(token_session(&key, "x.y"), None);
+        assert_eq!(token_session(&key, ""), None);
     }
 }

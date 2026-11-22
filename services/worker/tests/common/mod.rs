@@ -12,6 +12,14 @@ use worker::config::{RealWorker, WorkerConfig, build};
 use worker::ports::AttachSource;
 use worker::rt_events::{NoopPublisher, RtPublisher};
 
+/// `sql` as a tenant's session would run it. The admin session starts with
+/// `search_path = pg_catalog, pg_temp`; the live tests' setup SQL names its tables bare, so it
+/// runs under Postgres's default search path. On one line, so psql's line numbers stay the
+/// script's.
+pub fn tenant_sql(sql: &str) -> String {
+    format!("SET search_path = \"$user\", public; {sql}")
+}
+
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }

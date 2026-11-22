@@ -305,6 +305,10 @@ pub fn endpoint_consumer_name(endpoint: Uuid, since: DateTime<Utc>) -> String {
     format!("storage-webhook-{endpoint}-{}", since.timestamp_millis())
 }
 
+/// The most messages a consumer of this stream has delivered and unacknowledged at once: the
+/// worker takes each one up as it arrives, so its handling allows this many at a time.
+pub const MAX_ACK_PENDING: i64 = 64;
+
 /// An endpoint's consumer: durable, filtered to its database's subject, delivering from the
 /// time it was enabled, explicit acks (a failed delivery is NAKed with its backoff, so
 /// redelivery is the worker's to time), at most `max_ack_pending` in flight.
@@ -330,7 +334,7 @@ pub fn endpoint_consumer(
         // has its message redelivered after this.
         ack_wait: std::time::Duration::from_secs(60),
         max_deliver: -1,
-        max_ack_pending: 64,
+        max_ack_pending: MAX_ACK_PENDING,
         inactive_threshold: CONSUMER_INACTIVE,
         ..Default::default()
     }

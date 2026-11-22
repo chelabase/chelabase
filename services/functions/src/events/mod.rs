@@ -63,6 +63,11 @@ pub const OUTBOX_CAP: i64 = 10_000;
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 /// An event body over this is sent truncated.
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
+/// The most text a claimed big row's fixed event fields (`type`, `schema`, `table`, `txid`)
+/// may carry; a longer one claims as null and the row is refused.
+pub const MAX_EVENT_FIELD_BYTES: usize = 256;
+/// A big row's primary-key value over this many bytes of JSON text is sent as `null`.
+pub const MAX_PK_VALUE_BYTES: usize = 1024;
 /// The safety sweep: a pass runs at least this often without a notification (and a deleted
 /// branch's task ends within it).
 pub const SWEEP_EVERY: Duration = Duration::from_secs(30);
@@ -249,7 +254,8 @@ pub fn vet(
 
 /// The POST body the function's `fetch` handler gets: `{id, type, schema, table, record,
 /// old_record, txid}`, or, over [`MAX_EVENT_BYTES`], the records null with `truncated: true`
-/// and `primary_key` (the key's values, null for a table without one).
+/// and `primary_key` (the key's values, null for a table without one; a value over
+/// [`MAX_PK_VALUE_BYTES`] is null).
 pub fn event_body(e: &Event) -> Vec<u8> {
     let mut body = Map::new();
     body.insert("id".into(), json!(e.id));

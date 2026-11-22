@@ -30,14 +30,16 @@
 //!   them back on), members, admins and its own memberships revoked, objects it owns here
 //!   reassigned to the owner. Its former members' sessions are ended before and again after
 //!   the commit, and its own too when it had drifted or had a membership either way (else
-//!   they are the storage service's). Changed attributes, password or settings, or a member,
-//!   void its tickets; the health check notices any drift or membership, so reconcile reruns
+//!   they are the storage service's). A connection whose handshake read a replaced verifier
+//!   and finishes later is covered by the record the lockdown keeps on the role
+//!   ([`crate::login_lockdown`]): it fails the health check and the next run ends it.
+//!   Changed attributes, password or settings, or a member, void its tickets; the health check notices any drift or membership, so reconcile reruns
 //!   the lockdown.
 //! - `anon` and `authenticated` get `USAGE` on the schema (never `CREATE`) and table
 //!   privileges that row level security still gates. `authenticated` writes every column of
 //!   `storage.objects` a caller declares, the [`MANAGED_COLUMNS`] included, so RLS policies
-//!   see them. `authenticator` gets `USAGE` only (it parses statements before it switches
-//!   role).
+//!   see them. `authenticator` and the data API's elevated login get `USAGE` only (each
+//!   parses statements before it switches role).
 //! - Upload tickets vouch for the managed columns. Only [`STORAGE_ROLE`] writes
 //!   `storage.upload_tickets` (`guard_tickets` checks `current_user`, so `pg_write_all_data`
 //!   mints nothing: [`TICKET_FORGED`]); a ticket lives at most [`TICKET_MAX_LIFETIME`] and
@@ -103,10 +105,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 8;
+pub const STORAGE_SCHEMA_VERSION: u32 = 9;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 8";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 9";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -128,6 +130,15 @@ pub const TICKET_FORGED: &str = "CB004";
 /// bucket updated or deleted, `write_once` turned off, or a write-once bucket holding objects
 /// renamed. The storage service answers 409 `write_once`.
 pub const WRITE_ONCE: &str = "CB005";
+
+/// The SQLSTATE `guard_sessions` raises (m14) when a key and caller already have
+/// [`MAX_LIVE_SESSIONS`] live upload sessions in a bucket. The storage service answers 429
+/// `too_many_uploads` with its own fixed text.
+pub const SESSION_CAP: &str = "CB006";
+
+/// The most live (unexpired) upload sessions one key and caller may hold in one bucket
+/// (m14). Written into [`GUARD_SESSIONS_BODY`]; a test keeps the two equal.
+pub const MAX_LIVE_SESSIONS: u32 = 100;
 
 /// `chelabase_storage`'s connection limit. Each storage service process holds at most a
 /// branch's `storage_max_connections` (1 to 20) to it; during a rolling deploy two replicas
@@ -154,12 +165,18 @@ pub const FOREIGN_SCHEMA_MARK: &str = "chelabase_storage_foreign";
 /// qualify theirs, like the data API script.
 pub fn storage_schema_sql(owner_role: &str, verifier: &str, parent_verifier: Option<&str>) -> String {
     let owner = quote_ident(owner_role);
-    let verifier_lit = crate::data_api::quote_literal(verifier);
+    let verifier_lit = chelabase_schema::sql::literal(verifier);
     let foreign_objects = foreign_objects_sql();
-    let acl_entries = acl_entries_sql().replace("{owner}", &owner_role.replace('\'', "''"));
-    let owner_lit = crate::data_api::quote_literal(owner_role);
+    let acl_entries = acl_entries_sql().replace("{owner}", &chelabase_schema::sql::literal(owner_role));
+    let owner_lit = chelabase_schema::sql::literal(owner_role);
     let newer = newer_than_mine_sql();
     let drift = role_drift_sql("role", verifier);
+    // The durable record that the role's earlier sessions are void: written in the lockdown's
+    // transaction whenever its sessions are ended or its verifier was its parent's (either
+    // way the run replaces what a session could have authenticated against), completed after
+    // the commit.
+    let record = crate::login_lockdown::record_sql(STORAGE_ROLE, "role", "ended OR inherited");
+    let finish = crate::login_lockdown::finish_sql(STORAGE_ROLE);
     let inherited = parent_verifier.map_or_else(
         || "false".to_owned(),
         |parent| {
@@ -201,7 +218,7 @@ BEGIN
   inherited := {inherited};
   tampered := {drift} AND NOT inherited;
   ended := has_members OR tampered OR EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role);
-  ALTER ROLE chelabase_storage LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT CONNECTION LIMIT {STORAGE_CONNECTION_LIMIT} VALID UNTIL 'infinity' PASSWORD {verifier_lit};
+{record}  ALTER ROLE chelabase_storage LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT CONNECTION LIMIT {STORAGE_CONNECTION_LIMIT} VALID UNTIL 'infinity' PASSWORD {verifier_lit};
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
     WHERE s.setrole OPERATOR(pg_catalog.=) role
   LOOP
@@ -247,7 +264,7 @@ DO $$ BEGIN
         (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.storage_former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
-BEGIN;
+{finish}BEGIN;
 SET search_path = pg_catalog, pg_temp;
 SET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';
 SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});
@@ -387,7 +404,7 @@ DO $$ DECLARE e record; BEGIN
   END LOOP;
 END $$;
 REVOKE ALL ON SCHEMA storage FROM PUBLIC;
-GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_storage, {owner};
+GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_authenticator_elevated, chelabase_storage, {owner};
 ALTER TABLE storage.buckets ENABLE TRIGGER ALL;
 ALTER TABLE storage.objects ENABLE TRIGGER ALL;
 ALTER TABLE storage.upload_tickets ENABLE TRIGGER ALL;
@@ -396,7 +413,7 @@ ALTER TABLE storage.upload_tickets NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE storage.upload_tickets DISABLE ROW LEVEL SECURITY;
 ALTER TABLE storage.upload_sessions NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE storage.upload_sessions DISABLE ROW LEVEL SECURITY;
-REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
+REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_authenticator_elevated, chelabase_storage, {owner};
 GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;
 GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types, write_once), UPDATE (name, public, file_size_limit, allowed_mime_types, write_once), DELETE ON storage.buckets TO authenticated;
 GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;
@@ -685,17 +702,17 @@ fn acl_entries_sql() -> String {
     let ns = "pg_catalog.to_regnamespace('storage')";
     let tables = "CASE WHEN c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['upload_tickets', 'upload_sessions']::pg_catalog.name[]) THEN ARRAY['chelabase_storage'] ELSE ARRAY['anon', 'authenticated', 'chelabase_storage'] END";
     format!(
-        "SELECT 'ON SCHEMA storage' AS target, a.grantor, a.grantee, a.is_grantable, ARRAY['anon', 'authenticated', 'authenticator', 'chelabase_storage', '{{owner}}'] AS allowed \
+        "SELECT 'ON SCHEMA storage' AS target, a.grantor, a.grantee, a.is_grantable, ARRAY['anon', 'authenticated', 'authenticator', 'chelabase_authenticator_elevated', 'chelabase_storage', {{owner}}] AS allowed \
     FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a WHERE n.oid OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) n.nspowner \
   UNION ALL SELECT 'ON TABLE ' OPERATOR(pg_catalog.||) c.oid::pg_catalog.regclass::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, {tables} \
     FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) a WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
   UNION ALL SELECT pg_catalog.format('(%I) ON TABLE %s', t.attname, c.oid::pg_catalog.regclass), a.grantor, a.grantee, a.is_grantable, \
       CASE WHEN c.relname OPERATOR(pg_catalog.=) 'objects' AND t.attname OPERATOR(pg_catalog.=) 'id' AND a.privilege_type OPERATOR(pg_catalog.=) 'REFERENCES' \
-        THEN ARRAY['{{owner}}'] ELSE {tables} END \
+        THEN ARRAY[{{owner}}] ELSE {tables} END \
     FROM pg_catalog.pg_attribute t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.attrelid, pg_catalog.aclexplode(t.attacl) a \
     WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
   UNION ALL SELECT 'ON ROUTINE ' OPERATOR(pg_catalog.||) p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, \
-      CASE WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) THEN ARRAY['{{owner}}'] \
+      CASE WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) THEN ARRAY[{{owner}}] \
         WHEN p.proname OPERATOR(pg_catalog.=) 'record_part' THEN ARRAY['chelabase_storage'] \
         WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions', 'guard_buckets', 'freeze_objects']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
     FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) p.proowner \
@@ -708,7 +725,7 @@ fn acl_entries_sql() -> String {
 /// granted by anyone but the object's owner, with a grant option, or to a grantee the install
 /// doesn't grant there.
 pub fn foreign_acl_sql(owner_role: &str) -> String {
-    let entries = acl_entries_sql().replace("{owner}", &owner_role.replace('\'', "''"));
+    let entries = acl_entries_sql().replace("{owner}", &chelabase_schema::sql::literal(owner_role));
     format!(
         "SELECT FROM ({entries}) x LEFT JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) x.grantee \
   WHERE x.is_grantable OR NOT (COALESCE(r.rolname::pg_catalog.text, 'public') OPERATOR(pg_catalog.=) ANY (x.allowed)) \
@@ -749,10 +766,15 @@ BEGIN
 END
 ";
 
-/// `guard_sessions`'s body (m7).
+/// `guard_sessions`'s body (m7, m14).
 /// Only [`STORAGE_ROLE`] writes a session; an insert is stamped with this timeline (a branch
 /// copies the row, never the timeline) and lives at most 24 hours; an update changes only the
 /// parts, and the expiry only to come sooner.
+///
+/// **Invariant (m14):** a key, owner and bucket never have more than [`MAX_LIVE_SESSIONS`]
+/// live sessions. The count and the insert run under one transaction-scoped advisory lock
+/// keyed on the three, so concurrent inserts for them are counted one after another (each
+/// sees the others' committed rows) and exactly the ones that fit succeed; `CB006` past it.
 pub const GUARD_SESSIONS_BODY: &str = "
 BEGIN
   IF current_user <> 'chelabase_storage' THEN
@@ -773,14 +795,30 @@ BEGIN
   IF NEW.expires_at <= clock_timestamp() OR NEW.expires_at > clock_timestamp() + interval '24 hours' THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_sessions: a session expires within 24 hours';
   END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(NEW.key_id::pg_catalog.text || ':' || COALESCE(NEW.owner::pg_catalog.text, '') || ':' || NEW.bucket_id::pg_catalog.text, 0));
+  IF (SELECT pg_catalog.count(*) FROM storage.upload_sessions s
+        WHERE s.key_id = NEW.key_id AND s.owner IS NOT DISTINCT FROM NEW.owner AND s.bucket_id = NEW.bucket_id
+          AND s.expires_at > pg_catalog.clock_timestamp()) >= 100 THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB006', MESSAGE = 'storage.upload_sessions: too many live upload sessions for this key and caller in the bucket';
+  END IF;
   RETURN NEW;
 END
 ";
 
-/// `record_part`'s body (m7): merges one part into a live session's `parts`.
+/// `record_part`'s body (m7, m14): merges one part into a live session's `parts`, unless the
+/// recorded total (the other parts' sizes plus this one) would pass the bucket's
+/// `file_size_limit` (none when it is NULL, or the bucket is gone: completion decides then).
+///
+/// **Invariant (m14):** the session's recorded total never passes the bucket's limit. The check
+/// is in the `UPDATE`'s `WHERE`: the statement locks the session row, and under READ COMMITTED a
+/// concurrent `record_part` on the same row waits, then re-evaluates the `WHERE` against the
+/// new row version, so two parts that each fit alone can't both be recorded.
 pub const RECORD_PART_BODY: &str = "
-UPDATE storage.upload_sessions SET parts = parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))
-  WHERE id = p_session AND expires_at > clock_timestamp()
+UPDATE storage.upload_sessions u SET parts = u.parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))
+  WHERE u.id = p_session AND u.expires_at > clock_timestamp()
+    AND COALESCE((SELECT b.file_size_limit IS NULL
+                    OR p_size + COALESCE((SELECT sum((e.value->>'size')::bigint) FROM jsonb_each(u.parts) e WHERE e.key <> p_part::text), 0) <= b.file_size_limit
+                  FROM storage.buckets b WHERE b.id = u.bucket_id), true)
   RETURNING true
 ";
 
@@ -884,7 +922,7 @@ const CONSTRAINT_ENTRY: &str = "c.relname::pg_catalog.text OPERATOR(pg_catalog.|
 pub fn expected_list(items: &[&str]) -> String {
     let quoted: Vec<String> = items
         .iter()
-        .map(|i| format!("'{}'", i.replace('\'', "''")))
+        .map(|i| chelabase_schema::sql::literal(i))
         .collect();
     format!("ARRAY[{}]::pg_catalog.text[]", quoted.join(", "))
 }
@@ -892,16 +930,19 @@ pub fn expected_list(items: &[&str]) -> String {
 /// Whether the role `role` (an oid expression) has drifted from what the lockdown leaves:
 /// any attribute (it logs in, never expires), a password other than exactly `verifier`, a
 /// connection limit other than [`STORAGE_CONNECTION_LIMIT`], or settings other than exactly
-/// `search_path` and `event_triggers = off`.
+/// `search_path` and `event_triggers = off`, or a session of it that the last drifted
+/// lockdown voided ([`crate::login_lockdown::void_sessions_sql`]).
 pub fn role_drift_sql(role: &str, verifier: &str) -> String {
-    let verifier = crate::data_api::quote_literal(verifier);
+    let verifier = chelabase_schema::sql::literal(verifier);
+    let void = crate::login_lockdown::void_sessions_sql(role);
     format!(
         "(EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) {role}
     AND (NOT a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
       OR a.rolpassword IS DISTINCT FROM {verifier} OR a.rolconnlimit OPERATOR(pg_catalog.<>) {STORAGE_CONNECTION_LIMIT}
       OR a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz))
     OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {role}
-      AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']::pg_catalog.text[])))"
+      AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']::pg_catalog.text[]))
+    OR {void})"
     )
 }
 
@@ -984,6 +1025,10 @@ mod tests {
                 .starts_with("DO $$ BEGIN\n  PERFORM pg_catalog.pg_terminate_backend(a.pid)"),
             "{between_them}"
         );
+        // Then only the step that completes the role's record.
+        let between_them = between_them
+            .strip_suffix(&crate::login_lockdown::finish_sql(STORAGE_ROLE))
+            .expect("the record's step comes last before the install");
         assert!(
             between_them.trim_end().ends_with("END $$;"),
             "{between_them}"
@@ -1189,6 +1234,30 @@ mod tests {
         assert_eq!(STORAGE_ROLE, "chelabase_storage");
     }
 
+    /// `chelabase_storage` keeps the same record as the data API's elevated login
+    /// ([`crate::login_lockdown`]): written in the lockdown's transaction whenever its
+    /// sessions are ended or its verifier was its parent's, completed after the commit, and
+    /// read by the one drift predicate (so by the health check too).
+    #[test]
+    fn the_storage_lockdown_records_that_earlier_sessions_are_void() {
+        use crate::login_lockdown::{finish_sql, record_sql, void_sessions_sql};
+        let drift = role_drift_sql(STORAGE_ROLE_OID, VERIFIER);
+        assert!(drift.contains(&format!("OR {}", void_sessions_sql(STORAGE_ROLE_OID))), "{drift}");
+        assert!(storage_check_sql("postgres", Some(VERIFIER)).contains(&void_sessions_sql(STORAGE_ROLE_OID)));
+        for sql in [sql(), storage_schema_sql("postgres", VERIFIER, Some("SCRAM-SHA-256$4096:cGFyZW50$p:q"))] {
+            let (lockdown, after) = sql.split_once("COMMIT;\n").unwrap();
+            assert!(between(lockdown, "tampered :=", ";\n").contains(&void_sessions_sql("role")), "{lockdown}");
+            let record = record_sql(STORAGE_ROLE, "role", "ended OR inherited");
+            let written = lockdown.find(&record).expect("the record");
+            assert!(lockdown.find("ended := ").unwrap() < written && written < lockdown.find("ALTER ROLE chelabase_storage LOGIN").unwrap(), "{lockdown}");
+            // After the commit: the termination that reads the session's settings, then the
+            // step that reads the record; the install's transaction follows.
+            let finish = finish_sql(STORAGE_ROLE);
+            let at = after.find(&finish).expect("the step after the commit");
+            assert!(after[..at].trim_end().ends_with("END $$;") && after[at + finish.len()..].starts_with("BEGIN;\n"), "{after}");
+        }
+    }
+
     /// The grants are reset each run and then given exactly: `USAGE` (never `CREATE`) on the
     /// schema; `SELECT` for `anon`; `authenticated` writes every object column a caller
     /// declares, the managed ones included (so RLS policies see them; the ticket trigger
@@ -1200,15 +1269,15 @@ mod tests {
         // #102's grant came with version 8, so a version-7 schema is reinstalled.
         assert_eq!(
             (STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP),
-            (8, "chelabase storage schema 8")
+            (9, "chelabase storage schema 9")
         );
         let sql = sql();
         assert!(
             sql.contains("REVOKE ALL ON SCHEMA storage FROM PUBLIC;"),
             "{sql}"
         );
-        assert!(sql.contains("GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_storage, \"postgres\";"), "{sql}");
-        let reset = "REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, \"postgres\";";
+        assert!(sql.contains("GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_authenticator_elevated, chelabase_storage, \"postgres\";"), "{sql}");
+        let reset = "REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_authenticator_elevated, chelabase_storage, \"postgres\";";
         let reset_at = sql.find(reset).unwrap_or_else(|| panic!("{reset}: {sql}"));
         let grants: Vec<&str> = sql
             .lines()
@@ -1389,7 +1458,7 @@ mod tests {
     #[test]
     fn storage_schema_ticket_codes_are_dedicated() {
         assert_eq!((TICKET_MISSING, TICKET_FORGED), ("CB003", "CB004"));
-        let data_api = crate::data_api::data_api_sql("postgres", "pw", "public");
+        let data_api = crate::data_api::data_api_sql("postgres", "pw", "SCRAM-SHA-256$4096:c2FsdA==$a:b", "public");
         // A forged write is refused with the same code on the tickets and the sessions (m7).
         for (code, uses) in [(TICKET_MISSING, 1), (TICKET_FORGED, 2)] {
             assert_ne!(code, "42501");
@@ -1786,7 +1855,7 @@ mod tests {
     fn storage_schema_foreign_schema_stops_the_script_first() {
         let sql = sql();
         let check = sql.find(FOREIGN_SCHEMA_MARK).expect("the foreign check");
-        let lock = sql.rfind("pg_advisory_xact_lock").unwrap();
+        let lock = sql.rfind("SELECT pg_catalog.pg_advisory_xact_lock(").unwrap();
         let first_change = sql.find("CREATE SCHEMA").unwrap();
         assert!(lock < check && check < first_change, "{sql}");
         // ...but after the role's lockdown has committed (S2).
@@ -1815,7 +1884,7 @@ mod tests {
     /// AC 2: reconcile's check fails until the current version is installed.
     #[test]
     fn storage_schema_is_part_of_the_health_check() {
-        let check = schema_check_sql("public", Some(VERIFIER));
+        let check = schema_check_sql("public", Some(VERIFIER), Some("e"));
         let storage = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.ends_with(&storage), "{check}");
         // A branch with no stored storage login yet is never healthy: its bootstrap makes one.
@@ -2174,6 +2243,54 @@ mod tests {
         assert!(EXPECTED_CONSTRAINTS.contains(&"upload_sessions.upload_sessions_pkey"));
     }
 
+    /// m14: the schema is version 9 with the bodies that cap live sessions and check the
+    /// recorded total; both are installed and compared by the health check.
+    #[test]
+    fn record_part_checks_the_running_total() {
+        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (9, "chelabase storage schema 9"));
+        for part in [
+            // Other parts only (the replaced part doesn't count), plus this one, at most the limit.
+            "sum((e.value->>'size')::bigint) FROM jsonb_each(u.parts) e WHERE e.key <> p_part::text",
+            "p_size + COALESCE(",
+            "<= b.file_size_limit",
+            "b.file_size_limit IS NULL",
+            "FROM storage.buckets b WHERE b.id = u.bucket_id",
+            "AND u.expires_at > clock_timestamp()",
+        ] {
+            assert!(RECORD_PART_BODY.contains(part), "{part}: {RECORD_PART_BODY}");
+        }
+        // The check is inside the UPDATE's WHERE (so a concurrent writer re-evaluates it), and
+        // the signature, grant and security mode are unchanged.
+        let (update, rest) = RECORD_PART_BODY.split_once("WHERE").unwrap();
+        assert!(update.contains("UPDATE storage.upload_sessions u SET parts"), "{update}");
+        assert!(rest.contains("file_size_limit") && rest.trim_end().ends_with("RETURNING true"), "{rest}");
+        let sql = sql();
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION storage.record_part(p_session uuid, p_part integer, p_size bigint, p_etag text) RETURNS boolean\n  LANGUAGE sql SECURITY INVOKER"), "{sql}");
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION storage.record_part(uuid, integer, bigint, text) TO chelabase_storage;"));
+    }
+
+    /// m14: an insert takes the advisory lock for its key, owner and bucket, counts their live
+    /// sessions under it and raises `CB006` at the cap; updates return before either.
+    #[test]
+    fn guard_sessions_caps_live_sessions() {
+        assert_eq!(SESSION_CAP, "CB006");
+        assert!(GUARD_SESSIONS_BODY.contains(&format!(">= {MAX_LIVE_SESSIONS} THEN")), "{GUARD_SESSIONS_BODY}");
+        let lock = GUARD_SESSIONS_BODY.find("pg_advisory_xact_lock(pg_catalog.hashtextextended(NEW.key_id::pg_catalog.text || ':' || COALESCE(NEW.owner::pg_catalog.text, '') || ':' || NEW.bucket_id::pg_catalog.text, 0))").expect("the lock");
+        let count = GUARD_SESSIONS_BODY.find("pg_catalog.count(*) FROM storage.upload_sessions s").expect("the count");
+        let raise = GUARD_SESSIONS_BODY.find("ERRCODE = 'CB006'").expect("the refusal");
+        let update_return = GUARD_SESSIONS_BODY.find("RETURN NEW;\n  END IF;").expect("the update's return");
+        assert!(update_return < lock && lock < count && count < raise, "{GUARD_SESSIONS_BODY}");
+        for part in [
+            "s.key_id = NEW.key_id",
+            "s.owner IS NOT DISTINCT FROM NEW.owner",
+            "s.bucket_id = NEW.bucket_id",
+            "s.expires_at > pg_catalog.clock_timestamp()",
+        ] {
+            assert!(GUARD_SESSIONS_BODY.contains(part), "{part}");
+        }
+        assert!(sql().contains(&format!("$f${GUARD_SESSIONS_BODY}$f$")));
+    }
+
     /// m7: a part is recorded through `storage.record_part` (the storage service's statements
     /// never say `SET`): `SECURITY INVOKER`, so the session's guard sees the storage role, and
     /// executable by it alone; checked and healed like the others.
@@ -2190,8 +2307,8 @@ mod tests {
             assert!(sql.contains(part), "{part}");
         }
         for part in [
-            "UPDATE storage.upload_sessions SET parts = parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))",
-            "WHERE id = p_session AND expires_at > clock_timestamp()",
+            "UPDATE storage.upload_sessions u SET parts = u.parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))",
+            "WHERE u.id = p_session AND u.expires_at > clock_timestamp()",
             "RETURNING true",
         ] {
             assert!(RECORD_PART_BODY.contains(part), "{part}: {RECORD_PART_BODY}");

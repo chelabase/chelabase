@@ -228,7 +228,7 @@ const TOKEN: [u8; 32] = [7; 32];
 
 /// An invite of `identity_user_id` at `email`, open for a week, with `TOKEN` and `grants`.
 fn new_invite<'a>(identity_user_id: &'a str, email: &'a str, grants: &'a [(Uuid, GrantRow)]) -> NewInvite<'a> {
-    NewInvite { identity_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[] }
+    NewInvite { identity_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[], readmit_removed: true }
 }
 
 // #121: what sign-in and `/auth/v1/token` read: active and pending rows of every tenant.
@@ -1654,6 +1654,60 @@ async fn reinvite_reuses_a_removed_row() {
             .await,
         Err(AccessWriteError::Conflict(_))
     ));
+    s.finish().await;
+}
+
+// m10: an invite that may not re-admit (not a tenant admin's) is refused, under the tenant lock,
+// when a removed row of the tenant has the invitee's identity user or email: the row stays
+// removed with its mark, no row or invite is added, and a tenant admin's invite still re-admits.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn invite_without_readmit_refuses_a_removed_row_by_user_or_email() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let a = s
+        .client
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
+        .await
+        .unwrap();
+    let r = s
+        .client
+        .ensure_member_first_comer_for_tests(t, "r", "r@x.com", "R", Admission::Active)
+        .await
+        .unwrap();
+    s.client.remove_member(a.id, r.id).await.unwrap();
+    s.client.revoke_logins_for_identity_user(t, "r").await.unwrap();
+    let members = s.member_count(t).await;
+    // O4: the invite path's early read finds the removed row by email, trimmed and case folded;
+    // a live member's email, another tenant's or a blank one never matches.
+    for email in ["r@x.com", "  R@X.com ", "R@X.COM"] {
+        assert!(s.client.removed_member_with_email(t, email).await.unwrap(), "{email:?}");
+    }
+    for email in ["a@x.com", "", "  ", "other@x.com"] {
+        assert!(!s.client.removed_member_with_email(t, email).await.unwrap(), "{email:?}");
+    }
+    let other = s.tenant().await;
+    assert!(!s.client.removed_member_with_email(other, "r@x.com").await.unwrap(), "another tenant's");
+    let no_readmit = |user: &'static str, email: &'static str| NewInvite { readmit_removed: false, ..new_invite(user, email, &[]) };
+    // By identity user (any email), and by email under another identity user.
+    for (user, email) in [("r", "other@x.com"), ("new-account", "R@X.com ")] {
+        assert!(
+            matches!(
+                s.client.create_invited_member(a.id, t, no_readmit(user, email)).await,
+                Err(AccessWriteError::RemovedMember)
+            ),
+            "{user} {email}"
+        );
+    }
+    let kept = s.client.member(r.id).await.unwrap().unwrap();
+    assert_eq!((kept.status, kept.offboarded), (MemberStatus::Removed, true));
+    assert_eq!(s.member_count(t).await, members, "no row added");
+    assert!(s.client.open_invites(t).await.unwrap().is_empty(), "no invite");
+    // Someone else is invited as before.
+    s.client.create_invited_member(a.id, t, no_readmit("n", "n@x.com")).await.unwrap();
+    // A tenant admin's invite re-admits the removed row.
+    let (back, _) = s.client.create_invited_member(a.id, t, new_invite("r", "r@x.com", &[])).await.unwrap();
+    assert_eq!((back.id, back.status), (r.id, MemberStatus::Invited));
     s.finish().await;
 }
 

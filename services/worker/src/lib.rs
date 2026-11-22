@@ -45,6 +45,7 @@ mod f4_tests;
 mod fakes;
 #[cfg(test)]
 mod final_a_tests;
+pub mod login_lockdown;
 pub mod member_roles;
 pub mod schema_guard;
 pub mod merge;
@@ -122,6 +123,10 @@ pub struct Worker<M, S, C, N, P> {
     /// When reconcile first saw each `enabling` database row: one still there after
     /// [`reconcile::ENABLING_RETRY_SECS`] has its enable bootstrap run again.
     pub enabling_seen: Mutex<std::collections::HashMap<(BranchId, String), std::time::Instant>>,
+    /// Branches whose elevated-login rollout bootstrap failed, with the failures so far: the
+    /// next passes try them again ahead of the round-robin
+    /// ([`reconcile::LOGIN_ROLLOUT_RETRIES`]).
+    pub login_rollout_retry: Mutex<std::collections::HashMap<BranchId, u32>>,
     /// Endpoints whose last recreate left a compute that never got ready (reconcile skips them
     /// until their backoff ends).
     pub recreate_backoff: Mutex<std::collections::HashMap<String, reconcile::RecreateBackoff>>,

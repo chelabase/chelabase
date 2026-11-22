@@ -91,6 +91,29 @@ pub enum ParamType {
 }
 
 impl Plan {
+    /// About how many bytes this plan holds: its structs plus its two statements' text and
+    /// its binds' paths. What the shape cache weighs a plan by; an estimate that never
+    /// undercounts the heap it can see.
+    pub fn approx_bytes(&self) -> usize {
+        let binds: usize = self
+            .binds
+            .iter()
+            .map(|b| {
+                let path = match b {
+                    Bind::Text(p) | Bind::TextArray(p) | Bind::Json(p) => Some(p),
+                    Bind::Limit { .. } | Bind::Offset { .. } => None,
+                };
+                std::mem::size_of::<Bind>()
+                    + path.map_or(0, |p| match &p.slot {
+                        Slot::Where(ix) => ix.len() * std::mem::size_of::<usize>(),
+                        Slot::Arg(name) => name.len(),
+                        Slot::Rows | Slot::Set => 0,
+                    })
+            })
+            .sum();
+        std::mem::size_of::<Plan>() + self.sql.len() + self.capped_sql.len() + binds
+    }
+
     /// The types of `sql`'s parameters, one per bind.
     pub fn param_types(&self) -> Vec<ParamType> {
         self.binds

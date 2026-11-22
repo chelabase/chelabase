@@ -659,11 +659,11 @@ pub fn verify_privileges(
 /// `USING (true) WITH CHECK (true)`, commented [`ALL_ROWS_MARKER`]), one `text` per row.
 pub const ALL_ROWS_ROLES_SQL: &str = "SELECT DISTINCT r.rolname::pg_catalog.text \
      FROM pg_catalog.pg_policy pol \
-     JOIN pg_catalog.pg_roles r ON pol.polroles = ARRAY[r.oid] \
-     WHERE pol.polpermissive AND pol.polcmd = '*' \
-       AND pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) = 'true' \
-       AND pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) = 'true' \
-       AND pg_catalog.obj_description(pol.oid, 'pg_policy') = 'chelabase:all_rows'";
+     JOIN pg_catalog.pg_roles r ON pol.polroles OPERATOR(pg_catalog.=) ARRAY[r.oid] \
+     WHERE pol.polpermissive AND pol.polcmd OPERATOR(pg_catalog.=) '*' \
+       AND pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) OPERATOR(pg_catalog.=) 'true' \
+       AND pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) OPERATOR(pg_catalog.=) 'true' \
+       AND pg_catalog.obj_description(pol.oid, 'pg_policy') OPERATOR(pg_catalog.=) 'chelabase:all_rows'";
 
 /// EOS-H1: every membership as member → the roles it is a member of (any option, MH-26), one
 /// `(member, role)` pair of `text` per row.
@@ -846,6 +846,18 @@ mod fragment_tests {
     #[test]
     fn the_all_rows_roles_read_uses_the_marker() {
         assert!(ALL_ROWS_ROLES_SQL.contains(&format!("'{ALL_ROWS_MARKER}'")));
+    }
+
+    /// Every comparison of the all-rows roles read names its operator in `pg_catalog`, so the
+    /// read means the same under any search path.
+    #[test]
+    fn all_rows_roles_sql_qualifies_operators() {
+        let qualified = "OPERATOR(pg_catalog.=)";
+        assert_eq!(ALL_ROWS_ROLES_SQL.matches(qualified).count(), 5);
+        assert!(
+            !ALL_ROWS_ROLES_SQL.replace(qualified, "").contains('='),
+            "{ALL_ROWS_ROLES_SQL}"
+        );
     }
 
     /// EOS-H1: a change exposes only the (start, role) pairs it connects; the shortest chain

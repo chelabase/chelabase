@@ -5,6 +5,7 @@ import {
   type AppUser,
   type Client,
   createClient,
+  op,
   type DatabaseShape,
   type Int8,
   type Json,
@@ -103,11 +104,11 @@ async function names() {
 void names;
 
 // --- where: columns, values and operators are checked
-db.from("orders").where({ status: "paid", qty: { gte: 1, lt: 10 }, customer_name: null });
-db.from("orders").where({ or: [{ region: { in: ["eu"] } }, { vip: true }], not: { status: "pending" } });
+db.from("orders").where({ status: "paid", qty: op.all(op.gte(1), op.lt(10)), customer_name: null });
+db.from("orders").where({ or: [{ region: op.in(["eu"]) }, { vip: true }], not: { status: "pending" } });
 db.from("orders").where({ and: [{ col: "and", eq: "x" }, { status: "paid" }] });
-db.from("orders").where({ customer_name: { like: "A%" }, vip: { is: true }, total: { is: null } });
-big.from("events").where({ id: 1n, seq: { in: [2n] } });
+db.from("orders").where({ customer_name: op.like("A%"), vip: op.is(true), total: op.is(null) });
+big.from("events").where({ id: 1n, seq: op.in([2n]) });
 // @ts-expect-error unknown column
 db.from("orders").where({ nope: 1 });
 // @ts-expect-error wrong value type
@@ -115,9 +116,9 @@ db.from("orders").where({ qty: "1" });
 // @ts-expect-error not an enum value
 db.from("orders").where({ status: "lost" });
 // @ts-expect-error in takes a list of the column's values
-db.from("orders").where({ qty: { in: ["1"] } });
+db.from("orders").where({ qty: op.in(["1"]) });
 // @ts-expect-error like only on text columns
-db.from("orders").where({ qty: { like: "1%" } });
+db.from("orders").where({ qty: op.like("1%") });
 // @ts-expect-error unknown operator
 db.from("orders").where({ qty: { between: [1, 2] } });
 // @ts-expect-error int8 is a number without bigint: true
@@ -389,7 +390,7 @@ async function storagePathsAndIds() {
   expectTypeOf(rows[0]!.lookalike).toEqualTypeOf<string | null>();
   // Both are strings: written as plain strings, filtered like one.
   await gen.from("profiles").insert({ banner: { bucket_id: "b", name: "a" }, avatar_path: "u1/me.png", photo_id: "0000" });
-  await gen.from("profiles").select("id").where({ avatar_path: { eq: "u1/me.png" } });
+  await gen.from("profiles").select("id").where({ avatar_path: op.eq("u1/me.png") });
   const path: string = rows[0]!.avatar_path ?? "";
   void path;
   // resolve takes them as `{ bucket, name }` and `{ id }`.
@@ -406,3 +407,15 @@ async function storagePathsAndIds() {
   void gen.storage.resolve("u1/me.png");
 }
 void storagePathsAndIds;
+
+// --- operators come only from `op`: a bare operator-shaped object is a json value, nothing else
+db.from("orders").where({ meta: { eq: 1 } });
+db.from("orders").where({ total: op.all(op.gte("10"), op.lt("20")) });
+// @ts-expect-error a bare operator object is not an operator on a non-json column
+db.from("orders").where({ qty: { gte: 1 } });
+// @ts-expect-error op values must match the column type
+db.from("orders").where({ qty: op.gte("1") });
+// @ts-expect-error op values must match the column type inside op.all
+db.from("orders").where({ qty: op.all(op.gte(1), op.lt("2")) });
+// @ts-expect-error op.all takes at least one operator
+db.from("orders").where({ qty: op.all() });

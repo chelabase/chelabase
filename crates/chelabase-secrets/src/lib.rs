@@ -95,6 +95,9 @@ pub enum Purpose {
     Owner,
     /// The `authenticator` role's password on a branch.
     Authenticator,
+    /// The `chelabase_authenticator_elevated` login's password on a branch: the data API's
+    /// second login, which alone is meant to hold the roles only an Admin may key or act as.
+    AuthenticatorElevated,
     /// A public data API key, sealed so it can be shown again.
     DataKey,
     /// A login role's password (bound to its branch and name, see [`seal_role_password`]).
@@ -112,6 +115,8 @@ pub enum Purpose {
     /// A storage webhook endpoint's signing secret (bound to the endpoint, see
     /// [`seal_webhook_secret`]).
     Webhook,
+    /// The key app refresh tokens are tagged with ([`derive_key`]; never a sealed value).
+    AppRefresh,
 }
 
 impl Purpose {
@@ -119,6 +124,7 @@ impl Purpose {
         match self {
             Purpose::Owner => "owner",
             Purpose::Authenticator => "authenticator",
+            Purpose::AuthenticatorElevated => "authenticator_elevated",
             Purpose::DataKey => "data_key",
             Purpose::Role => "role",
             Purpose::MemberRole => "member_role",
@@ -126,6 +132,7 @@ impl Purpose {
             Purpose::FunctionsDispatch => "functions_dispatch",
             Purpose::StorageUrl => "storage_url",
             Purpose::Webhook => "webhook",
+            Purpose::AppRefresh => "app_refresh",
         }
     }
 }
@@ -349,6 +356,31 @@ mod derive_tests {
         assert_ne!(&a[..], &[7u8; 32][..]);
         assert_eq!(Purpose::StorageUrl.as_str(), "storage_url");
     }
+
+    // The key app refresh tokens are tagged with is its own: no other purpose shares its
+    // label or its derived key.
+    #[test]
+    fn app_refresh_has_its_own_label_and_key() {
+        let key = SecretKey::generate();
+        let all = [
+            Purpose::Owner,
+            Purpose::Authenticator,
+            Purpose::AuthenticatorElevated,
+            Purpose::DataKey,
+            Purpose::Role,
+            Purpose::MemberRole,
+            Purpose::Storage,
+            Purpose::FunctionsDispatch,
+            Purpose::StorageUrl,
+            Purpose::Webhook,
+            Purpose::AppRefresh,
+        ];
+        assert_eq!(Purpose::AppRefresh.as_str(), "app_refresh");
+        let labels: std::collections::HashSet<_> = all.iter().map(|p| p.as_str()).collect();
+        assert_eq!(labels.len(), all.len(), "purpose labels are unique");
+        let keys: std::collections::HashSet<_> = all.iter().map(|p| derive_key(&key, *p, 0)).collect();
+        assert_eq!(keys.len(), all.len(), "derived keys are distinct");
+    }
 }
 
 #[cfg(test)]
@@ -410,7 +442,15 @@ mod credential_tests {
     #[test]
     fn authenticator_and_data_key_purposes_round_trip_and_differ_in_aad() {
         let key = SecretKey::generate();
-        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey, Purpose::Storage, Purpose::FunctionsDispatch];
+        let all = [
+            Purpose::Owner,
+            Purpose::Authenticator,
+            Purpose::AuthenticatorElevated,
+            Purpose::DataKey,
+            Purpose::Storage,
+            Purpose::FunctionsDispatch,
+        ];
+        assert_eq!(Purpose::AuthenticatorElevated.as_str(), "authenticator_elevated");
         assert_eq!(Purpose::Owner.as_str(), "owner");
         assert_eq!(Purpose::FunctionsDispatch.as_str(), "functions_dispatch");
         assert_eq!(Purpose::Storage.as_str(), "storage");

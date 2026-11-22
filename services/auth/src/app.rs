@@ -2,14 +2,14 @@
 
 use crate::config::Config;
 use crate::cookie::*;
-use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
+use crate::guard::{CodeCheckSlot, RateLimiter, SignInSlots, Slot, UsedTickets, client_bucket, email_tag, pad};
 use chelabase_identity::{
     CodeKind, CodeRequest, Delivery, Identity, IdentityError, Missing, NewUser, Pool, SignedIn,
 };
 use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
 use chelabase_identity::rules::{PASSWORD_MAX_BYTES, normalize_email, strong_password};
 use crate::app_users::internal::OpenInvite;
-use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, may_issue_code};
+use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, reserve_code_issue};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -290,7 +290,7 @@ fn verify_step(s: &AppState, signed: SignedIn) -> Response {
     ),
 )]
 async fn instance(State(s): S, headers: HeaderMap) -> Response {
-    let ip = client_ip(&headers);
+    let ip = client_bucket(&headers);
     if !allowed(&s, &[(format!("instance:ip:{ip}"), 60, MINUTE)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
@@ -360,7 +360,7 @@ async fn sign_in(
 
 async fn sign_in_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap, b: SignInBody) -> Response {
     let email = normalize_email(&b.email);
-    let ip = client_ip(headers);
+    let ip = client_bucket(headers);
     if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
@@ -369,9 +369,13 @@ async fn sign_in_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap, b: Sig
     // concurrent requests can't all pass a check before any failure lands, and a client that
     // hangs up during the check still spends it. Only these outcomes give it back:
     //
-    // | Outcome                                                        | Answer  | Email slot |
+    // Two slots are reserved and refunded together ([`SignInSlots`]): the email from this
+    // client (5 a minute) and the email from anywhere (30 a minute), so failures from one
+    // client don't lock the owner out from another.
+    //
+    // | Outcome                                                        | Answer  | Both slots |
     // |----------------------------------------------------------------|---------|------------|
-    // | the email's 5 a minute are used                                | 429     | none held  |
+    // | this client's 5 or the email's 30 a minute are used            | 429     | none held  |
     // | wrong password, unknown email, banned, input identity refused  | 401     | counts     |
     // | right password, but no tenant to land in                       | 401     | counts     |
     // | identity or the orchestrator can't answer                      | 503     | refunded   |
@@ -379,15 +383,10 @@ async fn sign_in_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap, b: Sig
     // | the request is dropped undecided (the client hung up)          | none    | counts     |
     //
     // "No tenant" counts so that it can't be told from a wrong password by when the 429 comes.
-    let Some(slot) = Slot::reserve(
-        &s.limiter,
-        format!("sign-in:email:{}", email_tag(&email)),
-        5,
-        MINUTE,
-    ) else {
+    let Some(slot) = SignInSlots::reserve(&s.limiter, "", &email_tag(&email), &ip) else {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     };
-    // Counts: the slot is dropped without a refund.
+    // Counts: the slots are dropped without a refund.
     let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
     let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
         Ok(signed) => signed,
@@ -501,13 +500,14 @@ async fn conclude(s: &AppState, signed: SignedIn, wanted: Option<&str>) -> Concl
     ))
 }
 
-/// Mails a code, within [`may_issue_code`] (5 an hour per user and kind, whichever flow asks).
-/// The answer never says whether one went out.
+/// Mails a code, within [`reserve_code_issue`] (5 an hour per user and kind, whichever flow
+/// asks). The answer never says whether one went out. Identity keeps a live code sent under a
+/// minute ago (`CodeRecentlySent`): nothing is sent, so the hour's slot is given back.
 async fn send_code(s: &AppState, user_id: &str, kind: CodeKind) {
-    if !may_issue_code(&s.limiter, kind, user_id) {
+    let Some(slot) = reserve_code_issue(&s.limiter, kind, user_id) else {
         info!(kind = kind.as_str(), "a user's code limit is used up; nothing sent");
         return;
-    }
+    };
     // The page where the code is typed: never the code or an id in the link.
     let page = match kind {
         CodeKind::Reset => "password-reset",
@@ -516,8 +516,13 @@ async fn send_code(s: &AppState, user_id: &str, kind: CodeKind) {
     let link = format!("{}/{page}", s.config.studio_url);
     let mut request = CodeRequest::new(user_id, kind, Delivery::Email);
     request.link = Some(&link);
-    if let Err(e) = s.identity.create_code(&Pool::Members, &request).await {
-        warn!(error = %e, "sending a code failed");
+    match s.identity.create_code(&Pool::Members, &request).await {
+        Ok(_) => {}
+        Err(IdentityError::CodeRecentlySent) => {
+            slot.refund();
+            info!(kind = kind.as_str(), "a code went out under a minute ago; nothing sent");
+        }
+        Err(e) => warn!(error = %e, "sending a code failed"),
     }
 }
 
@@ -663,7 +668,7 @@ async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody
 
 async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) -> Response {
     let email = normalize_email(&b.email);
-    let ip = client_ip(headers);
+    let ip = client_bucket(headers);
     let setup_code = b.setup_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
     // Code guesses count against these too. No bucket is shared by every client: anyone could
     // drain it with junk and lock the operator out, and the code's ~98 bits need no global cap.
@@ -965,7 +970,7 @@ async fn describe_invite(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<De
 }
 
 async fn describe_invite_inner(s: &AppState, headers: &HeaderMap, q: DescribeInviteBody) -> Response {
-    let ip = client_ip(headers);
+    let ip = client_bucket(headers);
     if !allowed(s, &[(format!("describe-invite:ip:{ip}"), 60, HOUR)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
@@ -1112,7 +1117,7 @@ fn incomplete(s: &AppState, user: &str) -> Response {
 }
 
 async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteBody) -> Response {
-    let ip = client_ip(headers);
+    let ip = client_bucket(headers);
     // Only failed attempts count against an address, so an office behind one NAT can accept many
     // invites an hour while guessing codes from it still stops at 20 failures. The attempt is
     // counted up front (concurrent requests can't all pass a check before any failure lands) and
@@ -1182,13 +1187,8 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
             answer
         }
         Proof::Account { email } => {
-            // A password guess like a sign-in's, so it spends the same per-email budget.
-            let Some(email_slot) = Slot::reserve(
-                &s.limiter,
-                format!("sign-in:email:{}", email_tag(&email)),
-                5,
-                MINUTE,
-            ) else {
+            // A password guess like a sign-in's, so it spends the same per-email budgets.
+            let Some(email_slot) = SignInSlots::reserve(&s.limiter, "", &email_tag(&email), &ip) else {
                 return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
             };
             let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
@@ -1321,6 +1321,11 @@ async fn check_code(
         // A wrong, used, replaced or locked code, or an account an invite can't set (an
         // established one): counted.
         Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. }) => Checked::Refused(bad_invite()),
+        // The invitee's stored guess budget is spent: no guess is checked, and it counts like
+        // a wrong code.
+        Err(IdentityError::CodeBudgetSpent) => {
+            Checked::Refused(error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY))
+        }
         Err(IdentityError::NotFound(Missing::User)) => Checked::AddressCountsOnly(revoked()),
         Err(e @ IdentityError::Unavailable(_)) => Checked::NotCounted(identity_unavailable(&e)),
         // Any other refusal is identity answering about the code, not an outage: it counts.
@@ -1521,7 +1526,7 @@ fn step_ended(s: &AppState, mut answer: Response) -> Response {
 
 async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> Response {
     let state = current_login(s, headers).filter(|st| st.step == Step::Verify);
-    let mut checks = vec![(format!("verify:ip:{}", client_ip(headers)), 10, MINUTE)];
+    let mut checks = vec![(format!("verify:ip:{}", client_bucket(headers)), 10, MINUTE)];
     if let Some(st) = &state {
         checks.push((format!("verify:step:{}", step_key(st)), 10, HOUR));
     }
@@ -1547,6 +1552,10 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
         .await
     {
         Ok(user) => user,
+        // The stored guess budget is spent: no code is checked, a right one included.
+        Err(IdentityError::CodeBudgetSpent) => {
+            return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+        }
         // Refused, or spent by an earlier attempt whose later step failed: an email already
         // verified carries on (the step cookie is the password's proof), so a retry finishes.
         Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. } | IdentityError::NotFound(Missing::User)) => {
@@ -1655,7 +1664,7 @@ async fn resend_code(State(s): S, headers: HeaderMap, ApiJson(_): ApiJson<EmptyR
 
 async fn resend_code_inner(s: &AppState, headers: &HeaderMap) -> Response {
     let state = current_login(s, headers).filter(|st| st.step == Step::Verify);
-    let mut checks = vec![(format!("resend:ip:{}", client_ip(headers)), 20, HOUR)];
+    let mut checks = vec![(format!("resend:ip:{}", client_bucket(headers)), 20, HOUR)];
     if let Some(st) = &state {
         checks.push((format!("resend:step:{}", step_key(st)), 5, HOUR));
     }
@@ -1698,7 +1707,7 @@ async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Ema
 
 fn password_reset_inner(s: &Arc<AppState>, headers: &HeaderMap, b: EmailBody) -> Response {
     let email = normalize_email(&b.email);
-    let ip = client_ip(headers);
+    let ip = client_bucket(headers);
     if !allowed(
         s,
         &[
@@ -1768,8 +1777,7 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
     if !allowed(
         s,
         &[
-            (format!("confirm:ip:{}", client_ip(headers)), 10, MINUTE),
-            (format!("confirm:email:{}", email_tag(&email)), 10, HOUR),
+            (format!("confirm:ip:{}", client_bucket(headers)), 10, MINUTE),
         ],
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
@@ -1780,6 +1788,11 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
     if !usable_password(&b.password) {
         return weak();
     }
+    // The email's refused checks, known or not: auth answers 429 before identity's stored
+    // budget for the account can be spent. Only a right code gives the check back.
+    let Some(slot) = CodeCheckSlot::reserve(&s.limiter, "", "reset", &email_tag(&email)) else {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    };
     let code = b.code.trim();
     if !is_code(code) {
         return bad_code();
@@ -1795,8 +1808,14 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
         .verify_code(&Pool::Members, &user.id, CodeKind::Reset, code, Some(&b.password))
         .await
     {
-        Ok(_) => reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new()),
+        Ok(_) => {
+            slot.refund();
+            reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
+        }
         Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => weak(),
+        // The stored guess budget is spent: no code is checked, a right one included. The email's
+        // own check bound refuses first, so this answers only after an auth restart lost its count.
+        Err(IdentityError::CodeBudgetSpent) => error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY),
         Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. } | IdentityError::NotFound(Missing::User)) => {
             bad_code()
         }

@@ -101,8 +101,42 @@ struct StudioConfig {
     studio_host: String,
 }
 
-pub async fn run(url: &str, email: Option<String>) -> Result<()> {
+/// Refuses a URL the HTTP client can't parse or whose scheme isn't `http` or `https`, and plain
+/// http unless the host is loopback or `*.localhost`, or `insecure` is set.
+///
+/// Invariant: the host checked is the host the client contacts. The URL is read with the
+/// client's own parser (`reqwest::Url`, the WHATWG rules: a backslash ends the authority,
+/// surrounding whitespace and control characters are stripped or refused), never split by
+/// hand, so no input reads as one host here and another on the wire.
+pub fn check_scheme(url: &str, insecure: bool) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::anyhow!("{url:?} is not a URL ({e}); give it as https://host"))?;
+    match parsed.scheme() {
+        "https" => return Ok(()),
+        "http" => {}
+        other => bail!("{url:?} uses {other}:, not https or http"),
+    }
+    // The parser's host: a lowercased domain, a dotted IPv4 address or a bracketed IPv6 one.
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        bail!("{url:?} names no host");
+    };
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let local = match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => {
+            let name = bare.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    };
+    if local || insecure {
+        return Ok(());
+    }
+    bail!("refusing to send a password over plain http to {host}; use https, or pass --insecure")
+}
+
+pub async fn run(url: &str, email: Option<String>, insecure: bool) -> Result<()> {
     let url = normalize(url);
+    check_scheme(&url, insecure)?;
     let mut stdin = std::io::stdin().lock();
     let email = match email {
         Some(e) => e,
@@ -216,6 +250,66 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn plain_http_is_refused_off_loopback() {
+        for u in [
+            "http://api.example.com",
+            "http://api.example.com:8000",
+            "http://10.0.0.5:8000",
+            "http://localhost.example.com",
+            "http://localhost@evil.example.com",
+            "http://[2001:db8::1]:8000",
+            "HTTP://api.example.com",
+        ] {
+            assert!(check_scheme(u, false).is_err(), "{u}");
+            assert!(check_scheme(u, true).is_ok(), "{u} with --insecure");
+        }
+    }
+
+    /// O8: the host checked is the host the HTTP client contacts. A URL is read with the
+    /// client's own parser (`reqwest::Url`): one it can't parse, or with no scheme or another
+    /// scheme, is refused; a backslash, leading whitespace or a control character either makes
+    /// the URL unparseable or resolves to the host the client would use, and that host is the
+    /// one checked.
+    #[test]
+    fn the_checked_host_is_the_host_the_client_contacts() {
+        for u in [
+            "http://evil.example.com\\@localhost",
+            "http://evil.example.com\\localhost",
+            "http://localhost\\@evil.example.com",
+            " http://evil.example.com",
+            "\thttp://evil.example.com",
+            "http://evil.example.com\u{0}.localhost",
+            "http://evil.example.com%2f.localhost",
+            "http://evil.example.com#.localhost",
+            "http://evil.example.com?.localhost",
+        ] {
+            let client_host = reqwest::Url::parse(u).ok().and_then(|p| p.host_str().map(str::to_owned));
+            let local = client_host.as_deref().is_some_and(|h| h == "localhost" || h.ends_with(".localhost"));
+            assert!(check_scheme(u, false).is_err() || local, "{u:?} (client host {client_host:?})");
+        }
+        for u in ["api.example.com", "localhost:8000", "ftp://localhost", "file:///etc/x", "", "http://", "http://[::1"] {
+            assert!(check_scheme(u, false).is_err(), "{u:?}");
+            assert!(check_scheme(u, true).is_err(), "{u:?} with --insecure");
+        }
+        // Whitespace the client strips resolves to the same loopback host.
+        assert!(check_scheme(" http://localhost:8000", false).is_ok());
+    }
+
+    #[test]
+    fn loopback_and_https_are_accepted() {
+        for u in [
+            "http://localhost:8000",
+            "http://api.chelabase.localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://127.1.2.3",
+            "http://[::1]:8000",
+            "https://api.example.com",
+        ] {
+            assert!(check_scheme(u, false).is_ok(), "{u}");
+        }
+    }
 
     #[test]
     fn credentials_are_owner_only_and_keyed_by_instance() {

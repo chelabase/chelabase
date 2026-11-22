@@ -135,11 +135,13 @@ impl Scratch {
         (id, main, f)
     }
 
-    /// `n` schedules on the function, each due a minute ago.
+    /// `n` schedules on the function, each due a minute ago. They run once a year, so a
+    /// claimed one isn't due again while a test drains (with a tick every minute, a run that
+    /// crossed the minute claimed rows a second time, for the new tick).
     async fn due(&self, branch: BranchId, function: Uuid, n: i32) -> Vec<Uuid> {
         sqlx::query_scalar(
             "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
-             SELECT gen_random_uuid(), $1, $2, '* * * * *', 'UTC', now() - interval '1 minute'
+             SELECT gen_random_uuid(), $1, $2, '0 0 1 1 *', 'UTC', now() - interval '1 minute'
              FROM generate_series(1, $3) RETURNING id",
         )
         .bind(branch.as_uuid())
@@ -156,9 +158,21 @@ async fn drain(client: MetadataClient) -> Vec<Uuid> {
     let mut got = Vec::new();
     loop {
         let limit = rand::rng().random_range(1..=60);
-        let claimed = client.claim_due_schedules(limit).await.unwrap();
+        let claimed = client.claim_due_schedules(limit, &[]).await.unwrap();
         if claimed.is_empty() {
-            return got;
+            // The other claimer may hold the top of a database's share (skipped, not lost):
+            // finished only when nothing is due.
+            let due: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM function_schedules WHERE next_run_at <= now()",
+            )
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+            if due == 0 {
+                return got;
+            }
+            tokio::task::yield_now().await;
+            continue;
         }
         for c in claimed {
             assert!(c.run.is_some(), "an enabled function's due schedule runs");
@@ -203,9 +217,10 @@ async fn fn_schedules_two_claimers_never_return_the_same_row() {
         );
         let union: HashSet<_> = sa.union(&sb).copied().collect();
         assert_eq!(union, all, "round {round}: every due row is claimed");
+        // The test is about two claimers against each other: both must have claimed rows.
         assert!(
             !a.is_empty() && !b.is_empty(),
-            "round {round}: both claimers took part ({} / {})",
+            "round {round}: both claimers took part ({} and {})",
             a.len(),
             b.len()
         );
@@ -251,7 +266,7 @@ async fn fn_schedules_claim_skips_dead_rows_and_runs_only_enabled_functions() {
     .await
     .unwrap();
 
-    let mut claimed = s.client.claim_due_schedules(50).await.unwrap();
+    let mut claimed = s.client.claim_due_schedules(50, &[]).await.unwrap();
     claimed.sort_by_key(|c| c.function_name.clone());
     let got: Vec<_> = claimed
         .iter()
@@ -271,6 +286,63 @@ async fn fn_schedules_claim_skips_dead_rows_and_runs_only_enabled_functions() {
             c.function_name
         );
     }
-    assert!(s.client.claim_due_schedules(50).await.unwrap().is_empty());
+    assert!(s.client.claim_due_schedules(50, &[]).await.unwrap().is_empty());
+    s.finish().await;
+}
+
+/// One database's due schedules never take more than its share of a claim: with 100 due in one
+/// database and 1 in another, the first claim holds the other database's schedule and at most
+/// `MAX_IN_FLIGHT_PER_DATABASE` of the big one. A database with runs already in flight gets
+/// only what is left of its share, and one at the limit gets none: its schedules aren't locked
+/// or advanced (`next_run_at` unchanged) and are claimed, coalesced, once its runs end.
+#[tokio::test]
+#[ignore]
+async fn fn_schedules_claim_shares_slots_across_databases() {
+    use chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE as SHARE;
+    let share = SHARE as usize;
+    let s = Scratch::new().await;
+    let (big, big_branch, big_f) = s.function("big", true).await;
+    let (small, small_branch, small_f) = s.function("small", true).await;
+    let big_rows = s.due(big_branch, big_f, 100).await;
+    let small_row = s.due(small_branch, small_f, 1).await[0];
+    let next_of = |ids: Vec<Uuid>| {
+        let pool = s.pool().clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, chrono::DateTime<Utc>)>(
+                "SELECT id, next_run_at FROM function_schedules WHERE id = ANY($1) ORDER BY id",
+            )
+            .bind(ids)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = next_of(big_rows.clone()).await;
+
+    // The first claim: a limit larger than every due row still gives each database its share.
+    let first = s.client.claim_due_schedules(64, &[]).await.unwrap();
+    let of = |db: DatabaseId| first.iter().filter(|c| c.database_id == db).count();
+    assert_eq!((of(big), of(small)), (share, 1), "the share, and the other database's one");
+    assert!(first.iter().any(|c| c.id == small_row));
+
+    // The big database has 5 runs in flight: 3 more of its schedules, never beyond the limit.
+    let second = s.client.claim_due_schedules(64, &[(big, share - 3)]).await.unwrap();
+    assert_eq!(second.iter().filter(|c| c.database_id == big).count(), 3);
+
+    // At the limit: nothing of it is locked or advanced, whatever the claim limit.
+    let claimed: HashSet<Uuid> = first.iter().chain(&second).map(|c| c.id).collect();
+    let unclaimed: Vec<Uuid> = big_rows.iter().copied().filter(|id| !claimed.contains(id)).collect();
+    let snapshot = next_of(unclaimed.clone()).await;
+    let none = s.client.claim_due_schedules(64, &[(big, share)]).await.unwrap();
+    assert!(none.is_empty(), "a database at its limit claims nothing");
+    assert_eq!(next_of(unclaimed.clone()).await, snapshot, "skipped rows are untouched");
+    let over = s.client.claim_due_schedules(64, &[(big, share + 5)]).await.unwrap();
+    assert!(over.is_empty(), "over the limit is at the limit");
+
+    // Runs ended: the rest are claimed, share by share, each with its run.
+    let later = s.client.claim_due_schedules(64, &[]).await.unwrap();
+    assert_eq!(later.len(), share);
+    assert!(later.iter().all(|c| c.run.is_some() && unclaimed.contains(&c.id)));
+    assert!(before.iter().all(|(_, t)| *t < Utc::now()), "they were due");
     s.finish().await;
 }

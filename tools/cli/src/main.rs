@@ -45,6 +45,9 @@ enum Commands {
         /// read from stdin
         #[arg(long)]
         email: Option<String>,
+        /// Allow a plain-http URL on a non-local host (the password is sent unencrypted)
+        #[arg(long)]
+        insecure: bool,
     },
     /// Deploy and manage edge functions on a branch
     Functions {
@@ -386,7 +389,11 @@ async fn main() -> anyhow::Result<()> {
                 neon::password_updated(&endpoint, &role).await
             }
         },
-        Commands::Login { url, email } => login::run(&url, email).await,
+        Commands::Login {
+            url,
+            email,
+            insecure,
+        } => login::run(&url, email, insecure).await,
         Commands::Functions { target, command } => functions::run(target, command).await,
         Commands::Services { target, command } => services::run(target, command).await,
         Commands::Workbench { command } => {
