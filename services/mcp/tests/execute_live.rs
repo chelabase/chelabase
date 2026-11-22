@@ -142,6 +142,20 @@ struct Place {
     project: String,
 }
 
+/// The branch is still in its database's branch list (the branch path itself has no GET).
+async fn assert_branch_survived(place: &Place) {
+    let (list, id) = place
+        .branch
+        .rsplit_once('/')
+        .expect("branch path is /v1/databases/<id>/branches/<branch_id>");
+    let (status, body) = api(Method::GET, list, None).await;
+    assert_eq!(status, 200, "listing the branches: {body}");
+    let listed = body
+        .as_array()
+        .is_some_and(|branches| branches.iter().any(|b| b["id"] == id));
+    assert!(listed, "the branch {id} is still there: {body}");
+}
+
 /// Runs `checks` on a branch: `CHELABASE_MCP_LIVE_BRANCH`, else the main branch of a new
 /// database in a new project, both deleted afterwards, pass or fail.
 async fn with_branch<F, Fut>(checks: F)
@@ -392,8 +406,7 @@ async fn a_viewer_cannot_write_through_execute() {
             let v = value(&execute(&viewer, &code, true, false).await);
             assert_eq!(v["status"], 403, "the API's answer, passed through: {v}");
             assert_eq!(v["code"], "forbidden", "{v}");
-            let (status, _) = api(Method::GET, &place.branch, None).await;
-            assert_eq!(status, 200, "the branch is still there");
+            assert_branch_survived(&place).await;
         })
     })
     .await;
@@ -544,8 +557,7 @@ async fn read_only_connection_cannot_write_through_sql() {
         let error = tool_error(&execute_admin(&code, true, true).await);
         assert_eq!(error["code"], "read_only_connection", "{error}");
         assert_unchanged(&place, &t, &s).await;
-        let (status, _) = api(Method::GET, &place.branch, None).await;
-        assert_eq!(status, 200, "the branch is still there");
+        assert_branch_survived(&place).await;
     })
     .await;
 }
