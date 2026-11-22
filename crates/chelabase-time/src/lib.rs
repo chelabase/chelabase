@@ -33,6 +33,45 @@
 //!   converted to UTC. `Date` is written and read as `2026-10-01`; its `Display` is the same;
 //! - `Date` `Copy`, `Eq`, `Ord`, `Hash`.
 //!
+//! # The jiff backing
+//!
+//! [`jiff_backed`] holds the types that will replace the chrono aliases: newtypes over
+//! `jiff::Timestamp` and `jiff::civil::Date` with the same trait methods, inherent methods,
+//! operators, `Display`, `FromStr`, serde and (feature `sqlx`) Postgres codecs. Their parsers
+//! are ports of chrono 0.4.45's, so they accept and reject the same strings with the same error
+//! messages. `tests/parity.rs` compares them with chrono on random inputs, and
+//! `CHELABASE_TIME_BACKING=jiff cargo nextest run -p chelabase-time` runs every test of this
+//! crate, the goldens included, with the jiff types behind the public names.
+//!
+//! Subtracting two jiff-backed timestamps (`a - b`) gives a [`SignedDuration`], as
+//! [`TimestampExt::since`] does: signed, nanosecond-exact (chrono's was a `TimeDelta`).
+//!
+//! ## Differences
+//!
+//! Where the jiff backing can't do what chrono did, it does this instead:
+//!
+//! - **Range.** jiff's instants run from `-9999-01-02T01:59:59Z` to
+//!   `9999-12-30T22:00:00.999999999Z` (chrono's to about ±262,000 years); its dates from
+//!   `-9999-01-01` to `9999-12-31`. Outside it, constructors return `None`, parsers and serde
+//!   fail with chrono's "input is out of range", and a Postgres decode returns an error. So
+//!   `9999-12-31T23:59:59.999999999Z` (and any instant on 9999-12-31 after 22:00) is an error,
+//!   while `0001-01-01T00:00:00Z` is in range. Nothing is clamped.
+//! - **Leap seconds.** chrono read `23:59:60` (both parsers) as a leap second. The jiff backing
+//!   reads it as the same instant chrono's `unix_nanos` and Postgres encode gave it, the next
+//!   minute's second 0 (`23:59:60.5Z` is `00:00:00.5Z`), so it writes that back instead of `:60`
+//!   and compares equal to it.
+//! - **Postgres `infinity`.** A binary `infinity` made chrono's decode panic on overflow; the jiff
+//!   backing returns an error, in both protocols, for `timestamptz` and `date`.
+//! - **Postgres text with an offset in seconds.** Postgres prints local mean time with seconds
+//!   (`1900-01-01 05:41:16+05:41:16` in `Asia/Kathmandu`), which chrono's text decode refused;
+//!   the jiff backing reads it.
+//! - **Postgres type names.** sqlx keeps its `timestamptz`/`date` constants private, so the type
+//!   infos are built from the OIDs (1184, 1185, 1082, 1182). They bind the same parameter types
+//!   and compare equal to sqlx's, but `TypeInfo::name()` is `?`, which shows in sqlx's
+//!   type-mismatch error messages.
+//! - **`Debug`** is the `to_rfc3339_auto` form (chrono's today too), but isn't a contract.
+//!   `Hash` values differ from chrono's.
+//!
 //! # Old call → new call
 //!
 //! Every chrono and humantime use in `crates/`, `services/` and `tools/` at the time this crate
@@ -78,6 +117,7 @@
 //! | `chrono-tz` `Tz`, `croner` with chrono | not here: schedules move with croner (epic drop-chrono, cron milestones) |
 
 mod duration;
+pub mod jiff_backed;
 
 use std::fmt;
 use std::time::Duration;
@@ -89,10 +129,17 @@ pub use duration::{DurationError, parse_duration};
 pub use jiff::SignedDuration;
 
 /// An instant in UTC, nanosecond precision.
+#[cfg(not(chelabase_time_jiff))]
 pub type Timestamp = chrono::DateTime<chrono::Utc>;
 
 /// A calendar date without a time zone.
+#[cfg(not(chelabase_time_jiff))]
 pub type Date = chrono::NaiveDate;
+
+// The goldens' second run: `CHELABASE_TIME_BACKING=jiff` (see `build.rs`) puts the jiff
+// backing behind the public names, so the same test files run against it unchanged.
+#[cfg(chelabase_time_jiff)]
+pub use jiff_backed::{Date, Timestamp};
 
 /// The traits and types most code needs.
 pub mod prelude {
@@ -101,13 +148,13 @@ pub mod prelude {
 
 mod sealed {
     pub trait Sealed {}
-    impl Sealed for super::Timestamp {}
-    impl Sealed for super::Date {}
+    impl Sealed for chrono::DateTime<chrono::Utc> {}
+    impl Sealed for chrono::NaiveDate {}
 }
 
 /// Why a timestamp or date string didn't parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError(String);
+pub struct ParseError(pub(crate) String);
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,6 +204,9 @@ pub const fn seconds(n: u64) -> Duration {
 /// Building, formatting and computing with a [`Timestamp`]. None of these names exists as an
 /// inherent chrono method, so a call always reaches this trait.
 pub trait TimestampExt: sealed::Sealed + Sized {
+    /// The date type that goes with this timestamp type ([`Date`] for [`Timestamp`]).
+    type Date: DateExt;
+
     /// The current time.
     ///
     /// ```
@@ -322,10 +372,12 @@ pub trait TimestampExt: sealed::Sealed + Sized {
     /// let t = Timestamp::from_ymd_hms(2026, 9, 30, 23, 59, 59).unwrap();
     /// assert_eq!(t.utc_date(), Date::ymd(2026, 9, 30).unwrap());
     /// ```
-    fn utc_date(&self) -> Date;
+    fn utc_date(&self) -> Self::Date;
 }
 
-impl TimestampExt for Timestamp {
+impl TimestampExt for chrono::DateTime<chrono::Utc> {
+    type Date = chrono::NaiveDate;
+
     fn now() -> Self {
         chrono::Utc::now()
     }
@@ -404,7 +456,7 @@ impl TimestampExt for Timestamp {
         self.checked_sub_signed(chrono::TimeDelta::from_std(d).ok()?)
     }
 
-    fn utc_date(&self) -> Date {
+    fn utc_date(&self) -> chrono::NaiveDate {
         self.date_naive()
     }
 }
@@ -430,7 +482,7 @@ pub trait DateExt: sealed::Sealed + Sized {
     fn parse_iso(s: &str) -> Result<Self, ParseError>;
 }
 
-impl DateExt for Date {
+impl DateExt for chrono::NaiveDate {
     fn ymd(year: i32, month: u32, day: u32) -> Option<Self> {
         chrono::NaiveDate::from_ymd_opt(year, month, day)
     }
