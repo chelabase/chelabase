@@ -16,8 +16,9 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
 use crate::auth::Caller;
+use crate::limits::Admission;
 use crate::sandbox::Sandbox;
-use crate::tools;
+use crate::tools::{self, Toolbox};
 
 /// The revisions served: the current one and the one before it.
 pub const SUPPORTED_REVISIONS: [&str; 2] = ["2026-07-28", "2025-11-25"];
@@ -27,13 +28,24 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Clone)]
 pub struct Server {
-    sandbox: Arc<dyn Sandbox>,
-    log_code: bool,
+    toolbox: Arc<Toolbox>,
 }
 
 impl Server {
-    pub fn new(sandbox: Arc<dyn Sandbox>, log_code: bool) -> Self {
-        Self { sandbox, log_code }
+    pub fn new(
+        sandbox: Arc<dyn Sandbox>,
+        admission: Admission,
+        result_max_bytes: usize,
+        log_code: bool,
+    ) -> Self {
+        Self {
+            toolbox: Arc::new(Toolbox {
+                sandbox,
+                admission,
+                result_max_bytes,
+                log_code,
+            }),
+        }
     }
 }
 
@@ -116,13 +128,15 @@ impl ServerHandler for Server {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let caller = caller(&context)?;
+        // The SDK cancels `ct` when the client goes away before the answer (and leaves the
+        // handler running): the call stops there, ending its run.
         tools::call(
-            self.sandbox.as_ref(),
+            &self.toolbox,
             &caller,
             &request_id(&context),
-            self.log_code,
             &request.name,
             request.arguments,
+            context.ct.cancelled(),
         )
         .await
         .map(Into::into)

@@ -10,7 +10,8 @@ use chelabase_auth::member_token::{
     MEMBER_AUDIENCE, MemberClaims, MemberTokenSigner, MemberTokenVerifier,
 };
 use mcp::app::{Settings, router};
-use mcp::sandbox::{ErrorCode, Kind, Outcome, Run, Sandbox};
+use mcp::limits::Limits;
+use mcp::sandbox::{ErrorCode, Kind, Outcome, Ran, Run, Sandbox};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -71,9 +72,9 @@ struct Double {
 
 #[async_trait]
 impl Sandbox for Double {
-    async fn run(&self, run: Run) -> Outcome {
+    async fn run(&self, run: Run) -> Ran {
         self.runs.lock().unwrap().push(run);
-        self.answer.clone()
+        self.answer.clone().into()
     }
 }
 
@@ -114,6 +115,7 @@ impl Harness {
             api_base: API_BASE.into(),
             allowed_origins,
             log_code: false,
+            limits: Limits::default(),
         };
         let app = router(settings, verifier, sandbox.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
