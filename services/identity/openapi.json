@@ -103,7 +103,7 @@
       ],
       "post": {
         "operationId": "createUser",
-        "summary": "Create a user, with or without a password",
+        "summary": "Create a user, with or without a password (a password outside the length range is 400 `weak_password`)",
         "x-callers": [
           "auth",
           "orchestrator"
@@ -488,7 +488,7 @@
       ],
       "put": {
         "operationId": "setPassword",
-        "summary": "Set a user's password (creates the credential if missing)",
+        "summary": "Set a user's password (creates the credential if missing) and revoke all of the user's sessions",
         "x-callers": [
           "auth"
         ],

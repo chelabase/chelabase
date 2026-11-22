@@ -314,11 +314,12 @@ const ROUTES: readonly Route[] = [
       const name = optStr(body, "name", MAX_NAME) ?? "";
       const verified = optBool(body, "email_verified") === true;
       // `auth.api.createUser` is the one admin endpoint that allows a sessionless server call.
-      const out = await registry.use(pool, (auth) =>
-        auth.api.createUser({
+      const out = await registry.use(pool, async (auth) => {
+        if (password !== undefined) checkPasswordLength(await context(auth), password);
+        return auth.api.createUser({
           body: { email, name, ...(password === undefined ? {} : { password }), data: { emailVerified: verified } },
-        }),
-      );
+        });
+      });
       return { status: 201, body: { user: userOut(out.user as BaUser) } };
     },
   },
@@ -420,6 +421,8 @@ const ROUTES: readonly Route[] = [
         const hashed = await ctx.password.hash(password);
         if (await ctx.internalAdapter.findCredentialAccount(id)) await ctx.internalAdapter.updatePassword(id, hashed);
         else await ctx.internalAdapter.createAccount({ userId: id, providerId: "credential", accountId: user.id, password: hashed });
+        // A new password ends every session of the user, whoever called this route.
+        await ctx.internalAdapter.deleteUserSessions(id);
         return { status: 200, body: { status: true } };
       });
     },

@@ -48,6 +48,37 @@ describeDb("users", () => {
     expect((await signIn("ban@x.io", "password-ban-1")).status).toBe(201);
   });
 
+  it("users.set_password ends the user's sessions", async () => {
+    const user = await createUser("pwsess@x.io", "password-pwsess-1");
+    const other = await createUser("pwsess-other@x.io", "password-other-1");
+    const s1 = await signIn("pwsess@x.io", "password-pwsess-1");
+    const s2 = await signIn("pwsess@x.io", "password-pwsess-1");
+    const o1 = await signIn("pwsess-other@x.io", "password-other-1");
+    expect((await lookup(s1.body.session_token)).status).toBe(200);
+
+    const r = await call(h, "PUT", `${base()}/users/${user.id}/password`, { body: { password: "password-pwsess-2" } });
+    expect(r.status).toBe(200);
+    expect((await lookup(s1.body.session_token)).status).toBe(404);
+    expect((await lookup(s2.body.session_token)).status).toBe(404);
+    // Another user's session is untouched.
+    expect((await lookup(o1.body.session_token)).status).toBe(200);
+    expect(other.id).not.toBe(user.id);
+  });
+
+  it("users.create refuses a short password", async () => {
+    const r = await call(h, "POST", `${base()}/users`, { body: { email: "shortpw@x.io", name: "U", password: "short" } });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toBe("weak_password");
+    const found = await call(h, "GET", `${base()}/users?email=shortpw%40x.io`);
+    expect(found.status).toBe(200);
+    expect(found.body.users).toEqual([]);
+  });
+
+  it("users.create without a password still works", async () => {
+    const user = await createUser("nopw@x.io");
+    expect(user.email).toBe("nopw@x.io");
+  });
+
   it("admin_routes_round_trip", async () => {
     const user = await createUser("Round@X.io");
     expect(user.email).toBe("round@x.io");
