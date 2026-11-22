@@ -151,10 +151,9 @@ jobs:
         with:
           auto-install: true
 
-      # The version of cargo-deny matches `just deny-install`.
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
-          tool: nextest,cargo-deny@0.20.2
+          tool: nextest
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
@@ -180,6 +179,32 @@ jobs:
             # shellcheck disable=SC2086 # one argument per package
             just check-rust $RUST
           fi
+
+  # RustSec advisories against Cargo.lock, apart from check-rust so a newly published advisory
+  # (often one with no fixed version) never stops the Rust checks from running. Reported as its
+  # own check, not part of the `ci` job's result.
+  deny:
+    name: deny
+    needs: changes
+    if: needs.changes.outputs.rust != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # proto reads .prototools for just.
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+
+      # The version of cargo-deny matches `just deny-install`.
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-deny@0.20.2
+
+      - run: just deny
 
   web:
     name: check-web
