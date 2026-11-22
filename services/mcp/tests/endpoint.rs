@@ -619,9 +619,73 @@ async fn the_read_only_header_marks_the_context() {
         let run = h.runs().pop().unwrap();
         assert_eq!(run.caller.read_only(), read_only, "{value:?}");
     }
+    // Any one exact `true` among repeated headers narrows the context.
+    for (values, read_only) in [
+        (["false", "true"], true),
+        (["true", "false"], true),
+        (["false", "1"], false),
+    ] {
+        let mut req = h.request(Some(&h.token()), NEW, &call);
+        for v in values {
+            req = req.header("chelabase-mcp-read-only", v);
+        }
+        assert_eq!(req.send().await.unwrap().status(), StatusCode::OK);
+        let run = h.runs().pop().unwrap();
+        assert_eq!(run.caller.read_only(), read_only, "{values:?}");
+    }
     let audit = audit_lines();
     assert!(audit[0].contains("read_only=true"), "{audit:?}");
     assert!(audit[1].contains("read_only=false"), "{audit:?}");
+}
+
+#[tokio::test]
+async fn unknown_paths_are_404_not_401() {
+    let h = Harness::start().await;
+    for path in ["/foo", "/mcp/extra", "/"] {
+        let resp = h.http.get(format!("{}{path}", h.url)).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        assert!(resp.headers().get("www-authenticate").is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn body_over_limit_is_413() {
+    let h = Harness::start().await;
+    let big = "x".repeat(mcp::app::MAX_BODY + 1024);
+    let body = Harness::body(
+        NEW,
+        1,
+        "tools/call",
+        json!({"name": "search", "arguments": {"code": big}}),
+    );
+    let resp = h
+        .request(Some(&h.token()), NEW, &body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(h.runs().is_empty());
+}
+
+#[tokio::test]
+async fn an_invalid_params_call_writes_one_bare_audit_line() {
+    let h = Harness::start().await;
+    let (_, result) = h
+        .call(
+            "execute",
+            json!({"code": "async () => 'raw-code-marker'", "destructve": "raw-arg-marker"}),
+        )
+        .await;
+    assert_eq!(result["error"]["code"], -32602, "{result}");
+    let audit = audit_lines();
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    let line = &audit[0];
+    assert!(line.contains("outcome=\"invalid_params\""), "{line}");
+    assert!(!line.contains("raw-code-marker"), "{line}");
+    assert!(!line.contains("raw-arg-marker"), "{line}");
+    assert!(!line.contains("32602"), "{line}");
+    assert!(!log_text().contains("raw-arg-marker"));
+    assert!(h.runs().is_empty());
 }
 
 #[tokio::test]

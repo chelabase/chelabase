@@ -105,7 +105,8 @@ pub fn router(
 
     let mcp = Router::new()
         .route_service(ENDPOINT_PATH, service)
-        .layer(middleware::from_fn_with_state(gate, gate_request));
+        // `route_layer`: the gate runs for `/mcp` only, so an unknown path is a 404.
+        .route_layer(middleware::from_fn_with_state(gate, gate_request));
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route(METADATA_PATH, get(metadata.clone()))

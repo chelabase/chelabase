@@ -126,10 +126,12 @@ impl Authenticator {
         if claims.exp < now.saturating_add(MIN_REMAINING_SECS) {
             return Err(Refusal::ExpiresSoon);
         }
-        // Only the exact value narrows; nothing here can widen a grant.
+        // Only the exact value narrows, and any one of repeated headers is enough; nothing here
+        // can widen a grant.
         let read_only = headers
-            .get(READ_ONLY_HEADER)
-            .is_some_and(|v| v.as_bytes() == b"true");
+            .get_all(READ_ONLY_HEADER)
+            .iter()
+            .any(|v| v.as_bytes() == b"true");
         Ok(Caller {
             member: claims.sub,
             tenant: claims.tid,
