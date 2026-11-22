@@ -303,6 +303,7 @@ dependencies = [
  "chelabase-query",
  "chelabase-routes",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",
@@ -1121,6 +1122,7 @@ dependencies = [
  "chelabase-metadata",
  "chelabase-neon",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-typegen",
  "chelabase-types",
  "chrono",
@@ -1178,6 +1180,7 @@ dependencies = [
  "chelabase-schema",
  "chelabase-secrets",
  "chelabase-storage",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",
@@ -1216,6 +1219,7 @@ dependencies = [
  "axum",
  "chelabase-http",
  "chelabase-identity",
+ "chelabase-time",
  "chrono",
  "reqwest",
  "serde",
@@ -1261,10 +1265,12 @@ name = "chelabase-metadata"
 version = "0.1.0"
 dependencies = [
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "chrono-tz",
  "croner",
+ "jiff",
  "proptest",
  "serde",
  "serde_json",
@@ -1281,6 +1287,7 @@ name = "chelabase-nats"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "futures-util",
@@ -1306,6 +1313,7 @@ dependencies = [
  "bollard",
  "chelabase-http",
  "chelabase-metadata",
+ "chelabase-time",
  "chrono",
  "ed25519-dalek",
  "futures-util",
@@ -1438,6 +1446,7 @@ dependencies = [
  "chelabase-http",
  "chelabase-metadata",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",
@@ -1468,6 +1477,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "bytes",
+ "chelabase-time",
  "futures-util",
  "humantime",
  "tempfile",
@@ -1490,6 +1500,7 @@ dependencies = [
  "chelabase-query",
  "chelabase-routes",
  "chelabase-storage",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",
@@ -1510,6 +1521,22 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+]
+
+[[package]]
+name = "chelabase-time"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "humantime",
+ "jiff",
+ "jiff-sqlx",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "utoipa",
 ]
 
 [[package]]
@@ -2169,7 +2196,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2460,6 +2487,7 @@ dependencies = [
  "chelabase-auth",
  "chelabase-http",
  "chelabase-routes",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",
@@ -3043,6 +3071,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5e77cbfb9fff4798e283c2d69dff39fc2c45e7da017e5ce95b654e46ea41236"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "jiff-tzdb",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-sqlx"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4996ad290ff7f7081becdda47e28556fbebb81618c599eac5d09182b5a60e38"
+dependencies = [
+ "jiff",
+ "sqlx",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9067a0b23e5be3147d56b2dcf652b18e6b1364caca93fb157653b6fbcab23a9"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e71a1b68a875a44a33bb7a1dd84392cb77145a3367a552a3cfe6a4f5cf3afc"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3492,7 +3572,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3660,6 +3740,7 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "deadpool-postgres",
@@ -4102,6 +4183,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.12"
 source = "git+https://github.com/chelabase/rust-postgres?rev=38859553846efbf142c4006048fb034839897ac8#38859553846efbf142c4006048fb034839897ac8"
@@ -4314,7 +4404,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4650,6 +4740,7 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-typegen",
  "chelabase-types",
  "chrono",
@@ -4771,7 +4862,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4829,7 +4920,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5586,7 +5677,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6508,7 +6599,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6780,6 +6871,7 @@ dependencies = [
  "chelabase-secrets",
  "chelabase-storage",
  "chelabase-storage-service",
+ "chelabase-time",
  "chelabase-types",
  "chrono",
  "dotenvy",

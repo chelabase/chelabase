@@ -9,8 +9,11 @@ description = "Metadata database access stubs for Chelabase"
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }
 chrono = { workspace = true }
+chelabase-time = { workspace = true }
 croner = { workspace = true }
 chrono-tz = { workspace = true }
+# Function schedules move to jiff and its bundled time zones (epic drop-chrono).
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }

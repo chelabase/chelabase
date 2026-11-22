@@ -61,6 +61,7 @@ chelabase-neon = { workspace = true }
 rustls = { workspace = true }
 chelabase-secrets = { workspace = true }
 chrono = { workspace = true }
+chelabase-time = { workspace = true }
 # The live tests' own admin sessions (the service itself runs on tokio-postgres).
 sqlx = { workspace = true }
 worker = { path = "../worker" }
