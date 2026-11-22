@@ -102,9 +102,26 @@ pub struct RunSqlRequest {
     /// 100 to 900000; 60000 when absent.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// `true` runs statements the guard would hold back.
+    /// `true` runs statements the guard would hold back. Refused with `read_only`.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// `true` runs every statement inside one transaction Postgres holds read-only: any write
+    /// is refused by Postgres, including one a function called from a `SELECT` makes. Only
+    /// `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top
+    /// level; any other statement refuses the whole script before anything runs. The
+    /// timeout is at most 300000. Absent means `false`.
+    #[serde(default)]
+    pub read_only: Option<bool>,
+}
+
+/// The longest a read-only run may take.
+const MAX_READ_ONLY_TIMEOUT_MS: u64 = 300_000;
+
+/// The 422 for a read-only request that can't run (`confirm`, or a timeout past 300 s), or
+/// `None`.
+fn read_only_refusal(request: &RunSqlRequest) -> Option<ApiError> {
+    let _ = (request, MAX_READ_ONLY_TIMEOUT_MS);
+    None
 }
 
 /// `GET …/sql/schema`'s query.
@@ -1112,6 +1129,33 @@ mod tests {
         assert!(RESERVED_ROLES.contains(&"chelabase_storage"), "{RESERVED_ROLES:?}");
         for role in ["chelabase_storage", "chelabase_storage_x", "Chelabase_Storage"] {
             assert!(invalid_role(Some(role)).is_some(), "{role}");
+        }
+    }
+
+    fn request(body: serde_json::Value) -> RunSqlRequest {
+        let mut base = serde_json::json!({"run_id": Uuid::new_v4(), "sql": "SELECT 1"});
+        base.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn read_only_with_confirm_is_422() {
+        let refusal = read_only_refusal(&request(serde_json::json!({"read_only": true, "confirm": true})))
+            .expect("confirm with read_only is refused");
+        assert_eq!(refusal.status, 422);
+        assert_eq!(refusal.code, ErrorCode::InvalidRequest);
+        // A timeout past 300 s is refused; 300 s itself and the default run.
+        let long = request(serde_json::json!({"read_only": true, "timeout_ms": 300_001}));
+        assert_eq!(read_only_refusal(&long).map(|e| e.status), Some(422));
+        for ok in [
+            serde_json::json!({"read_only": true}),
+            serde_json::json!({"read_only": true, "timeout_ms": 300_000}),
+            serde_json::json!({"read_only": true, "confirm": false}),
+            // Not read-only: unchanged (900 s and confirm are fine).
+            serde_json::json!({"timeout_ms": 900_000, "confirm": true}),
+            serde_json::json!({"read_only": false, "confirm": true}),
+        ] {
+            assert!(read_only_refusal(&request(ok.clone())).is_none(), "{ok}");
         }
     }
 

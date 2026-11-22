@@ -147,6 +147,43 @@ struct Script {
     sql: String,
     role: Option<String>,
     timeout: Duration,
+    /// A read-only run's statements ([`super::read_only::check`]), run one by one inside a
+    /// read-only transaction; `None` sends `sql` as one simple query.
+    statements: Option<Vec<String>>,
+}
+
+/// The statement that takes a read-only transaction's snapshot: after it Postgres refuses
+/// any switch to read-write (`SET TRANSACTION READ WRITE`, `set_config`).
+const SNAPSHOT_SQL: &str = "SELECT 1";
+
+/// One step of a read-only run, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Step<'a> {
+    /// A setup statement (timeout, role, the transaction, its snapshot); a failure is
+    /// reported as statement 0.
+    Setup(String),
+    /// Prepares `sql` on the server (extended protocol), which refuses more than one command.
+    Prepare { statement: usize, sql: &'a str },
+    /// Runs the very text just prepared, as a simple query (text results).
+    Run { statement: usize, sql: &'a str },
+    /// Ends the transaction, whatever happened before (the connection closes after it).
+    Rollback,
+}
+
+/// The statements every run sends first: the statement timeout, then `SET ROLE`.
+fn setup_sql(timeout: Duration, role: Option<&str>) -> Vec<String> {
+    let mut setup = vec![format!("SET statement_timeout = {}", timeout.as_millis())];
+    if let Some(role) = role {
+        setup.push(format!("SET ROLE {}", quote_ident(role)));
+    }
+    setup
+}
+
+/// A read-only run's steps: the setup, `BEGIN TRANSACTION READ ONLY`, the snapshot, each
+/// statement prepared then run, and `ROLLBACK`.
+fn read_only_steps<'a>(timeout: Duration, role: Option<&str>, statements: &'a [String]) -> Vec<Step<'a>> {
+    let _ = statements;
+    setup_sql(timeout, role).into_iter().map(Step::Setup).collect()
 }
 
 /// Work for after a run ([`RunSpec::after`]).
@@ -408,7 +445,25 @@ pub fn run_reporting(
     finished: Finished,
 ) -> impl Stream<Item = RunEvent> + Send + 'static {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
-    tokio::spawn(drive(connected, spec, guard, tx, finished));
+    tokio::spawn(drive(connected, spec, None, guard, tx, finished));
+    stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
+}
+
+/// [`run_reporting`] for a read-only run: `statements` (the slices
+/// [`super::read_only::check`] returned for `spec.sql`) run one by one inside one
+/// transaction begun `READ ONLY`, each prepared on the server before it runs, and the
+/// transaction is rolled back at the end. Public as the live tests' seam: they pass slices
+/// the parse would never produce.
+pub fn run_read_only_reporting(
+    connected: Connected,
+    spec: RunSpec,
+    statements: Vec<String>,
+    guard: RunGuard,
+    finished: Finished,
+) -> impl Stream<Item = RunEvent> + Send + 'static {
+    let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    let _ = statements;
+    tokio::spawn(drive(connected, spec, None, guard, tx, finished));
     stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
 }
 
@@ -463,6 +518,7 @@ impl Emitter {
 async fn drive(
     connected: Connected,
     spec: RunSpec,
+    statements: Option<Vec<String>>,
     guard: RunGuard,
     tx: mpsc::Sender<RunEvent>,
     finished: Finished,
@@ -480,7 +536,7 @@ async fn drive(
         timeout,
         after,
     } = spec;
-    let spec = Script { sql, role, timeout };
+    let spec = Script { sql, role, timeout, statements };
     let mut out = Emitter {
         tx,
         token: guard.token(),
@@ -544,14 +600,7 @@ async fn execute(
     spec: &Script,
     out: &mut Emitter,
 ) -> Result<Outcome, Stop> {
-    let mut setup = vec![format!(
-        "SET statement_timeout = {}",
-        spec.timeout.as_millis()
-    )];
-    if let Some(role) = &spec.role {
-        setup.push(format!("SET ROLE {}", quote_ident(role)));
-    }
-    for sql in setup {
+    for sql in setup_sql(spec.timeout, spec.role.as_deref()) {
         let result = out.guarded(client.simple_query(&sql)).await?;
         drain_notices(notices, out).await?;
         if let Err(err) = result {
@@ -902,6 +951,42 @@ mod tests {
         for backend in [None, b("0", "t"), b("-1", "t"), b("x", "t"), b("42", "")] {
             assert_eq!(parse_backend(backend.clone()), None, "{backend:?}");
         }
+    }
+
+    #[test]
+    fn read_only_setup_order() {
+        let statements = vec!["SELECT 1".to_owned(), " SHOW x".to_owned()];
+        let timeout = Duration::from_secs(60);
+        let role = quote_ident("app");
+        assert_eq!(
+            read_only_steps(timeout, Some("app"), &statements),
+            vec![
+                Step::Setup("SET statement_timeout = 60000".into()),
+                Step::Setup(format!("SET ROLE {role}")),
+                Step::Setup("BEGIN TRANSACTION READ ONLY".into()),
+                Step::Setup(SNAPSHOT_SQL.into()),
+                Step::Prepare { statement: 0, sql: "SELECT 1" },
+                Step::Run { statement: 0, sql: "SELECT 1" },
+                Step::Prepare { statement: 1, sql: " SHOW x" },
+                Step::Run { statement: 1, sql: " SHOW x" },
+                Step::Rollback,
+            ]
+        );
+        // As the owner, without statements: the transaction is still begun and ended.
+        assert_eq!(
+            read_only_steps(timeout, None, &[]),
+            vec![
+                Step::Setup("SET statement_timeout = 60000".into()),
+                Step::Setup("BEGIN TRANSACTION READ ONLY".into()),
+                Step::Setup(SNAPSHOT_SQL.into()),
+                Step::Rollback,
+            ]
+        );
+        // The normal setup is unchanged.
+        assert_eq!(
+            setup_sql(timeout, Some("app")),
+            vec!["SET statement_timeout = 60000".to_owned(), format!("SET ROLE {role}")]
+        );
     }
 
     #[test]
