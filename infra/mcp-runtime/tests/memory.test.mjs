@@ -20,23 +20,32 @@ describe("mcp runtime: memory", () => {
     await host?.close();
   });
 
-  // TODO: workerd itself keeps ~20-24 KiB a run (1.20261023.1 and 1.20261119.1 alike, even for
-  // `async () => 1`), so this fails until that is fixed or the runtime recycles workerd; how is
-  // a human's call (mcp-core m3, #347). `todo` reports the failure without failing the suite.
-  test("memory levels off over many runs", { todo: "workerd keeps ~20-24 KiB a run (#347)" }, async (t) => {
-    // Each run holds ~2 MB, so a kept isolate would show at once. Past warm-up, two back-to-back
-    // windows of runs: memory may move in the first, but the second must stay level. A steady
-    // per-run leak (even a few KB a run) grows the second window as much as the first and fails.
-    const WARM = 200;
+  test("memory levels off over many runs", async (t) => {
+    // Each run holds ~2 MB, so a kept isolate would show at once. What a request leaves in the
+    // runner's isolate is freed by its major GCs, and the first comes after about 2000 runs
+    // (config.capnp, `autogates`): memory climbs some 50 MiB until then, so the warm-up runs past
+    // it. After that, two back-to-back windows of runs: memory may move in the first, but the
+    // second must stay level. A steady per-run leak grows the second window as much as the first
+    // and fails.
+    const WARM = 3000;
     const WINDOW = 1000;
-    const LEVEL_MIB = 4;
+    // One run's isolate still being torn down moves a reading by some 4 MiB; a leak of the size
+    // this once had (24 KiB a run) moves the second window by 24.
+    const LEVEL_MIB = 8;
     const code = `async () => { const big = new Array(250000).fill(0).map((_, i) => i); return big.length }`;
     const runs = async (n) => {
       for (let i = 0; i < n; i++) {
         const { body } = await runCode(rt, job(code, { host }));
         assert.equal(body.result, 250000, JSON.stringify(body));
       }
-      return rt.anonBytes();
+      // The last run's isolate (some 4 MiB here) is torn down a moment after its answer: a few
+      // trivial runs, then the lowest of a few readings.
+      let low = Infinity;
+      for (let i = 0; i < 4; i++) {
+        await runCode(rt, job("async () => 0", { host }));
+        low = Math.min(low, await rt.anonBytes());
+      }
+      return low;
     };
     const mib = (b) => (b / (1 << 20)).toFixed(1);
     const warm = await runs(WARM);
