@@ -28,7 +28,7 @@ use chelabase_metadata::members::{Admission, MemberStatus};
 use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
     MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, PeekOutcome, ProjectAuth,
-    ProjectRecord, RefreshNext, RefreshOutcome,
+    ProjectRecord, RefreshNext, RefreshOutcome, RefreshProof,
 };
 use chelabase_types::{DatabaseId, ProjectId};
 use chrono::{DateTime, Utc};
@@ -215,6 +215,7 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         next: &RefreshNext,
     ) -> impl Future<Output = Result<RefreshOutcome, MetadataError>> + Send;
     fn peek_app_session(
@@ -222,6 +223,7 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         cap: std::time::Duration,
     ) -> impl Future<Output = Result<PeekOutcome, MetadataError>> + Send;
     fn revoke_app_session(
@@ -480,18 +482,20 @@ impl NeonMetadataPort for MetadataClient {
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         next: &RefreshNext,
     ) -> Result<RefreshOutcome, MetadataError> {
-        MetadataClient::refresh_app_session(self, id, project, presented, next).await
+        MetadataClient::refresh_app_session(self, id, project, presented, proof, next).await
     }
     async fn peek_app_session(
         &self,
         id: Uuid,
         project: ProjectId,
         presented: [u8; 32],
+        proof: RefreshProof,
         cap: std::time::Duration,
     ) -> Result<PeekOutcome, MetadataError> {
-        MetadataClient::peek_app_session(self, id, project, presented, cap).await
+        MetadataClient::peek_app_session(self, id, project, presented, proof, cap).await
     }
     async fn revoke_app_session(
         &self,

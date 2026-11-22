@@ -2946,7 +2946,7 @@ export const getPutFunctionSecretUrl = (id: string,
 }
 
 /**
- * The function sees it in `env`. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.
+ * The function sees it in `env`. On a service it becomes the container's environment, so only a tenant admin may set it, and reserved names are refused. A name is a letter or `_`, then up to 127 of A-Z, a-z, 0-9 and `_`; a value is at most 64 KiB, and the function's secrets on the branch at most 128 KiB together. The value is never returned, logged or echoed in an error.
  * @summary Set a function's secret on the branch
  */
 export const putFunctionSecret = async (id: string,
@@ -3042,6 +3042,7 @@ export const getDeleteFunctionSecretUrl = (id: string,
 }
 
 /**
+ * On a service, only a tenant admin may delete a secret.
  * @summary Delete a function's secret on the branch
  */
 export const deleteFunctionSecret = async (id: string,
@@ -3238,7 +3239,7 @@ export const getCreateFunctionTriggerUrl = (id: string,
 }
 
 /**
- * A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled; a pending event is never dropped, and dead events past 10,000 per database or 7 days are removed and counted (`dropped_count`). The database's compute stays awake while it has an installed table trigger. A `storage` trigger starts `installed`. A new branch inherits the triggers.
+ * A `table` trigger is installed in the branch's database by the worker (`pending_install`, then `installed` or `failed`); each committed matching row change is then POSTed to the function's `fetch` handler with header `chelabase-event: db` and body `{id, type, schema, table, record, old_record, txid}` (over 256 KiB: `record` and `old_record` null, `truncated: true` and `primary_key`). Delivery is at least once (dedupe on `id`): a non-2xx answer is retried with backoff, and the 10th failure makes the event dead (`dead_count`). Events queue while the function is disabled; a pending event is never dropped, and dead events past 10,000 per database or 7 days are removed and counted (`dropped_count`). The database's compute stays awake while it has an installed table trigger. A `table` trigger is installed, and stays installed, only while the function's run-as role on the branch (the role identity approved when run-as was set) has table-level `SELECT` on the table and, when the table has row level security enabled, has `BYPASSRLS` or owns the table without `FORCE ROW LEVEL SECURITY`; a row change is queued only while that holds. Otherwise the trigger is uninstalled, its queued events are dropped (`dropped_count`) and it settles `failed` with `last_error` `run_as_role_required` (no run-as role), `run_as_role_cannot_read_table` (the role is gone or lacks `SELECT`) or `run_as_role_subject_to_rls`; after fixing the cause, turn the trigger off and on. A `storage` trigger starts `installed`. A new branch inherits the triggers.
  * @summary Add a trigger to a function on the branch
  */
 export const createFunctionTrigger = async (id: string,
@@ -9438,7 +9439,7 @@ export const getApplyMergeUrl = (id: string,
 }
 
 /**
- * Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.
+ * Refuses, in this order: a merge that isn't `rehearsed` (`merge_not_rehearsed`, or `merge_stale` for a stale one); a `version` that isn't the merge's (`merge_version_conflict`: a save of acknowledgements or the after-merge choice keeps a merge rehearsed, so send the version you last saw to apply what you saw); conflicts without a resolution (`merge_conflicts_open`); data-loss, security (BYPASSRLS, owner-level) or breaking (a role rename) steps without an acknowledgement (`merge_drops_unacknowledged`); a protected target without `confirm: true` (`merge_confirm_required`); another merge applying to the target, or failed half applied on it (`merge_busy`). A plan with a security step or user SQL (a `user` step, or `own_sql` from a resolution; steps run as the branch's owner) is applied only by an Admin, on any target. The worker then runs the plan (`applying`, then `online` for the concurrent index and validation steps, then `finishing`). The request doesn't read the target: before the plan's transaction the worker compares the target with the schema the plan was computed from, and if it changed, ends the merge `stale` without applying the transaction.
  * @summary Apply a rehearsed merge to its target
  */
 export const applyMerge = async (id: string,
@@ -9901,7 +9902,7 @@ export const getRehearseMergeUrl = (id: string,
 }
 
 /**
- * Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft.
+ * Runs the plan on a throwaway branch of the target (real data, so a failing constraint shows) and compares the result with the merged schema. Needs a `draft` with a plan and no open conflicts. Success makes the merge `rehearsed`; a failure returns it to `draft` with the failing step and the Postgres error in `rehearsal`. Send the `version` you last saw: the rehearsal then runs that draft. Steps run as the branch's owner, so a plan with user SQL (a `user` step, or `own_sql` from a resolution) is rehearsed only by an Admin, on any target.
  * @summary Rehearse a draft merge
  */
 export const rehearseMerge = async (id: string,
@@ -9993,7 +9994,7 @@ export const getRetryMergeUrl = (id: string,
 }
 
 /**
- * For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again.
+ * For a `failed` merge whose `failed_phase` is `roles`, `enum_add`, `tx` or `online`. Failed in `online`: the plan's transaction is committed and the target changed; only the online steps (concurrent indexes, constraint validation) are left, and the worker continues where it stopped (a valid index is skipped, an invalid one is dropped and rebuilt); the merge is `online` again. If the plan's transaction is no longer on the target, or the target is gone, the merge fails for good. Failed before (`roles`, `enum_add`, `tx`): the worker first checks whether the plan's transaction committed after all (its answer may have been lost); if it did, it goes on to the online steps; if not, the apply runs again from the start, with its checks (a target that changed since the merge was computed makes it `stale`; roles and enum values the first attempt made stay); the merge is `applying` again. A plan with user SQL (a `user` or `own_sql` step) is retried only by an Admin, on either path.
  * @summary Retry a merge that failed while applying
  */
 export const retryMerge = async (id: string,
@@ -14502,7 +14503,7 @@ export const getCreateProjectInviteUrl = (id: string,) => {
 }
 
 /**
- * As `createInvite` (including `delivery`), with one grant on this project.
+ * As `createInvite` (including `delivery`), with one grant on this project. Two invites are a tenant admin's alone (403 `forbidden`, `required`: `tenant admin`, before anything is made): one with `delivery: "link"`, and one that brings back a member who was removed (matched by their account or their email).
  * @summary Invite a person into this project
  */
 export const createProjectInvite = async (id: string,

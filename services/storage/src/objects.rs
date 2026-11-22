@@ -659,7 +659,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
     // arrive: 503 `busy` past it. A body that stalls fails the request (408), which frees it.
     let stream_part = chelabase_storage::STREAM_PART_SIZE as u64;
     let (body, stalled) = until_idle(request.into_data_stream(), state.inflight.body_idle());
-    let (mut body, held) = state.inflight.metered(body, stream_part);
+    let (mut body, held) = state.inflight.metered(body, stream_part, data.branch_id);
     if limits.sniffs() {
         let (head, again) = peek(body).await.map_err(|e| e.failure())?;
         limits.check_sniffed(&head)?;

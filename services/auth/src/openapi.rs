@@ -110,6 +110,7 @@ mod tests {
                 ("POST", "/auth/v1/app/password-reset", "appRequestPasswordReset"),
                 ("POST", "/auth/v1/app/password-reset/confirm", "appConfirmPasswordReset"),
                 ("POST", "/auth/v1/app/change-email", "appChangeEmail"),
+                ("POST", "/auth/v1/app/change-email/confirm", "appConfirmEmailChange"),
                 ("POST", "/auth/v1/app/change-password", "appChangePassword"),
                 ("GET", "/auth/v1/app/jwks", "appJwks"),
             ]

@@ -1,0 +1,5 @@
+Subject: Your {{project}} email address was changed
+
+The email address on your {{project}} account was changed, and this address no longer signs in to it.
+
+If you didn't make this change, contact {{project}} support.

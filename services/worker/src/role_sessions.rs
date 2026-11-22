@@ -6,26 +6,29 @@ use std::time::Duration;
 use chelabase_metadata::{BranchKind, BranchStatus};
 use chelabase_nats::{RoleRequest, RoleSession, RoleSessionsReply};
 use chelabase_neon::{ComputeBackend, ComputeStatus, SqlOpts};
+use chelabase_schema::sql::literal;
 use chelabase_types::role_name::check_any_role_name;
 use tracing::warn;
 
 use crate::Worker;
-use crate::data_api::quote_literal;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
 /// The read gives up after this, inside the request's 10 s deadline (the orchestrator waits
 /// 15 s for the reply).
 const SESSIONS_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The client sessions open as `role`, oldest first, as one JSON array.
+/// The client sessions open as `role`, oldest first, as one JSON array. The search path is
+/// pinned first and every name is qualified, so the read means the same in any session.
 fn sessions_sql(role: &str) -> String {
     format!(
-        "SELECT coalesce(json_agg(json_build_object(\
-         'client_addr', host(client_addr), \
+        "SET search_path = pg_catalog, pg_temp; \
+         SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_object(\
+         'client_addr', pg_catalog.host(client_addr), \
          'application_name', application_name, \
          'backend_start', backend_start) ORDER BY backend_start), '[]') \
-         FROM pg_stat_activity WHERE usename = {} AND backend_type = 'client backend'",
-        quote_literal(role)
+         FROM pg_catalog.pg_stat_activity WHERE usename OPERATOR(pg_catalog.=) {} \
+         AND backend_type OPERATOR(pg_catalog.=) 'client backend'",
+        literal(role)
     )
 }
 
@@ -112,6 +115,25 @@ mod tests {
         }
     }
 
+    /// The read pins its own search path and quotes the role name as one literal.
+    #[test]
+    fn sessions_sql_pins_search_path() {
+        let sql = sessions_sql("o'r\\x");
+        assert!(sql.starts_with("SET search_path = pg_catalog, pg_temp; SELECT "), "{sql}");
+        assert!(sql.contains("usename OPERATOR(pg_catalog.=) E'o''r\\\\x'"), "{sql}");
+        assert!(sql.contains("FROM pg_catalog.pg_stat_activity "), "{sql}");
+        for name in ["json_agg(", "json_build_object(", "host(", "coalesce("] {
+            for (at, _) in sql.match_indices(name) {
+                assert!(
+                    name == "coalesce(" || sql[..at].ends_with("pg_catalog."),
+                    "{name} in {sql}"
+                );
+            }
+        }
+        let bare = sql.replace("OPERATOR(pg_catalog.=)", "").replace("search_path =", "");
+        assert!(!bare.contains('='), "{sql}");
+    }
+
     #[tokio::test]
     async fn reads_the_roles_sessions_on_a_running_compute() {
         let (w, _journal) = worker();
@@ -145,12 +167,12 @@ mod tests {
         assert_eq!(sql.len(), 1, "{sql:?}");
         let (on, database, text) = &sql[0];
         assert_eq!((on.as_str(), database.as_str()), (ep.as_str(), "app"));
-        assert!(text.contains("FROM pg_stat_activity"), "{text}");
+        assert!(text.contains("FROM pg_catalog.pg_stat_activity"), "{text}");
         assert!(
-            text.contains("usename = 'it''s'"),
+            text.contains("usename OPERATOR(pg_catalog.=) 'it''s'"),
             "the name is a quoted literal: {text}"
         );
-        assert!(text.contains("backend_type = 'client backend'"), "{text}");
+        assert!(text.contains("backend_type OPERATOR(pg_catalog.=) 'client backend'"), "{text}");
         assert!(text.contains("ORDER BY backend_start"), "{text}");
         let opts = w.computes.sql_opts.lock().unwrap().last().cloned().unwrap();
         assert_eq!(opts.user, None, "the admin role reads every session");

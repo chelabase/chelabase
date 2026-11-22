@@ -1,4 +1,4 @@
-# cargo-deny configuration. `just deny` runs `cargo deny check advisories`
+# cargo-deny configuration. `just deny` runs `cargo deny check advisories licenses`
 # (called from `just check`).
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 
@@ -8,3 +8,27 @@ yanked = "deny"
 
 # Policy: this ignore list only shrinks. A new advisory is fixed by upgrading the
 # dependency; an ignore needs the user's explicit approval and a reason.
+
+# Permissive licenses only, no copyleft (the same rule `no-copyleft.sh` holds the JavaScript side
+# to). A crate whose license expression can't be satisfied from this list fails `just deny`.
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    # Mozilla's CA certificate data in webpki-roots / webpki-root-certs.
+    "CDLA-Permissive-2.0",
+]
+
+# Our own crates aren't published; their license field isn't checked.
+[licenses.private]
+ignore = true

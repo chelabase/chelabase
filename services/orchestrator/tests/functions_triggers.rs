@@ -391,4 +391,25 @@ mod functions_triggers {
             .await;
         assert_eq!(status, 404);
     }
+
+    /// A function has at most 20 triggers (table and storage together) on a branch: the 21st
+    /// is a 409 `conflict` and nothing is written; another function can still add its own.
+    #[tokio::test]
+    async fn functions_triggers_cap_409() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        w.function(w.w.dev, "other").await;
+        let base = w.path(w.w.dev, "/hello/triggers");
+        for i in 0..20 {
+            let body = if i % 2 == 0 { table() } else { storage() };
+            let (status, made) = w.call("dee", "POST", &base, Some(body.to_string())).await;
+            assert_eq!(status, 201, "{made}");
+        }
+        let (status, err) = w.call("dee", "POST", &base, Some(storage().to_string())).await;
+        assert_eq!(status, 409, "{err}");
+        assert_eq!(err["error"]["code"], "conflict", "{err}");
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!(list.as_array().unwrap().len(), 20, "nothing was written");
+        w.trigger(w.w.dev, "other").await;
+    }
 }

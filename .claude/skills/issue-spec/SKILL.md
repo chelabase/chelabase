@@ -82,6 +82,9 @@ only if they belong to one.
 
 - **Acceptance criteria are checkable.** "Returns 409 on duplicate name" is; "error handling
   is improved" is not.
+- **Criteria and the design sketch state the ideal outcome, not a script.** A builder or
+  auditor may reach it a better way, or accept a low-risk residual gap, and says how and why
+  (`AGENTS.md`, Judgment over the letter).
 - **Tests to write name the cases**, including at least one failure path per behaviour.
   Layout-only Studio work may say "none — layout; browser check".
 - **Out of scope is never empty**, and every exclusion names a destination.

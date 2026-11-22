@@ -108,7 +108,7 @@ async fn sql(
         .expect("the branch has an endpoint");
     worker
         .computes
-        .admin_sql(&ep, database, sql)
+        .admin_sql(&ep, database, &crate::common::tenant_sql(sql))
         .await
         .unwrap_or_else(|e| panic!("sql on {branch}: {e:#}"))
         .trim()

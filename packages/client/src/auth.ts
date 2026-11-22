@@ -483,7 +483,13 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
       await call("password-reset/confirm", { body: p });
     },
     async changeEmail(p) {
-      await userCall("change-email", { body: p });
+      const r = (await userCall("change-email", {
+        body: { email: p.email, current_password: p.currentPassword },
+      })) as { confirmation_required?: boolean } | undefined;
+      return { confirmationRequired: r?.confirmation_required === true };
+    },
+    async confirmEmailChange(p) {
+      await userCall("change-email/confirm", { body: { email: p.email, code: p.code } });
     },
     async changePassword(p) {
       const s = (await userCall(
@@ -523,6 +529,7 @@ export function staticAuth<DB extends DatabaseShape>(
     requestPasswordReset: reject,
     confirmPasswordReset: reject,
     changeEmail: reject,
+    confirmEmailChange: reject,
     changePassword: reject,
     onChange() {
       throw unavailable();

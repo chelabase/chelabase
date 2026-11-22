@@ -10,6 +10,7 @@ import { toError } from "./error.ts";
 import type { StorageOptions } from "./storage.ts";
 import type { AuthOptions, Client, DatabaseShape, TypeMap } from "./types.ts";
 
+export { op } from "./query.ts";
 export { DataApiError, UnsafeIntegerError } from "./error.ts";
 export { fetchTypes, type FetchTypesOptions } from "./fetch-types.ts";
 export { StorageError, type StorageErrorCode } from "./storage-errors.ts";
@@ -55,6 +56,7 @@ export type {
   Json,
   Nulls,
   Operation,
+  Op,
   Ops,
   PgExact,
   QueryTree,

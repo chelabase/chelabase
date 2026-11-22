@@ -107,7 +107,26 @@ impl std::fmt::Display for Refused {
     }
 }
 
+/// What an API answer says for every refusal that depends on how the platform's resolver sees
+/// a host ([`Refused::public_message`]).
+const RESOLUTION_REFUSED: &str = "the URL's host must resolve only to public addresses";
+
 impl Refused {
+    /// The refusal as an API answer may say it: the form errors (`Invalid`, `Scheme`,
+    /// `Credentials`, `NoHost`) are about the caller's own input and keep their text; every
+    /// refusal that depends on resolution or the platform's networks (`NotPublic`,
+    /// `Unresolved`, `Internal`) gives one message, so an answer never says how the resolver
+    /// sees a host. [`Refused::log_detail`] has the detail, for logs.
+    pub fn public_message(&self) -> &'static str {
+        match self {
+            Refused::Invalid => "not a valid absolute URL of at most 2048 bytes",
+            Refused::Scheme => "the URL must use https",
+            Refused::Credentials => "the URL must not carry a user name or password",
+            Refused::NoHost => "the URL has no host",
+            Refused::NotPublic { .. } | Refused::Unresolved { .. } | Refused::Internal { .. } => RESOLUTION_REFUSED,
+        }
+    }
+
     /// The refusal with the address at fault, for the operator's logs only (never an API
     /// answer).
     pub fn log_detail(&self) -> String {
@@ -659,6 +678,27 @@ pub fn refused_by_guard(err: &reqwest::Error) -> Option<Refused> {
 
 #[cfg(test)]
 mod tests {
+    /// Every variant: the form errors keep their `Display` text; the resolution-dependent ones
+    /// share one message that names no host or address.
+    #[test]
+    fn public_message_hides_resolution() {
+        let host = "db.internal".to_string();
+        let addr: IpAddr = "10.20.30.40".parse().unwrap();
+        for r in [Refused::Invalid, Refused::Scheme, Refused::Credentials, Refused::NoHost] {
+            assert_eq!(r.public_message(), r.to_string());
+        }
+        assert_eq!(MAX_URL_LEN, 2048);
+        for r in [
+            Refused::NotPublic { host: host.clone(), addr },
+            Refused::NotPublic { host: "127.0.0.1".into(), addr },
+            Refused::Unresolved { host: host.clone() },
+            Refused::Internal { host: host.clone() },
+        ] {
+            assert_eq!(r.public_message(), "the URL's host must resolve only to public addresses");
+            assert!(!r.public_message().contains("db.internal") && !r.public_message().contains("10."));
+        }
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;

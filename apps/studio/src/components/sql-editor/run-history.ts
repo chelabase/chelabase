@@ -64,6 +64,8 @@ export function loadHistory(sub: string, databaseId: string): HistoryEntry[] {
 
 /** Adds the newest entry (keeping at most 100) and returns the new list, even when storage fails. */
 export function addHistory(sub: string, databaseId: string, entry: HistoryEntry): HistoryEntry[] {
+  // A statement that sets a password is never kept; the unchanged list comes back.
+  if (/\bpassword\b/i.test(entry.sql)) return loadHistory(sub, databaseId);
   const next = [entry, ...loadHistory(sub, databaseId)].slice(0, HISTORY_MAX);
   write(historyKey(sub, databaseId), JSON.stringify(next));
   return next;
@@ -71,6 +73,20 @@ export function addHistory(sub: string, databaseId: string, entry: HistoryEntry)
 
 export function clearHistory(sub: string, databaseId: string): void {
   remove(historyKey(sub, databaseId));
+}
+
+/** Removes every `chelabase.sql.*` key (history, buffers, timeout) and nothing else. */
+export function clearAllSqlStorage(): void {
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k !== null && k.startsWith("chelabase.sql.")) keys.push(k);
+    }
+    for (const k of keys) remove(k);
+  } catch {
+    // storage unavailable: nothing to clear
+  }
 }
 
 export function loadBuffer(sub: string, databaseId: string): string {

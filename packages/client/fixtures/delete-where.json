@@ -1,5 +1,5 @@
 {
-  "call": "db.from(\"orders\").delete().where({ status: \"pending\", created_at: { lt: \"2026-01-01T00:00:00Z\" } })",
+  "call": "db.from(\"orders\").delete().where({ status: \"pending\", created_at: op.lt(\"2026-01-01T00:00:00Z\") })",
   "tree": {
     "v": 1,
     "op": "delete",

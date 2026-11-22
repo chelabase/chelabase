@@ -1,6 +1,7 @@
 import { useContext, useMemo, useState, type ReactNode } from "react";
 import { fetchStorageObject } from "@chelabase/management-client";
-import type { PreviewSource } from "@/components/storage/browser/object-preview";
+import { fetchUrlBlob } from "@/components/storage/browser/blob-url";
+import { previewSource, type PreviewSource } from "@/components/storage/browser/object-preview";
 import { consoleUploadApi } from "@/components/storage/upload/console-api";
 import { useProjectCaps } from "@/lib/capabilities";
 import { EnvContext } from "@/lib/env-context";
@@ -8,7 +9,7 @@ import { storageParams, useBuckets } from "@/lib/storage-api";
 import type { Row, RowColumn } from "@/lib/table-editor/rows";
 import type { CellValue } from "../cell-editor";
 import type { TableTarget } from "../target";
-import { refRequestOf, type RefRequest } from "./storage-ref";
+import { guessContentType, refRequestOf, type RefRequest } from "./storage-ref";
 import { StorageRefCell, StorageRefEditor } from "./storage-ref-cell";
 import { StorageRefPicker } from "./storage-ref-picker";
 import { cellUploader, objectIdOf } from "./storage-ref-upload";
@@ -95,14 +96,17 @@ export function useStorageRefCells({ target, columns, rows, keys, canEdit, canSi
   if (editing && column && at >= 0) {
     const value = rows[at]?.[column.name];
     const resolved = stateOf(column, value);
-    let previewSource: PreviewSource | null = null;
+    let source: PreviewSource | null = null;
     if (resolved?.state === "ok") {
       const { url, bucket, name } = resolved;
-      // A Viewer's signed URLs 403: its preview reads the bytes through the console download route.
-      previewSource =
-        canSign || resolved.public
-          ? { kind: "signed", sign: async () => url }
-          : { kind: "download", fetch: (range, signal) => fetchStorageObject(databaseId, branchId, bucket, name, storageParams(role, database), { range, signal }) };
+      // A URL that opens for the role streams media and is fetched as a blob for images and PDFs
+      // (Studio's CSP); a Viewer's signed URLs 403, so its preview reads through the console route.
+      const opens = canSign || resolved.public;
+      source = previewSource(
+        guessContentType(name),
+        opens ? async () => url : null,
+        opens ? (range, signal) => fetchUrlBlob(url, range, signal) : (range, signal) => fetchStorageObject(databaseId, branchId, bucket, name, storageParams(role, database), { range, signal }),
+      );
     }
     const desc = column.desc.storage_ref!;
     dialog = (
@@ -115,7 +119,7 @@ export function useStorageRefCells({ target, columns, rows, keys, canEdit, canSi
         value={value}
         resolved={resolved}
         canEdit={canEdit(column.name, editing.key)}
-        previewSource={previewSource}
+        previewSource={source}
         buckets={bucketList}
         pendingFile={editing.file}
         upload={upload}
