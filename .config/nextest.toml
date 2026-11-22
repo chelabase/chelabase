@@ -45,6 +45,11 @@ filter = 'package(chelabase-metadata) & binary(live_db) & test(/^(purge_app_sess
 test-group = "app-sessions-purge"
 
 # MCP's live tests (m12): the busy-loop test stalls and restarts the runtime the other one calls.
+# The execute_live tests run code in that same runtime, so they wait their turn too.
 [[profile.default.overrides]]
 filter = 'package(mcp) & binary(runtime) & test(/^(search_runs_in_the_runtime|a_busy_loop_times_out_and_the_next_call_works)$/)'
+test-group = "stack-serial"
+
+[[profile.default.overrides]]
+filter = 'package(mcp) & binary(execute_live)'
 test-group = "stack-serial"
