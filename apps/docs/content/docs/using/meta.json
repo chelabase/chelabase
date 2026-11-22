@@ -14,6 +14,7 @@
     "storage",
     "functions",
     "services",
+    "mcp",
     "app-users",
     "sql-editor",
     "table-editor",
