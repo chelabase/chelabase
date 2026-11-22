@@ -78,6 +78,8 @@ pub struct SentCode {
     pub code: String,
     /// The `link` the mail carried, if any.
     pub link: Option<String>,
+    /// The `project_name` the mail named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 /// What a test may read of a fake user.
@@ -105,6 +107,8 @@ pub struct ChangeNotice {
     pub user_id: String,
     /// The previous address, which the notice went to.
     pub email: String,
+    /// The `project_name` the notice named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 struct Fault {
@@ -221,6 +225,23 @@ pub(crate) fn str_field<'a>(body: &'a Value, key: &str) -> Result<&'a str, Refus
             &format!("{key} must be a non-empty string"),
         )),
     }
+}
+
+/// `project_name`, judged as the service judges it: a name it cannot show is not refused, it is
+/// left out and the mail names the default (`None`). Unusable is: not a string, blank (the
+/// service's `trim` is JavaScript's, which also strips U+FEFF), over 128 UTF-16 units, or
+/// holding a control character or line separator.
+pub(crate) fn project_field(body: &Value) -> Option<String> {
+    let name = body.get("project_name")?.as_str()?;
+    let blank = name
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .is_empty();
+    let usable = !blank
+        && name.encode_utf16().count() <= 128
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}');
+    usable.then(|| name.to_string())
 }
 
 fn bool_field(body: &Value, key: &str) -> Result<bool, Refusal> {
@@ -448,6 +469,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             let email = check_email(str_field(body, "email")?)?;
             let verified = bool_field(body, "email_verified")?;
             let notify = bool_field(body, "notify_previous")?;
+            let project = project_field(body);
             if p.users.iter().any(|u| u.email == email && u.id != *id) {
                 return Err(refuse(409, "conflict", "another user has this email"));
             }
@@ -464,6 +486,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                     pool: name.clone(),
                     user_id: id.to_string(),
                     email: previous,
+                    project,
                 });
             }
             (200, Some(json!({ "user": out })))
@@ -473,6 +496,8 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             check_password(password)?;
             let at = user_idx(p, id)?;
             p.users[at].password = Some(password.to_string());
+            // A new password ends every session of the user, whoever called this route.
+            p.sessions.retain(|s| s.user_id != *id);
             (200, Some(json!({ "status": true })))
         }
         ("POST", ["users", id, "verify-email"]) => {

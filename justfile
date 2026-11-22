@@ -113,6 +113,7 @@ check-scripts:
     scripts/tests/compose-env-tunables.sh
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
+    scripts/tests/wt-from-origin.sh
     scripts/tests/retired-names.sh
     scripts/tests/no-copyleft.sh
     scripts/tests/compose-image-pins.sh
@@ -225,7 +226,35 @@ sweep-builds days="14":
       fi
     done
 
+# Fetch origin once (quiet) and print where `ref` should start from: `origin/<ref>` when that exists
+# and local `<ref>` has nothing origin lacks, else `ref` as given (a SHA, `origin/...`, a local-only or
+# locally-ahead branch). A failed fetch (offline) prints `ref` and warns on stderr. Never fails.
+_wt-resolve ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    ref="$1"
+    if ! git -C "$main" fetch origin --prune --quiet; then
+      echo "warning: git fetch origin failed; starting from local refs, which may be behind origin" >&2
+      printf '%s\n' "$ref"
+      exit 0
+    fi
+    case "$ref" in
+      origin/* | HEAD) printf '%s\n' "$ref"; exit 0 ;;
+    esac
+    if ! git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
+      printf '%s\n' "$ref"
+    elif git -C "$main" show-ref --verify --quiet "refs/heads/$ref" &&
+      ! git -C "$main" merge-base --is-ancestor "refs/heads/$ref" "refs/remotes/origin/$ref"; then
+      echo "warning: local $ref has commits that aren't on origin/$ref: starting from local $ref" >&2
+      printf '%s\n' "$ref"
+    else
+      printf 'origin/%s\n' "$ref"
+    fi
+
 # New worktree at .worktrees/<branch with / as ->; creates the branch from base if it is new.
+# Fetches origin first: a new branch starts from origin/<base>, and a branch that exists only on origin
+# is checked out from there. An existing local branch is used as it is (with a warning if it is behind).
 # It starts no stack: a task worktree records the base's stack in `.workbench-stack` (no build when
 # a worktree has the base checked out); a main-based one gets its own from `just workbench up`.
 wt-add branch base="main":
@@ -235,10 +264,19 @@ wt-add branch base="main":
     branch="$1"
     base="$2"
     dir="$main/.worktrees/${branch//\//-}"
+    start="$("{{just_executable()}}" --justfile "{{justfile()}}" _wt-resolve "$base")"
     if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      up="$(git -C "$main" rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null || true)"
+      [ -n "$up" ] || up="origin/$branch"
+      if git -C "$main" rev-parse --verify --quiet "$up^{commit}" >/dev/null &&
+        ! git -C "$main" merge-base --is-ancestor "$up" "$branch"; then
+        echo "warning: local $branch is behind or has diverged from $up; checked out as it is" >&2
+      fi
       git -C "$main" worktree add "$dir" "$branch"
+    elif git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      git -C "$main" worktree add --track -b "$branch" "$dir" "origin/$branch"
     else
-      git -C "$main" worktree add "$dir" -b "$branch" "$base"
+      git -C "$main" worktree add "$dir" -b "$branch" "$start"
     fi
     ln -s "$main/.chelabase" "$dir/.chelabase"
     if [ "$base" != main ] && [ "$base" != origin/main ]; then
@@ -251,7 +289,7 @@ wt-add branch base="main":
 # A reusable worktree at .worktrees/<name>: made on first use, then switched in place, so its
 # target/ stays warm and only the changed crates rebuild. It refuses while the slot has changes.
 # Agents take a slot of the shared pool through wt-claim, which calls this.
-# With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
+# (wt-claim passes it origin/<ref>.) With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
 # fast-forwarded to `ref` when it has no commits of its own, and is never reset. Without: a
 # detached checkout of `ref`. The slot records the stack of `ref`'s worktree, like wt-add.
 wt-slot name ref branch="":
@@ -330,6 +368,8 @@ wt-claim ref branch="":
     ref="$1"
     branch="${2:-}"
     max="${CHELABASE_WT_POOL_MAX:-8}"
+    # Fetch origin once; a branch name with an origin counterpart (main, epic/x) starts from origin's.
+    ref="$("{{just_executable()}}" --justfile "{{justfile()}}" _wt-resolve "$ref")"
     git -C "$main" rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
       { echo "wt-claim: $ref isn't a branch or a commit" >&2; exit 1; }
     mkdir -p "$common/wt-slots"

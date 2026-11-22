@@ -66,6 +66,18 @@ function optText(body: Record<string, unknown>, key: string, max: number): strin
   return v;
 }
 
+/**
+ * `project_name`: shown in the mail. A name that cannot be shown (not a string, blank under
+ * JavaScript's `trim`, over MAX_PROJECT characters, or not a single line) is not refused: it is
+ * left out and the mail names the default, so a bad name can never block a mail. This is the
+ * one judge of a project name; callers pass the name through as they hold it.
+ */
+export function optProjectName(body: Record<string, unknown>): string | undefined {
+  const v = body.project_name;
+  if (typeof v !== "string" || v.trim() === "" || v.length > MAX_PROJECT || CONTROL.test(v)) return undefined;
+  return v;
+}
+
 /** An absolute http(s) URL, as given. */
 function optLink(body: Record<string, unknown>): string | undefined {
   const v = optText(body, "link", MAX_LINK);
@@ -136,15 +148,40 @@ async function inviteAllowed(ctx: Context, user: BaUser): Promise<boolean> {
 }
 
 /**
+ * Stores `hashed` as the user's credential password and ends every session of the user, in one
+ * transaction: either both happen or neither does. Better Auth's internal adapter joins a
+ * transaction only through an async-local store it does not export, so this writes through
+ * the transaction's own adapter (no hooks or secondary storage are configured; see
+ * better-auth.ts). The credential account is keyed as `internalAdapter.findCredentialAccount`
+ * keys it.
+ */
+export async function replacePasswordEndingSessions(ctx: Context, userId: string, hashed: string): Promise<void> {
+  await ctx.adapter.transaction(async (trx) => {
+    const account = [
+      { field: "userId", value: userId },
+      { field: "providerId", value: "credential" },
+      { field: "accountId", value: userId },
+    ];
+    if (await trx.findOne({ model: "account", where: account })) {
+      await trx.updateMany({ model: "account", where: account, update: { password: hashed } });
+    } else {
+      const now = new Date();
+      await trx.create({
+        model: "account",
+        data: { userId, providerId: "credential", accountId: userId, password: hashed, createdAt: now, updatedAt: now },
+      });
+    }
+    await trx.deleteMany({ model: "session", where: [{ field: "userId", value: userId }] });
+  });
+}
+
+/**
  * Sets the password after a reset or invite code: Better Auth's `setUserPassword` (the
  * `users.set_password` route) plus `revokeUserSessions`, and the email marked verified (the
  * code just proved it, as `resetPasswordEmailOTP` does).
  */
 async function setPasswordAfterCode(ctx: Context, user: BaUser, password: string): Promise<BaUser> {
-  const hashed = await ctx.password.hash(password);
-  if (await ctx.internalAdapter.findCredentialAccount(user.id)) await ctx.internalAdapter.updatePassword(user.id, hashed);
-  else await ctx.internalAdapter.createAccount({ userId: user.id, providerId: "credential", accountId: user.id, password: hashed });
-  await ctx.internalAdapter.deleteUserSessions(user.id);
+  await replacePasswordEndingSessions(ctx, user.id, await ctx.password.hash(password));
   if (user.emailVerified) return user;
   return (await ctx.internalAdapter.updateUser(user.id, { emailVerified: true })) as BaUser;
 }
@@ -159,7 +196,7 @@ export function codeRoutes(): Route[] {
         const id = userId(body);
         const kind = oneOf(body, "kind", CODE_KINDS);
         const delivery = oneOf(body, "delivery", DELIVERIES);
-        const project = optText(body, "project_name", MAX_PROJECT) ?? DEFAULT_PROJECT;
+        const project = optProjectName(body) ?? DEFAULT_PROJECT;
         const link = optLink(body);
         if (!CREATE_KINDS[caller].includes(kind)) {
           throw new HttpError(403, "forbidden", `${caller} may not create ${kind} codes`);
@@ -217,6 +254,8 @@ export function codeRoutes(): Route[] {
           throw new HttpError(400, "invalid_request", "code must be six digits");
         }
         const next = newEmail(body, kind);
+        // Named in the email-changed notice an `email_change` sends.
+        const project = optProjectName(body) ?? DEFAULT_PROJECT;
         const takesPassword = kind === "reset" || kind === "invite";
         const password = body.new_password;
         if (!takesPassword && password !== undefined) {
@@ -255,7 +294,7 @@ export function codeRoutes(): Route[] {
             // revokes the user's other outstanding codes in the same statement.
             const swapped = await auth.codes.changeEmail(id, next, true, user.email);
             if (!swapped) throw invalidCode();
-            await notifyEmailChanged(mailer, swapped.previous);
+            await notifyEmailChanged(mailer, swapped.previous, project);
             return { status: 200, body: { user: userOut(await requireUser(ctx, id)) } };
           }
           if (kind === "verify") {
@@ -283,7 +322,7 @@ export function inviteNoticeRoute(): Route {
     rest: ["users", ":id", "invite-notice"],
     async handle({ mailer, registry, pool, id, body }) {
       if (pool.name !== "members") throw new HttpError(400, "invalid_pool", "invite notices are for the members pool");
-      const project = optText(body, "project_name", MAX_PROJECT) ?? DEFAULT_PROJECT;
+      const project = optProjectName(body) ?? DEFAULT_PROJECT;
       const link = optLink(body);
       if (link === undefined) throw new HttpError(400, "invalid_request", "link is required");
       if (new URL(link).searchParams.has("code")) throw new HttpError(400, "invalid_request", "link must not carry a code");

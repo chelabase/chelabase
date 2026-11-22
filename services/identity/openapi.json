@@ -103,7 +103,7 @@
       ],
       "post": {
         "operationId": "createUser",
-        "summary": "Create a user, with or without a password",
+        "summary": "Create a user, with or without a password (a password outside the length range is 400 `weak_password`)",
         "x-callers": [
           "auth",
           "orchestrator"
@@ -439,6 +439,11 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Mail the previous address that it was replaced, when SMTP is configured and the address changes. A refused send does not fail the request."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the notice `notify_previous` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -493,7 +498,7 @@
       ],
       "put": {
         "operationId": "setPassword",
-        "summary": "Set a user's password (creates the credential if missing)",
+        "summary": "Set a user's password (creates the credential if missing) and revoke all of the user's sessions",
         "x-callers": [
           "auth"
         ],
@@ -1121,7 +1126,7 @@
                   "project_name": {
                     "type": "string",
                     "maxLength": 128,
-                    "description": "Shown in the email; single line. Default `Chelabase`."
+                    "description": "Shown in the email. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",
@@ -1251,6 +1256,11 @@
                     "type": "string",
                     "maxLength": 320,
                     "description": "Required for `email_change`: the address the code was issued for. Refused for every other kind."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the email-changed notice an `email_change` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -1330,7 +1340,8 @@
                 "properties": {
                   "project_name": {
                     "type": "string",
-                    "maxLength": 128
+                    "maxLength": 128,
+                    "description": "Shown in the notice. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",

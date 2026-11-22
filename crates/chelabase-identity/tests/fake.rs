@@ -74,6 +74,35 @@ async fn reset_revokes_sessions() {
 }
 
 #[tokio::test]
+async fn set_password_ends_sessions() {
+    let (_f, id, p) = setup(1).await;
+    common::set_password_ends_sessions(&id, &p[0]).await;
+}
+
+/// A `project_name` identity cannot show (not one line, blank under JavaScript's `trim`, which
+/// also strips U+FEFF) is not refused: the mail goes out under the default name.
+#[tokio::test]
+async fn unusable_project_names_fall_back_to_the_default() {
+    let (f, id, p) = setup(1).await;
+    let p = &p[0];
+    let mail = email("proj");
+    let uid = user(&id, p, &mail).await;
+    for (i, name) in ["\u{feff}", "\u{feff} ", " ", "Acme\nInc", &"x".repeat(129)].into_iter().enumerate() {
+        let mut request = CodeRequest::new(&uid, CodeKind::Reset, Delivery::Email);
+        request.project_name = Some(name);
+        id.create_code(p, &request).await.unwrap_or_else(|e| panic!("{name:?}: {e:?}"));
+        id.set_email_notifying(p, &uid, &email("moved"), true, Some(name)).await.unwrap();
+        assert_eq!(f.codes_sent().len(), i + 1);
+        assert_eq!(f.codes_sent().last().unwrap().project, None, "{name:?}");
+        assert_eq!(f.change_notices_sent().last().unwrap().project, None, "{name:?}");
+    }
+    let mut request = CodeRequest::new(&uid, CodeKind::Reset, Delivery::Email);
+    request.project_name = Some("Acme");
+    id.create_code(p, &request).await.unwrap();
+    assert_eq!(f.codes_sent().last().unwrap().project.as_deref(), Some("Acme"));
+}
+
+#[tokio::test]
 async fn unknown_pool_and_bad_pool_name() {
     let f = FakeIdentity::start().await;
     let id = f.client();

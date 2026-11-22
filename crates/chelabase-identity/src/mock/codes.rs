@@ -177,6 +177,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         ));
     }
     let next = new_email(body, kind)?;
+    let project = super::project_field(body);
     if next.is_some() && delivery != "email" {
         return Err(refuse(
             400,
@@ -248,6 +249,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
             kind,
             code,
             link: body.get("link").and_then(Value::as_str).map(str::to_string),
+            project,
         });
     }
     Ok((201, Some(out)))
@@ -261,6 +263,7 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         return Err(refuse(400, "invalid_request", "code must be six digits"));
     }
     let next = new_email(body, kind)?;
+    let project = super::project_field(body);
     let new_password = match (kind, body.get("new_password")) {
         (CodeKind::Verify | CodeKind::EmailChange, None) => None,
         (CodeKind::Verify | CodeKind::EmailChange, Some(_)) => {
@@ -328,6 +331,7 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
                 pool: pool.into(),
                 user_id: user_id.into(),
                 email: previous,
+                project,
             });
         }
         return Ok((200, Some(json!({ "user": out }))));
@@ -388,7 +392,7 @@ mod tests {
 
         // Another address, or another kind, never matches; each counts against the code.
         let e = id
-            .confirm_email_change(&p, &user, "other@x.io", &code)
+            .confirm_email_change(&p, &user, "other@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -400,7 +404,7 @@ mod tests {
         assert_eq!(f.user(&p, &user).unwrap().email, "old@x.io");
 
         let out = id
-            .confirm_email_change(&p, &user, "new@x.io", &code)
+            .confirm_email_change(&p, &user, "new@x.io", &code, None)
             .await
             .unwrap();
         assert_eq!((out.email.as_str(), out.email_verified), ("new@x.io", true));
@@ -412,7 +416,7 @@ mod tests {
         );
         // Single use.
         let e = id
-            .confirm_email_change(&p, &user, "new@x.io", &code)
+            .confirm_email_change(&p, &user, "new@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -425,13 +429,13 @@ mod tests {
         let wrong = format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000);
         for _ in 0..5 {
             let e = id
-                .confirm_email_change(&p, &user, "third@x.io", &wrong)
+                .confirm_email_change(&p, &user, "third@x.io", &wrong, None)
                 .await
                 .unwrap_err();
             assert!(is_invalid_code(&e), "{e:?}");
         }
         let e = id
-            .confirm_email_change(&p, &user, "third@x.io", &code)
+            .confirm_email_change(&p, &user, "third@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -441,7 +445,7 @@ mod tests {
         let (_, _, code) = last_sent(&f);
         id.set_email(&p, &user, "moved@x.io", true).await.unwrap();
         let e = id
-            .confirm_email_change(&p, &user, "third@x.io", &code)
+            .confirm_email_change(&p, &user, "third@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -456,7 +460,7 @@ mod tests {
             .await
             .unwrap();
         let e = id
-            .confirm_email_change(&p, &user, "fourth@x.io", v.code.as_deref().unwrap())
+            .confirm_email_change(&p, &user, "fourth@x.io", v.code.as_deref().unwrap(), None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -491,14 +495,14 @@ mod tests {
         let (_, _, code) = last_sent(&f);
         id.set_email(&p, &other, "new@x.io", true).await.unwrap();
         let e = id
-            .confirm_email_change(&p, &user, "new@x.io", &code)
+            .confirm_email_change(&p, &user, "new@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(matches!(&e, IdentityError::Conflict(_)), "{e:?}");
         assert_eq!(f.user(&p, &user).unwrap().email, "old@x.io");
         id.set_email(&p, &other, "taken@x.io", true).await.unwrap();
         let e = id
-            .confirm_email_change(&p, &user, "new@x.io", &code)
+            .confirm_email_change(&p, &user, "new@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -519,7 +523,7 @@ mod tests {
         id.set_email(&p, &user, "away@x.io", true).await.unwrap();
         id.set_email(&p, &user, "old@x.io", true).await.unwrap();
         let e = id
-            .confirm_email_change(&p, &user, "new@x.io", &code)
+            .confirm_email_change(&p, &user, "new@x.io", &code, None)
             .await
             .unwrap_err();
         assert!(is_invalid_code(&e), "{e:?}");
@@ -538,7 +542,7 @@ mod tests {
                 .await
                 .unwrap();
             let (_, _, code) = last_sent(&f);
-            id.confirm_email_change(&p, &user, addr, &code)
+            id.confirm_email_change(&p, &user, addr, &code, None)
                 .await
                 .unwrap();
         }
@@ -588,7 +592,7 @@ mod tests {
         );
 
         let out = id
-            .set_email_notifying(&p, &user, "loud@x.io", true)
+            .set_email_notifying(&p, &user, "loud@x.io", true, None)
             .await
             .unwrap();
         assert_eq!(
@@ -600,11 +604,11 @@ mod tests {
         assert_eq!(notices[0].email, "quiet@x.io");
 
         // The same address is no change: nothing more is mailed. Without SMTP, nothing either.
-        id.set_email_notifying(&p, &user, "loud@x.io", true)
+        id.set_email_notifying(&p, &user, "loud@x.io", true, None)
             .await
             .unwrap();
         f.set_email_configured(false);
-        id.set_email_notifying(&p, &user, "silent@x.io", true)
+        id.set_email_notifying(&p, &user, "silent@x.io", true, None)
             .await
             .unwrap();
         assert_eq!(f.change_notices_sent().len(), 1);

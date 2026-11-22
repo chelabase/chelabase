@@ -140,10 +140,11 @@ impl AppTokenVerifier {
         Self::from_pem(&read(public)?)
     }
 
-    /// Verify signature, issuer, `aud = app_audience(project)` and expiry (30 s leeway).
+    /// Verify `kid` (required, equal to this key's), signature, issuer,
+    /// `aud = app_audience(project)` and expiry (30 s leeway).
     pub fn verify(&self, token: &str, project: Uuid) -> Result<AppClaims, AppTokenError> {
         let header = decode_header(token.trim()).map_err(|_| AppTokenError::Invalid)?;
-        if header.kid.as_deref().is_some_and(|k| k != self.kid) {
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
             return Err(AppTokenError::Invalid);
         }
         let mut validation = Validation::new(Algorithm::EdDSA);

@@ -973,7 +973,9 @@ pub struct NewInvite<'a> {
     pub teams: &'a [TeamSeen],
     /// Whether the invite may bring back a removed member: only a tenant admin's may (m10).
     /// When `false`, a `removed` row of the tenant with this identity user or this email is
-    /// [`AccessWriteError::RemovedMember`], decided under the tenant lock.
+    /// [`AccessWriteError::RemovedMember`], decided under the tenant lock. When `true`, the
+    /// store also re-reads the actor under that lock and treats it as `false` unless the actor
+    /// is still an active tenant admin of the tenant (#315).
     pub readmit_removed: bool,
 }
 
@@ -3020,7 +3022,9 @@ impl MetadataClient {
     /// user or email is the invitee's becomes `invited`, and no new row is inserted beside one
     /// (`RemovedMember`). The check runs under the tenant lock, after the live-member checks, so
     /// a removal that commits before it is seen and one that hasn't is still a live member
-    /// (`Conflict`).
+    /// (`Conflict`). `readmit_removed` counts only while `actor` is, under that lock, an
+    /// active tenant admin of the tenant (#315): one demoted, suspended or removed since the
+    /// request authenticated is answered as a non-admin.
     pub async fn create_invited_member(
         &self,
         actor: Uuid,
@@ -3063,6 +3067,18 @@ impl MetadataClient {
                 "another member has this email".into(),
             ));
         }
+        // #315: the caller's flag is what the request saw when it authenticated. Under the
+        // tenant lock, which every demotion, suspension and removal takes, only an actor still
+        // an active tenant admin of this tenant may re-admit. A plain read: no new lock.
+        let readmit_removed = readmit_removed
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM members
+                                WHERE id = $1 AND tenant_id = $2 AND status = 'active' AND tenant_admin)",
+            )
+            .bind(actor)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
         if !readmit_removed {
             let removed: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM members

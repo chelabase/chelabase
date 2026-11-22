@@ -172,20 +172,25 @@ impl Identity {
     /// verified, and the previous address gets a notice (when SMTP is configured). Another
     /// address, a wrong code or a current address changed since the code was issued is
     /// `CodeInvalid`; `new_email` taken by another user since then is `Conflict` (the code is
-    /// spent); a spent failure budget is `CodeBudgetSpent`.
+    /// spent); a spent failure budget is `CodeBudgetSpent`. `project_name` is shown in the
+    /// notice, as in [`CodeRequest::project_name`].
     pub async fn confirm_email_change(
         &self,
         pool: &Pool,
         user_id: &str,
         new_email: &str,
         code: &str,
+        project_name: Option<&str>,
     ) -> Result<User, IdentityError> {
-        let body = json!({
+        let mut body = json!({
             "user_id": user_id,
             "kind": CodeKind::EmailChange.as_str(),
             "code": code,
             "new_email": new_email,
         });
+        if let Some(name) = project_name {
+            body["project_name"] = Value::String(name.to_string());
+        }
         self.post_verify(pool, body).await
     }
 
