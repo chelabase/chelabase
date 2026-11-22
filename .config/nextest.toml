@@ -43,3 +43,8 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(chelabase-metadata) & binary(live_db) & test(/^(purge_app_sessions_|peek_answers_like_refresh_and_writes_nothing$)/)'
 test-group = "app-sessions-purge"
+
+# MCP's live tests (m12): the busy-loop test stalls and restarts the runtime the other one calls.
+[[profile.default.overrides]]
+filter = 'package(mcp) & binary(runtime) & test(/^(search_runs_in_the_runtime|a_busy_loop_times_out_and_the_next_call_works)$/)'
+test-group = "stack-serial"
