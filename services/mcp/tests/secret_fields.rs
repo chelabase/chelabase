@@ -373,10 +373,8 @@ fn every_untyped_answer_is_hand_classified() {
         ("getSqlSchema", JSON),
         ("runSql", "application/x-ndjson"),
         ("storageAbortUpload", JSON),
-        ("storageCompleteUpload", JSON),
         ("storageCopyObject", JSON),
         ("storageCreateBucket", JSON),
-        ("storageCreateUpload", JSON),
         ("storageDeleteBucket", JSON),
         ("storageDeleteObject", JSON),
         ("storageDeleteObjects", JSON),
@@ -385,12 +383,9 @@ fn every_untyped_answer_is_hand_classified() {
         ("storageListObjects", JSON),
         ("storageListParts", JSON),
         ("storageMoveObject", JSON),
-        ("storagePutObject", JSON),
         ("storageResolveObjects", JSON),
         ("storageSignObject", JSON),
         ("storageUpdateBucket", JSON),
-        ("storageUploadObject", JSON),
-        ("storageUploadPart", JSON),
     ]
     .into();
     let spec = bundle();

@@ -290,7 +290,10 @@ mod tests {
         assert_eq!(err, SpecError::Unclassified("getNewThing GET /x".into()));
         let anonymous = json!({"/x": {"get": {"responses": {}}}});
         let err = build(&doc(json!({}), anonymous), &empty_data()).unwrap_err();
-        assert_eq!(err, SpecError::Unclassified("(no operationId) GET /x".into()));
+        assert_eq!(
+            err,
+            SpecError::Unclassified("(no operationId) GET /x".into())
+        );
         // A known name under another method is not the operation the table classified.
         let moved = json!({"/x": {"post": {"operationId": "getMe", "responses": {}}}});
         assert!(build(&doc(json!({}), moved), &empty_data()).is_err());
@@ -311,7 +314,11 @@ mod tests {
         );
         let b = build(&m, &empty_data()).unwrap();
         assert_eq!(
-            b["paths"]["/obj"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            b["paths"]["/obj"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
             ["delete"]
         );
         assert_eq!(b["paths"]["/obj"]["delete"]["x-class"], "destructive");

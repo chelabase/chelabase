@@ -448,7 +448,9 @@ const MERGE: &str = "services/orchestrator/src/merges.rs (`MergeView`): the work
      plan steps, rehearsal and result; plan SQL never carries a password (chelabase-schema plan \
      and export tests); routine bodies in it are the member's own text";
 
-/// Every untyped answer, or part of one, and what its handler shows it carries.
+/// Every untyped answer, or part of one, and what its handler shows it carries. Routes the
+/// policy table excludes (the binary uploads, `createFunctionDeployment`) are not in the
+/// bundle and never answer a sandbox, so they have no entry.
 pub static UNTYPED: &[Untyped] = &[
     // Storage's console routes: storage's own answers, passed through unchanged.
     untyped("storageListBuckets", Carries::Nothing, STORAGE_BUCKETS),
@@ -458,14 +460,9 @@ pub static UNTYPED: &[Untyped] = &[
     untyped("storageListObjects", Carries::Nothing, STORAGE_OBJECTS),
     untyped("storageCopyObject", Carries::Nothing, STORAGE_OBJECTS),
     untyped("storageMoveObject", Carries::Nothing, STORAGE_OBJECTS),
-    untyped("storageUploadObject", Carries::Nothing, STORAGE_OBJECTS),
-    untyped("storagePutObject", Carries::Nothing, STORAGE_OBJECTS),
     untyped("storageDeleteObject", Carries::Nothing, STORAGE_OBJECTS),
     untyped("storageDeleteObjects", Carries::Nothing, STORAGE_OBJECTS),
-    untyped("storageCreateUpload", Carries::Nothing, STORAGE_UPLOADS),
-    untyped("storageUploadPart", Carries::Nothing, STORAGE_UPLOADS),
     untyped("storageListParts", Carries::Nothing, STORAGE_UPLOADS),
-    untyped("storageCompleteUpload", Carries::Nothing, STORAGE_UPLOADS),
     untyped("storageAbortUpload", Carries::Nothing, STORAGE_UPLOADS),
     untyped(
         "storageSignObject",
@@ -592,12 +589,6 @@ pub static UNTYPED: &[Untyped] = &[
     part(
         "listFunctionDeployments",
         "/*/spec",
-        Carries::Nothing,
-        "services/orchestrator/src/functions.rs (`ServiceSpec`): the URL is refused with credentials",
-    ),
-    part(
-        "createFunctionDeployment",
-        "/spec",
         Carries::Nothing,
         "services/orchestrator/src/functions.rs (`ServiceSpec`): the URL is refused with credentials",
     ),
