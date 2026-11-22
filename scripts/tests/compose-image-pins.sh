@@ -104,6 +104,14 @@ render_images() { # render_images <-f args…>: "service image built" per line
       | "\(.key) \(.value.image // "-") \(.value.build != null and .value.pull_policy == "build")"'
 }
 if base_images="$(render_images -f "$compose")" && built_images="$(render_images -f "$compose" -f "$build")"; then
+  # Every image runs in the render (so a profile missing from `profiles` fails here, not passes
+  # on nothing), and the build overlay check below sees its services. An empty render is
+  # scripts/tests/image-inputs.sh's fixture, whose `docker` is a stub that prints nothing (a real
+  # `docker compose config` of this file never renders no service).
+  [[ -z "$base_images" ]] || for i in "${images[@]}"; do
+    awk -v i="$i" '$2 ~ ("^ghcr\\.io/chelabase/" i ":") { f = 1 } END { exit !f }' <<<"$base_images" ||
+      err "the render (${profiles[*]}) runs no service on the $i image"
+  done
   while read -r svc img _; do
     [[ "$img" == ghcr.io/chelabase/* && "$img" != ghcr.io/chelabase/neon-* ]] || continue
     got="$(awk -v s="$svc" '$1 == s { print $2 }' <<<"$built_images")"
