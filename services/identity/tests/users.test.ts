@@ -65,6 +65,28 @@ describeDb("users", () => {
     expect(other.id).not.toBe(user.id);
   });
 
+  it("users.set_password is atomic: a failed session delete keeps the old password", async () => {
+    const user = await createUser("pwatomic@x.io", "password-atomic-1");
+    const s1 = await signIn("pwatomic@x.io", "password-atomic-1");
+    expect(s1.status).toBe(201);
+    const schema = `identity_app_${pool.slice("app-".length).replaceAll("-", "")}`;
+    const q = (text: string) => h.db.query(text);
+    const fn = `"${schema}".fail_session_delete`;
+    await q(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$`);
+    await q(`CREATE TRIGGER fail_session_delete BEFORE DELETE ON "${schema}"."session" FOR EACH ROW EXECUTE FUNCTION ${fn}()`);
+    try {
+      const r = await call(h, "PUT", `${base()}/users/${user.id}/password`, { body: { password: "password-atomic-2" } });
+      expect(r.status).toBe(500);
+    } finally {
+      await q(`DROP TRIGGER fail_session_delete ON "${schema}"."session"`);
+      await q(`DROP FUNCTION ${fn}()`);
+    }
+    // Nothing changed: the old password still signs in, the new one does not, the session lives.
+    expect((await signIn("pwatomic@x.io", "password-atomic-2")).status).toBe(401);
+    expect((await signIn("pwatomic@x.io", "password-atomic-1")).status).toBe(201);
+    expect((await lookup(s1.body.session_token)).status).toBe(200);
+  });
+
   it("users.create refuses a short password", async () => {
     const r = await call(h, "POST", `${base()}/users`, { body: { email: "shortpw@x.io", name: "U", password: "short" } });
     expect(r.status).toBe(400);
@@ -245,12 +267,17 @@ describeDb("users", () => {
       await setEmail(user.id, { email: at("new"), notify_previous: true, project_name: "Acme" });
       expect(sink.messages.length).toBe(before + 1);
       expect(sink.messages.at(-1)!.data).toContain("Your Acme email address was changed");
-      // A name that isn't one line is refused before anything changes.
-      const r = await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${user.id}/email`, {
-        body: { email: at("x"), notify_previous: true, project_name: "Acme\nInc" },
-      });
-      expect(r.status).toBe(400);
-      expect(sink.messages.length).toBe(before + 1);
+      // A name identity cannot show (not one line, or blank once JavaScript's trim strips
+      // U+FEFF too) never blocks the change or the mail: the notice names the default.
+      for (const bad of ["Acme\nInc", "\ufeff", "\ufeff ", " \u00a0 "]) {
+        const n = sink.messages.length;
+        const r = await call(mailed, "PUT", `/internal/v1/pools/${p}/users/${(await mkUser()).id}/email`, {
+          body: { email: at(`bad${n}`), notify_previous: true, project_name: bad },
+        });
+        expect(r.status, JSON.stringify(bad)).toBe(200);
+        expect(sink.messages.length, JSON.stringify(bad)).toBe(n + 1);
+        expect(sink.messages.at(-1)!.data, JSON.stringify(bad)).toContain("Your Chelabase email address was changed");
+      }
     });
 
     it("set_email without notify_previous mails nothing", async () => {

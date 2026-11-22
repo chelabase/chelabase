@@ -12,7 +12,7 @@ import type { Mailer } from "./email/mailer.ts";
 import { HttpError, type Json } from "./http.ts";
 import { parsePoolName, type PoolRef } from "./pool-name.ts";
 import type { PoolRegistry } from "./registry.ts";
-import { codeRoutes, emailStatusRoute, inviteNoticeRoute, notifyEmailChanged, optProjectName } from "./routes/codes.ts";
+import { codeRoutes, emailStatusRoute, inviteNoticeRoute, notifyEmailChanged, optProjectName, replacePasswordEndingSessions } from "./routes/codes.ts";
 
 export type RouteId =
   | "pools.create"
@@ -425,12 +425,11 @@ const ROUTES: readonly Route[] = [
       return registry.use(pool, async (auth) => {
         const ctx = await context(auth);
         checkPasswordLength(ctx, password);
-        const user = await requireUser(ctx, id);
+        await requireUser(ctx, id);
         const hashed = await ctx.password.hash(password);
-        if (await ctx.internalAdapter.findCredentialAccount(id)) await ctx.internalAdapter.updatePassword(id, hashed);
-        else await ctx.internalAdapter.createAccount({ userId: id, providerId: "credential", accountId: user.id, password: hashed });
-        // A new password ends every session of the user, whoever called this route.
-        await ctx.internalAdapter.deleteUserSessions(id);
+        // The new password and the end of the user's sessions, whoever called this route, in one
+        // transaction: a failed delete cannot leave the new password stored.
+        await replacePasswordEndingSessions(ctx, id, hashed);
         return { status: 200, body: { status: true } };
       });
     },

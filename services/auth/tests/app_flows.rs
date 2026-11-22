@@ -3608,7 +3608,7 @@ async fn email_changed_notice_carries_the_project_name() {
 
 #[tokio::test]
 async fn a_project_name_identity_would_refuse_still_mails_under_the_default_name() {
-    // A project name may hold a line break; identity refuses that as a `project_name`, so the
+    // A project name may hold a line break; identity cannot show that as a `project_name`, so the
     // mail goes out under the service's default name instead of not at all.
     let h = harness_opts(true, 1, true).await;
     let mut branch = info(h.project, h.branch, true);
@@ -3617,4 +3617,28 @@ async fn a_project_name_identity_would_refuse_still_mails_under_the_default_name
     let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
     assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
     assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)]);
+}
+
+#[tokio::test]
+async fn a_project_named_only_a_byte_order_mark_mails_under_the_default_name() {
+    // JavaScript's `trim()` strips U+FEFF and Rust's does not, so identity treats these names
+    // as blank. Identity is the one judge of a name: it falls back to the default, so the code
+    // and the email-changed notice still go.
+    for name in ["\u{feff}", "\u{feff} "] {
+        let h = harness_opts(true, 1, true).await;
+        let mut branch = info(h.project, h.branch, true);
+        branch["project_name"] = json!(name);
+        h.internal.set_branch(h.branch, branch);
+        let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+        assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)], "{name:?}");
+        h.add_user("bob@example.com", true).await;
+        let s = h.sign_in("bob@example.com", PW).await;
+        assert_eq!(h.change_email("bob@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+        let sent = h.email_change_codes().pop().unwrap().2;
+        let a = h.confirm_email_change("bob@new.example", &sent, access(&s)).await;
+        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+        let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| n.project).collect();
+        assert_eq!(notices, vec![None], "{name:?}");
+    }
 }

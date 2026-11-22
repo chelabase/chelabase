@@ -227,28 +227,21 @@ pub(crate) fn str_field<'a>(body: &'a Value, key: &str) -> Result<&'a str, Refus
     }
 }
 
-/// `project_name`, checked as the service checks it: absent, or a non-empty single line of at
-/// most 128 UTF-16 units.
-pub(crate) fn project_field(body: &Value) -> Result<Option<String>, Refusal> {
-    let Some(v) = body.get("project_name") else {
-        return Ok(None);
-    };
-    match v.as_str() {
-        Some(name)
-            if !name.trim().is_empty()
-                && name.encode_utf16().count() <= 128
-                && !name
-                    .chars()
-                    .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}') =>
-        {
-            Ok(Some(name.to_string()))
-        }
-        _ => Err(refuse(
-            400,
-            "invalid_request",
-            "project_name must be a non-empty single-line string of at most 128 characters",
-        )),
-    }
+/// `project_name`, judged as the service judges it: a name it cannot show is not refused, it is
+/// left out and the mail names the default (`None`). Unusable is: not a string, blank (the
+/// service's `trim` is JavaScript's, which also strips U+FEFF), over 128 UTF-16 units, or
+/// holding a control character or line separator.
+pub(crate) fn project_field(body: &Value) -> Option<String> {
+    let name = body.get("project_name")?.as_str()?;
+    let blank = name
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .is_empty();
+    let usable = !blank
+        && name.encode_utf16().count() <= 128
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}');
+    usable.then(|| name.to_string())
 }
 
 fn bool_field(body: &Value, key: &str) -> Result<bool, Refusal> {
@@ -476,7 +469,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             let email = check_email(str_field(body, "email")?)?;
             let verified = bool_field(body, "email_verified")?;
             let notify = bool_field(body, "notify_previous")?;
-            let project = project_field(body)?;
+            let project = project_field(body);
             if p.users.iter().any(|u| u.email == email && u.id != *id) {
                 return Err(refuse(409, "conflict", "another user has this email"));
             }
@@ -503,6 +496,8 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             check_password(password)?;
             let at = user_idx(p, id)?;
             p.users[at].password = Some(password.to_string());
+            // A new password ends every session of the user, whoever called this route.
+            p.sessions.retain(|s| s.user_id != *id);
             (200, Some(json!({ "status": true })))
         }
         ("POST", ["users", id, "verify-email"]) => {

@@ -685,6 +685,24 @@ describeDb("codes", () => {
       expect((await confirm(user.id, next, code)).body.error).toBe("invalid_code");
     });
 
+    it("email_change notice under a name identity cannot show uses the default", async () => {
+      for (const bad of ["\ufeff", "\ufeff ", "Acme\nInc"]) {
+        const user = await mkUser();
+        const next = at("new");
+        const issued = await request(user.id, next, { project_name: bad });
+        expect(issued.status, JSON.stringify(bad) + JSON.stringify(issued.body)).toBe(201);
+        const mail = sink.messages.at(-1)!;
+        expect(mail.to).toEqual([next]);
+        expect(mail.data).not.toContain("Acme");
+        const code = /address is:\s+([0-9]{6})\b/.exec(textPart(mail.data))![1]!;
+        const before = sink.messages.length;
+        const r = await confirm(user.id, next, code, { project_name: bad });
+        expect(r.status, JSON.stringify(bad) + JSON.stringify(r.body)).toBe(200);
+        expect(sink.messages.length).toBe(before + 1);
+        expect(sink.messages.at(-1)!.data).toContain("Your Chelabase email address was changed");
+      }
+    });
+
     it("email_change notice names the project", async () => {
       const user = await mkUser();
       const next = at("new");

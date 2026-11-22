@@ -866,16 +866,11 @@ async fn publish_sync(app: &AppUsers, req: SyncRequest) {
     }
 }
 
-/// The project's name for its app users' mail, from the caller's own branch info. A name
-/// identity would refuse as `project_name` (blank, over 128 UTF-16 units, or holding a control
-/// character or line separator) is left out, and the mail names the service's default rather
-/// than not going at all.
+/// The project's name for its app users' mail, from the caller's own branch info, passed on as
+/// it is. Identity is the one judge of a name: one it cannot show (blank, too long, not a single
+/// line) is not refused there, the mail names its default, so no name can stop a mail.
 fn mail_name(info: &AppBranchInfo) -> Option<&str> {
-    info.project_name.as_deref().filter(|name| {
-        !name.trim().is_empty()
-            && name.encode_utf16().count() <= 128
-            && !name.chars().any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
-    })
+    info.project_name.as_deref()
 }
 
 /// Mails the user a code of `kind`, within [`reserve_code_issue`]: at most five of a kind an
