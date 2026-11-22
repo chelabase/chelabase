@@ -63,6 +63,8 @@ rust_reads=(
   'infra/workbench/*                                         self     chelabase'
   'infra/functions-runtime/*                                 self     chelabase'
   'infra/images/functions-runtime.Dockerfile                 self     chelabase'
+  'infra/mcp-runtime/*                                       self     chelabase'
+  'infra/images/mcp-runtime.Dockerfile                       self     chelabase'
   'infra/neon/NEON_REF                                       closure  bench-data-api'
   'scripts/compute-network-e2e.sh                            self     orchestrator'
   'scripts/neon-images.sh                                    self     chelabase-neon chelabase'
