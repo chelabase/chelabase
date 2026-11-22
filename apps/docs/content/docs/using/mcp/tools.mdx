@@ -1,0 +1,96 @@
+---
+title: The two tools
+description: The shape of spec and chelabase.request, and three worked examples drawn from the end-to-end test.
+---
+
+<AlphaNotice />
+
+Both tools take `code`: an async arrow function, as a string, up to 64 KiB. The server runs it and returns what it returns, as JSON text, so the code should return only what is needed. `execute` also takes `destructive` (a boolean, default false). Any other argument is refused as an invalid call, and nothing runs.
+
+## `search`
+
+The code sees one global, `spec`: the Chelabase API as an OpenAPI 3.1 object with every `$ref` resolved inline. It is far too large to return whole. Each operation carries `operationId`, `summary`, `tags`, `parameters`, `requestBody`, `responses`, its `x-errors` and an `x-class` of `read`, `write` or `destructive`. `info["x-spec-hash"]` identifies the version. `search` makes no API call, so it is always read-only.
+
+## `execute`
+
+The code sees one global, `chelabase`:
+
+```ts
+chelabase.request(req: {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  path: string;                       // a path from `search`, with its parameters filled in
+  query?: Record<string, string | number | boolean>;
+  body?: unknown;                     // sent as JSON
+}): Promise<{ status: number; ok: boolean; body: unknown }>
+```
+
+`request` does not throw on a 4xx or 5xx. Check `ok` and read the error from `body.error`. Only paths and methods that name an operation in the spec can be called, and each call is made as you, with your token, which the code never sees. A refusal by the server comes back the same way, as `{status: 403, ok: false, body: {error: {code}}}` (for example `operation_not_allowed` or `destructive_flag_required`). A method outside GET, HEAD, POST, PUT, PATCH and DELETE throws.
+
+Anything the code writes with `console.log` reaches the model as a second text block, cut at 4 KiB.
+
+The API answers are the ones the Management API gives: have the model read an operation's shapes with `search`, or see the [access reference](/reference/access) for who may call what. Table data is read and written through `/v1/databases/{id}/branches/{branch_id}/console/query` (see [Table API](/using/table-api)), and SQL runs through `/v1/databases/{id}/branches/{branch_id}/sql` (see [SQL editor](/using/sql-editor)).
+
+## Example: find an operation
+
+The model asks `search` which branch operations exist and what class each is:
+
+```js
+async () => Object.entries(spec.paths).flatMap(([path, ops]) =>
+  Object.entries(ops)
+    .filter(([, op]) => op.tags.includes("branches"))
+    .map(([method, op]) => ({ method: method.toUpperCase(), path, summary: op.summary, class: op["x-class"] })))
+```
+
+Then one operation's parameters and request schema:
+
+```js
+async () => {
+  const op = spec.paths["/v1/databases/{id}/branches"].post;
+  return { parameters: op.parameters, body: op.requestBody?.content["application/json"].schema };
+}
+```
+
+## Example: create a branch and query it
+
+One `execute` call can make several requests. This creates a branch, then reads a table on it. A branch's database can take a few seconds to become ready, so a real script retries the first query.
+
+```js
+async () => {
+  const made = await chelabase.request({
+    method: "POST",
+    path: "/v1/databases/<database id>/branches",
+    body: { name: "preview" },
+  });
+  if (!made.ok) return made.body.error;
+  const rows = await chelabase.request({
+    method: "POST",
+    path: `/v1/databases/<database id>/branches/${made.body.id}/console/query`,
+    body: { tree: { v: 1, op: "select", from: "orders", orderBy: [{ col: "id" }] } },
+  });
+  return { branch: made.body.id, status: rows.status, rows: rows.body };
+}
+```
+
+Creating a branch is a `write` operation and a `select` through `console/query` is a `read`, so no flag is needed. The new branch is its own: its writes don't reach the parent.
+
+## Example: a delete, with the flag
+
+Deleting a row is `destructive`. Without `destructive: true` the server refuses before anything is sent:
+
+```json
+{ "error": { "code": "destructive_flag_required",
+             "message": "a destructive operation needs execute's destructive: true; set it only when the user asked for this change",
+             "operations": ["consoleQuery"] } }
+```
+
+With the flag, the same code runs:
+
+```js
+async () => (await chelabase.request({
+  method: "POST",
+  path: "/v1/databases/<database id>/branches/<branch id>/console/query",
+  body: { tree: { v: 1, op: "delete", from: "orders", where: { col: "id", eq: 2 } } },
+})).status
+```
+
+The tool's description tells the model to set `destructive` only when you asked for that change. Whether a client asks you first is the client's setting: `execute` is annotated as destructive, and clients that confirm destructive tools will prompt.

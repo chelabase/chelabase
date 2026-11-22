@@ -1,0 +1,56 @@
+---
+title: Safety
+description: The destructive flag, read-only connections, how SQL runs and what each of them does and does not guarantee.
+---
+
+<AlphaNotice />
+
+The model's code is untrusted. Two checks sit between it and your data, and neither replaces the member's own permissions: every call is made with your token, so what the API refuses you, it refuses the model.
+
+## Operation classes
+
+Each operation has a class, shown as `x-class` in `search`.
+
+| Class | Count | What it is | What `execute` needs |
+|---|---|---|---|
+| `read` | 59 | Reads, including the POST routes that only read. | Nothing. |
+| `write` | 14 | Changes something without removing data, changing who can do what or touching a credential, for example creating a branch or a database. | Nothing. |
+| `destructive` | 90 | Removes or replaces data, changes who can do what, creates, replaces or invalidates a credential, or opens an outbound target. | `destructive: true`. |
+| excluded | 6 | Binary routes: the five storage upload routes and function deployment. | They can't be called from `execute`. |
+
+Four routes take their class from the request body, because one route does several things:
+
+- `console/query`: a select or count is `read`; an insert, or an update with a `where`, is `write`; a delete, a call, an update of every row, a batch holding one of those, or a tree that doesn't parse is `destructive`.
+- `sql`: `read` when the run is read-only (see below), otherwise `destructive`, whatever the SQL says.
+- Creating a storage bucket: `destructive` when it is public, otherwise `write`.
+- Applying schema changes: a dry run is `read` (or `write` when it carries a SQL expression); a real run is `destructive` when it carries SQL, adds a foreign key that cascades or sets values on delete or update, drops something, changes privileges, owners, schemas, policies or row-level security, changes a column's type, default or identity, lifts NOT NULL, or isn't recognised. Otherwise `write`.
+
+An operation the table doesn't know is treated as excluded. A run refused once for the flag or for a read-only connection stays refused: later calls in the same run answer the same, and the tool result is that error whatever the code returns.
+
+## Read-only mode
+
+`chelabase mcp --read-only` (or the `Chelabase-MCP-Read-Only: true` header) makes a connection read-only. Only `read` operations run: any `write` or `destructive` call answers `read_only_connection`, and the tool is annotated read-only. The header can only narrow a connection, never widen it.
+
+## How SQL runs
+
+`POST /v1/databases/{id}/branches/{branch_id}/sql` is the one route where the model can run arbitrary SQL.
+
+- **Without `destructive: true`, or on a read-only connection,** the server sets `read_only: true` on the run whatever the code sent. Postgres then runs the script in a read-only transaction. A script may hold several statements, but only `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN`, at most 100. Transaction control, `SET`, `COPY`, `DO`, `CALL`, `LOCK`, `PREPARE` and the rest are refused whole with `read_only_script_refused`, and nothing runs. A write made inside a function that a `SELECT` calls, and `nextval`, are refused by Postgres. An error's `position` counts from the start of its statement.
+- **With `destructive: true`** (and not read-only), the script runs as written, on the same terms as in the [SQL editor](/using/sql-editor).
+
+What a read-only run still permits:
+
+- Effects that aren't writes: row locks (`SELECT … FOR UPDATE`), advisory locks, `pg_sleep`, and signalling the role's own backends. They are bounded by the role's rights, the 300 s cap on a run and the connection closing at the end.
+- Reading anything the role may read.
+- **Extensions that open their own connections are outside the guarantee.** With `dblink` or a foreign-data wrapper installed, and a valid login password for the target, `dblink_exec` writes through a separate session that isn't read-only. Don't install such extensions on a database whose roles should only read.
+
+The engine is described in [SQL editor internals](/architecture/sql-editor#read-only-runs).
+
+## What the model never sees, and what it can
+
+- **Your token.** It is added by the server and never enters the sandbox. An answer that holds it is refused.
+- **Credentials in answers.** Operations that answer with a credential are refused with `secrets_unavailable`: `getDatabaseConnection`, `getBranchConnection`, `createKey`, `rotateKey`, `createPersonalLogin`, `resetPersonalLoginPassword`, `putFunction`, `updateFunction`, `createStorageWebhook`, `rotateStorageWebhookSecret`, `createInvite`, `createProjectInvite`, `resendInvite`, `storageSignObject` and `storageResolveObjects`. The call is not sent, so for the create and rotate operations nothing changes.
+- **Your own data is not sealed.** An answer that returns data you stored can hold anything in it, credentials included, and the model reads it. That covers table and SQL results (`console/query`, `sql`), object contents, a service's logs, SQL text in a merge plan, a table cell read with `getCell` (`/value`), a saved query's `/sql` and a function's `last_error`. Don't point the connection at a database whose rows hold secrets you don't want the model to read.
+- **No network.** The sandbox has no route out; the only thing code can reach is `chelabase.request`, through the server.
+
+Operators can read what ran: [MCP server](/self-hosting/mcp#the-audit-log).

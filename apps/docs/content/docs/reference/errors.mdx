@@ -242,6 +242,24 @@ The gateway authenticates data API requests before they reach the data API, and 
 
 A bad user token never falls back to the key's own role.
 
+## MCP tool errors
+
+These come from the MCP server's tools (`search` and `execute`), not the HTTP API. A failed tool call is a tool result with `isError: true` and one text block: `{"error": {"code", "message"}}`, with `retry_after_ms` on `rate_limited`, `operations` on a refusal, and `calls` (each `{operation, status}`) whenever an `execute` run made API calls and ended in `calls_unfinished`, `timeout`, `threw` or a refusal. A call listed as `unknown` may have been applied. See [Limits and errors](/using/mcp/limits-and-errors) for the detail.
+
+| Code | Meaning |
+|---|---|
+| `invalid_code` | The code is over 64 KiB, doesn't parse, or isn't a function. |
+| `threw` | The code threw. |
+| `timeout` | The run passed the time limit (30 s by default). |
+| `not_serializable` | The value returned can't be written as JSON, or is over 4 MiB. |
+| `runtime_unavailable` | The sandbox couldn't run the code: not configured, restarting, or restarted during the run (a busy loop does this). |
+| `rate_limited` | Over the per-member rate or concurrency limit, or the server's. `retry_after_ms` says when to retry. |
+| `destructive_flag_required` | A destructive operation was called without `destructive: true`. |
+| `read_only_connection` | A read-only connection called an operation that isn't a read. |
+| `calls_unfinished` | The code returned while an API call it made had no answer. `calls` lists them. |
+
+Inside `execute`, `chelabase.request` answers these as an API-shaped error instead of throwing: `operation_not_allowed` (403), `destructive_flag_required` (403), `read_only_connection` (403), `secrets_unavailable` (403), `too_many_calls` (429), `request_too_large` (413), `invalid_request` (400), `response_too_large` (502), `binary_body` (502), `upstream_unavailable` (502) and `timeout` (504).
+
 ## Data API errors
 
 The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:

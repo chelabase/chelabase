@@ -1,0 +1,87 @@
+---
+title: "MCP server"
+description: "The request path, the member-token credential, the spec bundle, the policy tables, the read-only SQL path, and the guarantees with their limits."
+---
+
+The MCP server (`services/mcp`) and its sandbox runtime (`infra/mcp-runtime`) let an AI client work with the Management API as the signed-in member. For how to use it, see [MCP](/using/mcp); for how to run it, [MCP server](/self-hosting/mcp). It runs only with the `mcp` compose profile.
+
+## The request path
+
+```text
+client -> bridge -> gateway -> mcp -> mcp-runtime -> mcp (callback) -> gateway -> API
+```
+
+1. **Client and bridge.** A client speaks MCP over Streamable HTTP, usually through `chelabase mcp`, a stdio bridge that posts each message to `/mcp` with the member's token (refreshing it, and retrying once on a 401).
+2. **Gateway.** Routes `/mcp` to `mcp` and forwards the bearer unchecked. It needs `CHELABASE_MCP_URL`; unset, `/mcp` is 404.
+3. **`mcp`, the public listener.** The only check of the token. It then admits the call (rate and concurrency limits), and hands the code to the runtime.
+4. **`mcp-runtime`.** workerd runs the code in a fresh isolate. The isolate has no outbound access of its own. Its one way out is `chelabase.request`, which posts to `mcp`'s internal listener, named by the run's random 256-bit `exec_id`.
+5. **`mcp`, the callback.** Decides whether the call is an operation the run may make (below), and makes it as the member, to the gateway, with the member's token and a `Chelabase-Via-Mcp: 1` header. The gateway authenticates it like any other API call.
+6. **The API** answers as it would to the member in Studio. `mcp` hands the code `{status, ok, headers, body}` with only `content-type`, `retry-after` and `x-request-id`.
+
+The runtime lives on `mcp-sandbox`, an internal network shared with `mcp` alone. It holds no secret, and the member's token is added in step 5, so it never enters the sandbox. The `mcp` service itself mounts one secret, the member public key, and has no database or key of its own.
+
+## The credential
+
+Every `/mcp` request needs a member access token, verified with `auth/member-jwt.pub` and the issuer from `CHELABASE_AUTH_HOST`. It reads headers only: a bad token is refused before the body is read. A token with under 60 seconds left is refused, so a run can't outlive its credential. The token's `sub` is the member and its `tid` the tenant; both go in the audit line, with `credential=member`. The `Chelabase-MCP-Read-Only: true` header can narrow a connection and never widen it. The `credential` field exists because the `mcp-oauth` epic will add a second kind of token; it is not available yet.
+
+Because the member's token is what the API sees, the member's role, project access and suspended or removed state all apply on every call. The server grants nothing of its own.
+
+## The spec bundle
+
+`openapi/mcp.json` is what `search` queries and what `execute` checks calls against. `services/mcp/src/spec.rs` builds it from `management.json` and `data.json`; `just api-gen` rewrites it, and the `spec_bundle_is_current` test fails when it is stale. See [API generation](/architecture/api-generation#the-mcp-spec-bundle). Each operation in the bundle carries its `x-class`. Excluded operations are not in the bundle at all: `execute` answers `operation_not_allowed` for them, and `search` doesn't show them.
+
+## The policy table
+
+`services/mcp/src/policy.rs` holds one row per operation of the Management API: `(operationId, method, class)`. The classes are `read` (59), `write` (14), `destructive` (90) and `excluded` (6, the binary routes). Four routes decide their class from the request body (`consoleQuery`, `runSql`, `storageCreateBucket`, `applySchemaChanges`); the table row is the class when the body can't be read: the route's strictest. Within `applySchemaChanges`, a foreign key that cascades or sets values on delete or update is destructive.
+
+The table fails closed: an operation it lacks is excluded at run time, the bundle generator refuses to build without a class for every operation, and a test fails when the API and the table disagree.
+
+For each call the host works through, in order:
+
+1. The `exec_id` must name a live `execute` run whose deadline hasn't passed, or the answer is a bare 404.
+2. A run that was refused once stays refused.
+3. At most `CHELABASE_MCP_MAX_CALLS` calls.
+4. The path must be canonical and match an operation of the bundle. Anything else, and every excluded operation, is `operation_not_allowed`.
+5. For `runSql`, a run without the `destructive` flag, or on a read-only connection, gets `read_only: true` whatever the code sent; the body is then classed.
+6. A read-only connection allows `read` only. A `destructive` operation needs the flag.
+7. An operation that answers with a credential isn't sent.
+8. The call is forwarded; only `accept` and `x-upsert` of the code's headers pass; redirects aren't followed.
+9. The answer is limited in size and, if it holds the member's token, refused.
+
+## The credential-field tables
+
+`services/mcp/src/secret_fields.rs` keeps two tables, filled from the handlers and their response types rather than from field names:
+
+- the locations in each operation's answer that hold a credential (a connection string, a data key, a signing secret, an invite link, a signed storage URL, a password);
+- the request fields that are write-only credential inputs.
+
+Today the first table decides: `execute` doesn't send an operation that answers with one, and answers `secrets_unavailable`. The epic `mcp-sealed` will replace those fields with sealed handles that the sandbox can't read; until then they are refused. Tests find every field in the bundle that is named like a credential and require it to be in one table or shown not to be one.
+
+## The read-only SQL path
+
+A `runSql` call made without the flag, or on a read-only connection, is rewritten to `read_only: true` and forwarded. The orchestrator then parses the script with `pg_query`, allows only `SELECT`, `SHOW` and `EXPLAIN` (up to 100 statements), and runs it in a `BEGIN TRANSACTION READ ONLY` that is always rolled back, on a connection that is never reused. Postgres, not a parser, decides what is a write. See [SQL editor internals](/architecture/sql-editor#read-only-runs).
+
+## Guarantees and their limits
+
+What holds:
+
+- **Nothing runs without a member token.** A request without a valid one is refused before its body is read.
+- **The model acts as the member.** Every API call carries the member's own token and passes the gateway and the API's own checks. A call outside the member's rights is refused by the API, not by `mcp`.
+- **The sandbox has no network.** It can reach `mcp`'s internal listener and nothing else, and calls reach only operations of the bundle.
+- **A destructive operation needs the flag and a read-only connection runs reads only,** checked by the host for every call, and a run refused once stays refused whatever the code does next.
+- **A write that happened is never silent.** Every call the host forwards gets one audit line. If a call's answer never reached the code (cut at the deadline or at the end of the run), the tool result is an error listing every call with its status, and an `unknown` one may have been applied. A write is reported either as an answer the code saw or as `unknown`.
+- **The member token and the credential-answering operations stay out of the sandbox,** and out of the audit log.
+- **Calls are bounded:** by time, size, rate and concurrency (see [Limits and errors](/using/mcp/limits-and-errors)).
+
+What does not hold:
+
+- **Table data isn't sealed.** The answers that return data the member stored (`console/query`, `sql`, object contents, a service's logs, SQL text in a merge plan, a table cell's `/value`, a saved query's `/sql`, a function's `last_error`) can hold anything the member put there, credentials included. The model reads them. This is the residual the credential tables can't close.
+- **Read-only isn't a sandbox for Postgres.** A read-only run still permits effects that aren't writes: row locks (`SELECT … FOR UPDATE`), advisory locks, `pg_sleep` and signalling the role's own backends. They are bounded by the role's rights, the 300 s cap and the connection closing. An extension that opens its own connection (`dblink`, a foreign-data wrapper) is outside the guarantee: with a valid login password, `dblink_exec` writes through a separate session.
+- **The `destructive` flag is a confirmation step the model sets itself.** The server checks that it was set; it can't check that the user asked. A client that confirms destructive tools with the user is the real guard. A read-only connection is the stronger one.
+- **Failed token checks aren't rate-limited in `mcp`.** A refusal costs one signature check, and a shared bucket would let bad tokens lock out good ones. Per-address limiting belongs at the gateway.
+- **A resource attack on the runtime is bounded, not prevented.** A busy loop or a large buffer restarts the runtime, and runs in flight at that moment fail with `runtime_unavailable`.
+- **Excluded operations** (the binary routes) can be called by the member through the API, just not from the sandbox.
+
+## Audit
+
+`mcp` writes a `tool call` line per call and an `api call` line per API call, joined on `exec_id`. Fields are listed in [MCP server](/self-hosting/mcp#the-audit-log).
