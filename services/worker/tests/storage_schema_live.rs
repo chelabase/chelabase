@@ -210,7 +210,7 @@ ROLLBACK;"
     async fn direct(&self, user: &str, password: &str, sql: &str) -> Result<String, String> {
         let locator = DockerLocator::connect(
             &std::env::var("CHELABASE_COMPUTE_NETWORK")
-                .unwrap_or_else(|_| "chelabase_compute".into()),
+                .unwrap_or_else(|_| "chelabase_compute-internal".into()),
             &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
         )
         .expect("the Docker client");
@@ -739,7 +739,7 @@ async fn bootstrap(fx: &Fx) {
 /// A psql session to the compute that stays open (stdin piped).
 async fn session(fx: &Fx, user: &str, password: &str) -> tokio::process::Child {
     let locator = DockerLocator::connect(
-        &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute".into()),
+        &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute-internal".into()),
         &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
     )
     .expect("the Docker client");

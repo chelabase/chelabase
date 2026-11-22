@@ -27,6 +27,8 @@
 #                      to a private host off the allowlist is refused, one to the allowlisted
 #                      receiver (`hooks`, over http: CHELABASE_WEBHOOKS_ALLOW_*) gets the upload's
 #                      object.created event, and its Chelabase-Signature verifies with the secret
+#   7a. no egress       with no `compute-egress` (the profile is off), a compute's lookup of an outside
+#                      name fails within a stated bound, and a stack name still resolves
 #   8. email            an invite by email reaches Mailpit through the identity service's SMTP
 #                      (the password file read at 10001:0600), with its code
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
@@ -173,7 +175,7 @@ free_port() {
 }
 
 # free_octet: a second octet N so that 10.N.0.0/16 overlaps no Docker network (the install's
-# control subnet is a /22 in it).
+# control and compute subnets are /22s in it).
 free_octet() {
   local n subnets
   subnets="$(docker network inspect $(docker network ls -q) -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null || true)"
@@ -188,7 +190,8 @@ free_octet() {
 }
 
 # write_env <project> <port> [extra lines…]: the install's .env: .env.example with the hosts moved
-# to the port, the settings Compose can't derive, a private control subnet and free proxy ports.
+# to the port, the settings Compose can't derive, private control and compute subnets (and the
+# compute network's egress address) and free proxy ports.
 write_env() {
   local p="$1" port="$2" n pg_port http_port
   shift 2
@@ -203,10 +206,13 @@ write_env() {
     echo "CHELABASE_AUTH_HOST_NAME=auth.chelabase.localhost"
     echo "CHELABASE_PUBLIC_PORT=$port"
     echo "CHELABASE_PUBLIC_SECURE=false"
-    echo "CHELABASE_CONTROL_SUBNET=10.$n.0.0/22"
-    echo "CHELABASE_CONTROL_COMPUTE_RANGE=10.$n.2.0/23"
-    echo "CHELABASE_ORCHESTRATOR_CONTROL_IP=10.$n.0.10"
-    echo "CHELABASE_REALTIME_CONTROL_IP=10.$n.0.12"
+    echo "CHELABASE_CONTROL_INTERNAL_SUBNET=10.$n.0.0/22"
+    echo "CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE=10.$n.2.0/23"
+    echo "CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP=10.$n.0.10"
+    echo "CHELABASE_REALTIME_CONTROL_INTERNAL_IP=10.$n.0.12"
+    echo "CHELABASE_COMPUTE_SUBNET=10.$n.8.0/22"
+    echo "CHELABASE_COMPUTE_RANGE=10.$n.10.0/23"
+    echo "CHELABASE_COMPUTE_EGRESS_IP=10.$n.8.2"
     echo "CHELABASE_PROXY_PORT=$pg_port"
     echo "CHELABASE_PROXY_HTTP_PORT=$http_port"
     if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]]; then
@@ -578,6 +584,29 @@ out="$(curl -sS --max-time 30 --resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1" --
 [[ "${out##*$'\n'}" == 200 ]] && jq -e '.rows[0].v == 42' <<<"${out%$'\n'*}" >/dev/null ||
   die "SQL over HTTP at $http_url: ${out##*$'\n'} $(head -c 300 <<<"${out%$'\n'*}")"
 pass "from the host: psql (verify-full, the CA from docker compose cp) created and read a row; SQL over HTTP read it"
+
+# ---- 7a. no outbound name resolution --------------------------------------------------------------
+
+step "the default install has no outbound name resolution"
+# Production installs run no `compute-egress` (its profile is off): the compute's resolver is pinned
+# at the egress address, where nothing listens, so an outside name must fail to resolve. The bound:
+# the lookup is wrapped in `timeout 30` and has to fail (not resolve) inside it; a name of the
+# stack itself still resolves through Docker's own resolver.
+[[ -z "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=compute-egress")" ]] ||
+  die "the default install runs a compute-egress container"
+compute_c="$(docker ps -q --filter "label=chelabase.dev/stack=$PROJECT" | head -n1)"
+[[ -n "$compute_c" ]] || die "no running compute of $PROJECT"
+want_dns="$(sed -n 's/^CHELABASE_COMPUTE_EGRESS_IP=//p' "$tmp/$PROJECT.env")"
+[[ "$(docker inspect -f '{{range .HostConfig.Dns}}{{.}} {{end}}' "$compute_c")" == "$want_dns " ]] ||
+  die "the compute's resolver is not the pinned egress address $want_dns"
+lookup_start=$SECONDS
+if timeout 30 docker exec "$compute_c" getent hosts example.com >/dev/null 2>&1; then
+  die "the compute resolved example.com in the default install"
+fi
+lookup_secs=$((SECONDS - lookup_start))
+((lookup_secs < 30)) || die "the lookup of an outside name didn't fail within the 30 s bound"
+docker exec "$compute_c" getent hosts orchestrator >/dev/null 2>&1 || die "the compute can't resolve a name of the stack (orchestrator)"
+pass "the default install: an outside name doesn't resolve from the compute (failed in $lookup_secs s, bound 30 s), stack names do"
 
 # ---- 7b. object storage --------------------------------------------------------------------------
 

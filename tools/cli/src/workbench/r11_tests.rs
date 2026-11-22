@@ -471,10 +471,10 @@ fn computes_join_the_stacks_compute_network() {
     let env: BTreeMap<String, String> = keys_of(&render_stack_env(ENV_EXAMPLE, &stack_input()))
         .into_iter()
         .collect();
-    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase-feat-x_compute");
+    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase-feat-x_compute-internal");
     assert_eq!(
         env["CHELABASE_COMPUTE_CONTROL_NETWORK"],
-        "chelabase-feat-x_control"
+        "chelabase-feat-x_control-internal"
     );
 }
 

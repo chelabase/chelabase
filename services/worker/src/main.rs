@@ -416,6 +416,10 @@ async fn serve_reset_password(worker: Arc<RealWorker>, client: async_nats::Clien
 // --- Reconcile ---------------------------------------------------------------
 
 async fn reconcile_loop(worker: Arc<RealWorker>, js: async_nats::jetstream::Context) {
+    // compute-network-reach: computes off the compute and control networks are moved at once,
+    // before the first pass (which creates them again), and then at the start of every pass.
+    // It asks Docker only.
+    worker.migrate_compute_networks().await;
     // First pass after one period, so queued jobs are picked up (and their rows
     // refreshed) before reconcile judges anything stale.
     let mut every = tokio::time::interval_at(

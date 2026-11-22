@@ -44,7 +44,10 @@
 #      no secret, volume, port or setting; `mcp` mounts only the member public key and binds its
 #      public listener on the default network's alias, its internal one on `mcp-sandbox`'s; each
 #      has an exact set of compose keys (nothing like cap_add, pid or devices can be added).
-# Every render takes every profile (sites, runner, services, mcp), so profiled services
+#  10. compute-egress (compute-network-reach m4): no secret, in either render. It has no `secrets`,
+#      no mount of the `secrets` volume or of the keys or state dir, and no Docker socket; the
+#      workbench gives it one read-only bind, its host-built binary, and nothing else.
+# Every render takes every profile (sites, runner, services, compute-egress, mcp), so profiled services
 # are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -63,7 +66,7 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile mcp >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile compute-egress --profile mcp >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 # The workbench runs mcp from m12 (#356) on. Until its overlay defines the service, the base's mcp
 # can't render under it (it waits for init-secrets, which the overlay turns off), so the workbench
@@ -71,7 +74,7 @@ compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --pr
 wb_mcp=()
 if grep -qE '^  mcp:' "$dir/docker-compose.workbench.yml"; then wb_mcp=(--profile mcp); fi
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services "${wb_mcp[@]}" \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services --profile compute-egress "${wb_mcp[@]}" \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -489,8 +492,8 @@ for render in base wb; do
       err "$render: $svc must not be on the runtime's network"
   done
   got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
-  # m13b: `compute` (no alias: it dials computes and listens on nothing there).
-  [[ "$got" == '{"compute":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
+  # m13b: `compute-internal` (no alias: it dials computes and listens on nothing there).
+  [[ "$got" == '{"compute-internal":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
 # #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
@@ -648,6 +651,24 @@ compose chelabase-boundary "$root/infra/compose/.env.example" -f "$root/infra/co
   err "rendering the base file without the mcp profile failed"
 got="$(jq -r '.services | keys[] | select(. == "mcp" or . == "mcp-runtime")' "$tmp/noprofile.json" | tr '\n' ' ')"
 [[ -z "$got" ]] || err "without --profile mcp the render still has [$got]"
+
+# 10. compute-egress sees no secret: no compose secret, no volume that reaches the secrets volume,
+# the keys or the state dir or the Docker socket, and no setting that names a secret file.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  [[ "$(jq -r '.services | has("compute-egress")' "$f")" == true ]] || err "$render: no compute-egress service"
+  got="$(jq -r --arg k "$keys" --arg st "$state" '.services["compute-egress"] | [
+      ((.secrets // [])[] | "compose secret \(.source)"),
+      ((.volumes // [])[] | select(.type != "bind" or (.read_only | not) or ((.source // "") | test("/target/debug/compute-egress$") | not))
+        | "volume \(.type) \(.source // "") -> \(.target)"),
+      ((.volumes // [])[] | select((.source // "") | (startswith($k + "/") or startswith($st + "/") or contains("docker.sock")))
+        | "mount \(.source)"),
+      ((.volumes_from // [])[] | "volumes_from \(.)"),
+      ((.environment // {}) | to_entries[] | select(.key | test("(_FILE|_KEY|_PASSWORD|_TOKEN|_SECRET|_URL|_URI)$")) | "setting \(.key)")
+    ] | join(", ")' "$f")"
+  [[ -z "$got" ]] || err "$render: compute-egress reaches a secret or something it must not: $got"
+done
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

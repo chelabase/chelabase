@@ -110,6 +110,7 @@ check-scripts:
     scripts/tests/compose-secret-argv.sh
     scripts/tests/compose-overlay-equiv.sh
     scripts/tests/compose-secret-boundary.sh
+    scripts/tests/compose-compute-network-internal.sh
     scripts/tests/compose-no-fixed-secrets.sh
     scripts/tests/compose-env-tunables.sh
     scripts/tests/http-no-redirects.sh
@@ -602,6 +603,12 @@ app-users-e2e:
 compute-network-e2e:
     cargo run -q -p chelabase -- workbench run scripts/compute-network-e2e.sh
 
+# Live check of compute egress (compute-network-reach): from a real compute, a listed destination
+# answers (dblink, postgres_fdw, a subscription) and an unlisted name, an unlisted port and a direct
+# address don't. Attaches the stack's compute-egress container to a test network for the run.
+compute-egress-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/compute-egress-e2e.sh
+
 # Live check of SeaweedFS's bucket boundary (object-storage m2): neon and storage identities each
 # reach only their own bucket (list, write, copy), no unauthenticated port is reachable, no key in inspect
 storage-iam-e2e:
@@ -705,6 +712,12 @@ auth-e2e:
 # Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
 selfhost-e2e:
     scripts/selfhost-e2e.sh
+
+# compute-network-reach: the production upgrade from main's release on the legacy networks, with
+# only `docker compose up -d --wait`. Builds this checkout's images (UPGRADE_PROD_E2E_IMAGES=local uses
+# `just images`'s); UPGRADE_PROD_E2E_DRY_RUN=1 only renders the configs.
+upgrade-prod-e2e:
+    scripts/upgrade-prod-e2e.sh
 
 # The self-hosted install behind a TLS proxy with no port in the hosts (#24): nginx with a
 # throwaway CA in front of a throwaway project, on the local release images (`just images`;

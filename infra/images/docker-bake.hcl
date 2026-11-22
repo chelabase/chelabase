@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "mcp", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "mcp", "compute-egress", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
 }
 
 target "_app" {
@@ -95,6 +95,12 @@ target "mcp" {
   inherits = ["_app"]
   target   = "mcp"
   tags     = ["${REPO}/mcp:${TAG}"]
+}
+# Compute egress (compute-network-reach): profile `compute-egress`. Unpublished until its first pin.
+target "compute-egress" {
+  inherits = ["_app"]
+  target   = "compute-egress"
+  tags     = ["${REPO}/compute-egress:${TAG}"]
 }
 target "init" {
   inherits = ["_app"]

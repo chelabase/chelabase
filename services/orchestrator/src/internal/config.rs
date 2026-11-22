@@ -21,8 +21,9 @@ pub struct InternalConfig {
     pub storage_token: String,
     pub storcon_url: String,
     pub compute_jwt_dir: PathBuf,
+    /// `CHELABASE_COMPUTE_NETWORK` (default `chelabase_compute-internal`).
     pub compute_network: String,
-    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control`): the network the
+    /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control-internal`): the network the
     /// console and the SQL editor reach computes on, over TLS.
     pub compute_control_network: String,
     /// `CHELABASE_COMPUTE_TLS_DIR` (default `.chelabase/orchestrator-tls`): the client pair the
@@ -90,10 +91,10 @@ impl InternalConfig {
             realtime_token: secret(DEV_BEARERS[4].0, DEV_BEARERS[4].1)?,
             storcon_url: or("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             compute_jwt_dir: PathBuf::from(or("CHELABASE_COMPUTE_JWT_DIR", ".chelabase/neon")),
-            compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_compute"),
+            compute_network: or("CHELABASE_COMPUTE_NETWORK", "chelabase_compute-internal"),
             compute_control_network: or(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
-                "chelabase_control",
+                "chelabase_control-internal",
             ),
             compute_tls_dir: PathBuf::from(or(
                 "CHELABASE_COMPUTE_TLS_DIR",
@@ -445,7 +446,7 @@ mod tests {
         assert_eq!(c.rest_token, "chelabase-dev-rest-internal");
         assert_eq!(c.storcon_url, "http://127.0.0.1:1234");
         assert_eq!(c.compute_jwt_dir, PathBuf::from(".chelabase/neon"));
-        assert_eq!(c.compute_network, "chelabase_compute");
+        assert_eq!(c.compute_network, "chelabase_compute-internal");
         assert_eq!(c.stack, "main");
         assert_eq!(c.control_plane_uri.as_str(), "http://orchestrator:8083");
     }
@@ -453,7 +454,7 @@ mod tests {
     #[test]
     fn compute_tls_settings_and_member_login_cidrs() {
         let c = InternalConfig::from_lookup(|_| None).unwrap();
-        assert_eq!(c.compute_control_network, "chelabase_control");
+        assert_eq!(c.compute_control_network, "chelabase_control-internal");
         assert_eq!(c.compute_tls_dir, PathBuf::from(".chelabase/orchestrator-tls"));
         // Unset: read as None, and asking for the logins is the startup error.
         assert_eq!(c.member_login_cidrs, None);

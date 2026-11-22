@@ -11,12 +11,13 @@ use bollard::Docker;
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerCreateBody, ContainerStateStatusEnum, HostConfig, NetworkConnectRequest,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerStateStatusEnum, ContainerSummary, ContainerSummaryStateEnum,
+    HostConfig, NetworkConnectRequest, NetworkInspect, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptionsBuilder, DownloadFromContainerOptions,
-    ListContainersOptions, RemoveContainerOptions, StartContainerOptions, UploadToContainerOptions,
+    InspectNetworkOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
+    UploadToContainerOptions,
 };
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
@@ -131,6 +132,94 @@ pub struct DockerSettings {
     /// its address there). A compute joins it after create, before start; when it is
     /// `network` itself there is nothing to join.
     pub control_network: String,
+    /// The networks computes ran on before they became internal
+    /// (`CHELABASE_LEGACY_COMPUTE_NETWORKS`): the worker removes each once nothing is attached
+    /// to it. Only these names are ever removed.
+    pub legacy_networks: Vec<String>,
+    /// The resolver computes are created with (`CHELABASE_COMPUTE_EGRESS_DNS`, the
+    /// compute-egress service); `None` leaves Docker's default.
+    pub egress_dns: Option<IpAddr>,
+}
+
+/// The option Docker reads for a bridge's IPv4 gateway mode.
+pub const GATEWAY_MODE_IPV4: &str = "com.docker.network.bridge.gateway_mode_ipv4";
+/// The option Docker reads for a bridge's IPv6 gateway mode.
+pub const GATEWAY_MODE_IPV6: &str = "com.docker.network.bridge.gateway_mode_ipv6";
+
+/// A network computes may run on: Docker `internal` (no default route) and both gateway modes
+/// `isolated` (the bridge has no host address). `inspect` is what Docker answered for `name`;
+/// its own name must be `name` exactly, since Docker also resolves an id prefix.
+pub fn check_compute_network(name: &str, inspect: &NetworkInspect) -> anyhow::Result<()> {
+    if inspect.name.as_deref() != Some(name) {
+        bail!(
+            "network {name}: Docker answered with network {:?}, not one of that name",
+            inspect.name.as_deref().unwrap_or("")
+        );
+    }
+    if inspect.internal != Some(true) {
+        bail!("network {name} is not internal: computes run only on internal networks");
+    }
+    for option in [GATEWAY_MODE_IPV4, GATEWAY_MODE_IPV6] {
+        let mode = inspect.options.as_ref().and_then(|o| o.get(option));
+        if mode.map(String::as_str) != Some("isolated") {
+            bail!("network {name} lacks {option}=isolated: computes run only on isolated networks");
+        }
+    }
+    Ok(())
+}
+
+/// A network by name and the id Docker gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRef {
+    pub name: String,
+    pub id: String,
+}
+
+/// One of this stack's computes and the networks it is attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedCompute {
+    pub endpoint_id: String,
+    /// The container's id: a removal is by id, so a container created since under the same
+    /// name is never the one removed.
+    pub container_id: String,
+    /// The container exists but was never started: a create is in flight (the control network
+    /// is joined after the container exists).
+    pub mid_create: bool,
+    /// Its attachments: each network's name and the id it was attached by (empty when Docker
+    /// doesn't say).
+    pub networks: Vec<NetworkRef>,
+}
+
+/// The networks computes should be on, and where each of this stack's computes is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeNetworks {
+    /// The compute and control networks (one entry when they are the same network).
+    pub expected: Vec<NetworkRef>,
+    pub computes: Vec<AttachedCompute>,
+}
+
+/// A listed legacy network as Docker has it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyNetwork {
+    /// No network of that name.
+    Missing { name: String },
+    /// It exists, with these containers attached (their names).
+    Present {
+        network: NetworkRef,
+        members: Vec<String>,
+    },
+    /// Docker couldn't say.
+    Unreadable { name: String, error: String },
+}
+
+/// What removing a legacy network came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkRemoval {
+    Removed,
+    /// It was already gone.
+    Gone,
+    /// Docker refused: something is still attached.
+    Occupied,
 }
 
 /// The env variable that picks the compute backend.
@@ -206,6 +295,23 @@ pub trait ComputeBackend: ComputeLocator {
     /// in a crash loop. Never one that is mid-create or mid-removal, or is serving. A listing
     /// that fails is an error, never an empty list.
     fn list_not_running(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
+    /// The compute and control networks by id, and every one of this stack's computes with
+    /// its attachments. Only containers carrying both the endpoint label and this stack's
+    /// label are listed. A failed listing or inspect is an error, never an empty answer.
+    fn compute_networks(&self) -> impl Future<Output = anyhow::Result<ComputeNetworks>> + Send;
+    /// Each configured legacy network as Docker has it now, in the configured order.
+    fn legacy_networks(&self) -> impl Future<Output = Vec<LegacyNetwork>> + Send;
+    /// Removes the compute container `container_id` (forced). One already gone is fine.
+    fn remove_compute_container(
+        &self,
+        endpoint_id: &str,
+        container_id: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Removes the network `network` by its id; Docker refuses while anything is attached.
+    fn remove_network(
+        &self,
+        network: &NetworkRef,
+    ) -> impl Future<Output = anyhow::Result<NetworkRemoval>> + Send;
     /// Runs `sql` (stdin) with psql inside the compute, as `opts.user` (`cloud_admin` when
     /// `None`); returns stdout. A call that outlasts `opts.timeout` fails with [`SqlTimedOut`]
     /// (tell it by [`is_timeout`], never by the text), and the psql inside the compute keeps
@@ -234,11 +340,16 @@ pub trait ComputeBackend: ComputeLocator {
 
 /// The container to create for an endpoint. The token goes in the environment, never argv.
 /// Nothing is published on the host: the stack reaches a compute on the compute network.
+///
+/// Its resolver is `docker.egress_dns` when set. It runs with no capability and no privilege
+/// gain: Postgres and compute_ctl run as the image's own unprivileged user, so nothing in it
+/// needs one, and without `NET_RAW` it can't send frames for an address that isn't its own on
+/// the shared bridges.
 pub fn create_body(
     endpoint_id: &str,
     compute_token: &str,
     settings: &ComputeSettings,
-    network: &str,
+    docker: &DockerSettings,
 ) -> ContainerCreateBody {
     ContainerCreateBody {
         image: Some(settings.image.clone()),
@@ -253,13 +364,16 @@ pub fn create_body(
             .into(),
         ),
         host_config: Some(HostConfig {
-            network_mode: Some(network.to_string()),
+            network_mode: Some(docker.network.clone()),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
             }),
             memory: Some(MEMORY_BYTES),
             nano_cpus: Some(NANO_CPUS),
+            dns: docker.egress_dns.map(|ip| vec![ip.to_string()]),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             ..Default::default()
         }),
         ..Default::default()
@@ -466,6 +580,47 @@ fn docker_status(state: ContainerStateStatusEnum) -> ComputeStatus {
     }
 }
 
+/// The names of the containers attached to a network.
+fn network_members(inspect: &NetworkInspect) -> Vec<String> {
+    let mut members: Vec<String> = inspect
+        .containers
+        .iter()
+        .flatten()
+        .map(|(id, c)| c.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| id.clone()))
+        .collect();
+    members.sort();
+    members
+}
+
+/// A listed container as an [`AttachedCompute`] of `stack`: `None` unless it carries the
+/// endpoint label and `stack`'s label (checked here too, so an engine that ignores a filter
+/// never offers another container) and has an id.
+fn attached_compute(container: ContainerSummary, stack: &str) -> Option<AttachedCompute> {
+    let labels = container.labels?;
+    if labels.get(STACK_LABEL).map(String::as_str) != Some(stack) {
+        return None;
+    }
+    let endpoint_id = labels.get(ENDPOINT_LABEL).filter(|e| !e.is_empty())?.clone();
+    let container_id = container.id.filter(|id| !id.is_empty())?;
+    let mut networks: Vec<NetworkRef> = container
+        .network_settings
+        .and_then(|n| n.networks)
+        .into_iter()
+        .flatten()
+        .map(|(name, endpoint)| NetworkRef {
+            name,
+            id: endpoint.network_id.unwrap_or_default(),
+        })
+        .collect();
+    networks.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(AttachedCompute {
+        endpoint_id,
+        container_id,
+        mid_create: container.state == Some(ContainerSummaryStateEnum::CREATED),
+        networks,
+    })
+}
+
 /// [`ComputeBackend`] over the Docker Engine API.
 pub struct DockerBackend {
     locator: DockerLocator,
@@ -474,6 +629,35 @@ pub struct DockerBackend {
 }
 
 impl DockerBackend {
+    /// The names of the containers, stopped ones included, that reference network `id`.
+    /// Docker's network inspect lists only active endpoints, and the engine deletes a network
+    /// that only stopped containers reference, which leaves them unable to start.
+    async fn stopped_members(&self, id: &str) -> anyhow::Result<Vec<String>> {
+        let filters = std::collections::HashMap::from([("network".to_string(), vec![id.to_string()])]);
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .with_context(|| format!("listing the containers attached to network {id}"))?;
+        Ok(containers
+            .into_iter()
+            .map(|c| {
+                c.names
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .filter(|n| !n.is_empty())
+                    .or(c.id)
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
     /// Nothing is contacted yet.
     pub fn connect(settings: ComputeSettings, docker: DockerSettings) -> anyhow::Result<Self> {
         Ok(Self {
@@ -590,6 +774,57 @@ impl DockerBackend {
         remove_container(self.docker(), name).await
     }
 
+    /// The network named exactly `name`; `None` when there is none. Docker also answers for an
+    /// id prefix: an answer for a network of another name counts as none.
+    async fn inspect_network(&self, name: &str) -> anyhow::Result<Option<NetworkInspect>> {
+        match self
+            .docker()
+            .inspect_network(name, None::<InspectNetworkOptions>)
+            .await
+        {
+            Ok(inspect) if inspect.name.as_deref() == Some(name) => Ok(Some(inspect)),
+            Ok(_) => Ok(None),
+            Err(e) if is_status(&e, 404) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("can't inspect network {name}"))),
+        }
+    }
+
+    /// The compute network, then the control network unless it is the same one.
+    fn configured_networks(&self) -> Vec<&str> {
+        let DockerSettings {
+            network,
+            control_network,
+            ..
+        } = &self.docker_settings;
+        if control_network == network {
+            vec![network]
+        } else {
+            vec![network, control_network]
+        }
+    }
+
+    /// Each configured network, inspected now, that passes [`check_compute_network`]; the
+    /// first that doesn't (or can't be read) is the error.
+    async fn expected_networks(&self) -> anyhow::Result<Vec<NetworkRef>> {
+        let mut expected = Vec::new();
+        for name in self.configured_networks() {
+            let inspect = self
+                .inspect_network(name)
+                .await?
+                .with_context(|| format!("network {name} doesn't exist"))?;
+            check_compute_network(name, &inspect)?;
+            let id = inspect
+                .id
+                .filter(|id| !id.is_empty())
+                .with_context(|| format!("network {name}: Docker gave no network id"))?;
+            expected.push(NetworkRef {
+                name: name.to_string(),
+                id,
+            });
+        }
+        Ok(expected)
+    }
+
     async fn run_exec(
         &self,
         endpoint_id: &str,
@@ -686,7 +921,13 @@ impl ComputeBackend for DockerBackend {
         let ca = self.ca()?;
         let server = ca.issue_server(endpoint_id, SystemTime::now())?;
         let tls = tls_files_tar(&server, ca.cert_pem())?;
-        let body = create_body(endpoint_id, compute_token, &self.settings, &self.docker_settings.network);
+        // On every create, never cached: a network can be recreated under the same name. A
+        // network that isn't internal and isolated, or can't be read, refuses the create
+        // before any container exists.
+        self.expected_networks()
+            .await
+            .with_context(|| format!("refusing to create compute {endpoint_id}"))?;
+        let body = create_body(endpoint_id, compute_token, &self.settings, &self.docker_settings);
         let create = || {
             self.docker().create_container(
                 Some(CreateContainerOptions {
@@ -827,6 +1068,88 @@ impl ComputeBackend for DockerBackend {
             .collect())
     }
 
+    async fn compute_networks(&self) -> anyhow::Result<ComputeNetworks> {
+        let expected = self.expected_networks().await?;
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(list_filters(&self.settings.stack)),
+                ..Default::default()
+            }))
+            .await
+            .context("listing compute containers")?;
+        let computes = containers
+            .into_iter()
+            .filter_map(|c| attached_compute(c, &self.settings.stack))
+            .collect();
+        Ok(ComputeNetworks { expected, computes })
+    }
+
+    async fn legacy_networks(&self) -> Vec<LegacyNetwork> {
+        let mut found = Vec::new();
+        for name in &self.docker_settings.legacy_networks {
+            found.push(match self.inspect_network(name).await {
+                Ok(None) => LegacyNetwork::Missing { name: name.clone() },
+                Ok(Some(inspect)) => match inspect.id.clone().filter(|id| !id.is_empty()) {
+                    Some(id) => match self.stopped_members(&id).await {
+                        Ok(stopped) => {
+                            let mut members = network_members(&inspect);
+                            for m in stopped {
+                                if !members.contains(&m) {
+                                    members.push(m);
+                                }
+                            }
+                            members.sort();
+                            LegacyNetwork::Present {
+                                network: NetworkRef {
+                                    name: name.clone(),
+                                    id,
+                                },
+                                members,
+                            }
+                        }
+                        // Not knowing a network is empty keeps it.
+                        Err(e) => LegacyNetwork::Unreadable {
+                            name: name.clone(),
+                            error: format!("{e:#}"),
+                        },
+                    },
+                    None => LegacyNetwork::Unreadable {
+                        name: name.clone(),
+                        error: "Docker gave no network id".to_string(),
+                    },
+                },
+                Err(e) => LegacyNetwork::Unreadable {
+                    name: name.clone(),
+                    error: format!("{e:#}"),
+                },
+            });
+        }
+        found
+    }
+
+    async fn remove_compute_container(
+        &self,
+        endpoint_id: &str,
+        container_id: &str,
+    ) -> anyhow::Result<()> {
+        self.remove(container_id)
+            .await
+            .with_context(|| format!("removing container {container_id} of compute {endpoint_id}"))
+    }
+
+    async fn remove_network(&self, network: &NetworkRef) -> anyhow::Result<NetworkRemoval> {
+        match self.docker().remove_network(&network.id).await {
+            Ok(()) => Ok(NetworkRemoval::Removed),
+            Err(e) if is_status(&e, 404) => Ok(NetworkRemoval::Gone),
+            // Docker refuses a network with active endpoints.
+            Err(e) if is_status(&e, 403) => Ok(NetworkRemoval::Occupied),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("removing network {} ({})", network.name, network.id))),
+        }
+    }
+
     async fn admin_sql_with(
         &self,
         endpoint_id: &str,
@@ -911,6 +1234,34 @@ impl ComputeBackend for Backend {
         }
     }
 
+    async fn compute_networks(&self) -> anyhow::Result<ComputeNetworks> {
+        match self {
+            Self::Docker(b) => b.compute_networks().await,
+        }
+    }
+
+    async fn legacy_networks(&self) -> Vec<LegacyNetwork> {
+        match self {
+            Self::Docker(b) => b.legacy_networks().await,
+        }
+    }
+
+    async fn remove_compute_container(
+        &self,
+        endpoint_id: &str,
+        container_id: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Docker(b) => b.remove_compute_container(endpoint_id, container_id).await,
+        }
+    }
+
+    async fn remove_network(&self, network: &NetworkRef) -> anyhow::Result<NetworkRemoval> {
+        match self {
+            Self::Docker(b) => b.remove_network(network).await,
+        }
+    }
+
     async fn admin_sql_with(
         &self,
         endpoint_id: &str,
@@ -935,8 +1286,64 @@ pub mod fake {
 
     use anyhow::bail;
 
-    use super::{ComputeBackend, ComputeStatus, NotRunning, SqlOpts, SqlTimedOut};
+    use super::{
+        AttachedCompute, ComputeBackend, ComputeNetworks, ComputeStatus, LegacyNetwork,
+        NetworkRef, NetworkRemoval, NotRunning, SqlOpts, SqlTimedOut,
+    };
     use crate::compute::ComputeLocator;
+
+    /// The fake's networks: where its computes are attached and which legacy networks exist.
+    pub struct FakeNetworks {
+        /// The compute and control networks. Default: `compute` (`net-compute`) and `control`
+        /// (`net-control`).
+        pub expected: Vec<NetworkRef>,
+        /// Computes attached elsewhere than `expected` (the rest are on `expected`). A create
+        /// puts its compute back on `expected`.
+        pub attached: HashMap<String, Vec<NetworkRef>>,
+        /// Computes whose container is mid-create (never started).
+        pub mid_create: std::collections::HashSet<String>,
+        /// What `legacy_networks` answers. A removed one becomes `Missing`.
+        pub legacy: Vec<LegacyNetwork>,
+        /// `compute_networks` fails with this.
+        pub fail_listing: Option<String>,
+        /// Removing these computes' containers fails.
+        pub fail_remove: std::collections::HashSet<String>,
+        /// `legacy_networks` answers `Unreadable` for these names.
+        pub unreadable: std::collections::HashSet<String>,
+        /// Removing these networks (by name) fails.
+        pub fail_remove_network: std::collections::HashSet<String>,
+        /// Docker refuses to remove these networks (by name) as in use, whatever their members.
+        pub occupied: std::collections::HashSet<String>,
+    }
+
+    impl Default for FakeNetworks {
+        fn default() -> Self {
+            Self {
+                expected: vec![net("compute"), net("control")],
+                attached: HashMap::new(),
+                mid_create: Default::default(),
+                legacy: Vec::new(),
+                fail_listing: None,
+                fail_remove: Default::default(),
+                unreadable: Default::default(),
+                fail_remove_network: Default::default(),
+                occupied: Default::default(),
+            }
+        }
+    }
+
+    /// A network named `name` whose id is `net-<name>`.
+    pub fn net(name: &str) -> NetworkRef {
+        NetworkRef {
+            name: name.to_string(),
+            id: format!("net-{name}"),
+        }
+    }
+
+    /// The fake's container id of `endpoint_id`'s compute.
+    pub fn container_id(endpoint_id: &str) -> String {
+        format!("cid-{endpoint_id}")
+    }
 
     pub type Journal = Arc<Mutex<Vec<String>>>;
 
@@ -990,6 +1397,8 @@ pub mod fake {
         fail_in_needles: Mutex<Vec<(String, String)>>,
         /// `(database, needle, message)` set by [`FakeBackend::fail_in_with`].
         fail_in_messages: Mutex<Vec<(String, String, String)>>,
+        /// Where the computes are attached, and the legacy networks.
+        pub networks: Mutex<FakeNetworks>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1150,6 +1559,9 @@ pub mod fake {
                     running: true,
                 },
             );
+            let mut networks = lock(&self.networks);
+            networks.attached.remove(endpoint_id);
+            networks.mid_create.remove(endpoint_id);
             Ok(())
         }
 
@@ -1178,6 +1590,7 @@ pub mod fake {
                 bail!(message);
             }
             lock(&self.computes).remove(endpoint_id);
+            lock(&self.networks).attached.remove(endpoint_id);
             Ok(())
         }
 
@@ -1206,6 +1619,107 @@ pub mod fake {
                 .collect();
             ids.sort();
             Ok(ids)
+        }
+
+        /// The computes sorted, each on `expected` unless [`FakeNetworks::attached`] says
+        /// otherwise.
+        async fn compute_networks(&self) -> anyhow::Result<ComputeNetworks> {
+            let networks = lock(&self.networks);
+            if let Some(message) = networks.fail_listing.clone() {
+                bail!(message);
+            }
+            let mut ids: Vec<String> = lock(&self.computes).keys().cloned().collect();
+            ids.sort();
+            let computes = ids
+                .into_iter()
+                .map(|ep| AttachedCompute {
+                    container_id: container_id(&ep),
+                    mid_create: networks.mid_create.contains(&ep),
+                    networks: networks
+                        .attached
+                        .get(&ep)
+                        .cloned()
+                        .unwrap_or_else(|| networks.expected.clone()),
+                    endpoint_id: ep,
+                })
+                .collect();
+            Ok(ComputeNetworks {
+                expected: networks.expected.clone(),
+                computes,
+            })
+        }
+
+        async fn legacy_networks(&self) -> Vec<LegacyNetwork> {
+            let networks = lock(&self.networks);
+            networks
+                .legacy
+                .iter()
+                .map(|l| {
+                    let name = match l {
+                        LegacyNetwork::Missing { name } | LegacyNetwork::Unreadable { name, .. } => name,
+                        LegacyNetwork::Present { network, .. } => &network.name,
+                    };
+                    if networks.unreadable.contains(name) {
+                        LegacyNetwork::Unreadable {
+                            name: name.clone(),
+                            error: "injected inspect failure".into(),
+                        }
+                    } else {
+                        l.clone()
+                    }
+                })
+                .collect()
+        }
+
+        /// Removes the compute if `container_id` is still its container, and its name (any
+        /// member ending in the endpoint id) from the legacy networks.
+        async fn remove_compute_container(
+            &self,
+            endpoint_id: &str,
+            container_id: &str,
+        ) -> anyhow::Result<()> {
+            self.record(format!("compute.remove_container {endpoint_id}"));
+            let mut networks = lock(&self.networks);
+            if networks.fail_remove.contains(endpoint_id) {
+                bail!("injected removal failure");
+            }
+            if container_id != self::container_id(endpoint_id) {
+                return Ok(());
+            }
+            lock(&self.computes).remove(endpoint_id);
+            networks.attached.remove(endpoint_id);
+            networks.mid_create.remove(endpoint_id);
+            for legacy in &mut networks.legacy {
+                if let LegacyNetwork::Present { members, .. } = legacy {
+                    members.retain(|m| !m.ends_with(endpoint_id));
+                }
+            }
+            Ok(())
+        }
+
+        async fn remove_network(&self, network: &NetworkRef) -> anyhow::Result<NetworkRemoval> {
+            self.record(format!("network.remove {}", network.name));
+            let mut networks = lock(&self.networks);
+            if networks.fail_remove_network.contains(&network.name) {
+                bail!("injected network removal failure");
+            }
+            if networks.occupied.contains(&network.name) {
+                return Ok(NetworkRemoval::Occupied);
+            }
+            for legacy in &mut networks.legacy {
+                if let LegacyNetwork::Present { network: n, members } = legacy
+                    && n.id == network.id
+                {
+                    if !members.is_empty() {
+                        return Ok(NetworkRemoval::Occupied);
+                    }
+                    *legacy = LegacyNetwork::Missing {
+                        name: n.name.clone(),
+                    };
+                    return Ok(NetworkRemoval::Removed);
+                }
+            }
+            Ok(NetworkRemoval::Gone)
         }
 
         async fn admin_sql_with(
@@ -1373,6 +1887,8 @@ mod tests {
         DockerSettings {
             network: "chelabase-feat-x_default".to_string(),
             control_network: "chelabase-feat-x_control".to_string(),
+            legacy_networks: Vec::new(),
+            egress_dns: None,
         }
     }
 
@@ -1386,7 +1902,7 @@ mod tests {
 
     #[test]
     fn container_body_runs_compute_ctl_with_the_token_in_env() {
-        let body = create_body("ep-abc123", "s3cret-token", &settings(), &docker_settings().network);
+        let body = create_body("ep-abc123", "s3cret-token", &settings(), &docker_settings());
         assert_eq!(body.image.as_deref(), Some("neon/compute-node-v17:test"));
         assert_eq!(
             body.entrypoint,
@@ -1410,7 +1926,7 @@ mod tests {
 
     #[test]
     fn container_body_limits_restarts_and_networks() {
-        let host = create_body("ep-abc123", "t", &settings(), &docker_settings().network)
+        let host = create_body("ep-abc123", "t", &settings(), &docker_settings())
             .host_config
             .unwrap();
         assert_eq!(
@@ -1427,8 +1943,100 @@ mod tests {
     }
 
     #[test]
+    fn the_create_body_carries_the_egress_resolver() {
+        let docker = DockerSettings {
+            egress_dns: Some("10.214.8.2".parse().unwrap()),
+            ..docker_settings()
+        };
+        let host = create_body("ep-abc123", "t", &settings(), &docker)
+            .host_config
+            .unwrap();
+        assert_eq!(host.dns, Some(vec!["10.214.8.2".to_string()]));
+        assert_eq!(host.extra_hosts, None);
+    }
+
+    #[test]
+    fn the_create_body_has_no_resolver_when_unset() {
+        let host = create_body("ep-abc123", "t", &settings(), &docker_settings())
+            .host_config
+            .unwrap();
+        assert_eq!(host.dns, None);
+        assert_eq!(host.extra_hosts, None);
+    }
+
+    // No capability at all (so no `NET_RAW`) and no privilege gain through setuid binaries.
+    #[test]
+    fn the_create_body_drops_raw_sockets() {
+        for docker in [
+            docker_settings(),
+            DockerSettings {
+                egress_dns: Some("fd00::53".parse().unwrap()),
+                ..docker_settings()
+            },
+        ] {
+            let host = create_body("ep-abc123", "t", &settings(), &docker)
+                .host_config
+                .unwrap();
+            assert_eq!(host.cap_drop, Some(vec!["ALL".to_string()]));
+            assert_eq!(host.cap_add, None);
+            assert_eq!(
+                host.security_opt,
+                Some(vec!["no-new-privileges:true".to_string()])
+            );
+            assert_ne!(host.privileged, Some(true));
+        }
+    }
+
+    fn network(name: &str, internal: Option<bool>, options: &[(&str, &str)]) -> NetworkInspect {
+        NetworkInspect {
+            name: Some(name.to_string()),
+            id: Some(format!("id-{name}")),
+            internal,
+            options: Some(
+                options
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    const ISOLATED: [(&str, &str); 2] = [(GATEWAY_MODE_IPV4, "isolated"), (GATEWAY_MODE_IPV6, "isolated")];
+
+    #[test]
+    fn an_internal_isolated_network_passes_the_check() {
+        check_compute_network("n", &network("n", Some(true), &ISOLATED)).unwrap();
+    }
+
+    #[test]
+    fn the_check_names_the_network_and_what_it_lacks() {
+        let cases: [(NetworkInspect, &str); 6] = [
+            (network("n", Some(false), &ISOLATED), "is not internal"),
+            (network("n", None, &ISOLATED), "is not internal"),
+            (network("n", Some(true), &[(GATEWAY_MODE_IPV6, "isolated")]), GATEWAY_MODE_IPV4),
+            (network("n", Some(true), &[(GATEWAY_MODE_IPV4, "isolated")]), GATEWAY_MODE_IPV6),
+            (
+                network("n", Some(true), &[(GATEWAY_MODE_IPV4, "nat"), (GATEWAY_MODE_IPV6, "isolated")]),
+                GATEWAY_MODE_IPV4,
+            ),
+            // Docker resolves an id prefix too: the answer must be the network of that name.
+            (network("other", Some(true), &ISOLATED), "not one of that name"),
+        ];
+        for (inspect, lacks) in cases {
+            let err = check_compute_network("n", &inspect).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("network n"), "{text}");
+            assert!(text.contains(lacks), "{lacks}: {text}");
+        }
+        let mut no_options = network("n", Some(true), &[]);
+        no_options.options = None;
+        assert!(check_compute_network("n", &no_options).is_err());
+    }
+
+    #[test]
     fn computes_publish_nothing_on_the_host() {
-        let body = create_body("ep-abc123", "t", &settings(), &docker_settings().network);
+        let body = create_body("ep-abc123", "t", &settings(), &docker_settings());
         assert_eq!(body.exposed_ports, None);
         let host = body.host_config.unwrap();
         assert!(host.port_bindings.as_ref().is_none_or(|b| b.is_empty()));
@@ -1437,7 +2045,7 @@ mod tests {
 
     #[test]
     fn computes_carry_their_stack_label() {
-        let labels = create_body("ep-abc123", "t", &settings(), &docker_settings().network).labels.unwrap();
+        let labels = create_body("ep-abc123", "t", &settings(), &docker_settings()).labels.unwrap();
         assert_eq!(labels.get("chelabase.dev/stack"), Some(&"feat-x".to_string()));
         assert_eq!(
             labels.get("chelabase.dev/endpoint-id"),

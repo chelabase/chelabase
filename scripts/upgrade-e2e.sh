@@ -16,6 +16,10 @@
 #      (or copy this script into S's checkout and run it there);
 #   3. in S's worktree: move to the RT1 branch, `just workbench up` (the upgrade in place);
 #   4. there: `just workbench run scripts/upgrade-e2e.sh verify`; then purge S.
+# For the compute-network-reach upgrade (a stack started on the legacy `compute` and `control`
+# networks) the base is the commit before that epic; verify then also checks that no compute is on
+# a legacy network, that each is on exactly the two new internal networks and that the legacy
+# networks are gone.
 # KEEP=1 leaves the database in place after verify.
 set -euo pipefail
 
@@ -109,6 +113,14 @@ if [[ "$phase" == seed ]]; then
   dev_id="$(jq -r '.id' "$tmp/body")"
   wait_branch_ready "$dev_id"
   sql_on "$dev_id" "INSERT INTO upg VALUES ('dev-before');" >/dev/null || die "writing to dev before the upgrade"
+  # What the stack looked like before the upgrade, for verify's compute-network-reach checks: the
+  # legacy networks that exist now and the ids of the running computes. A stack that never had
+  # the legacy networks makes verify fail, since it would prove nothing.
+  legacy_nets=""
+  for n in "${project}_compute" "${project}_control"; do
+    docker network inspect "$n" >/dev/null 2>&1 && legacy_nets="$legacy_nets $n"
+  done
+  compute_ids="$(docker ps -q --no-trunc --filter "label=chelabase.dev/stack=${CHELABASE_STACK:?}" | tr '\n' ' ')"
   tenant="$(metadata_sql -v id="$db_id" <<<"SELECT neon_tenant_id FROM databases WHERE id = :'id';")"
   {
     echo "UPG_DB_ID=$db_id"
@@ -117,6 +129,8 @@ if [[ "$phase" == seed ]]; then
     echo "UPG_TENANT=$tenant"
     echo "UPG_MAIN_TL=$(timeline_of "$main_id")"
     echo "UPG_DEV_TL=$(timeline_of "$dev_id")"
+    echo "UPG_LEGACY_NETS='${legacy_nets# }'"
+    echo "UPG_COMPUTE_IDS='${compute_ids% }'"
     echo "UPG_SEEDED_SAFEKEEPERS=$(docker ps --filter "label=com.docker.compose.project=$project" \
       --filter label=com.docker.compose.service --format '{{.Label "com.docker.compose.service"}}' | grep -c '^safekeeper' || true)"
   } >"$state"
@@ -189,12 +203,48 @@ for s in pageserver safekeeper1 safekeeper2 safekeeper3; do
   [[ "$uid" == "${CHELABASE_UID}" ]] && pass "$s runs as uid $uid" || fail "$s runs as uid $uid (wanted $CHELABASE_UID)"
 done
 
-# 5. The pre-RT1 database's computes are on the compute network only (with control), not the
-#    default network the stack's services share.
+# 5. compute-network-reach: the stack started on the legacy networks (`<project>_compute` and
+#    `<project>_control`, ordinary bridges). After the upgrade no compute is on a legacy network,
+#    each is on exactly the two new internal networks (`<project>_compute-internal`,
+#    `<project>_control-internal`), the legacy networks are gone, and (checks 2 and 3 above) the
+#    database's data reads back. Needs at least one compute: the seeded database's.
+want_nets="${project}_compute-internal ${project}_control-internal "
+# The seed must have seen both legacy networks and at least one compute, or this run is on a stack
+# that never had the legacy layout (a fresh stack passes every check below without an upgrade).
+if [[ "${UPG_LEGACY_NETS:-}" == "${project}_compute ${project}_control" ]]; then
+  pass "the seed saw both legacy networks (${UPG_LEGACY_NETS})"
+else
+  fail "the seed saw legacy networks '${UPG_LEGACY_NETS:-}', wanted '${project}_compute ${project}_control': this stack never ran on the legacy networks, so the upgrade wasn't tested"
+fi
+if [[ -n "${UPG_COMPUTE_IDS:-}" ]]; then
+  for old in $UPG_COMPUTE_IDS; do
+    if docker inspect "$old" >/dev/null 2>&1; then
+      fail "the pre-upgrade compute ${old:0:12} still exists (it should have been replaced)"
+    else
+      pass "the pre-upgrade compute ${old:0:12} was replaced"
+    fi
+  done
+else
+  fail "the seed recorded no compute id: the replacement of the computes can't be checked"
+fi
+seen=0
 for c in $(docker ps -q --filter "label=chelabase.dev/stack=${CHELABASE_STACK:?}"); do
-  nets="$(docker inspect -f '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}' "$c")"
-  [[ " $nets " == *" ${project}_compute "* && " $nets " != *" ${project}_default "* ]] &&
-    pass "compute $c is on ${project}_compute only ($nets)" || fail "compute $c networks: $nets"
+  seen=$((seen + 1))
+  nets="$(docker inspect -f '{{range $n, $_ := .NetworkSettings.Networks}}{{$n}} {{end}}' "$c" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')"
+  [[ "$nets" == "$want_nets" ]] &&
+    pass "compute $c is on exactly the two new internal networks ($nets)" || fail "compute $c networks: $nets (wanted $want_nets)"
+done
+[[ "$seen" -gt 0 ]] || fail "no compute of stack $CHELABASE_STACK is running after the upgrade"
+for legacy in "${project}_compute" "${project}_control"; do
+  if docker network inspect "$legacy" >/dev/null 2>&1; then
+    fail "the legacy network $legacy still exists after the upgrade"
+  else
+    pass "the legacy network $legacy is gone"
+  fi
+done
+for n in "${project}_compute-internal" "${project}_control-internal"; do
+  [[ "$(docker network inspect -f '{{.Internal}}' "$n" 2>/dev/null)" == true ]] &&
+    pass "$n is internal" || fail "$n is missing or not internal"
 done
 
 if [[ "$failures" -gt 0 ]]; then

@@ -469,10 +469,10 @@ services:
       - CHELABASE_SERVICES_ALLOW_HOSTS=${CHELABASE_SERVICES_ALLOW_HOSTS:-}
       - CHELABASE_SERVICES_ALLOW_HTTP=${CHELABASE_SERVICES_ALLOW_HTTP:-}
     group_add: ["${CHELABASE_DOCKER_GID:?set by chelabase workbench (stack.env)}"]
-    # Its static address on `control`, for its TLS connections to computes.
+    # Its static address on `control-internal`, for its TLS connections to computes.
     networks:
-      control:
-        ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:?set by chelabase workbench (stack.env)}
+      control-internal:
+        ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP:?set by chelabase workbench (stack.env)}
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -526,6 +526,8 @@ services:
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
       - CHELABASE_STORAGE_TOKEN_REFRESH_SECS=${CHELABASE_STORAGE_TOKEN_REFRESH_SECS:-3600}
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
+      # compute-network-reach: the resolver computes get (the egress service's address on the compute network).
+      - CHELABASE_COMPUTE_EGRESS_DNS=${CHELABASE_COMPUTE_EGRESS_IP:?set by chelabase workbench (stack.env)}
       # object-storage m8: the storage sweep reads and deletes user blobs as the `storage` identity.
       - CHELABASE_STORAGE_BACKEND=seaweedfs
       - CHELABASE_STORAGE_S3_ENDPOINT=http://seaweedfs:8333
@@ -709,7 +711,7 @@ services:
       - CHELABASE_STORAGE_S3_SECRET_KEY_FILE=/run/chelabase/secrets/storage-s3/secret-key
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -764,7 +766,7 @@ services:
     secrets:
       - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
-      # m13b: the dispatcher verifies computes (the network is the base file's `compute`).
+      # m13b: the dispatcher verifies computes (the network is the base file's `compute-internal`).
       - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
       - {source: nats-functions, target: "${CHELABASE_KEYS_DIR}/nats/functions.password"}
       - {source: token-orchestrator-functions, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-functions.token"}
@@ -852,7 +854,31 @@ services:
       metadata-db:
         condition: service_healthy
 
-  # Its static address on `control` is outside the computes' range and in the chelabase_realtime
+  # compute-network-reach m4: the egress forwarder, from the checkout's debug build, in the base
+  # file's profile `compute-egress` (`up` turns it on by naming the service, and always runs it).
+  # Everything the base file sets stays: a read-only root, no capability, no-new-privileges, the
+  # sysctls, the limits, the compute network at the address of the stack's slot
+  # (CHELABASE_COMPUTE_EGRESS_IP) and the egress network. Only the image, the user (the stack's
+  # uid:gid, never root) and the binary change, and its one mount is that binary, read-only, at its
+  # own path: no checkout, no key, no state dir. The allow-list is the fixed one the live tests
+  # (m5) use: two names, one on an assigned port, the host's alias, which the forwarder must
+  # refuse as non-public, and egress-blocked.test, whose test address (192.88.99.17, public) the
+  # deny list refuses.
+  compute-egress:
+    image: ${CHELABASE_WORKBENCH_IMAGE:?set by chelabase workbench (stack.env)}
+    user: "${CHELABASE_UID:?set by chelabase workbench (stack.env)}:${CHELABASE_GID:?set by chelabase workbench (stack.env)}"
+    command: ["${CHELABASE_CHECKOUT}/target/debug/compute-egress"]
+    environment:
+      CHELABASE_COMPUTE_EGRESS_ALLOW: "egress-allowed.test:5432,egress-second.test:5432@15432,host.docker.internal:5432@15433,egress-blocked.test:5432@15436"
+      CHELABASE_COMPUTE_EGRESS_DENY: "192.88.99.16/28"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - {type: bind, source: "${CHELABASE_CHECKOUT}/target/debug/compute-egress", target: "${CHELABASE_CHECKOUT}/target/debug/compute-egress", read_only: true, bind: {create_host_path: false}}
+    healthcheck:
+      <<: *app-health
+      test: !override ["CMD", "${CHELABASE_CHECKOUT}/target/debug/compute-egress", "health"]
+
+  # Its static address on `control-internal` is outside the computes' range and in the chelabase_realtime
   # login rule.
   realtime:
     <<: *workbench
@@ -872,8 +898,8 @@ services:
       - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
     networks:
-      control:
-        ipv4_address: ${CHELABASE_REALTIME_CONTROL_IP:?set by chelabase workbench (stack.env)}
+      control-internal:
+        ipv4_address: ${CHELABASE_REALTIME_CONTROL_INTERNAL_IP:?set by chelabase workbench (stack.env)}
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -983,9 +1009,9 @@ services:
     # e2e uploads bundles to the functions service's internal listener.
     networks:
       default: {}
-      control:
-        ipv4_address: ${CHELABASE_RUNNER_CONTROL_IP:?set by chelabase workbench (stack.env)}
-      compute: {}
+      control-internal:
+        ipv4_address: ${CHELABASE_RUNNER_CONTROL_INTERNAL_IP:?set by chelabase workbench (stack.env)}
+      compute-internal: {}
       functions-control: {}
     volumes:
       - *checkout-rw
@@ -1041,14 +1067,21 @@ services:
       - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
       - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
 
-# The stack's control subnet, from the registry's control slot; computes take addresses from the
-# upper /23 only.
+# The stack's control and compute subnets, from the registry's control slot; computes take
+# addresses from the upper /23 only. Only `ipam` is replaced: `internal` and the isolated gateway
+# modes come from the base file (scripts/tests/compose-compute-network-internal.sh).
 networks:
-  control: !override
-    ipam:
+  control-internal:
+    ipam: !override
       config:
-        - subnet: ${CHELABASE_CONTROL_SUBNET:?set by chelabase workbench (stack.env)}
-          ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
+        - subnet: ${CHELABASE_CONTROL_INTERNAL_SUBNET:?set by chelabase workbench (stack.env)}
+          ip_range: ${CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
+  compute-internal:
+    enable_ipv6: false
+    ipam: !override
+      config:
+        - subnet: ${CHELABASE_COMPUTE_SUBNET:?set by chelabase workbench (stack.env)}
+          ip_range: ${CHELABASE_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
 
 # The self-hosted install's secrets volume: unused here (the keys dir and the state dir hold
 # them, as Compose secrets below).

@@ -14,7 +14,7 @@ fail() {
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
   -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
   --env-file "$fixture" \
-  --profile sites --profile runner --profile services --profile mcp config --no-env-resolution --format json |
+  --profile sites --profile runner --profile services --profile compute-egress --profile mcp config --no-env-resolution --format json |
   jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" || fail "compose config failed"
 # (The rewrite lists each service's file secrets, which Docker binds read-only, among its volumes.)
 q() { jq -r "$1" <<<"$config"; }
@@ -28,8 +28,11 @@ expected="$(printf '%s\n' "gateway 127.0.0.1 8137 8137" "gateway ::1 8137 8137" 
 [[ "$published" == "$expected" ]] || fail "published ports must be the gateway's and the proxy's Postgres port only; got:
 $published"
 
-! grep -q 'host.docker.internal' <<<"$config" || fail "host.docker.internal is gone"
-! grep -q 'host-gateway' <<<"$config" || fail "no extra_hosts host-gateway"
+# The one exception is compute-egress, whose test allow-list names the host's alias to prove the
+# forwarder refuses it (compute-network-reach m4).
+others="$(jq -c 'del(.services["compute-egress"])' <<<"$config")"
+! grep -q 'host.docker.internal' <<<"$others" || fail "host.docker.internal is gone"
+! grep -q 'host-gateway' <<<"$others" || fail "no extra_hosts host-gateway"
 
 for name in studio api auth mail docs landing; do
   q '.services.gateway.networks.default.aliases[]?' | gq -x "$name.feat-x.chelabase.localhost" ||
@@ -94,7 +97,7 @@ for s in orchestrator worker gateway auth rest realtime studio; do
     | select((\"$s:\" + .source | test(\"^worker:/m/[.]chelabase/stacks/feat-x/(storage|functions)-s3/(access|secret)-key$\")) | not) | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
-for s in mailpit identity orchestrator worker gateway auth rest functions service-runner; do
+for s in mailpit identity orchestrator worker gateway auth rest functions service-runner compute-egress; do
   [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
 done
 
@@ -125,40 +128,42 @@ grep -q 'pnpm@12\.6\.0' "$df" || fail "pnpm 12.6.0 through corepack"
 for tool in ca-certificates curl jq postgresql-client docker-ce-cli; do
   grep -q "$tool" "$df" || fail "the image has $tool"
 done
-[[ "$(q '.networks.control.ipam.config[0].subnet')" == 10.213.4.0/22 ]] || fail "the control network has the stack's subnet"
-[[ "$(q '.networks.control.ipam.config[0].ip_range')" == 10.213.6.0/23 ]] || fail "computes get addresses from the upper /23"
-[[ "$(q '.services.orchestrator.networks.control.ipv4_address')" == 10.213.4.10 ]] || fail "the orchestrator's static control address"
-[[ "$(q '.services.runner.networks.control.ipv4_address')" == 10.213.4.11 ]] || fail "the runner's static control address"
-[[ "$(q '.services.orchestrator.networks | keys | sort | join(" ")')" == "compute control default functions-control" ]] || fail "the orchestrator is on the default, control, compute and functions-control networks"
-[[ "$(q '.services.worker.networks | keys | sort | join(" ")')" == "compute default functions-control services-control" ]] || fail "the worker isn't on the control network (it is on compute, default, functions-control and services-control)"
+[[ "$(q '.networks["control-internal"].ipam.config[0].subnet')" == 10.213.4.0/22 ]] || fail "the control network has the stack's subnet"
+[[ "$(q '.networks["control-internal"].ipam.config[0].ip_range')" == 10.213.6.0/23 ]] || fail "computes get addresses from the upper /23"
+[[ "$(q '.services.orchestrator.networks["control-internal"].ipv4_address')" == 10.213.4.10 ]] || fail "the orchestrator's static control address"
+[[ "$(q '.services.runner.networks["control-internal"].ipv4_address')" == 10.213.4.11 ]] || fail "the runner's static control address"
+[[ "$(q '.networks["compute-internal"].ipam.config[0].subnet')" == 10.212.4.0/22 ]] || fail "the compute network has the stack's subnet (10.212.{4k}.0/22)"
+[[ "$(q '.networks["compute-internal"].ipam.config[0].ip_range')" == 10.212.6.0/23 ]] || fail "computes get compute addresses from the upper /23"
+[[ "$(q '.services.orchestrator.networks | keys | sort | join(" ")')" == "compute-internal control-internal default functions-control" ]] || fail "the orchestrator is on the default, control, compute and functions-control networks"
+[[ "$(q '.services.worker.networks | keys | sort | join(" ")')" == "compute-internal default functions-control services-control" ]] || fail "the worker isn't on the control network (it is on compute, default, functions-control and services-control)"
 ca_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/compute-ca")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/compute-ca" and .read_only == true))"] | sort | join(" ")')"
 [[ "$ca_mounts" == "runner:true worker:false" ]] || fail "compute-ca: rw for the worker, ro for the runner (R-T9a), nobody else; got: $ca_mounts"
 tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "/m/.chelabase/orchestrator-tls")) | "\(.key):\(any(.value.volumes[]; .source == "/m/.chelabase/orchestrator-tls" and .read_only == true))"] | sort | join(" ")')"
 [[ "$tls_mounts" == "orchestrator:true runner:true worker:false" ]] || fail "orchestrator-tls: rw for the worker, ro for the orchestrator and runner; got: $tls_mounts"
 
 # --- RT1 T1 (R11): the compute network (P4, W14) ---------------------------------------------
-# Computes join `<project>_compute` (+ control). On it: what a compute needs (pageserver,
+# Computes join `<project>_compute-internal` (+ control-internal). On it: what a compute needs (pageserver,
 # safekeepers, the storage broker, the orchestrator's hooks listener) and the clients that dial
 # computes. Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the gateway or Studio.
-[[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
-on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
+[[ "$(q '.networks | has("compute-internal")')" == true ]] || fail "the stack defines a compute network"
+on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute-internal")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
-[[ "$on_compute" == "auth functions orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
+[[ "$on_compute" == "auth compute-egress functions orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
   fail "exactly the compute dependencies and the clients that dial computes are on the compute network; got: $on_compute"
 for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker; do
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
 done
-[[ "$(q '.services.runner.networks | keys | sort | join(" ")')" == "compute control default functions-control" ]] || fail "the runner is on default, control, compute and functions-control (the functions e2e)"
+[[ "$(q '.services.runner.networks | keys | sort | join(" ")')" == "compute-internal control-internal default functions-control" ]] || fail "the runner is on default, control, compute and functions-control (the functions e2e)"
 # m13b: the functions service dials computes as its dispatcher login (never the control network).
-[[ "$(q '.services.functions.networks | keys | sort | join(" ")')" == "compute default functions functions-control services-control" ]] ||
+[[ "$(q '.services.functions.networks | keys | sort | join(" ")')" == "compute-internal default functions functions-control services-control" ]] ||
   fail "functions is on compute (m13b), default, functions, functions-control and services-control"
 for s in nats valkey metadata-db storcon-db identity mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
-  [[ "$(q ".services[\"$s\"].networks // {} | has(\"compute\")")" == false ]] || fail "$s must not be on the compute network"
+  [[ "$(q ".services[\"$s\"].networks // {} | has(\"compute-internal\")")" == false ]] || fail "$s must not be on the compute network"
 done
 # The orchestrator answers computes as `orchestrator` there (CHELABASE_CONTROL_PLANE_URI).
-[[ "$(q '.services.orchestrator.networks.compute.aliases // [] | map(select(. != "orchestrator")) | length')" == 0 ]] ||
+[[ "$(q '.services.orchestrator.networks["compute-internal"].aliases // [] | map(select(. != "orchestrator")) | length')" == 0 ]] ||
   fail "the orchestrator has no other name on the compute network"
-grep -qx 'CHELABASE_COMPUTE_NETWORK=chelabase-feat-x_compute' "$fixture" || fail "the fixture's computes use the compute network"
+grep -qx 'CHELABASE_COMPUTE_NETWORK=chelabase-feat-x_compute-internal' "$fixture" || fail "the fixture's computes use the compute network"
 
 # --- RT1 T1 (R11, S1): per-service credentials, never in stack.env ---------------------------
 env_of() { q ".services[\"$1\"].environment // {} | .[\"$2\"] // empty"; }
@@ -329,12 +334,12 @@ done
 # P4: realtime dials computes (T8's replication and check connections) on the compute network.
 # Fork round 4 (C4, C5, SP10): realtime logs in to a compute as chelabase_realtime over the control
 # network, from a static address outside the computes' ip_range (so no compute can take it).
-[[ "$(q '.services.realtime.networks | keys | sort | join(" ")')" == "compute control default" ]] ||
+[[ "$(q '.services.realtime.networks | keys | sort | join(" ")')" == "compute-internal control-internal default" ]] ||
   fail "realtime is on the default, control and compute networks only"
-[[ "$(q '.services.realtime.networks.control.ipv4_address')" == 10.213.4.12 ]] ||
-  fail "realtime's static control address is \${CHELABASE_REALTIME_CONTROL_IP} (10.213.4.12)"
-[[ "$(q '.services.realtime.networks.control.ipv4_address')" == "$(sed -n 's/^CHELABASE_REALTIME_CONTROL_IP=//p' "$fixture")" ]] ||
-  fail "realtime's control address comes from CHELABASE_REALTIME_CONTROL_IP"
+[[ "$(q '.services.realtime.networks["control-internal"].ipv4_address')" == 10.213.4.12 ]] ||
+  fail "realtime's static control address is \${CHELABASE_REALTIME_CONTROL_INTERNAL_IP} (10.213.4.12)"
+[[ "$(q '.services.realtime.networks["control-internal"].ipv4_address')" == "$(sed -n 's/^CHELABASE_REALTIME_CONTROL_INTERNAL_IP=//p' "$fixture")" ]] ||
+  fail "realtime's control address comes from CHELABASE_REALTIME_CONTROL_INTERNAL_IP"
 # S1: realtime's own credentials and secrets, as files, in its own environment.
 want_env realtime CHELABASE_NATS_USER realtime
 want_env realtime CHELABASE_NATS_PASSWORD_FILE "$K/nats/realtime.password"
@@ -560,4 +565,24 @@ for s in $(bq '.services | keys[]'); do
       fail "$s: the base sets $k, but the workbench drops it (set it in the overlay, or list it in not_in_workbench with why)"
   done
 done
+# compute-network-reach m4: the egress forwarder from the checkout's debug build, in its profile,
+# on the compute network at the stack's address, with the fixed test allow-list, the stack's uid
+# and no mount but its own binary (the hardening and the networks: compose-compute-network-internal.sh).
+checkout="$(sed -n 's/^CHELABASE_CHECKOUT=//p' "$fixture")"
+egress_ip="$(sed -n 's/^CHELABASE_COMPUTE_EGRESS_IP=//p' "$fixture")"
+[[ "$(q '.services["compute-egress"].profiles | join(" ")')" == compute-egress ]] || fail "compute-egress is in the compute-egress profile only"
+[[ "$(q '.services["compute-egress"].image')" == chelabase-workbench:fixture000000 ]] || fail "compute-egress runs the workbench image"
+[[ "$(q '.services["compute-egress"].user')" == 1000:1000 ]] || fail "compute-egress runs as the stack's uid:gid, not root"
+[[ "$(q '.services["compute-egress"].command | join(" ")')" == "$checkout/target/debug/compute-egress" ]] ||
+  fail "compute-egress runs the checkout's debug binary"
+[[ "$(q '.services["compute-egress"].volumes | map("\(.source) \(.target) \(.read_only)") | join(",")')" == "$checkout/target/debug/compute-egress $checkout/target/debug/compute-egress true" ]] ||
+  fail "compute-egress mounts its own binary, read-only, and nothing else"
+[[ "$(q '.services["compute-egress"].networks["compute-internal"].ipv4_address')" == "$egress_ip" && "$egress_ip" == 10.212.4.2 ]] ||
+  fail "compute-egress's address on the compute network is the stack's (10.212.{4k}.2)"
+[[ "$(q '.services.worker.environment.CHELABASE_COMPUTE_EGRESS_DNS')" == "$egress_ip" ]] || fail "the worker's resolver is the egress address"
+[[ "$(sed -n 's/^CHELABASE_COMPUTE_EGRESS_DNS=//p' "$fixture")" == "$egress_ip" ]] || fail "the stack env's resolver is the egress address"
+[[ "$(q '.services["compute-egress"].environment.CHELABASE_COMPUTE_EGRESS_ALLOW')" == "egress-allowed.test:5432,egress-second.test:5432@15432,host.docker.internal:5432@15433,egress-blocked.test:5432@15436" ]] ||
+  fail "compute-egress has the workbench's test allow-list"
+[[ "$(q '.services["compute-egress"].environment.CHELABASE_COMPUTE_EGRESS_DENY')" == "192.88.99.16/28" ]] ||
+  fail "compute-egress has the workbench's test deny list (egress-blocked.test's address)"
 echo "workbench-compose: ok"

@@ -53,6 +53,7 @@ crate services/storage chelabase-storage-service bin 'http = { path = "../../cra
 # functions' package isn't named after its image either (edge functions m4b).
 crate services/functions chelabase-functions bin
 crate services/service-runner chelabase-service-runner bin
+crate services/compute-egress chelabase-compute-egress bin
 # The MCP server (mcp-core m8) embeds openapi/mcp.json.
 crate services/mcp mcp bin 'http = { path = "../../crates/http" }'
 crate tools/cli cli bin 'meta = { path = "../../crates/meta" }'
@@ -85,7 +86,7 @@ for f in config.capnp runner.js watchdog.sh; do echo "// $f" >"infra/mcp-runtime
 cp "$src/.dockerignore" .
 cp "$src"/scripts/{image-inputs.sh,publish-images.sh,pin-images.sh} scripts/ 2>/dev/null || true
 cp "$src/scripts/tests/compose-image-pins.sh" scripts/tests/
-images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime mcp mcp-runtime)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init studio identity functions-runtime mcp mcp-runtime)
 digest() { printf 'sha256:%064d' "$1"; }
 write_pins() { # write_pins <sha12>: every image pinned at <sha12>
   local i n=0
@@ -156,6 +157,8 @@ case_ edit services/functions/src/main.rs
 expect "functions' own crate (package chelabase-functions) -> functions" "functions" "$(changed)"
 case_ edit services/service-runner/src/main.rs
 expect "service-runner's own crate (package chelabase-service-runner) -> service-runner" "service-runner" "$(changed)"
+case_ edit services/compute-egress/src/main.rs
+expect "compute-egress' own crate (package chelabase-compute-egress) -> compute-egress" "compute-egress" "$(changed)"
 for f in infra/functions-runtime/supervisor.js infra/images/functions-runtime.Dockerfile; do
   case_ edit "$f"
   expect "$f -> functions-runtime" "functions-runtime" "$(changed)"
@@ -171,10 +174,10 @@ done
 case_ edit tools/cli/src/main.rs
 expect "a crate no image builds -> nothing" "" "$(changed)"
 case_ edit crates/meta/Cargo.toml
-expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init mcp" "$(changed)"
+expect "a manifest in the build (features unify) -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init mcp" "$(changed)"
 for f in Cargo.lock Cargo.toml rust-toolchain.toml; do
   case_ edit "$f"
-  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner init mcp" "$(changed)"
+  expect "$f -> every Rust image" "gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init mcp" "$(changed)"
 done
 case_ edit packages/ui/index.ts
 expect "a workspace package studio uses -> studio" "studio" "$(changed)"
@@ -196,7 +199,7 @@ for f in services/identity/src.ts infra/images/identity.Dockerfile; do
 done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
-all="gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime mcp mcp-runtime"
+all="gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init studio identity functions-runtime mcp mcp-runtime"
 for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"

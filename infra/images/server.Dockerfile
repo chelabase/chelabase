@@ -1,6 +1,6 @@
 # Release images for the Rust services (self-host). One builder stage runs one `cargo build`
 # for every binary; each runtime target copies what it needs:
-#   --target gateway|orchestrator|worker|rest|auth|realtime|storage|functions|service-runner|mcp|init   one binary, /usr/local/bin/<app>
+#   --target gateway|orchestrator|worker|rest|auth|realtime|storage|functions|service-runner|mcp|compute-egress|init   one binary, /usr/local/bin/<app>
 #   --target all                                                   every binary (chelabase/server)
 # `init` is the `chelabase-init` binary and keeps that name. The `chelabase` CLI is in none of them.
 # The workbench does not use this file: it runs host-built debug binaries (infra/workbench).
@@ -19,9 +19,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
       -p gateway -p orchestrator -p worker -p rest -p auth -p realtime -p chelabase-storage-service \
-      -p chelabase-functions -p chelabase-service-runner -p mcp -p init \
+      -p chelabase-functions -p chelabase-service-runner -p mcp -p chelabase-compute-egress -p init \
  && mkdir /out \
- && for b in gateway orchestrator worker rest auth realtime storage functions service-runner mcp chelabase-init; do \
+ && for b in gateway orchestrator worker rest auth realtime storage functions service-runner mcp compute-egress chelabase-init; do \
       install -m 0755 "target/release/${b}" "/out/${b}"; \
     done
 
@@ -92,6 +92,14 @@ FROM base-http AS mcp
 COPY --from=builder /out/mcp /usr/local/bin/mcp
 USER 10001:10001
 CMD ["mcp"]
+
+# Compute egress (compute-network-reach): the forwarder and its resolver, and nothing else. No
+# curl (its healthcheck is `compute-egress health`), no shell entrypoint. It runs as 65532, the
+# user the functions runtime uses, with no capability (docker-compose.yml).
+FROM base AS compute-egress
+COPY --from=builder /out/compute-egress /usr/local/bin/compute-egress
+USER 65532:65532
+CMD ["compute-egress"]
 
 FROM base AS init
 COPY --from=builder /out/chelabase-init /usr/local/bin/chelabase-init

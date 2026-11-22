@@ -1,11 +1,34 @@
 {
   "name": "chelabase-feat-x",
   "networks": {
-    "compute": {
+    "compute-egress": {
+      "enable_ipv6": false,
       "ipam": {},
-      "name": "chelabase-feat-x_compute"
+      "name": "chelabase-feat-x_compute-egress"
     },
-    "control": {
+    "compute-internal": {
+      "driver_opts": {
+        "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+        "com.docker.network.bridge.gateway_mode_ipv6": "isolated"
+      },
+      "enable_ipv6": false,
+      "internal": true,
+      "ipam": {
+        "config": [
+          {
+            "ip_range": "10.212.6.0/23",
+            "subnet": "10.212.4.0/22"
+          }
+        ]
+      },
+      "name": "chelabase-feat-x_compute-internal"
+    },
+    "control-internal": {
+      "driver_opts": {
+        "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+        "com.docker.network.bridge.gateway_mode_ipv6": "isolated"
+      },
+      "internal": true,
       "ipam": {
         "config": [
           {
@@ -14,7 +37,7 @@
           }
         ]
       },
-      "name": "chelabase-feat-x_control"
+      "name": "chelabase-feat-x_control-internal"
     },
     "default": {
       "ipam": {},
@@ -319,7 +342,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -376,6 +399,77 @@
         }
       ],
       "working_dir": "/w/feat-x"
+    },
+    "compute-egress": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": [
+        "/w/feat-x/target/debug/compute-egress"
+      ],
+      "entrypoint": null,
+      "environment": {
+        "CHELABASE_COMPUTE_EGRESS_ALLOW": "egress-allowed.test:5432,egress-second.test:5432@15432,host.docker.internal:5432@15433,egress-blocked.test:5432@15436",
+        "CHELABASE_COMPUTE_EGRESS_DENY": "192.88.99.16/28",
+        "CHELABASE_COMPUTE_EGRESS_DIAL_TIMEOUT_SECS": "",
+        "CHELABASE_COMPUTE_EGRESS_HEALTH_PORT": "",
+        "CHELABASE_COMPUTE_EGRESS_LISTEN": "10.212.4.2",
+        "CHELABASE_INTERNAL_SUBNETS": "10.212.4.0/22,10.213.4.0/22"
+      },
+      "extra_hosts": [
+        "host.docker.internal=host-gateway"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 30,
+        "start_period": "1m0s",
+        "test": [
+          "CMD",
+          "/w/feat-x/target/debug/compute-egress",
+          "health"
+        ],
+        "timeout": "5s"
+      },
+      "image": "chelabase-workbench:fixture000000",
+      "mem_limit": "268435456",
+      "networks": {
+        "compute-egress": {},
+        "compute-internal": {
+          "ipv4_address": "10.212.4.2"
+        }
+      },
+      "pids_limit": 256,
+      "profiles": [
+        "compute-egress"
+      ],
+      "read_only": true,
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "sysctls": {
+        "net.ipv4.conf.all.forwarding": "0",
+        "net.ipv4.ip_forward": "0",
+        "net.ipv4.ip_unprivileged_port_start": "0"
+      },
+      "ulimits": {
+        "nofile": {
+          "hard": 65536,
+          "soft": 65536
+        }
+      },
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "bind": {
+            "create_host_path": false
+          },
+          "read_only": true,
+          "source": "/w/feat-x/target/debug/compute-egress",
+          "target": "/w/feat-x/target/debug/compute-egress",
+          "type": "bind"
+        }
+      ]
     },
     "create-bucket": {
       "command": null,
@@ -508,7 +602,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {
           "aliases": [
             "functions-public"
@@ -1069,8 +1163,8 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
-        "control": {
+        "compute-internal": {},
+        "control-internal": {
           "ipv4_address": "10.213.4.10"
         },
         "default": {},
@@ -1224,7 +1318,7 @@
       },
       "image": "neon-storage:placeholder",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -1291,7 +1385,7 @@
       },
       "image": "neon-storage:placeholder",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "ports": [
@@ -1400,8 +1494,8 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
-        "control": {
+        "compute-internal": {},
+        "control-internal": {
           "ipv4_address": "10.213.4.12"
         },
         "default": {}
@@ -1541,7 +1635,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -1614,8 +1708,8 @@
       ],
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
-        "control": {
+        "compute-internal": {},
+        "control-internal": {
           "ipv4_address": "10.213.4.11"
         },
         "default": {},
@@ -1886,7 +1980,7 @@
       },
       "image": "neon-storage:placeholder",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -1959,7 +2053,7 @@
       },
       "image": "neon-storage:placeholder",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -2032,7 +2126,7 @@
       },
       "image": "neon-storage:placeholder",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -2268,7 +2362,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {}
       },
       "restart": "unless-stopped",
@@ -2581,6 +2675,7 @@
         }
       ],
       "environment": {
+        "CHELABASE_COMPUTE_EGRESS_DNS": "10.212.4.2",
         "CHELABASE_FUNCTIONS_S3_ACCESS_KEY_FILE": "/run/chelabase/secrets/functions-s3/access-key",
         "CHELABASE_FUNCTIONS_S3_BUCKET": "chelabase-functions",
         "CHELABASE_FUNCTIONS_S3_SECRET_KEY_FILE": "/run/chelabase/secrets/functions-s3/secret-key",
@@ -2625,7 +2720,7 @@
       },
       "image": "chelabase-workbench:fixture000000",
       "networks": {
-        "compute": {},
+        "compute-internal": {},
         "default": {},
         "functions-control": {},
         "services-control": {}

@@ -2,8 +2,10 @@
 
 pub mod argv;
 pub mod commands;
+pub mod engine;
 pub mod env;
 pub mod migrate;
+pub mod networks;
 pub mod registry;
 pub mod service_auth;
 pub mod slots;
@@ -55,3 +57,9 @@ mod c5_edge_tests;
 
 #[cfg(test)]
 mod t4_tests;
+
+#[cfg(test)]
+mod cnr_tests;
+
+#[cfg(test)]
+mod upgrade_model_tests;
