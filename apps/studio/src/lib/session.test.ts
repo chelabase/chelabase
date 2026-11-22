@@ -1,5 +1,6 @@
 import { ApiError } from "@chelabase/management-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { addHistory, loadHistory } from "@/components/sql-editor/run-history";
 import { createSession, realtimeAuthEvents, type MintedToken } from "./session";
 
 const unauthorized = () => new ApiError(401, "unauthorized", "Not signed in");
@@ -20,6 +21,7 @@ beforeEach(() => {
   vi.useFakeTimers();
 });
 afterEach(() => {
+  localStorage.clear();
   vi.useRealTimers();
 });
 
@@ -166,5 +168,22 @@ describe("session", () => {
     events.removeUserSignedOut(out);
     await session.start().catch(() => undefined);
     expect(loaded).toHaveBeenCalledTimes(2);
+  });
+
+  const entry = { sql: "select 1", branchId: "b1", database: null, role: null, at: "2026-10-03T00:00:00Z", outcome: "ok", durationMs: 1 } as const;
+
+  it("a_401_on_refresh_clears_stored_sql", async () => {
+    addHistory("u1", "d1", entry);
+    expect(loadHistory("u1", "d1")).toHaveLength(1);
+    const session = createSession({ mint: minter(unauthorized()) });
+    expect(await session.start()).toBe(false);
+    expect(loadHistory("u1", "d1")).toEqual([]);
+  });
+
+  it("a_non_auth_error_keeps_stored_sql", async () => {
+    addHistory("u1", "d1", entry);
+    const session = createSession({ mint: minter(new ApiError(500, "internal", "boom")) });
+    await expect(session.start()).rejects.toThrow();
+    expect(loadHistory("u1", "d1")).toHaveLength(1);
   });
 });
