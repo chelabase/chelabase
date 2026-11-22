@@ -635,6 +635,17 @@ impl SealedFixture {
                 .await
                 .unwrap();
             }
+            ("storage_webhooks", "secret_enc") => {
+                sqlx::query(
+                    "INSERT INTO storage_webhooks (id, database_id, url, events, secret_enc)
+                     VALUES (gen_random_uuid(), $1, 'https://example.test/hook',
+                             ARRAY['object.created'], 'v1:x')",
+                )
+                .bind(database.as_uuid())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             other => panic!("no fixture for sealed column {other:?}: add one here"),
         }
         fixture
@@ -811,9 +822,6 @@ const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[
     ("control_settings", "key", "a setting's name"),
     ("invites", "token_hash", "a SHA-256 of the invite token, never opened"),
     ("neon_endpoints", "compute_token_sha256", "a SHA-256 of the compute token, never opened"),
-    // TODO(#178): sealed with the secrets key (`Purpose::Webhook`) but not yet in
-    // SECRETS_KEY_SEALED; #178 adds it (and its fixture) and removes this entry.
-    ("storage_webhooks", "secret_enc", "TODO(#178)"),
 ];
 
 // #38: a new sealed column must join the key check (or be excluded here, with a reason). Edge
