@@ -4034,7 +4034,7 @@ pub type FakeWorker = Worker<FakeMetadata, FakeStorage, FakeBackend, FakeCache, 
 /// a `warn!` first hit by a test without a subscriber is cached as "never" for every thread, the
 /// capturing test's included, and its check fails now and then. Two dispatchers that live for
 /// the whole test process make tracing-core ask every live dispatcher instead.
-fn pin_tracing_dispatchers() {
+pub(crate) fn pin_tracing_dispatchers() {
     use tracing::Dispatch;
     use tracing::subscriber::NoSubscriber;
     static PINNED: std::sync::OnceLock<[Dispatch; 2]> = std::sync::OnceLock::new();
@@ -4210,6 +4210,87 @@ pub fn restored_by_hand(w: &FakeWorker, branch: BranchId, backup_name: &str) -> 
     assert!(switched.unwrap(), "switched");
     w.metadata.state().branches.get_mut(&branch).unwrap().status = BranchStatus::Ready;
     backup
+}
+
+/// The startup schedule report's metadata calls ([`crate::schedule_report::ScheduleStore`]):
+/// the stored rows in id order, every write call kept, and a read or write that can be made to
+/// fail.
+pub struct FakeSchedules {
+    rows: Vec<chelabase_metadata::ScheduleReportRow>,
+    recorded: Mutex<Vec<Vec<uuid::Uuid>>>,
+    reads: std::sync::atomic::AtomicUsize,
+    seen: std::sync::atomic::AtomicUsize,
+    fail_reads: std::sync::atomic::AtomicBool,
+    fail_writes: std::sync::atomic::AtomicBool,
+}
+
+impl FakeSchedules {
+    pub fn new(mut rows: Vec<chelabase_metadata::ScheduleReportRow>) -> Self {
+        rows.sort_by_key(|r| r.id);
+        Self {
+            rows,
+            recorded: Mutex::default(),
+            reads: Default::default(),
+            seen: Default::default(),
+            fail_reads: Default::default(),
+            fail_writes: Default::default(),
+        }
+    }
+
+    pub fn fail_reads(&self) {
+        self.fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn fail_writes(&self) {
+        self.fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The ids of each `record_schedule_errors` call.
+    pub fn recorded(&self) -> Vec<Vec<uuid::Uuid>> {
+        lock(&self.recorded).clone()
+    }
+
+    /// How many list calls were made.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many rows the list calls returned in all.
+    pub fn seen(&self) -> usize {
+        self.seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::schedule_report::ScheduleStore for FakeSchedules {
+    async fn list_schedules_for_report(
+        &self,
+        after: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<chelabase_metadata::ScheduleReportRow>, MetadataError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.reads.fetch_add(1, SeqCst);
+        if self.fail_reads.load(SeqCst) {
+            return Err(MetadataError::Config("the metadata database is down".into()));
+        }
+        let page: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|r| after.is_none_or(|a| r.id > a))
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        self.seen.fetch_add(page.len(), SeqCst);
+        Ok(page)
+    }
+
+    async fn record_schedule_errors(&self, ids: &[uuid::Uuid]) -> Result<(), MetadataError> {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MetadataError::Config("the write failed".into()));
+        }
+        lock(&self.recorded).push(ids.to_vec());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -172,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(serve_storage_webhook_test(worker.clone(), nats.clone(), webhooks));
 
+    // Before the schedule loop's first claim: list the stored schedules the current cron parser
+    // rejects (log + `last_error`). Awaited, so the loop only starts after the report; it never
+    // fails the worker.
+    worker::schedule_report::run(worker.metadata.inner()).await;
     match &functions.invoke {
         Some((url, token)) => {
             let invoker: Arc<dyn worker::fn_schedules::Invoker> =
