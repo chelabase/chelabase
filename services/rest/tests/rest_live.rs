@@ -2073,6 +2073,78 @@ async fn session_state_set_by_an_rpc_does_not_reach_the_next_request() {
     .await;
 }
 
+/// A request whose own work deallocates the connection's protocol-level statements commits
+/// (nothing after its plan uses one) and leaves its connection pooled, with a statement
+/// cache the server no longer matches. The next request's preamble meets the missing
+/// statement (`26000`) before any of its own statements ran: that connection is discarded
+/// and the request runs once more on another one, answering 200 (#324). One connection at
+/// most, so the second run's connection is a new one and the first's slot had to be freed.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_statement_missing_at_the_preamble_runs_once_more_on_another_connection() {
+    live("missingstmt", |l| async move {
+        l.metadata
+            .update_database_settings(
+                l.db,
+                &chelabase_metadata::SettingsPatch {
+                    max_connections: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        l.owner(
+            "CREATE TABLE t (id int PRIMARY KEY);
+             INSERT INTO t VALUES (1);
+             CREATE FUNCTION forget() RETURNS void LANGUAGE plpgsql AS \
+               'BEGIN EXECUTE ''DEALLOCATE ALL''; END';",
+        )
+        .await;
+        let read = json!({"v":1,"op":"select","from":"t"});
+        // Sequential first (the version and the view), then pipelined: the preamble is a
+        // statement the connection caches.
+        assert_eq!(l.auth(read.clone()).await.ok(), &json!([{"id":1}]));
+        let before = l.state.engine.pipelined_runs();
+        assert_eq!(l.auth(read.clone()).await.ok(), &json!([{"id":1}]));
+        assert_eq!(l.state.engine.pipelined_runs() - before, 1, "pipelined");
+        // Pipelined too, and it commits: its plan dropped every statement the connection
+        // holds, its own included, and nothing after the plan uses one.
+        let before = l.state.engine.pipelined_runs();
+        assert_eq!(
+            l.auth(json!({"v":1,"op":"call","fn":"forget"})).await.ok(),
+            &Value::Null
+        );
+        assert_eq!(l.state.engine.pipelined_runs() - before, 1, "pipelined");
+
+        // The preamble's cached statement is gone from the server: the first run fails
+        // before the request ran, the second runs on another connection.
+        let before = l.state.engine.pipelined_runs();
+        assert_eq!(l.auth(read.clone()).await.ok(), &json!([{"id":1}]));
+        assert_eq!(
+            l.state.engine.pipelined_runs() - before,
+            2,
+            "ran once more on another connection"
+        );
+        // That connection is the pool's now, with a cache that matches: one run each.
+        for _ in 0..2 {
+            let before = l.state.engine.pipelined_runs();
+            assert_eq!(l.auth(read.clone()).await.ok(), &json!([{"id":1}]));
+            assert_eq!(l.state.engine.pipelined_runs() - before, 1);
+        }
+        // A write retried this way commits once.
+        l.auth(json!({"v":1,"op":"call","fn":"forget"})).await.ok();
+        let before = l.state.engine.pipelined_runs();
+        let written = l
+            .auth(json!({"v":1,"op":"insert","into":"t","values":[{"id":2}],"returning":["id"]}))
+            .await;
+        assert_eq!(written.ok(), &json!([{"id":2}]));
+        assert_eq!(l.state.engine.pipelined_runs() - before, 2);
+        let all = json!({"v":1,"op":"select","from":"t","orderBy":[{"col":"id"}]});
+        assert_eq!(l.auth(all).await.ok(), &json!([{"id":1},{"id":2}]));
+    })
+    .await;
+}
+
 /// A database whose guard functions are gone (a database not bootstrapped since they were
 /// added): the pipeline finds them missing and every request runs sequentially, with the same
 /// answers, until the bootstrap puts them back.

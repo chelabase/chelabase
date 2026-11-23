@@ -789,24 +789,28 @@ where
         reset_sql: OWNER_RESET_SQL,
     };
     let rid = principal.request_id.as_str();
-    let result: Result<String, QueryFailure> = async {
-        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, &tls))?);
+    // Once more on another connection when nothing of the request ran on one that had to be
+    // discarded: each run's lease is dropped before it returns.
+    let (pool, tls, settings) = (&pool, &tls, &settings);
+    let result = chelabase_query::pipeline::once_more_on_another_connection(rid, || async move {
+        let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
         let out = chelabase_query::run(
             &lease,
             &state.console.cache,
             (branch.id.as_uuid(), &row.name),
             // The owner pool logs in as `owner` (`owner_pool_for`).
             RunAs::Owner { user: owner },
-            &settings,
+            settings,
             chelabase_query::engine::DEFAULT_MAX_RESPONSE_BYTES,
             op,
             rid,
         )
         .await;
         lease.done();
-        out
-    }
-    .await;
+        Ok(out)
+    })
+    .await
+    .and_then(|out| out);
     match result {
         Ok(out) => json_text(StatusCode::OK, out),
         Err(failure) => data_api_failure(failure),

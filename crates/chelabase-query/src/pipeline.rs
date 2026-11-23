@@ -21,7 +21,10 @@
 //!    ([`settle`]), the cap's error is the 413, a failed session check is a 500 that marks
 //!    the connection broken (never a fallback), and anything else maps as the sequential
 //!    path maps it. A cached statement the server no longer has (`26000`) marks the
-//!    connection broken too: its cache no longer matches the server.
+//!    connection broken too: its cache no longer matches the server. Raised by the
+//!    preamble, before any statement of the request ran, its failure says so
+//!    ([`QueryFailure::retries_on_another_connection`]) and the caller runs the request once
+//!    more on another connection ([`once_more_on_another_connection`]).
 //! 5. Rust counts the results again against the budget ([`response`]).
 
 use std::future::Future;
@@ -428,6 +431,19 @@ pub(crate) fn step_failed<E: StepError>(step: StepKind, e: &E, ctx: &Ctx<'_>) ->
         match (step, db.code()) {
             // The connection's fault, whatever the step: never the preamble's "role can't
             // be used" 503.
+            // Before any statement of the request ran: the transaction aborted at its
+            // preamble, so every plan after it was refused (`25P02`) and the `COMMIT`
+            // rolled back. The caller may run the request once more on another connection
+            // ([`once_more_on_another_connection`]); never on this one, whose cache no longer
+            // matches the server.
+            (StepKind::Preamble, MISSING_STATEMENT) => {
+                // [`failed`] logged the cause at warn.
+                return Attempt::Done(Err(QueryFailure::internal_on_another_connection(
+                    ctx.request_id,
+                )));
+            }
+            // Later, the request's own statements may have run: answered as it is, never
+            // run again.
             (_, MISSING_STATEMENT) => {}
             (StepKind::Preamble, STALE_VERSION) => return Attempt::Stale,
             (StepKind::Plan, TOO_LARGE) => return Attempt::Done(Err(too_large(ctx.budget))),
@@ -484,6 +500,41 @@ pub(crate) fn failed<C: QueryClient + ?Sized, E: StepError>(
         client.mark_broken();
     }
     step_failed(step, e, ctx)
+}
+
+/// Runs `run` (it takes a connection and runs one request on it, as [`crate::run`]), and
+/// once more when the first run's failure says nothing of the request ran and its connection
+/// is discarded ([`QueryFailure::retries_on_another_connection`]: a cached statement missing
+/// at the preamble). `run` must take its connection anew each time and let go of it (dropped
+/// or pooled) before it returns, so the second run never meets the first one's connection;
+/// the pool may still hand it one that lost the same statements, and then the second
+/// failure is the answer. The second run's answer is the request's, whatever it is: never a
+/// third run. An `Err` (taking the connection failed) is returned as it is.
+pub async fn once_more_on_another_connection<T, E, F>(
+    request_id: &str,
+    mut run: impl FnMut() -> F,
+) -> Result<Result<T, QueryFailure>, E>
+where
+    F: Future<Output = Result<Result<T, QueryFailure>, E>>,
+{
+    match run().await? {
+        Err(f) if f.retries_on_another_connection() => {
+            tracing::info!(
+                request_id,
+                "nothing of the request ran on a discarded connection; it runs once more on another one"
+            );
+            Ok(run().await?.map_err(|f| {
+                if f.retries_on_another_connection() {
+                    tracing::error!(
+                        request_id,
+                        "internal error: a cached statement was missing at the preamble on two connections"
+                    );
+                }
+                f.settled()
+            }))
+        }
+        out => Ok(out),
+    }
 }
 
 /// A statement didn't prepare: a database without the guard functions is marked; anything
@@ -1352,6 +1403,134 @@ mod tests {
         lease.done();
         drop(lease);
         assert_eq!(pool.status().size, 1, "kept");
+    }
+
+    fn gone() -> FakeErr {
+        FakeErr(FakeDb::new(
+            "26000",
+            "prepared statement \"s7\" does not exist",
+        ))
+    }
+
+    /// A cached statement missing when the preamble ran (nothing of the request ran: the
+    /// transaction aborted before its first statement): the connection is discarded and
+    /// the request runs once more on another one, whose answer is the request's.
+    #[tokio::test]
+    async fn preamble_missing_statement_retries_once() {
+        let pool = crate::fake_pg::pool(1).await;
+        let calls = AtomicUsize::new(0);
+        let out = once_more_on_another_connection("rid-1", || async {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            if call == 1 {
+                assert_eq!(pool.status().size, 0, "the first connection was closed");
+            }
+            let mut lease = Lease::new(pool.get().await.unwrap());
+            let out = if call == 0 {
+                Err(done_err(failed(&lease, StepKind::Preamble, &gone(), &role_ctx(100))))
+            } else {
+                assert!(!lease.is_broken(), "a new lease");
+                Ok("1".to_owned())
+            };
+            lease.done();
+            Ok::<_, std::convert::Infallible>(out)
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.unwrap(), "1");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.status().size, 1, "the second connection went back to the pool");
+    }
+
+    /// A cached statement missing after the request's own statements started (a plan, the
+    /// constraints, the check, `COMMIT`), or before the preamble (the opening): the request
+    /// may have run, so it never runs again; the connection is still discarded. Any other
+    /// failure of the preamble isn't retried either.
+    #[tokio::test]
+    async fn missing_statement_after_start_does_not_retry() {
+        let pool = crate::fake_pg::pool(1).await;
+        let mut cases: Vec<(StepKind, FakeErr)> = [
+            StepKind::Begin,
+            StepKind::Plan,
+            StepKind::Constraints,
+            StepKind::Check,
+            StepKind::Commit,
+        ]
+        .into_iter()
+        .map(|step| (step, gone()))
+        .collect();
+        for (code, message) in [
+            ("42501", "permission denied to set role \"anon\""),
+            ("57P01", "terminating connection due to administrator command"),
+            ("25P02", ABORTED),
+            ("CB001", "chelabase: stale schema version"),
+            ("XX000", "internal"),
+        ] {
+            cases.push((StepKind::Preamble, FakeErr(FakeDb::new(code, message))));
+        }
+        for (step, e) in cases {
+            let what = format!("{step:?} {}", e.0.code());
+            let calls = AtomicUsize::new(0);
+            let out = once_more_on_another_connection("rid-1", || async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let mut lease = Lease::new(pool.get().await.unwrap());
+                let out = match failed(&lease, step, &e, &role_ctx(100)) {
+                    Attempt::Done(out) => out,
+                    _ => Ok("fell back".to_owned()),
+                };
+                if let Err(f) = &out {
+                    assert!(!f.retries_on_another_connection(), "{what}");
+                }
+                lease.done();
+                Ok::<_, std::convert::Infallible>(out)
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{what}: run once");
+            if e.0.code() == MISSING_STATEMENT {
+                assert_eq!(out.unwrap_err().status, StatusCode::INTERNAL_SERVER_ERROR, "{what}");
+                assert_eq!(pool.status().size, 0, "{what}: discarded all the same");
+            }
+        }
+    }
+
+    /// The run on another connection fails the same way: its failure is the request's
+    /// answer, never a third run.
+    #[tokio::test]
+    async fn a_second_failure_is_returned() {
+        let pool = crate::fake_pg::pool(1).await;
+        let calls = AtomicUsize::new(0);
+        let out = once_more_on_another_connection("rid-1", || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let mut lease = Lease::new(pool.get().await.unwrap());
+            let f = done_err(failed(&lease, StepKind::Preamble, &gone(), &role_ctx(100)));
+            assert!(f.retries_on_another_connection());
+            lease.done();
+            Ok::<Result<String, _>, std::convert::Infallible>(Err(f))
+        })
+        .await
+        .unwrap();
+        let f = out.unwrap_err();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "once more, never a third time");
+        assert_eq!(f.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!f.retries_on_another_connection(), "the answer is settled");
+        // The mark isn't part of the answer: a marked failure equals the same 500 unmarked.
+        let marked = QueryFailure::internal_on_another_connection("rid-1");
+        assert!(marked.retries_on_another_connection());
+        assert_eq!(marked, QueryFailure::internal("rid-1", "gone"));
+        assert_eq!(f, marked);
+        assert_eq!(pool.status().size, 0, "both connections closed");
+
+        // A failure acquiring another connection is the answer too.
+        let calls = AtomicUsize::new(0);
+        let out = once_more_on_another_connection("rid-1", || async {
+            if calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                return Err("no connection");
+            }
+            Ok::<Result<String, _>, _>(Err(QueryFailure::internal_on_another_connection("rid-1")))
+        })
+        .await;
+        assert_eq!(out.unwrap_err(), "no connection");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// The deferrable-write mark is the session check's own answer: a `COMMIT` that fails
