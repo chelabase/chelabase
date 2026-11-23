@@ -13,6 +13,7 @@
 //! attaches to each service network. `service_containers_reach_nothing_but_their_own_port` uses
 //! the stack's real functions container instead (attached, then detached, by the runner).
 
+use chelabase_time::{DateExt, TimestampExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -601,7 +602,7 @@ async fn reconcile_follows_the_metadata() {
         .unwrap();
     let name = format!(
         "cm_{:08x}{}",
-        chrono::Utc::now().timestamp() as u32,
+        chelabase_time::Timestamp::now().timestamp() as u32,
         &hex()[..4]
     );
     sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
@@ -663,7 +664,7 @@ async fn reconcile_follows_the_metadata() {
                 bundle_sha256: None,
                 bundle_size: None,
                 spec: s,
-                compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                compatibility_date: chelabase_time::Date::ymd(2026, 11, 1).unwrap(),
                 created_by: "m10 live",
                 note: None,
             })
@@ -722,7 +723,7 @@ async fn reconcile_follows_the_metadata() {
             bundle_sha256: None,
             bundle_size: None,
             spec: &spec,
-            compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            compatibility_date: chelabase_time::Date::ymd(2026, 11, 1).unwrap(),
             created_by: "m11 live",
             note: None,
         })

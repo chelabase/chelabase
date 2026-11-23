@@ -281,6 +281,7 @@ pub fn event_body(e: &Event) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
     use chelabase_types::BranchId;
     use proptest::prelude::*;
 
@@ -320,7 +321,7 @@ mod tests {
             source: TriggerSource::Table,
             enabled,
             state,
-            enabled_since: chrono::Utc::now(),
+            enabled_since: chelabase_time::Timestamp::now(),
             pg_database: "app".into(),
             schema_name: Some("public".into()),
             table_name: Some("orders".into()),
@@ -348,7 +349,7 @@ mod tests {
             run_as_role_oid: None,
             run_as_unmintable: None,
             last_error: None,
-            updated_at: chrono::Utc::now(),
+            updated_at: chelabase_time::Timestamp::now(),
             health: None,
         }
     }

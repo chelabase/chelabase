@@ -31,6 +31,7 @@ use chelabase_nats::storage_objects::{
 use chelabase_nats::rt::{ACCESS, PROJECT, ProjectEvent};
 use chelabase_nats::{NatsConfig, SUBJECT_STORAGE_EVENTS, StorageEvent};
 use chelabase_pgsession::ConnSource;
+use chelabase_time::{Timestamp, TimestampExt};
 use futures_util::StreamExt;
 use uuid::Uuid;
 
@@ -127,7 +128,7 @@ pub fn event_of(data: &DataIdentity, at: &crate::engine::Located, change: Object
     ObjectEvent {
         id: Uuid::new_v4(),
         kind: change.kind,
-        time: chrono::Utc::now(),
+        time: Timestamp::now(),
         database_id: at.database_id,
         branch_id: data.branch_id,
         pg_database: at.database.clone(),
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!((e.version_id, e.size, e.content_type.as_deref()), (Some(Uuid::from_u128(9)), Some(3), Some("image/png")));
         assert_eq!(e.actor, ObjectActor { role: "app_writer".into(), sub: Some("user-1".into()) });
         assert!(!serde_json::to_string(&e).unwrap().contains("a@b.c"));
-        assert!((chrono::Utc::now() - e.time).num_seconds().abs() < 5);
+        assert!(Timestamp::now().since(e.time).abs().as_secs() < 5);
         let anon = event_of(&data(json!({ "sub": 7 })), &located(), change(ObjectEventType::Deleted));
         assert_eq!(anon.actor.sub, None);
         assert_ne!(anon.id, e.id);
