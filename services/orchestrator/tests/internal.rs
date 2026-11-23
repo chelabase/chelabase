@@ -1754,6 +1754,21 @@ async fn wake_compute_gives_the_running_compute() {
 }
 
 #[tokio::test]
+async fn wake_compute_answers_server_name() {
+    let neon = FakeNeon::default();
+    neon.add("ep-a", TENANT, TIMELINE);
+    let locator = FakeLocator::default();
+    locator.running("ep-a", "172.20.0.9", None);
+    let app = spawn_internal(neon, locator, "http://127.0.0.1:9").await;
+    let (status, body) = app
+        .get(&format!("{WAKE}?endpointish=ep-a"), Some(PROXY_TOKEN))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["server_name"], "ep-a.compute.chelabase.internal");
+    assert_eq!(body["address"], "172.20.0.9:5432");
+}
+
+#[tokio::test]
 async fn wake_compute_refuses_unroutable_endpoint() {
     let neon = FakeNeon::default();
     neon.add("ep-a", TENANT, TIMELINE);

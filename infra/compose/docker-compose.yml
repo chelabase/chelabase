@@ -838,14 +838,32 @@ services:
   # Valkey.
   # RT1 T1 (S6, S27): it logs in to Valkey as the `proxy` ACL user and calls the orchestrator
   # with its generated token, each read from its file. Runs as the app user (their owner).
+  # compute-hop-tls m1: the hop to the compute is TLS too. The orchestrator names each compute's
+  # certificate (<endpoint>.compute.chelabase.internal) in its wake_compute answer, and the proxy
+  # verifies it against the compute CA (NEON_INTERNAL_CA_FILE). The proxy accepts an unset
+  # variable, so the entrypoint refuses to start without a CA file holding a certificate.
+  # An orchestrator from before compute-hop-tls names no certificate (server_name null), and the
+  # proxy would cache that compute as plaintext. So the proxy starts only once the orchestrator
+  # is healthy (`up` never pairs a new proxy with the old orchestrator), and its node-info cache
+  # (--wake-compute-cache) keeps an entry for at most 10 minutes, however often it is used.
+  # Upgrading: `docker compose up -d` recreates the proxy. A restart (`docker compose restart`)
+  # keeps the old container's environment and mounts: without NEON_INTERNAL_CA_FILE every compute
+  # login fails until it is recreated (its in-memory caches don't survive the restart).
   proxy:
     image: *neon-image
     restart: unless-stopped
     user: "10001:10001"
+    environment:
+      NEON_INTERNAL_CA_FILE: /run/chelabase/secrets/compute-ca/ca.crt
     entrypoint:
       - /bin/sh
       - -c
-      - >-
+      - |
+        ca="$${NEON_INTERNAL_CA_FILE:-}"
+        if [ -z "$$ca" ] || [ ! -f "$$ca" ] || [ ! -s "$$ca" ] || ! grep -q -- '-----BEGIN CERTIFICATE-----' "$$ca"; then
+          echo "proxy: NEON_INTERNAL_CA_FILE=[$$ca] is unset, missing, empty or holds no certificate; the proxy verifies computes against the compute CA and won't start without it" >&2
+          exit 1
+        fi
         exec proxy --redis-plain=redis://proxy@valkey:6379 --redis-plain-password-file=/run/valkey-proxy.password --control-plane-token-file=/run/proxy-api.token "$$@"
       - proxy
     command:
@@ -857,6 +875,9 @@ services:
       - --tls-cert=/tls/tls.crt
       - --tls-key=/tls/tls.key
       - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
+      # Compute addresses (and whether to verify a certificate): the fork's default plus an
+      # absolute ttl, so no entry outlives 10 minutes.
+      - --wake-compute-cache=size=4000,idle_ttl=4m,ttl=10m
       - --redis-auth-type=plain
     # 5432, the Postgres default, so clients need no port; it is free beside a workbench (4432,
     # 4500-4599). Move it when the host runs its own Postgres.
@@ -870,6 +891,7 @@ services:
       - neon_proxy_tls:/tls:ro
       - {type: volume, source: secrets, target: /run/valkey-proxy.password, read_only: true, volume: {subpath: valkey/proxy.password}}
       - {type: volume, source: secrets, target: /run/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
       interval: 2s
@@ -877,8 +899,14 @@ services:
     depends_on:
       proxy-tls:
         condition: service_completed_successfully
+      # compute-ca/ca.crt (NEON_INTERNAL_CA_FILE).
+      init-secrets:
+        condition: service_completed_successfully
       # The proxy exits if it can't reach Redis at startup.
       valkey:
+        condition: service_healthy
+      # Its wake_compute answers name each compute's certificate (see above).
+      orchestrator:
         condition: service_healthy
 
   # --- The app tier ---------------------------------------------------------------------------
