@@ -1736,7 +1736,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 #[cfg(test)]
 mod tests {
     use super::*;
-use chelabase_time::{Timestamp, TimestampExt};
+    use chelabase_time::{Timestamp, TimestampExt};
 
     const ROLES: Roles = Roles {
         owner: Some(4242),

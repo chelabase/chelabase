@@ -733,7 +733,7 @@ UNION ALL \
 SELECT 'k ' || {rname} FROM pg_roles r WHERE {r_marked} \
 UNION ALL \
 SELECT 'u ' || {aname} || ' ' || CASE WHEN a.rolvaliduntil IS NULL OR NOT isfinite(a.rolvaliduntil) \
-THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
+OR a.rolvaliduntil > '9999-12-30 22:00:00+00'::timestamptz THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
 FROM pg_authid a WHERE {a_marked} \
 UNION ALL \
 SELECT 'd ' || {dname} || ' ' || {downer} FROM pg_database d \

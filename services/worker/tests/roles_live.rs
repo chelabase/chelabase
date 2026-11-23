@@ -3095,6 +3095,25 @@ async fn sql_changes_to_an_api_role_stick_through_the_resync() {
     .await;
 }
 
+// A VALID UNTIL past what the time type holds (`9999-12-31`, `294276-01-01`, beyond `i64`
+// microseconds as a unix time) reads as no expiry: the catalog SELECT must not raise
+// `bigint out of range`, so the resync still succeeds and records nothing as expiring.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_far_future_valid_until_does_not_break_the_resync() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        for until in ["9999-12-31 00:00:00+00", "294276-01-01 00:00:00+00"] {
+            fx.sql(&format!("ALTER ROLE app VALID UNTIL '{until}';")).await;
+            fx.worker.resync(fx.main).await.unwrap_or_else(|e| panic!("{until}: {e:#}"));
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let app = rows.iter().find(|r| r.name == "app").unwrap();
+            assert_eq!(app.attributes.valid_until, None, "{until} reads as no expiry");
+        }
+    })
+    .await;
+}
+
 // T14 I2: turning LOGIN on counts toward the login-role cap, in the same transaction as the
 // write (the worker's cap is 50 in the dev stack: a branch near it is built with SQL roles).
 #[tokio::test]

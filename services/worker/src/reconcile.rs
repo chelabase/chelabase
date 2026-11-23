@@ -1364,7 +1364,7 @@ mod tests {
     use chelabase_metadata::BranchKind;
 
     use super::*;
-use chelabase_time::{Timestamp, TimestampExt};
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{
         FRESH_HEAD, FakeWorker, Journal, entries, pending_branch, position, ready_branch,
         ready_database, worker,
