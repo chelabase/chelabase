@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use chelabase_metadata::{
     AppUsersStatus, BeginProjectDelete, ProjectRecord, ProjectStatus, RenameProject, valid_project_name,
 };
@@ -86,8 +86,8 @@ pub struct ProjectInfo {
     pub status: ProjectStatusView,
     #[schema(required = true)]
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// `null` while app users were never enabled for the project.
     #[schema(required = true)]
     pub app_users: Option<AppUsersStatusView>,

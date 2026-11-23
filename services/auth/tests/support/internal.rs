@@ -441,11 +441,17 @@ impl FakeInternal {
 
     /// The user's latest invite: open (expiring in 72 h), or expired an hour ago.
     pub fn set_open_invite(&self, user: &str, open: bool) {
-        let at = chrono::Utc::now()
-            + if open { chrono::Duration::hours(72) } else { chrono::Duration::hours(-1) };
+        use chelabase_time::{Timestamp, TimestampExt};
+        let now = Timestamp::now();
+        let at = if open {
+            now.checked_add(chelabase_time::hours(72))
+        } else {
+            now.checked_sub(chelabase_time::hours(1))
+        }
+        .unwrap();
         self.inner.lock().unwrap().open_invites.insert(
             user.into(),
-            json!({"open": open, "expires_at": at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)}),
+            json!({"open": open, "expires_at": at.to_rfc3339_micros()}),
         );
     }
 

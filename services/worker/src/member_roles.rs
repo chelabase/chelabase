@@ -72,7 +72,7 @@ use chelabase_types::access::{
 };
 use chelabase_types::role_name::{MEMBER_ROLE_PREFIX, PERSONAL_LOGIN_MARKER};
 use chelabase_types::table_api::SCHEMA_LOCKED_ROLE;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -144,7 +144,7 @@ pub struct DesiredMemberRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleKind {
     Member,
-    Personal { valid_until: DateTime<Utc> },
+    Personal { valid_until: Timestamp },
 }
 
 /// One `pg_auth_members` row of a member role.
@@ -172,7 +172,7 @@ pub struct ActualMemberRole {
     pub verifier: Option<String>,
     pub memberships: Vec<ActualMembership>,
     /// `rolvaliduntil` (`None`: no expiry); read for marked roles (T6).
-    pub valid_until: Option<DateTime<Utc>>,
+    pub valid_until: Option<Timestamp>,
 }
 
 /// One change to a branch's member roles, in [`plan_member_roles`]'s order: revokes; creates,
@@ -223,13 +223,13 @@ pub enum MemberRoleStep {
     CreatePersonal {
         role: String,
         verifier: String,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
         lock: bool,
     },
     /// T6: a personal login's `VALID UNTIL` set back to its record's.
     SetValidUntil {
         role: String,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     },
     /// T6-M6: a personal login's per-database settings reset, database by database (never a
     /// role-wide `RESET ALL`: the marker is a role-wide setting).
@@ -308,7 +308,7 @@ pub fn plan_member_roles(
             // protected child, a reset).
             (Some(a), RoleKind::Personal { valid_until }) => {
                 creates.extend(lock);
-                let micros = |t: &DateTime<Utc>| t.timestamp_micros();
+                let micros = |t: &Timestamp| t.timestamp_micros();
                 let expiry_differs =
                     a.valid_until.as_ref().map(micros) != Some(micros(valid_until));
                 if !a.attributes_ok || expiry_differs {
@@ -511,8 +511,8 @@ pub fn render_step(step: &MemberRoleStep) -> String {
 }
 
 /// A `VALID UNTIL` literal, to the microsecond Postgres keeps (RFC 3339, UTC).
-fn valid_until_literal(at: &DateTime<Utc>) -> String {
-    literal(&at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+fn valid_until_literal(at: &Timestamp) -> String {
+    literal(&at.to_rfc3339_micros())
 }
 
 /// Ends every session of `role`, waiting up to 5 s for each (M2).
@@ -733,7 +733,7 @@ UNION ALL \
 SELECT 'k ' || {rname} FROM pg_roles r WHERE {r_marked} \
 UNION ALL \
 SELECT 'u ' || {aname} || ' ' || CASE WHEN a.rolvaliduntil IS NULL OR NOT isfinite(a.rolvaliduntil) \
-THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
+OR a.rolvaliduntil > '9999-12-30T22:00:00.999999Z'::timestamptz THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
 FROM pg_authid a WHERE {a_marked} \
 UNION ALL \
 SELECT 'd ' || {dname} || ' ' || {downer} FROM pg_database d \
@@ -937,7 +937,7 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
     let mut settings: Vec<(String, Option<String>)> = Vec::new();
     let mut passwords: Vec<(String, Option<String>)> = Vec::new();
     let mut attributes: BTreeMap<String, bool> = BTreeMap::new();
-    let mut expiries: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
+    let mut expiries: Vec<(String, Option<Timestamp>)> = Vec::new();
     let field = |f: Option<&str>| {
         f.map(unhex)
             .unwrap_or_else(|| Err("a missing field".into()))
@@ -1012,15 +1012,9 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
                 let role = field(fields.next())?;
                 let until = match fields.next() {
                     Some("-") => None,
-                    Some(micros) => Some(
-                        micros
-                            .parse::<i64>()
-                            .ok()
-                            .and_then(DateTime::from_timestamp_micros)
-                            .ok_or_else(|| {
-                                format!("an unexpected VALID UNTIL {micros:?} in the member-role catalog")
-                            })?,
-                    ),
+                    Some(micros) => crate::resync::valid_until_from_micros(micros).ok_or_else(|| {
+                        format!("an unexpected VALID UNTIL {micros:?} in the member-role catalog")
+                    })?,
                     None => return Err("a member-role catalog line is missing a field".into()),
                 };
                 expiries.push((role, until));

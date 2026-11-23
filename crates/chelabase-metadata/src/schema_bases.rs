@@ -7,7 +7,7 @@
 //! was current there (see [`MetadataClient::switch_to_restored_timeline`]).
 
 use chelabase_types::BranchId;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use sqlx::postgres::PgRow;
 use sqlx::{Postgres, Row, Transaction};
 
@@ -68,10 +68,10 @@ pub struct SchemaBase {
     pub branch_timeline_id: Option<String>,
     pub branch_lsn: Option<String>,
     pub identity_map: serde_json::Value,
-    pub taken_at: DateTime<Utc>,
+    pub taken_at: Timestamp,
     /// When the entry was written (a restore's copy: the restore). Set by the metadata;
     /// ignored by [`MetadataClient::append_schema_base`].
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 fn base_from_row(r: &PgRow) -> Result<SchemaBase, MetadataError> {
@@ -88,8 +88,8 @@ fn base_from_row(r: &PgRow) -> Result<SchemaBase, MetadataError> {
         branch_timeline_id: r.get("branch_timeline_id"),
         branch_lsn: r.get("branch_lsn"),
         identity_map: r.get("identity_map"),
-        taken_at: r.get("taken_at"),
-        recorded_at: r.get("recorded_at"),
+        taken_at: r.try_get("taken_at")?,
+        recorded_at: r.try_get("recorded_at")?,
     })
 }
 

@@ -25,6 +25,7 @@ use chelabase_metadata::{
     ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
 };
 use chelabase_metadata::members::Admission;
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_types::data_key::{self, DataKeyKind};
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 
@@ -1309,7 +1310,7 @@ async fn create_branch_refuses_taken_names_and_unready_parents() {
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let (other, _ep) = ready_database(&client).await;
-    let at = chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z").unwrap().to_utc();
+    let at = Timestamp::parse_rfc3339("2026-09-30T12:00:00Z").unwrap();
 
     let mut dev = new_branch(id, "dev", main_of(id));
     dev.branched_at_time = Some(at);
@@ -2195,14 +2196,14 @@ async fn migration_backfills_main_for_live_databases_only() {
         assert_eq!(b.get::<Option<String>, _>("superseded_timeline_id"), None);
         assert_eq!(b.get::<Option<String>, _>("error"), row.error.map(str::to_string));
         assert_eq!(b.get::<Option<String>, _>("owner_password_enc"), row.sealed);
-        assert_eq!(b.get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at"), None);
+        assert_eq!(b.get::<Option<Timestamp>, _>("deleted_at"), None);
         assert_eq!(
-            b.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-            b.get::<chrono::DateTime<chrono::Utc>, _>("d_created")
+            b.get::<Timestamp, _>("created_at"),
+            b.get::<Timestamp, _>("d_created")
         );
         assert_eq!(
-            b.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-            b.get::<chrono::DateTime<chrono::Utc>, _>("d_updated")
+            b.get::<Timestamp, _>("updated_at"),
+            b.get::<Timestamp, _>("d_updated")
         );
         // The AAD is the branch id, which is the database id: the password still opens.
         if let Some(sealed) = b.get::<Option<String>, _>("owner_password_enc") {
@@ -2501,7 +2502,7 @@ async fn history_start_is_set_when_ready_and_follows_the_timeline() {
     let client = client().await;
     let (id, _ep) = ready_database(&client).await;
     let main = main_branch(&client, id).await;
-    let past: chrono::DateTime<chrono::Utc> = "2026-09-20T09:00:00Z".parse().unwrap();
+    let past: Timestamp = "2026-09-20T09:00:00Z".parse().unwrap();
     let b = new_branch(id, "dev", main_of(id));
     assert_eq!(client.create_branch(&b).await.unwrap(), CreateBranchOutcome::Created);
     link_branch(&client, b.id).await;
@@ -2525,7 +2526,7 @@ async fn history_start_is_set_when_ready_and_follows_the_timeline() {
         .await
         .unwrap());
     let pending = start_reset(&client, b.id).await;
-    let before: chrono::DateTime<chrono::Utc> =
+    let before: Timestamp =
         sqlx::query_scalar("SELECT now()").fetch_one(client.pool()).await.unwrap();
     assert!(client.switch_to_pending_timeline(b.id, &pending, None, "0/1").await.unwrap());
     let dev_reset = branch(&client, b.id).await;
@@ -2786,7 +2787,7 @@ fn new_key(branch: BranchId, kind: DataKeyKind, role: &str, name: &str) -> (NewD
     )
 }
 
-async fn last_used(client: &MetadataClient, key: uuid::Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+async fn last_used(client: &MetadataClient, key: uuid::Uuid) -> Option<Timestamp> {
     sqlx::query_scalar("SELECT last_used_at FROM data_api_keys WHERE id = $1")
         .bind(key)
         .fetch_one(client.pool())
@@ -3558,7 +3559,7 @@ impl ScratchDb {
     /// on main's endpoint.
     async fn with_login(&self) -> (TenantId, uuid::Uuid, DatabaseId, String) {
         let (t, alice, db, ep) = self.ready().await;
-        let until = chrono::Utc::now() + chrono::Duration::days(90);
+        let until = Timestamp::now() + chelabase_time::days(90);
         self.client
             .create_personal_login(alice, db.as_uuid(), "alice", PERSONAL_VERIFIER, until)
             .await
@@ -3660,7 +3661,7 @@ async fn a_personal_row_needs_its_record() {
         Some("neon_roles_personal_login"),
         "no record yet"
     );
-    let until = chrono::Utc::now() + chrono::Duration::days(90);
+    let until = Timestamp::now() + chelabase_time::days(90);
     c.create_personal_login(alice, db.as_uuid(), "alice", PERSONAL_VERIFIER, until).await.unwrap();
     assert_eq!(
         refused_by(insert("alice", "personal", Some(alice), Some("v1:sealed")).await).as_deref(),
@@ -3894,6 +3895,157 @@ async fn list_roles_password_states() {
     assert_eq!(states(&set_owner), with_owner(PasswordState::SetInSql));
 }
 
+// A role's `valid_until` can be set in SQL or reported by compute to a value past what the time
+// type holds (9999-12-31, and later years). Reading it never panics: it is no expiry.
+#[tokio::test]
+#[ignore]
+async fn a_far_future_role_expiry_from_compute_is_handled_without_a_panic() {
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let attrs = RoleAttributes { valid_until: Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap()), ..RoleAttributes::default() };
+    let role = NewApiRole {
+        name: "forever",
+        owner_level: false,
+        login: false,
+        attributes: &attrs,
+        verifier: None,
+        password_enc: None,
+        change_id: uuid::Uuid::new_v4(),
+    };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let mut seen = Vec::new();
+    for far in ["9999-12-31 00:00:00+00", "12000-01-01 00:00:00+00", "200000-06-01 00:00:00+00"] {
+        sqlx::query("UPDATE neon_roles SET valid_until = $2::timestamptz WHERE endpoint_id = $1 AND name = 'forever'")
+            .bind(&ep)
+            .bind(far)
+            .execute(client.pool())
+            .await
+            .unwrap();
+        let listed = client.list_roles(&ep).await.unwrap();
+        let (copies, _) = client.role_copies(&ep).await.unwrap();
+        seen.push((
+            far,
+            listed.iter().find(|r| r.name == "forever").unwrap().attributes.valid_until,
+            copies.iter().find(|r| r.name == "forever").unwrap().attributes.valid_until,
+        ));
+    }
+    cleanup(&client, id).await;
+    for (far, listed, copied) in seen {
+        for read in [listed, copied] {
+            assert_eq!(read, None, "{far}: read as no expiry");
+        }
+    }
+}
+
+// m13: rows the chrono build wrote (here, SQL literals at second, millisecond and microsecond
+// precision) read back through the jiff-backed types and written back unchanged keep their
+// stored value to the microsecond, in both protocols. Values past the type's range in the
+// compute-fillable `valid_until` (9999-12-31, years 10000 and later) read as no expiry, on
+// every role of the endpoint, and its owner still lists and its copies (what the resync reads)
+// still load.
+#[tokio::test]
+#[ignore]
+async fn rows_written_before_the_swap_read_back_equal() {
+    use sqlx::Row;
+    let client = client().await;
+    const LITERALS: &[&str] = &[
+        "2026-09-30 12:00:00+00",
+        "2026-09-30 12:00:00.5+00",
+        "2026-09-30 12:00:00.123+00",
+        "2026-09-30 12:00:00.123456+00",
+        "1999-12-31 23:59:59.999999+00",
+        "1969-12-31 23:59:59.999999+00",
+        "2026-09-30 17:45:00.000001+05:45",
+        "9999-12-30 21:59:59.999999+00",
+    ];
+    // The codec: decode each stored literal, bind it back, and compare in SQL.
+    for lit in LITERALS {
+        let sql = format!("SELECT '{lit}'::timestamptz AS t");
+        let binary = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).fetch_one(client.pool()).await.unwrap();
+        let text = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_one(client.pool()).await.unwrap();
+        for read in [binary.get::<Timestamp, _>("t"), text.get::<Timestamp, _>("t")] {
+            let same: bool = sqlx::query_scalar("SELECT $1::timestamptz = $2::timestamptz")
+                .bind(read)
+                .bind(*lit)
+                .fetch_one(client.pool())
+                .await
+                .unwrap();
+            assert!(same, "{lit} read as {read:?}");
+        }
+    }
+
+    // A role row: read through the listing, written back through an update, unchanged.
+    let (id, ep) = ready_database(&client).await;
+    let attrs = RoleAttributes::default();
+    let role = NewApiRole {
+        name: "kept",
+        owner_level: false,
+        login: false,
+        attributes: &attrs,
+        verifier: None,
+        password_enc: None,
+        change_id: uuid::Uuid::new_v4(),
+    };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let mut mismatched = Vec::new();
+    for lit in LITERALS {
+        sqlx::query("UPDATE neon_roles SET valid_until = $2::timestamptz WHERE endpoint_id = $1 AND name = 'kept'")
+            .bind(&ep)
+            .bind(*lit)
+            .execute(client.pool())
+            .await
+            .unwrap();
+        let listed = client.list_roles(&ep).await.unwrap();
+        let attributes = listed.iter().find(|r| r.name == "kept").unwrap().attributes.clone();
+        assert!(attributes.valid_until.is_some(), "{lit}");
+        let change = ApiRoleChange {
+            owner_level: false,
+            login: false,
+            attributes,
+            secret: SecretChange::Keep,
+            change_id: uuid::Uuid::new_v4(),
+        };
+        client.update_api_role(&ep, "kept", &change, 10).await.unwrap();
+        let same: bool = sqlx::query_scalar(
+            "SELECT valid_until = $2::timestamptz FROM neon_roles WHERE endpoint_id = $1 AND name = 'kept'",
+        )
+        .bind(&ep)
+        .bind(*lit)
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+        if !same {
+            mismatched.push(*lit);
+        }
+    }
+
+    // Past the range, on the API role and on the owner: no expiry, and the reads still work.
+    let mut far_reads = Vec::new();
+    for far in ["9999-12-31 00:00:00+00", "9999-12-30 22:00:01+00", "10000-01-01 00:00:00+00", "200000-06-01 00:00:00+00"] {
+        sqlx::query("UPDATE neon_roles SET valid_until = $2::timestamptz WHERE endpoint_id = $1")
+            .bind(&ep)
+            .bind(far)
+            .execute(client.pool())
+            .await
+            .unwrap();
+        let listed = client.list_roles(&ep).await;
+        let copies = client.role_copies(&ep).await;
+        far_reads.push((far, listed.map_err(|e| e.to_string()), copies.map_err(|e| e.to_string())));
+    }
+    cleanup(&client, id).await;
+    assert!(mismatched.is_empty(), "changed by a read and write-back: {mismatched:?}");
+    for (far, listed, copies) in far_reads {
+        let listed = listed.unwrap_or_else(|e| panic!("{far}: list_roles failed: {e}"));
+        let (copies, _) = copies.unwrap_or_else(|e| panic!("{far}: role_copies failed: {e}"));
+        assert!(listed.iter().any(|r| r.origin == RoleOrigin::Owner), "{far}: the owner lists");
+        assert_eq!(listed.len(), 2, "{far}");
+        assert_eq!(copies.len(), 2, "{far}");
+        for valid_until in listed.iter().map(|r| r.attributes.valid_until).chain(copies.iter().map(|c| c.attributes.valid_until)) {
+            assert_eq!(valid_until, None, "{far}: read as no expiry");
+        }
+    }
+}
+
 // U1: a NOLOGIN api row has no secrets and shows `none`; an update stores the wanted state
 // (pending, version bumped), and turning LOGIN on stores the new secrets.
 #[tokio::test]
@@ -3904,7 +4056,7 @@ async fn api_role_attributes_insert_and_update() {
     let group = RoleAttributes {
         inherit: false,
         connection_limit: 3,
-        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        valid_until: Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap()),
         bypass_rls: true,
         member_of: vec![],
         member_no_set: vec![],
@@ -4198,7 +4350,7 @@ async fn resync_updates_catalog_columns_of_a_recently_forwarded_row() {
     let wanted = RoleAttributes {
         inherit: false,
         connection_limit: 5,
-        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        valid_until: Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap()),
         bypass_rls: true,
         member_of: vec!["grp".into()],
         member_no_set: vec!["grp".into()],
@@ -4448,7 +4600,7 @@ async fn ddl_copy_count_and_upsert_follow_r5() {
     let quiet = client.begin_ddl(&ep).await.unwrap().expect("endpoint");
     quiet.commit().await.unwrap();
     let v_quiet = version(&client, &ep).await;
-    let forwarded: Option<chrono::DateTime<chrono::Utc>> =
+    let forwarded: Option<Timestamp> =
         sqlx::query_scalar("SELECT forwarded_at FROM neon_roles WHERE endpoint_id = $1 AND name = 'fresh'")
             .bind(&ep)
             .fetch_one(client.pool())
@@ -4653,7 +4805,7 @@ async fn ddl_owner_verifier_clears_the_sealed_owner_password() {
     tx.commit().await.unwrap();
     let sealed_after = main_branch(&client, id).await.owner_password_enc;
     let owner = client.neon_roles(&ep).await.unwrap();
-    let forwarded: Option<chrono::DateTime<chrono::Utc>> =
+    let forwarded: Option<Timestamp> =
         sqlx::query_scalar("SELECT forwarded_at FROM neon_roles WHERE endpoint_id = $1 AND origin = 'owner'")
             .bind(&ep)
             .fetch_one(client.pool())
@@ -4711,7 +4863,7 @@ async fn branch_copy_writes_role_copies_and_main_database() {
     let group = RoleAttributes {
         inherit: false,
         connection_limit: 3,
-        valid_until: Some(chrono::DateTime::<chrono::Utc>::from_timestamp(1_900_000_000, 0).unwrap()),
+        valid_until: Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap()),
         bypass_rls: true,
         member_of: vec!["readers".into()],
         member_no_set: vec![],
@@ -5659,7 +5811,7 @@ fn new_session<'a>(project: ProjectId, user: uuid::Uuid, refresh: u8) -> NewAppS
         user_id: user,
         identity_session_id: "zs-1",
         refresh_hash: hash(refresh),
-        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+        expires_at: Timestamp::now() + chelabase_time::days(1),
     }
 }
 
@@ -5839,7 +5991,7 @@ async fn finish_project_delete_cleans_up() {
     let sync = client.branch_auth_sync(main_of(db)).await.unwrap();
     let live = client.get_project(demo(), project).await.unwrap();
     let by_id = client.project_by_id(project).await.unwrap();
-    let (status, error, deleted_at): (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+    let (status, error, deleted_at): (String, Option<String>, Option<Timestamp>) =
         sqlx::query_as("SELECT status, error, deleted_at FROM projects WHERE id = $1")
             .bind(project.as_uuid())
             .fetch_one(client.pool())
@@ -6141,7 +6293,7 @@ async fn refresh_rotates_grace_and_reuse() {
 
     let RefreshOutcome::Rotated(r) = rotated else { panic!("{rotated:?}") };
     assert_eq!(r.id, session.id);
-    assert!(r.expires_at < chrono::Utc::now() + chrono::Duration::hours(2), "sliding applied");
+    assert!(r.expires_at < Timestamp::now() + chelabase_time::hours(2), "sliding applied");
     let RefreshOutcome::Grace { sealed, session: g } = within else { panic!("{within:?}") };
     assert_eq!(sealed, "sealed-2", "the grace hands out the token the rotation made");
     assert_eq!(g.revoked_at, None);
@@ -6437,7 +6589,7 @@ async fn revoke_user_sessions_keeps_and_filters_by_time() {
     }
     backdate_session(&client, s1.id, 7200).await;
 
-    let before = chrono::Utc::now() - chrono::Duration::hours(1);
+    let before = Timestamp::now() - chelabase_time::hours(1);
     let old_only = client.revoke_user_sessions(project, user, None, Some(before)).await.unwrap();
     let listed = client.list_user_sessions(project, user).await.unwrap();
     let rest = client.revoke_user_sessions(project, user, Some(s3.id), None).await.unwrap();
@@ -6780,8 +6932,8 @@ fn base_at(branch: BranchId, db: &str, source: BaseSource, timeline: &str, lsn: 
         branch_timeline_id: Some(timeline.into()),
         branch_lsn: Some(lsn.into()),
         identity_map: serde_json::json!({"pairs": []}),
-        taken_at: chrono::Utc::now(),
-        recorded_at: chrono::Utc::now(),
+        taken_at: Timestamp::now(),
+        recorded_at: Timestamp::now(),
     }
 }
 
@@ -8705,14 +8857,14 @@ async fn storage_upload_tokens_spend_once() {
     client.insert_data_key(&key).await.unwrap();
     let live = client.live_data_key(key.id).await.unwrap();
     let unknown = client.live_data_key(uuid::Uuid::new_v4()).await.unwrap();
-    let later = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let later = Timestamp::now() + chelabase_time::minutes(5);
     let claims = serde_json::json!({ "sub": "u1" });
     let (token, expired, revoked) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let recorded = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
     let again = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
     let dead_key = client.insert_upload_token(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), &claims, later).await;
     client
-        .insert_upload_token(expired, key.id, &claims, chrono::Utc::now() - chrono::Duration::seconds(1))
+        .insert_upload_token(expired, key.id, &claims, Timestamp::now() - chelabase_time::seconds(1))
         .await
         .unwrap();
     let (a, b) = tokio::join!(client.consume_upload_token(token), client.consume_upload_token(token));

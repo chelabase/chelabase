@@ -26161,7 +26161,8 @@
           "cron",
           "timezone",
           "enabled",
-          "next_run_at"
+          "next_run_at",
+          "last_error"
         ],
         "properties": {
           "cron": {
@@ -26175,6 +26176,13 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the schedule was switched off, `null` normally: the cron or time zone no longer\nparses, or it has no upcoming time. Cleared when the schedule next gets a time (a\nworker pass, or a successful change)."
           },
           "next_run_at": {
             "type": [

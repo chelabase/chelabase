@@ -1,5 +1,5 @@
-# cargo-deny configuration. `just deny` runs `cargo deny check advisories licenses`
-# (called from `just check`).
+# cargo-deny configuration. `just deny` runs `cargo deny check advisories licenses bans`
+# (called from `just check`; CI's `deny` job runs it too).
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 
 [advisories]
@@ -32,3 +32,13 @@ allow = [
 # Our own crates aren't published; their license field isn't checked.
 [licenses.private]
 ignore = true
+
+# Time goes through `chelabase-time` (jiff underneath). These crates left the tree and may not
+# come back, directly or through a dependency (`scripts/tests/deny-bans.sh` proves the ban
+# fires). Duplicate versions stay warnings.
+[bans]
+deny = [
+    { crate = "chrono", reason = "RUSTSEC-2026-0543; use chelabase-time" },
+    { crate = "chrono-tz", reason = "RUSTSEC-2026-0555; use chelabase-time (jiff's bundled time zones)" },
+    { crate = "humantime", reason = "RUSTSEC-2026-0542; use chelabase_time::parse_duration" },
+]

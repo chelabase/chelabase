@@ -20,7 +20,7 @@
 //! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes; a rollover's guarded switch) | branch create copies (insert), tombstone purge (delete) |
-//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
+//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone; `record_schedule_errors` `FOR UPDATE SKIP LOCKED`, alone (no branch or function row), then updates only the rows it locked: it waits on no row lock, so it closes no wait cycle with any writer, a tombstone purge's `DELETE` (physical order) included | branch create copies (insert), tombstone purge (delete) |
 //! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
@@ -40,7 +40,9 @@
 //! takes a `service_health` row (beside 3, written by nobody else) and, inserting it, its
 //! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
-//! alone, skipping any another transaction holds, and takes nothing after them.
+//! alone, skipping any another transaction holds, and takes nothing after them; so does the
+//! startup report's [`MetadataClient::record_schedule_errors`]. A writer that never waits on a
+//! row lock can't be part of a wait cycle, whatever order the others take the rows in.
 //! `add_schedule` and `add_trigger` (m13b) take a transaction advisory lock, `fn-schedules:` /
 //! `fn-triggers:{branch}:{function}`, the same shape and place as `put_secret`'s: after the
 //! per-branch locks (1 to 3) and before anything else, so two adds can't each pass the
@@ -64,11 +66,13 @@
 use chelabase_secrets::SecretKey;
 use chelabase_types::container_env::reserved_container_env_name;
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, NaiveDate, Utc};
+use chelabase_time::{Date, Timestamp};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
+use tracing::warn;
 use uuid::Uuid;
 
+use crate::schedule::{NO_UPCOMING_TIME, Schedule, advance, next_run};
 use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
@@ -165,7 +169,7 @@ pub struct FunctionRecord {
     pub database_id: DatabaseId,
     pub name: String,
     pub kind: FunctionKind,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A deployment to record. A function has a bundle (`bundle_sha256` and `bundle_size`); a
@@ -177,7 +181,7 @@ pub struct NewDeployment<'a> {
     pub bundle_sha256: Option<&'a str>,
     pub bundle_size: Option<i64>,
     pub spec: &'a serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub created_by: &'a str,
     pub note: Option<&'a str>,
 }
@@ -189,9 +193,9 @@ pub struct DeploymentRecord {
     pub bundle_sha256: Option<String>,
     pub bundle_size: Option<i64>,
     pub spec: serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub note: Option<String>,
 }
 
@@ -213,7 +217,7 @@ pub struct BranchFunction {
     /// again ([`MetadataClient::settle_run_as_mint`]).
     pub run_as_unmintable: Option<RunAsUnmintable>,
     pub last_error: Option<String>,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// m9: what the last health check of the active deployment saw (`healthy` or
     /// `unhealthy`); `None` before any, and for a function.
     pub health: Option<String>,
@@ -245,7 +249,7 @@ pub struct ResolvedFunction {
     pub deployment_id: Uuid,
     pub bundle_sha256: Option<String>,
     pub spec: serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub auth: FunctionAuth,
     pub enabled: bool,
     pub run_as_role: Option<String>,
@@ -258,7 +262,7 @@ pub struct NewSchedule<'a> {
     pub function_id: Uuid,
     pub cron: &'a str,
     pub timezone: &'a str,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,108 +272,21 @@ pub struct ScheduleRecord {
     pub function_id: Uuid,
     pub cron: String,
     pub timezone: String,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     pub enabled: bool,
+    /// Why the schedule was switched off (see [`crate::ScheduleProblem`]); `None` normally.
+    pub last_error: Option<String>,
 }
 
-/// A schedule's part a caller got wrong ([`Schedule::parse`]).
+/// One schedule as the startup report reads it ([`MetadataClient::list_schedules_for_report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScheduleError {
-    Cron(String),
-    Timezone(String),
-}
-
-impl ScheduleError {
-    /// The request field it names: `cron` or `timezone`.
-    pub fn field(&self) -> &'static str {
-        match self {
-            ScheduleError::Cron(_) => "cron",
-            ScheduleError::Timezone(_) => "timezone",
-        }
-    }
-}
-
-impl std::fmt::Display for ScheduleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScheduleError::Cron(why) | ScheduleError::Timezone(why) => {
-                write!(f, "{}: {why}", self.field())
-            }
-        }
-    }
-}
-
-/// A checked schedule: a 5-field cron (minute granularity, no seconds or years) in an IANA
-/// time zone. Times in a DST gap run at the first instant after it; times a fall-back repeats
-/// run once.
-#[derive(Debug, Clone)]
-pub struct Schedule {
-    cron: croner::Cron,
-    tz: chrono_tz::Tz,
-}
-
-impl Schedule {
-    pub fn parse(cron: &str, timezone: &str) -> Result<Schedule, ScheduleError> {
-        use croner::parser::{CronParser, Seconds, Year};
-        if cron.is_empty() || cron.len() > 100 {
-            return Err(ScheduleError::Cron("1 to 100 characters".into()));
-        }
-        if timezone.is_empty() || timezone.len() > 64 {
-            return Err(ScheduleError::Timezone("1 to 64 characters".into()));
-        }
-        let parsed = CronParser::builder()
-            .seconds(Seconds::Disallowed)
-            .year(Year::Disallowed)
-            .build()
-            .parse(cron)
-            .map_err(|e| ScheduleError::Cron(format!("not a 5-field cron ({e})")))?;
-        let tz = timezone
-            .parse::<chrono_tz::Tz>()
-            .map_err(|_| ScheduleError::Timezone(format!("unknown IANA time zone {timezone:?}")))?;
-        Ok(Schedule { cron: parsed, tz })
-    }
-
-    /// The first time strictly after `after`; `None` when there is none (a date that never
-    /// comes).
-    pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.cron
-            .find_next_occurrence(&after.with_timezone(&self.tz), false)
-            .ok()
-            .map(|t| t.with_timezone(&Utc))
-    }
-}
-
-/// What a claim does with one due schedule ([`advance`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Advance {
-    /// The new `next_run_at`.
-    pub next: Option<DateTime<Utc>>,
-    /// Run the function for this tick (the `scheduledTime`): the due `next_run_at`, once, however
-    /// many ticks were missed; `None` for a disabled or undeployed function, or a schedule that
-    /// had no time yet.
-    pub run: Option<DateTime<Utc>>,
-    /// The schedule stays enabled; false when its cron or time zone no longer parses or it has
-    /// no time left.
+pub struct ScheduleReportRow {
+    pub id: Uuid,
+    pub branch_id: BranchId,
+    pub function_name: String,
+    pub cron: String,
+    pub timezone: String,
     pub enabled: bool,
-}
-
-/// A due schedule's step at `now`: missed ticks coalesce into one run, and `next_run_at` moves
-/// to the first tick after `now`, whether the function runs or not.
-pub fn advance(
-    cron: &str,
-    timezone: &str,
-    due: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    function_enabled: bool,
-) -> Advance {
-    let next = Schedule::parse(cron, timezone)
-        .ok()
-        .and_then(|s| s.next_after(now));
-    Advance {
-        next,
-        run: due.filter(|_| function_enabled && next.is_some()),
-        enabled: next.is_some(),
-    }
 }
 
 /// A schedule a claim advanced ([`MetadataClient::claim_due_schedules`]).
@@ -382,8 +299,8 @@ pub struct ClaimedSchedule {
     pub function_name: String,
     pub cron: String,
     /// The tick to run, `None` when nothing runs ([`Advance::run`]).
-    pub run: Option<DateTime<Utc>>,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub run: Option<Timestamp>,
+    pub next_run_at: Option<Timestamp>,
 }
 
 /// A trigger to add. `table`: `schema_name`, `table_name` and events from insert, update and
@@ -410,7 +327,7 @@ pub struct TriggerRecord {
     pub source: TriggerSource,
     pub enabled: bool,
     pub state: TriggerState,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
     pub pg_database: String,
     pub schema_name: Option<String>,
     pub table_name: Option<String>,
@@ -424,7 +341,7 @@ pub struct TriggerRecord {
     /// m13: why the last failed delivery failed; cleared by a delivery.
     pub last_delivery_error: Option<String>,
     /// m13: when an event was last delivered.
-    pub last_delivered_at: Option<DateTime<Utc>>,
+    pub last_delivered_at: Option<Timestamp>,
     /// m13b: events the outbox bound removed undelivered (dead ones past the cap or the
     /// retention, a disabled trigger's queued ones).
     pub dropped_count: i64,
@@ -457,7 +374,7 @@ pub struct StorageTriggerTarget {
     pub bucket: Option<String>,
     pub prefix: Option<String>,
     pub events: Vec<String>,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
 }
 
 /// One table trigger's install, as the worker reports it
@@ -466,7 +383,7 @@ pub struct StorageTriggerTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerInstall {
     pub id: Uuid,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
     pub error: Option<String>,
 }
 
@@ -785,22 +702,23 @@ fn function_from_row(r: &PgRow) -> Result<FunctionRecord, MetadataError> {
         database_id: DatabaseId(r.get("database_id")),
         name: r.get("name"),
         kind: FunctionKind::parse(r.get("kind"))?,
-        created_at: r.get("created_at"),
+        created_at: r.try_get("created_at")?,
     })
 }
 
-fn deployment_from_row(r: &PgRow) -> DeploymentRecord {
-    DeploymentRecord {
+fn deployment_from_row(r: &PgRow) -> Result<DeploymentRecord, MetadataError> {
+    Ok(DeploymentRecord {
         id: r.get("id"),
         function_id: r.get("function_id"),
         bundle_sha256: r.get("bundle_sha256"),
         bundle_size: r.get("bundle_size"),
         spec: r.get("spec"),
-        compatibility_date: r.get("compatibility_date"),
+        // Filled by clients, so a year this type can't hold is an error, never a panic.
+        compatibility_date: r.try_get("compatibility_date")?,
         created_by: r.get("created_by"),
         created_at: r.get("created_at"),
         note: r.get("note"),
-    }
+    })
 }
 
 /// The columns [`trigger_from_row`] reads.
@@ -816,7 +734,7 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         source: TriggerSource::parse(r.get("source"))?,
         enabled: r.get("enabled"),
         state: TriggerState::parse(r.get("state"))?,
-        enabled_since: r.get("enabled_since"),
+        enabled_since: r.try_get("enabled_since")?,
         pg_database: r.get("pg_database"),
         schema_name: r.get("schema_name"),
         table_name: r.get("table_name"),
@@ -827,7 +745,7 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         dead_count: r.get("dead_count"),
         dropped_count: r.get("dropped_count"),
         last_delivery_error: r.get("last_delivery_error"),
-        last_delivered_at: r.get("last_delivered_at"),
+        last_delivered_at: r.try_get("last_delivered_at")?,
     })
 }
 
@@ -880,8 +798,8 @@ pub(crate) async fn copy_branch_functions(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at, enabled)
-         SELECT gen_random_uuid(), $2, function_id, cron, timezone, next_run_at, enabled
+        "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at, enabled, last_error)
+         SELECT gen_random_uuid(), $2, function_id, cron, timezone, next_run_at, enabled, last_error
          FROM function_schedules WHERE branch_id = $1",
     )
     .bind(parent)
@@ -1495,7 +1413,7 @@ impl MetadataClient {
         .await
         .map_err(map_check)?;
         tx.commit().await?;
-        Ok(deployment_from_row(&row))
+        deployment_from_row(&row)
     }
 
     /// The function's deployments, newest first (none for an unknown function). Callers scope
@@ -1504,7 +1422,7 @@ impl MetadataClient {
         &self,
         function_id: Uuid,
     ) -> Result<Vec<DeploymentRecord>, MetadataError> {
-        Ok(sqlx::query(
+        sqlx::query(
             "SELECT * FROM function_deployments WHERE function_id = $1
              ORDER BY created_at DESC, id DESC",
         )
@@ -1513,7 +1431,7 @@ impl MetadataClient {
         .await?
         .iter()
         .map(deployment_from_row)
-        .collect())
+        .collect()
     }
 
     /// Makes `deployment_id` the function's active deployment on the branch (a new branch
@@ -1704,7 +1622,7 @@ impl MetadataClient {
                 deployment_id: r.get("deployment_id"),
                 bundle_sha256: r.get("bundle_sha256"),
                 spec: r.get("spec"),
-                compatibility_date: r.get("compatibility_date"),
+                compatibility_date: r.try_get("compatibility_date")?,
                 auth: FunctionAuth::parse(r.get("auth"))?,
                 enabled: r.get("enabled"),
                 run_as_role: r.get("run_as_role"),
@@ -2021,7 +1939,7 @@ impl MetadataClient {
         branch: BranchId,
     ) -> Result<Vec<ScheduleRecord>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, branch_id, function_id, cron, timezone, next_run_at, enabled
+            "SELECT id, branch_id, function_id, cron, timezone, next_run_at, enabled, last_error
              FROM function_schedules WHERE branch_id = $1 ORDER BY created_at, id",
         )
         .bind(branch.as_uuid())
@@ -2035,6 +1953,85 @@ impl MetadataClient {
             cron: r.get("cron"),
             timezone: r.get("timezone"),
             next_run_at: r.get("next_run_at"),
+            enabled: r.get("enabled"),
+            last_error: r.get("last_error"),
+        })
+        .collect())
+    }
+
+    /// The startup report's write, for the schedules it found unable to run. It doesn't take
+    /// the report's reasons: under the row lock it derives each row's own from its stored
+    /// `cron` and `timezone` ([`next_run`]) and writes only `last_error`, so the text is always
+    /// the parser's for exactly what the row holds. A row that parses and has a next time (a
+    /// PATCH fixed it since the report read it) is left alone, as is an unknown id.
+    ///
+    /// Best effort: it locks with `SKIP LOCKED` and leaves alone a row another transaction
+    /// holds, since that one is about to handle it (a claim sets its own reason, a PATCH
+    /// clears it, a purge deletes it). It takes only `function_schedules` row locks (4a),
+    /// waits on none, and takes nothing after them.
+    pub async fn record_schedule_errors(&self, ids: &[Uuid]) -> Result<(), MetadataError> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT id, cron, timezone, now() AS now FROM function_schedules
+             WHERE id = ANY($1) ORDER BY id FOR UPDATE SKIP LOCKED",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let (mut locked, mut reasons) = (Vec::new(), Vec::new());
+        for row in rows {
+            let (cron, timezone): (String, String) = (row.get("cron"), row.get("timezone"));
+            if let Err(problem) = next_run(&cron, &timezone, row.try_get("now")?) {
+                locked.push(row.get::<Uuid, _>("id"));
+                reasons.push(problem.reason());
+            }
+        }
+        if !locked.is_empty() {
+            // Only the rows locked above: a fresh match could take a row out of order.
+            sqlx::query(
+                "UPDATE function_schedules AS s SET last_error = v.err
+                 FROM unnest($1::uuid[], $2::text[]) AS v(id, err)
+                 WHERE s.id = v.id",
+            )
+            .bind(locked)
+            .bind(reasons)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_check)?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Every schedule on every branch, for the startup report: id order, `limit` rows after
+    /// `after` (the last id of the previous page; `None` for the first). Reads only.
+    pub async fn list_schedules_for_report(
+        &self,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ScheduleReportRow>, MetadataError> {
+        Ok(sqlx::query(
+            "SELECT s.id, s.branch_id, f.name, s.cron, s.timezone, s.enabled
+             FROM function_schedules s JOIN functions f ON f.id = s.function_id
+             WHERE ($1::uuid IS NULL OR s.id > $1) ORDER BY s.id LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|r| ScheduleReportRow {
+            id: r.get("id"),
+            branch_id: BranchId(r.get("branch_id")),
+            function_name: r.get("name"),
+            cron: r.get("cron"),
+            timezone: r.get("timezone"),
             enabled: r.get("enabled"),
         })
         .collect())
@@ -2071,12 +2068,13 @@ impl MetadataClient {
         let new_tz = timezone.unwrap_or(&was.1);
         let new_enabled = enabled.unwrap_or(was.2);
         let schedule = Schedule::parse(new_cron, new_tz).map_err(|e| invalid(e.to_string()))?;
-        let mut next: Option<DateTime<Utc>> = row.get("next_run_at");
+        let mut next: Option<Timestamp> = row.try_get("next_run_at")?;
         if new_cron != was.0 || new_tz != was.1 || (new_enabled && !was.2) {
-            next = schedule.next_after(row.get("now"));
+            next = schedule.next_after(row.try_get("now")?);
         }
         sqlx::query(
-            "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5
+            "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5,
+                    last_error = NULL
              WHERE id = $1",
         )
         .bind(id)
@@ -2096,6 +2094,7 @@ impl MetadataClient {
             timezone: new_tz.to_owned(),
             next_run_at: next,
             enabled: new_enabled,
+            last_error: None,
         }))
     }
 
@@ -2177,20 +2176,26 @@ impl MetadataClient {
         .fetch_all(&mut *tx)
         .await?;
         let mut claimed = Vec::with_capacity(rows.len());
-        let (mut ids, mut nexts, mut enabled) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut nexts, mut enabled, mut errors) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for r in &rows {
             let cron: String = r.get("cron");
             let step = advance(
                 &cron,
                 r.get("timezone"),
-                r.get("next_run_at"),
-                r.get("now"),
+                r.try_get("next_run_at")?,
+                r.try_get("now")?,
                 r.get("function_enabled"),
             );
             let id: Uuid = r.get("id");
+            if !step.enabled {
+                // Said once: the row is disabled below, so no later claim sees it.
+                log_disabled_schedule(id, &cron, r.get("timezone"), step.error.as_deref().unwrap_or(NO_UPCOMING_TIME));
+            }
             ids.push(id);
             nexts.push(step.next);
             enabled.push(step.enabled);
+            errors.push(step.error);
             claimed.push(ClaimedSchedule {
                 id,
                 branch_id: BranchId(r.get("branch_id")),
@@ -2203,13 +2208,16 @@ impl MetadataClient {
         }
         if !ids.is_empty() {
             sqlx::query(
-                "UPDATE function_schedules AS s SET next_run_at = v.next, enabled = v.enabled
-                 FROM unnest($1::uuid[], $2::timestamptz[], $3::bool[]) AS v(id, next, enabled)
+                "UPDATE function_schedules AS s SET next_run_at = v.next, enabled = v.enabled,
+                        last_error = v.error
+                 FROM unnest($1::uuid[], $2::timestamptz[], $3::bool[], $4::text[])
+                      AS v(id, next, enabled, error)
                  WHERE s.id = v.id",
             )
             .bind(ids)
             .bind(nexts)
             .bind(enabled)
+            .bind(errors)
             .execute(&mut *tx)
             .await?;
         }
@@ -2516,7 +2524,7 @@ impl MetadataClient {
             return Ok(0);
         }
         let ids: Vec<Uuid> = installs.iter().map(|i| i.id).collect();
-        let since: Vec<DateTime<Utc>> = installs.iter().map(|i| i.enabled_since).collect();
+        let since: Vec<Timestamp> = installs.iter().map(|i| i.enabled_since).collect();
         let errors: Vec<Option<String>> = installs
             .iter()
             .map(|i| i.error.as_ref().map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect()))
@@ -2619,6 +2627,12 @@ impl MetadataClient {
     }
 }
 
+/// The `warn` a claim logs for a schedule it switches off, naming the schedule and why:
+/// `reason` is the step's own `last_error` text, so the log and the API say the same thing.
+fn log_disabled_schedule(id: Uuid, cron: &str, timezone: &str, reason: &str) {
+    warn!(schedule = %id, %cron, %timezone, %reason, "disabling a schedule that can no longer run");
+}
+
 #[cfg(test)]
 #[path = "functions_lock_model.rs"]
 mod lock_model;
@@ -2626,6 +2640,49 @@ mod lock_model;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn logged(f: impl FnOnce()) -> String {
+        let out = Captured::default();
+        let writer = out.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A claim that switches a schedule off says so at `warn`, with the schedule id and why.
+    #[test]
+    fn disabling_a_schedule_warns_with_its_id_and_reason() {
+        let id = Uuid::parse_str("5b1f0c1e-7d57-4a4e-9a52-2f0f6d1d9c11").unwrap();
+        let now = Timestamp::now();
+        for (cron, want) in [("0 0 * * jan", None), ("0 0 30 2 *", Some(NO_UPCOMING_TIME))] {
+            let step = advance(cron, "UTC", Some(now), now, true);
+            assert!(!step.enabled, "{cron}: {step:?}");
+            let reason = step.error.clone().unwrap();
+            if let Some(want) = want {
+                assert_eq!(reason, want, "{cron}");
+            }
+            let text = logged(|| log_disabled_schedule(id, cron, "UTC", &reason));
+            assert!(text.contains("WARN"), "{text}");
+            assert!(text.contains(&id.to_string()), "{text}");
+            assert!(text.contains(cron), "{text}");
+            assert!(text.contains(&reason), "{cron}: stored reason {reason:?} missing: {text}");
+        }
+    }
 
     /// O2: exhaustive over kind x tenant admin x (delete, or set a plain, reserved or
     /// other-case name): only a tenant admin writes a service's secret, a reserved name is

@@ -10,6 +10,7 @@
 //! Jobs go through `handle_branch_job`, the dispatch the worker's consumer uses, after the
 //! claims the orchestrator makes before it publishes.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -190,7 +191,7 @@ async fn story(
         )
         .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let noted = chrono::Utc::now();
+    let noted = Timestamp::now();
     tokio::time::sleep(Duration::from_secs(2)).await;
     story.sql(&main, "INSERT INTO t VALUES ('B');").await;
     assert_eq!(story.rows(&main).await, "A,B");
@@ -275,7 +276,7 @@ async fn story(
         .handle_database_settings(id)
         .await
         .expect("settings job");
-    let old = chrono::Utc::now() - chrono::Duration::hours(2);
+    let old = Timestamp::now() - chelabase_time::hours(2);
     let too_old_id = story
         .create("too-old", main_id, Some(PointInTime::Timestamp(old)))
         .await;
@@ -288,7 +289,7 @@ async fn story(
         .map(|(_, oldest)| oldest)
         .unwrap_or_else(|| panic!("{error}"));
     assert!(
-        chrono::DateTime::parse_from_rfc3339(oldest).is_ok(),
+        Timestamp::parse_rfc3339(oldest).is_ok(),
         "the oldest point is a time: {error}"
     );
 
@@ -431,9 +432,9 @@ async fn restore(
 }
 
 /// A time with writes 2 s before and after it.
-async fn noted_time() -> chrono::DateTime<chrono::Utc> {
+async fn noted_time() -> Timestamp {
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let noted = chrono::Utc::now();
+    let noted = Timestamp::now();
     tokio::time::sleep(Duration::from_secs(2)).await;
     noted
 }

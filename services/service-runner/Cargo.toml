@@ -47,6 +47,6 @@ uuid = { workspace = true }
 chelabase-metadata = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }
-chrono = { workspace = true }
+chelabase-time = { workspace = true }
 proptest = { workspace = true }
 tower = { version = "0.5.3", features = ["util"] }

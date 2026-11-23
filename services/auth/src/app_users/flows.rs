@@ -20,7 +20,7 @@ use chelabase_identity::{
 use chelabase_query::app_users::{NewUserRow, UserRowError};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::api_extract::ApiJson;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -59,7 +59,7 @@ pub struct AppUserView {
     pub id: Uuid,
     pub email: String,
     pub email_verified: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A signed-in session: a short-lived access token and the refresh token that renews it.
@@ -901,7 +901,7 @@ fn pending(id: Uuid, email: &str) -> Response {
             id,
             email: email.to_string(),
             email_verified: false,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         },
         verification_required: true,
     };

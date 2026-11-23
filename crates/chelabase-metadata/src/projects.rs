@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -58,8 +58,8 @@ pub struct ProjectRecord {
     pub slug: String,
     pub status: ProjectStatus,
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// How [`MetadataClient::begin_project_delete`] ended.
@@ -134,8 +134,8 @@ pub(crate) fn project_from_row(r: &PgRow) -> Result<ProjectRecord, MetadataError
         slug: r.get("slug"),
         status: ProjectStatus::parse(r.get("status"))?,
         error: r.get("error"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
     })
 }
 

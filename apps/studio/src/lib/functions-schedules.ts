@@ -15,6 +15,8 @@ function itemOk(item: string, f: (typeof FIELDS)[number]): boolean {
   const [range, step, ...extra] = item.split("/");
   if (extra.length > 0) return false;
   if (step !== undefined && !(/^\d+$/.test(step) && Number(step) >= 1)) return false;
+  // "5L": the last Friday of the month. Only day of week takes it; a bare "L" is refused.
+  if (f.max === 7 && /^[0-7]L$/.test(range)) return true;
   if (range === "*" || (range === "?" && f.names !== undefined && f.max === 7)) return true;
   const value = (v: string): number | null => {
     if (/^\d+$/.test(v)) return Number(v);
@@ -46,6 +48,15 @@ export function cronReason(raw: string): string | null {
   return null;
 }
 
+/** What a schedule's row says about it: running, switched off by the user, or stopped by the worker. */
+export type ScheduleStatus = { kind: "on" } | { kind: "off" } | { kind: "stopped"; reason: string };
+
+/** `last_error` wins; an older API without the field (undefined) or an empty one never reads as stopped. */
+export function scheduleStatus(s: Pick<FunctionSchedule, "enabled"> & { last_error?: string | null }): ScheduleStatus {
+  if (typeof s.last_error === "string" && s.last_error !== "") return { kind: "stopped", reason: s.last_error };
+  return { kind: s.enabled ? "on" : "off" };
+}
+
 /** Why a time zone can't be sent: blank, or one this browser doesn't know as IANA. */
 export function timezoneReason(raw: string): string | null {
   const tz = raw.trim();
@@ -58,11 +69,15 @@ export function timezoneReason(raw: string): string | null {
   }
 }
 
-/** The schedule form: a new schedule (`editing` null) or one being edited. */
+/**
+ * The schedule form: a new schedule (`editing` null) or one being edited. `repair` is set when
+ * the schedule being edited was stopped by the worker, so saving it turns it back on.
+ */
 export interface ScheduleForm {
   editing: string | null;
   cron: string;
   timezone: string;
+  repair: boolean;
 }
 
 export type ScheduleFormAction =
@@ -71,13 +86,18 @@ export type ScheduleFormAction =
   | { type: "reset" };
 
 export function initialScheduleForm(): ScheduleForm {
-  return { editing: null, cron: "", timezone: "UTC" };
+  return { editing: null, cron: "", timezone: "UTC", repair: false };
 }
 
 export function scheduleFormReducer(state: ScheduleForm, action: ScheduleFormAction): ScheduleForm {
   switch (action.type) {
     case "edit":
-      return { editing: action.schedule.id, cron: action.schedule.cron, timezone: action.schedule.timezone };
+      return {
+        editing: action.schedule.id,
+        cron: action.schedule.cron,
+        timezone: action.schedule.timezone,
+        repair: scheduleStatus(action.schedule).kind === "stopped",
+      };
     case "set":
       return { ...state, [action.field]: action.value };
     case "reset":
@@ -87,4 +107,13 @@ export function scheduleFormReducer(state: ScheduleForm, action: ScheduleFormAct
 
 export function scheduleFormReason(form: ScheduleForm): string | null {
   return cronReason(form.cron) ?? timezoneReason(form.timezone);
+}
+
+/**
+ * The body the form sends (create or PATCH). Repairing a stopped schedule also sends
+ * `enabled: true`: the API keeps a schedule's on/off as it was unless the body says otherwise.
+ */
+export function scheduleFormBody(form: ScheduleForm): { cron: string; timezone: string; enabled?: true } {
+  const body = { cron: form.cron.trim(), timezone: form.timezone.trim() };
+  return form.repair ? { ...body, enabled: true } : body;
 }

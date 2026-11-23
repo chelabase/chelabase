@@ -10,6 +10,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chelabase_auth::internal::DataIdentity;
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_types::data_key::DataKeyKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -291,10 +292,10 @@ impl Control for Orchestrator {
             struct Recorded {
                 expires_at: u64,
             }
-            let expires = chrono::DateTime::<chrono::Utc>::from_timestamp(expires_at as i64, 0)
+            let expires = Timestamp::from_unix_seconds(expires_at as i64)
                 .ok_or_else(|| Unreachable("an expiry out of range".into()))?;
             let path = "/internal/storage/upload-tokens";
-            let body = json!({ "token_id": token_id, "key_id": key_id, "claims": claims, "expires_at": expires });
+            let body = json!({ "token_id": token_id, "key_id": key_id, "claims": claims, "expires_at": expires.to_rfc3339_auto() });
             match self.call("POST", path, Some(body)).await? {
                 // Never later than asked, whatever the answer says.
                 (200, v) => parse::<Recorded>(v).map(|r| Some(r.expires_at.min(expires_at))),

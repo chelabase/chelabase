@@ -39,6 +39,17 @@ dependencies = [
 
 [[package]]
 name = "ahash"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891477e0c6a8957309ee5c45a6368af3ae14bb510732d2684ffa19af310920f9"
+dependencies = [
+ "getrandom 0.2.17",
+ "once_cell",
+ "version_check",
+]
+
+[[package]]
+name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -83,15 +94,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "android_system_properties"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -127,7 +129,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -138,7 +140,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -303,8 +305,8 @@ dependencies = [
  "chelabase-query",
  "chelabase-routes",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "hex",
  "http",
@@ -1121,9 +1123,9 @@ dependencies = [
  "chelabase-metadata",
  "chelabase-neon",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-typegen",
  "chelabase-types",
- "chrono",
  "clap",
  "hex",
  "jsonwebtoken",
@@ -1192,8 +1194,8 @@ dependencies = [
  "chelabase-schema",
  "chelabase-secrets",
  "chelabase-storage",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "futures-util",
  "hex",
@@ -1230,7 +1232,7 @@ dependencies = [
  "axum",
  "chelabase-http",
  "chelabase-identity",
- "chrono",
+ "chelabase-time",
  "reqwest",
  "serde",
  "serde_json",
@@ -1275,10 +1277,10 @@ name = "chelabase-metadata"
 version = "0.1.0"
 dependencies = [
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
- "chrono-tz",
  "croner",
+ "jiff",
  "proptest",
  "serde",
  "serde_json",
@@ -1286,6 +1288,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "utoipa",
  "uuid",
 ]
@@ -1295,8 +1298,8 @@ name = "chelabase-nats"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "futures-util",
  "hex",
  "serde",
@@ -1320,13 +1323,12 @@ dependencies = [
  "bollard",
  "chelabase-http",
  "chelabase-metadata",
- "chrono",
+ "chelabase-time",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
  "hex",
  "hmac",
- "humantime",
  "jsonwebtoken",
  "libc",
  "pbkdf2",
@@ -1452,8 +1454,8 @@ dependencies = [
  "chelabase-http",
  "chelabase-metadata",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "futures-util",
  "getrandom 0.4.3",
@@ -1482,8 +1484,8 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "bytes",
+ "chelabase-time",
  "futures-util",
- "humantime",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1504,8 +1506,8 @@ dependencies = [
  "chelabase-query",
  "chelabase-routes",
  "chelabase-storage",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "futures-util",
  "hmac",
@@ -1524,6 +1526,20 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+]
+
+[[package]]
+name = "chelabase-time"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+ "jiff-sqlx",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "utoipa",
 ]
 
 [[package]]
@@ -1550,30 +1566,6 @@ dependencies = [
  "tower",
  "utoipa",
  "uuid",
-]
-
-[[package]]
-name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
-dependencies = [
- "iana-time-zone",
- "js-sys",
- "num-traits",
- "serde",
- "wasm-bindgen",
- "windows-link",
-]
-
-[[package]]
-name = "chrono-tz"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
-dependencies = [
- "chrono",
- "phf 0.12.1",
 ]
 
 [[package]]
@@ -1790,13 +1782,11 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "croner"
-version = "4.0.2"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d09284075f5c87675790d1ad74212a7863eb8bdf228cdbd364f08a152fc62d"
+checksum = "5c0d18af839fad650d1673db4e2e40cfad3288dcb84a13670a9014e8d0978008"
 dependencies = [
- "chrono",
- "derive_builder",
- "strum 0.27.2",
+ "jiff",
 ]
 
 [[package]]
@@ -1923,41 +1913,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darling"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
-dependencies = [
- "darling_core",
- "darling_macro",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "darling_macro"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
-dependencies = [
- "darling_core",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "dashmap"
 version = "5.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,37 +2009,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "derive_builder"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "507dfb09ea8b7fa618fcf76e953f4f5e192547945816d5358edffe39f6f94947"
-dependencies = [
- "derive_builder_macro",
-]
-
-[[package]]
-name = "derive_builder_core"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d5bcf7b024d6835cfb3d473887cd966994907effbe9227e8c8219824d06c4e8"
-dependencies = [
- "darling",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "derive_builder_macro"
-version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
-dependencies = [
- "derive_builder_core",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -2195,7 +2119,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2323,7 +2247,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf5efcf77a4da27927d3ab0509dec5b0954bb3bc59da5a1de9e52642ebd4cdf9"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "num_cpus",
  "parking_lot",
  "seize",
@@ -2486,8 +2410,8 @@ dependencies = [
  "chelabase-auth",
  "chelabase-http",
  "chelabase-routes",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "hex",
  "http",
@@ -2596,6 +2520,9 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+dependencies = [
+ "ahash 0.7.8",
+]
 
 [[package]]
 name = "hashbrown"
@@ -2743,12 +2670,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "humantime"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2849,30 +2770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iana-time-zone"
-version = "0.1.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
-dependencies = [
- "android_system_properties",
- "core-foundation-sys",
- "iana-time-zone-haiku",
- "js-sys",
- "log",
- "wasm-bindgen",
- "windows-core",
-]
-
-[[package]]
-name = "iana-time-zone-haiku"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2954,12 +2851,6 @@ dependencies = [
  "zerotrie",
  "zerovec",
 ]
-
-[[package]]
-name = "ident_case"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idna"
@@ -3087,6 +2978,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiff"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5e77cbfb9fff4798e283c2d69dff39fc2c45e7da017e5ce95b654e46ea41236"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "jiff-tzdb",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-sqlx"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4996ad290ff7f7081becdda47e28556fbebb81618c599eac5d09182b5a60e38"
+dependencies = [
+ "jiff",
+ "sqlx",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9067a0b23e5be3147d56b2dcf652b18e6b1364caca93fb157653b6fbcab23a9"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "jiff-tzdb"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e71a1b68a875a44a33bb7a1dd84392cb77145a3367a552a3cfe6a4f5cf3afc"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3162,7 +3105,7 @@ version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea18b8d5e1469b1bdd6b349169305141316a7c26da27f239773b65c830c0f5d6"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "bytecount",
  "data-encoding",
  "email_address",
@@ -3230,7 +3173,7 @@ version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e3bfac11ac357ec620880025757d38c67da8fd5b9ef5024d19f0f360002b4ca"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
@@ -3562,7 +3505,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3734,8 +3677,8 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "deadpool-postgres",
  "dotenvy",
  "futures-util",
@@ -3889,30 +3832,12 @@ dependencies = [
 
 [[package]]
 name = "phf"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
-dependencies = [
- "phf_shared 0.12.1",
-]
-
-[[package]]
-name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
 dependencies = [
- "phf_shared 0.13.1",
+ "phf_shared",
  "serde",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
-dependencies = [
- "siphasher",
 ]
 
 [[package]]
@@ -3953,9 +3878,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pingora-cache"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrayvec",
  "async-trait",
  "blake2",
@@ -3988,14 +3913,13 @@ dependencies = [
 [[package]]
 name = "pingora-core"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "async-trait",
  "brotli",
  "bstr",
  "bytes",
- "chrono",
  "clap",
  "daemonix",
  "daggy",
@@ -4037,12 +3961,12 @@ dependencies = [
 [[package]]
 name = "pingora-error"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 
 [[package]]
 name = "pingora-header-serde"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "bytes",
  "http",
@@ -4057,7 +3981,7 @@ dependencies = [
 [[package]]
 name = "pingora-http"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "bytes",
  "http",
@@ -4067,13 +3991,13 @@ dependencies = [
 [[package]]
 name = "pingora-lru"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.17.1",
+ "hashbrown 0.12.3",
  "log",
  "parking_lot",
  "rand 0.8.8",
@@ -4083,7 +4007,7 @@ dependencies = [
 [[package]]
 name = "pingora-pool"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "crossbeam-queue",
  "dashmap",
@@ -4098,7 +4022,7 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4120,7 +4044,7 @@ dependencies = [
 [[package]]
 name = "pingora-runtime"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "log",
  "once_cell",
@@ -4133,7 +4057,7 @@ dependencies = [
 [[package]]
 name = "pingora-timeout"
 version = "0.9.0"
-source = "git+https://github.com/chelabase/pingora?rev=0eddec5420f2481ce6a761443105ea7f3fc35b65#0eddec5420f2481ce6a761443105ea7f3fc35b65"
+source = "git+https://github.com/chelabase/pingora?rev=13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8#13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8"
 dependencies = [
  "once_cell",
  "parking_lot",
@@ -4174,6 +4098,15 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "postgres-protocol"
@@ -4388,7 +4321,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4621,7 +4554,7 @@ version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "590efadb0a669f1712c1e3ab810a55d4c3d20d0127c455f7236dd0710aba0346"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
  "fluent-uri",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
@@ -4724,9 +4657,9 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-time",
  "chelabase-typegen",
  "chelabase-types",
- "chrono",
  "deadpool-postgres",
  "dotenvy",
  "moka",
@@ -4766,18 +4699,17 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "3.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "391f153431ab68664d946513ea0cb3edbca78eaf99c5a983036cacab6220d85b"
+source = "git+https://github.com/chelabase/rmcp?rev=9043cdfa8694d83bf506c2f3eb0313ec173edd7e#9043cdfa8694d83bf506c2f3eb0313ec173edd7e"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
- "chrono",
  "futures",
  "http",
  "http-body",
  "http-body-util",
  "indexmap 2.14.2",
+ "jiff",
  "libc",
  "pastey",
  "percent-encoding",
@@ -4881,7 +4813,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4939,7 +4871,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5008,7 +4940,6 @@ version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
- "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -5345,7 +5276,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5395,7 +5326,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cfg-if",
- "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -5472,7 +5402,6 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
- "chrono",
  "crc",
  "digest 0.11.3",
  "dotenvy",
@@ -5501,7 +5430,6 @@ dependencies = [
  "base64 0.22.1",
  "bitflags",
  "byteorder",
- "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -5535,7 +5463,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
- "chrono",
  "flume",
  "form_urlencoded",
  "futures-channel",
@@ -5601,15 +5528,6 @@ dependencies = [
 
 [[package]]
 name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
@@ -5627,18 +5545,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
  "syn 2.0.119",
 ]
 
@@ -5743,10 +5649,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5925,7 +5831,7 @@ dependencies = [
  "log",
  "parking_lot",
  "percent-encoding",
- "phf 0.13.1",
+ "phf",
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
@@ -6668,7 +6574,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6678,63 +6584,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link",
- "windows-result",
- "windows-strings",
-]
-
-[[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-
-[[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link",
-]
 
 [[package]]
 name = "windows-sys"
@@ -6940,8 +6793,8 @@ dependencies = [
  "chelabase-secrets",
  "chelabase-storage",
  "chelabase-storage-service",
+ "chelabase-time",
  "chelabase-types",
- "chrono",
  "dotenvy",
  "futures-util",
  "hex",

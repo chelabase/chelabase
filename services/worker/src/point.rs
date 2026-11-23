@@ -5,7 +5,7 @@ use chelabase_nats::PointInTime;
 use chelabase_neon::storcon::LsnKind;
 use chelabase_neon::{ComputeBackend, Lsn, NeonId};
 use chelabase_types::BranchId;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use tracing::warn;
 
 use crate::Worker;
@@ -74,7 +74,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         tenant: &NeonId,
         timeline: &NeonId,
         lsn: Lsn,
-    ) -> Option<DateTime<Utc>> {
+    ) -> Option<Timestamp> {
         match self.storage.timestamp_of_lsn(tenant, timeline, lsn).await {
             Ok(at) => at,
             Err(err) => {
@@ -98,7 +98,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         source_timeline: &NeonId,
         oldest: Lsn,
     ) -> String {
-        let rfc3339 = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        let rfc3339 = |t: Timestamp| t.to_rfc3339_auto();
         let branch = match self.metadata.get_branch(source).await {
             Ok(branch) => branch,
             Err(err) => {

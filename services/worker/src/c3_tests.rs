@@ -1,7 +1,7 @@
 //! C3 edge tests (fork round 4, personal logins) beyond the RED set.
 
 use chelabase_metadata::{RoleAttributes, RoleCopy, RoleLevel, RoleOrigin};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 
 use crate::OWNER_ROLE;
 use crate::c2_tests::ready_named;
@@ -22,7 +22,7 @@ fn personal(name: &str, member_of: &[&str]) -> RoleCopy {
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
-        created_at: DateTime::<Utc>::UNIX_EPOCH,
+        created_at: Timestamp::UNIX_EPOCH,
         attributes: RoleAttributes {
             member_of: member_of.iter().map(|g| g.to_string()).collect(),
             ..RoleAttributes::default()

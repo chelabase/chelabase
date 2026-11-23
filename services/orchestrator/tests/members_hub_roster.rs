@@ -194,13 +194,13 @@ async fn the_roster_carries_the_suspension_of_a_suspended_member_and_null_otherw
     }
     let admin = w.metadata.member(w.tenant, DEFAULT_SUB).unwrap().id;
 
-    let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let before = Timestamp::now() - chelabase_time::seconds(5);
     assert_eq!(send(Method::POST, format!("/v1/members/{ann}/suspend")).await.status(), 200);
     let list = roster().await;
     let a = of(&list, ann);
     assert_eq!(a["status"], "suspended");
-    let at: chrono::DateTime<chrono::Utc> = a["suspended_at"].as_str().unwrap_or_else(|| panic!("{a}")).parse().unwrap();
-    assert!(at >= before && at <= chrono::Utc::now() + chrono::Duration::seconds(5), "{at}");
+    let at: Timestamp = a["suspended_at"].as_str().unwrap_or_else(|| panic!("{a}")).parse().unwrap();
+    assert!(at >= before && at <= Timestamp::now() + chelabase_time::seconds(5), "{at}");
     assert_eq!(a["suspended_by"], json!(admin), "{a}");
     assert_suspension_null(&of(&list, bob));
 

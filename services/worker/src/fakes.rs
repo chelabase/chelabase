@@ -29,7 +29,7 @@ use chelabase_neon::{Lsn, NeonId, StorconError};
 use chelabase_secrets::SecretKey;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use futures_util::future::BoxFuture;
 
 use chelabase_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDatabase};
@@ -247,7 +247,7 @@ pub struct FakeState {
     /// upsert): a revoke-now landing between a reconcile's read of the rows and its write.
     pub before_upsert_member_branch_role: Option<StateHook>,
     /// `merges.handed_back_at` (T14 M10).
-    pub handed_back: HashMap<uuid::Uuid, DateTime<Utc>>,
+    pub handed_back: HashMap<uuid::Uuid, Timestamp>,
     /// Members of every tenant, their project grants by `(member, project)`, their overrides by
     /// `(member, database)`, and the reconciler's `member_branch_roles`.
     pub members: Vec<chelabase_metadata::members::MemberRecord>,
@@ -463,7 +463,7 @@ impl FakeState {
                 id,
                 branch_timeline_id: Some(to.to_string()),
                 branch_lsn: Some(at.to_string()),
-                recorded_at: Utc::now(),
+                recorded_at: Timestamp::now(),
                 ..copy
             });
         }
@@ -528,7 +528,7 @@ impl FakeMetadata {
     /// and status), as `insert_database_pending` makes them.
     pub fn insert_database(&self, name: &str, status: DatabaseStatus) -> DatabaseId {
         let id = DatabaseId::new();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let mut state = self.state();
         state.databases.insert(
             id,
@@ -625,7 +625,7 @@ impl FakeMetadata {
         if live_normal >= usize::try_from(max).unwrap_or(0) {
             return CreateBranchOutcome::CapReached { max };
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let parent_guard_logins = state.branches[&b.parent_branch_id].guard_logins;
         state.branches.insert(
             b.id,
@@ -664,7 +664,7 @@ impl FakeMetadata {
     /// An `active` project row.
     pub fn insert_project(&self) -> ProjectId {
         let id = ProjectId::new();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.state().projects.insert(
             id,
             ProjectRecord {
@@ -688,7 +688,7 @@ impl FakeMetadata {
 
     /// A `project_auth` row for `project` with the defaults (`public.users` in `app`).
     pub fn insert_auth(&self, project: ProjectId, db: DatabaseId, status: AppUsersStatus) {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.state().project_auth.insert(
             project,
             ProjectAuth {
@@ -714,7 +714,7 @@ impl FakeMetadata {
     /// A live app session of `user`, with identity session `identity_session_id`.
     pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, identity_session_id: &str) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.state().app_sessions.push(AppSession {
             id,
             project_id: project,
@@ -722,7 +722,7 @@ impl FakeMetadata {
             identity_session_id: identity_session_id.to_string(),
             created_at: now,
             last_used_at: now,
-            expires_at: now + chrono::Duration::days(30),
+            expires_at: now + chelabase_time::days(30),
             revoked_at: None,
         });
         id
@@ -745,7 +745,7 @@ impl FakeMetadata {
         status: MergeStatus,
     ) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let row = MergeRecord {
             id,
             database_id: db.as_uuid(),
@@ -1050,7 +1050,7 @@ impl WorkerMetadata for FakeMetadata {
         id: BranchId,
         sealed_password: &str,
         branched_at_lsn: Option<&str>,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("set_branch_ready")?;
         let Some(database_id) = state.branches.get(&id).map(|b| b.database_id) else {
@@ -1181,8 +1181,8 @@ impl WorkerMetadata for FakeMetadata {
         let id = state.schema_bases.iter().map(|b| b.id).max().unwrap_or(0) + 1;
         state.schema_bases.push(SchemaBase {
             id,
-            taken_at: Utc::now(),
-            recorded_at: Utc::now(),
+            taken_at: Timestamp::now(),
+            recorded_at: Timestamp::now(),
             ..base.clone()
         });
         // T14 M7: an older entry superseded on its timeline by one recorded more than the
@@ -1193,8 +1193,8 @@ impl WorkerMetadata for FakeMetadata {
             .and_then(|b| state.databases.get(&b.database_id))
             .map(|d| d.history_window);
         if let Some(window) = window {
-            let cutoff = Utc::now()
-                - chrono::Duration::from_std(window).unwrap_or(chrono::Duration::MAX);
+            // A window too long to subtract leaves no cutoff: nothing is older than it.
+            let cutoff = Timestamp::now().checked_sub(window);
             let same = |a: &SchemaBase, b: &SchemaBase| {
                 a.branch_id == b.branch_id
                     && a.database_name == b.database_name
@@ -1208,7 +1208,7 @@ impl WorkerMetadata for FakeMetadata {
                     state
                         .schema_bases
                         .iter()
-                        .any(|f| same(e, f) && f.id > e.id && f.recorded_at < cutoff)
+                        .any(|f| same(e, f) && f.id > e.id && cutoff.is_some_and(|c| f.recorded_at < c))
                 })
                 .map(|e| e.id)
                 .collect();
@@ -1948,7 +1948,7 @@ impl WorkerMetadata for FakeMetadata {
         match state.branches.get_mut(&id) {
             Some(b) if branch_live(b.status) => {
                 b.pending_timeline_id = timeline_id.map(str::to_string);
-                b.pending_timeline_at = timeline_id.map(|_| chrono::Utc::now());
+                b.pending_timeline_at = timeline_id.map(|_| Timestamp::now());
                 Ok(true)
             }
             _ => Ok(false),
@@ -1959,7 +1959,7 @@ impl WorkerMetadata for FakeMetadata {
         &self,
         id: BranchId,
         expected_pending: &str,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
         branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("switch_to_pending_timeline")?;
@@ -1971,7 +1971,7 @@ impl WorkerMetadata for FakeMetadata {
                 b.superseded_timeline_id = b.timeline_id.take();
                 b.timeline_id = b.pending_timeline_id.take();
                 b.pending_timeline_at = None;
-                b.history_start = Some(history_start.unwrap_or_else(chrono::Utc::now));
+                b.history_start = Some(history_start.unwrap_or_else(Timestamp::now));
                 b.branched_at_lsn = Some(branched_at_lsn.to_string());
                 (b.endpoint_id.clone(), b.timeline_id.clone().unwrap())
             }
@@ -2002,7 +2002,7 @@ impl WorkerMetadata for FakeMetadata {
         if state.name_taken(b.database_id, backup_name) {
             return Err(MetadataError::BranchNameTaken(backup_name.to_string()));
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         state.branches.insert(
             backup,
             BranchRecord {
@@ -2063,7 +2063,7 @@ impl WorkerMetadata for FakeMetadata {
         match state.branches.get_mut(&id) {
             Some(b) if branch_live(b.status) && b.pending_timeline_id.as_deref() == expected => {
                 b.pending_timeline_id = new.map(str::to_string);
-                b.pending_timeline_at = new.map(|_| chrono::Utc::now());
+                b.pending_timeline_at = new.map(|_| Timestamp::now());
                 Ok(true)
             }
             _ => Ok(false),
@@ -2096,7 +2096,7 @@ impl WorkerMetadata for FakeMetadata {
         error: &str,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("fail_stuck_restore")?;
-        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(max_age_secs);
+        let cutoff = Timestamp::now() - chelabase_time::seconds(max_age_secs.max(0) as u64);
         match state.branches.get_mut(&id) {
             Some(b)
                 if b.status == BranchStatus::Resetting
@@ -2189,7 +2189,7 @@ impl WorkerMetadata for FakeMetadata {
                 name: k.name.clone(),
                 prefix: k.prefix.clone(),
                 sealed: k.sealed.clone(),
-                created_at: chrono::Utc::now(),
+                created_at: Timestamp::now(),
                 last_used_at: None,
                 revoked_at: None,
                 databases: k.databases.clone(),
@@ -2685,7 +2685,7 @@ impl WorkerMetadata for FakeMetadata {
 
     async fn deleting_projects(&self, older_than: Duration) -> Result<Vec<ProjectId>, MetadataError> {
         let state = self.read("deleting_projects")?;
-        let cutoff = Utc::now() - older_than;
+        let cutoff = Timestamp::now() - older_than;
         let mut found: Vec<&ProjectRecord> = state
             .projects
             .values()
@@ -2700,7 +2700,7 @@ impl WorkerMetadata for FakeMetadata {
         older_than: Duration,
     ) -> Result<Vec<ProjectAuth>, MetadataError> {
         let state = self.read("app_users_in_transition")?;
-        let cutoff = Utc::now() - older_than;
+        let cutoff = Timestamp::now() - older_than;
         let mut found: Vec<ProjectAuth> = state
             .project_auth
             .values()
@@ -2739,14 +2739,14 @@ impl WorkerMetadata for FakeMetadata {
         let mut state = self.write("set_project_error")?;
         if let Some(p) = state.projects.get_mut(&id) {
             p.error = error.map(str::to_string);
-            p.updated_at = Utc::now();
+            p.updated_at = Timestamp::now();
         }
         Ok(())
     }
 
     async fn finish_project_delete(&self, id: ProjectId) -> Result<(), MetadataError> {
         let mut state = self.write("finish_project_delete")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         for s in state.app_sessions.iter_mut() {
             if s.project_id == id && s.revoked_at.is_none() {
                 s.revoked_at = Some(now);
@@ -2825,7 +2825,7 @@ impl WorkerMetadata for FakeMetadata {
                         a.error = Some(e);
                     }
                 }
-                a.updated_at = Utc::now();
+                a.updated_at = Timestamp::now();
                 Ok(true)
             }
             _ => Ok(false),
@@ -2862,7 +2862,7 @@ impl WorkerMetadata for FakeMetadata {
             .filter(|a| a.error.as_deref() != error)
         {
             a.error = error.map(str::to_string);
-            a.updated_at = Utc::now();
+            a.updated_at = Timestamp::now();
         }
         Ok(())
     }
@@ -2970,10 +2970,10 @@ impl WorkerMetadata for FakeMetadata {
         project: ProjectId,
         user: uuid::Uuid,
         keep: Option<uuid::Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         let mut state = self.write("revoke_user_sessions")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut revoked = Vec::new();
         for s in state.app_sessions.iter_mut() {
             if s.project_id == project
@@ -2991,7 +2991,7 @@ impl WorkerMetadata for FakeMetadata {
 
     async fn revoke_project_sessions(&self, project: ProjectId) -> Result<Vec<AppSession>, MetadataError> {
         let mut state = self.write("revoke_project_sessions")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut revoked = Vec::new();
         for s in state.app_sessions.iter_mut() {
             if s.project_id == project && s.revoked_at.is_none() {
@@ -3004,7 +3004,7 @@ impl WorkerMetadata for FakeMetadata {
 
     async fn purge_app_sessions(&self, older_than: Duration) -> Result<u64, MetadataError> {
         let mut state = self.write("purge_app_sessions")?;
-        let cutoff = Utc::now() - older_than;
+        let cutoff = Timestamp::now() - older_than;
         let before = state.app_sessions.len();
         state
             .app_sessions
@@ -3081,8 +3081,8 @@ impl WorkerMetadata for FakeMetadata {
         }
         let m = state.merges.get_mut(&id).expect("checked above");
         m.status = to;
-        m.updated_at = Utc::now();
-        m.claimed_at = to.is_working().then(Utc::now);
+        m.updated_at = Timestamp::now();
+        m.claimed_at = to.is_working().then(Timestamp::now);
         if patch.analysis.is_some() || patch.plan.is_some() {
             m.version += 1;
         }
@@ -3135,7 +3135,7 @@ impl WorkerMetadata for FakeMetadata {
         let mut state = self.read("touch_merge_claim")?;
         Ok(match state.merges.get_mut(&id) {
             Some(m) if m.status == status => {
-                m.claimed_at = Some(Utc::now());
+                m.claimed_at = Some(Timestamp::now());
                 true
             }
             _ => false,
@@ -3157,7 +3157,7 @@ impl WorkerMetadata for FakeMetadata {
         let id = state.merge_events.len() as i64 + 1;
         state.merge_events.push(MergeEvent {
             id,
-            at: Utc::now(),
+            at: Timestamp::now(),
             ..event.clone()
         });
         Ok(())
@@ -3194,7 +3194,7 @@ impl WorkerMetadata for FakeMetadata {
         if state.name_taken(database_id, name) {
             return Err(MetadataError::BranchNameTaken(name.to_string()));
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         let row = BranchRecord {
             id: BranchId::new(),
             database_id,
@@ -3230,7 +3230,7 @@ impl WorkerMetadata for FakeMetadata {
         rehand_after: Duration,
     ) -> Result<Vec<MergeRecord>, MetadataError> {
         let state = self.read("stale_merge_claims")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let cutoff = now - older_than;
         let mut rows: Vec<MergeRecord> = state
             .merges
@@ -3256,7 +3256,7 @@ impl WorkerMetadata for FakeMetadata {
         rehand_after: Duration,
     ) -> Result<Vec<MergeRecord>, MetadataError> {
         let state = self.read("stale_finish_requests")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut rows: Vec<MergeRecord> = state
             .merges
             .values()
@@ -3289,7 +3289,7 @@ impl WorkerMetadata for FakeMetadata {
         if state.merges.get(&id).is_none_or(|m| m.status != status) {
             return Ok(false);
         }
-        state.handed_back.insert(id, Utc::now());
+        state.handed_back.insert(id, Timestamp::now());
         Ok(true)
     }
 
@@ -3340,7 +3340,7 @@ impl WorkerMetadata for FakeMetadata {
 /// Oldest first, like the real queries.
 /// The endpoint's rows as `role_copies` reads them: the owner's first, then by name.
 fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
-    let at = DateTime::<Utc>::UNIX_EPOCH;
+    let at = Timestamp::UNIX_EPOCH;
     let owner = ep.roles.first().map(|o| RoleCopy {
         name: o.name.clone(),
         origin: RoleOrigin::Owner,
@@ -3438,7 +3438,7 @@ pub struct FakeStorage {
     /// What `lsn_by_timestamp` answers; `None` answers `present` at the timeline's head.
     pub lsn_at: Mutex<Option<LsnAtTime>>,
     /// What `timestamp_of_lsn` answers.
-    pub timestamp_at: Mutex<Option<DateTime<Utc>>>,
+    pub timestamp_at: Mutex<Option<Timestamp>>,
     /// Each timeline's GC cutoff, once set (none otherwise).
     pub gc_cutoffs: Mutex<HashMap<NeonId, Lsn>>,
     /// How every `wait_attached` ends ([`worker`] sets `Attached`).
@@ -3719,7 +3719,7 @@ impl Storage for FakeStorage {
         &self,
         tenant: &NeonId,
         timeline: &NeonId,
-        _at: DateTime<Utc>,
+        _at: Timestamp,
     ) -> Result<LsnAtTime, StorconError> {
         self.check("lsn_by_timestamp")?;
         let head = self.head(tenant, timeline)?;
@@ -3734,7 +3734,7 @@ impl Storage for FakeStorage {
         _tenant: &NeonId,
         _timeline: &NeonId,
         _lsn: Lsn,
-    ) -> Result<Option<DateTime<Utc>>, StorconError> {
+    ) -> Result<Option<Timestamp>, StorconError> {
         self.check("timestamp_of_lsn")?;
         Ok(*lock(&self.timestamp_at))
     }
@@ -4034,7 +4034,7 @@ pub type FakeWorker = Worker<FakeMetadata, FakeStorage, FakeBackend, FakeCache, 
 /// a `warn!` first hit by a test without a subscriber is cached as "never" for every thread, the
 /// capturing test's included, and its check fails now and then. Two dispatchers that live for
 /// the whole test process make tracing-core ask every live dispatcher instead.
-fn pin_tracing_dispatchers() {
+pub(crate) fn pin_tracing_dispatchers() {
     use tracing::Dispatch;
     use tracing::subscriber::NoSubscriber;
     static PINNED: std::sync::OnceLock<[Dispatch; 2]> = std::sync::OnceLock::new();
@@ -4210,6 +4210,87 @@ pub fn restored_by_hand(w: &FakeWorker, branch: BranchId, backup_name: &str) -> 
     assert!(switched.unwrap(), "switched");
     w.metadata.state().branches.get_mut(&branch).unwrap().status = BranchStatus::Ready;
     backup
+}
+
+/// The startup schedule report's metadata calls ([`crate::schedule_report::ScheduleStore`]):
+/// the stored rows in id order, every write call kept, and a read or write that can be made to
+/// fail.
+pub struct FakeSchedules {
+    rows: Vec<chelabase_metadata::ScheduleReportRow>,
+    recorded: Mutex<Vec<Vec<uuid::Uuid>>>,
+    reads: std::sync::atomic::AtomicUsize,
+    seen: std::sync::atomic::AtomicUsize,
+    fail_reads: std::sync::atomic::AtomicBool,
+    fail_writes: std::sync::atomic::AtomicBool,
+}
+
+impl FakeSchedules {
+    pub fn new(mut rows: Vec<chelabase_metadata::ScheduleReportRow>) -> Self {
+        rows.sort_by_key(|r| r.id);
+        Self {
+            rows,
+            recorded: Mutex::default(),
+            reads: Default::default(),
+            seen: Default::default(),
+            fail_reads: Default::default(),
+            fail_writes: Default::default(),
+        }
+    }
+
+    pub fn fail_reads(&self) {
+        self.fail_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn fail_writes(&self) {
+        self.fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The ids of each `record_schedule_errors` call.
+    pub fn recorded(&self) -> Vec<Vec<uuid::Uuid>> {
+        lock(&self.recorded).clone()
+    }
+
+    /// How many list calls were made.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many rows the list calls returned in all.
+    pub fn seen(&self) -> usize {
+        self.seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::schedule_report::ScheduleStore for FakeSchedules {
+    async fn list_schedules_for_report(
+        &self,
+        after: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<chelabase_metadata::ScheduleReportRow>, MetadataError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.reads.fetch_add(1, SeqCst);
+        if self.fail_reads.load(SeqCst) {
+            return Err(MetadataError::Config("the metadata database is down".into()));
+        }
+        let page: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|r| after.is_none_or(|a| r.id > a))
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        self.seen.fetch_add(page.len(), SeqCst);
+        Ok(page)
+    }
+
+    async fn record_schedule_errors(&self, ids: &[uuid::Uuid]) -> Result<(), MetadataError> {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MetadataError::Config("the write failed".into()));
+        }
+        lock(&self.recorded).push(ids.to_vec());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

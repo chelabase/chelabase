@@ -411,6 +411,7 @@ impl<P: MetadataPort> Metadata<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::DateExt;
 
     fn parts(secrets: &[(&str, &str)], service_key: Option<&str>) -> Parts {
         Parts {
@@ -469,7 +470,7 @@ mod tests {
                 deployment_id: Uuid::new_v4(),
                 bundle_sha256: Some("a".repeat(64)),
                 spec: serde_json::json!({}),
-                compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                compatibility_date: chelabase_time::Date::ymd(2026, 10, 1).unwrap(),
                 auth: FunctionAuth::Key,
                 enabled: self.enabled,
                 run_as_role: self.run_as_key_id.map(|_| "reporter".into()),

@@ -493,6 +493,49 @@ async fn proxied_response_carries_cors_headers_for_studio() {
     assert!(vary.contains("Origin"), "CORS Vary missing: {vary:?}");
 }
 
+/// RFC 7231 IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`, with a two-digit day.
+fn is_imf_fixdate(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let digits = |range: std::ops::Range<usize>| {
+        bytes.get(range).is_some_and(|b| b.iter().all(u8::is_ascii_digit))
+    };
+    value.len() == 29
+        && days.iter().any(|d| value.starts_with(&format!("{d}, ")))
+        && digits(5..7)
+        && bytes[7] == b' '
+        && months.iter().any(|m| bytes.get(8..11) == Some(m.as_bytes()))
+        && bytes[11] == b' '
+        && digits(12..16)
+        && bytes[16] == b' '
+        && digits(17..19)
+        && bytes[19] == b':'
+        && digits(20..22)
+        && bytes[22] == b':'
+        && digits(23..25)
+        && value.ends_with(" GMT")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_carry_an_imf_fixdate_date_header() {
+    // The validator must reject the non-padded day that chrono-free formatting could emit.
+    assert!(!is_imf_fixdate("Sun, 6 Nov 1994 08:49:37 GMT"));
+    assert!(is_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT"));
+    let stack = start_stack().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/databases", stack.base))
+        .header("authorization", stack.bearer())
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let date = resp.headers()["date"].to_str().unwrap().to_string();
+    assert!(is_imf_fixdate(&date), "{date:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_down_is_502_json() {
     let jwks = MemberKeys::new();

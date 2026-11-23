@@ -496,7 +496,7 @@ impl MetadataPort for Doc {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chelabase_time::Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         match *self {}
     }
@@ -992,7 +992,7 @@ impl members::MembersPort for Doc {
     async fn open_signup(&self, tenant: TenantId) -> Result<bool, MetadataError> {
         match *self {}
     }
-    async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
+    async fn admin_claimed_since(&self, tenant: TenantId, since: chelabase_time::Timestamp) -> Result<bool, MetadataError> {
         match *self {}
     }
     async fn access_events(
@@ -1023,7 +1023,7 @@ impl members::MembersPort for Doc {
         database: Uuid,
         role_name: &str,
         scram_verifier: &str,
-        valid_until: chrono::DateTime<chrono::Utc>,
+        valid_until: chelabase_time::Timestamp,
     ) -> Result<chelabase_metadata::personal_logins::PersonalLogin, chelabase_metadata::personal_logins::LoginWriteError> {
         match *self {}
     }
@@ -1032,7 +1032,7 @@ impl members::MembersPort for Doc {
         member: Uuid,
         database: Uuid,
         scram_verifier: &str,
-        valid_until: chrono::DateTime<chrono::Utc>,
+        valid_until: chelabase_time::Timestamp,
     ) -> Result<
         (chelabase_metadata::personal_logins::PersonalLogin, Vec<chelabase_metadata::personal_logins::LoginEndpoint>),
         chelabase_metadata::personal_logins::LoginWriteError,
@@ -1127,7 +1127,7 @@ impl members::MembersPort for Doc {
         &self,
         actor: Uuid,
         invite: Uuid,
-        expires_at: chrono::DateTime<chrono::Utc>,
+        expires_at: chelabase_time::Timestamp,
         token_hash: [u8; 32],
     ) -> Result<(), DocWriteError> {
         match *self {}

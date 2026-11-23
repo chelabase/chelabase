@@ -34,7 +34,7 @@ use chelabase_nats::storage_objects::{
     self, AttemptOutcome, ObjectActor, ObjectEvent, ObjectEventType, TestReply, TestRequest,
 };
 use chelabase_secrets::{SecretKey, open_webhook_secret};
-use chrono::{DateTime, Utc};
+use chelabase_time::{SignedDuration, Timestamp, TimestampExt};
 use futures_util::StreamExt;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -47,10 +47,15 @@ pub const EVENT_TYPE_HEADER: &str = "chelabase-event-type";
 /// Each request's whole time.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// An event is retried for this long after it happened, then dropped.
-pub const MAX_AGE: chrono::TimeDelta = chelabase_metadata::STORAGE_WEBHOOK_RETRY_WINDOW;
+pub const MAX_AGE: Duration = chelabase_metadata::STORAGE_WEBHOOK_RETRY_WINDOW;
 /// An endpoint failing for this long running is disabled (a run ends at a success, or after a
 /// quiet spell longer than [`MAX_AGE`]: see [`chelabase_metadata::FailureRun`]).
-pub const DISABLE_AFTER: chrono::TimeDelta = chrono::TimeDelta::hours(72);
+pub const DISABLE_AFTER: Duration = chelabase_time::hours(72);
+
+/// Whether `at` is `window` or more before `now`. Signed: an `at` after `now` is never old.
+pub(crate) fn aged(now: Timestamp, at: Timestamp, window: Duration) -> bool {
+    SignedDuration::try_from(window).is_ok_and(|w| now.since(at) >= w)
+}
 /// The first retry's delay; each next one doubles, up to [`BACKOFF_CAP`].
 pub const BACKOFF_BASE: Duration = Duration::from_secs(5);
 pub const BACKOFF_CAP: Duration = Duration::from_secs(3600);
@@ -170,18 +175,18 @@ pub enum Next {
 pub fn decide(
     delivered: bool,
     attempt: u64,
-    event_time: DateTime<Utc>,
-    now: DateTime<Utc>,
-    failing_since: Option<DateTime<Utc>>,
+    event_time: Timestamp,
+    now: Timestamp,
+    failing_since: Option<Timestamp>,
     jitter: f64,
 ) -> Next {
     if delivered {
         return Next::Ack;
     }
-    if failing_since.is_some_and(|since| now - since >= DISABLE_AFTER) {
+    if failing_since.is_some_and(|since| aged(now, since, DISABLE_AFTER)) {
         return Next::Disabled;
     }
-    if now - event_time >= MAX_AGE {
+    if aged(now, event_time, MAX_AGE) {
         return Next::Dropped;
     }
     Next::Retry(backoff(attempt, jitter))
@@ -196,9 +201,9 @@ pub trait AttemptStore: Send + Sync + 'static {
         &'a self,
         webhook: Uuid,
         attempt: &'a StorageWebhookAttempt,
-    ) -> Fut<'a, Option<DateTime<Utc>>>;
+    ) -> Fut<'a, Option<Timestamp>>;
     /// Disables the endpoint if it is still failing since `since`.
-    fn disable_failing(&self, webhook: Uuid, since: DateTime<Utc>) -> Fut<'_, bool>;
+    fn disable_failing(&self, webhook: Uuid, since: Timestamp) -> Fut<'_, bool>;
 }
 
 impl AttemptStore for MetadataClient {
@@ -206,11 +211,11 @@ impl AttemptStore for MetadataClient {
         &'a self,
         webhook: Uuid,
         attempt: &'a StorageWebhookAttempt,
-    ) -> Fut<'a, Option<DateTime<Utc>>> {
+    ) -> Fut<'a, Option<Timestamp>> {
         Box::pin(self.record_storage_webhook_attempt(webhook, attempt))
     }
 
-    fn disable_failing(&self, webhook: Uuid, since: DateTime<Utc>) -> Fut<'_, bool> {
+    fn disable_failing(&self, webhook: Uuid, since: Timestamp) -> Fut<'_, bool> {
         Box::pin(self.disable_failing_storage_webhook(webhook, since))
     }
 }
@@ -230,7 +235,7 @@ pub async fn send(
     url: &str,
     secret: &str,
     event: &ObjectEvent,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Sent {
     let started = Instant::now();
     let elapsed = |started: Instant| started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -325,7 +330,7 @@ impl<S: AttemptStore> Delivery<S> {
         secret: &str,
         payload: &[u8],
         attempt: u64,
-        now: DateTime<Utc>,
+        now: Timestamp,
         jitter: f64,
     ) -> Next {
         let Ok(event) = serde_json::from_slice::<ObjectEvent>(payload) else {
@@ -336,7 +341,7 @@ impl<S: AttemptStore> Delivery<S> {
         if event.database_id != target.database_id || !matches(target, &event) {
             return Next::Ack;
         }
-        if now - event.time >= MAX_AGE {
+        if aged(now, event.time, MAX_AGE) {
             return self.drop_event(target, &event);
         }
         let sent = send(&self.client, &target.url, secret, &event, now).await;
@@ -400,7 +405,7 @@ pub fn log_dropped_totals(total: u64, since_last: u64) {
 
 /// A test event for `webhook`: type `webhook.test`, now, as the database's own; no object and
 /// no branch (`branch_id` is the nil uuid).
-pub fn test_event(webhook: &StorageWebhook, now: DateTime<Utc>) -> ObjectEvent {
+pub fn test_event(webhook: &StorageWebhook, now: Timestamp) -> ObjectEvent {
     ObjectEvent {
         id: Uuid::new_v4(),
         kind: ObjectEventType::Test,
@@ -446,7 +451,7 @@ pub async fn test_reply(
             message: "the endpoint's secret doesn't open".into(),
         };
     };
-    let now = Utc::now();
+    let now = Timestamp::now();
     let sent = send(
         client,
         &target.webhook.url,
@@ -635,7 +640,7 @@ async fn consume(
                     &current.secret,
                     &message.payload,
                     attempt,
-                    Utc::now(),
+                    Timestamp::now(),
                     jitter,
                 )
                 .await;
@@ -665,8 +670,8 @@ mod tests {
 
     const SECRET: &str = "whsec_0123456789abcdef";
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix_seconds(secs).unwrap()
     }
 
     // --- signing (AC 4) ---
@@ -758,7 +763,7 @@ mod tests {
         }
     }
 
-    fn event(kind: ObjectEventType, bucket: &str, name: &str, time: DateTime<Utc>) -> ObjectEvent {
+    fn event(kind: ObjectEventType, bucket: &str, name: &str, time: Timestamp) -> ObjectEvent {
         ObjectEvent {
             id: Uuid::new_v4(),
             kind,
@@ -855,10 +860,27 @@ mod tests {
         }
     }
 
+    // AC 9: the age test is signed. An event (or a failing-since) stamped after `now`, as a
+    // clock step back leaves it, is young, never old.
+    #[test]
+    fn a_time_after_now_is_never_aged() {
+        let now = at(1_700_000_000);
+        let h = chelabase_time::hours;
+        assert!(!aged(now, now + h(1), Duration::ZERO));
+        assert!(!aged(now, now + h(1), MAX_AGE));
+        assert!(!aged(now, now + h(100), MAX_AGE));
+        assert!(aged(now, now - h(24), MAX_AGE));
+        assert!(!aged(now, now - h(24) + chelabase_time::seconds(1), MAX_AGE));
+        assert_eq!(
+            decide(false, 1, now + h(1), now, Some(now + h(100)), 0.0),
+            Next::Retry(Duration::from_secs(5))
+        );
+    }
+
     #[test]
     fn decide_retries_then_drops_after_a_day_and_disables_after_three() {
         let t0 = at(1_700_000_000);
-        let h = chrono::TimeDelta::hours;
+        let h = chelabase_time::hours;
         assert_eq!(decide(true, 1, t0, t0, None, 0.0), Next::Ack);
         assert_eq!(
             decide(true, 9, t0, t0 + h(30), Some(t0 - h(100)), 0.0),
@@ -878,7 +900,7 @@ mod tests {
                 false,
                 3,
                 t0,
-                t0 + h(24) - chrono::TimeDelta::seconds(1),
+                t0 + h(24) - chelabase_time::seconds(1),
                 Some(t0),
                 0.0
             ),
@@ -894,7 +916,7 @@ mod tests {
                 1,
                 t0,
                 t0,
-                Some(t0 - h(72) + chrono::TimeDelta::seconds(1)),
+                Some(t0 - h(72) + chelabase_time::seconds(1)),
                 0.0
             ),
             Next::Retry(Duration::from_secs(5))
@@ -914,8 +936,8 @@ mod tests {
     /// ([`chelabase_metadata::FailureRun`]).
     struct FakeStore {
         attempts: Mutex<Vec<(Uuid, StorageWebhookAttempt)>>,
-        run: Mutex<(chelabase_metadata::FailureRun, Option<DateTime<Utc>>)>,
-        disabled: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+        run: Mutex<(chelabase_metadata::FailureRun, Option<Timestamp>)>,
+        disabled: Mutex<Vec<(Uuid, Timestamp)>>,
     }
 
     impl Default for FakeStore {
@@ -936,7 +958,7 @@ mod tests {
 
     impl FakeStore {
         /// Failing since `since`, the last attempt at `last`.
-        fn failing(since: DateTime<Utc>, last: DateTime<Utc>) -> Arc<Self> {
+        fn failing(since: Timestamp, last: Timestamp) -> Arc<Self> {
             let store = Self::default();
             *store.run.lock().unwrap() = (
                 chelabase_metadata::FailureRun {
@@ -954,7 +976,7 @@ mod tests {
             &'a self,
             webhook: Uuid,
             attempt: &'a StorageWebhookAttempt,
-        ) -> Fut<'a, Option<DateTime<Utc>>> {
+        ) -> Fut<'a, Option<Timestamp>> {
             let mut run = self.run.lock().unwrap();
             let next = run
                 .0
@@ -969,7 +991,7 @@ mod tests {
             Box::pin(std::future::ready(Ok(out)))
         }
 
-        fn disable_failing(&self, webhook: Uuid, since: DateTime<Utc>) -> Fut<'_, bool> {
+        fn disable_failing(&self, webhook: Uuid, since: Timestamp) -> Fut<'_, bool> {
             self.disabled.lock().unwrap().push((webhook, since));
             Box::pin(std::future::ready(Ok(true)))
         }
@@ -1037,6 +1059,25 @@ mod tests {
         &request[request.find("\r\n\r\n").unwrap() + 4..]
     }
 
+    /// A delivery at an instant with a fraction signs whole unix seconds (`t=` is seconds, not
+    /// milliseconds, and the fraction is dropped), with the MAC of those seconds and the body.
+    #[tokio::test]
+    async fn signature_uses_whole_unix_seconds() {
+        let (port, seen) = endpoint(&[200]).await;
+        let d = local(Arc::new(FakeStore::default()));
+        let mut w = webhook(&["object.created"], Some("avatars"), None);
+        w.url = format!("http://127.0.0.1:{port}/hook");
+        let secs = 1_900_000_000;
+        let now = at(secs) + Duration::from_millis(987);
+        let e = event(ObjectEventType::Created, "avatars", "a.png", at(secs));
+        let payload = serde_json::to_vec(&e).unwrap();
+        assert_eq!(d.process(&w, SECRET, &payload, 1, now, 0.0).await, Next::Ack);
+        let requests = seen.lock().unwrap().clone();
+        let header = header_of(&requests[0], SIGNATURE_HEADER).unwrap();
+        assert_eq!(header, signature(SECRET, secs, body_of(&requests[0]).as_bytes()));
+        assert!(header.starts_with("t=1900000000,v1="), "{header}");
+    }
+
     /// AC 2: 500 three times then 200: four attempts of the same event id, each signed, with
     /// increasing backoff between them, then acknowledged.
     #[tokio::test]
@@ -1046,12 +1087,12 @@ mod tests {
         let d = local(store.clone());
         let mut w = webhook(&["object.created"], Some("avatars"), None);
         w.url = format!("http://127.0.0.1:{port}/hook");
-        let t0 = at(Utc::now().timestamp());
+        let t0 = at(Timestamp::now().timestamp());
         let e = event(ObjectEventType::Created, "avatars", "a.png", t0);
         let payload = serde_json::to_vec(&e).unwrap();
         let mut delays = Vec::new();
         for attempt in 1..=4u64 {
-            let now = t0 + chrono::TimeDelta::seconds(attempt as i64 * 10);
+            let now = t0 + chelabase_time::seconds(attempt * 10);
             match d.process(&w, SECRET, &payload, attempt, now, 0.0).await {
                 Next::Retry(delay) => delays.push(delay),
                 Next::Ack => assert_eq!(attempt, 4),
@@ -1076,7 +1117,7 @@ mod tests {
             let body = body_of(r);
             let sent: ObjectEvent = serde_json::from_str(body).unwrap();
             assert_eq!(sent, e);
-            let now = (t0 + chrono::TimeDelta::seconds((i as i64 + 1) * 10)).timestamp();
+            let now = (t0 + chelabase_time::seconds((i as u64 + 1) * 10)).timestamp();
             assert_eq!(
                 verify(
                     SECRET,
@@ -1114,7 +1155,7 @@ mod tests {
         let d = local(store.clone());
         let mut w = webhook(&["object.created"], Some("avatars"), None);
         w.url = format!("http://127.0.0.1:{port}/hook");
-        let now = Utc::now();
+        let now = Timestamp::now();
         let other_bucket = event(ObjectEventType::Created, "docs", "a.png", now);
         let mut foreign = event(ObjectEventType::Created, "avatars", "a.png", now);
         foreign.database_id = Uuid::new_v4();
@@ -1169,7 +1210,7 @@ mod tests {
     async fn a_dropped_event_is_counted_in_the_totals_line() {
         let d = local(Arc::new(FakeStore::default()));
         let w = webhook(&["object.created"], None, None);
-        let now = Utc::now();
+        let now = Timestamp::now();
         let stale = event(ObjectEventType::Created, "a", "b", now - MAX_AGE);
         let payload = serde_json::to_vec(&stale).unwrap();
         for _ in 0..3 {
@@ -1194,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn an_endpoint_failing_for_three_days_is_disabled() {
         let (port, _) = endpoint(&[503]).await;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let store = FakeStore::failing(now - DISABLE_AFTER, now - BACKOFF_CAP);
         let d = local(store.clone());
         let mut w = webhook(&["object.created"], None, None);
@@ -1215,8 +1256,8 @@ mod tests {
     #[tokio::test]
     async fn a_failure_after_a_quiet_spell_starts_a_new_run_not_a_disable() {
         let (port, _) = endpoint(&[502]).await;
-        let now = Utc::now();
-        let h = chrono::TimeDelta::hours;
+        let now = Timestamp::now();
+        let h = chelabase_time::hours;
         let store = FakeStore::failing(now - h(96), now - h(72));
         let d = local(store.clone());
         let mut w = webhook(&["object.created"], None, None);
@@ -1260,7 +1301,7 @@ mod tests {
         let (port, seen) = endpoint(&[200]).await;
         let store = Arc::new(FakeStore::default());
         let d = Delivery::new(store.clone(), &Outbound::new().allow_http(true)).unwrap();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let payload = serde_json::to_vec(&event(ObjectEventType::Created, "a", "b", now)).unwrap();
         for url in [
             format!("http://127.0.0.1:{port}/"),

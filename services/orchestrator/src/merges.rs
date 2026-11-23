@@ -27,7 +27,7 @@ use chelabase_metadata::{
 use chelabase_nats::{JobEnvelope, MergeAfter, MergeJob};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiPath, BranchId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
@@ -199,8 +199,8 @@ struct MergeSummary {
     #[schema(required = true)]
     error: Option<String>,
     created_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
 }
 
 impl From<&MergeRecord> for MergeSummary {
@@ -240,8 +240,8 @@ struct Merge {
     #[schema(required = true)]
     error: Option<String>,
     created_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
     /// SHA-256 of each normalized schema the analysis is based on; null until computed.
     #[schema(required = true)]
     base_fingerprint: Option<String>,
@@ -313,7 +313,7 @@ impl From<MergeRecord> for Merge {
 /// One line of a merge's log.
 #[derive(Debug, Serialize, ToSchema)]
 struct MergeLogEntry {
-    at: DateTime<Utc>,
+    at: Timestamp,
     /// `status`, `step` or `note`.
     kind: String,
     #[schema(required = true)]
@@ -1981,6 +1981,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     fn step(kind: &str) -> Value {
         json!({
@@ -1991,7 +1992,7 @@ mod tests {
     }
 
     fn record(plan: Option<Value>, user_steps: Value) -> MergeRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         MergeRecord {
             id: Uuid::new_v4(),
             database_id: Uuid::new_v4(),

@@ -13,6 +13,7 @@ mod branches;
 mod data_api;
 mod ddl;
 mod functions;
+mod schedule;
 pub mod members;
 mod merges;
 mod neon;
@@ -45,11 +46,14 @@ pub use storage_webhooks::{
 };
 pub use ddl::DdlTx;
 pub use functions::{
-    Advance, BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
+    BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_IN_FLIGHT_PER_DATABASE, MAX_LAST_ERROR_CHARS, MAX_SCHEDULES_PER_FUNCTION, MAX_TRIGGERS_PER_FUNCTION, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
-    NewSchedule, NewTrigger, ResolvedFunction, RunAs, Schedule, ScheduleError, ScheduleRecord,
-    ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState, advance,
+    NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleRecord, ScheduleReportRow,
+    ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
     secret_write_allowed, secrets_env_bytes, valid_function_name, valid_secret_name,
+};
+pub use schedule::{
+    Advance, SCHEDULE_ERROR_MAX_CHARS, NO_UPCOMING_TIME, Schedule, ScheduleError, ScheduleProblem, advance, next_run,
 };
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
@@ -500,7 +504,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261116000001).
+        // this file when adding one (last: 20261123000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
@@ -1090,8 +1094,8 @@ mod tests {
             slug: slug.into(),
             status: ProjectStatus::Active,
             error: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: <chelabase_time::Timestamp as chelabase_time::TimestampExt>::now(),
+            updated_at: <chelabase_time::Timestamp as chelabase_time::TimestampExt>::now(),
         }
     }
 

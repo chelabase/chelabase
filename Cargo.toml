@@ -30,6 +30,7 @@ members = [
     "crates/chelabase-typegen",
     "crates/chelabase-storage",
     "crates/chelabase-pgsession",
+    "crates/chelabase-time",
 ]
 
 [workspace.package]
@@ -54,9 +55,11 @@ chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
 chelabase-storage = { path = "crates/chelabase-storage" }
 chelabase-pgsession = { path = "crates/chelabase-pgsession" }
+chelabase-time = { path = "crates/chelabase-time" }
 
 axum = "0.8.9"
-utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
+# `jiff_0_2` only teaches the macros the names `Timestamp` and `Date` (no extra crate).
+utoipa = { version = "6.0.0", features = ["jiff_0_2", "uuid"] }
 utoipa-axum = "0.3.0"
 tokio = { version = "1.54.0", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors"] }
@@ -69,18 +72,23 @@ thiserror = "2.0.21"
 anyhow = "1.0.104"
 # TLS on aws-lc-rs like everything else, so a `sslmode=verify-full` URL works once the
 # servers have certificates.
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "json", "migrate", "tls-rustls-aws-lc-rs"] }
 # Defaults off: they select ring for TLS and pull in KV, object store, websockets and the
 # service API, none of which we use.
 async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "aws-lc-rs", "server_2_10", "server_2_11", "server_2_12", "server_2_14"] }
 dotenvy = "0.15.7"
-chrono = { version = "0.4.45", features = ["serde"] }
 # Edge functions m7: function schedules (5-field cron, IANA time zones).
-croner = { version = "4.0.2", default-features = false, features = ["chrono"] }
-chrono-tz = "0.10.4"
+# Only `jiff`: croner's `std` feature names its other backend as a weak dependency
+# (`?/std`), which Cargo writes into Cargo.lock although nothing builds it. croner without `std`
+# is `no_std` with `core::error::Error`; jiff's own `std` comes from the `jiff` entry below.
+croner = { version = "5.0.0", default-features = false, features = ["jiff"] }
 # async-nats's own time type (a consumer's start time); already in the tree through it.
 time = "0.3.55"
-humantime = "2.4.0"
+# chelabase-time's backing, and function schedules' time zones (deny.toml bans the crates it
+# replaced). The tz database is compiled in, so a schedule's zone doesn't depend on the host's
+# zoneinfo.
+jiff = { version = "1.0.2", default-features = false, features = ["std", "serde", "tzdb-bundle-always"] }
+jiff-sqlx = { version = "1.0.0", features = ["postgres"] }
 urlencoding = "2.1.3"
 bollard = "0.21.1"
 futures-util = "0.3.34"
@@ -177,10 +185,11 @@ tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "38
 # support (no zero-capacity BufReader, which tokio 1.54 panics on for every accepted connection)
 # with h2 0.4.20, the 32-per-connection malformed-stream bound kept under h2 0.4.20, and a
 # write-buffer resize that flushes pending bytes first, and zstd 0.14.3 / zstd-safe 8.2
-# (RUSTSEC-2026-0391/0398/0403/0410).
+# (RUSTSEC-2026-0391/0398/0403/0410), and no RUSTSEC-2026-0543: the Date header is
+# written with httpdate.
 # From git, pingora-proxy takes its pingora-* siblings from the same checkout (path deps), so the
 # ones the gateway names directly come from the same rev too; otherwise their types would differ.
-pingora-proxy = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
-pingora-core = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
-pingora-http = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
-pingora-error = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
+pingora-proxy = { git = "https://github.com/chelabase/pingora", rev = "13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8" }
+pingora-core = { git = "https://github.com/chelabase/pingora", rev = "13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8" }
+pingora-http = { git = "https://github.com/chelabase/pingora", rev = "13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8" }
+pingora-error = { git = "https://github.com/chelabase/pingora", rev = "13867bfd9b7232115524e6d38a6c8a8d8d7b1fe8" }

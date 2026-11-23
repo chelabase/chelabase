@@ -31,7 +31,7 @@ use chelabase_types::role_name::{
     check_login_role_name, is_membership_reserved, is_reserved_for, is_reserved_target,
     quote_ident, quote_literal,
 };
-use chrono::{DateTime, SubsecRound, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -169,7 +169,7 @@ pub struct RoleSpec {
     pub inherit: bool,
     /// `-1`: no limit.
     pub connection_limit: i32,
-    pub valid_until: Option<DateTime<Utc>>,
+    pub valid_until: Option<Timestamp>,
     pub bypass_rls: bool,
     /// Roles it's made a member of; each must exist, the owner must administer it, and none
     /// may be one of Chelabase's own (`is_membership_reserved`).
@@ -229,7 +229,7 @@ pub struct RolePatch {
     pub login: Option<bool>,
     pub inherit: Option<bool>,
     pub connection_limit: Option<i32>,
-    pub valid_until: Option<Option<DateTime<Utc>>>,
+    pub valid_until: Option<Option<Timestamp>>,
     pub bypass_rls: Option<bool>,
     pub member_of: Option<Vec<String>>,
 }
@@ -275,8 +275,8 @@ impl From<&RoleUpdateRequest> for RolePatch {
 }
 
 /// `at` to the microsecond Postgres keeps.
-fn to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
-    at.trunc_subsecs(6)
+fn to_micros(at: Timestamp) -> Timestamp {
+    at.trunc_micros()
 }
 
 fn sorted(names: &[String]) -> Vec<String> {
@@ -3480,8 +3480,8 @@ mod tests {
     /// One role's catalog read.
     const ROLE_READ: &str = "FROM pg_authid";
 
-    fn until() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap()
+    fn until() -> Timestamp {
+        Timestamp::from_unix_seconds(1_900_000_000).unwrap()
     }
 
     /// The membership check's answer: each name and whether the owner holds ADMIN on it.
@@ -4132,7 +4132,7 @@ mod tests {
             api_owner_level: true,
             pending,
             attributes_pending: pending,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             attributes: chelabase_metadata::RoleAttributes {
                 connection_limit: 7,
                 ..Default::default()

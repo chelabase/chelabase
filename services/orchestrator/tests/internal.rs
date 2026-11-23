@@ -5,6 +5,7 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use chelabase_time::{SignedDuration, Timestamp, TimestampExt};
 use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;
@@ -64,7 +65,7 @@ type KeyEntry = ([u8; 32], DataKeyLookup);
 type UploadTokens = HashMap<uuid::Uuid, (uuid::Uuid, Value, bool)>;
 
 /// An invite's stored expiry and whether the database clock calls it open.
-type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
+type InviteExpiry = (Timestamp, bool);
 
 #[derive(Clone, Default)]
 struct FakeNeon {
@@ -175,7 +176,7 @@ struct FakeSession {
     hash: [u8; 32],
     prev: Option<[u8; 32]>,
     sealed: Option<String>,
-    grace_until: Option<chrono::DateTime<chrono::Utc>>,
+    grace_until: Option<Timestamp>,
 }
 
 /// One endpoint's rows as the DDL receiver's transaction sees them.
@@ -208,7 +209,7 @@ fn copy(name: &str, origin: RoleOrigin, verifier: Option<&str>, sealed: Option<&
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
-        created_at: chrono::Utc::now(),
+        created_at: Timestamp::now(),
         attributes: chelabase_metadata::RoleAttributes::default(),
     }
 }
@@ -472,7 +473,7 @@ impl FakeNeon {
             level: RoleLevel::Plain,
             login: false,
             password: chelabase_metadata::PasswordState::Generated,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             pending: false,
             attributes: chelabase_metadata::RoleAttributes {
                 member_of: member_of.iter().map(|r| r.to_string()).collect(),
@@ -593,7 +594,7 @@ impl NeonMetadataPort for FakeNeon {
         token_id: uuid::Uuid,
         key_id: uuid::Uuid,
         claims: &Value,
-        _expires_at: chrono::DateTime<chrono::Utc>,
+        _expires_at: Timestamp,
     ) -> Result<bool, MetadataError> {
         if self.live_data_key(key_id).await?.is_none() {
             return Ok(false);
@@ -798,7 +799,7 @@ impl NeonMetadataPort for FakeNeon {
         let st = self.setup.lock().unwrap();
         Ok(st.claims.get(&tenant).map(|user| chelabase_metadata::members::SetupClaim {
             identity_user_id: user.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             has_member_row: st.member_rows.contains(user),
         }))
     }
@@ -932,7 +933,7 @@ impl NeonMetadataPort for FakeNeon {
 
     async fn insert_app_session(&self, n: &NewAppSession<'_>) -> Result<(), MetadataError> {
         self.check()?;
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.app.lock().unwrap().sessions.push(FakeSession {
             s: AppSession {
                 id: n.id,
@@ -981,8 +982,8 @@ impl NeonMetadataPort for FakeNeon {
         if f.s.project_id != project || f.s.revoked_at.is_some() {
             return Ok(RefreshOutcome::Invalid);
         }
-        let now = chrono::Utc::now();
-        let cap_end = f.s.created_at + chrono::Duration::from_std(next.cap).unwrap();
+        let now = Timestamp::now();
+        let cap_end = f.s.created_at + next.cap;
         if now >= f.s.expires_at || now >= cap_end {
             f.s.revoked_at = Some(now);
             return Ok(RefreshOutcome::Invalid);
@@ -991,9 +992,9 @@ impl NeonMetadataPort for FakeNeon {
             f.prev = Some(f.hash);
             f.hash = next.new_hash;
             f.sealed = Some(next.new_sealed.clone());
-            f.grace_until = Some(now + chrono::Duration::from_std(next.grace).unwrap());
+            f.grace_until = Some(now + next.grace);
             f.s.last_used_at = now;
-            f.s.expires_at = (now + chrono::Duration::from_std(next.sliding).unwrap()).min(cap_end);
+            f.s.expires_at = (now + next.sliding).min(cap_end);
             Ok(RefreshOutcome::Rotated(f.s.clone()))
         } else if f.prev == Some(presented) {
             match (f.grace_until, &f.sealed) {
@@ -1031,8 +1032,8 @@ impl NeonMetadataPort for FakeNeon {
         if f.s.project_id != project || f.s.revoked_at.is_some() {
             return Ok(PeekOutcome::Invalid);
         }
-        let now = chrono::Utc::now();
-        let cap_end = f.s.created_at + chrono::Duration::from_std(cap).unwrap();
+        let now = Timestamp::now();
+        let cap_end = f.s.created_at + cap;
         if now >= f.s.expires_at || now >= cap_end {
             return Ok(PeekOutcome::Invalid);
         }
@@ -1064,7 +1065,7 @@ impl NeonMetadataPort for FakeNeon {
             .iter_mut()
             .find(|f| f.s.id == id && f.s.project_id == project && f.s.revoked_at.is_none())
             .map(|f| {
-                f.s.revoked_at = Some(chrono::Utc::now());
+                f.s.revoked_at = Some(Timestamp::now());
                 f.s.clone()
             }))
     }
@@ -1087,7 +1088,7 @@ impl NeonMetadataPort for FakeNeon {
                     && (f.hash == presented || f.prev == Some(presented))
             })
             .map(|f| {
-                f.s.revoked_at = Some(chrono::Utc::now());
+                f.s.revoked_at = Some(Timestamp::now());
                 f.s.clone()
             }))
     }
@@ -1097,11 +1098,11 @@ impl NeonMetadataPort for FakeNeon {
         project: ProjectId,
         user: uuid::Uuid,
         keep: Option<uuid::Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         self.check()?;
         let mut app = self.app.lock().unwrap();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         Ok(app
             .sessions
             .iter_mut()
@@ -2756,7 +2757,7 @@ async fn storage_upload_tokens_follow_the_app_session() {
         role_oid: None,
     };
     neon.data_keys.lock().unwrap().push(([9; 32], lookup));
-    let session = |project: ProjectId, life: chrono::Duration| {
+    let session = |project: ProjectId, expires_at: Timestamp| {
         let neon = neon.clone();
         async move {
             let id = uuid::Uuid::new_v4();
@@ -2766,7 +2767,7 @@ async fn storage_upload_tokens_follow_the_app_session() {
                 user_id: uuid::Uuid::new_v4(),
                 identity_session_id: "z",
                 refresh_hash: [1; 32],
-                expires_at: chrono::Utc::now() + life,
+                expires_at,
             })
             .await
             .unwrap();
@@ -2775,7 +2776,7 @@ async fn storage_upload_tokens_follow_the_app_session() {
     };
     let record = |token: uuid::Uuid, sid: Value| {
         let body = json!({ "token_id": token, "key_id": key_id, "claims": { "sub": "u1", "sid": sid },
-            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1) });
+            "expires_at": Timestamp::now() + chelabase_time::hours(1) });
         app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), body)
     };
     let app = &app;
@@ -2784,12 +2785,12 @@ async fn storage_upload_tokens_follow_the_app_session() {
     };
 
     // Clamped to the session's 10 minutes, and spent while it is live.
-    let live = session(project, chrono::Duration::minutes(10)).await;
+    let live = session(project, Timestamp::now() + chelabase_time::minutes(10)).await;
     let t1 = uuid::Uuid::new_v4();
     let (code, body) = record(t1, json!(live)).await;
     assert_eq!(code, 200, "{body}");
     let exp = body["expires_at"].as_i64().unwrap();
-    let cap = (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp();
+    let cap = (Timestamp::now() + chelabase_time::minutes(10)).timestamp();
     assert!(exp <= cap && exp > cap - 30, "{body}");
     assert_eq!(consume(t1).await.0, 200);
 
@@ -2800,8 +2801,8 @@ async fn storage_upload_tokens_follow_the_app_session() {
     assert_eq!(consume(t2).await.0, 404);
 
     // A revoked, expired, unknown, another project's or unreadable session mints nothing.
-    let expired = session(project, chrono::Duration::seconds(-1)).await;
-    let foreign = session(ProjectId::new(), chrono::Duration::minutes(10)).await;
+    let expired = session(project, Timestamp::now() - chelabase_time::seconds(1)).await;
+    let foreign = session(ProjectId::new(), Timestamp::now() + chelabase_time::minutes(10)).await;
     for sid in [json!(live), json!(expired), json!(uuid::Uuid::new_v4()), json!(foreign), json!("nope"), json!(7)] {
         assert_eq!(record(uuid::Uuid::new_v4(), sid.clone()).await.0, 409, "{sid}");
     }
@@ -3812,7 +3813,7 @@ async fn ddl_is_idempotent() {
     after_second.roles_version = 0;
     for s in [&mut after_first, &mut after_second] {
         for r in s.roles.values_mut() {
-            r.created_at = chrono::DateTime::UNIX_EPOCH;
+            r.created_at = Timestamp::UNIX_EPOCH;
         }
     }
     assert_eq!(after_first, after_second);
@@ -4674,7 +4675,7 @@ fn branch_record(
     status: BranchStatus,
     endpoint: Option<&str>,
 ) -> BranchRecord {
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     BranchRecord {
         id,
         database_id: db,
@@ -4703,7 +4704,7 @@ fn branch_record(
 }
 
 fn project_record(id: ProjectId) -> ProjectRecord {
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     ProjectRecord {
         id,
         tenant_id: TenantId::new(),
@@ -4747,7 +4748,7 @@ fn app_world() -> AppWorld {
             branch_record(bare, bare_db, None, Normal, Ready, Some("ep-bare")),
             branch_record(gone, auth_db, Some(main), Normal, Deleted, None),
         ]);
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         app.auths.push(ProjectAuth {
             project_id: project,
             status: AppUsersStatus::Enabled,
@@ -5236,7 +5237,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
     let w = app_world();
     let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
-    let before = chrono::Utc::now();
+    let before = Timestamp::now();
     let (status, body) = a
         .app
         .post_json(
@@ -5257,9 +5258,9 @@ async fn create_session_returns_a_token_of_the_right_shape() {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'),
         "{rest}"
     );
-    let expires: chrono::DateTime<chrono::Utc> = body["expires_at"].as_str().unwrap().parse().unwrap();
-    let ttl = chrono::Duration::from_std(REFRESH_TTL).unwrap();
-    assert!(expires >= before + ttl && expires <= chrono::Utc::now() + ttl, "{expires}");
+    let expires: Timestamp = body["expires_at"].as_str().unwrap().parse().unwrap();
+    let ttl = REFRESH_TTL;
+    assert!(expires >= before + ttl && expires <= Timestamp::now() + ttl, "{expires}");
     let stored = a.session(sid);
     assert_eq!(stored.hash, sha256(token), "the hash covers the whole token");
     assert_eq!(stored.s.user_id, user);
@@ -5309,8 +5310,8 @@ async fn refresh_grace_returns_the_same_token() {
     assert!(!a.revoked(sid));
     assert_eq!(a.session(sid).hash, sha256(&t1));
     // The grace is 10 s.
-    let grace = a.session(sid).grace_until.unwrap() - chrono::Utc::now();
-    assert!(grace <= chrono::Duration::seconds(10) && grace > chrono::Duration::seconds(5), "{grace}");
+    let grace = a.session(sid).grace_until.unwrap().since(Timestamp::now());
+    assert!(grace <= SignedDuration::from_secs(10) && grace > SignedDuration::from_secs(5), "{grace}");
 }
 
 // Review Focus 1.
@@ -5322,7 +5323,7 @@ async fn refresh_reuse_revokes_and_ends_the_identity_session() {
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
-    a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    a.edit_session(sid, |f| f.grace_until = Some(Timestamp::now() - chelabase_time::seconds(1)));
     let (status, body) = a.refresh(w.project, &t0).await;
     assert_eq!(status, 401, "{body}");
     assert_eq!(error_code(&body), "refresh_token_reused");
@@ -5419,7 +5420,7 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
     let (_, body) = a.refresh(w.project, &t1).await;
     let t2 = body["refresh_token"].as_str().unwrap().to_string();
     let (dead, dead_token) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs2").await;
-    a.edit_session(dead, |f| f.s.revoked_at = Some(chrono::Utc::now()));
+    a.edit_session(dead, |f| f.s.revoked_at = Some(Timestamp::now()));
     let unknown = format!("{}.{}", uuid::Uuid::new_v4(), t0.split_once('.').unwrap().1);
     for (what, token) in [
         ("unknown session", unknown),
@@ -5430,7 +5431,7 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
         let (status, body) = a.peek(w.project, &token).await;
         assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{what}: {body}");
     }
-    a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    a.edit_session(sid, |f| f.grace_until = Some(Timestamp::now() - chelabase_time::seconds(1)));
     let before = a.session(sid);
     let (status, body) = a.peek(w.project, &t1).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"), "{body}");
@@ -5465,7 +5466,7 @@ async fn peek_leaves_an_expired_session_to_refresh() {
     let w = app_world();
     let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
-    a.edit_session(sid, |f| f.s.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1));
+    a.edit_session(sid, |f| f.s.expires_at = Timestamp::now() - chelabase_time::seconds(1));
     let (status, body) = a.peek(w.project, &t0).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
     assert!(!a.revoked(sid));
@@ -5575,7 +5576,7 @@ async fn legacy_tokens_rotate_and_never_revoke_on_a_mismatch() {
     a.edit_session(sid, |f| {
         f.hash = sha256(&legacy1);
         f.prev = Some(sha256(&legacy0));
-        f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        f.grace_until = Some(Timestamp::now() - chelabase_time::seconds(1));
     });
     let stale = format!("{sid}.{}", "c".repeat(43));
     for peek in [false, true] {
@@ -5603,13 +5604,13 @@ async fn session_liveness() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, json!({ "live": true, "project_id": w.project, "user_id": user }));
     // Expired.
-    a.edit_session(sid, |f| f.s.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1));
+    a.edit_session(sid, |f| f.s.expires_at = Timestamp::now() - chelabase_time::seconds(1));
     let (_, body) = a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await;
     assert_eq!(body["live"], json!(false), "{body}");
     // Revoked.
     a.edit_session(sid, |f| {
-        f.s.expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-        f.s.revoked_at = Some(chrono::Utc::now());
+        f.s.expires_at = Timestamp::now() + chelabase_time::hours(1);
+        f.s.revoked_at = Some(Timestamp::now());
     });
     let (_, body) = a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await;
     assert_eq!(body["live"], json!(false), "{body}");
@@ -5658,13 +5659,13 @@ async fn revoke_user_sessions_keeps_one() {
     // `created_before` limits it to older sessions.
     let cut = a.session(s2).s.created_at;
     let (s5, _) = a.create_session(w.project, u, z.id("z5")).await;
-    a.edit_session(s5, |f| f.s.created_at = cut + chrono::Duration::seconds(5));
+    a.edit_session(s5, |f| f.s.created_at = cut + chelabase_time::seconds(5));
     let (status, _) = a
         .app
         .post_json(
             &format!("/internal/app/users/{u}/revoke-sessions"),
             Some(APP_AUTH_TOKEN),
-            json!({ "project_id": w.project, "created_before": cut + chrono::Duration::seconds(1) }),
+            json!({ "project_id": w.project, "created_before": cut + chelabase_time::seconds(1) }),
         )
         .await;
     assert_eq!(status, 204);
@@ -5722,7 +5723,7 @@ async fn revokes_answer_before_identity_ends_the_sessions() {
 
     let (s5, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "z5").await;
     let (_, _) = a.refresh(w.project, &t0).await;
-    a.edit_session(s5, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    a.edit_session(s5, |f| f.grace_until = Some(Timestamp::now() - chelabase_time::seconds(1)));
     let start = std::time::Instant::now();
     let (status, body) = a.refresh(w.project, &t0).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"));
@@ -6429,9 +6430,9 @@ async fn describe_invite_needs_the_token() {
 async fn open_invite_answers_open_and_expiry_only() {
     let neon = FakeNeon::default();
     invite_fixture(&neon, Some(token_hash("right")));
-    let now = chrono::Utc::now();
-    let later = now + chrono::Duration::days(3);
-    let earlier = now - chrono::Duration::minutes(1);
+    let now = Timestamp::now();
+    let later = now + chelabase_time::days(3);
+    let earlier = now - chelabase_time::minutes(1);
     neon.invite_expiries.lock().unwrap().insert("u1".into(), (later, true));
     neon.invite_expiries.lock().unwrap().insert("u2".into(), (earlier, false));
     // The database clock decides: an expiry the orchestrator's clock calls future, the
@@ -6442,7 +6443,7 @@ async fn open_invite_answers_open_and_expiry_only() {
         let app = &app;
         async move { app.post_json("/internal/invites/open", Some(APP_AUTH_TOKEN), body).await }
     };
-    let rfc = |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let rfc = |t: Timestamp| t.to_rfc3339_micros();
     assert_eq!(ask(json!({ "user": "u1" })).await, (200, json!({ "open": true, "expires_at": rfc(later) })));
     assert_eq!(ask(json!({ "user": "u2" })).await, (200, json!({ "open": false, "expires_at": rfc(earlier) })));
     assert_eq!(ask(json!({ "user": "u4" })).await, (200, json!({ "open": false, "expires_at": rfc(later) })));
@@ -6455,6 +6456,64 @@ async fn open_invite_answers_open_and_expiry_only() {
     assert_eq!(app.post_json("/internal/invites/open", Some("wrong"), body.clone()).await.0, 401);
     assert_eq!(app.post_json("/internal/invites/open", Some(REALTIME_TOKEN), body.clone()).await.0, 401);
     assert_eq!(app.post_json("/internal/invites/open", None, body).await.0, 401);
+}
+
+/// m8: the open-invite `expires_at` is written with exactly six fraction digits and a `Z`,
+/// whatever precision the stored time has (nanoseconds are cut, not rounded).
+#[tokio::test]
+async fn invite_expiry_keeps_microsecond_text() {
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    for (user, stored) in [
+        ("w", "2026-09-30T12:00:00Z"),
+        ("m", "2026-09-30T12:00:00.5Z"),
+        ("n", "2026-09-30T12:00:00.123456789Z"),
+        ("o", "2026-09-30T14:00:00.000001+02:00"),
+    ] {
+        let at: Timestamp = stored.parse().unwrap();
+        neon.invite_expiries.lock().unwrap().insert(user.into(), (at, true));
+    }
+    let app = describe_app(neon).await;
+    for (user, text) in [
+        ("w", "2026-09-30T12:00:00.000000Z"),
+        ("m", "2026-09-30T12:00:00.500000Z"),
+        ("n", "2026-09-30T12:00:00.123456Z"),
+        ("o", "2026-09-30T12:00:00.000001Z"),
+    ] {
+        let got = app.post_json("/internal/invites/open", Some(APP_AUTH_TOKEN), json!({ "user": user })).await;
+        assert_eq!(got, (200, json!({ "open": true, "expires_at": text })), "{user}");
+    }
+}
+
+/// m8: the storage upload token's reply carries `expires_at` as integer unix seconds: the
+/// floor of the instant, read from any offset.
+#[tokio::test]
+async fn upload_token_expiry_is_unix_seconds() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let key_id = uuid::Uuid::new_v4();
+    neon.data_keys.lock().unwrap().push((
+        [9; 32],
+        DataKeyLookup {
+            key_id,
+            branch_id: BranchId::new(),
+            project_id: ProjectId::new(),
+            kind: DataKeyKind::Secret,
+            role: "authenticated".into(),
+            databases: None,
+            role_oid: Some(16384),
+        },
+    ));
+    for (stored, secs) in [
+        ("2030-01-01T00:00:00Z", 1_893_456_000_i64),
+        ("2030-01-01T00:00:00.999999999Z", 1_893_456_000),
+        ("2030-01-01T02:00:00+02:00", 1_893_456_000),
+        ("1969-12-31T23:59:59.5Z", -1),
+    ] {
+        let body = json!({ "token_id": uuid::Uuid::new_v4(), "key_id": key_id, "claims": { "sub": "u1" }, "expires_at": stored });
+        let got = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), body).await;
+        assert_eq!(got, (200, json!({ "expires_at": secs })), "{stored}");
+    }
 }
 
 // R36: the invite page names the workspace by its display name, and by its slug without one.

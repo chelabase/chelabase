@@ -12,7 +12,7 @@ aws-credential-types = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-humantime = { workspace = true }
+chelabase-time = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 

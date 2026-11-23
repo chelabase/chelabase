@@ -90,9 +90,10 @@ api-gen:
 deny-install:
     cargo install cargo-deny --version 0.20.2 --locked
 
-# RustSec advisories, yanked crates and licenses against Cargo.lock (deny.toml); fix by upgrading, never by an unapproved ignore
+# RustSec advisories, yanked crates, licenses and banned crates (chrono, chrono-tz, humantime) against
+# Cargo.lock (deny.toml); fix by upgrading, never by an unapproved ignore
 deny:
-    cargo deny check advisories licenses
+    cargo deny check advisories licenses bans
 
 # Everything CI checks offline: the shell script tests, the Rust checks and the web checks.
 # CI runs the same recipes, each limited to what a pull request affects (scripts/ci-affected.sh).

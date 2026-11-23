@@ -42,7 +42,7 @@ sha2 = { workspace = true }
 # Storage webhooks (m18): their HMAC-SHA256 signatures.
 hmac = { workspace = true }
 hex = { workspace = true }
-chrono = { workspace = true }
+chelabase-time = { workspace = true }
 uuid = { workspace = true }
 # The storage sweep (object-storage m8): user blobs.
 chelabase-storage = { workspace = true }

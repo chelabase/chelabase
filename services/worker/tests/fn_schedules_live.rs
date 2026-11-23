@@ -15,7 +15,7 @@ use chelabase_metadata::{
     DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionKind, MetadataClient, MetadataConfig, NewDeployment,
 };
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{NaiveDate, Utc};
+use chelabase_time::{Date, DateExt, Timestamp, TimestampExt};
 use rand::RngExt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -50,7 +50,7 @@ impl Scratch {
             .connect(&url())
             .await
             .expect("metadata Postgres reachable (is the workbench stack up?)");
-        let secs = Utc::now().timestamp() as u32;
+        let secs = Timestamp::now().timestamp() as u32;
         let name = format!("cm_{secs:08x}{}", &Uuid::new_v4().simple().to_string()[..4]);
         sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&meta)
@@ -123,7 +123,7 @@ impl Scratch {
                 bundle_sha256: Some(&sha),
                 bundle_size: Some(10),
                 spec: &spec,
-                compatibility_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                compatibility_date: Date::ymd(2026, 10, 1).unwrap(),
                 created_by: "member-1",
                 note: None,
             })
@@ -176,7 +176,7 @@ async fn drain(client: MetadataClient) -> Vec<Uuid> {
         }
         for c in claimed {
             assert!(c.run.is_some(), "an enabled function's due schedule runs");
-            assert!(c.next_run_at.unwrap() > Utc::now() - chrono::Duration::seconds(5));
+            assert!(c.next_run_at.unwrap() > Timestamp::now() - chelabase_time::seconds(5));
             got.push(c.id);
         }
     }
@@ -274,14 +274,14 @@ async fn fn_schedules_claim_skips_dead_rows_and_runs_only_enabled_functions() {
         .collect();
     assert_eq!(got, vec![(off_row, "off", false), (on_row, "on", true)]);
     for c in &claimed {
-        let next: chrono::DateTime<Utc> =
+        let next: Timestamp =
             sqlx::query_scalar("SELECT next_run_at FROM function_schedules WHERE id = $1")
                 .bind(c.id)
                 .fetch_one(s.pool())
                 .await
                 .unwrap();
         assert!(
-            next > Utc::now(),
+            next > Timestamp::now(),
             "{}: next_run_at moved on",
             c.function_name
         );
@@ -308,7 +308,7 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
     let next_of = |ids: Vec<Uuid>| {
         let pool = s.pool().clone();
         async move {
-            sqlx::query_as::<_, (Uuid, chrono::DateTime<Utc>)>(
+            sqlx::query_as::<_, (Uuid, Timestamp)>(
                 "SELECT id, next_run_at FROM function_schedules WHERE id = ANY($1) ORDER BY id",
             )
             .bind(ids)
@@ -343,6 +343,70 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
     let later = s.client.claim_due_schedules(64, &[]).await.unwrap();
     assert_eq!(later.len(), share);
     assert!(later.iter().all(|c| c.run.is_some() && unclaimed.contains(&c.id)));
-    assert!(before.iter().all(|(_, t)| *t < Utc::now()), "they were due");
+    assert!(before.iter().all(|(_, t)| *t < Timestamp::now()), "they were due");
+    s.finish().await;
+}
+
+/// The startup report on real Postgres: two schedules stored with crons an older parser
+/// accepted (inserted directly), one healthy. After the report the two have their reason in
+/// `last_error` and nothing else changed; the first claim after it disables both by today's
+/// rule and keeps the reason. A third broken schedule that is already disabled is counted
+/// and logged but keeps `last_error` NULL. (`main` awaits the report before it spawns the claim loop, so the
+/// claim here follows it the same way.)
+#[tokio::test]
+#[ignore]
+async fn the_report_precedes_the_first_claim() {
+    let s = Scratch::new().await;
+    let (_db, branch, function) = s.function("reported", true).await;
+    let insert = |cron: &'static str, enabled: bool| {
+        let pool = s.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, enabled, next_run_at)
+                 VALUES (gen_random_uuid(), $1, $2, $3, 'UTC', $4, now() - interval '1 minute') RETURNING id",
+            )
+            .bind(branch.as_uuid())
+            .bind(function)
+            .bind(cron)
+            .bind(enabled)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (jan, ell, healthy) = (insert("0 0 * * jan", true).await, insert("0 0 * * L", true).await, insert("*/5 * * * *", true).await);
+    let off = insert("0 0 * * jan", false).await;
+    let state = |id: Uuid| {
+        let pool = s.pool().clone();
+        async move {
+            sqlx::query_as::<_, (String, String, bool, Option<chelabase_time::Timestamp>, Option<String>)>(
+                "SELECT cron, timezone, enabled, next_run_at, last_error FROM function_schedules WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = (state(jan).await, state(ell).await, state(healthy).await);
+    let off_before = state(off).await;
+
+    assert_eq!(worker::schedule_report::run(&s.client).await, Some(3), "the disabled one is counted too");
+
+    for (id, was) in [(jan, &before.0), (ell, &before.1)] {
+        let now = state(id).await;
+        assert!(now.4.as_deref().is_some_and(|e| e.starts_with("cron:")), "reason: {:?}", now.4);
+        assert_eq!((&now.0, &now.1, now.2, now.3), (&was.0, &was.1, was.2, was.3), "nothing else changed");
+    }
+    assert_eq!(state(healthy).await, before.2, "the healthy schedule is untouched");
+    assert_eq!(state(off).await, off_before, "a disabled broken schedule is logged only: last_error stays NULL");
+    assert!(off_before.4.is_none() && !off_before.2);
+
+    s.client.claim_due_schedules(64, &[]).await.unwrap();
+    for id in [jan, ell] {
+        let now = state(id).await;
+        assert!(!now.2 && now.3.is_none(), "disabled with no next time");
+        assert!(now.4.as_deref().is_some_and(|e| e.starts_with("cron:")), "the reason is kept: {:?}", now.4);
+    }
     s.finish().await;
 }

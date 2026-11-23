@@ -1364,6 +1364,7 @@ mod tests {
     use chelabase_metadata::BranchKind;
 
     use super::*;
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{
         FRESH_HEAD, FakeWorker, Journal, entries, pending_branch, position, ready_branch,
         ready_database, worker,
@@ -2354,7 +2355,7 @@ mod tests {
         let (id, _ep) = provision(&w, &journal).await;
         let main = w.metadata.main(id).id;
         let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(3600);
         {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&silent).unwrap();
@@ -2381,7 +2382,7 @@ mod tests {
         let silent = merge(MergeStatus::Online);
         let busy = merge(MergeStatus::Applying);
         let idle = merge(MergeStatus::Draft);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(300);
         for m in [silent, idle] {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&m).unwrap();
@@ -2404,7 +2405,7 @@ mod tests {
         let (id, _ep) = provision(&w, &journal).await;
         let main = w.metadata.main(id).id;
         let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(3600);
         let age = |w: &crate::fakes::FakeWorker, at| {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&silent).unwrap();
@@ -2417,11 +2418,11 @@ mod tests {
         assert!(resumed(&w).await.is_empty());
         assert_eq!(w.metadata.merge_row(silent).claimed_at, Some(long_ago), "the claim isn't touched");
         // A worker claimed it after the hand-back, then went silent again: handed back.
-        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(1000));
-        age(&w, chrono::Utc::now() - chrono::Duration::seconds(600));
+        w.metadata.state().handed_back.insert(silent, Timestamp::now() - chelabase_time::seconds(1000));
+        age(&w, Timestamp::now() - chelabase_time::seconds(600));
         assert_eq!(resumed(&w).await.len(), 1);
         // The window passed with no claim: handed back (the job was lost).
-        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(3600));
+        w.metadata.state().handed_back.insert(silent, Timestamp::now() - chelabase_time::seconds(3600));
         age(&w, long_ago);
         assert_eq!(resumed(&w).await.len(), 1);
     }
@@ -2438,7 +2439,7 @@ mod tests {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&m).unwrap();
             row.result = Some(serde_json::json!({ "after": { "choice": "reset", "requested": true } }));
-            row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+            row.updated_at = Timestamp::now() - chelabase_time::seconds(3600);
         }
         assert_eq!(
             resumed(&w).await,
@@ -2456,7 +2457,7 @@ mod tests {
         let mut state = w.metadata.state();
         let row = state.merges.get_mut(&m).unwrap();
         row.result = Some(serde_json::json!({ "after": after }));
-        row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        row.updated_at = Timestamp::now() - chelabase_time::seconds(3600);
         m
     }
 
@@ -2478,7 +2479,7 @@ mod tests {
     async fn a_lost_finish_is_handed_back_once_per_rehand_window() {
         let (w, journal) = worker();
         let m = drifted_with_after(&w, &journal, serde_json::json!({ "choice": "reset", "requested": true })).await;
-        let ago = |secs| chrono::Utc::now() - chrono::Duration::seconds(secs);
+        let ago = |secs: u64| Timestamp::now() - chelabase_time::seconds(secs);
         w.metadata.state().handed_back.insert(m, ago(15 * 60));
         assert!(resumed(&w).await.is_empty(), "handed back 15 minutes ago");
         w.metadata.state().handed_back.insert(m, ago(31 * 60));

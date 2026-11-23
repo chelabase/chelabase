@@ -1,3 +1,4 @@
+use chelabase_time::{Timestamp, TimestampExt};
 use axum::Router;
 use chelabase_auth::internal::{
     generate_keypair_pem, AuthMethod, Identity, InternalSigner, InternalVerifier, IDENTITY_HEADER,
@@ -124,7 +125,7 @@ struct FakeMetadata {
     /// Reads of a branch's roles (`list_roles`).
     role_reads: Arc<AtomicUsize>,
     /// When each tenant's admin was claimed by a first sign-in (`admin_claimed`).
-    admin_claims: Arc<Mutex<HashMap<TenantId, chrono::DateTime<chrono::Utc>>>>,
+    admin_claims: Arc<Mutex<HashMap<TenantId, Timestamp>>>,
     /// Selfhost-install m3: each tenant's fresh-install claim (its bound user). With one, only
     /// that user claims the admin (`admit_member`'s rule); without one the fake keeps the first
     /// comer's rule the other tests build on.
@@ -136,7 +137,7 @@ struct FakeMetadata {
     /// R31: their last acted role, by (member, branch).
     acted_roles: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), String>>>,
     /// When each member row was made (stamped by every fake write that makes one).
-    member_created: Arc<Mutex<HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>>>>,
+    member_created: Arc<Mutex<HashMap<uuid::Uuid, Timestamp>>>,
     /// T7: invites, the access log and each tenant's open sign-up switch.
     invites: Arc<Mutex<Vec<FakeInvite>>>,
     events: Arc<Mutex<Vec<chelabase_metadata::members::AccessEvent>>>,
@@ -196,7 +197,7 @@ impl orchestrator::functions_triggers::TriggersPort for FakeMetadata {
             source: t.source,
             enabled: true,
             state: if table { chelabase_metadata::TriggerState::PendingInstall } else { chelabase_metadata::TriggerState::Installed },
-            enabled_since: chrono::Utc::now(),
+            enabled_since: Timestamp::now(),
             pg_database: t.pg_database.to_string(),
             schema_name: t.schema_name.map(str::to_string),
             table_name: t.table_name.map(str::to_string),
@@ -279,7 +280,7 @@ struct FakeInvite {
     id: uuid::Uuid,
     member_id: uuid::Uuid,
     identity_user_id: String,
-    expires_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Timestamp,
     /// SHA-256 of the link's token.
     token_hash: [u8; 32],
     revoked: bool,
@@ -320,7 +321,7 @@ impl From<DatabaseRecord> for Db {
 }
 
 fn main_for(record: &DatabaseRecord) -> BranchRecord {
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     BranchRecord {
         id: BranchId::from(record.database_id),
         database_id: record.database_id,
@@ -383,7 +384,7 @@ impl FakeMetadata {
             display_name: sub.into(),
             tenant_admin,
             status,
-            accepted_at: (status == MemberStatus::Active).then(chrono::Utc::now),
+            accepted_at: (status == MemberStatus::Active).then(Timestamp::now),
             offboarded: false, suspended_at: None, suspended_by: None,
         });
         id
@@ -438,14 +439,14 @@ impl FakeMetadata {
             id: uuid::Uuid::new_v4(),
             member_id: member,
             identity_user_id,
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(72),
+            expires_at: Timestamp::now() + chelabase_time::hours(72),
             token_hash: [3; 32],
             revoked: false,
             accepted: false,
         });
     }
 
-    fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
+    fn set_admin_claim(&self, tenant: TenantId, at: Option<Timestamp>) {
         let mut claims = self.admin_claims.lock().unwrap();
         match at {
             Some(at) => claims.insert(tenant, at),
@@ -456,7 +457,7 @@ impl FakeMetadata {
     /// Every invite of `member` has expired.
     fn expire_invites(&self, member: uuid::Uuid) {
         for i in self.invites.lock().unwrap().iter_mut().filter(|i| i.member_id == member) {
-            i.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+            i.expires_at = Timestamp::now() - chelabase_time::minutes(1);
         }
     }
 
@@ -478,7 +479,7 @@ impl FakeMetadata {
         kind: BranchKind,
         status: BranchStatus,
     ) -> BranchId {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let id = BranchId::new();
         let has_endpoint = kind == BranchKind::Normal && status == BranchStatus::Ready;
         self.branches.lock().unwrap().insert(
@@ -558,7 +559,7 @@ impl FakeMetadata {
             level: if privileged { RoleLevel::OwnerLevel } else { RoleLevel::Plain },
             login: true,
             password: PasswordState::Generated,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             pending,
             attributes: RoleAttributes::default(),
         });
@@ -618,13 +619,13 @@ impl FakeMetadata {
                     level: RoleLevel::Plain,
                     login: true,
                     password: PasswordState::SetInSql,
-                    created_at: chrono::Utc::now(),
+                    created_at: Timestamp::now(),
                     pending: false,
                     attributes: RoleAttributes::default(),
                 },
             );
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let login = FakeLogin {
             login: PersonalLogin {
                 member_id: member,
@@ -632,7 +633,7 @@ impl FakeMetadata {
                 project_id: record.project_id.as_uuid(),
                 database_name: record.name.clone(),
                 role_name: name.into(),
-                valid_until: now + chrono::Duration::days(90),
+                valid_until: now + chelabase_time::days(90),
                 created_at: now,
                 revoked_at: None,
                 revoked_reason: None,
@@ -852,7 +853,7 @@ impl MetadataPort for FakeMetadata {
         if count as i64 >= i64::from(max) {
             return Ok(CreateBranchOutcome::CapReached { max });
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let parent_guard_logins = branches[&b.parent_branch_id].guard_logins;
         // The parent's exemptions too, as the real create does in its transaction.
         let mut exemptions = self.guard_exemptions.lock().unwrap();
@@ -1204,7 +1205,7 @@ impl MetadataPort for FakeMetadata {
             k.id == key_id && k.branch_id == branch && k.revoked_at.is_none() && k.kind == DataKeyKind::Secret
         }) {
             Some((k, _)) => {
-                k.revoked_at = Some(chrono::Utc::now());
+                k.revoked_at = Some(Timestamp::now());
                 Ok(true)
             }
             None => Ok(false),
@@ -1224,7 +1225,7 @@ impl MetadataPort for FakeMetadata {
         else {
             return Ok(false);
         };
-        keys[i].0.revoked_at = Some(chrono::Utc::now());
+        keys[i].0.revoked_at = Some(Timestamp::now());
         // As the real one does: the replacement reaches the same databases.
         let mut new = new.clone();
         new.databases = keys[i].0.databases.clone();
@@ -1403,7 +1404,7 @@ impl MetadataPort for FakeMetadata {
             slug = format!("{base}-{n}");
             n += 1;
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let record = ProjectRecord {
             id: ProjectId::new(),
             tenant_id: tenant,
@@ -1435,7 +1436,7 @@ impl MetadataPort for FakeMetadata {
             return Ok(RenameProject::Deleting);
         }
         p.name = name.to_string();
-        p.updated_at = chrono::Utc::now();
+        p.updated_at = Timestamp::now();
         Ok(RenameProject::Renamed(p.clone()))
     }
 
@@ -1540,7 +1541,7 @@ impl MetadataPort for FakeMetadata {
             }
             return Ok(BeginEnable::Exists(existing.clone()));
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         auths.insert(
             new.project_id,
             ProjectAuth {
@@ -1599,7 +1600,7 @@ impl MetadataPort for FakeMetadata {
             .unwrap()
             .iter()
             // Like the real query: live only (not revoked, not expired).
-            .filter(|s| s.project_id == project && s.user_id == user && s.revoked_at.is_none() && s.expires_at > chrono::Utc::now())
+            .filter(|s| s.project_id == project && s.user_id == user && s.revoked_at.is_none() && s.expires_at > Timestamp::now())
             .cloned()
             .collect())
     }
@@ -1609,7 +1610,7 @@ impl MetadataPort for FakeMetadata {
         project: ProjectId,
         user: uuid::Uuid,
         keep: Option<uuid::Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         if *self.fail_revoke.lock().unwrap() {
             return Err(MetadataError::Conflict);
@@ -1622,7 +1623,7 @@ impl MetadataPort for FakeMetadata {
                 && Some(s.id) != keep
                 && created_before.is_none_or(|t| s.created_at < t)
             {
-                s.revoked_at = Some(chrono::Utc::now());
+                s.revoked_at = Some(Timestamp::now());
                 revoked.push(s.clone());
             }
         }
@@ -1682,7 +1683,7 @@ impl MetadataPort for FakeMetadata {
         if mine().any(|(_, _, q)| q.name.to_lowercase() == name.to_lowercase()) {
             return Ok(SavedQueryWrite::NameTaken);
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let q = SavedQuery {
             id,
             name: name.into(),
@@ -1739,7 +1740,7 @@ impl MetadataPort for FakeMetadata {
             q.role = v.clone();
         }
         q.version += 1;
-        q.updated_at = chrono::Utc::now();
+        q.updated_at = Timestamp::now();
         Ok(SavedQueryWrite::Saved(q.clone()))
     }
 
@@ -1750,7 +1751,7 @@ impl MetadataPort for FakeMetadata {
         {
             return Ok(None);
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let w = StorageWebhook {
             id: new.id,
             database_id: new.database_id,
@@ -1806,7 +1807,7 @@ impl MetadataPort for FakeMetadata {
         match patch.enabled {
             Some(true) if !w.enabled => {
                 w.enabled = true;
-                w.enabled_since = chrono::Utc::now();
+                w.enabled_since = Timestamp::now();
                 w.disabled_reason = None;
                 w.failing_since = None;
                 w.consecutive_failures = 0;
@@ -1885,7 +1886,7 @@ impl MetadataPort for FakeMetadata {
         }) {
             return Ok(MergeCreate::OpenExists(r.id));
         }
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let record = MergeRecord {
             id: m.id,
             database_id: m.database_id.as_uuid(),
@@ -1954,7 +1955,7 @@ impl MetadataPort for FakeMetadata {
         }
         if patch.start_compute {
             r.status = MergeStatus::Computing;
-            r.claimed_at = Some(chrono::Utc::now());
+            r.claimed_at = Some(Timestamp::now());
         }
         if let Some(v) = &patch.resolutions { r.resolutions = v.clone(); }
         if let Some(v) = &patch.user_steps { r.user_steps = v.clone(); }
@@ -2007,7 +2008,7 @@ impl MetadataPort for FakeMetadata {
         }
         let r = &mut rows[r];
         r.status = to;
-        r.claimed_at = to.is_working().then(chrono::Utc::now);
+        r.claimed_at = to.is_working().then(Timestamp::now);
         if patch.analysis.is_some() || patch.plan.is_some() { r.version += 1; }
         if let Some(v) = patch.analysis { r.analysis = Some(v); }
         if let Some(v) = patch.plan { r.plan = Some(v); }
@@ -2069,7 +2070,7 @@ impl MetadataPort for FakeMetadata {
             if !matches!(m.status, MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended) {
                 if m.status == MemberStatus::Invited {
                     // I1: only while an open invite exists; otherwise the member stays invited.
-                    let now = chrono::Utc::now();
+                    let now = Timestamp::now();
                     let mut invites = self.invites.lock().unwrap();
                     let open = invites
                         .iter()
@@ -2108,14 +2109,14 @@ impl MetadataPort for FakeMetadata {
             display_name: name.into(),
             tenant_admin: claims,
             status,
-            accepted_at: Some(chrono::Utc::now()),
+            accepted_at: Some(Timestamp::now()),
             offboarded: false, suspended_at: None, suspended_by: None,
         };
         self.stamp_created(record.id);
         members.push(record.clone());
         drop(members);
         if record.tenant_admin {
-            self.set_admin_claim(tenant, Some(chrono::Utc::now()));
+            self.set_admin_claim(tenant, Some(Timestamp::now()));
         }
         if status == MemberStatus::Pending {
             self.log(Change::new(tenant, Some(record.id), "member_joined", Some(record.id)).after(json!({ "status": "pending", "tenant_admin": false })));
@@ -2267,7 +2268,7 @@ fn insert_key(keys: &mut Vec<KeyRow>, key: &NewDataKey) -> Result<(), MetadataEr
             name: key.name.clone(),
             prefix: key.prefix.clone(),
             sealed: key.sealed.clone(),
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             last_used_at: None,
             revoked_at: None,
             databases: key.databases.clone(),
@@ -3338,7 +3339,7 @@ async fn post_create(app: &TestApp, identity_header: Option<&str>, body: serde_j
 
 /// A merge row as the fake stores it, for tests that start from a given state.
 fn merge_row(db: DatabaseId, source: BranchId, target: BranchId, status: MergeStatus) -> MergeRecord {
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     MergeRecord {
         id: uuid::Uuid::new_v4(),
         database_id: db.as_uuid(),
@@ -3568,7 +3569,7 @@ impl FakeMetadata {
             database_id: database,
             before,
             after,
-            at: chrono::Utc::now(),
+            at: Timestamp::now(),
             actor_email: None,
             target_email: None,
             project_name: None,
@@ -3595,17 +3596,17 @@ impl FakeMetadata {
     }
 
     /// Stamps the row's creation time once, strictly after every earlier stamp.
-    fn stamp_created(&self, id: uuid::Uuid) -> chrono::DateTime<chrono::Utc> {
+    fn stamp_created(&self, id: uuid::Uuid) -> Timestamp {
         let mut created = self.member_created.lock().unwrap();
         let latest = created.values().max().copied();
-        let mut now = chrono::Utc::now();
+        let mut now = Timestamp::now();
         if latest.is_some_and(|l| l >= now) {
-            now = latest.unwrap() + chrono::Duration::microseconds(1);
+            now = latest.unwrap() + std::time::Duration::from_micros(1);
         }
         *created.entry(id).or_insert(now)
     }
 
-    fn created_at(&self, id: uuid::Uuid) -> chrono::DateTime<chrono::Utc> {
+    fn created_at(&self, id: uuid::Uuid) -> Timestamp {
         self.stamp_created(id)
     }
 
@@ -3716,7 +3717,7 @@ impl FakeMetadata {
         let mut login = l.login.clone();
         login.status = if login.revoked_at.is_some() {
             LoginStatus::Revoked
-        } else if login.valid_until <= chrono::Utc::now() {
+        } else if login.valid_until <= Timestamp::now() {
             LoginStatus::Expired
         } else {
             LoginStatus::Active
@@ -3739,7 +3740,7 @@ impl FakeMetadata {
         use chelabase_metadata::personal_logins::LoginStatus;
         let mut n = 0;
         for l in self.personal_logins.lock().unwrap().iter_mut().filter(|l| l.login.member_id == member && l.login.revoked_at.is_none()) {
-            l.login.revoked_at = Some(chrono::Utc::now());
+            l.login.revoked_at = Some(Timestamp::now());
             l.login.revoked_reason = Some(reason);
             l.login.status = LoginStatus::Revoked;
             l.verifier = None;
@@ -3852,7 +3853,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         &self,
         invite: uuid::Uuid,
     ) -> Result<Option<chelabase_metadata::members::InviteState>, MetadataError> {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         Ok(self
             .invites
             .lock()
@@ -3926,7 +3927,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(self.open_signups.lock().unwrap().get(&tenant).copied().unwrap_or(false))
     }
 
-    async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
+    async fn admin_claimed_since(&self, tenant: TenantId, since: Timestamp) -> Result<bool, MetadataError> {
         // As the real one: only the bound user's first request (`admin_claimed`) opens the
         // window; binding the claim doesn't (m3 re-audit, B3).
         Ok(self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
@@ -3999,7 +4000,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         database: uuid::Uuid,
         role_name: &str,
         scram_verifier: &str,
-        valid_until: chrono::DateTime<chrono::Utc>,
+        valid_until: Timestamp,
     ) -> Result<chelabase_metadata::personal_logins::PersonalLogin, chelabase_metadata::personal_logins::LoginWriteError> {
         use chelabase_metadata::personal_logins::{LoginStatus, LoginWriteError, PersonalLogin};
         let Some(level) = self.login_level(member, database).filter(|l| *l >= PlatformRole::Developer) else {
@@ -4050,7 +4051,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             database_name: record.name.clone(),
             role_name: role_name.into(),
             valid_until,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             revoked_at: None,
             revoked_reason: None,
             status: LoginStatus::Active,
@@ -4075,7 +4076,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         member: uuid::Uuid,
         database: uuid::Uuid,
         scram_verifier: &str,
-        valid_until: chrono::DateTime<chrono::Utc>,
+        valid_until: Timestamp,
     ) -> Result<
         (chelabase_metadata::personal_logins::PersonalLogin, Vec<chelabase_metadata::personal_logins::LoginEndpoint>),
         chelabase_metadata::personal_logins::LoginWriteError,
@@ -4207,7 +4208,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             let mut members = self.members.lock().unwrap();
             let x = members.iter_mut().find(|x| x.id == member).unwrap();
             x.status = MemberStatus::Suspended;
-            x.suspended_at = Some(chrono::Utc::now());
+            x.suspended_at = Some(Timestamp::now());
             x.suspended_by = Some(actor);
         }
         let rotated = self.mark_member_roles_for_rotation(member);
@@ -4290,7 +4291,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             database_id: e.database,
             before: e.before.cloned(),
             after: e.after.cloned(),
-            at: chrono::Utc::now(),
+            at: Timestamp::now(),
             actor_email: None,
             target_email: None,
             project_name: None,
@@ -4593,7 +4594,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok((listing, invite))
     }
 
-    async fn resend_invite(&self, actor: uuid::Uuid, invite: uuid::Uuid, expires_at: chrono::DateTime<chrono::Utc>, token_hash: [u8; 32]) -> FakeWrite<()> {
+    async fn resend_invite(&self, actor: uuid::Uuid, invite: uuid::Uuid, expires_at: Timestamp, token_hash: [u8; 32]) -> FakeWrite<()> {
         use chelabase_metadata::members::AccessWriteError;
         let member = {
             let mut invites = self.invites.lock().unwrap();
@@ -4652,7 +4653,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             let mut members = self.members.lock().unwrap();
             let row = members.iter_mut().find(|x| x.id == member).unwrap();
             row.status = MemberStatus::Active;
-            row.accepted_at = Some(chrono::Utc::now());
+            row.accepted_at = Some(Timestamp::now());
             row.clone()
         };
         self.log(Change::new(m.tenant_id, Some(actor), "member_approved", Some(member)).scope(single_project(grants), None).before(json!({ "status": "pending" })).after(json!({ "status": "active", "grants": grants_json(grants) })));
@@ -4731,7 +4732,7 @@ fn team_event_json(team: uuid::Uuid, name: &str, grants: &[(uuid::Uuid, GrantRow
 impl FakeMetadata {
     /// A team of `tenant` (no event, no check); returns its id.
     fn seed_team(&self, tenant: TenantId, name: &str) -> uuid::Uuid {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let id = uuid::Uuid::new_v4();
         self.teams.lock().unwrap().push(FakeTeam {
             record: chelabase_metadata::teams::TeamRecord {
@@ -4953,7 +4954,7 @@ impl FakeMetadata {
             let t = teams.iter_mut().find(|t| t.record.id == team).unwrap();
             t.record.name = new_name;
             t.record.description = new_description;
-            t.record.updated_at = chrono::Utc::now();
+            t.record.updated_at = Timestamp::now();
             t.record.clone()
         };
         let mut before_json = team_event_json(team, &before.name, &[], &[]);
@@ -5079,7 +5080,7 @@ impl FakeMetadata {
             return;
         }
         for l in self.personal_logins.lock().unwrap().iter_mut().filter(|l| l.login.member_id == member && lost.contains(&l.login.database_id)) {
-            l.login.revoked_at = Some(chrono::Utc::now());
+            l.login.revoked_at = Some(Timestamp::now());
             l.login.revoked_reason = Some(RevokeReason::AccessLost);
             l.login.status = LoginStatus::Revoked;
             l.verifier = None;
@@ -5176,7 +5177,7 @@ impl FakeMetadata {
             }
         };
         if let Some(t) = self.teams.lock().unwrap().iter_mut().find(|t| t.record.id == id) {
-            t.record.updated_at = chrono::Utc::now();
+            t.record.updated_at = Timestamp::now();
         }
         self.log(event);
         for (member, _) in &affected {
@@ -5420,7 +5421,7 @@ impl FakeMetadata {
                 && k.managed_by_function.as_ref().is_some_and(|(id, _)| *id == function)
                 && branch.is_none_or(|b| k.branch_id == b)
             {
-                k.revoked_at = Some(chrono::Utc::now());
+                k.revoked_at = Some(Timestamp::now());
                 k.sealed = None;
             }
         }
@@ -5438,7 +5439,7 @@ impl FakeMetadata {
         match fs.states.iter_mut().find(|(b, st)| *b == branch && st.function_id == function) {
             Some((_, st)) => {
                 change(st);
-                st.updated_at = chrono::Utc::now();
+                st.updated_at = Timestamp::now();
                 Ok(true)
             }
             None => Ok(false),
@@ -5478,7 +5479,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             database_id: database,
             name: name.to_string(),
             kind,
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
         };
         fs.functions.push(record.clone());
         Ok(record)
@@ -5562,7 +5563,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             spec: d.spec.clone(),
             compatibility_date: d.compatibility_date,
             created_by: d.created_by.to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
             note: d.note.map(str::to_string),
         };
         fs.deployments.push(record.clone());
@@ -5594,7 +5595,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
             Some((_, st)) => {
                 st.deployment_id = deployment;
                 st.last_error = None;
-                st.updated_at = chrono::Utc::now();
+                st.updated_at = Timestamp::now();
                 *fs.generations.entry((branch, function)).or_default() += 1;
             }
             None => fs.states.push((
@@ -5611,7 +5612,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
                     run_as_role_oid: None,
                     run_as_unmintable: None,
                     last_error: None,
-                    updated_at: chrono::Utc::now(),
+                    updated_at: Timestamp::now(),
                     health: None,
                 },
             )),
@@ -5649,7 +5650,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
         }
         st.deployment_id = deployment;
         st.last_error = None;
-        st.updated_at = chrono::Utc::now();
+        st.updated_at = Timestamp::now();
         fs.generations.insert((branch, function), current + 1);
         Ok(true)
     }
@@ -5688,7 +5689,7 @@ impl orchestrator::functions::FunctionsPort for FakeMetadata {
                     name: name.clone(),
                     prefix: r.prefix.clone(),
                     sealed: Some("sealed".into()),
-                    created_at: chrono::Utc::now(),
+                    created_at: Timestamp::now(),
                     last_used_at: None,
                     revoked_at: None,
                     databases: None,
@@ -5790,6 +5791,7 @@ impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
             timezone: s.timezone.to_string(),
             next_run_at: s.next_run_at,
             enabled: true,
+            last_error: None,
         });
         Ok(id)
     }
@@ -5817,9 +5819,10 @@ impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
             .map_err(|e| MetadataError::InvalidFunction(e.to_string()))?;
         let new_enabled = enabled.unwrap_or(s.enabled);
         if new_cron != s.cron || new_tz != s.timezone || (new_enabled && !s.enabled) {
-            s.next_run_at = parsed.next_after(chrono::Utc::now());
+            s.next_run_at = parsed.next_after(Timestamp::now());
         }
         (s.cron, s.timezone, s.enabled) = (new_cron, new_tz, new_enabled);
+        s.last_error = None;
         Ok(Some(s.clone()))
     }
 

@@ -28,7 +28,7 @@ use chelabase_neon::{ComputeBackend, ComputeLocator};
 use chelabase_types::access::PlatformRole;
 use chelabase_types::role_name::is_marked_sql;
 use chelabase_types::{BranchId, DatabaseId, TenantId};
-use chrono::Utc;
+use chelabase_time::{Timestamp, TimestampExt};
 use uuid::Uuid;
 use worker::config::RealWorker;
 
@@ -193,7 +193,7 @@ impl Fx {
                 self.id.as_uuid(),
                 name,
                 &verifier,
-                Utc::now() + chrono::Duration::days(90),
+                Timestamp::now() + chelabase_time::days(90),
             )
             .await
             .unwrap_or_else(|e| panic!("create the login {name}: {e:?}"));
@@ -409,6 +409,29 @@ async fn a_personal_login_reaches_only_its_safe_set_through_set_role() {
     .await;
 }
 
+// A personal login whose VALID UNTIL was set past what the time type holds (`9999-12-31`,
+// `294276-01-01`) is read as having none: the member catalog SELECT must not raise `bigint out
+// of range`, and the reconcile sets the record's expiry back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the members hub images (end-of-step pass)"]
+async fn a_far_future_valid_until_on_a_login_is_set_back() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        fx.create_login(m, "pl_far", "pl-far-pass").await;
+        fx.reconcile(fx.main).await;
+        for until in ["9999-12-31 00:00:00+00", "294276-01-01 00:00:00+00"] {
+            fx.sql(&fx.ep, &format!("ALTER ROLE pl_far VALID UNTIL '{until}';")).await;
+            fx.reconcile(fx.main).await;
+            let back = fx
+                .sql(&fx.ep, "SELECT rolvaliduntil < now() + interval '91 days' FROM pg_roles WHERE rolname = 'pl_far';")
+                .await;
+            assert_eq!(back.trim(), "t", "{until} set back to the record's");
+        }
+    })
+    .await;
+}
+
 /// D2, S1: a new branch carries no personal row from its parent; its login comes from its own
 /// reconcile, with the record's verifier, marked.
 #[tokio::test(flavor = "multi_thread")]
@@ -456,7 +479,7 @@ async fn a_restore_before_deletion_brings_no_login_back() {
         fx.reconcile(fx.main).await;
         assert!(fx.role_exists(&fx.ep, "pl_carol").await);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.metadata
             .delete_personal_login(m, m, fx.id.as_uuid())
@@ -664,7 +687,7 @@ async fn a_reset_password_works_and_the_old_one_is_refused_on_every_branch() {
                 m,
                 fx.id.as_uuid(),
                 &verifier,
-                Utc::now() + chrono::Duration::days(90),
+                Timestamp::now() + chelabase_time::days(90),
             )
             .await
             .expect("reset");

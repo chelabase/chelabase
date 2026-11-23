@@ -3,6 +3,7 @@
 //! one that changed nothing; a failed publish never fails the write; deletes read their ids
 //! before the write. The table of what publishes what is in `crate::rt_events`'s docs.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::sync::Arc;
 
 use chelabase_metadata::{
@@ -266,7 +267,7 @@ async fn fail_stuck_restore_publishes_failed() {
         let b = state.branches.get_mut(&p.dev).unwrap();
         b.status = BranchStatus::Resetting;
         b.pending_timeline_id = Some("pending".into());
-        b.pending_timeline_at = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        b.pending_timeline_at = Some(Timestamp::now() - chelabase_time::hours(2));
     }
     assert!(p.m.fail_stuck_restore(p.dev, 60, "stuck").await.unwrap());
     assert_eq!(

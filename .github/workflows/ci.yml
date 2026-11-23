@@ -190,7 +190,7 @@ jobs:
             just check-rust $RUST
           fi
 
-  # RustSec advisories against Cargo.lock, apart from check-rust so a newly published advisory
+  # RustSec advisories and banned crates against Cargo.lock, apart from check-rust so a newly published advisory
   # (often one with no fixed version) never stops the Rust checks from running. Reported as its
   # own check, not part of the `ci` job's result.
   deny:
@@ -223,6 +223,10 @@ jobs:
           cargo -V
 
       - run: just deny
+
+      # The bans fire: a scratch workspace adding chrono, humantime (through a dependency) or
+      # chrono-tz fails `just deny` with the ban.
+      - run: scripts/tests/deny-bans.sh
 
   web:
     name: check-web

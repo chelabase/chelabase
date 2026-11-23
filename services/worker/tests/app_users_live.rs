@@ -19,6 +19,7 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -192,7 +193,7 @@ impl Fx {
                     email,
                     true,
                     false,
-                    chrono::Utc::now(),
+                    Timestamp::now(),
                     data.as_ref(),
                 ))
                 .await,
@@ -315,7 +316,7 @@ impl Fx {
     /// An access token for `user` in this project, with a live app session behind it.
     async fn user_token(&self, user: Uuid, email: &str) -> String {
         let sid = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.metadata
             .insert_app_session(&NewAppSession {
                 id: sid,
@@ -323,7 +324,7 @@ impl Fx {
                 user_id: user,
                 identity_session_id: "app-users-live",
                 refresh_hash: rand_hash(),
-                expires_at: now + chrono::Duration::hours(1),
+                expires_at: now + chelabase_time::hours(1),
             })
             .await
             .expect("insert the app session");
@@ -636,7 +637,7 @@ async fn banned_at_follows_the_ban() {
         fx.bootstrap().await.expect("bootstrap");
         let id = Uuid::new_v4();
         let email = "ban@example.com";
-        let call = |banned: bool| upsert_call_sql(id, email, true, banned, chrono::Utc::now(), None);
+        let call = |banned: bool| upsert_call_sql(id, email, true, banned, Timestamp::now(), None);
         let banned_at = format!("SELECT coalesce(banned_at::text, 'null') FROM public.users WHERE id = '{id}'");
 
         fx.sql(&call(false)).await;
@@ -661,7 +662,7 @@ async fn banned_at_follows_the_ban() {
 
         // A row first written for a banned user is marked from the start.
         let late = Uuid::new_v4();
-        fx.sql(&upsert_call_sql(late, "late@example.com", true, true, chrono::Utc::now(), None))
+        fx.sql(&upsert_call_sql(late, "late@example.com", true, true, Timestamp::now(), None))
             .await;
         assert_eq!(
             fx.value(&format!("SELECT banned_at IS NOT NULL FROM public.users WHERE id = '{late}'"))
@@ -721,7 +722,7 @@ async fn the_bootstrap_upgrades_an_existing_users_table() {
         );
         assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|6");
         // The row survived and the new upsert marks it.
-        fx.sql(&upsert_call_sql(id, "old@example.com", true, true, chrono::Utc::now(), None))
+        fx.sql(&upsert_call_sql(id, "old@example.com", true, true, Timestamp::now(), None))
             .await;
         assert_eq!(
             fx.value(&format!("SELECT banned_at IS NOT NULL FROM public.users WHERE id = '{id}'"))
@@ -989,7 +990,7 @@ async fn mark_deleted_email_can_sign_up_again() {
             .admin_sql(
                 &fx.ep,
                 &fx.database,
-                &upsert_call_sql(dup, "SAME@example.com", true, false, chrono::Utc::now(), None),
+                &upsert_call_sql(dup, "SAME@example.com", true, false, Timestamp::now(), None),
             )
             .await
             .expect_err("a second live row with the same email");
@@ -1545,7 +1546,7 @@ async fn app_users_live() {
                 user_id: user,
                 identity_session_id: "app-users-live",
                 refresh_hash: rand_hash(),
-                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                expires_at: Timestamp::now() + chelabase_time::hours(1),
             })
             .await
             .expect("insert the app session");
@@ -1574,9 +1575,9 @@ async fn app_users_live() {
             .unwrap();
         let ghost = Uuid::new_v4();
         for ep in [&fx.ep, &dev_ep] {
-            fx.sql_in(ep, &fx.database, &upsert_call_sql(user, "stale@example.com", false, false, chrono::Utc::now(), None))
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(user, "stale@example.com", false, false, Timestamp::now(), None))
                 .await;
-            fx.sql_in(ep, &fx.database, &upsert_call_sql(ghost, "ghost@example.com", true, false, chrono::Utc::now(), None))
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(ghost, "ghost@example.com", true, false, Timestamp::now(), None))
                 .await;
         }
         fx.worker.reconcile_app_users(fx.project).await.expect("reconcile");

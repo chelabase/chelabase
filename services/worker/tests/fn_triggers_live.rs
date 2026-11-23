@@ -17,6 +17,7 @@ mod common;
 
 mod fn_triggers {
     use std::time::{Duration, Instant};
+    use chelabase_time::{Date, DateExt, Timestamp, TimestampExt};
 
     use chelabase_metadata::{
         BranchRecord, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus,
@@ -219,7 +220,7 @@ mod fn_triggers {
                     bundle_sha256: Some(&sha),
                     bundle_size: Some(1),
                     spec: &spec,
-                    compatibility_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                    compatibility_date: Date::ymd(2026, 11, 1).unwrap(),
                     created_by: "member-1",
                     note: None,
                 })
@@ -575,7 +576,7 @@ mod fn_triggers {
             // Restore point T: dev has only `orders`. Then a trigger made after T, one deleted
             // after T, and events.
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let noted = chrono::Utc::now();
+            let noted = Timestamp::now();
             tokio::time::sleep(Duration::from_secs(2)).await;
             let later = fx.trigger(dev, f, "later", &["insert"]).await;
             sqlx_delete_trigger(&fx.metadata, dev_orders).await;

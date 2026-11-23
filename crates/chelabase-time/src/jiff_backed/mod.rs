@@ -1,0 +1,477 @@
+//! [`Timestamp`] and [`Date`], newtypes over jiff that replaced the chrono aliases. They keep
+//! every contract the crate docs list, with the exceptions in the crate docs' "Differences from
+//! chrono" section.
+
+mod parse;
+#[cfg(feature = "sqlx")]
+mod pg;
+
+use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use jiff::tz::Offset;
+
+use crate::{DateExt, ParseError, SignedDuration, TimestampExt};
+
+const NANOS_PER_SEC: i128 = 1_000_000_000;
+
+/// An instant in UTC, nanosecond precision, backed by [`jiff::Timestamp`].
+///
+/// Its range is jiff's: [`Timestamp::MIN`] (`-9999-01-02T01:59:59Z`) to [`Timestamp::MAX`]
+/// (`9999-12-30T22:00:00.999999999Z`). Every constructor and parser accepts exactly that range
+/// and returns `None` or an error outside it, never a clamped value. The part that round trips
+/// through Postgres is narrower: [`Timestamp::round_trips_through_pg`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(jiff::Timestamp);
+
+/// A calendar date without a time zone, backed by [`jiff::civil::Date`] (years -9999..=9999).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Date(jiff::civil::Date);
+
+impl Timestamp {
+    /// `1970-01-01T00:00:00Z`.
+    pub const UNIX_EPOCH: Timestamp = Timestamp(jiff::Timestamp::UNIX_EPOCH);
+
+    /// The earliest instant the type holds, `-9999-01-02T01:59:59Z`.
+    pub const MIN: Timestamp = Timestamp(jiff::Timestamp::MIN);
+
+    /// The latest instant the type holds, `9999-12-30T22:00:00.999999999Z`. A later one (a
+    /// `timestamptz` of `9999-12-31` that Postgres stores) is a parse or decode error.
+    pub const MAX: Timestamp = Timestamp(jiff::Timestamp::MAX);
+
+    /// The earliest instant that round trips through a Postgres `timestamptz`,
+    /// `0001-01-01T00:00:00Z`. Postgres stores earlier ones (to `4714-11-24 00:00:00+00 BC`),
+    /// but only in its own `… BC` text: it refuses the year `0000` and a signed year in an
+    /// RFC 3339 literal, and RFC 3339 itself has no year before `0000`. See the crate docs,
+    /// "Postgres round trip".
+    pub const PG_ROUND_TRIP_MIN: Timestamp =
+        Timestamp(jiff::Timestamp::constant(-62_135_596_800, 0));
+
+    /// The latest instant that round trips through a Postgres `timestamptz`,
+    /// `9999-12-30T22:00:00.999999Z`: [`Timestamp::MAX`] truncated to the microsecond Postgres
+    /// keeps. Every instant up to [`Timestamp::MAX`] is stored as one at or before it.
+    pub const PG_ROUND_TRIP_MAX: Timestamp =
+        Timestamp(jiff::Timestamp::constant(253_402_207_200, 999_999_000));
+
+    /// Whether the instant round trips through a Postgres `timestamptz`: written as
+    /// [`TimestampExt::to_rfc3339_micros`], stored, and read back as whole microseconds
+    /// ([`TimestampExt::from_unix_micros`]), it is [`TimestampExt::trunc_micros`] of itself.
+    /// That is the instants from [`Timestamp::PG_ROUND_TRIP_MIN`] to [`Timestamp::MAX`].
+    pub fn round_trips_through_pg(&self) -> bool {
+        let stored = self.trunc_micros();
+        Self::PG_ROUND_TRIP_MIN <= stored && stored <= Self::PG_ROUND_TRIP_MAX
+    }
+
+    /// Whole seconds since the Unix epoch, rounded toward the past.
+    pub fn timestamp(&self) -> i64 {
+        self.floor_div(NANOS_PER_SEC)
+    }
+
+    /// Whole milliseconds since the Unix epoch, rounded toward the past.
+    pub fn timestamp_millis(&self) -> i64 {
+        self.floor_div(1_000_000)
+    }
+
+    /// Whole microseconds since the Unix epoch, rounded toward the past
+    /// (`1969-12-31T23:59:59.999999999Z` is `-1`).
+    pub fn timestamp_micros(&self) -> i64 {
+        self.floor_div(1_000)
+    }
+
+    /// The jiff value underneath.
+    pub fn to_jiff(self) -> jiff::Timestamp {
+        self.0
+    }
+
+    /// Wraps a jiff value.
+    pub fn from_jiff(t: jiff::Timestamp) -> Self {
+        Timestamp(t)
+    }
+
+    fn floor_div(&self, unit: i128) -> i64 {
+        // jiff's range in nanoseconds divided by at least 1000 fits an i64.
+        self.0.as_nanosecond().div_euclid(unit) as i64
+    }
+
+    fn from_nanos(nanos: i128) -> Option<Self> {
+        jiff::Timestamp::from_nanosecond(nanos).ok().map(Timestamp)
+    }
+
+    fn parse_with(
+        s: &str,
+        parser: fn(&str) -> Result<i128, parse::Kind>,
+    ) -> Result<Self, ParseError> {
+        let nanos = parser(s).map_err(kind_error)?;
+        Self::from_nanos(nanos).ok_or_else(beyond_range)
+    }
+
+    /// Writes the UTC date and time as chrono's `write_rfc3339` does, up to the offset.
+    fn write_rfc3339(&self, f: &mut impl fmt::Write, fraction: Fraction, sep: char) -> fmt::Result {
+        let dt = Offset::UTC.to_datetime(self.0);
+        write_year(f, dt.year())?;
+        write!(
+            f,
+            "-{:02}-{:02}{sep}{:02}:{:02}:{:02}",
+            dt.month(),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        )?;
+        // A civil time's fraction is never negative.
+        let nano = dt.subsec_nanosecond() as u32;
+        match fraction {
+            Fraction::Millis => write!(f, ".{:03}", nano / 1_000_000),
+            Fraction::Micros => write!(f, ".{:06}", nano / 1_000),
+            Fraction::Auto => write_auto_fraction(f, nano),
+        }
+    }
+
+    fn rfc3339_string(&self, fraction: Fraction, zone: &str) -> String {
+        let mut s = String::with_capacity(36);
+        // Writing to a String can't fail.
+        let _ = self.write_rfc3339(&mut s, fraction, 'T');
+        s.push_str(zone);
+        s
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Fraction {
+    Auto,
+    Millis,
+    Micros,
+}
+
+/// chrono's year: four digits in 0..=9999, otherwise signed with at least four digits.
+fn write_year(f: &mut impl fmt::Write, year: i16) -> fmt::Result {
+    if (0..=9999).contains(&year) {
+        write!(f, "{year:04}")
+    } else {
+        write!(f, "{year:+05}")
+    }
+}
+
+/// chrono's `SecondsFormat::AutoSi` and `NaiveTime`'s `Display`: none, 3, 6 or 9 digits.
+fn write_auto_fraction(f: &mut impl fmt::Write, nano: u32) -> fmt::Result {
+    if nano == 0 {
+        Ok(())
+    } else if nano.is_multiple_of(1_000_000) {
+        write!(f, ".{:03}", nano / 1_000_000)
+    } else if nano.is_multiple_of(1_000) {
+        write!(f, ".{:06}", nano / 1_000)
+    } else {
+        write!(f, ".{nano:09}")
+    }
+}
+
+fn kind_error(kind: parse::Kind) -> ParseError {
+    ParseError::new(kind.message(), false)
+}
+
+/// A well-formed time or date past jiff's range: chrono's "input is out of range".
+fn beyond_range() -> ParseError {
+    ParseError::new(parse::Kind::OutOfRange.message(), true)
+}
+
+impl crate::sealed::Sealed for Timestamp {}
+impl crate::sealed::Sealed for Date {}
+
+impl TimestampExt for Timestamp {
+    type Date = Date;
+
+    fn now() -> Self {
+        Timestamp(jiff::Timestamp::now())
+    }
+
+    fn from_unix_seconds(secs: i64) -> Option<Self> {
+        jiff::Timestamp::from_second(secs).ok().map(Timestamp)
+    }
+
+    // Through nanoseconds, not jiff's `from_millisecond`/`from_microsecond`: those refuse the
+    // range's last second (`22:00:00.000001` to `22:00:00.999999`), which the parsers accept.
+    fn from_unix_millis(millis: i64) -> Option<Self> {
+        Self::from_nanos(i128::from(millis) * 1_000_000)
+    }
+
+    fn from_unix_micros(micros: i64) -> Option<Self> {
+        Self::from_nanos(i128::from(micros) * 1_000)
+    }
+
+    fn from_ymd_hms(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> Option<Self> {
+        let dt = jiff::civil::DateTime::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+            i8::try_from(hour).ok()?,
+            i8::try_from(minute).ok()?,
+            i8::try_from(second).ok()?,
+            0,
+        )
+        .ok()?;
+        Offset::UTC.to_timestamp(dt).ok().map(Timestamp)
+    }
+
+    fn parse_rfc3339(s: &str) -> Result<Self, ParseError> {
+        Self::parse_with(s, parse::rfc3339_strict)
+    }
+
+    fn to_rfc3339_auto(&self) -> String {
+        self.rfc3339_string(Fraction::Auto, "Z")
+    }
+
+    fn to_rfc3339_millis(&self) -> String {
+        self.rfc3339_string(Fraction::Millis, "Z")
+    }
+
+    fn to_rfc3339_micros(&self) -> String {
+        self.rfc3339_string(Fraction::Micros, "Z")
+    }
+
+    fn to_rfc3339_offset(&self) -> String {
+        self.rfc3339_string(Fraction::Auto, "+00:00")
+    }
+
+    fn to_iso8601_basic(&self) -> String {
+        let dt = Offset::UTC.to_datetime(self.0);
+        let mut s = String::with_capacity(16);
+        let _ = write_year(&mut s, dt.year());
+        let _ = fmt::Write::write_fmt(
+            &mut s,
+            format_args!(
+                "{:02}{:02}T{:02}{:02}{:02}Z",
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second()
+            ),
+        );
+        s
+    }
+
+    fn unix_nanos(&self) -> i128 {
+        self.0.as_nanosecond()
+    }
+
+    fn trunc_micros(self) -> Self {
+        let nanos = self.0.as_nanosecond();
+        // Truncating toward the past stays above jiff's minimum, a whole second.
+        Self::from_nanos(nanos - nanos.rem_euclid(1_000)).unwrap_or(self)
+    }
+
+    fn since(&self, earlier: Self) -> SignedDuration {
+        self.0.duration_since(earlier.0)
+    }
+
+    fn checked_add(self, d: Duration) -> Option<Self> {
+        let d = SignedDuration::try_from(d).ok()?;
+        self.0.checked_add(d).ok().map(Timestamp)
+    }
+
+    fn checked_sub(self, d: Duration) -> Option<Self> {
+        let d = SignedDuration::try_from(d).ok()?;
+        self.0.checked_sub(d).ok().map(Timestamp)
+    }
+
+    fn utc_date(&self) -> Date {
+        Date(Offset::UTC.to_datetime(self.0).date())
+    }
+}
+
+impl std::ops::Add<Duration> for Timestamp {
+    type Output = Timestamp;
+
+    /// Panics past the supported range; [`TimestampExt::checked_add`] doesn't.
+    fn add(self, d: Duration) -> Timestamp {
+        self.checked_add(d)
+            .expect("`Timestamp + Duration` overflowed")
+    }
+}
+
+impl std::ops::Sub<Duration> for Timestamp {
+    type Output = Timestamp;
+
+    /// Panics past the supported range; [`TimestampExt::checked_sub`] doesn't.
+    fn sub(self, d: Duration) -> Timestamp {
+        self.checked_sub(d)
+            .expect("`Timestamp - Duration` overflowed")
+    }
+}
+
+impl std::ops::AddAssign<Duration> for Timestamp {
+    fn add_assign(&mut self, d: Duration) {
+        *self = *self + d;
+    }
+}
+
+impl std::ops::SubAssign<Duration> for Timestamp {
+    fn sub_assign(&mut self, d: Duration) {
+        *self = *self - d;
+    }
+}
+
+/// `a - b` is [`TimestampExt::since`]: signed, negative when `b` is later. It can't overflow.
+impl std::ops::Sub<Timestamp> for Timestamp {
+    type Output = SignedDuration;
+
+    fn sub(self, earlier: Timestamp) -> SignedDuration {
+        self.since(earlier)
+    }
+}
+
+/// The same instant as a [`std::time::SystemTime`], as chrono's `From<DateTime<Utc>>` gave
+/// (every instant in the range is one).
+impl From<Timestamp> for std::time::SystemTime {
+    fn from(t: Timestamp) -> std::time::SystemTime {
+        let d = t.0.duration_since(jiff::Timestamp::UNIX_EPOCH);
+        // jiff's range is within what `SystemTime` holds on the platforms we build for, so this
+        // panics no more than chrono's did (it computed `UNIX_EPOCH ± duration` the same way).
+        if d.is_negative() {
+            std::time::UNIX_EPOCH - d.unsigned_abs()
+        } else {
+            std::time::UNIX_EPOCH + d.unsigned_abs()
+        }
+    }
+}
+
+/// `2026-09-30 12:00:00.500 UTC`: chrono's `Display` for `DateTime<Utc>`.
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_rfc3339(f, Fraction::Auto, ' ')?;
+        f.write_str(" UTC")
+    }
+}
+
+/// `2026-09-30T12:00:00.500Z` (chrono's `Debug` for `DateTime<Utc>`; not a contract).
+impl fmt::Debug for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_rfc3339(f, Fraction::Auto, 'T')?;
+        f.write_str("Z")
+    }
+}
+
+/// chrono's `DateTime<Utc>` `FromStr`: relaxed RFC 3339, see the crate docs.
+impl FromStr for Timestamp {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        Self::parse_with(s, parse::rfc3339_relaxed)
+    }
+}
+
+impl serde::Serialize for Timestamp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_rfc3339_auto())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Timestamp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Timestamp;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an RFC 3339 formatted date and time string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Timestamp, E> {
+                value.parse().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+impl Date {
+    /// The jiff value underneath.
+    pub fn to_jiff(self) -> jiff::civil::Date {
+        self.0
+    }
+
+    /// Wraps a jiff value.
+    pub fn from_jiff(d: jiff::civil::Date) -> Self {
+        Date(d)
+    }
+
+    fn from_ymd(ymd: parse::Ymd) -> Result<Self, ParseError> {
+        let year = i16::try_from(ymd.year).map_err(|_| beyond_range())?;
+        // `Ymd` holds a valid month and day; only the year can be past jiff's range.
+        jiff::civil::Date::new(year, ymd.month as i8, ymd.day as i8)
+            .map(Date)
+            .map_err(|_| beyond_range())
+    }
+}
+
+impl DateExt for Date {
+    fn ymd(year: i32, month: u32, day: u32) -> Option<Self> {
+        jiff::civil::Date::new(
+            i16::try_from(year).ok()?,
+            i8::try_from(month).ok()?,
+            i8::try_from(day).ok()?,
+        )
+        .ok()
+        .map(Date)
+    }
+
+    fn parse_iso(s: &str) -> Result<Self, ParseError> {
+        Self::from_ymd(parse::date_iso(s).map_err(kind_error)?)
+    }
+}
+
+/// `2026-10-01`: chrono's `NaiveDate` `Display` (signed years outside 0..=9999).
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_year(f, self.0.year())?;
+        write!(f, "-{:02}-{:02}", self.0.month(), self.0.day())
+    }
+}
+
+/// The same as `Display`, as chrono's.
+impl fmt::Debug for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// chrono's `NaiveDate` `FromStr`: `%Y-%m-%d` with spaces allowed around the dashes and after.
+impl FromStr for Date {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        Self::from_ymd(parse::date_relaxed(s).map_err(kind_error)?)
+    }
+}
+
+impl serde::Serialize for Date {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Date {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Date;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a formatted date string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Date, E> {
+                value.parse().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}

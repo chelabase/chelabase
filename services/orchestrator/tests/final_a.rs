@@ -78,7 +78,7 @@ fn log_event(
         database_id: None,
         before,
         after,
-        at: chrono::Utc::now(),
+        at: Timestamp::now(),
         actor_email: None,
         target_email: None,
         project_name: None,

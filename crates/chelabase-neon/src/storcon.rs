@@ -13,6 +13,7 @@ use serde_json::json;
 
 use crate::id::NeonId;
 use crate::lsn::Lsn;
+use chelabase_time::{Timestamp, TimestampExt};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Creating a timeline (a branch of a large one included) may take longer than a request.
@@ -563,14 +564,14 @@ impl StorconClient {
         &self,
         tenant: &NeonId,
         timeline: &NeonId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: Timestamp,
     ) -> Result<LsnAtTime, StorconError> {
         #[derive(Deserialize)]
         struct Reply {
             lsn: Lsn,
             kind: LsnKind,
         }
-        let ts = at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        let ts = at.to_rfc3339_auto();
         let resp = self
             .http
             .get(self.url(&format!(
@@ -592,7 +593,7 @@ impl StorconClient {
         tenant: &NeonId,
         timeline: &NeonId,
         lsn: Lsn,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorconError> {
+    ) -> Result<Option<Timestamp>, StorconError> {
         let resp = self
             .http
             .get(self.url(&format!(
@@ -609,9 +610,9 @@ impl StorconClient {
             return Ok(None);
         }
         let text: String = check(resp).await?.json().await?;
-        let parsed = chrono::DateTime::parse_from_rfc3339(&text)
+        let parsed = Timestamp::parse_rfc3339(&text)
             .map_err(|e| anyhow::anyhow!("timestamp {text:?}: {e}"))?;
-        Ok(Some(parsed.with_timezone(&chrono::Utc)))
+        Ok(Some(parsed))
     }
 
     /// PUT /v1/tenant/{t}/timeline/{tl}/detach_ancestor?detach_behavior=multi_level_and_no_reparent
@@ -666,7 +667,7 @@ impl StorconClient {
         else {
             return Ok(None);
         };
-        let parsed = humantime::parse_duration(text)
+        let parsed = chelabase_time::parse_duration(text)
             .map_err(|e| anyhow::anyhow!("pitr_interval {text:?}: {e}"))?;
         Ok(Some(parsed))
     }

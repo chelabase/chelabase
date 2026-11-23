@@ -19,7 +19,7 @@
 
 use chelabase_types::TenantId;
 use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole, PlatformRole, RoleSet};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction};
@@ -104,7 +104,7 @@ enum AdminClaim {
 pub struct SetupClaim {
     /// The identity user the claim binds.
     pub identity_user_id: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Whether that user has a member row in the tenant (any status).
     pub has_member_row: bool,
 }
@@ -135,12 +135,12 @@ pub struct MemberRecord {
     pub display_name: String,
     pub tenant_admin: bool,
     pub status: MemberStatus,
-    pub accepted_at: Option<DateTime<Utc>>,
+    pub accepted_at: Option<Timestamp>,
     /// D7: the member's identity user was offboarded (`members.offboarded_at`); cleared when an
     /// accepted invite shows the user back. Independent of `status`.
     pub offboarded: bool,
     /// D10: when the member was suspended (`members.suspended_at`); `None` unless suspended.
-    pub suspended_at: Option<DateTime<Utc>>,
+    pub suspended_at: Option<Timestamp>,
     /// D10: the member who suspended it (`members.suspended_by`); `None` unless suspended, and
     /// for a member suspended before the column existed.
     pub suspended_by: Option<Uuid>,
@@ -159,7 +159,7 @@ pub struct MemberListing {
     pub member: MemberRecord,
     /// A tenant admin, or holding at least one project grant (an override alone doesn't count).
     pub has_access: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl std::ops::Deref for MemberListing {
@@ -281,7 +281,7 @@ pub struct AccessEvent {
     pub database_id: Option<Uuid>,
     pub before: Option<Value>,
     pub after: Option<Value>,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The actor's email now (members are kept when removed); `None` for the system, or a
     /// member whose address went stale.
     pub actor_email: Option<String>,
@@ -297,7 +297,7 @@ pub struct AccessEvent {
 pub struct OpenInvite {
     pub id: Uuid,
     pub member_id: Uuid,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 /// A project's grants by member, and the overrides on its databases by (member, database).
@@ -684,7 +684,7 @@ struct MemberRaw {
     display_name: String,
     tenant_admin: bool,
     status: String,
-    accepted_at: Option<DateTime<Utc>>,
+    accepted_at: Option<Timestamp>,
 }
 
 impl TryFrom<MemberRaw> for MemberRecord {
@@ -714,7 +714,7 @@ struct MemberRow {
     #[sqlx(flatten)]
     base: MemberRaw,
     offboarded: bool,
-    suspended_at: Option<DateTime<Utc>>,
+    suspended_at: Option<Timestamp>,
     suspended_by: Option<Uuid>,
 }
 
@@ -742,7 +742,7 @@ struct EventRaw {
     database_id: Option<Uuid>,
     before: Option<Value>,
     after: Option<Value>,
-    at: DateTime<Utc>,
+    at: Timestamp,
     actor_email: Option<String>,
     target_email: Option<String>,
     project_name: Option<String>,
@@ -767,7 +767,7 @@ struct ListingRaw {
     #[sqlx(flatten)]
     member: MemberRow,
     has_access: bool,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 impl From<EventRaw> for AccessEvent {
@@ -952,10 +952,10 @@ macro_rules! returning_listing {
 pub(crate) type Tx = Transaction<'static, Postgres>;
 
 /// When an invite was revoked or accepted, if it was.
-type Stamp = Option<DateTime<Utc>>;
+type Stamp = Option<Timestamp>;
 
 /// An invite's member, expiry, and when it was revoked or accepted.
-pub type InviteState = (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+pub type InviteState = (Uuid, Timestamp, Option<Timestamp>, Option<Timestamp>);
 
 /// An open invite's token hash, inviter name and email, tenant slug and display name.
 type InviteDescriptionRow = (Uuid, Option<Vec<u8>>, String, Option<String>, String, Option<String>);
@@ -966,7 +966,7 @@ type InviteDescriptionRow = (Uuid, Option<Vec<u8>>, String, Option<String>, Stri
 pub struct NewInvite<'a> {
     pub identity_user_id: &'a str,
     pub email: &'a str,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     pub token_hash: [u8; 32],
     pub grants: &'a [(Uuid, GrantRow)],
     /// The teams the invitee joins, as the invite's check read them (P25).
@@ -2168,7 +2168,7 @@ impl MetadataClient {
     pub async fn invite_expiry_for_user(
         &self,
         identity_user_id: &str,
-    ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
+    ) -> Result<Option<(Timestamp, bool)>, MetadataError> {
         Ok(sqlx::query_as(
             "SELECT i.expires_at, i.expires_at > now()
              FROM invites i
@@ -2265,7 +2265,7 @@ impl MetadataClient {
     /// The tenant's open invites (neither revoked nor accepted, expired ones included), by
     /// member then newest first.
     pub async fn open_invites(&self, tenant: TenantId) -> Result<Vec<OpenInvite>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
+        let rows: Vec<(Uuid, Uuid, Timestamp)> = sqlx::query_as(
             "SELECT i.id, i.member_id, i.expires_at
              FROM invites i JOIN members m ON m.id = i.member_id
              WHERE m.tenant_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
@@ -3181,11 +3181,11 @@ impl MetadataClient {
         &self,
         actor: Uuid,
         invite: Uuid,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
         token_hash: [u8; 32],
     ) -> Result<(), AccessWriteError> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<(Uuid, Uuid, DateTime<Utc>, Stamp, Stamp)> = sqlx::query_as(
+        let row: Option<(Uuid, Uuid, Timestamp, Stamp, Stamp)> = sqlx::query_as(
             "SELECT i.member_id, m.tenant_id, i.expires_at, i.revoked_at, i.accepted_at
                  FROM invites i JOIN members m ON m.id = i.member_id
                  WHERE i.id = $1 FOR UPDATE OF i",
@@ -3254,8 +3254,8 @@ impl MetadataClient {
             .ok_or(AccessWriteError::NotFound)?;
         let (identity_user_id, revoked, accepted): (
             String,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
+            Option<Timestamp>,
+            Option<Timestamp>,
         ) = sqlx::query_as(
             "SELECT identity_user_id, revoked_at, accepted_at FROM invites WHERE id = $1 FOR UPDATE",
         )
@@ -3316,7 +3316,7 @@ impl MetadataClient {
     pub async fn admin_claimed_since(
         &self,
         tenant: TenantId,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> Result<bool, MetadataError> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM access_events
@@ -3358,7 +3358,7 @@ impl MetadataClient {
         #[derive(sqlx::FromRow)]
         struct Row {
             identity_user_id: String,
-            created_at: DateTime<Utc>,
+            created_at: Timestamp,
             has_member_row: bool,
         }
         Ok(sqlx::query_as::<_, Row>(
@@ -3826,6 +3826,7 @@ impl MetadataClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     // T1 audit (b), coder's edges: an `expect` must name every project a joined team reaches;
     // extra projects (the own grants') are fine, and teams without grants need nothing.
@@ -4144,7 +4145,7 @@ mod tests {
 
     #[test]
     fn event_row_maps_to_event() {
-        let at = Utc::now();
+        let at = Timestamp::now();
         let event = AccessEvent::from(EventRaw {
             id: 7,
             tenant_id: Uuid::from_u128(2),

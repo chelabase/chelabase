@@ -14,7 +14,7 @@ use chelabase_neon::{ComputeBackend, Lsn, NeonId, SqlOpts, StorconError};
 use chelabase_schema::catalog::{CATALOG_SQL, parse_catalog};
 use chelabase_schema::{IdentityMap, MODEL_VERSION, SUPPORTED_SERVER_MAJOR, SchemaModel};
 use chelabase_types::BranchId;
-use chrono::Utc;
+use chelabase_time::{Timestamp, TimestampExt};
 use reqwest::StatusCode;
 use tracing::{info, warn};
 
@@ -99,8 +99,8 @@ fn base_row(
         identity_map: serde_json::to_value(map)
             .map_err(|e| format!("serializing the identity map: {e}"))?,
         // The metadata sets both.
-        taken_at: Utc::now(),
-        recorded_at: Utc::now(),
+        taken_at: Timestamp::now(),
+        recorded_at: Timestamp::now(),
     })
 }
 
@@ -542,6 +542,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{
         FakeWorker, Journal, entries, pending_branch, position, ready_branch, ready_database,
         worker,
@@ -1544,7 +1545,7 @@ mod tests {
         // finds the create's entry superseded long enough.
         let merge_id = stored(&w, dev, "app").unwrap().id;
         edit_current(&w, dev, "app", |b| {
-            b.recorded_at = Utc::now() - chrono::Duration::days(8);
+            b.recorded_at = Timestamp::now() - chelabase_time::days(8);
         });
         let timeline = w.metadata.branch(dev).timeline_id.unwrap();
         w.record_merge_base(

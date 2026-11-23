@@ -664,6 +664,7 @@ mod tests {
     use chelabase_types::DatabaseId;
 
     use super::*;
+    use chelabase_time::Timestamp;
     use crate::fakes::{
         FRESH_HEAD, FakeWorker, Journal, STORAGE_CAUSE, entries, pending_branch, position,
         ready_database, worker,
@@ -873,7 +874,7 @@ mod tests {
         // the branch was created.
         let (w, journal) = worker();
         let s = setup(&w, &journal).await;
-        let commit: chrono::DateTime<chrono::Utc> = "2026-09-28T10:00:00Z".parse().unwrap();
+        let commit: Timestamp = "2026-09-28T10:00:00Z".parse().unwrap();
         *w.storage.timestamp_at.lock().unwrap() = Some(commit);
         let at = PointInTime::Timestamp("2026-09-28T11:00:00Z".parse().unwrap());
         w.handle_branch_create(s.dev, Some(at)).await.unwrap();

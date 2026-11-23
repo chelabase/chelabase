@@ -42,7 +42,7 @@ use std::time::Duration;
 use chelabase_metadata::{MetadataClient, StorageTriggerTarget, TriggerDelivery};
 use chelabase_nats::storage_objects::{self, ObjectEvent, ObjectEventType};
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use futures_util::StreamExt;
 use tracing::{info, warn};
 
@@ -51,7 +51,7 @@ use crate::storage_webhooks::backoff;
 
 /// An event is retried for this long after it happened, then dropped (the stream keeps it an
 /// hour longer).
-pub const MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+pub const MAX_AGE: Duration = chelabase_time::hours(24);
 /// How often the triggers are read again.
 pub const POLL: Duration = Duration::from_secs(10);
 /// How long a delivered message waits for its ack before redelivery: above the invoke
@@ -260,7 +260,7 @@ impl<R: Recorder> Delivery<R> {
         t: &StorageTriggerTarget,
         payload: &[u8],
         attempt: u64,
-        now: DateTime<Utc>,
+        now: Timestamp,
         jitter: f64,
     ) -> Next {
         let Ok(event) = serde_json::from_slice::<ObjectEvent>(payload) else {
@@ -270,7 +270,7 @@ impl<R: Recorder> Delivery<R> {
         if !matches(t, &event) {
             return Next::Ack;
         }
-        if now - event.time >= MAX_AGE {
+        if crate::storage_webhooks::aged(now, event.time, MAX_AGE) {
             self.count_drop(t, &event);
             self.record(t, outcome(t, false, 1, None)).await;
             return Next::Dropped;
@@ -618,7 +618,7 @@ async fn consume(
                 },
                 async {
                     delivery
-                        .process(&current, &message.payload, attempt, Utc::now(), jitter)
+                        .process(&current, &message.payload, attempt, Timestamp::now(), jitter)
                         .await
                 },
             )

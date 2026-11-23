@@ -35,37 +35,38 @@ use super::{
     str_field, user_idx, user_out,
 };
 use crate::codes::CodeKind;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chelabase_time::{Timestamp, TimestampExt, days, hours, minutes, seconds};
+use std::time::Duration;
 use serde_json::{Value, json};
 
 pub const MAX_ATTEMPTS: u32 = 5;
 pub const FAILURE_BUDGET: u32 = 10;
 
 fn failure_window() -> Duration {
-    Duration::hours(24)
+    hours(24)
 }
 
 fn replace_after() -> Duration {
-    Duration::seconds(60)
+    seconds(60)
 }
 
 /// A `(user, kind)`'s wrong guesses in the window that started at `since`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Budget {
     pub failures: u32,
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
 }
 
 impl Budget {
-    fn open(&self, now: DateTime<Utc>) -> bool {
-        self.since.is_some_and(|s| s > now - failure_window())
+    fn open(&self, now: Timestamp) -> bool {
+        self.since.is_some_and(|s| s > now.checked_sub(failure_window()).expect("in range"))
     }
 
-    fn spent(&self, now: DateTime<Utc>) -> bool {
+    fn spent(&self, now: Timestamp) -> bool {
         self.open(now) && self.failures >= FAILURE_BUDGET
     }
 
-    fn fail(&mut self, now: DateTime<Utc>) {
+    fn fail(&mut self, now: Timestamp) {
         if self.open(now) {
             self.failures += 1;
         } else {
@@ -81,9 +82,9 @@ pub(crate) struct CodeRow {
     /// The requested new address (`email_change` only).
     pub next: Option<String>,
     pub code: String,
-    pub expires: DateTime<Utc>,
+    pub expires: Timestamp,
     pub attempts: u32,
-    pub issued: DateTime<Utc>,
+    pub issued: Timestamp,
 }
 
 /// Deletes every outstanding code of `user_id`, of every kind (budgets stay). Called whenever
@@ -126,8 +127,8 @@ fn new_email(body: &Value, kind: CodeKind) -> Result<Option<String>, super::Refu
 
 fn ttl(kind: CodeKind) -> Duration {
     match kind {
-        CodeKind::Invite => Duration::days(7),
-        _ => Duration::minutes(15),
+        CodeKind::Invite => days(7),
+        _ => minutes(15),
     }
 }
 
@@ -212,7 +213,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
     let key = (user_id.to_string(), kind);
     if kind != CodeKind::Invite
         && p.codes.get(&key).is_some_and(|row| {
-            row.expires > now && row.attempts < MAX_ATTEMPTS && row.issued > now - replace_after()
+            row.expires > now && row.attempts < MAX_ATTEMPTS && row.issued > now.checked_sub(replace_after()).expect("in range")
         })
     {
         return Err(refuse(
@@ -221,7 +222,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
             "a code was sent less than a minute ago; use it or wait",
         ));
     }
-    let expires = now + ttl(kind);
+    let expires = now.checked_add(ttl(kind)).expect("in range");
     p.codes.insert(
         key,
         CodeRow {
@@ -236,7 +237,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
     let mut out = json!({
         "kind": kind.as_str(),
         "delivery": delivery,
-        "expires_at": expires.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "expires_at": expires.to_rfc3339_millis(),
     });
     if delivery == "return" {
         out["code"] = json!(code);
@@ -371,6 +372,41 @@ mod tests {
         let sent = f.codes_sent();
         let s = sent.last().expect("a code was mailed");
         (s.kind, s.email.clone(), s.code.clone())
+    }
+
+    /// `expires_at` as the fake writes it: exactly three fraction digits and `Z`; invite codes
+    /// last 7 days, the others 15 minutes.
+    #[tokio::test]
+    async fn expires_at_keeps_millisecond_text() {
+        use chelabase_time::{Timestamp, TimestampExt, days, minutes};
+        let f = FakeIdentity::start().await;
+        let p = Pool::Members;
+        let invitee = f.with_invited_user(&p, "new@x.io");
+        let member = f.with_user(&p, "old@x.io", "password-1");
+        let http = chelabase_http::client_builder().build().unwrap();
+        for (user, kind, ttl) in [(invitee, "invite", days(7)), (member, "reset", minutes(15))] {
+            let before = Timestamp::now();
+            let reply: serde_json::Value = http
+                .post(format!("{}/internal/v1/pools/members/codes", f.base))
+                .bearer_auth(crate::mock::TOKEN)
+                .json(&serde_json::json!({"user_id": user, "kind": kind, "delivery": "return"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let after = Timestamp::now();
+            let text = reply["expires_at"].as_str().expect("expires_at is text");
+            let b = text.as_bytes();
+            assert_eq!(b.len(), 24, "{text}");
+            assert!(b[19] == b'.' && b[23] == b'Z', "{text}");
+            assert!(b[20..23].iter().all(u8::is_ascii_digit), "{text}");
+            let at = Timestamp::parse_rfc3339(text).unwrap();
+            let slack = chelabase_time::seconds(1);
+            assert!(at >= before.checked_add(ttl).unwrap().checked_sub(std::time::Duration::from_millis(1)).unwrap(), "{text}");
+            assert!(at <= after.checked_add(ttl).unwrap().checked_add(slack).unwrap(), "{text}");
+        }
     }
 
     #[tokio::test]
