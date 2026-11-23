@@ -13,7 +13,7 @@ use chelabase_metadata::{
     RoleWriteOutcome, SchemaBase, ServedDatabase,
 };
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -107,7 +107,7 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         id: BranchId,
         sealed_password: &str,
         branched_at_lsn: Option<&str>,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
     ) -> Result<bool, MetadataError> {
         let changed = self
             .inner
@@ -483,7 +483,7 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         &self,
         id: BranchId,
         expected_pending: &str,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
         branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         self.inner
@@ -883,7 +883,7 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         self.inner
             .revoke_user_sessions(project, user, keep, created_before)

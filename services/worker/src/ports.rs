@@ -24,7 +24,7 @@ use chelabase_neon::storcon::LsnAtTime;
 use chelabase_neon::{ComputeSigner, Lsn, NeonId, StorconClient, StorconError};
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 
 use crate::safekeepers::SafekeeperSet;
 
@@ -104,7 +104,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         id: BranchId,
         sealed_password: &str,
         branched_at_lsn: Option<&str>,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn set_failed(
         &self,
@@ -336,7 +336,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         id: BranchId,
         expected_pending: &str,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
         branched_at_lsn: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     /// `restore_lsn`: the point on the old timeline the restored one was branched at (its
@@ -653,7 +653,7 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
     /// Revokes every live session of the project; returns them.
     fn revoke_project_sessions(
@@ -821,7 +821,7 @@ impl WorkerMetadata for MetadataClient {
         id: BranchId,
         sealed_password: &str,
         branched_at_lsn: Option<&str>,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
     ) -> Result<bool, MetadataError> {
         MetadataClient::set_branch_ready(self, id, sealed_password, branched_at_lsn, history_start)
             .await
@@ -1074,7 +1074,7 @@ impl WorkerMetadata for MetadataClient {
         &self,
         id: BranchId,
         expected_pending: &str,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
         branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         MetadataClient::switch_to_pending_timeline(
@@ -1431,7 +1431,7 @@ impl WorkerMetadata for MetadataClient {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
     }
@@ -1575,7 +1575,7 @@ pub trait Storage: Placement + 'static {
         &self,
         tenant: &NeonId,
         timeline: &NeonId,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> impl Future<Output = Result<LsnAtTime, StorconError>> + Send;
     /// `None` when no timestamp is known for the LSN.
     fn timestamp_of_lsn(
@@ -1583,7 +1583,7 @@ pub trait Storage: Placement + 'static {
         tenant: &NeonId,
         timeline: &NeonId,
         lsn: Lsn,
-    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, StorconError>> + Send;
+    ) -> impl Future<Output = Result<Option<Timestamp>, StorconError>> + Send;
     fn detach_ancestor(
         &self,
         tenant: &NeonId,
@@ -1783,7 +1783,7 @@ impl Storage for RealStorage {
         &self,
         tenant: &NeonId,
         timeline: &NeonId,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Result<LsnAtTime, StorconError> {
         StorconClient::lsn_by_timestamp(&self.storcon, tenant, timeline, at).await
     }
@@ -1793,7 +1793,7 @@ impl Storage for RealStorage {
         tenant: &NeonId,
         timeline: &NeonId,
         lsn: Lsn,
-    ) -> Result<Option<DateTime<Utc>>, StorconError> {
+    ) -> Result<Option<Timestamp>, StorconError> {
         StorconClient::timestamp_of_lsn(&self.storcon, tenant, timeline, lsn).await
     }
 

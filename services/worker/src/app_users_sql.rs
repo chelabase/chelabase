@@ -2,7 +2,7 @@
 //! protect triggers, the `chelabase_auth_sync` login and the sync functions), and the calls the
 //! sync makes as that login.
 
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use uuid::Uuid;
 
 use chelabase_schema::sql::literal;
@@ -566,7 +566,7 @@ pub fn upsert_call_sql(
     email: &str,
     verified: bool,
     banned: bool,
-    created: DateTime<Utc>,
+    created: Timestamp,
     data: Option<&serde_json::Value>,
 ) -> String {
     let data = data.map_or_else(|| "NULL".to_string(), |d| literal(&d.to_string()));
@@ -574,7 +574,7 @@ pub fn upsert_call_sql(
         "BEGIN; SET LOCAL ROLE {USERS_SYNC_ROLE}; SELECT chelabase.app_users_upsert({}, {}, {verified}, {banned}, {}, {data}); COMMIT;",
         literal(&id.to_string()),
         literal(email),
-        literal(&created.to_rfc3339()),
+        literal(&created.to_rfc3339_offset()),
     )
 }
 
@@ -599,7 +599,7 @@ pub const USERS_ROWS_SQL: &str =
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use chelabase_time::{Timestamp, TimestampExt};
 
     use super::*;
     use crate::data_api::{BOOTSTRAP_LOCK_KEY, DATA_API_SCHEMA_VERSION, NEWER_DATA_API_MARK};
@@ -1611,10 +1611,35 @@ COMMIT;
         );
     }
 
+    /// The created time is the `+00:00` offset form, never `Z`.
+    #[test]
+    fn created_literal_keeps_the_offset_form() {
+        let id = Uuid::nil();
+        let created = Timestamp::from_ymd_hms(2026, 10, 3, 10, 0, 0).unwrap();
+        let sql = upsert_call_sql(id, "a@x.io", true, false, created, None);
+        assert!(sql.contains(", '2026-10-03T10:00:00+00:00', NULL)"), "{sql}");
+        assert!(!sql.contains("10:00:00Z"), "{sql}");
+    }
+
+    /// The fraction is written as 0, 3, 6 or 9 digits, whichever holds it exactly.
+    #[test]
+    fn created_literal_keeps_fraction_digits() {
+        let id = Uuid::nil();
+        let whole = Timestamp::from_ymd_hms(2026, 10, 3, 10, 0, 0).unwrap();
+        for (created, text) in [
+            (whole + std::time::Duration::from_millis(120), "2026-10-03T10:00:00.120+00:00"),
+            (whole + std::time::Duration::from_micros(120_001), "2026-10-03T10:00:00.120001+00:00"),
+            (whole + std::time::Duration::from_nanos(120_000_001), "2026-10-03T10:00:00.120000001+00:00"),
+        ] {
+            let sql = upsert_call_sql(id, "a@x.io", true, false, created, None);
+            assert!(sql.contains(&format!(", '{text}', NULL)")), "{sql}");
+        }
+    }
+
     #[test]
     fn upsert_call_quotes_values_and_null_data() {
         let id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
-        let created = Utc.with_ymd_and_hms(2026, 10, 3, 10, 0, 0).unwrap();
+        let created = Timestamp::from_ymd_hms(2026, 10, 3, 10, 0, 0).unwrap();
         assert_eq!(
             upsert_call_sql(id, "o'neil@example.com", true, false, created, None),
             "BEGIN; SET LOCAL ROLE chelabase_auth_sync; SELECT chelabase.app_users_upsert(\

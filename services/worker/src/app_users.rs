@@ -15,7 +15,7 @@ use chelabase_nats::{AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppU
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -42,9 +42,9 @@ pub struct UserRow {
     pub id: Uuid,
     pub email: String,
     pub email_verified: bool,
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<Timestamp>,
     #[serde(default)]
-    pub banned_at: Option<DateTime<Utc>>,
+    pub banned_at: Option<Timestamp>,
 }
 
 /// The project's app-user pool. Only ever built from the project's own id, so a drop can't
@@ -776,6 +776,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+use chelabase_time::{Timestamp, TimestampExt};
     use crate::app_users_sql::{
         USERS_ROWS_SQL, USERS_TEARDOWN_SQL, claim_helpers_sql, gone_call_sql, upsert_call_sql,
         users_bootstrap_sql,
@@ -1018,7 +1019,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn created() -> DateTime<Utc> {
+    fn created() -> Timestamp {
         "2026-10-03T10:00:00Z".parse().unwrap()
     }
 
@@ -2427,13 +2428,13 @@ pub(crate) mod tests {
 
     // --- The periodic pass ------------------------------------------------------------
 
-    fn age_auth(s: &Setup, project: ProjectId, minutes: i64) {
+    fn age_auth(s: &Setup, project: ProjectId, minutes: u64) {
         s.w.metadata
             .state()
             .project_auth
             .get_mut(&project)
             .unwrap()
-            .updated_at = Utc::now() - chrono::Duration::minutes(minutes);
+            .updated_at = Timestamp::now() - chelabase_time::minutes(minutes);
     }
 
     #[tokio::test]
@@ -2464,14 +2465,14 @@ pub(crate) mod tests {
             let mut state = s.w.metadata.state();
             let row = state.projects.get_mut(&p).unwrap();
             row.status = ProjectStatus::Deleting;
-            row.updated_at = Utc::now() - chrono::Duration::minutes(minutes);
+            row.updated_at = Timestamp::now() - chelabase_time::minutes(minutes);
         }
         // Sessions revoked 8 days ago are purged; one revoked an hour ago stays.
         let old = s.w.metadata.add_session(s.project, user, "zs-old");
         let recent = s.w.metadata.add_session(s.project, user, "zs-recent");
         for (id, ago) in [
-            (old, chrono::Duration::days(8)),
-            (recent, chrono::Duration::hours(1)),
+            (old, chelabase_time::days(8)),
+            (recent, chelabase_time::hours(1)),
         ] {
             s.w.metadata
                 .state()
@@ -2479,7 +2480,7 @@ pub(crate) mod tests {
                 .iter_mut()
                 .find(|x| x.id == id)
                 .unwrap()
-                .revoked_at = Some(Utc::now() - ago);
+                .revoked_at = Some(Timestamp::now() - ago);
         }
 
         s.w.app_users_reconcile_once().await;

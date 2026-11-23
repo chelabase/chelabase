@@ -21,7 +21,7 @@ use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
     has_reserved_prefix, is_membership_reserved, is_reserved_for, quote_ident, quote_literal,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_types::role_password::{PasswordKind, hash_kind};
 use tracing::{error, info, warn};
 
@@ -320,7 +320,7 @@ pub struct ObservedRole {
     /// `-1`: no limit.
     pub connection_limit: i32,
     /// `None`: no expiry (or `infinity`).
-    pub valid_until: Option<DateTime<Utc>>,
+    pub valid_until: Option<Timestamp>,
     pub bypass_rls: bool,
     /// The roles it's a direct member of (`neon_superuser` excluded), sorted, once each.
     pub member_of: Vec<String>,
@@ -536,12 +536,30 @@ fn parse_memberships(field: &str) -> Option<Memberships> {
     })
 }
 
+/// The latest microsecond a VALID UNTIL is read as an instant: `9999-12-30T22:00:00.999999Z`,
+/// the end of what the time type holds (`chelabase_time` names no constant for it). A finite
+/// expiry Postgres accepts past it (`9999-12-31`, `294276-01-01`) is read as none, as
+/// `infinity` is, so the catalog still parses and resync converges; the role is never taken as
+/// expired.
+const LAST_VALID_UNTIL_MICROS: i128 = 253_402_207_200_999_999;
+
+/// A VALID UNTIL in whole microseconds since the epoch, as Postgres prints it: the instant, or
+/// none for one past [`LAST_VALID_UNTIL_MICROS`]. `None` for anything else, a far past
+/// included.
+pub(crate) fn valid_until_from_micros(field: &str) -> Option<Option<Timestamp>> {
+    let micros: i128 = field.parse().ok()?;
+    if micros > LAST_VALID_UNTIL_MICROS {
+        return Some(None);
+    }
+    Timestamp::from_unix_micros(i64::try_from(micros).ok()?).map(Some)
+}
+
 /// A VALID UNTIL in microseconds since the epoch; empty is none.
-fn parse_valid_until(field: &str) -> Option<Option<DateTime<Utc>>> {
+fn parse_valid_until(field: &str) -> Option<Option<Timestamp>> {
     if field.is_empty() {
         return Some(None);
     }
-    DateTime::from_timestamp_micros(field.parse().ok()?).map(Some)
+    valid_until_from_micros(field)
 }
 
 /// `o` as [`ROLE_SELECT`] prints it (tests feed it to the fake backend).
@@ -1345,15 +1363,15 @@ pub struct WantedRole<'a> {
 }
 
 /// A VALID UNTIL as a literal, to the microsecond Postgres keeps.
-fn valid_until_literal(at: Option<DateTime<Utc>>) -> String {
+fn valid_until_literal(at: Option<Timestamp>) -> String {
     match at {
-        Some(at) => quote_literal(&at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        Some(at) => quote_literal(&at.to_rfc3339_micros()),
         None => "'infinity'".to_string(),
     }
 }
 
 /// The microseconds a VALID UNTIL compares by.
-fn micros(at: Option<DateTime<Utc>>) -> Option<i64> {
+fn micros(at: Option<Timestamp>) -> Option<i64> {
     at.map(|t| t.timestamp_micros())
 }
 
@@ -1529,7 +1547,7 @@ pub(crate) fn set_password_sql(name: &str, verifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use chelabase_time::{Timestamp, TimestampExt};
 
     use super::*;
     use crate::fakes::{FakeLogin, FakeWorker, Journal, entries, position, ready_database, worker};
@@ -1572,7 +1590,7 @@ mod tests {
             api_owner_level: false,
             pending: false,
             attributes_pending: false,
-            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            created_at: Timestamp::UNIX_EPOCH,
             attributes: RoleAttributes::default(),
         }
     }
@@ -1629,7 +1647,7 @@ mod tests {
             name: format!("{role}-key"),
             prefix: "chk_sec_xxxx".into(),
             sealed: None,
-            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            created_at: Timestamp::UNIX_EPOCH,
             last_used_at: None,
             revoked_at: None,
             databases: None,
@@ -2608,7 +2626,7 @@ mod tests {
         seen.owner_granted = vec!["readers".into()];
         seen.inherit = false;
         seen.connection_limit = 4;
-        seen.valid_until = Some(DateTime::from_timestamp(1_900_000_000, 0).unwrap());
+        seen.valid_until = Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap());
         seen.bypass_rls = true;
         let mut readers = role("readers", None);
         readers.login = false;
@@ -2663,7 +2681,7 @@ mod tests {
                                 match differs {
                                     1 => o.inherit = false,
                                     2 => o.connection_limit = 9,
-                                    3 => o.valid_until = Some(DateTime::from_timestamp(1, 0).unwrap()),
+                                    3 => o.valid_until = Some(Timestamp::from_unix_seconds(1).unwrap()),
                                     4 => o.bypass_rls = !o.bypass_rls,
                                     5 => {
                                         o.member_of = vec!["g".into()];
@@ -2750,7 +2768,7 @@ mod tests {
         let wanted = RoleAttributes {
             inherit: false,
             connection_limit: 3,
-            valid_until: Some(DateTime::from_timestamp(1_900_000_000, 0).unwrap()),
+            valid_until: Some(Timestamp::from_unix_seconds(1_900_000_000).unwrap()),
             bypass_rls: true,
             member_of: vec!["g".into(), "gone".into()],
             member_no_set: vec![],
@@ -2863,7 +2881,7 @@ mod tests {
         full.login = false;
         full.inherit = false;
         full.connection_limit = 3;
-        full.valid_until = Some(DateTime::from_timestamp_micros(1_900_000_000_123_456).unwrap());
+        full.valid_until = Some(Timestamp::from_unix_micros(1_900_000_000_123_456).unwrap());
         full.bypass_rls = true;
         full.member_of = vec!["a,b".into(), "g".into()];
         full.owner_granted = vec!["g".into()];
@@ -3509,5 +3527,98 @@ mod tests {
         assert!(repairs.is_empty() && write.removals == ["sql_gone"], "{repairs:?} {write:?}");
         // The script `create_role_sql` makes has no marker for any input.
         assert!(!create_role_sql(OWNER_ROLE, &wanted, None).contains("managed_role"));
+    }
+
+    fn wanted(attributes: &RoleAttributes) -> WantedRole<'_> {
+        WantedRole { name: "r", owner_level: false, login: true, attributes }
+    }
+
+    /// `2099-01-02T03:04:05Z` and the two fractions the expiry literal must keep as six digits.
+    fn expiries() -> [(Timestamp, &'static str); 3] {
+        let whole = Timestamp::from_ymd_hms(2099, 1, 2, 3, 4, 5).unwrap();
+        [
+            (whole, "'2099-01-02T03:04:05.000000Z'"),
+            (whole + std::time::Duration::from_millis(500), "'2099-01-02T03:04:05.500000Z'"),
+            (whole + std::time::Duration::from_micros(123_456), "'2099-01-02T03:04:05.123456Z'"),
+        ]
+    }
+
+    // An expiry is written with exactly six fraction digits and a `Z`, whatever the stored
+    // value's own fraction; none clears it with `infinity`, and a new role gets no clause.
+    #[test]
+    fn valid_until_literal_keeps_six_digits() {
+        for (at, literal) in expiries() {
+            assert_eq!(valid_until_literal(Some(at)), literal);
+        }
+        assert_eq!(valid_until_literal(None), "'infinity'");
+        let mut attributes = RoleAttributes::default();
+        let create = create_role_options(&wanted(&attributes), None);
+        assert!(!create.iter().any(|o| o.starts_with("VALID UNTIL")), "{create:?}");
+        attributes.valid_until = Some(expiries()[1].0);
+        let create = create_role_options(&wanted(&attributes), None);
+        assert!(create.contains(&"VALID UNTIL '2099-01-02T03:04:05.500000Z'".to_string()), "{create:?}");
+        let mut seen = role("r", None);
+        seen.valid_until = Some(expiries()[0].0);
+        let alter = attributes_sql(&wanted(&RoleAttributes::default()), &seen).unwrap();
+        assert!(alter.contains("VALID UNTIL 'infinity'"), "{alter}");
+    }
+
+    // The catalog keeps microseconds: the same expiry with nanosecond digits is equal (no
+    // endless re-apply), and one microsecond off is written again.
+    #[test]
+    fn an_expiry_one_microsecond_off_is_reapplied() {
+        let micros = Timestamp::from_unix_micros(1_900_000_000_123_456).unwrap();
+        let mut attributes = RoleAttributes {
+            valid_until: Some(micros + std::time::Duration::from_nanos(789)),
+            ..RoleAttributes::default()
+        };
+        let mut seen = role("r", None);
+        seen.valid_until = Some(micros);
+        assert_eq!(attributes_sql(&wanted(&attributes), &seen), None);
+        for off in [micros - std::time::Duration::from_micros(1), micros + std::time::Duration::from_micros(1)] {
+            seen.valid_until = Some(off);
+            let sql = attributes_sql(&wanted(&attributes), &seen).expect("re-applied");
+            assert!(sql.contains("VALID UNTIL '2030-03-17T17:46:40.123456Z'"), "{sql}");
+        }
+        attributes.valid_until = Some(micros + std::time::Duration::from_micros(1));
+        seen.valid_until = Some(micros);
+        assert!(attributes_sql(&wanted(&attributes), &seen).is_some());
+    }
+
+    // The expiry field of a resync line: empty is none, a number is the instant, anything
+    // else is refused (`-` is the member catalog's spelling, not this one's).
+    #[test]
+    fn a_non_numeric_expiry_field_is_refused() {
+        assert_eq!(parse_valid_until(""), Some(None));
+        assert_eq!(
+            parse_valid_until("1900000000123456"),
+            Some(Some(Timestamp::from_unix_micros(1_900_000_000_123_456).unwrap()))
+        );
+        assert_eq!(parse_valid_until("-"), None);
+        assert_eq!(parse_valid_until("soon"), None);
+        assert_eq!(parse_valid_until("1.5"), None);
+        let bad = role_line(&role("r", None)).replacen("|-1||", "|-1|soon|", 1);
+        assert!(bad.contains("|soon|"), "{bad}");
+        assert!(parse_observed(&bad).is_err());
+    }
+
+    // A finite expiry Postgres accepts (`9999-12-31`, `294276-01-01`) that the time type can't
+    // hold counts as no expiry, as `infinity` does: the line parses, nothing is re-applied
+    // forever and the role is never taken as expired. Independent of the backing type's range.
+    #[test]
+    fn a_far_future_observed_expiry_does_not_block_resync() {
+        // 9999-12-31T00:00:00Z, 294276-01-01 (past `i64` microseconds), and a huge one.
+        for field in ["253402214400000000", "253402207201000000", "9223372036854775807", "9223372036854775808", "9300000000000000000"] {
+            assert_eq!(parse_valid_until(field), Some(None), "{field}");
+        }
+        // The far past isn't "no expiry": an unreadable one stays refused.
+        assert_eq!(parse_valid_until("-9223372036854775809"), None);
+        let seen = role("r", None);
+        let line = role_line(&seen).replacen("|-1||", "|-1|253402214400000000|", 1);
+        assert!(line.contains("|253402214400000000|"), "{line}");
+        let observed = parse_observed(&line).unwrap();
+        assert_eq!(observed.roles[0].valid_until, None);
+        let attributes = observed.roles[0].attributes();
+        assert_eq!(attributes_sql(&wanted(&attributes), &observed.roles[0]), None);
     }
 }

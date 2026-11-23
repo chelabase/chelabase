@@ -15,7 +15,7 @@ use chelabase_metadata::{
     DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionKind, MetadataClient, MetadataConfig, NewDeployment,
 };
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{NaiveDate, Utc};
+use chelabase_time::{Date, DateExt, Timestamp, TimestampExt};
 use rand::RngExt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -50,7 +50,7 @@ impl Scratch {
             .connect(&url())
             .await
             .expect("metadata Postgres reachable (is the workbench stack up?)");
-        let secs = Utc::now().timestamp() as u32;
+        let secs = Timestamp::now().timestamp() as u32;
         let name = format!("cm_{secs:08x}{}", &Uuid::new_v4().simple().to_string()[..4]);
         sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&meta)
@@ -123,7 +123,7 @@ impl Scratch {
                 bundle_sha256: Some(&sha),
                 bundle_size: Some(10),
                 spec: &spec,
-                compatibility_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                compatibility_date: Date::ymd(2026, 10, 1).unwrap(),
                 created_by: "member-1",
                 note: None,
             })
@@ -176,7 +176,7 @@ async fn drain(client: MetadataClient) -> Vec<Uuid> {
         }
         for c in claimed {
             assert!(c.run.is_some(), "an enabled function's due schedule runs");
-            assert!(c.next_run_at.unwrap() > Utc::now() - chrono::Duration::seconds(5));
+            assert!(c.next_run_at.unwrap() > Timestamp::now() - chelabase_time::seconds(5));
             got.push(c.id);
         }
     }
@@ -274,14 +274,14 @@ async fn fn_schedules_claim_skips_dead_rows_and_runs_only_enabled_functions() {
         .collect();
     assert_eq!(got, vec![(off_row, "off", false), (on_row, "on", true)]);
     for c in &claimed {
-        let next: chrono::DateTime<Utc> =
+        let next: Timestamp =
             sqlx::query_scalar("SELECT next_run_at FROM function_schedules WHERE id = $1")
                 .bind(c.id)
                 .fetch_one(s.pool())
                 .await
                 .unwrap();
         assert!(
-            next > Utc::now(),
+            next > Timestamp::now(),
             "{}: next_run_at moved on",
             c.function_name
         );
@@ -308,7 +308,7 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
     let next_of = |ids: Vec<Uuid>| {
         let pool = s.pool().clone();
         async move {
-            sqlx::query_as::<_, (Uuid, chrono::DateTime<Utc>)>(
+            sqlx::query_as::<_, (Uuid, Timestamp)>(
                 "SELECT id, next_run_at FROM function_schedules WHERE id = ANY($1) ORDER BY id",
             )
             .bind(ids)
@@ -343,6 +343,6 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
     let later = s.client.claim_due_schedules(64, &[]).await.unwrap();
     assert_eq!(later.len(), share);
     assert!(later.iter().all(|c| c.run.is_some() && unclaimed.contains(&c.id)));
-    assert!(before.iter().all(|(_, t)| *t < Utc::now()), "they were due");
+    assert!(before.iter().all(|(_, t)| *t < Timestamp::now()), "they were due");
     s.finish().await;
 }

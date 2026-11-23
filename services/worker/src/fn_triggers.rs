@@ -1736,6 +1736,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 #[cfg(test)]
 mod tests {
     use super::*;
+use chelabase_time::{Timestamp, TimestampExt};
 
     const ROLES: Roles = Roles {
         owner: Some(4242),
@@ -2002,7 +2003,7 @@ mod tests {
             source: TriggerSource::Table,
             enabled,
             state,
-            enabled_since: chrono::Utc::now(),
+            enabled_since: Timestamp::now(),
             pg_database: "app".into(),
             schema_name: Some("public".into()),
             table_name: Some("orders".into()),
@@ -2276,7 +2277,7 @@ mod tests {
             run_as_role_oid: oid,
             run_as_unmintable: None,
             last_error: None,
-            updated_at: chrono::Utc::now(),
+            updated_at: Timestamp::now(),
             health: None,
         };
         let fs = [

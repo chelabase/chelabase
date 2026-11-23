@@ -1090,6 +1090,7 @@ fn sweep_settings_keep_the_grace_above_the_longest_upload() {
 
 mod worker_reads {
     use super::*;
+use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{ready_branch, ready_database, restored_by_hand, worker};
     use chelabase_nats::BranchJob;
 
@@ -1265,7 +1266,7 @@ mod worker_reads {
         let main = w.metadata.main(db);
         let dev = ready_branch(&w, db, "dev", main.id).await;
         let (main_tl, dev_tl) = (timeline(&w, main.id), timeline(&w, dev));
-        let when = chrono::Utc::now() - chrono::Duration::days(3);
+        let when = Timestamp::now() - chelabase_time::days(3);
         *w.storage.timestamp_at.lock().unwrap() = Some(when);
         let recorded: BTreeSet<String> = [main_tl.clone()].into();
         assert_eq!(

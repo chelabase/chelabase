@@ -1,6 +1,7 @@
 //! Test helpers for the merge jobs: catalog documents as `CATALOG_SQL` prints them, and a
 //! database with a `dev` branch whose base was recorded.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_metadata::BranchRecord;
 use chelabase_types::DatabaseId;
 use serde_json::{Value, json};
@@ -322,7 +323,7 @@ pub fn move_to(w: &FakeWorker, id: uuid::Uuid, status: chelabase_metadata::Merge
     let mut state = w.metadata.state();
     let m = state.merges.get_mut(&id).unwrap();
     m.status = status;
-    m.claimed_at = status.is_working().then(chrono::Utc::now);
+    m.claimed_at = status.is_working().then(Timestamp::now);
 }
 
 /// Acknowledges every flagged step of merge `id`'s plan, as the user does before apply.

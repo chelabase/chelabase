@@ -17,6 +17,7 @@
 //! recreate the stack's orchestrator through Compose with extra settings (or stop it) and recreate
 //! it plain afterwards, pass or fail; the runner has Compose and the stack's `CHELABASE_*` env.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -278,7 +279,7 @@ impl Fx {
     async fn child_at(
         &self,
         name: &str,
-        at: Option<chrono::DateTime<chrono::Utc>>,
+        at: Option<Timestamp>,
     ) -> (BranchId, String) {
         let child = BranchId::new();
         let outcome = self
@@ -1163,7 +1164,7 @@ async fn restore_before_the_migration_and_rerun() {
     live(|fx| async move {
         const MIGRATION: &str = "CREATE ROLE mig LOGIN PASSWORD 'migration-pass-1'";
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = chrono::Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.owner_ok(MIGRATION).await;
         assert_logs_in(&fx.ep, &fx.database, "mig", "migration-pass-1").await;
@@ -1298,7 +1299,7 @@ async fn protected_child_at_a_past_point_refuses_a_dropped_roles_password() {
             .await;
         fx.owner_ok("CREATE ROLE grp PASSWORD 'grp-pass-12345'").await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = chrono::Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.owner_ok("DROP ROLE gone").await;
         fx.owner_ok("DROP ROLE grp").await;
@@ -2733,7 +2734,7 @@ async fn restore_before_the_role_brings_it_back() {
         fx.sql("CREATE TABLE public.t (v text); INSERT INTO public.t VALUES ('A');")
             .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = chrono::Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.create(fx.main, "app", false).await;
         let pw = fx.password(fx.main, "app").await;
@@ -2787,7 +2788,7 @@ async fn nologin_group_role_and_membership_on_a_real_compute() {
             login: false,
             inherit: false,
             connection_limit: 3,
-            valid_until: chrono::DateTime::from_timestamp(1_900_000_000, 0),
+            valid_until: Timestamp::from_unix_seconds(1_900_000_000),
             bypass_rls: true,
             ..RoleSpec::login("readers", false)
         };
