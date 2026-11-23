@@ -2551,9 +2551,12 @@ impl MetadataClient {
     /// sweep looks at (edge functions m8): `pending_install` (to install) or `installed` (to
     /// check for drift), each with whether it has a pending one. A `failed` row never comes
     /// back here until it is pended again (a reset, a restore, or a change to the trigger), so
-    /// a refusal is terminal. The worker orders them by its own last attempt. A read.
+    /// a refusal is terminal. A page in id order after `after` (#302: a keyset, so the worker
+    /// pages through every candidate however many there are, and a branch added or removed
+    /// meanwhile moves no other); the worker orders a page by its own last attempt. A read.
     pub async fn trigger_sweep_branches(
         &self,
+        after: Option<BranchId>,
         limit: i64,
     ) -> Result<Vec<(BranchId, bool)>, MetadataError> {
         // m13: a disabled pending row is never installed, so it doesn't count as pending; a
@@ -2567,9 +2570,11 @@ impl MetadataClient {
                    UNION ALL
                    SELECT branch_id, true FROM function_trigger_drops) c ON c.branch_id = b.id
              WHERE b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')
+               AND ($2::uuid IS NULL OR b.id > $2)
              GROUP BY b.id ORDER BY b.id LIMIT $1",
         )
         .bind(limit)
+        .bind(after.map(|b| b.as_uuid()))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(id, pending)| (BranchId(id), pending)).collect())
@@ -2578,9 +2583,12 @@ impl MetadataClient {
     /// Up to `limit` ready `normal` branches (of live databases) with a function that has a
     /// `run_as_role`, no key and no terminal outcome (`run_as_unmintable`): the worker's sweep
     /// mints their run-as keys (edge functions m8). Chosen by state alone, whatever `last_error` says (the functions service overwrites
-    /// it on any invocation error); the worker orders them by its own last attempt. A read.
+    /// it on any invocation error). A page in id order after `after`, as
+    /// [`Self::trigger_sweep_branches`] (#302); the worker orders a page by its own last
+    /// attempt. A read.
     pub async fn pending_run_as_branches(
         &self,
+        after: Option<BranchId>,
         limit: i64,
     ) -> Result<Vec<BranchId>, MetadataError> {
         let ids: Vec<Uuid> = sqlx::query_scalar(
@@ -2590,9 +2598,11 @@ impl MetadataClient {
                AND EXISTS (SELECT 1 FROM branch_functions bf WHERE bf.branch_id = b.id
                            AND bf.run_as_role IS NOT NULL AND bf.run_as_key_id IS NULL
                            AND bf.run_as_unmintable IS NULL)
+               AND ($2::uuid IS NULL OR b.id > $2)
              ORDER BY b.id LIMIT $1",
         )
         .bind(limit)
+        .bind(after.map(|b| b.as_uuid()))
         .fetch_all(&self.pool)
         .await?;
         Ok(ids.into_iter().map(BranchId).collect())

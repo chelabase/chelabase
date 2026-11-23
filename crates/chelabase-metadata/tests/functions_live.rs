@@ -2965,7 +2965,7 @@ mod functions {
         let b = c.add_trigger(&table_trigger(main, f, &["delete"])).await.unwrap();
         let read = c.list_triggers(main).await.unwrap();
         let since = |id: Uuid| read.iter().find(|t| t.id == id).unwrap().enabled_since;
-        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, true)]);
+        assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, true)]);
         let stale = since(a) - chelabase_time::seconds(1);
         let settled = c
             .settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: stale, error: None }])
@@ -2988,7 +2988,7 @@ mod functions {
         assert_eq!((row(a).state, row(a).last_error), (TriggerState::Installed, None));
         assert_eq!((row(b).state, row(b).last_error.as_deref()), (TriggerState::Failed, Some("table_missing")));
         // Round 2: an installed row stays in the sweep (its drift is checked), not pending.
-        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
+        assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, false)]);
         let again = c
             .settle_trigger_installs(
                 main,
@@ -3008,7 +3008,7 @@ mod functions {
         assert_eq!(failed, 1);
         let row_a = c.list_triggers(main).await.unwrap().into_iter().find(|t| t.id == a).unwrap();
         assert_eq!((row_a.state, row_a.last_error.as_deref()), (TriggerState::Failed, Some("table_missing")));
-        assert!(c.trigger_sweep_branches(10).await.unwrap().is_empty(), "failed rows leave the sweep");
+        assert!(c.trigger_sweep_branches(None, 10).await.unwrap().is_empty(), "failed rows leave the sweep");
         let (_, other) = s.database().await;
         assert_eq!(
             c.settle_trigger_installs(other, &[TriggerInstall { id: a, enabled_since: since(a), error: None }])
@@ -3194,11 +3194,11 @@ mod functions {
         let (db, main) = s.database().await;
         let (f, _) = s.full_function(db, main, "hello").await;
         let c = &s.client;
-        assert!(c.pending_run_as_branches(10).await.unwrap().is_empty(), "main has its key");
+        assert!(c.pending_run_as_branches(None, 10).await.unwrap().is_empty(), "main has its key");
         let child = s.branch(db, main, "dev").await;
-        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child]);
+        assert_eq!(c.pending_run_as_branches(None, 10).await.unwrap(), vec![child]);
         c.set_function_last_error(child, f, Some("TypeError: boom")).await.unwrap();
-        assert_eq!(c.pending_run_as_branches(10).await.unwrap(), vec![child], "an invocation error doesn't stop it");
+        assert_eq!(c.pending_run_as_branches(None, 10).await.unwrap(), vec![child], "an invocation error doesn't stop it");
         // Round 3 (B2): only the state decides, and a terminal outcome is state too.
         let st = c.list_for_branch(child).await.unwrap().into_iter().find(|b| b.function_id == f).unwrap();
         let settled = c
@@ -3206,7 +3206,7 @@ mod functions {
             .await
             .unwrap();
         assert!(settled);
-        assert!(c.pending_run_as_branches(10).await.unwrap().is_empty(), "a terminal outcome leaves the sweep");
+        assert!(c.pending_run_as_branches(None, 10).await.unwrap().is_empty(), "a terminal outcome leaves the sweep");
         s.finish().await;
     }
 
@@ -3294,13 +3294,13 @@ mod functions {
         let t = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
         let st = c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
         install_all(c, main).await;
-        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
+        assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, false)]);
         assert_eq!(c.update_trigger(main, g, t, false).await.unwrap(), None, "another function's");
         let off = c.update_trigger(main, f, t, false).await.unwrap().unwrap();
         assert_eq!((off.enabled, off.state), (false, TriggerState::Installed));
         let drops = c.trigger_drops(main).await.unwrap();
         assert_eq!(drops.len(), 1, "the disable records a drop");
-        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, true)], "a drop is pending work");
+        assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, true)], "a drop is pending work");
         assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a disabled trigger is never dispatched");
         let on = c.update_trigger(main, f, t, true).await.unwrap().unwrap();
         assert_eq!((on.enabled, on.state, on.last_error), (true, TriggerState::PendingInstall, None));
@@ -3312,7 +3312,7 @@ mod functions {
         // A disabled pending row is no pending work of its own.
         let later = c.trigger_drops(main).await.unwrap();
         c.clear_trigger_drops(main, &later).await.unwrap();
-        assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, false)]);
+        assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, false)]);
         c.update_trigger(main, f, t, true).await.unwrap().unwrap();
         assert!(!c.delete_trigger(main, g, t).await.unwrap(), "another function's");
         assert!(c.delete_trigger(main, f, t).await.unwrap());
@@ -3343,7 +3343,7 @@ mod functions {
         assert!(c.list_triggers(main).await.unwrap().is_empty());
         assert_eq!(c.trigger_drops(main).await.unwrap().len(), 1);
         assert_eq!(c.trigger_drops(child).await.unwrap().len(), 1);
-        let mut sweep = c.trigger_sweep_branches(10).await.unwrap();
+        let mut sweep = c.trigger_sweep_branches(None, 10).await.unwrap();
         sweep.sort_by_key(|(b, _)| b.as_uuid());
         let mut want = vec![(main, true), (child, true)];
         want.sort_by_key(|(b, _)| b.as_uuid());
@@ -3565,6 +3565,107 @@ mod functions {
         let (_, now) = c.active_deployment_generation(main, f).await.unwrap().unwrap();
         let err = c.switch_active_deployment(main, f, now, foreign).await.unwrap_err();
         assert!(matches!(err, MetadataError::InvalidFunction(_)), "{err:?}");
+        s.finish().await;
+    }
+
+    /// #302: a database whose main branch has a table trigger: one sweep candidate (a
+    /// database has at most five branches, so each candidate gets its own).
+    async fn sweep_candidate(s: &Scratch) -> BranchId {
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        s.client.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        main
+    }
+
+    /// #302: `n` sweep candidates, in id order (the sweep's keyset order).
+    async fn sweep_candidates(s: &Scratch, n: usize) -> Vec<BranchId> {
+        let mut all = Vec::new();
+        for _ in 0..n {
+            all.push(sweep_candidate(s).await);
+        }
+        all.sort_by_key(|b| b.as_uuid());
+        all
+    }
+
+    fn ids(page: &[(BranchId, bool)]) -> Vec<BranchId> {
+        page.iter().map(|(b, _)| *b).collect()
+    }
+
+    /// #302: past the page size the sweep keeps reading (15 candidates, pages of 10, stand in
+    /// for 1,500 and 1,000): two pages, each after the last id of the one before, cover every
+    /// candidate exactly once, in id order.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_sweep_pages_past_the_limit() {
+        let s = Scratch::new().await;
+        let all = sweep_candidates(&s, 15).await;
+        let c = &s.client;
+        let first = ids(&c.trigger_sweep_branches(None, 10).await.unwrap());
+        assert_eq!(first, all[..10]);
+        let second = ids(&c.trigger_sweep_branches(first.last().copied(), 10).await.unwrap());
+        assert_eq!(second, all[10..], "the second page starts after the first");
+        s.finish().await;
+    }
+
+    /// #302: the run-as sweep pages the same way.
+    #[tokio::test]
+    #[ignore]
+    async fn run_as_sweep_pages_past_the_limit() {
+        let s = Scratch::new().await;
+        let mut all = Vec::new();
+        for _ in 0..15 {
+            // Main has its key; the child copies the role without one.
+            let (db, main) = s.database().await;
+            s.full_function(db, main, "hello").await;
+            all.push(s.branch(db, main, "dev").await);
+        }
+        all.sort_by_key(|b| b.as_uuid());
+        let c = &s.client;
+        let first = c.pending_run_as_branches(None, 10).await.unwrap();
+        assert_eq!(first, all[..10]);
+        let second = c.pending_run_as_branches(first.last().copied(), 10).await.unwrap();
+        assert_eq!(second, all[10..], "the second page starts after the first");
+        assert!(c.pending_run_as_branches(all.last().copied(), 10).await.unwrap().is_empty());
+        s.finish().await;
+    }
+
+    /// #302: past the highest id a page is empty (the worker then starts again from none),
+    /// and a read from none starts at the lowest id again.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_sweep_wraps_around() {
+        let s = Scratch::new().await;
+        let all = sweep_candidates(&s, 5).await;
+        let c = &s.client;
+        let last = all.last().copied();
+        assert!(c.trigger_sweep_branches(last, 10).await.unwrap().is_empty());
+        assert_eq!(ids(&c.trigger_sweep_branches(None, 2).await.unwrap()), all[..2]);
+        s.finish().await;
+    }
+
+    /// #302: the cursor is a key, not a row: a page after a branch that left the sweep (deleted)
+    /// still starts right after its id, and a branch added below the cursor comes back once
+    /// the sweep starts again from none.
+    #[tokio::test]
+    #[ignore]
+    async fn trigger_sweep_survives_deleted_cursor_branch() {
+        let s = Scratch::new().await;
+        let all = sweep_candidates(&s, 15).await;
+        let c = &s.client;
+        let first = ids(&c.trigger_sweep_branches(None, 10).await.unwrap());
+        let cursor = *first.last().unwrap();
+        c.mark_branch_deleted(cursor).await.unwrap();
+        let added = sweep_candidate(&s).await;
+        let second = ids(&c.trigger_sweep_branches(Some(cursor), 10).await.unwrap());
+        let mut want: Vec<BranchId> = all[10..].to_vec();
+        if added.as_uuid() > cursor.as_uuid() {
+            want.push(added);
+            want.sort_by_key(|b| b.as_uuid());
+        }
+        assert_eq!(second, want, "the page after a deleted cursor");
+        let again = ids(&c.trigger_sweep_branches(None, 20).await.unwrap());
+        assert!(again.contains(&added) && !again.contains(&cursor), "{again:?}");
+        assert_eq!(again.len(), 15);
         s.finish().await;
     }
 }

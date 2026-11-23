@@ -135,7 +135,8 @@
 //! pended every table trigger of the branch); and on each reconcile pass
 //! ([`Worker::sync_pending_fn_triggers`]). That pass covers branches with a pending row, and
 //! branches whose installed triggers are checked for drift (dropped, disabled or changed: put
-//! back), up to [`SWEEP_BATCH`], least recently attempted first. A branch create also mints the
+//! back), up to [`SWEEP_BATCH`], least recently attempted first, from one page of candidates
+//! (each pass reads the page after the last, [`SweepCursor`]). A branch create also mints the
 //! child's run-as keys ([`Worker::mint_child_run_as`]); the reconcile pass retries any still
 //! owed ([`Worker::sync_pending_run_as`], chosen by state, not by `last_error`).
 
@@ -457,7 +458,9 @@ pub fn foreign_refusal(error: &str) -> Option<String> {
 /// Branches the reconcile sweep syncs per pass.
 const SWEEP_BATCH: i64 = 20;
 
-/// The most candidates a sweep reads per pass (it takes [`SWEEP_BATCH`] of them).
+/// The most candidates a sweep reads per pass: one page (it takes [`SWEEP_BATCH`] of them).
+/// #302: the next pass reads the page after it ([`SweepCursor`]), so no candidate past the
+/// first page is left out.
 const SWEEP_CANDIDATES: i64 = 1000;
 
 /// The two reconcile sweeps, each with its own attempt times.
@@ -467,10 +470,86 @@ pub enum Sweep {
     RunAs,
 }
 
-/// When each branch was last attempted, per sweep (this worker's memory: a restart starts
-/// with every branch unattempted).
-pub type SweepAttempts =
-    std::collections::HashMap<Sweep, std::collections::HashMap<BranchId, std::time::Instant>>;
+/// Each sweep's state (this worker's memory: a restart starts with every branch unattempted,
+/// from the lowest id).
+pub type SweepAttempts = std::collections::HashMap<Sweep, SweepState>;
+
+/// One sweep's state: when each branch was last attempted, and where its next page starts.
+#[derive(Debug, Default)]
+pub struct SweepState {
+    pub attempts: std::collections::HashMap<BranchId, std::time::Instant>,
+    pub cursor: SweepCursor,
+}
+
+/// #302: where a sweep reads its next page of candidates, a keyset on the branch id (the
+/// page after [`Self::after`], or from the lowest id). A keyset, not an offset: a branch
+/// added or removed between passes moves no other, so a pass from the lowest id to a short
+/// page (a cycle) reads each branch that stays a candidate exactly once, and every cycle ends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepCursor {
+    after: Option<BranchId>,
+}
+
+/// The ids a page read covered: after `from` (from the lowest when none) up to and including
+/// `to` (to the end when none: the page was short, so nothing follows it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepWindow {
+    pub from: Option<BranchId>,
+    pub to: Option<BranchId>,
+}
+
+impl SweepWindow {
+    pub fn contains(&self, branch: BranchId) -> bool {
+        let id = branch.as_uuid();
+        self.from.is_none_or(|f| id > f.as_uuid()) && self.to.is_none_or(|t| id <= t.as_uuid())
+    }
+}
+
+impl SweepCursor {
+    /// The id the next page starts after (none: from the lowest).
+    pub fn after(self) -> Option<BranchId> {
+        self.after
+    }
+
+    /// Moves past `page`, read in id order after `from` with `limit`: to its last id when the
+    /// page is full (more may follow), else back to the lowest id (the page ran to the end).
+    /// A cursor another pass moved meanwhile (it no longer stands at `from`) stays put. The
+    /// window the page covered.
+    pub fn advance(
+        &mut self,
+        from: Option<BranchId>,
+        page: &[BranchId],
+        limit: usize,
+    ) -> SweepWindow {
+        let to = if page.len() >= limit {
+            page.last().copied()
+        } else {
+            None
+        };
+        if self.after == from {
+            self.after = to;
+        }
+        SweepWindow { from, to }
+    }
+}
+
+/// One pass of a sweep over `page` (its candidates read after `from` with `limit`): moves the
+/// cursor, forgets the attempts of branches in the page's window that left the sweep (others
+/// wait for their own page), and takes up to `n` ([`sweep_order`]).
+pub fn sweep_pass(
+    state: &mut SweepState,
+    from: Option<BranchId>,
+    page: &[(BranchId, bool)],
+    limit: usize,
+    n: usize,
+) -> Vec<BranchId> {
+    let ids: Vec<BranchId> = page.iter().map(|(b, _)| *b).collect();
+    let window = state.cursor.advance(from, &ids, limit);
+    state
+        .attempts
+        .retain(|b, _| !window.contains(*b) || ids.contains(b));
+    sweep_order(page, &state.attempts, n)
+}
 
 /// A table trigger to install: its row's id, table and events, and (m17) its function's
 /// approved run-as role OID on the branch, which the install and `enqueue()` check with
@@ -1461,20 +1540,37 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
     /// Records an attempt on `branch` for the sweep of `kind`, now.
     fn attempted(&self, kind: Sweep, branch: BranchId) {
-        let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
-        attempts
+        let mut sweeps = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
+        sweeps
             .entry(kind)
             .or_default()
+            .attempts
             .insert(branch, std::time::Instant::now());
     }
 
-    /// Up to [`SWEEP_BATCH`] of `candidates` for the sweep of `kind` ([`sweep_order`]).
-    fn sweep_batch(&self, kind: Sweep, candidates: &[(BranchId, bool)]) -> Vec<BranchId> {
-        let mut attempts = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
-        let map = attempts.entry(kind).or_default();
-        // Forget branches that left the sweep.
-        map.retain(|b, _| candidates.iter().any(|(c, _)| c == b));
-        sweep_order(candidates, map, SWEEP_BATCH as usize)
+    /// Where the sweep of `kind` reads its next page ([`SweepCursor`]).
+    fn sweep_cursor(&self, kind: Sweep) -> Option<BranchId> {
+        let sweeps = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
+        sweeps.get(&kind).and_then(|s| s.cursor.after())
+    }
+
+    /// Up to [`SWEEP_BATCH`] of `candidates`, the page read after `from`, for the sweep of
+    /// `kind` ([`sweep_pass`]).
+    fn sweep_batch(
+        &self,
+        kind: Sweep,
+        from: Option<BranchId>,
+        candidates: &[(BranchId, bool)],
+    ) -> Vec<BranchId> {
+        let mut sweeps = self.fn_sweeps.lock().unwrap_or_else(|e| e.into_inner());
+        let state = sweeps.entry(kind).or_default();
+        sweep_pass(
+            state,
+            from,
+            candidates,
+            SWEEP_CANDIDATES as usize,
+            SWEEP_BATCH as usize,
+        )
     }
 
     /// The reconcile sweep (best effort): branches with a pending table trigger to install,
@@ -1485,11 +1581,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(meta) = self.metadata.functions() else {
             return;
         };
-        let candidates = match meta.trigger_sweep_branches(SWEEP_CANDIDATES).await {
+        let from = self.sweep_cursor(Sweep::Triggers);
+        let candidates = match meta.trigger_sweep_branches(from, SWEEP_CANDIDATES).await {
             Ok(candidates) => candidates,
             Err(e) => return warn!("listing branches with function triggers: {e}"),
         };
-        for branch in self.sweep_batch(Sweep::Triggers, &candidates) {
+        for branch in self.sweep_batch(Sweep::Triggers, from, &candidates) {
             self.attempted(Sweep::Triggers, branch);
             // m13: drop, then forget. The drops read before a complete sync are cleared after it:
             // that sync no longer wanted their triggers, so it dropped them.
@@ -1519,12 +1616,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(meta) = self.metadata.functions() else {
             return;
         };
+        let from = self.sweep_cursor(Sweep::RunAs);
         let candidates: Vec<(BranchId, bool)> =
-            match meta.pending_run_as_branches(SWEEP_CANDIDATES).await {
+            match meta.pending_run_as_branches(from, SWEEP_CANDIDATES).await {
                 Ok(branches) => branches.into_iter().map(|b| (b, true)).collect(),
                 Err(e) => return warn!("listing branches with run-as keys to mint: {e}"),
             };
-        for branch in self.sweep_batch(Sweep::RunAs, &candidates) {
+        for branch in self.sweep_batch(Sweep::RunAs, from, &candidates) {
             self.attempted(Sweep::RunAs, branch);
             self.mint_child_run_as(branch).await;
         }
@@ -1916,6 +2014,122 @@ mod tests {
             sweep_order(&candidates, &attempts, 27).last(),
             Some(&checked.0)
         );
+    }
+
+    /// #302: the cursor alone: a full page moves it to the page's last id, a short one back
+    /// to the lowest, and a cursor another pass moved stays put.
+    #[test]
+    fn fn_triggers_sweep_cursor_pages_and_wraps() {
+        let id = |n: u128| BranchId(Uuid::from_u128(n));
+        let mut c = SweepCursor::default();
+        let w = c.advance(None, &[id(1), id(2)], 2);
+        let full = SweepWindow {
+            from: None,
+            to: Some(id(2)),
+        };
+        assert_eq!((w, c.after()), (full, Some(id(2))));
+        assert!(w.contains(id(1)) && w.contains(id(2)) && !w.contains(id(3)));
+        let w = c.advance(Some(id(2)), &[id(5)], 2);
+        let short = SweepWindow {
+            from: Some(id(2)),
+            to: None,
+        };
+        assert_eq!((w, c.after()), (short, None));
+        assert!(!w.contains(id(2)) && w.contains(id(3)) && w.contains(id(u128::MAX)));
+        // A pass that read from a cursor that has moved since doesn't move it again.
+        c.advance(None, &[id(1), id(2)], 2);
+        c.advance(None, &[id(1), id(2)], 2);
+        assert_eq!(c.after(), Some(id(2)));
+    }
+
+    /// #302, the sweep's invariant as a model: with candidates added and removed between
+    /// passes, a cycle (from the lowest id to a short page) reads no branch twice, reads every
+    /// branch that stays a candidate throughout it, and ends within one pass more than its
+    /// full pages; every branch that stays a candidate is attempted within a bounded number of
+    /// passes; and the attempt times kept are those of branches still candidates, or removed
+    /// since the start of the cycle before.
+    #[test]
+    fn fn_triggers_sweep_cursor_model() {
+        use proptest::prelude::*;
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        const LIMIT: usize = 10;
+        const BATCH: usize = 3;
+        let id = |n: u16| BranchId(Uuid::from_u128(u128::from(n) << 64));
+        // The default case count (256), or PROPTEST_CASES.
+        proptest!(|(
+            initial in proptest::collection::btree_set(1u16..400, 0..60),
+            churn in proptest::collection::vec(
+                proptest::collection::vec((any::<bool>(), 1u16..400), 0..4),
+                0..200,
+            ),
+        )| {
+            // Branches that stay candidates all along (ids above the churn's).
+            let stable: BTreeSet<u16> = (0..25).map(|i| 400 + i * 7).collect();
+            let mut live: BTreeSet<u16> = initial.union(&stable).copied().collect();
+            let mut state = SweepState::default();
+            let mut clock = Instant::now();
+            // The current cycle: what it read, what was live all along, ids live at any point.
+            let mut read: HashSet<u16> = HashSet::new();
+            let mut throughout: BTreeSet<u16> = live.clone();
+            let mut seen_in_cycle: BTreeSet<u16> = live.clone();
+            let mut passes_in_cycle = 0usize;
+            let mut removed_since: HashSet<u16> = HashSet::new();
+            let mut removed_prev: HashSet<u16> = HashSet::new();
+            let mut last_attempt: HashMap<u16, usize> = stable.iter().map(|s| (*s, 0)).collect();
+            let passes = churn.len() + 200;
+            for pass in 0..passes {
+                for (add, n) in churn.get(pass).cloned().unwrap_or_default() {
+                    if add {
+                        live.insert(n);
+                        seen_in_cycle.insert(n);
+                    } else if live.remove(&n) {
+                        throughout.remove(&n);
+                        removed_since.insert(n);
+                    }
+                }
+                // The SQL: ids after the cursor, in order, up to the limit.
+                let from = state.cursor.after();
+                let lo = from.map(|b| (b.as_uuid().as_u128() >> 64) as u16 + 1).unwrap_or(0);
+                let page: Vec<(BranchId, bool)> =
+                    live.range(lo..).take(LIMIT).map(|n| (id(*n), false)).collect();
+                for (b, _) in &page {
+                    let n = (b.as_uuid().as_u128() >> 64) as u16;
+                    prop_assert!(read.insert(n), "{n} read twice in one cycle");
+                }
+                for b in sweep_pass(&mut state, from, &page, LIMIT, BATCH) {
+                    clock += Duration::from_millis(1);
+                    state.attempts.insert(b, clock);
+                    last_attempt.insert((b.as_uuid().as_u128() >> 64) as u16, pass);
+                }
+                passes_in_cycle += 1;
+                if state.cursor.after().is_none() {
+                    for n in &throughout {
+                        prop_assert!(read.contains(n), "{n} missed by a cycle");
+                    }
+                    prop_assert!(passes_in_cycle <= seen_in_cycle.len() / LIMIT + 1);
+                    for b in state.attempts.keys() {
+                        let n = (b.as_uuid().as_u128() >> 64) as u16;
+                        prop_assert!(
+                            live.contains(&n) || removed_since.contains(&n) || removed_prev.contains(&n),
+                            "{n} kept after it left"
+                        );
+                    }
+                    read.clear();
+                    throughout = live.clone();
+                    seen_in_cycle = live.clone();
+                    passes_in_cycle = 0;
+                    removed_prev = std::mem::take(&mut removed_since);
+                }
+                // A stable branch waits at most: its page comes once a cycle (at most
+                // 425 / LIMIT + 1 passes) and takes BATCH of at most LIMIT, least recent first.
+                let bound = (425 / LIMIT + 1) * LIMIT.div_ceil(BATCH) + 1;
+                for s in &stable {
+                    prop_assert!(pass - last_attempt[s] <= bound, "{s} starved at pass {pass}");
+                }
+            }
+        });
     }
 
     /// Round 4 (B1, B2) and the third invariant: the sweep's script takes no lock a tenant
