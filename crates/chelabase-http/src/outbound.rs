@@ -50,7 +50,7 @@ pub const STACK_HOSTS: &[&str] = &[
     "register-safekeepers", "proxy-tls", "proxy", "identity", "orchestrator", "worker", "gateway",
     "gateway-functions", "auth", "rest", "realtime", "storage", "studio", "functions",
     "functions-public", "functions-internal", "functions-control", "functions-runtime",
-    "service-runner", "service-runner-control", "init-secrets", "init-bootstrap", "mailpit", "control",
+    "mcp", "mcp-public", "mcp-internal", "mcp-runtime", "service-runner", "service-runner-control", "init-secrets", "init-bootstrap", "mailpit", "control",
     "secrets", "compute-egress",
     // The workbench's own: its docs and landing sites and the test runner.
     "docs", "landing", "runner",
