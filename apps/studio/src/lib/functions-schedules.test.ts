@@ -50,7 +50,7 @@ describe("scheduleFormReducer", () => {
   });
 
   it("edit_loads_the_schedule_and_reset_clears_it", () => {
-    let s = scheduleFormReducer(initialScheduleForm(), { type: "edit", schedule: { id: "s1", cron: "0 9 * * *", timezone: "Europe/Paris", enabled: true, next_run_at: null } });
+    let s = scheduleFormReducer(initialScheduleForm(), { type: "edit", schedule: { id: "s1", cron: "0 9 * * *", timezone: "Europe/Paris", enabled: true, next_run_at: null, last_error: null } });
     expect(s).toEqual({ editing: "s1", cron: "0 9 * * *", timezone: "Europe/Paris" });
     s = scheduleFormReducer(s, { type: "set", field: "cron", value: "0 10 * * *" });
     expect(s.cron).toBe("0 10 * * *");
