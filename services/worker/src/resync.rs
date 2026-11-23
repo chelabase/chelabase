@@ -422,7 +422,7 @@ const ROLE_SELECT: &str = "SELECT 'r',
                     WHERE s.member = a.oid AND s.roleid = 'neon_superuser'::regrole)),
        a.rolinherit,
        a.rolconnlimit,
-       coalesce(CASE WHEN isfinite(a.rolvaliduntil) AND a.rolvaliduntil <= '9999-12-30 22:00:00+00'::timestamptz
+       coalesce(CASE WHEN isfinite(a.rolvaliduntil) AND a.rolvaliduntil <= '9999-12-30T22:00:00.999999Z'::timestamptz
                      THEN (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END, ''),
        a.rolbypassrls,
        coalesce((SELECT string_agg(encode(convert_to(g.rolname, 'UTF8'), 'hex')
@@ -536,21 +536,18 @@ fn parse_memberships(field: &str) -> Option<Memberships> {
     })
 }
 
-/// The latest microsecond a VALID UNTIL is read as an instant: `9999-12-30T22:00:00Z`, the last
-/// instant the time type's `from_unix_micros` accepts (#397 makes it accept the parser's range,
-/// up to `Timestamp::MAX`; a test pins this bound to the constructor). A finite expiry Postgres
-/// accepts past it (`9999-12-31`, `294276-01-01`) is read as none, as `infinity` is, so the
-/// catalog still parses and resync converges; the role is never taken as expired. The catalog SELECTs apply
-/// the same bound (`'9999-12-30 22:00:00+00'`), so Postgres never has to print a value past `i64`
-/// microseconds.
-const LAST_VALID_UNTIL_MICROS: i128 = 253_402_207_200_000_000;
-
 /// A VALID UNTIL in whole microseconds since the epoch, as Postgres prints it: the instant, or
-/// none for one past [`LAST_VALID_UNTIL_MICROS`]. `None` for anything else, a far past
-/// included.
+/// none for one past [`Timestamp::PG_ROUND_TRIP_MAX`] (`9999-12-30T22:00:00.999999Z`), the last
+/// instant that round trips through Postgres. Every expiry the API accepts reads back as itself
+/// (`chelabase_time`'s "Postgres round trip" invariant), so resync converges on it. A finite
+/// expiry Postgres keeps past the bound (`9999-12-31`, `294276-01-01`, set by hand) is read as
+/// none, as `infinity` is, so the catalog still parses and resync converges; the role is never
+/// taken as expired. The catalog SELECTs apply the same bound
+/// (`'9999-12-30T22:00:00.999999Z'`, tested equal to the constant), so Postgres never has to
+/// print a value past `i64` microseconds. `None` for anything else, a far past included.
 pub(crate) fn valid_until_from_micros(field: &str) -> Option<Option<Timestamp>> {
     let micros: i128 = field.parse().ok()?;
-    if micros > LAST_VALID_UNTIL_MICROS {
+    if micros > i128::from(Timestamp::PG_ROUND_TRIP_MAX.timestamp_micros()) {
         return Some(None);
     }
     Timestamp::from_unix_micros(i64::try_from(micros).ok()?).map(Some)
@@ -3624,21 +3621,119 @@ mod tests {
         assert_eq!(attributes_sql(&wanted(&attributes), &observed.roles[0]), None);
     }
 
-    // The bound is the last instant the time type's constructor accepts, not just what the
-    // parser's own comparison lets through: one microsecond more is read as none.
+    // The bound is the last instant that round trips through Postgres, which the time type's
+    // constructor also accepts: one microsecond more is read as none.
     #[test]
     fn the_expiry_bound_is_the_last_instant_the_jiff_backing_holds() {
-        let last = i64::try_from(LAST_VALID_UNTIL_MICROS).unwrap();
-        assert!(Timestamp::from_unix_micros(last).is_some());
+        let last = Timestamp::PG_ROUND_TRIP_MAX.timestamp_micros();
+        assert_eq!(Timestamp::from_unix_micros(last), Some(Timestamp::PG_ROUND_TRIP_MAX));
         assert!(Timestamp::from_unix_micros(last + 1).is_none());
-        assert!(Timestamp::from_unix_micros(last).unwrap() <= Timestamp::MAX);
+        assert_eq!(Timestamp::PG_ROUND_TRIP_MAX, Timestamp::MAX.trunc_micros());
         assert_eq!(parse_valid_until(&(last + 1).to_string()), Some(None));
         let seen = role("r", None);
         let line = role_line(&seen).replacen("|-1||", &format!("|-1|{}|", last + 1), 1);
         assert_eq!(parse_observed(&line).unwrap().roles[0].valid_until, None);
         // The SELECTs carry the same bound, so Postgres never casts a value past `i64`
         // microseconds (`bigint out of range`) before the parser reads it.
-        assert!(ROLE_SELECT.contains("<= '9999-12-30 22:00:00+00'::timestamptz"));
-        assert!(crate::member_roles::member_catalog_sql().contains("> '9999-12-30 22:00:00+00'::timestamptz"));
+        assert!(ROLE_SELECT.contains("<= '9999-12-30T22:00:00.999999Z'::timestamptz"));
+        assert!(crate::member_roles::member_catalog_sql().contains("> '9999-12-30T22:00:00.999999Z'::timestamptz"));
+    }
+
+    // #397 / drop-chrono m13 F1: an expiry in the range's last second reads back as itself, so
+    // the resync after it is stored produces nothing.
+    #[test]
+    fn a_last_second_expiry_reads_back_and_converges() {
+        let last = Timestamp::PG_ROUND_TRIP_MAX;
+        assert_eq!(parse_valid_until(&last.timestamp_micros().to_string()), Some(Some(last)));
+        let half: Timestamp = "9999-12-30T22:00:00.5Z".parse().unwrap();
+        let attributes = RoleAttributes { valid_until: Some(half), ..RoleAttributes::default() };
+        let mut seen = role("r", None);
+        seen.valid_until = parse_valid_until("253402207200500000").unwrap();
+        assert_eq!(seen.valid_until, Some(half));
+        assert_eq!(attributes_sql(&wanted(&attributes), &seen), None);
+        let line = role_line(&role("r", None)).replacen("|-1||", &format!("|-1|{}|", last.timestamp_micros()), 1);
+        assert_eq!(parse_observed(&line).unwrap().roles[0].valid_until, Some(last));
+    }
+
+    /// The bound a catalog SELECT applies, read out of its text: `<marker>'<instant>'::timestamptz`.
+    fn sql_bound(sql: &str, marker: &str) -> Timestamp {
+        let at = sql.find(marker).unwrap_or_else(|| panic!("no {marker:?} in the SELECT")) + marker.len();
+        let rest = sql[at..].strip_prefix('\'').expect("a quoted bound");
+        let literal = &rest[..rest.find('\'').unwrap()];
+        let bound = literal.parse::<Timestamp>().unwrap();
+        assert!(rest[literal.len()..].starts_with("'::timestamptz"), "{rest}");
+        bound
+    }
+
+    /// What resync reads back for `wanted` after writing it: the literal it writes, stored as
+    /// Postgres stores it (the literal's six digits, exactly), printed by `ROLE_SELECT` (empty
+    /// past its bound), and parsed. `None` when it isn't read back at all.
+    fn written_and_read_back(wanted: Timestamp) -> Option<Option<Timestamp>> {
+        let literal = valid_until_literal(Some(wanted));
+        let text = literal.strip_prefix('\'').unwrap().strip_suffix('\'').unwrap();
+        assert_eq!(text.len(), "2099-01-02T03:04:05.000000Z".len(), "{literal}");
+        let stored = Timestamp::parse_rfc3339(text).ok()?.timestamp_micros();
+        let bound = sql_bound(ROLE_SELECT, "a.rolvaliduntil <= ").timestamp_micros();
+        let field = if stored > bound { String::new() } else { stored.to_string() };
+        parse_valid_until(&field)
+    }
+
+    /// The invariant (`chelabase_time`'s "Postgres round trip"): every expiry the management
+    /// API accepts ([`Timestamp::round_trips_through_pg`], the orchestrator's check) reads back
+    /// as the same instant to the microsecond, so no resync re-issues its `ALTER ROLE`.
+    fn assert_accepted_reads_back_equal(at: Timestamp) {
+        if !at.round_trips_through_pg() {
+            return;
+        }
+        let back = written_and_read_back(at).unwrap_or_else(|| panic!("{at:?} isn't read back"));
+        assert_eq!(micros(back), micros(Some(at)), "{at:?}");
+        let attributes = RoleAttributes { valid_until: Some(at), ..RoleAttributes::default() };
+        let mut seen = role("r", None);
+        seen.valid_until = back;
+        assert_eq!(attributes_sql(&wanted(&attributes), &seen), None, "{at:?}");
+    }
+
+    #[test]
+    fn every_accepted_boundary_expiry_reads_back_equal() {
+        // Both catalog SELECTs bound at the last instant that round trips.
+        assert_eq!(sql_bound(ROLE_SELECT, "a.rolvaliduntil <= "), Timestamp::PG_ROUND_TRIP_MAX);
+        let member = crate::member_roles::member_catalog_sql();
+        assert_eq!(sql_bound(&member, "a.rolvaliduntil > "), Timestamp::PG_ROUND_TRIP_MAX);
+        let mut checked = 0;
+        for edge in [Timestamp::MIN, Timestamp::PG_ROUND_TRIP_MIN, Timestamp::PG_ROUND_TRIP_MAX, Timestamp::MAX] {
+            for nanos in [0u64, 1, 999, 1_000, 1_001, 500_000_000, 999_999_999, 1_000_000_000, 86_400_000_000_000] {
+                let d = std::time::Duration::from_nanos(nanos);
+                for at in [edge.checked_add(d), edge.checked_sub(d)].into_iter().flatten() {
+                    checked += usize::from(at.round_trips_through_pg());
+                    assert_accepted_reads_back_equal(at);
+                }
+            }
+        }
+        assert!(checked > 20, "{checked}");
+    }
+
+    /// The instant `nanos` after the epoch.
+    fn from_nanos(nanos: i128) -> Timestamp {
+        let secs = i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap();
+        let sub = u64::try_from(nanos.rem_euclid(1_000_000_000)).unwrap();
+        Timestamp::from_unix_seconds(secs).unwrap().checked_add(std::time::Duration::from_nanos(sub)).unwrap()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn any_accepted_expiry_reads_back_equal(
+            nanos in Timestamp::PG_ROUND_TRIP_MIN.unix_nanos()..=Timestamp::MAX.unix_nanos(),
+        ) {
+            let at = from_nanos(nanos);
+            assert_accepted_reads_back_equal(at);
+        }
+
+        #[test]
+        fn any_accepted_last_day_expiry_reads_back_equal(
+            nanos in (Timestamp::MAX.unix_nanos() - 86_400_000_000_000)..=Timestamp::MAX.unix_nanos(),
+        ) {
+            let at = from_nanos(nanos);
+            assert_accepted_reads_back_equal(at);
+        }
     }
 }

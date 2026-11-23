@@ -228,3 +228,52 @@ async fn infinity_is_an_error() {
     }
     s.drop_schema().await;
 }
+
+/// "Postgres round trip": an instant [`JTs::round_trips_through_pg`] holds for, written as its
+/// `to_rfc3339_micros` literal and read back as `extract(epoch …)` microseconds (as the worker
+/// does with a role's `VALID UNTIL`), is itself truncated, in a UTC and a far-east session; the
+/// literal of an instant before [`JTs::PG_ROUND_TRIP_MIN`] is refused.
+#[tokio::test]
+#[ignore = "live: needs the workbench metadata Postgres"]
+async fn the_round_trip_range_is_what_postgres_stores_and_reads_back() {
+    let fits = [
+        JTs::PG_ROUND_TRIP_MIN,
+        JTs::PG_ROUND_TRIP_MIN + std::time::Duration::from_nanos(1_500),
+        "1969-12-31T23:59:59.999999999Z".parse().unwrap(),
+        "9999-12-30T22:00:00Z".parse().unwrap(),
+        "9999-12-30T22:00:00.5Z".parse().unwrap(),
+        JTs::PG_ROUND_TRIP_MAX,
+        JTs::MAX,
+    ];
+    let refused: [JTs; 3] = [
+        JTs::PG_ROUND_TRIP_MIN - std::time::Duration::from_micros(1),
+        "-4713-11-24T00:00:00Z".parse().unwrap(),
+        JTs::MIN,
+    ];
+    for time_zone in ["UTC", "Etc/GMT-14"] {
+        let mut s = Scratch::new(time_zone).await;
+        for t in fits {
+            assert!(t.round_trips_through_pg(), "{t:?}");
+            let sql = format!(
+                "SELECT (extract(epoch FROM '{}'::timestamptz) * 1000000)::bigint",
+                t.to_rfc3339_micros()
+            );
+            let micros: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+                .fetch_one(&mut s.conn)
+                .await
+                .unwrap();
+            assert_eq!(
+                JTs::from_unix_micros(micros),
+                Some(t.trunc_micros()),
+                "{t:?} in {time_zone}"
+            );
+        }
+        for t in refused {
+            assert!(!t.round_trips_through_pg(), "{t:?}");
+            let sql = format!("SELECT '{}'::timestamptz", t.to_rfc3339_micros());
+            let err = sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut s.conn).await;
+            assert!(err.is_err(), "{t:?} in {time_zone}");
+        }
+        s.drop_schema().await;
+    }
+}

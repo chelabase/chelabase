@@ -18,8 +18,10 @@ const NANOS_PER_SEC: i128 = 1_000_000_000;
 
 /// An instant in UTC, nanosecond precision, backed by [`jiff::Timestamp`].
 ///
-/// Its range is jiff's: about `-9999-01-02T01:59:59Z` to `9999-12-30T22:00:00Z`. Every
-/// constructor and parser returns `None` or an error outside it, never a clamped value.
+/// Its range is jiff's: [`Timestamp::MIN`] (`-9999-01-02T01:59:59Z`) to [`Timestamp::MAX`]
+/// (`9999-12-30T22:00:00.999999999Z`). Every constructor and parser accepts exactly that range
+/// and returns `None` or an error outside it, never a clamped value. The part that round trips
+/// through Postgres is narrower: [`Timestamp::round_trips_through_pg`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(jiff::Timestamp);
 
@@ -37,6 +39,29 @@ impl Timestamp {
     /// The latest instant the type holds, `9999-12-30T22:00:00.999999999Z`. A later one (a
     /// `timestamptz` of `9999-12-31` that Postgres stores) is a parse or decode error.
     pub const MAX: Timestamp = Timestamp(jiff::Timestamp::MAX);
+
+    /// The earliest instant that round trips through a Postgres `timestamptz`,
+    /// `0001-01-01T00:00:00Z`. Postgres stores earlier ones (to `4714-11-24 00:00:00+00 BC`),
+    /// but only in its own `… BC` text: it refuses the year `0000` and a signed year in an
+    /// RFC 3339 literal, and RFC 3339 itself has no year before `0000`. See the crate docs,
+    /// "Postgres round trip".
+    pub const PG_ROUND_TRIP_MIN: Timestamp =
+        Timestamp(jiff::Timestamp::constant(-62_135_596_800, 0));
+
+    /// The latest instant that round trips through a Postgres `timestamptz`,
+    /// `9999-12-30T22:00:00.999999Z`: [`Timestamp::MAX`] truncated to the microsecond Postgres
+    /// keeps. Every instant up to [`Timestamp::MAX`] is stored as one at or before it.
+    pub const PG_ROUND_TRIP_MAX: Timestamp =
+        Timestamp(jiff::Timestamp::constant(253_402_207_200, 999_999_000));
+
+    /// Whether the instant round trips through a Postgres `timestamptz`: written as
+    /// [`TimestampExt::to_rfc3339_micros`], stored, and read back as whole microseconds
+    /// ([`TimestampExt::from_unix_micros`]), it is [`TimestampExt::trunc_micros`] of itself.
+    /// That is the instants from [`Timestamp::PG_ROUND_TRIP_MIN`] to [`Timestamp::MAX`].
+    pub fn round_trips_through_pg(&self) -> bool {
+        let stored = self.trunc_micros();
+        Self::PG_ROUND_TRIP_MIN <= stored && stored <= Self::PG_ROUND_TRIP_MAX
+    }
 
     /// Whole seconds since the Unix epoch, rounded toward the past.
     pub fn timestamp(&self) -> i64 {
@@ -164,16 +189,14 @@ impl TimestampExt for Timestamp {
         jiff::Timestamp::from_second(secs).ok().map(Timestamp)
     }
 
+    // Through nanoseconds, not jiff's `from_millisecond`/`from_microsecond`: those refuse the
+    // range's last second (`22:00:00.000001` to `22:00:00.999999`), which the parsers accept.
     fn from_unix_millis(millis: i64) -> Option<Self> {
-        jiff::Timestamp::from_millisecond(millis)
-            .ok()
-            .map(Timestamp)
+        Self::from_nanos(i128::from(millis) * 1_000_000)
     }
 
     fn from_unix_micros(micros: i64) -> Option<Self> {
-        jiff::Timestamp::from_microsecond(micros)
-            .ok()
-            .map(Timestamp)
+        Self::from_nanos(i128::from(micros) * 1_000)
     }
 
     fn from_ymd_hms(
