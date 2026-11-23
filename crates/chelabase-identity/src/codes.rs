@@ -24,7 +24,7 @@ use crate::client::Identity;
 use crate::error::IdentityError;
 use crate::ops;
 use crate::types::{Pool, User};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -100,7 +100,7 @@ impl<'a> CodeRequest<'a> {
 pub struct IssuedCode {
     pub kind: CodeKind,
     pub delivery: Delivery,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// Present only for [`Delivery::Return`].
     #[serde(default)]
     pub code: Option<String>,
