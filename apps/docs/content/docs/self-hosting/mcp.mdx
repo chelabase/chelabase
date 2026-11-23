@@ -40,7 +40,7 @@ Blank means the default. The compose file passes each of these to the service th
 | `CHELABASE_MCP_MEMBER_CONCURRENCY` | `2` | Runs one member may have in flight. |
 | `CHELABASE_MCP_CONCURRENCY` | `8` | Runs in flight overall. |
 | `CHELABASE_MCP_MAX_CALLS` | `50` | API calls one `execute` run may make. 1 to 1000. |
-| `CHELABASE_MCP_RESPONSE_MAX_BYTES` | `1048576` | The largest API answer `execute` reads. 1024 to 16777216. A larger one answers `response_too_large` to the code. |
+| `CHELABASE_MCP_RESPONSE_MAX_BYTES` | `1048576` | The largest API answer `execute` reads. 1024 to 8388608 (8 MiB). A larger one answers `response_too_large` to the code, and so does an answer whose JSON form is over 8 MiB. |
 | `CHELABASE_MCP_RUNTIME_MEMORY` | `512m` | The runtime container's memory limit (a compose size), with swap equal to it. Every run shares it. |
 
 The member access token's lifetime (`CHELABASE_MEMBER_ACCESS_TTL_SECS`, which auth allows down to 60) must be above the run timeout plus 10 seconds (and above 60), or `mcp` refuses every token as too short-lived and MCP doesn't work. The defaults (300 and 30 s) are fine.
