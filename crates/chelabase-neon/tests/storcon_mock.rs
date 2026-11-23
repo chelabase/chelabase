@@ -11,6 +11,7 @@ use axum::http::StatusCode as AxumStatus;
 use axum::response::{IntoResponse, Response};
 use chelabase_neon::storcon::{LsnAtTime, LsnKind, TimelineInfo};
 use chelabase_neon::{Lsn, NeonId, StorconClient, StorconError};
+use chelabase_time::{Timestamp, TimestampExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -519,8 +520,8 @@ async fn list_tenant_ids_rejects_a_malformed_id() {
     assert!(matches!(err, StorconError::Other(_)), "{err:?}");
 }
 
-fn at() -> chrono::DateTime<chrono::Utc> {
-    "2026-09-30T12:34:56Z".parse().unwrap()
+fn at() -> Timestamp {
+    Timestamp::parse_rfc3339("2026-09-30T12:34:56Z").unwrap()
 }
 
 #[tokio::test]
@@ -622,26 +623,61 @@ async fn patch_tenant_config_sends_seconds() {
 }
 
 #[tokio::test]
-async fn tenant_pitr_interval_parses_humantime() {
+async fn tenant_pitr_interval_parses_the_pageservers_forms() {
     let m = mock(vec![
         (200, r#"{"tenant_specific_overrides":{},"effective_config":{"pitr_interval":"7days"}}"#),
         (200, r#"{"effective_config":{"pitr_interval":"604800s"}}"#),
         (200, r#"{"effective_config":{"pitr_interval":"1h 30m"}}"#),
-        (200, r#"{"effective_config":{"pitr_interval":"garbage"}}"#),
+        (200, r#"{"effective_config":{"pitr_interval":"0s"}}"#),
     ])
     .await;
     let client = StorconClient::new(&m.base, 0);
     let t = id(1);
-    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(604_800)));
-    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(604_800)));
-    assert_eq!(client.tenant_pitr_interval(&t).await.unwrap(), Some(Duration::from_secs(5_400)));
-    assert!(matches!(
-        client.tenant_pitr_interval(&t).await,
-        Err(StorconError::Other(_))
-    ));
+    for want in [604_800, 604_800, 5_400, 0] {
+        assert_eq!(
+            client.tenant_pitr_interval(&t).await.unwrap(),
+            Some(Duration::from_secs(want))
+        );
+    }
     let seen = m.seen();
     assert_eq!(seen[0].method, "GET");
     assert_eq!(seen[0].path, format!("/v1/tenant/{}/config", t.as_str()));
+}
+
+#[tokio::test]
+async fn tenant_pitr_interval_refuses_garbage() {
+    let m = mock(vec![(200, r#"{"effective_config":{"pitr_interval":"soon"}}"#)]).await;
+    let err = StorconClient::new(&m.base, 0)
+        .tenant_pitr_interval(&id(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert!(err.to_string().contains("\"soon\""), "{err}");
+}
+
+#[tokio::test]
+async fn lsn_by_timestamp_sends_the_same_timestamp_text() {
+    let m = mock(vec![(200, r#"{"lsn":"0/1","kind":"present"}"#); 4]).await;
+    let client = StorconClient::new(&m.base, 0);
+    let (t, tl) = (id(1), id(2));
+    let cases = [
+        (0, "2026-09-30T12%3A34%3A56Z"),
+        (123_000_000, "2026-09-30T12%3A34%3A56.123Z"),
+        (123_456_000, "2026-09-30T12%3A34%3A56.123456Z"),
+        (123_456_789, "2026-09-30T12%3A34%3A56.123456789Z"),
+    ];
+    for (nanos, _) in cases {
+        let nanos: u64 = nanos;
+        let at = Timestamp::from_unix_seconds(1_790_771_696)
+            .unwrap()
+            .checked_add(Duration::from_nanos(nanos))
+            .unwrap();
+        client.lsn_by_timestamp(&t, &tl, at).await.unwrap();
+    }
+    let seen = m.seen();
+    for (req, (_, want)) in seen.iter().zip(cases) {
+        assert_eq!(req.query, format!("timestamp={want}&with_lease=true"));
+    }
 }
 
 #[tokio::test]
