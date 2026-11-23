@@ -111,6 +111,36 @@ pub struct Advance {
     /// The schedule stays enabled; false when its cron or time zone no longer parses or it has
     /// no time left.
     pub enabled: bool,
+    /// Why the schedule was switched off (`enabled` false), for `last_error`: the parser's own
+    /// message or `no upcoming time`, at most [`SCHEDULE_ERROR_MAX_CHARS`] characters; `None` when
+    /// the schedule parsed and has a next time.
+    pub error: Option<String>,
+}
+
+/// The longest `last_error` the column holds (its CHECK counts characters).
+pub const SCHEDULE_ERROR_MAX_CHARS: usize = 500;
+
+/// What `last_error` says for a schedule that parsed but has no time left.
+pub const NO_UPCOMING_TIME: &str = "no upcoming time";
+
+/// Why a stored schedule can't run: the parser's typed error, or a cron that parses but never
+/// fires again. The only source of `last_error` text ([`ScheduleFault`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleProblem {
+    Invalid(ScheduleError),
+    NoUpcomingTime,
+}
+
+impl ScheduleProblem {
+    /// What `last_error` stores: never empty, at most [`SCHEDULE_ERROR_MAX_CHARS`] characters (cut
+    /// on a character boundary, as Postgres `length()` counts them).
+    pub fn reason(&self) -> String {
+        let text = match self {
+            ScheduleProblem::Invalid(e) => e.to_string(),
+            ScheduleProblem::NoUpcomingTime => NO_UPCOMING_TIME.to_owned(),
+        };
+        text.chars().take(SCHEDULE_ERROR_MAX_CHARS).collect()
+    }
 }
 
 /// A due schedule's step at `now`: missed ticks coalesce into one run, and `next_run_at` moves
@@ -122,13 +152,18 @@ pub fn advance(
     now: DateTime<Utc>,
     function_enabled: bool,
 ) -> Advance {
-    let next = Schedule::parse(cron, timezone)
-        .ok()
-        .and_then(|s| s.next_after(now));
+    let (next, problem) = match Schedule::parse(cron, timezone) {
+        Err(e) => (None, Some(ScheduleProblem::Invalid(e))),
+        Ok(s) => match s.next_after(now) {
+            Some(t) => (Some(t), None),
+            None => (None, Some(ScheduleProblem::NoUpcomingTime)),
+        },
+    };
     Advance {
         next,
         run: due.filter(|_| function_enabled && next.is_some()),
         enabled: next.is_some(),
+        error: problem.map(|p| p.reason()),
     }
 }
 
@@ -230,8 +265,32 @@ mod tests {
             Advance {
                 next: None,
                 run: None,
-                enabled: false
+                enabled: false,
+                error: Some(
+                    Schedule::parse("0 0 * * jan", "UTC").unwrap_err().to_string()
+                ),
             }
         );
+    }
+
+    #[test]
+    fn advance_reports_the_reason_it_disabled() {
+        let now = at("2026-06-01T10:00:00Z");
+        let why = |cron: &str, tz: &str| advance(cron, tz, Some(now), now, true).error;
+        assert!(why("0 0 * * jan", "UTC").unwrap().starts_with("cron: "));
+        assert!(why("* * * * *", "Mars/Olympus").unwrap().starts_with("timezone: "));
+        assert_eq!(why("0 0 30 2 *", "UTC").as_deref(), Some("no upcoming time"));
+        assert_eq!(why("* * * * *", "UTC"), None, "a healthy schedule has no reason");
+        // A function that is off doesn't make a healthy schedule an error.
+        assert_eq!(advance("* * * * *", "UTC", Some(now), now, false).error, None);
+    }
+
+    #[test]
+    fn a_reason_is_cut_to_500_characters_on_a_boundary() {
+        let long = ScheduleProblem::Invalid(ScheduleError::Timezone("é".repeat(900)));
+        let text = long.reason();
+        assert_eq!(text.chars().count(), SCHEDULE_ERROR_MAX_CHARS);
+        assert!(text.starts_with("timezone: éé"));
+        assert_eq!(ScheduleProblem::NoUpcomingTime.reason(), "no upcoming time");
     }
 }

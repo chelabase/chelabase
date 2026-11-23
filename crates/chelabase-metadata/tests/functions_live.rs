@@ -15,6 +15,7 @@ mod functions {
         BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
         KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, RunAsMint, RunAsUnmintable,
+        Schedule, ScheduleError, ScheduleFault, ScheduleProblem,
         TriggerDelivery, TriggerInstall, TriggerSource,
         TriggerState,
     };
@@ -1813,6 +1814,15 @@ mod functions {
             ("update_schedule", |c, x| Box::pin(async move { c.update_schedule(x.main, x.f, x.schedule, Some("*/5 * * * *"), None, None).await.map(drop) })),
             ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50, &[]).await.map(drop) })),
+            ("record_schedule_errors", |c, x| Box::pin(async move {
+                c.record_schedule_errors(&[ScheduleFault {
+                    id: x.schedule,
+                    cron: "0 * * * *".into(),
+                    timezone: "UTC".into(),
+                    problem: ScheduleProblem::NoUpcomingTime,
+                }])
+                .await
+            })),
             ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
             ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
             ("settle_run_as_mint", |c, x| Box::pin(async move {
@@ -2253,6 +2263,441 @@ mod functions {
         assert_eq!(c.list_schedules(main).await.unwrap().len(), 1, "still listed");
         let fixed = c.update_schedule(main, f, id, Some("0 9 * * MON"), None, Some(true)).await.unwrap().unwrap();
         assert!(fixed.enabled && fixed.next_run_at.is_some(), "{fixed:?}");
+        s.finish().await;
+    }
+
+    /// A due, enabled schedule of an enabled function, its stored cron and zone written
+    /// directly (the API refuses ones that don't parse); its id.
+    async fn due_schedule(s: &Scratch, main: BranchId, f: Uuid, cron: &str, tz: &str) -> Uuid {
+        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::hours(1), 6);
+        let id = s
+            .client
+            .add_schedule(&NewSchedule { branch_id: main, function_id: f, cron: "* * * * *", timezone: "UTC", next_run_at: Some(past) })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE function_schedules SET cron = $2, timezone = $3 WHERE id = $1")
+            .bind(id)
+            .bind(cron)
+            .bind(tz)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn stored(s: &Scratch, id: Uuid) -> (bool, Option<chrono::DateTime<Utc>>, Option<String>, String, String) {
+        sqlx::query_as("SELECT enabled, next_run_at, last_error, cron, timezone FROM function_schedules WHERE id = $1")
+            .bind(id)
+            .fetch_one(s.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn set_error(s: &Scratch, id: Uuid, why: &str) {
+        sqlx::query("UPDATE function_schedules SET last_error = $2 WHERE id = $1")
+            .bind(id)
+            .bind(why)
+            .execute(s.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn active_function(s: &Scratch, db: DatabaseId, main: BranchId) -> Uuid {
+        let f = s.function(db, "hello").await;
+        let d = s.deployment(f, &sha('a')).await;
+        s.client.set_active_deployment(main, f, d).await.unwrap();
+        assert!(s.client.set_enabled(main, f, true).await.unwrap());
+        f
+    }
+
+    /// m15: the column is added over a database that already has schedules: every row reads
+    /// NULL, a second run changes nothing, and the table isn't rewritten.
+    #[tokio::test]
+    #[ignore]
+    async fn the_last_error_migration_leaves_existing_schedules_null() {
+        let s = Scratch::empty().await;
+        let full = sqlx::migrate!("./migrations");
+        let version = full
+            .migrations
+            .iter()
+            .find(|m| m.description.ends_with("function_schedule_last_error"))
+            .expect("the last_error migration exists")
+            .version;
+        let latest_before = full.migrations.iter().map(|m| m.version).filter(|v| *v < version).max().unwrap();
+        assert_eq!(latest_before, 20261116000001, "it sorts after every earlier migration");
+        let mut before = sqlx::migrate!("./migrations");
+        before.migrations = Cow::Owned(full.migrations.iter().filter(|m| m.version < version).cloned().collect());
+        before.run(s.pool()).await.unwrap();
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        for _ in 0..3 {
+            s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        }
+        let node = |s: &Scratch| {
+            let pool = s.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT relfilenode::bigint FROM pg_class WHERE relname = 'function_schedules'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let file = node(&s).await;
+        s.client.migrate().await.unwrap();
+        s.client.migrate().await.unwrap();
+        assert_eq!(node(&s).await, file, "the table was not rewritten");
+        let nulls: i64 = sqlx::query_scalar("SELECT count(*) FROM function_schedules WHERE last_error IS NULL")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(nulls, 3);
+        assert!(s.client.list_schedules(main).await.unwrap().iter().all(|r| r.last_error.is_none()));
+        // The column's CHECK: empty and over-long are refused by the database.
+        for bad in [String::new(), "x".repeat(501)] {
+            let refused = sqlx::query("UPDATE function_schedules SET last_error = $1")
+                .bind(bad)
+                .execute(s.pool())
+                .await;
+            assert!(refused.is_err());
+        }
+        s.finish().await;
+    }
+
+    /// m15: a claim that switches a schedule off says why in `last_error`: `cron:`, `timezone:`
+    /// or `no upcoming time`; a healthy one in the same claim has none.
+    #[tokio::test]
+    #[ignore]
+    async fn a_claim_records_why_it_disabled_a_schedule() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = active_function(&s, db, main).await;
+        let cron = due_schedule(&s, main, f, "0 0 * * jan", "UTC").await;
+        let zone = due_schedule(&s, main, f, "* * * * *", "Mars/Olympus").await;
+        let none = due_schedule(&s, main, f, "0 0 30 2 *", "UTC").await;
+        let fine = due_schedule(&s, main, f, "* * * * *", "UTC").await;
+        s.client.claim_due_schedules(50, &[]).await.unwrap();
+        let (en, next, err, ..) = stored(&s, cron).await;
+        assert_eq!((en, next), (false, None));
+        assert!(err.unwrap().starts_with("cron: "));
+        let (en, next, err, ..) = stored(&s, zone).await;
+        assert_eq!((en, next), (false, None));
+        assert!(err.unwrap().starts_with("timezone: "));
+        let (en, next, err, ..) = stored(&s, none).await;
+        assert_eq!((en, next, err.as_deref()), (false, None, Some("no upcoming time")));
+        let (en, next, err, ..) = stored(&s, fine).await;
+        assert!(en && next.is_some() && err.is_none());
+        s.finish().await;
+    }
+
+    /// m15: the claim's arrays stay aligned: each row of a mixed batch gets its own value.
+    #[tokio::test]
+    #[ignore]
+    async fn a_mixed_claim_batch_gives_each_row_its_own_reason() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = active_function(&s, db, main).await;
+        let mut want = Vec::new();
+        for i in 0..6 {
+            let (cron, tz, prefix) = match i % 3 {
+                0 => ("* * * * *", "UTC", None),
+                1 => ("0 0 * * jan", "UTC", Some("cron: ")),
+                _ => ("* * * * *", "Mars/Olympus", Some("timezone: ")),
+            };
+            want.push((due_schedule(&s, main, f, cron, tz).await, prefix));
+        }
+        s.client.claim_due_schedules(50, &[]).await.unwrap();
+        for (id, prefix) in want {
+            let (_, _, err, ..) = stored(&s, id).await;
+            match prefix {
+                None => assert_eq!(err, None),
+                Some(p) => assert!(err.is_some_and(|e| e.starts_with(p)), "{id}"),
+            }
+        }
+        s.finish().await;
+    }
+
+    /// m15: a claim that advances a schedule clears a reason a report set earlier.
+    #[tokio::test]
+    #[ignore]
+    async fn a_claim_that_advances_clears_the_last_error() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = active_function(&s, db, main).await;
+        let id = due_schedule(&s, main, f, "* * * * *", "UTC").await;
+        set_error(&s, id, "cron: stale").await;
+        s.client.claim_due_schedules(50, &[]).await.unwrap();
+        let (en, next, err, ..) = stored(&s, id).await;
+        assert!(en && next.is_some());
+        assert_eq!(err, None);
+        s.finish().await;
+    }
+
+    /// m15: a successful update clears `last_error` (a user's own disable too); a refused one
+    /// changes nothing.
+    #[tokio::test]
+    #[ignore]
+    async fn a_successful_update_clears_the_last_error() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let id = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        set_error(&s, id, "cron: stale").await;
+        let fixed = c.update_schedule(main, f, id, Some("5 * * * *"), None, None).await.unwrap().unwrap();
+        assert_eq!(fixed.last_error, None);
+        assert_eq!(stored(&s, id).await.2, None);
+        let healthy = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        let off = c.update_schedule(main, f, healthy, None, None, Some(false)).await.unwrap().unwrap();
+        assert_eq!((off.enabled, off.last_error), (false, None), "a user's own disable is not an error");
+        s.finish().await;
+    }
+
+    /// m15 (failure path): an update that fails validation leaves `last_error`, `enabled` and
+    /// `next_run_at` as they were.
+    #[tokio::test]
+    #[ignore]
+    async fn a_refused_update_changes_nothing() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let id = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        sqlx::query("UPDATE function_schedules SET cron = '0 0 * * jan', enabled = false, next_run_at = NULL WHERE id = $1")
+            .bind(id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        set_error(&s, id, "cron: not a 5-field cron (x)").await;
+        let before = stored(&s, id).await;
+        for (cron, tz) in [(None, Some("Europe/London")), (Some("nope"), None), (None, Some("Mars/Olympus"))] {
+            c.update_schedule(main, f, id, cron, tz, Some(true)).await.unwrap_err();
+            assert_eq!(stored(&s, id).await, before);
+        }
+        s.finish().await;
+    }
+
+    /// m15: a PATCH that succeeds on a schedule with no upcoming time clears the reason, and
+    /// the next claim sets `no upcoming time` again.
+    #[tokio::test]
+    #[ignore]
+    async fn an_enabled_schedule_with_no_time_gets_its_reason_back() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = active_function(&s, db, main).await;
+        let id = due_schedule(&s, main, f, "0 0 30 2 *", "UTC").await;
+        s.client.claim_due_schedules(50, &[]).await.unwrap();
+        assert_eq!(stored(&s, id).await.2.as_deref(), Some("no upcoming time"));
+        // Turned on again with the same cron: it parses, so the PATCH succeeds and clears.
+        let on = s.client.update_schedule(main, f, id, None, None, Some(true)).await.unwrap().unwrap();
+        assert_eq!((on.enabled, on.last_error), (true, None));
+        sqlx::query("UPDATE function_schedules SET next_run_at = NULL WHERE id = $1")
+            .bind(id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        s.client.claim_due_schedules(50, &[]).await.unwrap();
+        let (en, next, err, ..) = stored(&s, id).await;
+        assert_eq!((en, next, err.as_deref()), (false, None, Some("no upcoming time")));
+        s.finish().await;
+    }
+
+    fn fault(id: Uuid, cron: &str, tz: &str, problem: ScheduleProblem) -> ScheduleFault {
+        ScheduleFault { id, cron: cron.into(), timezone: tz.into(), problem }
+    }
+
+    /// m15: the report's write changes only `last_error`, ignores an unknown id and an empty
+    /// list.
+    #[tokio::test]
+    #[ignore]
+    async fn record_schedule_errors_sets_only_the_reason() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        let before = stored(&s, id).await;
+        s.client.record_schedule_errors(&[]).await.unwrap();
+        let problem = ScheduleProblem::Invalid(ScheduleError::Cron("not a 5-field cron (x)".into()));
+        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", problem.clone())]).await.unwrap();
+        let after = stored(&s, id).await;
+        assert_eq!(after.2.as_deref(), Some("cron: not a 5-field cron (x)"));
+        assert_eq!((after.0, after.1, after.3, after.4), (before.0, before.1, before.3, before.4));
+        s.finish().await;
+    }
+
+    /// m15 (failure path): an unknown id is ignored (the known one in the same call is still
+    /// written).
+    #[tokio::test]
+    #[ignore]
+    async fn an_unknown_id_is_ignored() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        s.client
+            .record_schedule_errors(&[
+                fault(Uuid::new_v4(), "0 * * * *", "UTC", ScheduleProblem::NoUpcomingTime),
+                fault(id, "0 * * * *", "UTC", ScheduleProblem::NoUpcomingTime),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(stored(&s, id).await.2.as_deref(), Some("no upcoming time"));
+        s.finish().await;
+    }
+
+    /// m15 (failure path): a reason over 500 characters is cut, not refused, and multibyte
+    /// text is counted in characters (as the CHECK's `length()` does).
+    #[tokio::test]
+    #[ignore]
+    async fn an_overlong_reason_is_truncated_not_refused() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        let long = ScheduleProblem::Invalid(ScheduleError::Timezone("z".repeat(2000)));
+        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", long)]).await.unwrap();
+        let (_, _, err, ..) = stored(&s, id).await;
+        let err = err.unwrap();
+        assert_eq!(err.chars().count(), 500);
+        assert!(err.starts_with("timezone: zzz"));
+        s.finish().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_multibyte_overlong_reason_passes_the_check() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        let long = ScheduleProblem::Invalid(ScheduleError::Timezone("é€😀".repeat(400)));
+        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", long)]).await.unwrap();
+        let (_, _, err, ..) = stored(&s, id).await;
+        assert_eq!(err.unwrap().chars().count(), 500);
+        let stored_len: i32 = sqlx::query_scalar("SELECT length(last_error) FROM function_schedules WHERE id = $1")
+            .bind(id)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored_len, 500);
+        s.finish().await;
+    }
+
+    /// m15 (failure path): a PATCH between the report's read and its write leaves the fixed
+    /// schedule alone: the write only matches a row with the cron and zone it was computed from.
+    #[tokio::test]
+    #[ignore]
+    async fn a_stale_report_does_not_overwrite_a_fixed_schedule() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let id = c.add_schedule(&a_schedule(main, f)).await.unwrap();
+        sqlx::query("UPDATE function_schedules SET cron = '0 0 * * jan', enabled = false, next_run_at = NULL WHERE id = $1")
+            .bind(id)
+            .execute(s.pool())
+            .await
+            .unwrap();
+        let read = Schedule::parse("0 0 * * jan", "UTC").unwrap_err();
+        c.update_schedule(main, f, id, Some("0 9 * * MON"), None, Some(true)).await.unwrap();
+        c.record_schedule_errors(&[fault(id, "0 0 * * jan", "UTC", ScheduleProblem::Invalid(read.clone()))])
+            .await
+            .unwrap();
+        let (en, next, err, cron, _) = stored(&s, id).await;
+        assert!(en && next.is_some() && cron == "0 9 * * MON");
+        assert_eq!(err, None, "the stale reason was not written");
+        // A change of zone alone is a mismatch too.
+        c.update_schedule(main, f, id, None, Some("Europe/London"), None).await.unwrap();
+        c.record_schedule_errors(&[fault(id, "0 9 * * MON", "UTC", ScheduleProblem::NoUpcomingTime)]).await.unwrap();
+        assert_eq!(stored(&s, id).await.2, None);
+        s.finish().await;
+    }
+
+    /// m15: two reports, a claim and an update on overlapping rows all finish (the report takes
+    /// only schedule row locks, in id order).
+    #[tokio::test]
+    #[ignore]
+    async fn a_report_racing_a_claim_and_an_update_does_not_deadlock() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = active_function(&s, db, main).await;
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(due_schedule(&s, main, f, "* * * * *", "UTC").await);
+        }
+        let faults = |reverse: bool| {
+            let mut v: Vec<ScheduleFault> =
+                ids.iter().map(|id| fault(*id, "* * * * *", "UTC", ScheduleProblem::NoUpcomingTime)).collect();
+            if reverse {
+                v.reverse();
+            }
+            v
+        };
+        for _ in 0..10 {
+            let (a, b) = (s.client.clone(), s.client.clone());
+            let (c1, c2) = (s.client.clone(), s.client.clone());
+            let (fa, fb) = (faults(false), faults(true));
+            let target = ids[3];
+            let results = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::join!(
+                    tokio::spawn(async move { a.record_schedule_errors(&fa).await }),
+                    tokio::spawn(async move { b.record_schedule_errors(&fb).await }),
+                    tokio::spawn(async move { c1.claim_due_schedules(50, &[]).await.map(drop) }),
+                    tokio::spawn(async move { c2.update_schedule(main, f, target, Some("*/7 * * * *"), None, None).await.map(drop) }),
+                )
+            })
+            .await
+            .expect("no deadlock");
+            for r in [results.0.unwrap(), results.1.unwrap(), results.2.unwrap(), results.3.unwrap()] {
+                r.unwrap();
+            }
+        }
+        s.finish().await;
+    }
+
+    /// m15: a branch copy carries `last_error`.
+    #[tokio::test]
+    #[ignore]
+    async fn copying_a_branch_copies_the_last_error() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        set_error(&s, id, "timezone: unknown IANA time zone \"X\"").await;
+        let child = s.branch(db, main, "dev").await;
+        let copied = s.client.list_schedules(child).await.unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].last_error.as_deref(), Some("timezone: unknown IANA time zone \"X\""));
+        s.finish().await;
+    }
+
+    /// m15: a reset and a restore leave the branch's `last_error` as it was; the backup branch
+    /// has no schedules.
+    #[tokio::test]
+    #[ignore]
+    async fn a_reset_keeps_the_last_error() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        set_error(&s, id, "cron: kept").await;
+        let c = &s.client;
+        for restore in [false, true] {
+            assert!(c.set_branch_status(main, &[BranchStatus::Ready], BranchStatus::Resetting).await.unwrap());
+            let pending = format!("tl-{restore}");
+            assert!(c.set_pending_timeline(main, Some(&pending)).await.unwrap());
+            let backup = BranchId::new();
+            let switched = if restore {
+                c.switch_to_restored_timeline(main, &pending, backup, "main-before", "0/1").await
+            } else {
+                c.switch_to_pending_timeline(main, &pending, None, "0/1").await
+            };
+            assert!(switched.unwrap());
+            assert_eq!(stored(&s, id).await.2.as_deref(), Some("cron: kept"));
+            if restore {
+                assert!(c.list_schedules(backup).await.unwrap().is_empty(), "the backup has no schedules");
+            }
+            s.ready(main).await;
+        }
         s.finish().await;
     }
 

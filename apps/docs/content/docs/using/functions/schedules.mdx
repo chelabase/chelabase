@@ -23,6 +23,7 @@ curl -X DELETE "$BASE/$SCHEDULE_ID" -H "Authorization: Bearer $MEMBER_TOKEN"
 - `cron`: five fields (minute, hour, day of month, month, day of week), so the finest grain is a minute.
 - `timezone`: an IANA name such as `Europe/London`. Default `UTC`. The cron is read in that zone, including its daylight-saving changes.
 - `enabled`: a disabled schedule never runs. A schedule lists its `next_run_at`.
+- `last_error`: `null` normally. When the worker switches a schedule off because its cron or time zone no longer parses, or because it has no upcoming time, `last_error` says why (for example `cron: not a 5-field cron (…)`, `timezone: unknown IANA time zone "…"` or `no upcoming time`). It is cleared when the schedule next gets a next time: on a worker pass that advances it, or on a PATCH that succeeds. You can't set it, and turning a schedule off yourself leaves it `null`.
 - An invalid cron or time zone answers 422 naming the field.
 - Day and month names (`MON-FRI`, `JAN`) work only in their own field; see [Cron strings that changed](#cron-strings-that-changed).
 - A function has at most 20 schedules on a branch; adding a 21st answers 409 `conflict`.
@@ -50,7 +51,7 @@ chelabase functions schedule list NAME
 
 ## Cron strings that changed
 
-Moving to croner 5.0.0 changed what a cron means in these cases. A cron that is no longer accepted answers 422 with `field` `cron` when you create or change a schedule, and that includes a PATCH that sends only `enabled` or `timezone` for a schedule whose stored cron is now rejected. A schedule already stored with such a cron is **disabled at its next due time**: it does not run, its `next_run_at` is cleared, it is still listed (shown disabled) and the worker logs a warning with its id. Send a valid `cron` in a PATCH to repair it and turn it back on.
+Moving to croner 5.0.0 changed what a cron means in these cases. A cron that is no longer accepted answers 422 with `field` `cron` when you create or change a schedule, and that includes a PATCH that sends only `enabled` or `timezone` for a schedule whose stored cron is now rejected. A schedule already stored with such a cron is **disabled at its next due time**: it does not run, its `next_run_at` is cleared, it is still listed (shown disabled, with the reason in `last_error`) and the worker logs a warning with its id. Send a valid `cron` in a PATCH to repair it and turn it back on.
 
 | Cron | Before | Now |
 |---|---|---|

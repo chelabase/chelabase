@@ -112,6 +112,11 @@ struct ScheduleView {
     /// When it runs next.
     #[schema(required = true)]
     next_run_at: Option<DateTime<Utc>>,
+    /// Why the schedule was switched off, `null` normally: the cron or time zone no longer
+    /// parses, or it has no upcoming time. Cleared when the schedule next gets a time (a
+    /// worker pass, or a successful change).
+    #[schema(required = true)]
+    last_error: Option<String>,
 }
 
 impl From<ScheduleRecord> for ScheduleView {
@@ -122,6 +127,7 @@ impl From<ScheduleRecord> for ScheduleView {
             timezone: s.timezone,
             enabled: s.enabled,
             next_run_at: s.next_run_at,
+            last_error: s.last_error,
         }
     }
 }
@@ -281,6 +287,7 @@ where
                 timezone: timezone.to_owned(),
                 enabled: true,
                 next_run_at,
+                last_error: None,
             };
             Ok((StatusCode::CREATED, Json(view)).into_response())
         }

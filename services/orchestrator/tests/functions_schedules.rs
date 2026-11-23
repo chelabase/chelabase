@@ -334,6 +334,93 @@ mod functions_schedules {
         }
     }
 
+    /// Sets `last_error` on every schedule of the fake, as a claim or the startup report would.
+    fn set_last_error(w: &World, why: &str) {
+        for s in w.w.metadata.functions.lock().unwrap().schedules.iter_mut() {
+            s.last_error = Some(why.to_owned());
+        }
+    }
+
+    /// m15: every schedule carries `last_error`, `null` for a healthy one, the reason once set,
+    /// and a successful PATCH with a valid cron clears it.
+    #[tokio::test]
+    async fn schedules_carry_last_error() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let base = w.path(w.w.dev, "/hello/schedules");
+        let (status, made) = w
+            .call("dee", "POST", &base, Some(json!({"cron": "0 * * * *"}).to_string()))
+            .await;
+        assert_eq!(status, 201, "{made}");
+        assert_eq!(made.get("last_error"), Some(&Value::Null), "create: {made}");
+        let id = made["id"].as_str().unwrap().to_string();
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!(list[0].get("last_error"), Some(&Value::Null), "{list}");
+
+        set_last_error(&w, "cron: not a 5-field cron (x)");
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!(list[0]["last_error"], "cron: not a 5-field cron (x)");
+
+        let (status, off) = w
+            .call("dee", "PATCH", &format!("{base}/{id}"), Some(json!({"cron": "5 * * * *"}).to_string()))
+            .await;
+        assert_eq!(status, 200, "{off}");
+        assert_eq!(off.get("last_error"), Some(&Value::Null), "update: {off}");
+    }
+
+    /// m15: a body naming `last_error` is refused and the stored reason stays.
+    #[tokio::test]
+    async fn a_request_cannot_set_last_error() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let id = w.schedule(w.w.dev, "hello").await;
+        let base = w.path(w.w.dev, "/hello/schedules");
+        set_last_error(&w, "timezone: unknown IANA time zone \"X\"");
+        for (method, path, body) in [
+            ("POST", base.clone(), json!({"cron": "* * * * *", "last_error": "x"})),
+            ("PATCH", format!("{base}/{id}"), json!({"enabled": false, "last_error": null})),
+        ] {
+            let (status, err) = w.call("dee", method, &path, Some(body.to_string())).await;
+            assert_eq!(status, 422, "{method}: {err}");
+        }
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1, "nothing was added");
+        assert_eq!(list[0]["last_error"], "timezone: unknown IANA time zone \"X\"");
+        assert_eq!(list[0]["enabled"], true, "the refused PATCH changed nothing");
+    }
+
+    /// m15: a Viewer reads `last_error`.
+    #[tokio::test]
+    async fn a_viewer_sees_last_error() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        w.schedule(w.w.dev, "hello").await;
+        set_last_error(&w, "no upcoming time");
+        let (status, list) = w
+            .call("vic", "GET", &w.path(w.w.dev, "/hello/schedules"), None)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(list[0]["last_error"], "no upcoming time");
+    }
+
+    /// m15: another database's branch is 404 and no error body carries the reason.
+    #[tokio::test]
+    async fn another_databases_schedule_is_404_without_last_error() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let id = w.schedule(w.w.dev, "hello").await;
+        set_last_error(&w, "cron: secret-reason");
+        let mut other = sample_database(w.w.tenant);
+        other.project_id = w.w.project;
+        let other_main = other.main.id;
+        w.w.metadata.insert_database(other);
+        for (method, path, body, _) in routes(&w, other_main, &id) {
+            let (status, text) = w.call("dee", method, &path, body).await;
+            assert_eq!(status, 404, "{method} {path}: {text}");
+            assert!(!text.to_string().contains("secret-reason") && text.get("last_error").is_none(), "{text}");
+        }
+    }
+
     /// A schedule is only reachable under its own function, and an unknown function is 404.
     #[tokio::test]
     async fn functions_schedules_of_another_function_404() {
