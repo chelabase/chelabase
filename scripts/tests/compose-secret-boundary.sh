@@ -593,7 +593,7 @@ for render in "${renders[@]}"; do
   rt="$(jq -c '.services["mcp-runtime"] // {} | {volumes: (.volumes // []), ports: (.ports // []), expose: (.expose // []),
     secrets: (.secrets // []), environment: (.environment // {}), env_file: (.env_file // []), volumes_from: (.volumes_from // []),
     user, read_only, cap_drop, security_opt, restart, privileged: (.privileged // false), network_mode: (.network_mode // null),
-    pids: (.pids_limit != null), mem: (.mem_limit != null and .mem_limit == .memswap_limit)}' "$f")"
+    pids: (.pids_limit == 256), mem: (.mem_limit != null and .mem_limit == .memswap_limit)}' "$f")"
   [[ "$rt" == '{"volumes":[],"ports":[],"expose":[],"secrets":[],"environment":{},"env_file":[],"volumes_from":[],"user":"65532:65532","read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"restart":"always","privileged":false,"network_mode":null,"pids":true,"mem":true}' ]] ||
     err "$render: mcp-runtime holds nothing and is hardened like the functions runtime: got $rt"
   # Its host service is mcp's internal listener, on the sandbox network's alias.
