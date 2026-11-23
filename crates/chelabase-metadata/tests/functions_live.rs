@@ -15,7 +15,7 @@ mod functions {
         BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
         KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, RunAsMint, RunAsUnmintable,
-        Schedule, ScheduleError, ScheduleFault, ScheduleProblem,
+        Schedule, ScheduleError, ScheduleProblem,
         TriggerDelivery, TriggerInstall, TriggerSource,
         TriggerState,
     };
@@ -1815,13 +1815,7 @@ mod functions {
             ("delete_schedule", |c, x| Box::pin(async move { c.delete_schedule(x.main, x.f, x.schedule).await.map(drop) })),
             ("claim_due_schedules", |c, _| Box::pin(async move { c.claim_due_schedules(50, &[]).await.map(drop) })),
             ("record_schedule_errors", |c, x| Box::pin(async move {
-                c.record_schedule_errors(&[ScheduleFault {
-                    id: x.schedule,
-                    cron: "0 * * * *".into(),
-                    timezone: "UTC".into(),
-                    problem: ScheduleProblem::NoUpcomingTime,
-                }])
-                .await
+                c.record_schedule_errors(&[x.schedule]).await
             })),
             ("set_service_signing_secret", |c, x| Box::pin(async move { c.set_service_signing_secret(x.db, x.f, "whsec_x").await.map(drop) })),
             ("set_service_health", |c, x| Box::pin(async move { c.set_service_health(x.deployment, false).await })),
@@ -2317,12 +2311,12 @@ mod functions {
     async fn the_last_error_migration_leaves_existing_schedules_null() {
         let s = Scratch::empty().await;
         let full = sqlx::migrate!("./migrations");
-        let version = full
-            .migrations
-            .iter()
-            .find(|m| m.description.ends_with("function_schedule_last_error"))
-            .expect("the last_error migration exists")
-            .version;
+        // Looked up by version: sqlx turns the file name's underscores into spaces.
+        let version = 20261123000001;
+        assert!(
+            full.migrations.iter().any(|m| m.version == version && m.description == "function schedule last error"),
+            "the last_error migration exists"
+        );
         let latest_before = full.migrations.iter().map(|m| m.version).filter(|v| *v < version).max().unwrap();
         assert_eq!(latest_before, 20261116000001, "it sorts after every earlier migration");
         let mut before = sqlx::migrate!("./migrations");
@@ -2501,12 +2495,18 @@ mod functions {
         s.finish().await;
     }
 
-    fn fault(id: Uuid, cron: &str, tz: &str, problem: ScheduleProblem) -> ScheduleFault {
-        ScheduleFault { id, cron: cron.into(), timezone: tz.into(), problem }
+    async fn set_cron(s: &Scratch, id: Uuid, cron: &str, tz: &str) {
+        sqlx::query("UPDATE function_schedules SET cron = $2, timezone = $3 WHERE id = $1")
+            .bind(id)
+            .bind(cron)
+            .bind(tz)
+            .execute(s.pool())
+            .await
+            .unwrap();
     }
 
-    /// m15: the report's write changes only `last_error`, ignores an unknown id and an empty
-    /// list.
+    /// m15: the report's write changes only `last_error`, to the parser's own reason for the
+    /// row's stored cron, and ignores an empty list.
     #[tokio::test]
     #[ignore]
     async fn record_schedule_errors_sets_only_the_reason() {
@@ -2514,13 +2514,22 @@ mod functions {
         let (db, main) = s.database().await;
         let f = s.function(db, "hello").await;
         let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        set_cron(&s, id, "0 0 * * jan", "UTC").await;
         let before = stored(&s, id).await;
         s.client.record_schedule_errors(&[]).await.unwrap();
-        let problem = ScheduleProblem::Invalid(ScheduleError::Cron("not a 5-field cron (x)".into()));
-        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", problem.clone())]).await.unwrap();
+        s.client.record_schedule_errors(&[id, id]).await.unwrap();
         let after = stored(&s, id).await;
-        assert_eq!(after.2.as_deref(), Some("cron: not a 5-field cron (x)"));
+        let want = Schedule::parse("0 0 * * jan", "UTC").unwrap_err().to_string();
+        assert!(want.starts_with("cron: "), "{want}");
+        assert_eq!(after.2, Some(want));
         assert_eq!((after.0, after.1, after.3, after.4), (before.0, before.1, before.3, before.4));
+        // A zone that no longer parses, and a cron with no time left.
+        set_cron(&s, id, "0 * * * *", "Mars/Olympus").await;
+        s.client.record_schedule_errors(&[id]).await.unwrap();
+        assert!(stored(&s, id).await.2.unwrap().starts_with("timezone: "));
+        set_cron(&s, id, "0 0 30 2 *", "UTC").await;
+        s.client.record_schedule_errors(&[id]).await.unwrap();
+        assert_eq!(stored(&s, id).await.2.as_deref(), Some("no upcoming time"));
         s.finish().await;
     }
 
@@ -2533,35 +2542,16 @@ mod functions {
         let (db, main) = s.database().await;
         let f = s.function(db, "hello").await;
         let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
-        s.client
-            .record_schedule_errors(&[
-                fault(Uuid::new_v4(), "0 * * * *", "UTC", ScheduleProblem::NoUpcomingTime),
-                fault(id, "0 * * * *", "UTC", ScheduleProblem::NoUpcomingTime),
-            ])
-            .await
-            .unwrap();
+        set_cron(&s, id, "0 0 30 2 *", "UTC").await;
+        s.client.record_schedule_errors(&[Uuid::new_v4(), id]).await.unwrap();
         assert_eq!(stored(&s, id).await.2.as_deref(), Some("no upcoming time"));
         s.finish().await;
     }
 
-    /// m15 (failure path): a reason over 500 characters is cut, not refused, and multibyte
-    /// text is counted in characters (as the CHECK's `length()` does).
-    #[tokio::test]
-    #[ignore]
-    async fn an_overlong_reason_is_truncated_not_refused() {
-        let s = Scratch::new().await;
-        let (db, main) = s.database().await;
-        let f = s.function(db, "hello").await;
-        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
-        let long = ScheduleProblem::Invalid(ScheduleError::Timezone("z".repeat(2000)));
-        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", long)]).await.unwrap();
-        let (_, _, err, ..) = stored(&s, id).await;
-        let err = err.unwrap();
-        assert_eq!(err.chars().count(), 500);
-        assert!(err.starts_with("timezone: zzz"));
-        s.finish().await;
-    }
-
+    /// m15 (failure path): a reason cut to 500 characters passes the column's CHECK, multibyte
+    /// text included (cut in characters, as the CHECK's `length()` counts). A stored cron or
+    /// zone can't give a reason that long today (the parser caps both first), so the cut
+    /// reason is written directly.
     #[tokio::test]
     #[ignore]
     async fn a_multibyte_overlong_reason_passes_the_check() {
@@ -2569,21 +2559,23 @@ mod functions {
         let (db, main) = s.database().await;
         let f = s.function(db, "hello").await;
         let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
-        let long = ScheduleProblem::Invalid(ScheduleError::Timezone("é€😀".repeat(400)));
-        s.client.record_schedule_errors(&[fault(id, "0 * * * *", "UTC", long)]).await.unwrap();
-        let (_, _, err, ..) = stored(&s, id).await;
-        assert_eq!(err.unwrap().chars().count(), 500);
-        let stored_len: i32 = sqlx::query_scalar("SELECT length(last_error) FROM function_schedules WHERE id = $1")
-            .bind(id)
-            .fetch_one(s.pool())
-            .await
-            .unwrap();
-        assert_eq!(stored_len, 500);
+        for long in ["z".repeat(2000), "é€😀".repeat(400)] {
+            let reason = ScheduleProblem::Invalid(ScheduleError::Timezone(long)).reason();
+            assert_eq!(reason.chars().count(), 500);
+            set_error(&s, id, &reason).await;
+            let stored_len: i32 = sqlx::query_scalar("SELECT length(last_error) FROM function_schedules WHERE id = $1")
+                .bind(id)
+                .fetch_one(s.pool())
+                .await
+                .unwrap();
+            assert_eq!(stored_len, 500);
+        }
         s.finish().await;
     }
 
     /// m15 (failure path): a PATCH between the report's read and its write leaves the fixed
-    /// schedule alone: the write only matches a row with the cron and zone it was computed from.
+    /// schedule alone, and a row changed to another broken cron gets that cron's reason: the
+    /// write derives the reason from what the row holds under its lock.
     #[tokio::test]
     #[ignore]
     async fn a_stale_report_does_not_overwrite_a_fixed_schedule() {
@@ -2597,23 +2589,28 @@ mod functions {
             .execute(s.pool())
             .await
             .unwrap();
-        let read = Schedule::parse("0 0 * * jan", "UTC").unwrap_err();
+        // The report read the row broken; a PATCH fixes it before the write.
         c.update_schedule(main, f, id, Some("0 9 * * MON"), None, Some(true)).await.unwrap();
-        c.record_schedule_errors(&[fault(id, "0 0 * * jan", "UTC", ScheduleProblem::Invalid(read.clone()))])
-            .await
-            .unwrap();
+        c.record_schedule_errors(&[id]).await.unwrap();
         let (en, next, err, cron, _) = stored(&s, id).await;
         assert!(en && next.is_some() && cron == "0 9 * * MON");
         assert_eq!(err, None, "the stale reason was not written");
-        // A change of zone alone is a mismatch too.
+        // A change of zone alone that parses is fixed too.
         c.update_schedule(main, f, id, None, Some("Europe/London"), None).await.unwrap();
-        c.record_schedule_errors(&[fault(id, "0 9 * * MON", "UTC", ScheduleProblem::NoUpcomingTime)]).await.unwrap();
+        c.record_schedule_errors(&[id]).await.unwrap();
         assert_eq!(stored(&s, id).await.2, None);
+        // Broken differently since the read: the reason is the row's current one.
+        set_cron(&s, id, "0 9 * * MON", "Mars/Olympus").await;
+        c.record_schedule_errors(&[id]).await.unwrap();
+        assert_eq!(
+            stored(&s, id).await.2,
+            Some(Schedule::parse("0 9 * * MON", "Mars/Olympus").unwrap_err().to_string())
+        );
         s.finish().await;
     }
 
-    /// m15: two reports, a claim and an update on overlapping rows all finish (the report takes
-    /// only schedule row locks, in id order).
+    /// m15: two reports, a claim, an update and a branch purge on overlapping rows all finish
+    /// (the report waits on no row lock, so it closes no cycle with the others).
     #[tokio::test]
     #[ignore]
     async fn a_report_racing_a_claim_and_an_update_does_not_deadlock() {
@@ -2621,21 +2618,22 @@ mod functions {
         let (db, main) = s.database().await;
         let f = active_function(&s, db, main).await;
         let mut ids = Vec::new();
-        for _ in 0..8 {
-            ids.push(due_schedule(&s, main, f, "* * * * *", "UTC").await);
+        for n in 0..8 {
+            // Half have no time left, so the report writes them and the claim disables them.
+            let cron = if n % 2 == 0 { "* * * * *" } else { "0 0 30 2 *" };
+            ids.push(due_schedule(&s, main, f, cron, "UTC").await);
         }
-        let faults = |reverse: bool| {
-            let mut v: Vec<ScheduleFault> =
-                ids.iter().map(|id| fault(*id, "* * * * *", "UTC", ScheduleProblem::NoUpcomingTime)).collect();
-            if reverse {
-                v.reverse();
-            }
-            v
-        };
-        for _ in 0..10 {
+        for n in 0..10 {
+            // A child branch copies main's schedules; the purge deletes them while the others
+            // run on them too.
+            let child = s.branch(db, main, &format!("dev-{n}")).await;
+            let mut all = ids.clone();
+            all.extend(s.client.list_schedules(child).await.unwrap().into_iter().map(|r| r.id));
             let (a, b) = (s.client.clone(), s.client.clone());
-            let (c1, c2) = (s.client.clone(), s.client.clone());
-            let (fa, fb) = (faults(false), faults(true));
+            let (c1, c2, c3) = (s.client.clone(), s.client.clone(), s.client.clone());
+            let fa = all.clone();
+            let mut fb = all.clone();
+            fb.reverse();
             let target = ids[3];
             let results = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::join!(
@@ -2643,14 +2641,81 @@ mod functions {
                     tokio::spawn(async move { b.record_schedule_errors(&fb).await }),
                     tokio::spawn(async move { c1.claim_due_schedules(50, &[]).await.map(drop) }),
                     tokio::spawn(async move { c2.update_schedule(main, f, target, Some("*/7 * * * *"), None, None).await.map(drop) }),
+                    tokio::spawn(async move { c3.mark_branch_deleted(child).await }),
                 )
             })
             .await
             .expect("no deadlock");
-            for r in [results.0.unwrap(), results.1.unwrap(), results.2.unwrap(), results.3.unwrap()] {
+            for r in [results.0.unwrap(), results.1.unwrap(), results.2.unwrap(), results.3.unwrap(), results.4.unwrap()] {
                 r.unwrap();
             }
         }
+        s.finish().await;
+    }
+
+    /// m15 audit S1: a report and a branch purge on the same rows both finish. The purge's
+    /// DELETE locks in physical order; a report that waited on row locks in id order could
+    /// close a cycle with it (40P01). Rows `i < k - 1` in physical order with `id(i) > id(k)`;
+    /// a blocker holds row `i + 1`, so the purge holds `i` and waits; the report then takes
+    /// `k` and reaches `i`; the blocker lets go and the purge reaches `k`.
+    #[tokio::test]
+    #[ignore]
+    async fn a_report_racing_a_branch_purge_does_not_deadlock() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        for _ in 0..8 {
+            let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+            sqlx::query("UPDATE function_schedules SET cron = '0 0 * * jan' WHERE id = $1")
+                .bind(id)
+                .execute(s.pool())
+                .await
+                .unwrap();
+        }
+        let physical: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM function_schedules WHERE branch_id = $1 ORDER BY ctid")
+                .bind(main.as_uuid())
+                .fetch_all(s.pool())
+                .await
+                .unwrap();
+        let (i, k) = (0..physical.len())
+            .flat_map(|i| (i + 2..physical.len()).map(move |k| (i, k)))
+            .find(|&(i, k)| physical[i] > physical[k])
+            .expect("8 random ids are not all in physical order");
+        let mut blocker = s.pool().begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM function_schedules WHERE id = $1 FOR UPDATE")
+            .bind(physical[i + 1])
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let c = s.client.clone();
+        let purge = tokio::spawn(async move { c.mark_branch_deleted(main).await });
+        settle(&s, &[&purge]).await;
+        let c = s.client.clone();
+        let (ri, rk) = (physical[i], physical[k]);
+        let report = tokio::spawn(async move {
+            c.record_schedule_errors(&[ri, rk]).await
+        });
+        settle(&s, &[&purge, &report]).await;
+        blocker.commit().await.unwrap();
+        let (p, r) = tokio::time::timeout(std::time::Duration::from_secs(30), async { (purge.await.unwrap(), report.await.unwrap()) })
+            .await
+            .expect("both finish");
+        assert!(p.is_ok() && r.is_ok(), "purge: {p:?}; report: {r:?}");
+        s.finish().await;
+    }
+
+    /// m15 audit S2: the report can't store text of the caller's choosing (it passes only
+    /// ids), and on a schedule that parses and has a next time nothing is written.
+    #[tokio::test]
+    #[ignore]
+    async fn a_report_on_a_healthy_schedule_writes_nothing() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let id = s.client.add_schedule(&a_schedule(main, f)).await.unwrap();
+        s.client.record_schedule_errors(&[id]).await.unwrap();
+        assert_eq!(stored(&s, id).await.2, None);
         s.finish().await;
     }
 

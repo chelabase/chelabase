@@ -20,7 +20,7 @@
 //! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes; a rollover's guarded switch) | branch create copies (insert), tombstone purge (delete) |
-//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone; `record_schedule_errors` `FOR UPDATE` in `id` order, alone (no branch or function row) | branch create copies (insert), tombstone purge (delete) |
+//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone; `record_schedule_errors` `FOR UPDATE SKIP LOCKED`, alone (no branch or function row), then updates only the rows it locked: it waits on no row lock, so it closes no wait cycle with any writer, a tombstone purge's `DELETE` (physical order) included | branch create copies (insert), tombstone purge (delete) |
 //! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
@@ -40,7 +40,9 @@
 //! takes a `service_health` row (beside 3, written by nobody else) and, inserting it, its
 //! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
 //! worker's schedule claim ([`MetadataClient::claim_due_schedules`]) locks schedule rows (4a)
-//! alone, skipping any another transaction holds, and takes nothing after them.
+//! alone, skipping any another transaction holds, and takes nothing after them; so does the
+//! startup report's [`MetadataClient::record_schedule_errors`]. A writer that never waits on a
+//! row lock can't be part of a wait cycle, whatever order the others take the rows in.
 //! `add_schedule` and `add_trigger` (m13b) take a transaction advisory lock, `fn-schedules:` /
 //! `fn-triggers:{branch}:{function}`, the same shape and place as `put_secret`'s: after the
 //! per-branch locks (1 to 3) and before anything else, so two adds can't each pass the
@@ -70,7 +72,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::schedule::{Schedule, ScheduleProblem, advance};
+use crate::schedule::{Schedule, advance, next_run};
 use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
@@ -272,19 +274,8 @@ pub struct ScheduleRecord {
     pub timezone: String,
     pub next_run_at: Option<DateTime<Utc>>,
     pub enabled: bool,
-    /// Why the schedule was switched off (see [`ScheduleProblem`]); `None` normally.
+    /// Why the schedule was switched off (see [`crate::ScheduleProblem`]); `None` normally.
     pub last_error: Option<String>,
-}
-
-/// A schedule the startup report found unable to run: the `cron` and `timezone` it parsed
-/// and the parser's typed problem. [`MetadataClient::record_schedule_errors`] writes only the
-/// problem's text, and only while the row still has this cron and time zone.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduleFault {
-    pub id: Uuid,
-    pub cron: String,
-    pub timezone: String,
-    pub problem: ScheduleProblem,
 }
 
 /// One schedule as the startup report reads it ([`MetadataClient::list_schedules_for_report`]).
@@ -1967,57 +1958,52 @@ impl MetadataClient {
         .collect())
     }
 
-    /// The startup report's write: sets `last_error` (the problem's text, at most 500
-    /// characters) on each schedule that still has the `cron` and `timezone` the fault was
-    /// computed from, and nothing else of it. An unknown id, or a row a PATCH changed since,
-    /// is left alone. Takes only `function_schedules` row locks (4a), in `id` order, and
-    /// nothing after them.
-    pub async fn record_schedule_errors(&self, faults: &[ScheduleFault]) -> Result<(), MetadataError> {
-        // One entry per id (the last wins), in id order.
-        let mut by_id: std::collections::BTreeMap<Uuid, &ScheduleFault> = std::collections::BTreeMap::new();
-        for f in faults {
-            by_id.insert(f.id, f);
-        }
-        let (mut ids, mut crons, mut zones, mut reasons) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (id, f) in by_id {
-            let reason = f.problem.reason();
-            if reason.is_empty() {
-                continue;
-            }
-            ids.push(id);
-            crons.push(f.cron.clone());
-            zones.push(f.timezone.clone());
-            reasons.push(reason);
-        }
+    /// The startup report's write, for the schedules it found unable to run. It doesn't take
+    /// the report's reasons: under the row lock it derives each row's own from its stored
+    /// `cron` and `timezone` ([`next_run`]) and writes only `last_error`, so the text is always
+    /// the parser's for exactly what the row holds. A row that parses and has a next time (a
+    /// PATCH fixed it since the report read it) is left alone, as is an unknown id.
+    ///
+    /// Best effort: it locks with `SKIP LOCKED` and leaves alone a row another transaction
+    /// holds, since that one is about to handle it (a claim sets its own reason, a PATCH
+    /// clears it, a purge deletes it). It takes only `function_schedules` row locks (4a),
+    /// waits on none, and takes nothing after them.
+    pub async fn record_schedule_errors(&self, ids: &[Uuid]) -> Result<(), MetadataError> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
         if ids.is_empty() {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        // Lock first, in id order, only the rows that still match: an `UPDATE … FROM` locks in
-        // plan order.
-        sqlx::query(
-            "SELECT s.id FROM function_schedules s
-             JOIN unnest($1::uuid[], $2::text[], $3::text[]) AS v(id, cron, tz)
-               ON s.id = v.id AND s.cron = v.cron AND s.timezone = v.tz
-             ORDER BY s.id FOR UPDATE OF s",
+        let rows = sqlx::query(
+            "SELECT id, cron, timezone, now() AS now FROM function_schedules
+             WHERE id = ANY($1) ORDER BY id FOR UPDATE SKIP LOCKED",
         )
         .bind(&ids)
-        .bind(&crons)
-        .bind(&zones)
         .fetch_all(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE function_schedules AS s SET last_error = v.err
-             FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[]) AS v(id, cron, tz, err)
-             WHERE s.id = v.id AND s.cron = v.cron AND s.timezone = v.tz",
-        )
-        .bind(ids)
-        .bind(crons)
-        .bind(zones)
-        .bind(reasons)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_check)?;
+        let (mut locked, mut reasons) = (Vec::new(), Vec::new());
+        for row in rows {
+            let (cron, timezone): (String, String) = (row.get("cron"), row.get("timezone"));
+            if let Err(problem) = next_run(&cron, &timezone, row.get("now")) {
+                locked.push(row.get::<Uuid, _>("id"));
+                reasons.push(problem.reason());
+            }
+        }
+        if !locked.is_empty() {
+            // Only the rows locked above: a fresh match could take a row out of order.
+            sqlx::query(
+                "UPDATE function_schedules AS s SET last_error = v.err
+                 FROM unnest($1::uuid[], $2::text[]) AS v(id, err)
+                 WHERE s.id = v.id",
+            )
+            .bind(locked)
+            .bind(reasons)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_check)?;
+        }
         tx.commit().await?;
         Ok(())
     }
