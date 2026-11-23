@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc da4e13605abd7ecabf6461f9271d184893e3b81c005390d183252a29743f5955 # shrinks to cron = "* 0 * * *", zone = "America/Vancouver", from = 2026-11-01T07:55:00Z
+cc b913a032ccb34197b03ad777a1262d19d6ea92924d4443e28aef1ee7090f8c86 # shrinks to cron = "* * * * 0L", zone = "Africa/Tripoli", from = 2000-01-01T00:00:00Z
