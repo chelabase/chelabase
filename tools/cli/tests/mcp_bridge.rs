@@ -31,6 +31,8 @@ type Script = dyn Fn(&Seen, usize) -> Answer + Send + Sync;
 struct Stub {
     seen: Mutex<Vec<Seen>>,
     mints: Mutex<Vec<String>>,
+    /// Seconds left on each minted token.
+    mint_left: u64,
     script: Box<Script>,
 }
 
@@ -68,7 +70,7 @@ async fn mcp(State(s): State<Arc<Stub>>, headers: HeaderMap, body: String) -> Re
 
 async fn mint(State(s): State<Arc<Stub>>) -> Response {
     let mut minted = s.mints.lock().unwrap();
-    let token = jwt(&format!("minted{}", minted.len() + 1), 900);
+    let token = jwt(&format!("minted{}", minted.len() + 1), s.mint_left);
     minted.push(token.clone());
     axum::Json(json!({"access_token": token})).into_response()
 }
@@ -97,9 +99,21 @@ async fn run_with(
     login: bool,
     script: impl Fn(&Seen, usize) -> Answer + Send + Sync + 'static,
 ) -> Run {
+    run_minting(args, input, login, 900, script).await
+}
+
+/// [`run_with`], with minted tokens that have `mint_left` seconds left.
+async fn run_minting(
+    args: &[&str],
+    input: &str,
+    login: bool,
+    mint_left: u64,
+    script: impl Fn(&Seen, usize) -> Answer + Send + Sync + 'static,
+) -> Run {
     let stub = Arc::new(Stub {
         seen: Mutex::default(),
         mints: Mutex::default(),
+        mint_left,
         script: Box::new(script),
     });
     let app = Router::new()
@@ -206,9 +220,78 @@ mod mcp {
                 Some("application/json, text/event-stream")
             );
         }
+        // `initialize` carries no revision header: the server negotiates from the body.
         let first = seen.iter().find(|s| s.body["id"] == 1).unwrap();
-        assert_eq!(header(first, "mcp-protocol-version"), Some(OLD));
+        assert_eq!(header(first, "mcp-protocol-version"), None);
         assert_eq!(header(first, "mcp-method"), None);
+    }
+
+    /// The server as `services/mcp` answers: an unsupported revision header is 400 with no id;
+    /// `initialize` negotiates down to one it supports.
+    fn server(s: &Seen) -> Answer {
+        let supported = [NEW, OLD];
+        if let Some(v) = header(s, "mcp-protocol-version")
+            && !supported.contains(&v)
+        {
+            let body = json!({"jsonrpc": "2.0", "error": {"code": -32022,
+                "message": "Unsupported protocol version"}});
+            return (400, "application/json", body.to_string());
+        }
+        if s.body["method"] == "initialize" {
+            let asked = s.body["params"]["protocolVersion"].as_str().unwrap();
+            let version = if supported.contains(&asked) { asked } else { OLD };
+            return ok(json!({"jsonrpc": "2.0", "id": s.body["id"],
+                "result": {"protocolVersion": version}}));
+        }
+        reply(s)
+    }
+
+    #[tokio::test]
+    async fn an_older_client_negotiates_down() {
+        let input = format!("{}{}", init("2025-06-18"), list(2));
+        let run = run_with(&[], &input, true, |s, _| server(s)).await;
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        let lines = run.lines();
+        let init = lines.iter().find(|l| l["id"] == 1).expect(&run.stdout);
+        assert_eq!(init["result"]["protocolVersion"], OLD, "{init}");
+        let listed = lines.iter().find(|l| l["id"] == 2).expect(&run.stdout);
+        assert!(listed["result"].is_object(), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_error_without_an_id_gets_the_requests() {
+        let run = run_with(&[], &list(9), true, |_, _| {
+            let body = json!({"jsonrpc": "2.0", "error": {"code": -32022, "message": "no"}});
+            (400, "application/json", body.to_string())
+        })
+        .await;
+        let lines = run.lines();
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        assert_eq!(lines[0]["id"], 9);
+        assert_eq!(lines[0]["error"]["code"], -32022);
+    }
+
+    /// A freshly minted token that is still refused for its lifetime: signing in again can't
+    /// help, so the message names the operator's setting instead.
+    #[tokio::test]
+    async fn a_token_too_short_lived_ever_to_pass_names_the_ttl() {
+        let refused = || {
+            let body = json!({"error": {"code": "unauthorized",
+                "message": "a member token with at least 70 seconds left is required",
+                "min_remaining_secs": 70}});
+            (401, "application/json", body.to_string())
+        };
+        let run = run_minting(&[], &list(7), true, 50, move |_, _| refused()).await;
+        let lines = run.lines();
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        let message = lines[0]["error"]["message"].as_str().unwrap();
+        assert!(message.contains("CHELABASE_MEMBER_ACCESS_TTL_SECS"), "{message}");
+        assert!(message.contains("70"), "{message}");
+        assert!(!message.contains("chelabase login"), "{message}");
+        // A fresh token with enough life refused all the same: signing in again may help.
+        let run = run_minting(&[], &list(7), true, 900, move |_, _| refused()).await;
+        let message = run.lines()[0]["error"]["message"].as_str().unwrap().to_owned();
+        assert!(message.contains("chelabase login"), "{message}");
     }
 
     #[tokio::test]

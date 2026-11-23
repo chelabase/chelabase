@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinSet;
 
+use crate::dev::token::seconds_left;
 use crate::login;
 
 const PARSE_ERROR: i64 = -32700;
@@ -27,12 +28,15 @@ struct Headers {
     name: Option<String>,
 }
 
-/// The headers for `msg`: its revision (from `initialize`, its `_meta`, else the one the server
-/// negotiated), and from 2026-07-28 on its method and, for a call, the tool, prompt or resource.
+/// The headers for `msg`: its revision (its `_meta`, else the one the server negotiated), and
+/// from 2026-07-28 on its method and, for a call, the tool, prompt or resource. `initialize`
+/// carries no revision header: the server negotiates from the body, so a client asking for a
+/// revision the server doesn't serve gets one it does instead of a 400.
 fn headers_for(msg: &Value, negotiated: Option<&str>) -> Headers {
     let method = msg["method"].as_str();
     let params = &msg["params"];
-    let version = if method == Some("initialize") {
+    let initialize = method == Some("initialize");
+    let version = if initialize {
         params["protocolVersion"].as_str()
     } else {
         params["_meta"][VERSION_META].as_str().or(negotiated)
@@ -44,7 +48,7 @@ fn headers_for(msg: &Value, negotiated: Option<&str>) -> Headers {
         _ => None,
     };
     Headers {
-        protocol_version: version.map(str::to_owned),
+        protocol_version: version.filter(|_| !initialize).map(str::to_owned),
         method: method.filter(|_| mirrored).map(str::to_owned),
         name: name.filter(|_| mirrored).map(str::to_owned),
     }
@@ -125,6 +129,19 @@ impl Bridge {
             }
             if attempt == 0 {
                 token = self.token(Some(&token)).await?;
+            } else {
+                // The token just obtained, refused again: say why when signing in can't help.
+                let body: Value = resp.json().await.unwrap_or_default();
+                let needed = body["error"]["min_remaining_secs"].as_u64();
+                let left = seconds_left(&token, now());
+                if let Some(needed) = needed.filter(|n| left > 0 && left < *n) {
+                    anyhow::bail!(
+                        "the instance refused a freshly issued member token: it has {left} seconds \
+left and the MCP server needs at least {needed}. Signing in again gives the same lifetime: ask the \
+operator to raise CHELABASE_MEMBER_ACCESS_TTL_SECS above {needed}, or to lower \
+CHELABASE_MCP_TIMEOUT_MS"
+                    );
+                }
             }
         }
         anyhow::bail!(
@@ -172,9 +189,19 @@ impl Bridge {
         {
             return Ok(());
         }
-        if serde_json::from_str::<Value>(&body).is_ok_and(|v| v["jsonrpc"] == "2.0") {
-            // A JSON-RPC answer, also on an error status (a refused revision, say).
-            self.emit(Some(body), initialize).await;
+        if let Ok(mut answer) = serde_json::from_str::<Value>(&body)
+            && answer["jsonrpc"] == "2.0"
+        {
+            // A JSON-RPC answer, also on an error status (a refused revision, say). An error
+            // the endpoint sent without an id (its transport checks run before it reads one)
+            // gets the request's, so the client doesn't wait for an answer forever.
+            if answer.get("error").is_some()
+                && answer.get("id").is_none_or(Value::is_null)
+                && let Some(id) = msg.get("id").filter(|id| !id.is_null())
+            {
+                answer["id"] = id.clone();
+            }
+            self.emit(Some(answer.to_string()), initialize).await;
             return Ok(());
         }
         if status.is_success() {
@@ -245,6 +272,13 @@ fn sse_data(event: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub async fn run(url: Option<String>, read_only: bool) -> Result<()> {
     let instance = login::instance(url.as_deref(), None)?;
     let http = chelabase_http::client_builder()
@@ -304,12 +338,12 @@ mod tests {
         assert_eq!(h.method.as_deref(), Some("tools/call"));
         assert_eq!(h.name.as_deref(), Some("execute"));
 
-        // The older revision carries no method or name headers; the version comes from
-        // `initialize`, then from what the server negotiated.
+        // The older revision carries no method or name headers; the version comes from what
+        // the server negotiated.
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-11-25"}});
         let h = headers_for(&init, None);
-        assert_eq!(h.protocol_version.as_deref(), Some("2025-11-25"));
+        assert_eq!(h.protocol_version, None, "initialize negotiates from the body");
         assert_eq!(h.method, None);
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let h = headers_for(&list, Some("2025-11-25"));
