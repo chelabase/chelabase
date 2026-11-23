@@ -22,9 +22,9 @@ mod functions {
     use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_secrets::SecretKey;
     use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-    use chelabase_time::{Date, Timestamp, TimestampExt};
+    use chelabase_time::{Date, DateExt, Timestamp, TimestampExt};
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{AssertSqlSafe, PgPool};
+    use sqlx::{AssertSqlSafe, PgPool, Row};
     use uuid::Uuid;
 
     /// The migration this milestone adds.
@@ -343,7 +343,7 @@ mod functions {
     }
 
     fn date() -> Date {
-        Date::from_ymd_opt(2026, 11, 1).unwrap()
+        Date::ymd(2026, 11, 1).unwrap()
     }
 
     fn sha(c: char) -> String {
@@ -920,6 +920,56 @@ mod functions {
             .await
             .unwrap();
         assert!(s.client.resolve(main, "hello").await.unwrap().is_none());
+        s.finish().await;
+    }
+
+    /// `compatibility_date` is client-filled: a row holding a year the jiff-backed `Date`
+    /// can't decode (12000, which PostgreSQL stores) must make the listing and `resolve`
+    /// return an error, never panic.
+    #[tokio::test]
+    #[ignore]
+    async fn a_compatibility_date_past_the_date_range_never_panics() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "far").await;
+        let d = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO function_deployments
+                 (id, function_id, bundle_sha256, bundle_size, spec, compatibility_date, created_by)
+             VALUES ($1, $2, $3, 1, '{}', '12000-01-01'::date, 'member-1')",
+        )
+        .bind(d)
+        .bind(f)
+        .bind(sha('c'))
+        .execute(s.pool())
+        .await
+        .unwrap();
+        s.client.set_active_deployment(main, f, d).await.unwrap();
+        assert!(s.client.set_enabled(main, f, true).await.unwrap());
+
+        // The premise: decoded the way the jiff backing does, the stored date is out of range.
+        let row = sqlx::query("SELECT compatibility_date FROM function_deployments WHERE id = $1")
+            .bind(d)
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert!(
+            row.try_get::<chelabase_time::jiff_backed::Date, _>("compatibility_date")
+                .is_err()
+        );
+
+        // Each read runs in its own task so a panic shows as a join error.
+        let c = s.client.clone();
+        let listed = tokio::spawn(async move { c.list_deployments(f).await.map(|v| v.len()) })
+            .await
+            .expect("list_deployments must not panic");
+        let c = s.client.clone();
+        let resolved = tokio::spawn(async move { c.resolve(main, "far").await.map(|r| r.is_some()) })
+            .await
+            .expect("resolve must not panic");
+        // Under chrono the date decodes (Ok); behind the jiff backing both are errors.
+        assert!(listed.is_err() || listed.unwrap() == 1);
+        assert!(resolved.is_err() || resolved.unwrap());
         s.finish().await;
     }
 

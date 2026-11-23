@@ -706,18 +706,19 @@ fn function_from_row(r: &PgRow) -> Result<FunctionRecord, MetadataError> {
     })
 }
 
-fn deployment_from_row(r: &PgRow) -> DeploymentRecord {
-    DeploymentRecord {
+fn deployment_from_row(r: &PgRow) -> Result<DeploymentRecord, MetadataError> {
+    Ok(DeploymentRecord {
         id: r.get("id"),
         function_id: r.get("function_id"),
         bundle_sha256: r.get("bundle_sha256"),
         bundle_size: r.get("bundle_size"),
         spec: r.get("spec"),
-        compatibility_date: r.get("compatibility_date"),
+        // Filled by clients, so a year this type can't hold is an error, never a panic.
+        compatibility_date: r.try_get("compatibility_date")?,
         created_by: r.get("created_by"),
         created_at: r.get("created_at"),
         note: r.get("note"),
-    }
+    })
 }
 
 /// The columns [`trigger_from_row`] reads.
@@ -1412,7 +1413,7 @@ impl MetadataClient {
         .await
         .map_err(map_check)?;
         tx.commit().await?;
-        Ok(deployment_from_row(&row))
+        deployment_from_row(&row)
     }
 
     /// The function's deployments, newest first (none for an unknown function). Callers scope
@@ -1421,7 +1422,7 @@ impl MetadataClient {
         &self,
         function_id: Uuid,
     ) -> Result<Vec<DeploymentRecord>, MetadataError> {
-        Ok(sqlx::query(
+        sqlx::query(
             "SELECT * FROM function_deployments WHERE function_id = $1
              ORDER BY created_at DESC, id DESC",
         )
@@ -1430,7 +1431,7 @@ impl MetadataClient {
         .await?
         .iter()
         .map(deployment_from_row)
-        .collect())
+        .collect()
     }
 
     /// Makes `deployment_id` the function's active deployment on the branch (a new branch
@@ -1621,7 +1622,7 @@ impl MetadataClient {
                 deployment_id: r.get("deployment_id"),
                 bundle_sha256: r.get("bundle_sha256"),
                 spec: r.get("spec"),
-                compatibility_date: r.get("compatibility_date"),
+                compatibility_date: r.try_get("compatibility_date")?,
                 auth: FunctionAuth::parse(r.get("auth"))?,
                 enabled: r.get("enabled"),
                 run_as_role: r.get("run_as_role"),
