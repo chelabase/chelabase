@@ -289,6 +289,8 @@ async fn lists_exactly_two_tools() {
         assert_eq!(search["annotations"]["readOnlyHint"], true);
         let desc = search["description"].as_str().unwrap();
         assert!(desc.contains("x-class") && desc.contains("spec"), "{desc}");
+        // The body-dependent class is declared, so `destructive` isn't read as always needed.
+        assert!(desc.contains(r#""x-class-rule"?: string"#), "{desc}");
 
         let execute = tool(&list, "execute");
         assert_eq!(
@@ -308,6 +310,7 @@ async fn lists_exactly_two_tools() {
             desc.contains("chelabase.request") && desc.contains("destructive"),
             "{desc}"
         );
+        assert!(desc.contains("headers: Record<string, string>;"), "{desc}");
     }
 }
 

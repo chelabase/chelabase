@@ -1040,6 +1040,60 @@ async fn credential_answering_operations_are_not_sent_without_a_sealer() {
     assert!(h.seen().is_empty(), "{:?}", h.seen());
 }
 
+/// A credential operation is refused `secrets_unavailable` before the flag check: it is never
+/// sent, so it neither asks for `destructive: true` nor makes the run refused.
+#[tokio::test]
+async fn a_credential_operation_is_secrets_unavailable_before_the_flag_check() {
+    let h = Harness::start().await;
+    let matcher = Matcher::bundle();
+    let (method, path) = mcp::secret_fields::CREDENTIAL_FIELDS
+        .iter()
+        .find_map(|(operation, _)| {
+            let (method, template, _) = matcher
+                .operations()
+                .find(|(_, _, id)| id == operation)?;
+            (mcp::policy::static_class(operation, method) == Some(mcp::policy::Class::Destructive))
+                .then(|| {
+                    let path = template
+                        .split('/')
+                        .map(|s| if s.starts_with('{') { "x" } else { s })
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    (method.to_owned(), path)
+                })
+        })
+        .expect("a destructive credential operation");
+    h.respond(|_| Reply::json(200, json!([])));
+    let result = h
+        .execute(calls(vec![call(&method, &path, json!({})), get("/v1/projects")]))
+        .await;
+    let answers = answers(&result);
+    assert_eq!(refusal(&answers[0]), "secrets_unavailable");
+    assert_eq!(answer(&answers[1])["status"], 200, "the run is not refused");
+}
+
+/// `runSql` with `copy_out` is in `search`, so "use a path and method from search" would
+/// mislead: the refusal says `copy_out` isn't available here.
+#[tokio::test]
+async fn run_sql_with_copy_out_says_copy_out_is_unavailable() {
+    let h = Harness::start().await;
+    let result = h
+        .execute_destructive(calls(vec![call(
+            "POST",
+            &format!("{BRANCH}/sql"),
+            json!({"sql": "select 1", "copy_out": true}),
+        )]))
+        .await;
+    let answers = answers(&result);
+    assert_eq!(refusal(&answers[0]), "operation_not_allowed");
+    let message = answer(&answers[0])["body"]["error"]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.contains("copy_out"), "{message}");
+    assert!(!message.contains("from search"), "{message}");
+    assert!(h.seen().is_empty());
+}
+
 // ---- headers ----
 
 #[tokio::test]
@@ -1249,6 +1303,39 @@ async fn response_cap() {
     assert_eq!(answer(&answers[1])["status"], 200);
 }
 
+/// The runner refuses a host answer over 8 MiB of JSON text (it would throw in the code), so
+/// the host refuses one whose JSON form tops that, even when its body is under the cap: an
+/// answer the host marks delivered always reaches the code.
+#[tokio::test]
+async fn an_answer_whose_json_tops_the_runner_cap_is_response_too_large() {
+    let h = Harness::with(Options {
+        config: HostConfig {
+            response_max_bytes: 4 << 20,
+            ..HostConfig::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    h.respond(|seen| match seen.uri.path() {
+        // 1.5 MiB of control characters: each is six bytes (`\u0001`) as JSON.
+        "/v1/projects" => Reply {
+            headers: vec![("content-type", "text/plain".into())],
+            body: vec![1u8; 3 << 19],
+            ..Reply::json(200, json!({}))
+        },
+        _ => Reply::json(200, json!({"pad": "x".repeat(2 << 20)})),
+    });
+    // The stub runtime returns every answer in its result, too large for a tool result; what
+    // the code got is what the stub recorded.
+    h.execute(calls(vec![get("/v1/projects"), get("/v1/teams")]))
+        .await;
+    let answers = h.runtime.last_answers.lock().unwrap().clone();
+    assert_eq!(answers.len(), 2);
+    assert_eq!(refusal(&answers[0]), "response_too_large");
+    // Under both caps: delivered whole.
+    assert_eq!(answer(&answers[1])["status"], 200);
+}
+
 #[tokio::test]
 async fn binary_body_is_refused() {
     let h = Harness::start().await;
@@ -1372,6 +1459,10 @@ async fn a_short_lived_token_is_refused_up_front() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The answer names the least lifetime, so a client can tell a token too short-lived ever
+    // to pass from one that is merely old.
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["min_remaining_secs"], 70, "{body}");
     assert!(h.runtime.exec_ids.lock().unwrap().is_empty(), "nothing ran");
     assert!(h.seen().is_empty());
     // Enough time left: it runs.
@@ -1712,12 +1803,9 @@ async fn check_matrix(end: End) {
             End::Returns if unknown => Some("calls_unfinished"),
             _ => None,
         };
-        let want_calls = match end {
-            End::Refusal => !labels.is_empty(),
-            // A timed-out run lists every forwarded call.
-            End::HostTimeout | End::HostTimeoutThenThrow | End::RunnerTimeout => !labels.is_empty(),
-            _ => unknown,
-        };
+        // Every error lists every forwarded call, whatever ended the run: a write answered
+        // before the code threw is never silent.
+        let want_calls = !labels.is_empty();
         match (want_code, result["isError"] == true) {
             (None, false) => {}
             (None, true) => failures.push(format!("{what}: want success, got {result}")),

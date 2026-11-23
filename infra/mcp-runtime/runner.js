@@ -34,7 +34,11 @@ const MAX_BODY_BYTES = 2 << 20; // a JSON-escaped 256 KiB of code fits
 const MAX_SPEC_BYTES = 16 << 20;
 const MAX_SPECS = 4;
 const MAX_ANSWER_BYTES = 6 << 20; // a 4 MiB result plus logs
-const MAX_HOST_REQUEST_BYTES = 1 << 20;
+// The host's own caps line up with these (services/mcp/src/host.rs): it reads an envelope of up
+// to 4 MiB (MAX_ENVELOPE_BYTES) and answers a body over 1 MiB with request_too_large, and it
+// answers response_too_large rather than send an answer over 8 MiB (RUNNER_ANSWER_MAX_BYTES),
+// so the code gets those answers instead of a throw.
+const MAX_HOST_REQUEST_BYTES = 4 << 20;
 const MAX_HOST_ANSWER_BYTES = 8 << 20;
 const MAX_TIMEOUT_MS = 60_000;
 const SPEC_TIMEOUT_MS = 10_000;
@@ -340,7 +344,10 @@ async function hostRequest(env, execId, opts) {
   } catch {
     throw new TypeError("chelabase.request: body is not JSON");
   }
-  if (envelope.length > MAX_HOST_REQUEST_BYTES) throw new RangeError("chelabase.request: the request is over 1 MiB");
+  // Bytes, as the host counts them (a string's length counts UTF-16 units).
+  if (new TextEncoder().encode(envelope).byteLength > MAX_HOST_REQUEST_BYTES) {
+    throw new RangeError("chelabase.request: the request is over 4 MiB");
+  }
   const res = await env.HOST.fetch(`http://mcp-internal/internal/exec/${execId}/request`, {
     method: "POST",
     headers: { "content-type": "application/json" },
