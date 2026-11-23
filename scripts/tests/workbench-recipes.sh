@@ -33,8 +33,9 @@ just --show wt-remove | gq 'workbench purge' || fail "wt-remove purges the workt
 just --show wt-remove | gq -- '--show-toplevel' || fail "wt-remove checks the directory is still that worktree (git toplevel) before it purges (T5 review I4)"
 ! just --show wt-add | gq '\.env\.local' || fail "wt-add no longer links Studio's env"
 # wt-add and wt-slot record the base's stack through _wt-stack: read from the base's worktree
-# (its record, or the registry entry of its checkout), and only without one asked of the CLI. The
-# slug is never recomputed, and no build runs when the base has a worktree.
+# (its record, the registry entry of its checkout, or its directory name when that already is a
+# slug), and only without a worktree asked of the CLI. The slug is never recomputed, and no build
+# runs when the base has a worktree.
 for r in wt-add wt-slot; do
   just --show "$r" | gq '_wt-stack' || fail "$r records the base's stack through _wt-stack"
   ! just --show "$r" | gq 'cargo' || fail "$r itself runs no cargo"

@@ -117,6 +117,7 @@ check-scripts:
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/wt-from-origin.sh
+    scripts/tests/wt-slot-stack.sh
     scripts/tests/retired-names.sh
     scripts/tests/no-copyleft.sh
     scripts/tests/compose-image-pins.sh
@@ -510,8 +511,11 @@ wt-warm ref *args:
     done
 
 # Write <dir>/.workbench-stack for a worktree based on `base` (wt-add and wt-slot call it): the
-# stack the base's worktree borrows or owns, read from its `.workbench-stack` or the registry. Only
-# when no worktree has the base checked out does it ask the CLI, which builds it in <dir>.
+# stack the base's worktree borrows or owns, read from its `.workbench-stack` or the registry. A
+# base worktree under .worktrees/ (not a slot) whose stack isn't up yet still owns the stack named
+# after its directory: when that name already is a slug (epic-<slug>), it is recorded as is (the
+# slug is never recomputed here). Only when no worktree has the base checked out does it ask the
+# CLI, which builds it in <dir>.
 _wt-stack dir base:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -520,15 +524,27 @@ _wt-stack dir base:
     base="${2#origin/}"
     basedir="$(git -C "$main" worktree list --porcelain |
       BASE="branch refs/heads/$base" awk '/^worktree /{w=substr($0,10)} $0==ENVIRON["BASE"]{print w; exit}')"
+    recorded=""
+    if [ -n "$basedir" ] && [ -f "$basedir/.workbench-stack" ]; then
+      recorded="$(tr -d '[:space:]' < "$basedir/.workbench-stack")"
+    fi
     if [ -z "$basedir" ]; then
       slug="$(env -C "$dir" cargo run -q -p chelabase -- workbench slug-of "$base" || true)"
-    elif [ -s "$basedir/.workbench-stack" ]; then
-      slug="$(tr -d '[:space:]' < "$basedir/.workbench-stack")"
+    elif [ -n "$recorded" ]; then
+      slug="$recorded"
     else
       registry="$main/.chelabase/stacks/registry.json"
       slug=""
       if [ -f "$registry" ]; then
         slug="$(jq -r --arg c "$basedir" '[.stacks[] | select(.checkout == $c) | .slug][0] // empty' "$registry" || true)"
+      fi
+      name="${basedir#"$main/.worktrees/"}"
+      # A directory name that already is a slug (what the CLI's slug_for_dir leaves unchanged) is
+      # the stack the base worktree owns; any other name is left to the registry.
+      if [ -z "$slug" ] && [ "$name" != "$basedir" ] && [ "$name" != main ] && [ "${#name}" -le 40 ] &&
+        LC_ALL=C grep -Eqx '[a-z0-9]+(-[a-z0-9]+)*' <<< "$name" &&
+        [ ! -e "$(git -C "$basedir" rev-parse --absolute-git-dir)/chelabase-slot" ]; then
+        slug="$name"
       fi
     fi
     printf '%s\n' "$slug" > "$dir/.workbench-stack"
