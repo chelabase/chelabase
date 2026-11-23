@@ -29,7 +29,7 @@ const WEBSOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 /// answer comes only once its whole body is in (1 GiB at 1 MiB/s is about 17 minutes).
 const TRANSFER_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 /// `POST /mcp`'s upstream read timeout (`Transfer::SlowAnswer`): above the longest tool run
-/// the mcp service allows (120 s, and it gives up 2 s after), so the service answers a
+/// the mcp service allows (60 s, and it gives up 2 s after), so the service answers a
 /// timeout itself; an answer that never starts is cut here.
 const SLOW_ANSWER_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// A transfer route's client idle timeout (the longest the client may pause sending its body).

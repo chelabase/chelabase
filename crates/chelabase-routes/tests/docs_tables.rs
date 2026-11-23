@@ -82,7 +82,7 @@ fn auth_text(a: Auth) -> &'static str {
         Auth::DataKey => "any data key",
         Auth::SecretDataKey => "secret data key",
         Auth::PublicDataKey => "public data key",
-        Auth::Mcp => "Bearer (member or MCP token), checked by the MCP service",
+        Auth::Mcp => "Bearer (member token; MCP access tokens come with mcp-oauth), checked by the MCP service",
     }
 }
 

@@ -86,9 +86,9 @@ Sorted by path. Credentials: *Member token* is a member access token from `POST 
 | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/\{name\}` | any data key | Data API key |
 | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/functions/v1/\{name\}/\{*rest\}` | any data key | Data API key |
 | GET | `/health` | none | Public |
-| DELETE | `/mcp` | Bearer (member or MCP token), checked by the MCP service | Signed in |
-| GET | `/mcp` | Bearer (member or MCP token), checked by the MCP service | Signed in |
-| POST | `/mcp` | Bearer (member or MCP token), checked by the MCP service | Signed in |
+| DELETE | `/mcp` | Bearer (member token; MCP access tokens come with mcp-oauth), checked by the MCP service | Signed in |
+| GET | `/mcp` | Bearer (member token; MCP access tokens come with mcp-oauth), checked by the MCP service | Signed in |
+| POST | `/mcp` | Bearer (member token; MCP access tokens come with mcp-oauth), checked by the MCP service | Signed in |
 | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/services/v1/\{name\}` | any data key | Data API key |
 | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS | `/services/v1/\{name\}/\{*rest\}` | any data key | Data API key |
 | GET | `/storage/v1/bucket` | any data key | Data API key |

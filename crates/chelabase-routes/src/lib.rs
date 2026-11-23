@@ -122,8 +122,8 @@ pub enum Auth {
     SecretDataKey,
     /// A public data key; a secret key is refused.
     PublicDataKey,
-    /// A bearer the owning service verifies (the `/mcp` routes only: a member token or an MCP
-    /// access token). The gateway requires one in `Authorization: Bearer` form, mints no
+    /// A bearer the owning service verifies (the `/mcp` routes only: a member token today; MCP access
+    /// tokens come with the `mcp-oauth` epic). The gateway requires one in `Authorization: Bearer` form, mints no
     /// internal identity, and passes the header on unchanged; without one it answers 401 with
     /// the MCP `resource_metadata` challenge.
     Mcp,
@@ -2683,8 +2683,8 @@ mod tests {
                 Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
                     assert_eq!(access, Access::DataKey, "{}", ep.name)
                 }
-                // The mcp service verifies the bearer (a member token or an MCP access
-                // token, both a member's) and calls the API as that member.
+                // The mcp service verifies the bearer (a member token today; MCP access
+                // tokens come with mcp-oauth) and calls the API as that member.
                 Auth::Mcp => assert_eq!(access, Access::SignedIn, "{}", ep.name),
                 Auth::Management => assert!(
                     !matches!(access, Access::Public | Access::DataKey),

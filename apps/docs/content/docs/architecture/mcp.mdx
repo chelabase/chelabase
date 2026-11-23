@@ -22,7 +22,7 @@ The runtime lives on `mcp-sandbox`, an internal network shared with `mcp` alone.
 
 ## The credential
 
-Every `/mcp` request needs a member access token, verified with `auth/member-jwt.pub` and the issuer from `CHELABASE_AUTH_HOST`. It reads headers only: a bad token is refused before the body is read. A token with under 60 seconds left is refused, so a run can't outlive its credential. The token's `sub` is the member and its `tid` the tenant; both go in the audit line, with `credential=member`. The `Chelabase-MCP-Read-Only: true` header can narrow a connection and never widen it. The `credential` field exists because the `mcp-oauth` epic will add a second kind of token; it is not available yet.
+Every `/mcp` request needs a member access token, verified with `auth/member-jwt.pub` and the issuer from `CHELABASE_AUTH_HOST`. It reads headers only: a bad token is refused before the body is read. A token is refused unless it has at least the larger of 60 seconds and the run's timeout plus 10 seconds left (60 seconds with the default timeout), so a run can't outlive its credential. The token's `sub` is the member and its `tid` the tenant; both go in the audit line, with `credential=member`. The `Chelabase-MCP-Read-Only: true` header can narrow a connection and never widen it. The `credential` field exists because the `mcp-oauth` epic will add a second kind of token; it is not available yet.
 
 Because the member's token is what the API sees, the member's role, project access and suspended or removed state all apply on every call. The server grants nothing of its own.
 
@@ -38,7 +38,7 @@ The table fails closed: an operation it lacks is excluded at run time, the bundl
 
 For each call the host works through, in order:
 
-1. The `exec_id` must name a live `execute` run whose deadline hasn't passed, or the answer is a bare 404.
+1. The `exec_id` must name a live `execute` run whose deadline hasn't passed. An unknown `exec_id` answers a bare 404; a passed deadline answers an API-shaped 504 `timeout`.
 2. A run that was refused once stays refused.
 3. At most `CHELABASE_MCP_MAX_CALLS` calls.
 4. The path must be canonical and match an operation of the bundle. Anything else, and every excluded operation, is `operation_not_allowed`.
@@ -78,7 +78,7 @@ What does not hold:
 - **Table data isn't sealed.** The answers that return data the member stored (`console/query`, `sql`, object contents, a service's logs, SQL text in a merge plan, a table cell's `/value`, a saved query's `/sql`, a function's `last_error`) can hold anything the member put there, credentials included. The model reads them. This is the residual the credential tables can't close.
 - **Read-only isn't a sandbox for Postgres.** A read-only run still permits effects that aren't writes: row locks (`SELECT … FOR UPDATE`), advisory locks, `pg_sleep` and signalling the role's own backends. They are bounded by the role's rights, the 300 s cap and the connection closing. An extension that opens its own connection (`dblink`, a foreign-data wrapper) is outside the guarantee: with a valid login password, `dblink_exec` writes through a separate session.
 - **The `destructive` flag is a confirmation step the model sets itself.** The server checks that it was set; it can't check that the user asked. A client that confirms destructive tools with the user is the real guard. A read-only connection is the stronger one.
-- **Failed token checks aren't rate-limited in `mcp`.** A refusal costs one signature check, and a shared bucket would let bad tokens lock out good ones. Per-address limiting belongs at the gateway.
+- **Failed token checks aren't rate-limited in `mcp`.** A refusal costs one signature check, and a shared bucket would let bad tokens lock out good ones. Nothing limits them today: per-address limiting should sit at the gateway or in front of it (tracked in #395).
 - **A resource attack on the runtime is bounded, not prevented.** A busy loop or a large buffer restarts the runtime, and runs in flight at that moment fail with `runtime_unavailable`.
 - **Excluded operations** (the binary routes) can be called by the member through the API, just not from the sandbox.
 

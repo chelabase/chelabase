@@ -5,7 +5,7 @@ description: Configure Claude Code, Cursor, Claude Desktop or VS Code with chela
 
 <AlphaNotice />
 
-The server answers at `/mcp` on your instance's API host (for example `http://api.chelabase.localhost:8000/mcp`). It takes a member access token, which is short-lived (at most 15 minutes, 5 by default). The server refuses a token with less than a minute left. There are two ways to connect.
+The server answers at `/mcp` on your instance's API host (for example `http://api.chelabase.localhost:8000/mcp`). It takes a member access token, which is short-lived (at most 15 minutes, 5 by default). The server refuses a token unless it has at least the larger of 60 seconds and the run timeout plus 10 seconds left (60 seconds with the default 30-second timeout). There are two ways to connect.
 
 ## The bridge: `chelabase mcp`
 
@@ -65,3 +65,5 @@ Because a member token lasts minutes, a direct connection needs something that k
 ## Protocol versions
 
 The server speaks the 2026-07-28 revision and the one before it, 2025-11-25. A client asking for another revision gets a `400` listing the supported ones. The official TypeScript SDK (1.32.2) negotiates 2025-11-25.
+
+A 2026-07-28 client doesn't send `initialize`. It starts with `server/discover` and puts the revision and its capabilities in the `_meta` of every request (`io.modelcontextprotocol/protocolVersion` and `clientCapabilities`). An `initialize` that names 2026-07-28 is negotiated down to 2025-11-25. From 2026-07-28 on, each request also needs the `Mcp-Method` header, and a tool call needs `Mcp-Name`; the bridge sends both.
