@@ -789,10 +789,10 @@ where
         reset_sql: OWNER_RESET_SQL,
     };
     let rid = principal.request_id.as_str();
-    // Once more on a fresh connection when nothing of the request ran on one that had to be
+    // Once more on another connection when nothing of the request ran on one that had to be
     // discarded: each run's lease is dropped before it returns.
     let (pool, tls, settings) = (&pool, &tls, &settings);
-    let result = chelabase_query::pipeline::once_more_on_fresh_connection(|| async move {
+    let result = chelabase_query::pipeline::once_more_on_another_connection(rid, || async move {
         let mut lease = Lease::new(pool.get().await.map_err(|e| pool_failure(e, rid, tls))?);
         let out = chelabase_query::run(
             &lease,

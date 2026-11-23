@@ -21,7 +21,7 @@ pub fn schema_missing_in(database: &str) -> String {
     format!("the data API's schema is missing in the database {database:?}; it will be reinstalled")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct QueryFailure {
     pub status: StatusCode,
     pub code: &'static str,
@@ -30,9 +30,36 @@ pub struct QueryFailure {
     pub hint: Option<String>,
     pub sqlstate: Option<String>,
     /// Nothing of the request ran, and its connection is gone: the caller may run it once
-    /// more on a fresh connection ([`crate::pipeline::once_more_on_fresh_connection`]).
-    fresh_connection: bool,
+    /// more on another connection ([`crate::pipeline::once_more_on_another_connection`]).
+    another_connection: bool,
 }
+
+/// Two failures are equal when the client would see the same answer: the retry mark
+/// ([`QueryFailure::retries_on_another_connection`]) is how the answer came about, not part of it.
+impl PartialEq for QueryFailure {
+    fn eq(&self, other: &Self) -> bool {
+        let QueryFailure {
+            status,
+            code,
+            message,
+            detail,
+            hint,
+            sqlstate,
+            another_connection: _,
+        } = self;
+        (status, code, message, detail, hint, sqlstate)
+            == (
+                &other.status,
+                &other.code,
+                &other.message,
+                &other.detail,
+                &other.hint,
+                &other.sqlstate,
+            )
+    }
+}
+
+impl Eq for QueryFailure {}
 
 impl QueryFailure {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
@@ -43,25 +70,35 @@ impl QueryFailure {
             detail: None,
             hint: None,
             sqlstate: None,
-            fresh_connection: false,
+            another_connection: false,
         }
     }
 
-    /// Whether nothing of the request ran and it may run once more on a fresh connection
-    /// ([`crate::pipeline::once_more_on_fresh_connection`]).
-    pub fn retries_on_fresh_connection(&self) -> bool {
-        self.fresh_connection
+    /// Whether nothing of the request ran and it may run once more on another connection
+    /// ([`crate::pipeline::once_more_on_another_connection`]).
+    pub fn retries_on_another_connection(&self) -> bool {
+        self.another_connection
     }
 
-    /// This failure, marked: nothing of the request ran ([`Self::retries_on_fresh_connection`]).
-    pub(crate) fn on_fresh_connection(mut self) -> Self {
-        self.fresh_connection = true;
-        self
+    /// The 500 [`Self::internal`] answers, marked: nothing of the request ran and it may
+    /// run once more on another connection ([`Self::retries_on_another_connection`]). Not
+    /// logged at error level here: whoever saw the cause logs it at warn with the request
+    /// id, and the error line belongs to the request's final answer
+    /// ([`crate::pipeline::once_more_on_another_connection`]).
+    pub(crate) fn internal_on_another_connection(request_id: &str) -> Self {
+        QueryFailure {
+            another_connection: true,
+            ..Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("internal error (request id {request_id})"),
+            )
+        }
     }
 
     /// This failure, as the request's answer: never retried again.
     pub(crate) fn settled(mut self) -> Self {
-        self.fresh_connection = false;
+        self.another_connection = false;
         self
     }
 
@@ -105,7 +142,7 @@ impl QueryFailure {
                 detail: err.detail().map(str::to_owned),
                 hint: err.hint().map(str::to_owned),
                 sqlstate: Some(sqlstate.to_owned()),
-                fresh_connection: false,
+                another_connection: false,
             },
             None => Self::internal(request_id, format!("{sqlstate}: {}", err.message())),
         }

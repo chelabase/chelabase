@@ -531,8 +531,8 @@ impl<S: ConnSource> Engine<S> {
         };
         // Each run takes its own connection and lets go of it (its session ends) before it
         // returns: when nothing of the request ran on a connection that had to be discarded,
-        // the second run is on a fresh one, through the role's checks again.
-        let out = chelabase_query::pipeline::once_more_on_fresh_connection(|| async move {
+        // the second run is on another one, through the role's checks again.
+        let out = chelabase_query::pipeline::once_more_on_another_connection(request_id, || async move {
             let conn = self
                 .acquire_for(branch, &database.name, &data.role, guard, request_id)
                 .await?;
