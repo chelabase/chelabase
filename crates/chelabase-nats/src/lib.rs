@@ -1,7 +1,7 @@
 //! NATS JetStream subjects, envelopes, and helpers for Chelabase control plane.
 
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -167,7 +167,7 @@ pub struct DeleteDatabaseJob {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PointInTime {
-    Timestamp(DateTime<Utc>),
+    Timestamp(Timestamp),
     Lsn(String),
 }
 
@@ -479,7 +479,7 @@ pub struct RoleCreateRequest {
     #[serde(default = "no_connection_limit")]
     pub connection_limit: i32,
     #[serde(default)]
-    pub valid_until: Option<DateTime<Utc>>,
+    pub valid_until: Option<Timestamp>,
     #[serde(default)]
     pub bypass_rls: bool,
     /// Roles the new role is made a member of.
@@ -523,7 +523,7 @@ pub struct RoleUpdateRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "double_option"
     )]
-    pub valid_until: Option<Option<DateTime<Utc>>>,
+    pub valid_until: Option<Option<Timestamp>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass_rls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -732,7 +732,7 @@ pub struct RoleSession {
     /// The client's address; `None` for a local (Unix socket) connection.
     pub client_addr: Option<String>,
     pub application_name: String,
-    pub backend_start: DateTime<Utc>,
+    pub backend_start: Timestamp,
 }
 
 /// The worker's answer to [`SUBJECT_ROLE_SESSIONS`]. `code` says why when `ok` is false:
@@ -1870,6 +1870,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     // T4 coder: the drift check sees a change in each setting P8 pins, and none in the
     // config itself (an existing stream with it is left alone).
@@ -2213,7 +2214,7 @@ mod tests {
             login: false,
             inherit: false,
             connection_limit: 3,
-            valid_until: Some(DateTime::<Utc>::UNIX_EPOCH),
+            valid_until: Some(Timestamp::UNIX_EPOCH),
             bypass_rls: true,
             member_of: vec!["g".into()],
             ..RoleCreateRequest::login(branch, "r", false)
@@ -2237,7 +2238,7 @@ mod tests {
             login: Some(false),
             inherit: Some(false),
             connection_limit: Some(5),
-            valid_until: Some(Some(DateTime::<Utc>::UNIX_EPOCH)),
+            valid_until: Some(Some(Timestamp::UNIX_EPOCH)),
             bypass_rls: Some(true),
             member_of: Some(vec!["g".into()]),
             ..RoleUpdateRequest::new(branch, "r")
@@ -2611,11 +2612,62 @@ mod tests {
     fn point_in_time_is_snake_case_tagged() {
         let at = PointInTime::Lsn("0/16B3748".into());
         assert_eq!(serde_json::to_value(&at).unwrap(), serde_json::json!({ "lsn": "0/16B3748" }));
-        let time: DateTime<Utc> = "2026-09-30T12:00:00Z".parse().unwrap();
+        let time: Timestamp = "2026-09-30T12:00:00Z".parse().unwrap();
         assert_eq!(
             serde_json::to_value(PointInTime::Timestamp(time)).unwrap(),
             serde_json::json!({ "timestamp": "2026-09-30T12:00:00Z" })
         );
+    }
+
+    /// Every payload type with a time field, against a frozen JSON literal: the text is what
+    /// other services and old messages already carry, so it can't change with the type behind
+    /// `Timestamp`.
+    #[test]
+    fn time_fields_keep_their_json() {
+        use chelabase_time::{Timestamp, TimestampExt};
+        let whole = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
+        let millis = Timestamp::from_unix_millis(1_700_000_000_005).unwrap();
+        let micros = Timestamp::from_unix_micros(1_700_000_000_123_456).unwrap();
+        let branch = BranchId::new();
+
+        let at = |t| serde_json::to_value(PointInTime::Timestamp(t)).unwrap();
+        assert_eq!(at(whole), serde_json::json!({ "timestamp": "2023-11-14T22:13:20Z" }));
+        assert_eq!(at(millis), serde_json::json!({ "timestamp": "2023-11-14T22:13:20.005Z" }));
+        assert_eq!(at(micros), serde_json::json!({ "timestamp": "2023-11-14T22:13:20.123456Z" }));
+        let back: PointInTime = serde_json::from_value(at(micros)).unwrap();
+        assert_eq!(back, PointInTime::Timestamp(micros));
+        // An offset on the way in is read as the same instant.
+        let offset: PointInTime =
+            serde_json::from_value(serde_json::json!({ "timestamp": "2023-11-15T00:13:20.123456+02:00" })).unwrap();
+        assert_eq!(offset, PointInTime::Timestamp(micros));
+
+        let create = RoleCreateRequest {
+            valid_until: Some(micros),
+            ..RoleCreateRequest::login(branch, "r", false)
+        };
+        let json = serde_json::to_value(&create).unwrap();
+        assert_eq!(json["valid_until"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(serde_json::from_value::<RoleCreateRequest>(json).unwrap(), create);
+
+        let update = |v| RoleUpdateRequest { valid_until: Some(v), ..RoleUpdateRequest::new(branch, "r") };
+        for (request, want) in [
+            (update(Some(whole)), serde_json::json!("2023-11-14T22:13:20Z")),
+            (update(Some(millis)), serde_json::json!("2023-11-14T22:13:20.005Z")),
+            (update(None), serde_json::Value::Null),
+        ] {
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(json["valid_until"], want);
+            assert_eq!(serde_json::from_value::<RoleUpdateRequest>(json).unwrap(), request);
+        }
+
+        let session = RoleSession {
+            client_addr: None,
+            application_name: "psql".into(),
+            backend_start: micros,
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["backend_start"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(serde_json::from_value::<RoleSession>(json).unwrap(), session);
     }
 
     #[test]
@@ -2629,7 +2681,7 @@ mod tests {
                 branch_id,
                 backup_id: BranchId::new(),
                 backup_name: "dev-before-restore-20260930T120000Z".into(),
-                at: PointInTime::Timestamp(Utc::now()),
+                at: PointInTime::Timestamp(Timestamp::now()),
             },
             BranchJob::Delete { branch_id },
         ];

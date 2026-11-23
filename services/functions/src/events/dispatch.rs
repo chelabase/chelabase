@@ -674,6 +674,7 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     /// A big row's claimed payload is built from the allowlisted keys, never the stored
     /// payload minus some keys, and each `pk` value is size-capped.
@@ -739,7 +740,7 @@ mod tests {
             source: chelabase_metadata::TriggerSource::Table,
             enabled: false,
             state: chelabase_metadata::TriggerState::Installed,
-            enabled_since: chrono::Utc::now(),
+            enabled_since: chelabase_time::Timestamp::now(),
             pg_database: "app".into(),
             schema_name: Some("public".into()),
             table_name: Some("orders".into()),

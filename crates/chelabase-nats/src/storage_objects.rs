@@ -10,7 +10,7 @@
 //!
 //! An event never carries object contents or a signed URL.
 
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
@@ -185,7 +185,7 @@ pub struct ObjectEvent {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub kind: ObjectEventType,
-    pub time: DateTime<Utc>,
+    pub time: Timestamp,
     /// The Chelabase database.
     pub database_id: Uuid,
     pub branch_id: Uuid,
@@ -301,7 +301,7 @@ pub fn jetstream(client: async_nats::Client) -> async_nats::jetstream::Context {
 /// The durable consumer name of an endpoint enabled since `since`: a re-enabled endpoint gets a
 /// new consumer starting then (the old one, if a worker never deleted it, expires after
 /// [`CONSUMER_INACTIVE`]).
-pub fn endpoint_consumer_name(endpoint: Uuid, since: DateTime<Utc>) -> String {
+pub fn endpoint_consumer_name(endpoint: Uuid, since: Timestamp) -> String {
     format!("storage-webhook-{endpoint}-{}", since.timestamp_millis())
 }
 
@@ -315,7 +315,7 @@ pub const MAX_ACK_PENDING: i64 = 64;
 pub fn endpoint_consumer(
     endpoint: Uuid,
     database_id: Uuid,
-    since: DateTime<Utc>,
+    since: Timestamp,
 ) -> async_nats::jetstream::consumer::pull::Config {
     use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
     let name = endpoint_consumer_name(endpoint, since);
@@ -325,7 +325,7 @@ pub fn endpoint_consumer(
         filter_subject: subject(database_id),
         deliver_policy: DeliverPolicy::ByStartTime {
             start_time: time::OffsetDateTime::from_unix_timestamp_nanos(
-                since.timestamp_nanos_opt().unwrap_or_default() as i128,
+                since.unix_nanos(),
             )
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
         },
@@ -343,7 +343,7 @@ pub fn endpoint_consumer(
 /// Edge functions m14: the durable consumer name of a storage trigger enabled since `since`
 /// (`fn-trigger-<id>-<enabled_since_ms>`): a re-enabled trigger gets a new consumer starting
 /// then, so nothing from the disabled window is replayed.
-pub fn fn_trigger_consumer_name(trigger: Uuid, since: DateTime<Utc>) -> String {
+pub fn fn_trigger_consumer_name(trigger: Uuid, since: Timestamp) -> String {
     format!("fn-trigger-{trigger}-{}", since.timestamp_millis())
 }
 
@@ -354,7 +354,7 @@ pub fn fn_trigger_consumer_name(trigger: Uuid, since: DateTime<Utc>) -> String {
 pub fn fn_trigger_consumer(
     trigger: Uuid,
     database_id: Uuid,
-    since: DateTime<Utc>,
+    since: Timestamp,
     ack_wait: std::time::Duration,
 ) -> async_nats::jetstream::consumer::pull::Config {
     let name = fn_trigger_consumer_name(trigger, since);
@@ -520,7 +520,7 @@ mod tests {
         ObjectEvent {
             id: Uuid::max(),
             kind: ObjectEventType::Moved,
-            time: DateTime::from_timestamp(253_402_300_799, 999_999_999).unwrap(),
+            time: Timestamp::from_unix_seconds(253_402_300_799).unwrap() + std::time::Duration::from_nanos(999_999_999),
             database_id: Uuid::max(),
             branch_id: Uuid::max(),
             pg_database: "\u{1}".repeat(PG_NAME_BYTES),
@@ -546,7 +546,7 @@ mod tests {
         ObjectEvent {
             id: Uuid::nil(),
             kind: ObjectEventType::Moved,
-            time: DateTime::from_timestamp(0, 0).unwrap(),
+            time: Timestamp::from_unix_seconds(0).unwrap(),
             database_id: Uuid::nil(),
             branch_id: Uuid::nil(),
             pg_database: "a".into(),
@@ -649,7 +649,7 @@ mod tests {
         let e = ObjectEvent {
             id: Uuid::nil(),
             kind: ObjectEventType::Moved,
-            time: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            time: Timestamp::from_unix_seconds(1_700_000_000).unwrap(),
             database_id: Uuid::nil(),
             branch_id: Uuid::nil(),
             pg_database: "app".into(),
@@ -717,7 +717,7 @@ mod tests {
     fn an_endpoint_consumer_is_filtered_to_its_database_from_its_enable_time() {
         use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
         let (endpoint, db) = (Uuid::new_v4(), Uuid::new_v4());
-        let since = DateTime::from_timestamp(1_700_000_000, 5_000_000).unwrap();
+        let since = Timestamp::from_unix_millis(1_700_000_000_005).unwrap();
         let c = endpoint_consumer(endpoint, db, since);
         assert_eq!(c.filter_subject, subject(db));
         assert_eq!(
@@ -735,8 +735,38 @@ mod tests {
         // A re-enable is a new consumer.
         assert_ne!(
             endpoint_consumer_name(endpoint, since),
-            endpoint_consumer_name(endpoint, since + chrono::Duration::seconds(1))
+            endpoint_consumer_name(endpoint, since + chelabase_time::seconds(1))
         );
+    }
+
+    /// The consumer names and start times other processes already hold: a change here
+    /// recreates a consumer and redelivers or skips events.
+    #[test]
+    fn consumer_names_and_start_time_are_unchanged() {
+        use async_nats::jetstream::consumer::DeliverPolicy;
+        let id = Uuid::from_u128(0x1234);
+        let since = Timestamp::from_unix_micros(1_700_000_000_005_000).unwrap();
+        assert_eq!(
+            endpoint_consumer_name(id, since),
+            format!("storage-webhook-{id}-1700000000005")
+        );
+        assert_eq!(fn_trigger_consumer_name(id, since), format!("fn-trigger-{id}-1700000000005"));
+        // Sub-millisecond parts are dropped from the name, kept in the start time.
+        let finer = Timestamp::from_unix_micros(1_700_000_000_005_999).unwrap();
+        assert_eq!(endpoint_consumer_name(id, finer), endpoint_consumer_name(id, since));
+        let db = Uuid::from_u128(1);
+        for start in [endpoint_consumer(id, db, since).deliver_policy,
+                      fn_trigger_consumer(id, db, since, std::time::Duration::from_secs(90)).deliver_policy] {
+            let DeliverPolicy::ByStartTime { start_time } = start else { panic!("{start:?}") };
+            assert_eq!(start_time.unix_timestamp_nanos(), 1_700_000_000_005_000_000);
+        }
+        let DeliverPolicy::ByStartTime { start_time } = endpoint_consumer(id, db, finer).deliver_policy else {
+            panic!()
+        };
+        assert_eq!(start_time.unix_timestamp_nanos(), 1_700_000_000_005_999_000);
+        // Before the epoch.
+        let before = Timestamp::from_unix_millis(-1).unwrap();
+        assert_eq!(endpoint_consumer_name(id, before), format!("storage-webhook-{id}--1"));
     }
 
     /// #154: a totals line every [`LOSS_TOTALS_EVERY`] while the total grows, with the
@@ -793,7 +823,7 @@ mod tests {
     fn a_function_trigger_consumer_starts_at_its_enable_time() {
         use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
         let (trigger, db) = (Uuid::new_v4(), Uuid::new_v4());
-        let since = DateTime::from_timestamp(1_700_000_000, 7_000_000).unwrap();
+        let since = Timestamp::from_unix_millis(1_700_000_000_007).unwrap();
         let ack_wait = std::time::Duration::from_secs(90);
         let c = fn_trigger_consumer(trigger, db, since, ack_wait);
         assert_eq!(
@@ -817,7 +847,7 @@ mod tests {
         assert_eq!(start_time.unix_timestamp_nanos(), 1_700_000_000_007_000_000);
         assert_ne!(
             fn_trigger_consumer_name(trigger, since),
-            fn_trigger_consumer_name(trigger, since + chrono::Duration::milliseconds(1)),
+            fn_trigger_consumer_name(trigger, since + std::time::Duration::from_millis(1)),
             "a re-enable is a new consumer"
         );
     }
