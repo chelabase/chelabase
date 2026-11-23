@@ -373,6 +373,41 @@ mod tests {
         (s.kind, s.email.clone(), s.code.clone())
     }
 
+    /// `expires_at` as the fake writes it: exactly three fraction digits and `Z`; invite codes
+    /// last 7 days, the others 15 minutes.
+    #[tokio::test]
+    async fn expires_at_keeps_millisecond_text() {
+        use chelabase_time::{Timestamp, TimestampExt, days, minutes};
+        let f = FakeIdentity::start().await;
+        let p = Pool::Members;
+        let invitee = f.with_invited_user(&p, "new@x.io");
+        let member = f.with_user(&p, "old@x.io", "password-1");
+        let http = reqwest::Client::new();
+        for (user, kind, ttl) in [(invitee, "invite", days(7)), (member, "reset", minutes(15))] {
+            let before = Timestamp::now();
+            let reply: serde_json::Value = http
+                .post(format!("{}/internal/v1/pools/members/codes", f.base))
+                .bearer_auth(crate::mock::TOKEN)
+                .json(&serde_json::json!({"user_id": user, "kind": kind, "delivery": "return"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let after = Timestamp::now();
+            let text = reply["expires_at"].as_str().expect("expires_at is text");
+            let b = text.as_bytes();
+            assert_eq!(b.len(), 24, "{text}");
+            assert!(b[19] == b'.' && b[23] == b'Z', "{text}");
+            assert!(b[20..23].iter().all(u8::is_ascii_digit), "{text}");
+            let at = Timestamp::parse_rfc3339(text).unwrap();
+            let slack = chelabase_time::seconds(1);
+            assert!(at >= before.checked_add(ttl).unwrap().checked_sub(std::time::Duration::from_millis(1)).unwrap(), "{text}");
+            assert!(at <= after.checked_add(ttl).unwrap().checked_add(slack).unwrap(), "{text}");
+        }
+    }
+
     #[tokio::test]
     async fn mock_email_change_binds_the_new_address() {
         let f = FakeIdentity::start().await;

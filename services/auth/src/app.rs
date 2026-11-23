@@ -9,7 +9,7 @@ use chelabase_identity::{
 use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
 use chelabase_identity::rules::{PASSWORD_MAX_BYTES, normalize_email, strong_password};
 use crate::app_users::internal::OpenInvite;
-use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, reserve_code_issue};
+use crate::session::{Choice, choose, past_absolute_lifetime, reserve_code_issue};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -591,7 +591,7 @@ async fn token_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap) -> Respo
             return down();
         }
     };
-    if s.clock.now() - live.session.created_at > ABSOLUTE_LIFETIME {
+    if past_absolute_lifetime(s.clock.now(), live.session.created_at) {
         drop_session(s, &session_id).await;
         return refused();
     }

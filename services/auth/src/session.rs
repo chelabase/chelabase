@@ -28,6 +28,12 @@ impl Clock {
 /// expiry says the same (`session.expiresIn`); this holds even if a read there ever slid it.
 pub const ABSOLUTE_LIFETIME: chrono::Duration = chrono::Duration::days(30);
 
+/// Whether a session created at `created_at` is past [`ABSOLUTE_LIFETIME`] at `now`. Strict:
+/// exactly 30 days old is still valid; a `created_at` after `now` is valid too.
+pub fn past_absolute_lifetime(now: DateTime<Utc>, created_at: DateTime<Utc>) -> bool {
+    now - created_at > ABSOLUTE_LIFETIME
+}
+
 /// Codes of one kind a user can be sent per hour. Identity bounds the guesses itself (a stored
 /// failure budget per user and kind, and no new code within a minute of a live one); this bounds
 /// the mail.
@@ -76,6 +82,28 @@ pub fn choose(tenants: &MemberTenants, wanted: Option<&str>) -> Choice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clock_offset_adds_whole_seconds() {
+        let clock = Clock::default();
+        clock.advance(Duration::from_secs(90));
+        let before = Utc::now();
+        let now = clock.now();
+        let after = Utc::now();
+        let ahead = chrono::Duration::seconds(90);
+        assert!(before + ahead <= now && now <= after + ahead, "{before} {now} {after}");
+        assert_eq!(ABSOLUTE_LIFETIME.num_seconds(), 2_592_000);
+    }
+
+    #[test]
+    fn absolute_lifetime_edges_are_unchanged() {
+        let now = Utc::now();
+        let age = |secs: i64| now - chrono::Duration::seconds(secs);
+        assert!(!past_absolute_lifetime(now, age(2_592_000)), "exactly 30 days is valid");
+        assert!(past_absolute_lifetime(now, age(2_592_001)), "30 days + 1 s is refused");
+        assert!(!past_absolute_lifetime(now, age(-5)), "created after now is valid");
+        assert!(!past_absolute_lifetime(now, age(0)));
+    }
 
     const A: Uuid = Uuid::from_u128(1);
     const B: Uuid = Uuid::from_u128(2);

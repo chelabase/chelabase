@@ -47,13 +47,17 @@ struct SessionAnswer {
 
 impl SessionAnswer {
     fn into_liveness(self) -> Liveness {
+        self.into_liveness_at(chrono::Utc::now())
+    }
+
+    fn into_liveness_at(self, now: chrono::DateTime<chrono::Utc>) -> Liveness {
         let flagged_live = match (self.live, self.revoked) {
             (_, Some(true)) | (Some(false), _) => false,
             (Some(true), _) | (None, Some(false)) => true,
             // Neither field present: don't guess, treat it as dead.
             (None, None) => false,
         };
-        let expired = self.expires_at.is_some_and(|at| at <= chrono::Utc::now());
+        let expired = self.expires_at.is_some_and(|at| at <= now);
         Liveness {
             live: flagged_live && !expired,
             project_id: self.project_id,
@@ -261,6 +265,20 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn a_token_expires_at_its_instant_not_after() {
+        let now = chrono::Utc::now();
+        let us = chrono::Duration::microseconds(1);
+        let live_at = |at| {
+            SessionAnswer { live: Some(true), revoked: None, expires_at: Some(at), project_id: None }
+                .into_liveness_at(now)
+                .live
+        };
+        assert!(!live_at(now), "expires now: expired");
+        assert!(!live_at(now - us), "1 us in the past: expired");
+        assert!(live_at(now + us), "1 us in the future: valid");
+    }
 
     #[tokio::test]
     async fn without_a_verification_key_every_token_is_invalid() {
