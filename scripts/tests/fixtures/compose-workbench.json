@@ -1167,7 +1167,11 @@
         "control-internal": {
           "ipv4_address": "10.213.4.10"
         },
-        "default": {},
+        "default": {
+          "aliases": [
+            "orchestrator-api"
+          ]
+        },
         "functions-control": {}
       },
       "restart": "unless-stopped",

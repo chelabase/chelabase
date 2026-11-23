@@ -565,18 +565,6 @@ fn env_port(var: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-/// The port of a `host:port` listen address in `var`, or `default`.
-fn addr_port(var: &str, default: u16) -> u16 {
-    match std::env::var(var) {
-        Ok(addr) => addr
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or_else(|| panic!("{var} is not host:port: {addr}")),
-        Err(_) => default,
-    }
-}
-
 fn proxy_pg_port() -> u16 {
     env_port("CHELABASE_PROXY_PG_PORT", 4432)
 }
@@ -599,8 +587,11 @@ fn internal_addr() -> String {
     url_host_port("CHELABASE_INTERNAL_URL", "http://orchestrator:8083")
 }
 
+/// Where the management API answers: the host:port of `CHELABASE_ORCHESTRATOR_URL`, its alias on
+/// the default network (#318: never `orchestrator`, which the runner may resolve on the compute
+/// network, where the listener has no socket).
 fn orchestrator_addr() -> String {
-    format!("orchestrator:{}", addr_port("CHELABASE_ORCHESTRATOR_ADDR", 8081))
+    url_host_port("CHELABASE_ORCHESTRATOR_URL", "http://orchestrator-api:8081")
 }
 
 /// The `chelabase` CLI: `CHELABASE_CLI` (the runner sets it), else the build next to this test's

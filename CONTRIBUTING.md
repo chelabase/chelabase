@@ -176,7 +176,7 @@ Everything a browser or a script reaches goes through the stack's gateway, by ho
 
 ## Ports
 
-On the host, a workbench stack publishes only two ports, on loopback (`127.0.0.1` and `::1`). Every other service is reachable only inside the stack's network, by service name (`metadata-db:5432`, `nats:4222`, `orchestrator:8081`, and so on); tests and scripts run there, in the runner container (`just workbench test|run`), and `just workbench psql|exec` reach in.
+On the host, a workbench stack publishes only two ports, on loopback (`127.0.0.1` and `::1`). Every other service is reachable only inside the stack's network, by service name (`metadata-db:5432`, `nats:4222`, `orchestrator-api:8081`, and so on); tests and scripts run there, in the runner container (`just workbench test|run`), and `just workbench psql|exec` reach in.
 
 | Port | main | worktree stacks | What |
 | --- | --- | --- | --- |

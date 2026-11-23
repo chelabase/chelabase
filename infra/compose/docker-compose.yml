@@ -85,7 +85,9 @@ x-app-env: &app-env
   CHELABASE_SAFEKEEPER_HTTP: 1=http://safekeeper1:7676,2=http://safekeeper2:7676,3=http://safekeeper3:7676
   CHELABASE_INTERNAL_URL: http://orchestrator:8083
   CHELABASE_REST_INTERNAL_URL: http://rest:8086
-  CHELABASE_ORCHESTRATOR_URL: http://orchestrator:8081
+  # #318: the management API's alias on the default network only (never `orchestrator`, which
+  # resolves on every network the orchestrator shares with a caller).
+  CHELABASE_ORCHESTRATOR_URL: http://orchestrator-api:8081
   CHELABASE_AUTH_URL: http://auth:8084
   CHELABASE_REST_URL: http://rest:8085
   CHELABASE_REALTIME_URL: http://realtime:8087
@@ -103,7 +105,9 @@ x-app-env: &app-env
   # the profile the name doesn't resolve and container services answer 503 (m11).
   CHELABASE_SERVICE_RUNNER_URL: http://service-runner-control:8094
   CHELABASE_STUDIO_UPSTREAM: http://studio:3000
-  CHELABASE_ORCHESTRATOR_ADDR: 0.0.0.0:8081
+  # #318: the management API binds its default-network alias and loopback (the healthcheck), each
+  # resolved at start, never 0.0.0.0: it has no socket on the compute or control network.
+  CHELABASE_ORCHESTRATOR_ADDR: orchestrator-api:8081,127.0.0.1:8081
   CHELABASE_WORKER_HEALTH_ADDR: 0.0.0.0:8082
   CHELABASE_INTERNAL_ADDR: 0.0.0.0:8083
   CHELABASE_AUTH_ADDR: 0.0.0.0:8084
@@ -1053,9 +1057,12 @@ services:
     # The default network for the apps, `control-internal` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute-internal` (P4): computes call its hooks listener
     # (8083) as `orchestrator`. `functions-control` (m4b): the functions service's internal
-    # listener, for bundle uploads.
+    # listener, for bundle uploads. #318: the management API (8081) binds the alias
+    # `orchestrator-api`, declared on `default` only, and loopback; computes can't connect to it
+    # (scripts/tests/compose-compute-network-internal.sh, scripts/compute-network-e2e.sh).
     networks:
-      default: {}
+      default:
+        aliases: [orchestrator-api]
       control-internal:
         ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP:-10.214.4.10}
       compute-internal: {}
