@@ -72,7 +72,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::schedule::{Schedule, advance, next_run};
+use crate::schedule::{NO_UPCOMING_TIME, Schedule, advance, next_run};
 use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
@@ -2190,7 +2190,7 @@ impl MetadataClient {
             let id: Uuid = r.get("id");
             if !step.enabled {
                 // Said once: the row is disabled below, so no later claim sees it.
-                log_disabled_schedule(id, &cron, r.get("timezone"));
+                log_disabled_schedule(id, &cron, r.get("timezone"), step.error.as_deref().unwrap_or(NO_UPCOMING_TIME));
             }
             ids.push(id);
             nexts.push(step.next);
@@ -2627,12 +2627,9 @@ impl MetadataClient {
     }
 }
 
-/// The `warn` a claim logs for a schedule it switches off, naming the schedule and why.
-fn log_disabled_schedule(id: Uuid, cron: &str, timezone: &str) {
-    let reason = match Schedule::parse(cron, timezone) {
-        Err(e) => e.to_string(),
-        Ok(_) => "no later time".to_owned(),
-    };
+/// The `warn` a claim logs for a schedule it switches off, naming the schedule and why:
+/// `reason` is the step's own `last_error` text, so the log and the API say the same thing.
+fn log_disabled_schedule(id: Uuid, cron: &str, timezone: &str, reason: &str) {
     warn!(schedule = %id, %cron, %timezone, %reason, "disabling a schedule that can no longer run");
 }
 
@@ -2643,6 +2640,7 @@ mod lock_model;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -2670,15 +2668,20 @@ mod tests {
     #[test]
     fn disabling_a_schedule_warns_with_its_id_and_reason() {
         let id = Uuid::parse_str("5b1f0c1e-7d57-4a4e-9a52-2f0f6d1d9c11").unwrap();
-        let text = logged(|| log_disabled_schedule(id, "0 0 * * jan", "UTC"));
-        assert!(text.contains("WARN"), "{text}");
-        assert!(text.contains(&id.to_string()), "{text}");
-        assert!(text.contains("0 0 * * jan"), "{text}");
-        let reason = Schedule::parse("0 0 * * jan", "UTC").unwrap_err().to_string();
-        assert!(text.contains(&reason), "reason {reason:?} missing: {text}");
-
-        let text = logged(|| log_disabled_schedule(id, "0 0 30 2 *", "UTC"));
-        assert!(text.contains(&id.to_string()) && text.contains("no later time"), "{text}");
+        let now = Timestamp::now();
+        for (cron, want) in [("0 0 * * jan", None), ("0 0 30 2 *", Some(NO_UPCOMING_TIME))] {
+            let step = advance(cron, "UTC", Some(now), now, true);
+            assert!(!step.enabled, "{cron}: {step:?}");
+            let reason = step.error.clone().unwrap();
+            if let Some(want) = want {
+                assert_eq!(reason, want, "{cron}");
+            }
+            let text = logged(|| log_disabled_schedule(id, cron, "UTC", &reason));
+            assert!(text.contains("WARN"), "{text}");
+            assert!(text.contains(&id.to_string()), "{text}");
+            assert!(text.contains(cron), "{text}");
+            assert!(text.contains(&reason), "{cron}: stored reason {reason:?} missing: {text}");
+        }
     }
 
     /// O2: exhaustive over kind x tenant admin x (delete, or set a plain, reserved or
