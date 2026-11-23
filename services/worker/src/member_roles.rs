@@ -2280,10 +2280,6 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         reply
     }
 
-    /// I2: one pass of the periodic sweep, the backstop for lost or failed reconciles: every
-    /// ready normal branch of a live database is reconciled once (PB R12: members or not, as
-    /// the protected-branch guard's backstop too).
-    /// Returns `(done, failed)`.
     /// #337: the branches the sweep leaves to live tests. With the setting on, the live
     /// branches are listed to find each one's database; a failed listing leaves only the live
     /// tests' main branches (whose id is the database's) out.
@@ -2301,6 +2297,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         crate::live_test::LiveTests::new(true, branches.iter().map(|b| (b.id, b.database_id)))
     }
 
+    /// I2: one pass of the periodic sweep, the backstop for lost or failed reconciles: every
+    /// ready normal branch of a live database is reconciled once (PB R12: members or not, as
+    /// the protected-branch guard's backstop too).
+    /// Returns `(done, failed)`.
     pub async fn sweep_member_roles_once(&self) -> (usize, usize) {
         let branches = match self.metadata.member_role_branches().await {
             Ok(branches) => branches,
