@@ -1,13 +1,10 @@
-//! The jiff-backed [`Timestamp`] and [`Date`] that replace the chrono aliases when chrono leaves
-//! the tree. They keep every contract the crate docs list, with the exceptions in the crate
-//! docs' "Differences" section, and are proven equal to the chrono backing by
-//! `tests/parity.rs` while chrono is still here to compare against.
+//! [`Timestamp`] and [`Date`], newtypes over jiff that replaced the chrono aliases. They keep
+//! every contract the crate docs list, with the exceptions in the crate docs' "Differences from
+//! chrono" section.
 
 mod parse;
 #[cfg(feature = "sqlx")]
 mod pg;
-#[cfg(feature = "sqlx")]
-pub use pg::{decode_pg_binary_micros, decode_pg_date_text, decode_pg_text};
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,6 +30,13 @@ pub struct Date(jiff::civil::Date);
 impl Timestamp {
     /// `1970-01-01T00:00:00Z`.
     pub const UNIX_EPOCH: Timestamp = Timestamp(jiff::Timestamp::UNIX_EPOCH);
+
+    /// The earliest instant the type holds, `-9999-01-02T01:59:59Z`.
+    pub const MIN: Timestamp = Timestamp(jiff::Timestamp::MIN);
+
+    /// The latest instant the type holds, `9999-12-30T22:00:00.999999999Z`. A later one (a
+    /// `timestamptz` of `9999-12-31` that Postgres stores) is a parse or decode error.
+    pub const MAX: Timestamp = Timestamp(jiff::Timestamp::MAX);
 
     /// Whole seconds since the Unix epoch, rounded toward the past.
     pub fn timestamp(&self) -> i64 {
@@ -74,7 +78,7 @@ impl Timestamp {
         parser: fn(&str) -> Result<i128, parse::Kind>,
     ) -> Result<Self, ParseError> {
         let nanos = parser(s).map_err(kind_error)?;
-        Self::from_nanos(nanos).ok_or_else(|| kind_error(parse::Kind::OutOfRange))
+        Self::from_nanos(nanos).ok_or_else(beyond_range)
     }
 
     /// Writes the UTC date and time as chrono's `write_rfc3339` does, up to the offset.
@@ -138,7 +142,12 @@ fn write_auto_fraction(f: &mut impl fmt::Write, nano: u32) -> fmt::Result {
 }
 
 fn kind_error(kind: parse::Kind) -> ParseError {
-    ParseError(kind.message().to_owned())
+    ParseError::new(kind.message(), false)
+}
+
+/// A well-formed time or date past jiff's range: chrono's "input is out of range".
+fn beyond_range() -> ParseError {
+    ParseError::new(parse::Kind::OutOfRange.message(), true)
 }
 
 impl crate::sealed::Sealed for Timestamp {}
@@ -296,6 +305,21 @@ impl std::ops::Sub<Timestamp> for Timestamp {
     }
 }
 
+/// The same instant as a [`std::time::SystemTime`], as chrono's `From<DateTime<Utc>>` gave
+/// (every instant in the range is one).
+impl From<Timestamp> for std::time::SystemTime {
+    fn from(t: Timestamp) -> std::time::SystemTime {
+        let d = t.0.duration_since(jiff::Timestamp::UNIX_EPOCH);
+        // jiff's range is within what `SystemTime` holds on the platforms we build for, so this
+        // panics no more than chrono's did (it computed `UNIX_EPOCH ± duration` the same way).
+        if d.is_negative() {
+            std::time::UNIX_EPOCH - d.unsigned_abs()
+        } else {
+            std::time::UNIX_EPOCH + d.unsigned_abs()
+        }
+    }
+}
+
 /// `2026-09-30 12:00:00.500 UTC`: chrono's `Display` for `DateTime<Utc>`.
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -357,11 +381,11 @@ impl Date {
     }
 
     fn from_ymd(ymd: parse::Ymd) -> Result<Self, ParseError> {
-        let year = i16::try_from(ymd.year).map_err(|_| kind_error(parse::Kind::OutOfRange))?;
+        let year = i16::try_from(ymd.year).map_err(|_| beyond_range())?;
         // `Ymd` holds a valid month and day; only the year can be past jiff's range.
         jiff::civil::Date::new(year, ymd.month as i8, ymd.day as i8)
             .map(Date)
-            .map_err(|_| kind_error(parse::Kind::OutOfRange))
+            .map_err(|_| beyond_range())
     }
 }
 

@@ -520,7 +520,8 @@ mod tests {
         ObjectEvent {
             id: Uuid::max(),
             kind: ObjectEventType::Moved,
-            time: Timestamp::from_unix_seconds(253_402_300_799).unwrap() + std::time::Duration::from_nanos(999_999_999),
+            // 9999-12-30T21:59:59.999999999Z: as long as a time is written, in the type's range.
+            time: Timestamp::from_unix_seconds(253_402_207_199).unwrap() + std::time::Duration::from_nanos(999_999_999),
             database_id: Uuid::max(),
             branch_id: Uuid::max(),
             pg_database: "\u{1}".repeat(PG_NAME_BYTES),

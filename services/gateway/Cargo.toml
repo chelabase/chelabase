@@ -37,7 +37,6 @@ reqwest = { workspace = true }
 moka = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
-chrono = { workspace = true }
 chelabase-time = { workspace = true }
 
 [dev-dependencies]

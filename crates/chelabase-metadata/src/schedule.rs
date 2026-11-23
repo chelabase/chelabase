@@ -10,11 +10,11 @@
 //!
 //! The times come from croner's jiff backend in jiff's bundled tz database, never the host's
 //! zoneinfo. A zone name is accepted only as the database spells it, byte for byte (exact
-//! case, no aliasing by case, no POSIX or offset strings). The model test is
-//! `next_runs_match_the_chrono_backend`: until croner's chrono backend and `chrono-tz` go
-//! (epic drop-chrono, m13), it compares every next time with theirs on random crons, zones and
-//! instants and at every DST transition of a few awkward zones; `next_runs_goldens` keeps the
-//! agreed outputs after that.
+//! case, no aliasing by case, no POSIX or offset strings). Until croner's chrono backend and
+//! `chrono-tz` left the tree, a model test compared every next time with theirs on random
+//! crons, zones and instants and at every DST transition of a few awkward zones;
+//! `next_runs_goldens` keeps the outputs both agreed on, and the zone-name fixture keeps
+//! `chrono-tz` 0.10.4's list. jiff's bundled tzdata (2026f) is the accepted source since.
 
 use chelabase_time::{Timestamp, TimestampExt};
 use tracing::warn;
@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// The zone names `chrono-tz` 0.10.4 accepted (its `TZ_VARIANTS`), frozen.
-    pub(super) fn chrono_tz_names() -> Vec<&'static str> {
+    fn chrono_tz_names() -> Vec<&'static str> {
         include_str!("../tests/fixtures/tz_names_chrono_tz_0_10_4.txt")
             .lines()
             .collect()
@@ -484,8 +484,8 @@ mod tests {
     }
 
     /// (cron, zone, start) and the next three runs both backends agreed on before croner's
-    /// chrono backend went (m11). Kept after m13 as the record of that agreement.
-    pub(super) const GOLDENS: &[(&str, &str, &str, [&str; 3])] = &[
+    /// chrono backend went (m11): the record of that agreement.
+    const GOLDENS: &[(&str, &str, &str, [&str; 3])] = &[
         ("30 1 * * *", "Europe/London", "2026-03-28T00:00:00Z", ["2026-03-28T01:30:00Z", "2026-03-29T01:00:00Z", "2026-03-30T00:30:00Z"]),
         ("30 1 * * *", "Europe/London", "2026-10-24T12:00:00Z", ["2026-10-25T00:30:00Z", "2026-10-26T01:30:00Z", "2026-10-27T01:30:00Z"]),
         ("0 9 * * MON-FRI", "Europe/London", "2026-03-27T12:00:00Z", ["2026-03-30T08:00:00Z", "2026-03-31T08:00:00Z", "2026-04-01T08:00:00Z"]),
@@ -528,7 +528,7 @@ mod tests {
         ("0 0 * * 1#2", "Europe/Berlin", "2026-03-01T00:00:00Z", ["2026-03-08T23:00:00Z", "2026-04-12T22:00:00Z", "2026-05-10T22:00:00Z"]),
     ];
 
-    pub(super) fn three_runs(s: &Schedule, from: Timestamp) -> Vec<Option<Timestamp>> {
+    fn three_runs(s: &Schedule, from: Timestamp) -> Vec<Option<Timestamp>> {
         let mut t = Some(from);
         (0..3)
             .map(|_| {
@@ -545,344 +545,6 @@ mod tests {
             let s = Schedule::parse(cron, tz).unwrap();
             let want: Vec<_> = want.iter().map(|w| Some(at(w))).collect();
             assert_eq!(three_runs(&s, at(from)), want, "{cron} in {tz} from {from}");
-        }
-    }
-}
-
-/// The differential test against croner's chrono backend and `chrono-tz`: removed with them in
-/// m13 (epic drop-chrono); [`tests::GOLDENS`] stays.
-#[cfg(test)]
-mod chrono_parity {
-    use super::tests::{GOLDENS, chrono_tz_names, three_runs};
-    use super::*;
-    use proptest::prelude::*;
-
-    fn at(s: &str) -> Timestamp {
-        Timestamp::parse_rfc3339(s).unwrap()
-    }
-
-    /// The chrono backend's next time: what `Schedule::try_next_after` did before m11.
-    fn chrono_next(s: &Schedule, tz: chrono_tz::Tz, after: Timestamp) -> Result<Option<Timestamp>, String> {
-        let ns = i64::try_from(after.unix_nanos()).map_err(|e| e.to_string())?;
-        let start = chrono::DateTime::from_timestamp_nanos(ns).with_timezone(&tz);
-        let found = never_fires_is_none(s.cron.find_next_occurrence(&start, false)).map_err(|e| e.to_string())?;
-        found
-            .map(|t| {
-                let ns = t.timestamp_nanos_opt().ok_or("out of range")?;
-                from_unix_nanos(i128::from(ns)).ok_or_else(|| "out of range".to_owned())
-            })
-            .transpose()
-    }
-
-    /// Where the two tz databases disagree: each zone's first instant whose UTC offset differs
-    /// between `chrono-tz` 0.10.4 (tzdata 2025b) and jiff-tzdb 1.0.0 (tzdata 2026f), between
-    /// 2000 and 2040, with jiff's and chrono's offsets in seconds. Next times are compared up to
-    /// it; [`tzdata_differences_are_the_listed_ones`] recomputes it, so it can't widen silently.
-    const TZDATA_DIFFERENCES: &[(&str, &str, i32, i32)] = &[
-        ("Africa/Casablanca", "2026-09-20T01:00:00Z", 0, 3600),
-        ("Africa/El_Aaiun", "2026-09-20T01:00:00Z", 0, 3600),
-        ("America/Edmonton", "2026-11-01T08:00:00Z", -21600, -25200),
-        ("America/Havana", "2026-11-01T05:00:00Z", -14400, -18000),
-        ("America/Inuvik", "2026-11-01T08:00:00Z", -21600, -25200),
-        ("America/Rainy_River", "2026-11-01T07:00:00Z", -18000, -21600),
-        ("America/Vancouver", "2026-11-01T09:00:00Z", -25200, -28800),
-        ("America/Winnipeg", "2026-11-01T07:00:00Z", -18000, -21600),
-        ("America/Yellowknife", "2026-11-01T08:00:00Z", -21600, -25200),
-        ("Canada/Central", "2026-11-01T07:00:00Z", -18000, -21600),
-        ("Canada/Mountain", "2026-11-01T08:00:00Z", -21600, -25200),
-        ("Canada/Pacific", "2026-11-01T09:00:00Z", -25200, -28800),
-        ("Cuba", "2026-11-01T05:00:00Z", -14400, -18000),
-        ("Europe/Chisinau", "2022-03-27T00:00:00Z", 7200, 10800),
-        ("Europe/Tiraspol", "2022-03-27T00:00:00Z", 7200, 10800),
-    ];
-
-    fn divergence(zone: &str) -> Option<Timestamp> {
-        TZDATA_DIFFERENCES.iter().find(|d| d.0 == zone).map(|d| at(d.1))
-    }
-
-    /// jiff 1.0.2 reads 23:00-23:59 on 2023-10-28 in `America/Nuuk` (and its alias) as a fold
-    /// whose earlier instant is 22:xx local: the zone's last explicit transition meets its
-    /// POSIX rule there. croner's debug assertion catches it. The window is in the past, and
-    /// a schedule only searches from now, so the comparison skips searches that cross it.
-    fn crosses_the_nuuk_fold(zone: &str, after: Timestamp, chrono: Option<Timestamp>) -> bool {
-        ["America/Nuuk", "America/Godthab"].contains(&zone)
-            && after < at("2023-10-29T02:00:00Z")
-            && chrono.is_none_or(|c| c >= at("2023-10-29T00:00:00Z"))
-    }
-
-    /// Up to `n` chained next times from both backends; `Err` names the first disagreement or
-    /// error (an error is never read as "never fires"). Answers must be equal whenever either
-    /// is before the zone's tzdata divergence; the comparison stops at the first pair past it.
-    fn compare(cron: &str, zone: &str, from: Timestamp, n: usize) -> Result<(), String> {
-        let s = Schedule::parse(cron, zone).map_err(|e| format!("jiff refused {cron:?} in {zone}: {e}"))?;
-        let tz: chrono_tz::Tz = zone.parse().map_err(|e| format!("chrono-tz refused {zone}: {e}"))?;
-        let diverges = divergence(zone);
-        let mut t = from;
-        for i in 0..n {
-            let c = chrono_next(&s, tz, t).map_err(|e| format!("chrono search failed for {cron:?} in {zone} after {t}: {e}"))?;
-            if crosses_the_nuuk_fold(zone, t, c) {
-                break;
-            }
-            let j = s.try_next_after(t).map_err(|e| format!("jiff search failed for {cron:?} in {zone} after {t}: {e}"))?;
-            // `None` (never fires) sorts after every time.
-            let earliest = match (j, c) {
-                (Some(j), Some(c)) => Some(j.min(c)),
-                (one, other) => one.or(other),
-            };
-            let past_divergence = |d: Timestamp| earliest.is_none_or(|e| e >= d);
-            if diverges.is_some_and(past_divergence) {
-                break;
-            }
-            if j != c {
-                return Err(format!("{cron:?} in {zone} from {from}, run {i} after {t}: jiff {j:?}, chrono {c:?}"));
-            }
-            match j {
-                Some(next) => t = next,
-                None => break,
-            }
-        }
-        Ok(())
-    }
-
-    fn jiff_offset(tz: &jiff::tz::TimeZone, s: i64) -> i32 {
-        tz.to_offset(jiff::Timestamp::from_second(s).unwrap()).seconds()
-    }
-
-    fn chrono_offset(tz: &chrono_tz::Tz, s: i64) -> i32 {
-        use chrono::{Offset, TimeZone};
-        let utc = chrono::DateTime::from_timestamp(s, 0).unwrap().naive_utc();
-        tz.offset_from_utc_datetime(&utc).fix().local_minus_utc()
-    }
-
-    const FROM_2000: i64 = 946_684_800;
-    const UNTIL_2040: i64 = 2_208_988_800;
-
-    #[test]
-    fn tzdata_differences_are_the_listed_ones() {
-        let db = jiff::tz::TimeZoneDatabase::bundled();
-        let mut found = Vec::new();
-        for zone in chrono_tz_names() {
-            let (tz, ctz): (_, chrono_tz::Tz) = (db.get(zone).unwrap(), zone.parse().unwrap());
-            // Every 3 hours (a DST period lasts months), and a second either side of each of
-            // jiff's transitions (a transition both have, moved within the day).
-            let mut points: Vec<i64> = (FROM_2000..UNTIL_2040).step_by(3 * 3600).collect();
-            let start = jiff::Timestamp::from_second(FROM_2000).unwrap();
-            for tr in tz.following(start).take_while(|t| t.timestamp().as_second() < UNTIL_2040) {
-                let x = tr.timestamp().as_second();
-                points.extend([x - 1, x, x + 1]);
-            }
-            points.sort_unstable();
-            points.dedup();
-            let differs = |x: i64| jiff_offset(&tz, x) != chrono_offset(&ctz, x);
-            let mut agreed = FROM_2000;
-            if differs(agreed) {
-                found.push((zone, agreed));
-                continue;
-            }
-            if let Some(&first) = points.iter().find(|&&x| {
-                let d = differs(x);
-                if !d {
-                    agreed = x;
-                }
-                d
-            }) {
-                // Bisect to the exact second.
-                let (mut ok, mut bad) = (agreed, first);
-                while bad - ok > 1 {
-                    let mid = ok + (bad - ok) / 2;
-                    if differs(mid) { bad = mid } else { ok = mid }
-                }
-                found.push((zone, bad));
-            }
-        }
-        let found: Vec<(&str, String, i32, i32)> = found
-            .into_iter()
-            .map(|(zone, x)| {
-                let (tz, ctz): (_, chrono_tz::Tz) = (db.get(zone).unwrap(), zone.parse().unwrap());
-                let when = from_unix_nanos(i128::from(x) * 1_000_000_000).unwrap().to_rfc3339_auto();
-                (zone, when, jiff_offset(&tz, x), chrono_offset(&ctz, x))
-            })
-            .collect();
-        for f in &found {
-            println!("        ({:?}, {:?}, {}, {}),", f.0, f.1, f.2, f.3);
-        }
-        let listed: Vec<_> = TZDATA_DIFFERENCES.iter().map(|d| (d.0, d.1.to_owned(), d.2, d.3)).collect();
-        assert_eq!(found, listed);
-    }
-
-    /// Wall-clock times resolve to the same instants in both databases (one, two in a fold,
-    /// none in a gap) around every transition before each zone's divergence, except jiff's
-    /// Nuuk fold ([`crosses_the_nuuk_fold`]).
-    #[test]
-    fn local_times_resolve_as_chrono_tz_did() {
-        use chrono::TimeZone;
-        use jiff::tz::AmbiguousOffset;
-        let db = jiff::tz::TimeZoneDatabase::bundled();
-        let mut differ = Vec::new();
-        for zone in chrono_tz_names() {
-            let (tz, ctz): (_, chrono_tz::Tz) = (db.get(zone).unwrap(), zone.parse().unwrap());
-            let until = divergence(zone).map_or(UNTIL_2040, |d| d.timestamp() - 2 * 86_400);
-            let start = jiff::Timestamp::from_second(FROM_2000).unwrap();
-            for tr in tz.following(start).take_while(|t| t.timestamp().as_second() < until) {
-                let base = tr.timestamp().to_zoned_datetime(tz.clone()).datetime();
-                for minutes in (-240i64..=240).step_by(5) {
-                    let dt = base.checked_add(jiff::SignedDuration::from_mins(minutes)).unwrap();
-                    let amb = tz.to_ambiguous_zoned_datetime(dt);
-                    let secs = |z: Result<jiff::ZonedDateTime, jiff::Error>| z.unwrap().timestamp().as_second();
-                    let j: Vec<i64> = match amb.offset() {
-                        AmbiguousOffset::Unambiguous { .. } => vec![secs(amb.unambiguous())],
-                        AmbiguousOffset::Fold { .. } => vec![secs(amb.clone().earlier()), secs(amb.later())],
-                        AmbiguousOffset::Gap { .. } => vec![],
-                    };
-                    let naive = chrono::NaiveDate::from_ymd_opt(i32::from(dt.year()), dt.month() as u32, dt.day() as u32)
-                        .unwrap()
-                        .and_hms_opt(dt.hour() as u32, dt.minute() as u32, 0)
-                        .unwrap();
-                    let c: Vec<i64> = match ctz.from_local_datetime(&naive) {
-                        chrono::LocalResult::Single(x) => vec![x.timestamp()],
-                        chrono::LocalResult::Ambiguous(x, y) => vec![x.timestamp().min(y.timestamp()), x.timestamp().max(y.timestamp())],
-                        chrono::LocalResult::None => vec![],
-                    };
-                    if j != c {
-                        differ.push(format!("{zone} {dt}"));
-                    }
-                }
-            }
-        }
-        differ.sort();
-        differ.dedup();
-        let want: Vec<String> = ["America/Godthab", "America/Nuuk"]
-            .iter()
-            .flat_map(|zone| (0..60).step_by(5).map(move |m| format!("{zone} 2023-10-28T23:{m:02}:00")))
-            .collect();
-        assert_eq!(differ, want);
-    }
-
-    #[test]
-    fn the_fixture_is_chrono_tz_0_10_4s_zone_list() {
-        let mut want: Vec<&str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
-        want.sort_unstable();
-        assert_eq!(chrono_tz_names(), want);
-    }
-
-    #[test]
-    fn the_goldens_agree_with_the_chrono_backend() {
-        for (cron, zone, from, _) in GOLDENS {
-            compare(cron, zone, at(from), 3).unwrap();
-            let s = Schedule::parse(cron, zone).unwrap();
-            let tz: chrono_tz::Tz = zone.parse().unwrap();
-            let mut t = Some(at(from));
-            let chrono: Vec<_> = (0..3).map(|_| { t = t.and_then(|t| chrono_next(&s, tz, t).unwrap()); t }).collect();
-            assert_eq!(three_runs(&s, at(from)), chrono, "{cron} in {zone}");
-        }
-    }
-
-    /// Prints the goldens table from the chrono backend, for a changed (cron, zone, start):
-    /// `cargo nextest run -p chelabase-metadata print_goldens --run-ignored only --no-capture`.
-    #[test]
-    #[ignore = "generates GOLDENS"]
-    fn print_goldens() {
-        for (cron, zone, from, _) in GOLDENS {
-            let s = Schedule::parse(cron, zone).unwrap();
-            let tz: chrono_tz::Tz = zone.parse().unwrap();
-            let mut t = Some(at(from));
-            let runs: Vec<String> = (0..3)
-                .map(|_| {
-                    t = t.and_then(|t| chrono_next(&s, tz, t).unwrap());
-                    format!("{:?}", t.unwrap().to_rfc3339_auto())
-                })
-                .collect();
-            println!("        ({cron:?}, {zone:?}, {from:?}, [{}]),", runs.join(", "));
-        }
-    }
-
-    const TRANSITION_ZONES: &[&str] = &[
-        "Europe/London",
-        "America/New_York",
-        "Australia/Lord_Howe",
-        "Pacific/Apia",
-        "America/Nuuk",
-    ];
-
-    /// Crons aimed at the hours clocks change in (and a whole skipped day).
-    const TRANSITION_CRONS: &[&str] = &[
-        "* * * * *",
-        "*/15 * * * *",
-        "0 * * * *",
-        "30 * * * *",
-        "0 0 * * *",
-        "30 1 * * *",
-        "0 2 * * *",
-        "30 2 * * *",
-        "45 3 * * *",
-        "0,30 0-4 * * *",
-        "59 23 * * *",
-        "0 12 * * SUN",
-    ];
-
-    #[test]
-    fn next_runs_match_the_chrono_backend_at_every_transition() {
-        let (from, until) = (jiff::Timestamp::from_second(946_684_800).unwrap(), jiff::Timestamp::from_second(2_208_988_800).unwrap());
-        let mut checked = 0;
-        for zone in TRANSITION_ZONES {
-            let tz = jiff::tz::TimeZoneDatabase::bundled().get(zone).unwrap();
-            for transition in tz.following(from).take_while(|t| t.timestamp() < until) {
-                let ns = transition.timestamp().as_nanosecond();
-                for offset in [-5_400, -1, 0, 1, 1_800] {
-                    let start = from_unix_nanos(ns + i128::from(offset) * 1_000_000_000).unwrap();
-                    for cron in TRANSITION_CRONS {
-                        compare(cron, zone, start, 5).unwrap_or_else(|e| panic!("{e}"));
-                        checked += 1;
-                    }
-                }
-            }
-        }
-        assert!(checked > 10_000, "{checked}");
-    }
-
-    /// One 5-field cron term in `lo..=hi`: `*`, a value, a range, a step or a list.
-    fn term(lo: u32, hi: u32) -> impl Strategy<Value = String> {
-        prop_oneof![
-            Just("*".to_owned()),
-            (lo..=hi).prop_map(|v| v.to_string()),
-            (lo..=hi, lo..=hi).prop_map(|(a, b)| format!("{}-{}", a.min(b), a.max(b))),
-            (1..=hi.max(2)).prop_map(|n| format!("*/{n}")),
-            (lo..=hi, lo..=hi, 1..=hi.max(2)).prop_map(|(a, b, n)| format!("{}-{}/{n}", a.min(b), a.max(b))),
-            prop::collection::vec(lo..=hi, 2..4).prop_map(|v| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",")),
-        ]
-    }
-
-    fn cron() -> impl Strategy<Value = String> {
-        let dom = prop_oneof![4 => term(1, 31), 1 => Just("L".to_owned())];
-        let dow = prop_oneof![
-            6 => term(0, 6),
-            1 => Just("MON-FRI".to_owned()),
-            1 => (0..=6u32).prop_map(|d| format!("{d}L")),
-            1 => (0..=6u32, 1..=5u32).prop_map(|(d, n)| format!("{d}#{n}")),
-        ];
-        (term(0, 59), term(0, 23), dom, term(1, 12), dow)
-            .prop_map(|(mi, h, dom, mo, dow)| format!("{mi} {h} {dom} {mo} {dow}"))
-    }
-
-    fn zone() -> impl Strategy<Value = &'static str> {
-        prop::sample::select(chrono_tz_names())
-    }
-
-    /// 2000-01-01 to 2040-01-01, with nanoseconds.
-    fn instant() -> impl Strategy<Value = Timestamp> {
-        (946_684_800i128..2_208_988_800, 0i128..1_000_000_000)
-            .prop_map(|(s, ns)| from_unix_nanos(s * 1_000_000_000 + ns).unwrap())
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(4096))]
-
-        #[test]
-        fn next_runs_match_the_chrono_backend(cron in cron(), zone in zone(), from in instant()) {
-            prop_assume!(Schedule::parse(&cron, zone).is_ok());
-            if let Err(e) = compare(&cron, zone, from, 5) {
-                return Err(TestCaseError::fail(e));
-            }
         }
     }
 }

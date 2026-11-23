@@ -1,10 +1,9 @@
-//! `parse_duration` against humantime 2.4.0: a frozen table of literals (it outlives humantime)
-//! and a differential test while humantime is still in the tree.
+//! `parse_duration` keeps humantime 2.4.0's grammar: a frozen table of literals taken from it,
+//! which outlived the differential test that compared the two while humantime was in the tree.
 
 use std::time::Duration;
 
 use chelabase_time::parse_duration;
-use proptest::prelude::*;
 
 const S: u64 = 1;
 const MIN: u64 = 60;
@@ -155,7 +154,7 @@ const REJECTED: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn every_unit_matches_humantime() {
+fn every_unit_parses_as_humantime_did() {
     for (unit, want) in UNITS {
         for input in [
             format!("3{unit}"),
@@ -164,117 +163,30 @@ fn every_unit_matches_humantime() {
         ] {
             let got = parse_duration(&input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
             assert_eq!(got, *want, "{input:?} (frozen)");
-            assert_eq!(
-                humantime::parse_duration(&input).unwrap(),
-                *want,
-                "{input:?} (humantime)"
-            );
         }
     }
 }
 
 #[test]
-fn combined_units_match() {
+fn combined_units_parse_as_humantime_did() {
     for (input, want) in COMBINED {
         let got = parse_duration(input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
         assert_eq!(got, *want, "{input:?} (frozen)");
-        assert_eq!(
-            humantime::parse_duration(input).unwrap(),
-            *want,
-            "{input:?} (humantime)"
-        );
     }
 }
 
 #[test]
-fn rejects_what_humantime_rejects() {
+fn rejects_what_humantime_rejected() {
     for (input, message) in REJECTED {
         let ours = parse_duration(input).expect_err(input);
         assert_eq!(ours.to_string(), *message, "{input:?} (frozen)");
-        let theirs = humantime::parse_duration(input).expect_err(input);
-        assert_eq!(theirs.to_string(), *message, "{input:?} (humantime)");
     }
 }
 
-/// humantime panics (in `Duration::new`) when a nanosecond carry lands on `u64::MAX` seconds;
+/// humantime panicked (in `Duration::new`) when a nanosecond carry landed on `u64::MAX` seconds;
 /// ours returns the overflow error.
 #[test]
 fn a_carry_past_the_largest_duration_is_an_error_not_a_panic() {
     let input = "18446744073709551615s 999999999ns 1ns";
-    assert!(std::panic::catch_unwind(|| humantime::parse_duration(input)).is_err());
     assert!(parse_duration(input).is_err());
-}
-
-fn assert_same(input: &str) -> Result<(), TestCaseError> {
-    let theirs = std::panic::catch_unwind(|| humantime::parse_duration(input));
-    let Ok(theirs) = theirs else {
-        // humantime's one panic (see above); ours must refuse it.
-        prop_assert!(parse_duration(input).is_err(), "{input:?}");
-        return Ok(());
-    };
-    let ours = parse_duration(input);
-    match (&ours, &theirs) {
-        (Ok(a), Ok(b)) => prop_assert_eq!(a, b, "{:?}", input),
-        (Err(a), Err(b)) => prop_assert_eq!(a.to_string(), b.to_string(), "{:?}", input),
-        _ => prop_assert!(false, "{input:?}: ours {ours:?}, humantime {theirs:?}"),
-    }
-    Ok(())
-}
-
-const SPELLINGS: &[&str] = &[
-    "nanos", "nsec", "ns", "usec", "us", "µs", "millis", "msec", "ms", "seconds", "second", "secs",
-    "sec", "s", "minutes", "minute", "min", "mins", "m", "hours", "hour", "hr", "hrs", "h", "days",
-    "day", "d", "weeks", "week", "wk", "wks", "w", "months", "month", "M", "years", "year", "yr",
-    "yrs", "y",
-];
-
-fn number() -> impl Strategy<Value = String> {
-    prop_oneof![
-        (0u64..10_000).prop_map(|n| n.to_string()),
-        any::<u64>().prop_map(|n| n.to_string()),
-        (0u64..1000, "[0-9]{1,12}").prop_map(|(n, f)| format!("{n}.{f}")),
-        "[0-9]{18,22}",
-    ]
-}
-
-fn unit() -> impl Strategy<Value = String> {
-    prop_oneof![
-        8 => proptest::sample::select(SPELLINGS).prop_map(str::to_string),
-        1 => "[a-zA-Zµ]{0,4}",
-    ]
-}
-
-fn sep() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just(String::new()),
-        Just(" ".to_string()),
-        Just("  ".to_string()),
-        Just("\t".to_string())
-    ]
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(4000))]
-
-    /// Random sequences of number + unit, mostly well-formed.
-    #[test]
-    fn proptest_matches_humantime(
-        parts in proptest::collection::vec((number(), sep(), unit(), sep()), 1..5),
-        lead in sep(),
-    ) {
-        let mut input = lead;
-        for (n, s1, u, s2) in parts {
-            input.push_str(&n);
-            input.push_str(&s1);
-            input.push_str(&u);
-            input.push_str(&s2);
-        }
-        assert_same(&input)?;
-    }
-
-    /// Arbitrary short strings from the characters the grammar cares about.
-    #[test]
-    fn proptest_matches_humantime_on_noise(input in "[0-9 .,a-zA-Zµ+\\-\t]{0,16}") {
-        assert_same(&input)?;
-    }
 }

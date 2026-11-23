@@ -1,15 +1,11 @@
-//! Live: values written through one backing and read through the other, in the extended
-//! (binary) and the simple (text) protocol, in UTC and non-UTC sessions. Against the metadata
-//! Postgres, in a scratch schema dropped afterwards (not shared state). Run through the live
-//! queue: just workbench test -p chelabase-time --test pg_live -- --run-ignored only
+//! Live: values written through the binds and read back in the extended (binary) and the
+//! simple (text) protocol, in UTC and non-UTC sessions. Against the metadata Postgres, in a
+//! scratch schema dropped afterwards (not shared state). Run through the live queue:
+//! just workbench test -p chelabase-time --test pg_live -- --run-ignored only
 
-use chelabase_time::jiff_backed::{Date as JDate, Timestamp as JTs};
-use chelabase_time::{DateExt, TimestampExt};
-use chrono::{DateTime, NaiveDate, Utc};
+use chelabase_time::{Date as JDate, DateExt, Timestamp as JTs, TimestampExt};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{AssertSqlSafe, Connection, Row};
-
-type CTs = DateTime<Utc>;
 
 fn url() -> String {
     std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
@@ -83,7 +79,7 @@ const DATES: &[&str] = &[
     "9999-12-31",
 ];
 
-/// One row as a backing reads it; `None` where the backing couldn't decode a column.
+/// One row as read; `None` where a column didn't decode.
 #[derive(Debug, PartialEq)]
 struct Read {
     ts: Option<Option<i128>>,
@@ -91,7 +87,7 @@ struct Read {
     d: Option<Option<String>>,
 }
 
-fn read_jiff(row: &PgRow) -> Read {
+fn read(row: &PgRow) -> Read {
     Read {
         ts: row
             .try_get::<Option<JTs>, _>("ts")
@@ -108,37 +104,10 @@ fn read_jiff(row: &PgRow) -> Read {
     }
 }
 
-fn read_chrono(row: &PgRow) -> Read {
-    Read {
-        ts: row
-            .try_get::<Option<CTs>, _>("ts")
-            .ok()
-            .map(|t| t.map(|t| t.unix_nanos())),
-        tsa: row
-            .try_get::<Option<Vec<Option<CTs>>>, _>("tsa")
-            .ok()
-            .map(|v| v.map(|v| v.into_iter().map(|t| t.map(|t| t.unix_nanos())).collect())),
-        d: row
-            .try_get::<Option<NaiveDate>, _>("d")
-            .ok()
-            .map(|d| d.map(|d| d.to_string())),
-    }
-}
-
-/// chrono's text decode can't read an offset with seconds (local mean time before 1920 in
-/// Asia/Kathmandu, before 1884 in America/St_Johns), so a column it fails on is skipped; the
-/// jiff backing must read every one.
-fn agree<T: PartialEq + std::fmt::Debug>(j: &Option<T>, c: &Option<T>, what: &str) {
-    let j = j
-        .as_ref()
-        .unwrap_or_else(|| panic!("jiff couldn't decode {what}"));
-    if let Some(c) = c {
-        assert_eq!(j, c, "{what}");
-    }
-}
-
-/// Writes every instant and date (and a row of NULLs) through one backing, reads them back
-/// through both, in both protocols, and checks they agree and equal the truncated input.
+/// Writes every instant and date (and a row of NULLs), reads them back in both protocols, and
+/// checks they equal the input as Postgres keeps it. An offset with seconds in the text
+/// protocol (local mean time before 1920 in Asia/Kathmandu, before 1884 in America/St_Johns),
+/// which chrono's text decode refused, must decode.
 async fn round_trip(time_zone: &str) {
     let mut s = Scratch::new(time_zone).await;
     let insert = format!(
@@ -149,20 +118,15 @@ async fn round_trip(time_zone: &str) {
     for i in 0..n {
         let ts = INSTANTS.get(i).copied();
         let d = DATES.get(i).copied();
-        // Even rows go in through chrono, odd rows through jiff.
-        let q = sqlx::query(AssertSqlSafe(insert.clone())).bind(i as i32 * 2);
-        let q = if i % 2 == 0 {
-            let c = ts.map(|s| CTs::parse_rfc3339(s).unwrap());
-            q.bind(c)
-                .bind(c.map(|c| vec![Some(c), None]))
-                .bind(d.map(|d| NaiveDate::parse_iso(d).unwrap()))
-        } else {
-            let j = ts.map(|s| JTs::parse_rfc3339(s).unwrap());
-            q.bind(j)
-                .bind(j.map(|j| vec![Some(j), None]))
-                .bind(d.map(|d| JDate::parse_iso(d).unwrap()))
-        };
-        q.execute(&mut s.conn).await.unwrap();
+        let j = ts.map(|s| JTs::parse_rfc3339(s).unwrap());
+        sqlx::query(AssertSqlSafe(insert.clone()))
+            .bind(i as i32 * 2)
+            .bind(j)
+            .bind(j.map(|j| vec![Some(j), None]))
+            .bind(d.map(|d| JDate::parse_iso(d).unwrap()))
+            .execute(&mut s.conn)
+            .await
+            .unwrap();
     }
     sqlx::query(AssertSqlSafe(insert.clone()))
         .bind(1_000)
@@ -186,12 +150,9 @@ async fn round_trip(time_zone: &str) {
     for rows in [&binary, &text] {
         assert_eq!(rows.len(), n + 1);
         for (i, row) in rows.iter().enumerate() {
-            let (j, c) = (read_jiff(row), read_chrono(row));
+            let j = read(row);
             let what = format!("{time_zone} row {i}");
-            agree(&j.ts, &c.ts, &what);
-            agree(&j.tsa, &c.tsa, &what);
-            agree(&j.d, &c.d, &what);
-            // Postgres keeps microseconds; sqlx's encode cuts toward 2000 (for both backings),
+            // Postgres keeps microseconds; sqlx's encode cuts toward 2000 (as chrono's did),
             // which differs from `trunc_micros` only for sub-microsecond digits before 2000.
             const Y2K: i128 = 946_684_800 * 1_000_000_000;
             let cut = INSTANTS.get(i).map(|s| {

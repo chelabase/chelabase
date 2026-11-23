@@ -947,14 +947,14 @@ mod functions {
         s.client.set_active_deployment(main, f, d).await.unwrap();
         assert!(s.client.set_enabled(main, f, true).await.unwrap());
 
-        // The premise: decoded the way the jiff backing does, the stored date is out of range.
+        // The premise: the stored date is past the date type's range.
         let row = sqlx::query("SELECT compatibility_date FROM function_deployments WHERE id = $1")
             .bind(d)
             .fetch_one(s.pool())
             .await
             .unwrap();
         assert!(
-            row.try_get::<chelabase_time::jiff_backed::Date, _>("compatibility_date")
+            row.try_get::<chelabase_time::Date, _>("compatibility_date")
                 .is_err()
         );
 
@@ -967,9 +967,9 @@ mod functions {
         let resolved = tokio::spawn(async move { c.resolve(main, "far").await.map(|r| r.is_some()) })
             .await
             .expect("resolve must not panic");
-        // Under chrono the date decodes (Ok); behind the jiff backing both are errors.
-        assert!(listed.is_err() || listed.unwrap() == 1);
-        assert!(resolved.is_err() || resolved.unwrap());
+        // Both are errors, never a panic.
+        assert!(listed.is_err(), "{listed:?}");
+        assert!(resolved.is_err(), "{resolved:?}");
         s.finish().await;
     }
 

@@ -140,3 +140,19 @@ fn date_helpers() {
         d
     );
 }
+
+#[test]
+fn converts_to_system_time() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = ts("2026-09-30T12:00:00.123456789Z");
+    let st = SystemTime::from(t);
+    assert_eq!(
+        st.duration_since(UNIX_EPOCH).unwrap(),
+        Duration::new(1_790_769_600, 123_456_789)
+    );
+    let before = SystemTime::from(ts("1969-12-31T23:59:59Z"));
+    assert_eq!(
+        UNIX_EPOCH.duration_since(before).unwrap(),
+        Duration::from_secs(1)
+    );
+}

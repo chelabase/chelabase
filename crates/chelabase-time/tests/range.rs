@@ -1,8 +1,7 @@
-//! The ends of the jiff backing's range: in range, or `None`/an error, never a panic and never
+//! The ends of the types' range (jiff's): in range, or `None`/an error, never a panic and never
 //! a clamped value. jiff's UTC range is about -9999-01-02T01:59:59Z to 9999-12-30T22:00:00Z.
 
-use chelabase_time::jiff_backed::{Date, Timestamp};
-use chelabase_time::{DateExt, TimestampExt};
+use chelabase_time::{Date, DateExt, Timestamp, TimestampExt};
 
 #[test]
 fn extremes_error_and_never_panic() {
@@ -60,8 +59,9 @@ fn extremes_error_and_never_panic() {
     assert!(low.checked_sub(std::time::Duration::MAX).is_none());
 
     // The type's own ends format, truncate and give a date without panicking.
-    let min = Timestamp::from_jiff(jiff::Timestamp::MIN);
-    let max = Timestamp::from_jiff(jiff::Timestamp::MAX);
+    let (min, max) = (Timestamp::MIN, Timestamp::MAX);
+    assert_eq!(min, Timestamp::from_jiff(jiff::Timestamp::MIN));
+    assert_eq!(max, Timestamp::from_jiff(jiff::Timestamp::MAX));
     assert_eq!(min.to_rfc3339_auto(), "-9999-01-02T01:59:59Z");
     assert_eq!(max.to_rfc3339_auto(), "9999-12-30T22:00:00.999999999Z");
     assert_eq!(min.to_string(), "-9999-01-02 01:59:59 UTC");
