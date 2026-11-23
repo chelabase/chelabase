@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "init", "server", "studio", "identity", "functions-runtime"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "storage", "functions", "service-runner", "mcp", "compute-egress", "init", "server", "studio", "identity", "functions-runtime", "mcp-runtime"]
 }
 
 target "_app" {
@@ -90,6 +90,18 @@ target "service-runner" {
   target   = "service-runner"
   tags     = ["${REPO}/service-runner:${TAG}"]
 }
+# mcp-core (m8): the MCP server (profile `mcp`). Unpublished until its first pin.
+target "mcp" {
+  inherits = ["_app"]
+  target   = "mcp"
+  tags     = ["${REPO}/mcp:${TAG}"]
+}
+# Compute egress (compute-network-reach): profile `compute-egress`. Unpublished until its first pin.
+target "compute-egress" {
+  inherits = ["_app"]
+  target   = "compute-egress"
+  tags     = ["${REPO}/compute-egress:${TAG}"]
+}
 target "init" {
   inherits = ["_app"]
   target   = "init"
@@ -134,4 +146,17 @@ target "functions-runtime" {
   }
   annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags        = ["${REPO}/functions-runtime:${TAG}"]
+}
+
+# The MCP sandbox runtime (mcp-core): workerd, the runner worker and the watchdog (profile `mcp`).
+# Unpublished until its first pin.
+target "mcp-runtime" {
+  context    = "."
+  dockerfile = "infra/images/mcp-runtime.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
+  tags        = ["${REPO}/mcp-runtime:${TAG}"]
 }

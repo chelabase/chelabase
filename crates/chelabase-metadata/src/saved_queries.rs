@@ -1,6 +1,6 @@
 //! SQL editor saved queries: private to one user, per Chelabase database.
 
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use sqlx::postgres::PgRow;
 use sqlx::{QueryBuilder, Row};
 use uuid::Uuid;
@@ -26,8 +26,8 @@ pub struct SavedQuery {
     pub pg_database: Option<String>,
     pub role: Option<String>,
     pub version: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// The member who wrote it; `None` for a query saved before members. Not in the API.
     #[serde(skip)]
     pub author_member_id: Option<Uuid>,
@@ -41,7 +41,7 @@ pub struct SavedQuerySummary {
     pub pg_database: Option<String>,
     pub role: Option<String>,
     pub version: i32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// Fields to change; `None` leaves a field, `Some(None)` clears a hint.

@@ -2,7 +2,9 @@
 //! delivery attempts. The sealed secret is read only by the worker ([`DeliveryTarget`]); no
 //! API type carries it.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use std::time::Duration;
+
+use chelabase_time::{SignedDuration, Timestamp, TimestampExt};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
@@ -16,13 +18,19 @@ pub const STORAGE_WEBHOOK_ATTEMPTS_KEPT: i64 = 100;
 /// How long the worker retries an event before dropping it. While an endpoint keeps failing
 /// some event is always retrying, so attempts are never further apart than this: a longer
 /// quiet spell ends a run of failures.
-pub const STORAGE_WEBHOOK_RETRY_WINDOW: TimeDelta = TimeDelta::hours(24);
+pub const STORAGE_WEBHOOK_RETRY_WINDOW: Duration = chelabase_time::hours(24);
 
 /// An endpoint's run of failed attempts: when it started (`None`: not failing) and how many.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailureRun {
-    pub failing_since: Option<DateTime<Utc>>,
+    pub failing_since: Option<Timestamp>,
     pub consecutive_failures: i32,
+}
+
+/// Whether `at` is more than the retry window after `last`. Signed: an `at` before `last` is
+/// never outside the window.
+fn outside_retry_window(at: Timestamp, last: Timestamp) -> bool {
+    at.since(last) > SignedDuration::try_from(STORAGE_WEBHOOK_RETRY_WINDOW).unwrap_or(SignedDuration::MAX)
 }
 
 impl FailureRun {
@@ -30,9 +38,9 @@ impl FailureRun {
     /// the endpoint's last attempt.
     pub fn after(
         self,
-        last_attempt_at: Option<DateTime<Utc>>,
+        last_attempt_at: Option<Timestamp>,
         delivered: bool,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> FailureRun {
         if delivered {
             return FailureRun {
@@ -40,7 +48,7 @@ impl FailureRun {
                 consecutive_failures: 0,
             };
         }
-        if last_attempt_at.is_none_or(|last| at - last > STORAGE_WEBHOOK_RETRY_WINDOW) {
+        if last_attempt_at.is_none_or(|last| outside_retry_window(at, last)) {
             return FailureRun {
                 failing_since: Some(at),
                 consecutive_failures: 1,
@@ -75,16 +83,16 @@ pub struct StorageWebhook {
     pub prefix: Option<String>,
     pub enabled: bool,
     /// When delivery last (re)started: events from then on are delivered.
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
     /// Why it is disabled: `member` (through the API) or `failing` (three days of failed
     /// attempts); `null` while enabled.
     pub disabled_reason: Option<String>,
     /// The start of the current run of failed attempts; `null` after a success.
-    pub failing_since: Option<DateTime<Utc>>,
+    pub failing_since: Option<Timestamp>,
     pub consecutive_failures: i32,
-    pub last_attempt_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub last_attempt_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A new endpoint; `secret_enc` is its sealed signing secret.
@@ -130,7 +138,7 @@ pub struct StorageWebhookAttempt {
     /// The HTTP status, when there was an answer.
     pub status: Option<i32>,
     pub duration_ms: i32,
-    pub attempted_at: DateTime<Utc>,
+    pub attempted_at: Timestamp,
 }
 
 fn webhook_from_row(r: &PgRow) -> StorageWebhook {
@@ -348,7 +356,7 @@ impl MetadataClient {
         &self,
         webhook: Uuid,
         attempt: &StorageWebhookAttempt,
-    ) -> Result<Option<DateTime<Utc>>, MetadataError> {
+    ) -> Result<Option<Timestamp>, MetadataError> {
         let delivered = attempt.outcome == "delivered";
         let mut tx = self.pool.begin().await?;
         let Some(row) = sqlx::query(
@@ -362,13 +370,13 @@ impl MetadataClient {
             return Ok(None);
         };
         let run = FailureRun {
-            failing_since: row.get("failing_since"),
+            failing_since: row.try_get("failing_since")?,
             consecutive_failures: row.get("consecutive_failures"),
         }
-        .after(row.get("last_attempt_at"), delivered, attempt.attempted_at);
+        .after(row.try_get("last_attempt_at")?, delivered, attempt.attempted_at);
         // As stored (microseconds): the value a later disable compares with. An attempt older
         // than the last one (recorded out of order) never moves `last_attempt_at` back.
-        let failing_since: Option<DateTime<Utc>> = sqlx::query_scalar(
+        let failing_since: Option<Timestamp> = sqlx::query_scalar(
             "UPDATE storage_webhooks
              SET failing_since = $2, consecutive_failures = $3,
                  last_attempt_at = GREATEST(last_attempt_at, $4)
@@ -413,7 +421,7 @@ impl MetadataClient {
     pub async fn disable_failing_storage_webhook(
         &self,
         webhook: Uuid,
-        failing_since: DateTime<Utc>,
+        failing_since: Timestamp,
     ) -> Result<bool, MetadataError> {
         let done = sqlx::query(
             "UPDATE storage_webhooks SET enabled = false, disabled_reason = 'failing', updated_at = now()
@@ -462,8 +470,8 @@ impl MetadataClient {
 mod tests {
     use super::*;
 
-    fn at(hours: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).unwrap() + TimeDelta::hours(hours)
+    fn at(hours: i64) -> Timestamp {
+        Timestamp::from_unix_seconds(1_700_000_000 + hours * 3600).unwrap()
     }
 
     fn run(since: Option<i64>, n: i32) -> FailureRun {
@@ -499,7 +507,7 @@ mod tests {
             run(Some(0), 5).after(Some(last), false, last + w),
             run(Some(0), 6)
         );
-        let later = last + w + TimeDelta::seconds(1);
+        let later = last + w + chelabase_time::seconds(1);
         assert_eq!(
             run(Some(0), 5).after(Some(last), false, later),
             FailureRun {
@@ -510,6 +518,40 @@ mod tests {
         // An attempt recorded out of order (concurrent deliveries) continues the run.
         assert_eq!(
             run(Some(0), 5).after(Some(at(10)), false, at(9)),
+            run(Some(0), 6)
+        );
+    }
+
+    fn secs(n: i64) -> Timestamp {
+        Timestamp::from_unix_seconds(1_700_000_000 + n).unwrap()
+    }
+
+    /// 24 h minus a second, exactly 24 h and 24 h plus a second after the last attempt: only
+    /// the last starts a new run (strictly greater than the window).
+    #[test]
+    fn retry_window_edges_are_unchanged() {
+        let day = 24 * 3600;
+        let last = secs(0);
+        let cont = run(Some(0), 5);
+        let after = |gap: i64| cont.after(Some(last), false, secs(gap));
+        assert_eq!(after(day - 1).consecutive_failures, 6);
+        assert_eq!(after(day).consecutive_failures, 6);
+        assert_eq!(after(day + 1), FailureRun { failing_since: Some(secs(day + 1)), consecutive_failures: 1 });
+        // The helper itself, with sub-second edges.
+        let edge = last + STORAGE_WEBHOOK_RETRY_WINDOW;
+        assert!(!outside_retry_window(edge, last));
+        assert!(outside_retry_window(edge + std::time::Duration::from_nanos(1), last));
+    }
+
+    /// `at` before the last attempt gives a negative difference, never outside the window,
+    /// however far back (an unsigned or absolute-value comparison would start a new run).
+    #[test]
+    fn an_attempt_before_the_last_success_keeps_todays_result() {
+        let last = secs(100 * 24 * 3600);
+        assert!(!outside_retry_window(secs(0), last));
+        assert!(!outside_retry_window(last - chelabase_time::seconds(1), last));
+        assert_eq!(
+            run(Some(0), 5).after(Some(last), false, secs(0)),
             run(Some(0), 6)
         );
     }

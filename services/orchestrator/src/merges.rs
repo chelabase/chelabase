@@ -27,7 +27,7 @@ use chelabase_metadata::{
 use chelabase_nats::{JobEnvelope, MergeAfter, MergeJob};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiPath, BranchId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
@@ -199,8 +199,8 @@ struct MergeSummary {
     #[schema(required = true)]
     error: Option<String>,
     created_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
 }
 
 impl From<&MergeRecord> for MergeSummary {
@@ -240,8 +240,8 @@ struct Merge {
     #[schema(required = true)]
     error: Option<String>,
     created_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
     /// SHA-256 of each normalized schema the analysis is based on; null until computed.
     #[schema(required = true)]
     base_fingerprint: Option<String>,
@@ -313,7 +313,7 @@ impl From<MergeRecord> for Merge {
 /// One line of a merge's log.
 #[derive(Debug, Serialize, ToSchema)]
 struct MergeLogEntry {
-    at: DateTime<Utc>,
+    at: Timestamp,
     /// `status`, `step` or `note`.
     kind: String,
     #[schema(required = true)]
@@ -1113,7 +1113,7 @@ where
         let secure = security_items(&merge);
         let old: HashSet<&str> = merge.acknowledgements.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let new: HashSet<&str> = acks.iter().map(String::as_str).collect();
-        if new.symmetric_difference(&old).any(|item| secure.contains(*item)) {
+        if new.symmetric_difference(&old).any(|item| secure.covers(item)) {
             return Err(admin_only());
         }
     }
@@ -1140,19 +1140,38 @@ where
 // ---- actions ------------------------------------------------------------------------------
 
 /// Whether the plan has a security step (BYPASSRLS, owner-level; E28): applying it needs Admin.
+/// Fails closed: a plan whose `steps` isn't a list counts.
 fn has_security_steps(merge: &MergeRecord) -> bool {
-    merge
-        .plan
-        .as_ref()
-        .and_then(|p| p["steps"].as_array())
-        .into_iter()
-        .flatten()
-        .any(|step| match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
-            Ok(s) => s.security,
-            // A step this build can't read: by its flag, as the engine writes it; without one it
-            // counts as a security step (an access check fails closed).
-            Err(_) => step["security"].as_bool().unwrap_or(true),
-        })
+    let Some(plan) = merge.plan.as_ref() else {
+        return false;
+    };
+    let Some(steps) = plan["steps"].as_array() else {
+        return true;
+    };
+    steps.iter().any(|step| match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
+        Ok(s) => s.security,
+        // A step this build can't read: by its flag, as the engine writes it; without one it
+        // counts as a security step (an access check fails closed).
+        Err(_) => step["security"].as_bool().unwrap_or(true),
+    })
+}
+
+/// The items acknowledging which is an Admin's act (R25).
+#[derive(Debug, PartialEq, Eq)]
+enum SecurityItems {
+    /// The plan's `steps` can't be read: every item counts (an access check fails closed).
+    Unreadable,
+    /// The security steps' items, or a step's id when it has none.
+    Listed(HashSet<String>),
+}
+
+impl SecurityItems {
+    fn covers(&self, item: &str) -> bool {
+        match self {
+            SecurityItems::Unreadable => true,
+            SecurityItems::Listed(items) => items.contains(item),
+        }
+    }
 }
 
 /// Whether the plan runs SQL the user wrote (a `user` step, or own SQL from a resolution): the
@@ -1184,9 +1203,14 @@ fn has_user_sql_steps(merge: &MergeRecord) -> bool {
 
 /// The items an acknowledgement of a security step goes by: the step's items, or its id when
 /// it has none (as `unacknowledged` reads them).
-fn security_items(merge: &MergeRecord) -> HashSet<String> {
+fn security_items(merge: &MergeRecord) -> SecurityItems {
+    let steps = match merge.plan.as_ref().map(|p| p["steps"].as_array()) {
+        None => return SecurityItems::Listed(HashSet::new()),
+        Some(None) => return SecurityItems::Unreadable,
+        Some(Some(steps)) => steps,
+    };
     let mut items = HashSet::new();
-    for step in merge.plan.as_ref().and_then(|p| p["steps"].as_array()).into_iter().flatten() {
+    for step in steps {
         let secure = match serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()) {
             Ok(s) => s.security,
             Err(_) => step["security"].as_bool().unwrap_or(true),
@@ -1201,7 +1225,7 @@ fn security_items(merge: &MergeRecord) -> HashSet<String> {
             items.extend(listed.into_iter().map(str::to_string));
         }
     }
-    items
+    SecurityItems::Listed(items)
 }
 
 fn admin_only() -> ApiError {
@@ -1957,6 +1981,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     fn step(kind: &str) -> Value {
         json!({
@@ -1967,7 +1992,7 @@ mod tests {
     }
 
     fn record(plan: Option<Value>, user_steps: Value) -> MergeRecord {
-        let now = Utc::now();
+        let now = Timestamp::now();
         MergeRecord {
             id: Uuid::new_v4(),
             database_id: Uuid::new_v4(),
@@ -2020,5 +2045,60 @@ mod tests {
         let recorded = json!([{ "id": "u1", "after": null, "sql": "SELECT 1" }]);
         assert!(has_user_sql_steps(&record(Some(json!({ "steps": [step("generated")] })), recorded)));
         assert!(has_user_sql_steps(&record(None, json!({ "odd": true }))));
+    }
+
+    fn record_plan(plan: Option<Value>) -> MergeRecord {
+        record(plan, json!([]))
+    }
+
+    /// A step this build reads, with the given security flag.
+    fn sec_step(id: &str, security: bool) -> Value {
+        let step = json!({
+            "id": id, "kind": "generated", "phase": "tx", "sql": "SELECT 1", "items": [],
+            "data_loss": false, "rewrite": false, "security": security, "locks": [],
+            "role_op": null, "online": null,
+        });
+        serde_json::from_value::<chelabase_schema::plan::Step>(step.clone()).expect("a readable step");
+        step
+    }
+
+    fn malformed_plans() -> Vec<Value> {
+        vec![
+            json!({ "steps": { "s1": sec_step("s1", false) } }),
+            json!({ "steps": null }),
+            json!({}),
+            json!({ "steps": "s1" }),
+            json!([sec_step("s1", false)]),
+        ]
+    }
+
+    #[test]
+    fn malformed_plan_counts_as_security_steps() {
+        for plan in malformed_plans() {
+            assert!(has_security_steps(&record_plan(Some(plan.clone()))), "{plan}");
+        }
+    }
+
+    #[test]
+    fn plain_plan_has_no_security_steps() {
+        let plain = record_plan(Some(json!({ "steps": [sec_step("s1", false), sec_step("s2", false)] })));
+        assert!(!has_security_steps(&plain));
+        assert_eq!(security_items(&plain), SecurityItems::Listed(HashSet::new()));
+        let none = record_plan(Some(json!({ "steps": [] })));
+        assert!(!has_security_steps(&none));
+        // No plan yet: nothing to apply, as `has_user_sql_steps` reads it.
+        assert!(!has_security_steps(&record_plan(None)));
+        let secure = record_plan(Some(json!({ "steps": [sec_step("s1", false), sec_step("s2", true)] })));
+        assert!(has_security_steps(&secure));
+        assert_eq!(security_items(&secure), SecurityItems::Listed(HashSet::from(["s2".to_string()])));
+    }
+
+    #[test]
+    fn malformed_plan_makes_every_item_a_security_item() {
+        for plan in malformed_plans() {
+            let items = security_items(&record_plan(Some(plan.clone())));
+            assert_eq!(items, SecurityItems::Unreadable, "{plan}");
+            assert!(items.covers("s1") && items.covers("any item"), "{plan}");
+        }
     }
 }

@@ -1,0 +1,29 @@
+[package]
+name = "chelabase-compute-egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase compute egress: allow-listed TCP destinations for computes, with a resolver for the listed names only"
+
+[lib]
+name = "compute_egress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compute-egress"
+path = "src/main.rs"
+
+[dependencies]
+# `outbound`: `is_public`, `Net`, `parse_nets`, the platform name list and the resolver trait.
+chelabase-http = { workspace = true }
+chelabase-types = { workspace = true }
+# The resolver's DNS messages: parsing and building only (no defaults, no networking).
+hickory-proto = { workspace = true }
+# TCP keepalive on both sides of a forwarded connection (no idle timeout).
+socket2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

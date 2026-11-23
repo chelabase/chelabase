@@ -391,6 +391,20 @@ pub async fn reset_revokes_sessions(id: &Identity, pool: &Pool) {
     id.sign_in(pool, &mail, "n3w password!").await.unwrap();
 }
 
+/// `PUT users/:id/password` ends every session of that user (and only theirs), as a reset does.
+pub async fn set_password_ends_sessions(id: &Identity, pool: &Pool) {
+    let mail = email("setpw");
+    let uid = user(id, pool, &mail).await;
+    let other = email("setpw-other");
+    user(id, pool, &other).await;
+    let s = id.sign_in(pool, &mail, PW).await.unwrap();
+    let o = id.sign_in(pool, &other, PW).await.unwrap();
+    id.set_password(pool, &uid, "n3w password!").await.unwrap();
+    assert!(id.session_by_token(pool, &s.session_token).await.is_err());
+    id.session_by_token(pool, &o.session_token).await.unwrap();
+    id.sign_in(pool, &mail, "n3w password!").await.unwrap();
+}
+
 async fn code_for(id: &Identity, pool: &Pool, uid: &str, kind: CodeKind) -> String {
     id.create_code(pool, &CodeRequest::new(uid, kind, Delivery::Return))
         .await

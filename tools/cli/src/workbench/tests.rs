@@ -1,7 +1,7 @@
 //! W2 core: slug, registry, slots, stack env and argv (spec section 1).
 
 use super::argv::{Compose, nextest_archive_args, nextest_run_args};
-use super::env::{StackEnvInput, control_net, render_stack_env};
+use super::env::{StackEnvInput, cidr_overlaps, compute_net, control_net, render_stack_env};
 use super::registry::{Entry, MAIN_GATEWAY_PORT, MAIN_PROXY_PORT, Registry, with_registry};
 use super::slots::{
     SlotOptions, acquire_slot, cap_from_env, reap, release_slot, ticket_name, wait_from_env,
@@ -509,7 +509,7 @@ fn the_stack_env_keeps_the_example_and_overlays_the_stack() {
         ("CHELABASE_AUTH_TRUSTED_PROXY", "gateway"),
         ("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083"),
         // RT1 T1 (P4/W14): computes get the stack's own network.
-        ("CHELABASE_COMPUTE_NETWORK", "chelabase-feat-x_compute"),
+        ("CHELABASE_COMPUTE_NETWORK", "chelabase-feat-x_compute-internal"),
         ("CHELABASE_BOOTSTRAP_DIR", "/m/.chelabase/stacks/feat-x/bootstrap"),
         ("CHELABASE_SECRETS_DIR", "/m/.chelabase/secrets"),
         ("CHELABASE_AUTH_DIR", "/m/.chelabase/auth"),
@@ -572,7 +572,7 @@ fn main_renders_todays_hosts_and_network() {
     i.state = Path::new("/m/.chelabase/stacks/main");
     let env = parse(&render_stack_env(EXAMPLE, &i));
     assert_eq!(env["CHELABASE_STUDIO_HOST"], "studio.chelabase.localhost:8000");
-    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase_compute");
+    assert_eq!(env["CHELABASE_COMPUTE_NETWORK"], "chelabase_compute-internal");
     assert_eq!(env["CHELABASE_PROXY_PORT"], "4432");
     assert_eq!(env["CHELABASE_CLI"], "/m/target/debug/chelabase");
 }
@@ -619,6 +619,8 @@ fn compose_always_names_its_project_file_and_env() {
             "/w/infra/compose/docker-compose.workbench.yml",
             "--env-file",
             "/s/env/stack.env",
+            "--profile",
+            "mcp",
             "ps",
             "-q"
         ]
@@ -696,11 +698,14 @@ fn an_empty_selection_archives_the_workspace() {
 fn the_stack_env_carries_the_control_network() {
     let env = parse(&render_stack_env(EXAMPLE, &input()));
     for (k, v) in [
-        ("CHELABASE_COMPUTE_CONTROL_NETWORK", "chelabase-feat-x_control"),
-        ("CHELABASE_CONTROL_SUBNET", "10.213.4.0/22"),
-        ("CHELABASE_CONTROL_COMPUTE_RANGE", "10.213.6.0/23"),
-        ("CHELABASE_ORCHESTRATOR_CONTROL_IP", "10.213.4.10"),
-        ("CHELABASE_RUNNER_CONTROL_IP", "10.213.4.11"),
+        ("CHELABASE_COMPUTE_CONTROL_NETWORK", "chelabase-feat-x_control-internal"),
+        ("CHELABASE_LEGACY_COMPUTE_NETWORKS", "chelabase-feat-x_compute,chelabase-feat-x_control"),
+        ("CHELABASE_CONTROL_INTERNAL_SUBNET", "10.213.4.0/22"),
+        ("CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE", "10.213.6.0/23"),
+        ("CHELABASE_COMPUTE_SUBNET", "10.212.4.0/22"),
+        ("CHELABASE_COMPUTE_RANGE", "10.212.6.0/23"),
+        ("CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP", "10.213.4.10"),
+        ("CHELABASE_RUNNER_CONTROL_INTERNAL_IP", "10.213.4.11"),
         ("CHELABASE_MEMBER_LOGIN_CIDRS", "10.213.4.10/32,10.213.4.11/32"),
         ("CHELABASE_COMPUTE_CA_DIR", "/m/.chelabase/compute-ca"),
         ("CHELABASE_COMPUTE_TLS_DIR", "/m/.chelabase/orchestrator-tls"),
@@ -713,6 +718,51 @@ fn the_stack_env_carries_the_control_network() {
         ("10.213.0.0/22", "10.213.2.0/23", "10.213.0.10", "10.213.0.11")
     );
     assert_eq!(control_net(63).subnet, "10.213.252.0/22");
+}
+
+// compute-network-reach m4: the egress service sits on the compute network at an address derived
+// from the stack's slot: inside the subnet, outside the range Docker assigns computes from (it
+// hands out the range's first address), and never the network, gateway or broadcast address.
+#[test]
+fn the_egress_address_follows_the_compute_subnet() {
+    for slot in 0..=63u8 {
+        let net = compute_net(slot);
+        let base = u16::from(slot) * 4;
+        assert_eq!(net.egress_ip, format!("10.212.{base}.2"), "slot {slot}");
+        let host = format!("{}/32", net.egress_ip);
+        assert!(cidr_overlaps(&host, &net.subnet), "slot {slot}: inside {}", net.subnet);
+        assert!(!cidr_overlaps(&host, &net.range), "slot {slot}: outside {}", net.range);
+        for reserved in [format!("10.212.{base}.0"), format!("10.212.{base}.1"), format!("10.212.{}.255", base + 3)] {
+            assert_ne!(net.egress_ip, reserved, "slot {slot}");
+        }
+    }
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    for k in ["CHELABASE_COMPUTE_EGRESS_IP", "CHELABASE_COMPUTE_EGRESS_DNS"] {
+        assert_eq!(env.get(k).map(String::as_str), Some("10.212.4.2"), "{k}");
+    }
+}
+
+// The egress service is a Rust app of the stack whose compose profile (`compute-egress`) `up`
+// activates by naming the service: built, recorded, started with the late apps and restartable
+// with the others. (The service-runner's profile stays off: `service_runner_is_built_but_never_started`.)
+#[test]
+fn compute_egress_is_a_profile_app() {
+    use super::commands::{APPS, LATE_APPS, PROFILE_RUST_APPS, RUST_APPS, build_packages, restart_targets};
+    assert!(RUST_APPS.contains(&"compute-egress"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"compute-egress"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"compute-egress"), "{LATE_APPS:?}");
+    assert!(!PROFILE_RUST_APPS.contains(&"compute-egress"), "built once, as a Rust app");
+    assert_eq!(build_packages(&["compute-egress"], false), ["-p", "chelabase-compute-egress"]);
+    let up = build_packages(&RUST_APPS, true);
+    assert_eq!(up.iter().filter(|a| *a == "chelabase-compute-egress").count(), 1, "{up:?}");
+    assert_eq!(restart_targets(&["compute-egress".into()]).unwrap(), ["compute-egress"]);
+    assert!(restart_targets(&[]).unwrap().contains(&"compute-egress".to_string()));
+    // Naming it on the `up` command line is what turns its profile on.
+    let args = super::commands::compose_up_args(&[], LATE_APPS);
+    assert!(args.iter().any(|a| a == "compute-egress"), "{args:?}");
+    // Every call that lists, stops, removes or recreates the stack's containers names the profile.
+    let recreate = super::commands::recreate_args(&["compute-egress".to_string()]);
+    assert!(recreate.windows(2).any(|w| w == ["--profile", "compute-egress"]), "{recreate:?}");
 }
 
 // U15 (f5b). Invariant: every connection Chelabase opens to a compute uses TLS verified against
@@ -811,6 +861,55 @@ fn functions_is_one_of_the_stacks_rust_apps() {
     assert!(INFRA.contains(&"functions-runtime"), "{INFRA:?}");
     assert!(!RUST_APPS.contains(&"functions-runtime"));
     assert_eq!(restart_targets(&["functions".into()]).unwrap(), ["functions"]);
+}
+
+// mcp-core m12 (#356): `up` builds, records and restarts the MCP server with the other Rust apps
+// and starts it with the late apps; its runtime is infra (an image, no binary).
+#[test]
+fn mcp_is_a_rust_app_and_its_runtime_is_infra() {
+    use super::commands::{APPS, INFRA, LATE_APPS, PROFILE_RUST_APPS, RUST_APPS, build_packages, restart_targets};
+    assert!(RUST_APPS.contains(&"mcp"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"mcp"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"mcp"), "{LATE_APPS:?}");
+    assert!(INFRA.contains(&"mcp-runtime"), "{INFRA:?}");
+    assert!(!RUST_APPS.contains(&"mcp-runtime") && !APPS.contains(&"mcp-runtime"));
+    assert!(!PROFILE_RUST_APPS.contains(&"mcp"));
+    assert_eq!(build_packages(&["mcp"], false), ["-p", "mcp"]);
+    assert_eq!(restart_targets(&["mcp".into()]).unwrap(), ["mcp"]);
+    assert!(restart_targets(&[]).unwrap().contains(&"mcp".to_string()));
+}
+
+// The MCP runtime's image is built from the Dockerfile and `infra/mcp-runtime/*`, tagged by their
+// content, and its tag is not the functions runtime's.
+#[test]
+fn mcp_runtime_image_inputs() {
+    use super::commands::{MCP_RUNTIME_INPUTS, mcp_runtime_tag};
+    assert_eq!(MCP_RUNTIME_INPUTS[0], "infra/images/mcp-runtime.Dockerfile");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for rel in ["config.capnp", "runner.js", "watchdog.sh"] {
+        let input = format!("infra/mcp-runtime/{rel}");
+        assert!(MCP_RUNTIME_INPUTS.contains(&input.as_str()), "{input}");
+    }
+    for rel in MCP_RUNTIME_INPUTS {
+        assert!(root.join(rel).is_file(), "{rel} exists in the checkout");
+    }
+    // Every file the Dockerfile copies from the checkout is an input.
+    let dockerfile = std::fs::read_to_string(root.join(MCP_RUNTIME_INPUTS[0])).unwrap();
+    for line in dockerfile.lines().filter(|l| l.starts_with("COPY infra/")) {
+        for src in line.split_whitespace().skip(1).filter(|w| w.starts_with("infra/")) {
+            assert!(MCP_RUNTIME_INPUTS.contains(&src), "{src} is copied but not an input");
+        }
+    }
+    let tag = mcp_runtime_tag(&root).unwrap();
+    assert!(tag.starts_with("wb-") && tag.len() == 15, "{tag}");
+}
+
+// m12: the gateway's upstream and the live tests' endpoint are in stack.env.
+#[test]
+fn the_stack_env_points_the_gateway_and_the_live_tests_at_mcp() {
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    assert_eq!(env["CHELABASE_MCP_URL"], "http://mcp-public:8095");
+    assert_eq!(env["CHELABASE_MCP_LIVE_URL"], format!("{}/mcp", env["CHELABASE_ENTRY_API_URL"]));
 }
 
 // auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be

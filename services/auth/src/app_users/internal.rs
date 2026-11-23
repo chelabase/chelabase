@@ -26,6 +26,10 @@ pub struct AppBranchInfo {
     pub target_branch_id: Uuid,
     /// `None` while the target has no running compute or no sync role.
     pub sync: Option<SyncTarget>,
+    /// The project's name, shown in its app users' mail. `None` from an orchestrator that
+    /// doesn't send it: the mail then names the service's default.
+    #[serde(default)]
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,7 +83,7 @@ pub struct RevokeUserSessions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_before: Option<chelabase_time::Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,7 +111,7 @@ pub struct OpenInvite {
     /// The invite is open: not revoked, accepted or expired.
     pub open: bool,
     /// Its stored expiry; `None` when the user has no such invite.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chelabase_time::Timestamp>,
 }
 
 /// The sign-up gate's answer (`POST /internal/signup/check`).

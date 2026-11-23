@@ -7,6 +7,8 @@
     "storage-settings",
     "amazon-s3",
     "functions",
+    "mcp",
+    "compute-egress",
     "example"
   ]
 }

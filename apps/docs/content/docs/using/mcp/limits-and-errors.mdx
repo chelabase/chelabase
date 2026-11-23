@@ -1,0 +1,83 @@
+---
+title: Limits and errors
+description: How long, how big and how often a tool call may run, how a long result is cut, and every error code a tool returns.
+---
+
+<AlphaNotice />
+
+## Limits
+
+An operator can change these ([MCP server](/self-hosting/mcp#settings)). The defaults:
+
+| Limit | Default |
+|---|---|
+| Time for one tool call | 30 s |
+| Size of a result | 24,000 bytes of JSON text |
+| Tool calls per member | 60 a minute |
+| Runs in flight per member | 2 |
+| Runs in flight overall | 8 |
+| API calls in one `execute` | 50 |
+| Size of one API answer the code reads | 1 MiB of body (an operator can raise it to 8 MiB); the whole answer, as JSON, at most 8 MiB |
+| Size of a request body | 1 MiB |
+| Size of one `chelabase.request` call | 4 MiB of JSON |
+| Size of the code | 64 KiB |
+| Sandbox memory | 128 MiB of JavaScript heap per run; the runtime container is capped at 512 MiB |
+
+A call refused for a limit answers at once with `rate_limited` and `retry_after_ms`; nothing waits for a slot.
+
+**Truncation.** A result longer than the cap is cut at a character boundary and ends with a `--- TRUNCATED: <kept> of <total> bytes; … ---` marker. A cut result has no structured form. Return less: pick fields, count, or page.
+
+## Errors
+
+A failed tool call is a tool result with `isError: true` and one text block of JSON: `{"error": {"code", "message"}}`. A call that doesn't have the right arguments is a protocol error (`-32602`) instead, and nothing runs.
+
+| Code | Meaning |
+|---|---|
+| `invalid_code` | The code is over 64 KiB, or doesn't parse, or isn't a function. |
+| `threw` | The code threw. The message is the error's. |
+| `timeout` | The run took longer than the limit, or code that only waits never finished. |
+| `not_serializable` | The value the code returned can't be written as JSON (a function, symbol, bigint or cycle, or over 4 MiB). |
+| `runtime_unavailable` | The sandbox couldn't run the code: it isn't configured, is restarting, or was restarted while the run was in flight. |
+| `rate_limited` | A limit above was reached. `retry_after_ms` says how long to wait. |
+| `destructive_flag_required` | A destructive operation was called without `destructive: true`. `operations` lists them. |
+| `read_only_connection` | A connection that is read-only called an operation that isn't a read. `operations` lists them. |
+| `calls_unfinished` | The code returned a value while an API call it made still had no answer. `calls` lists each call. |
+
+Every error of an `execute` run that made any API call carries `calls`, whatever the code: one `{operation, status}` per call the server sent, where `status` is the API's status number, `upstream_unavailable` or `unknown`. A call with a status number was made and answered, so a write listed with a 2xx status happened even when the code then threw or the sandbox restarted: don't retry it blindly. **An `unknown` call may have been applied.** If the message says so, check the state before you retry. A SQL run that ended before its answer reached the code may have applied its earlier statements.
+
+**A busy loop is `runtime_unavailable`, not `timeout`.** Code such as `for (;;) {}` keeps the sandbox busy; its watchdog restarts the runtime after about 8 seconds, before the time limit. Other runs in flight at that moment also answer `runtime_unavailable`, and calls work again within about 10 seconds. Code that only awaits forever gets `timeout`.
+
+### Errors the code sees from `chelabase.request`
+
+These come back as `{status, ok: false, body: {error: {code, message}}}`, not as a thrown error.
+
+| Status | Code | Meaning |
+|---|---|---|
+| 403 | `operation_not_allowed` | Not an operation of the spec, or an excluded one (the binary routes). A `runSql` with `copy_out` gets a message saying `copy_out` isn't available here. |
+| 403 | `destructive_flag_required` | See above. |
+| 403 | `read_only_connection` | See above. |
+| 403 | `secrets_unavailable` | The operation answers with a credential, or the answer held your token. A credential operation is refused this way before the class is checked, so it never needs the flag. |
+| 429 | `too_many_calls` | More than the limit of API calls in one `execute`. |
+| 413 | `request_too_large` | The request body is over 1 MiB. |
+| 400 | `invalid_request` | A query value isn't a string, number or boolean; or a number is an integer outside the 64-bit range, or a decimal that can't be carried exactly (send it as a string). |
+| 502 | `response_too_large` | The answer's body is over the size limit, or the answer as JSON is over 8 MiB (text full of characters JSON escapes can grow up to six times): page through it. The call was made: `calls` shows its status. |
+| 502 | `binary_body` | The answer isn't text. |
+| 502 | `upstream_unavailable` | The API couldn't be reached; the call may or may not have run. |
+| 504 | `timeout` | The run's time ran out during the call. |
+
+Anything else is the API's own answer: see [Error codes](/reference/errors).
+
+`request` throws (and the code gets `threw` unless it catches it) only when the call can't be sent at all: a method outside GET, HEAD, POST, PUT, PATCH and DELETE; a path that isn't absolute; a `query` or `headers` that isn't an object (of strings, for `headers`); a body that can't be written as JSON; or a call over 4 MiB as JSON. None of these reaches the API. It also throws if the run has already ended.
+
+### Errors from the endpoint
+
+| Status | Code | Meaning |
+|---|---|---|
+| 401 | `unauthorized` | No token, a bad or expired one, or one without enough time left (below). |
+| 403 | `forbidden` | A browser `Origin` the operator hasn't allowed. |
+| 405 | `method_not_allowed` | The endpoint takes `POST` only. |
+| 400 | (JSON-RPC `-32022`) | An unsupported protocol revision; the answer lists the supported ones. |
+
+**How much time a token needs.** A token must have at least the larger of 60 seconds and the time limit plus 10 seconds left: 60 s with the default 30 s limit, and 70 s when the limit is at its largest (60 s). The 401 says how many seconds in `min_remaining_secs`. The member access token's lifetime (`CHELABASE_MEMBER_ACCESS_TTL_SECS` on `auth`) must be longer than that, or no token ever passes; `chelabase mcp` says so when a token it has just been issued is refused for its lifetime.
+
+Failed token checks are not rate-limited inside the MCP server: per-address limits belong at the gateway.

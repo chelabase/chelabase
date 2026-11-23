@@ -6,13 +6,13 @@
 //! - `struct NetworkSubnets { pub name: String, pub subnets: Vec<String> }` and
 //!   `parse_network_subnets(json: &str) -> anyhow::Result<Vec<NetworkSubnets>>`: the output of
 //!   `docker network inspect $(docker network ls -q)` (an array; `IPAM.Config` may be null).
-//! - `check_control_subnet(slug: &str, slot: u8, own_network: &str, networks: &[NetworkSubnets])
+//! - `check_stack_subnets(slug: &str, slot: u8, project: &str, networks: &[NetworkSubnets])
 //!   -> anyhow::Result<()>`: fails when another network's IPv4 subnet overlaps the slot's
-//!   `control_net(slot).subnet`; the stack's own network (`own_network`, e.g.
-//!   `chelabase-feat-x_control`) may hold it. The error names the stack, the slot, the wanted
+//!   `control_net(slot).subnet` (or, since compute-network-reach, `compute_net(slot).subnet`); the
+//!   stack's own networks (of `project`, e.g. `chelabase-feat-x_control`) may hold it. The error names the stack, the slot, the wanted
 //!   subnet, and the offending network with its subnet.
 
-use super::env::{NetworkSubnets, parse_network_inspect, check_control_subnet, cidr_overlaps, control_net, parse_network_subnets};
+use super::env::{NetworkSubnets, parse_network_inspect, check_stack_subnets, cidr_overlaps, control_net, parse_network_subnets};
 
 fn net(name: &str, subnets: &[&str]) -> NetworkSubnets {
     NetworkSubnets {
@@ -65,11 +65,11 @@ fn docker_network_inspect_output_is_parsed() {
 fn no_networks_or_no_overlap_passes() {
     let wanted = control_net(1).subnet;
     assert_eq!(wanted, "10.213.4.0/22");
-    check_control_subnet("feat-x", 1, "chelabase-feat-x_control", &[]).unwrap();
-    check_control_subnet(
+    check_stack_subnets("feat-x", 1, "chelabase-feat-x", &[]).unwrap();
+    check_stack_subnets(
         "feat-x",
         1,
-        "chelabase-feat-x_control",
+        "chelabase-feat-x",
         &[net("bridge", &["172.17.0.0/16"]), net("other_control", &["10.213.8.0/22"]), net("empty", &[])],
     )
     .unwrap();
@@ -78,7 +78,7 @@ fn no_networks_or_no_overlap_passes() {
 #[test]
 fn an_overlapping_network_is_named_with_the_stack_and_slot() {
     let nets = [net("bridge", &["172.17.0.0/16"]), net("legacy_default", &["10.213.0.0/16"])];
-    let err = check_control_subnet("feat-x", 1, "chelabase-feat-x_control", &nets)
+    let err = check_stack_subnets("feat-x", 1, "chelabase-feat-x", &nets)
         .unwrap_err()
         .to_string();
     for needle in ["feat-x", "slot 1", "10.213.4.0/22", "legacy_default", "10.213.0.0/16"] {
@@ -90,7 +90,7 @@ fn an_overlapping_network_is_named_with_the_stack_and_slot() {
 fn another_stacks_control_network_is_named() {
     // Slot 2 is 10.213.8.0/22; a stray network from a registry that was reset holds half of it.
     let nets = [net("chelabase-old_control", &["10.213.10.0/23"])];
-    let err = check_control_subnet("feat-y", 2, "chelabase-feat-y_control", &nets)
+    let err = check_stack_subnets("feat-y", 2, "chelabase-feat-y", &nets)
         .unwrap_err()
         .to_string();
     assert!(err.contains("chelabase-old_control") && err.contains("slot 2") && err.contains("feat-y"), "{err}");
@@ -100,13 +100,13 @@ fn another_stacks_control_network_is_named() {
 fn the_stacks_own_control_network_may_hold_its_subnet() {
     // A re-run of `up` finds the network Compose made last time.
     let nets = [net("chelabase-feat-x_control", &["10.213.4.0/22"])];
-    check_control_subnet("feat-x", 1, "chelabase-feat-x_control", &nets).unwrap();
+    check_stack_subnets("feat-x", 1, "chelabase-feat-x", &nets).unwrap();
     // But not when the same subnet is held by a different network too.
     let nets = [
         net("chelabase-feat-x_control", &["10.213.4.0/22"]),
         net("squatter", &["10.213.4.0/24"]),
     ];
-    let err = check_control_subnet("feat-x", 1, "chelabase-feat-x_control", &nets).unwrap_err().to_string();
+    let err = check_stack_subnets("feat-x", 1, "chelabase-feat-x", &nets).unwrap_err().to_string();
     assert!(err.contains("squatter"), "{err}");
 }
 
@@ -116,16 +116,16 @@ fn ipv6_only_and_non_overlapping_networks_are_ignored() {
         net("v6", &["fd00::/8"]),
         net("dual", &["192.168.0.0/16", "fd00:10:213::/48"]),
     ];
-    check_control_subnet("feat-x", 1, "chelabase-feat-x_control", &nets).unwrap();
+    check_stack_subnets("feat-x", 1, "chelabase-feat-x", &nets).unwrap();
 }
 
 #[test]
 fn every_slot_is_checked_against_its_own_subnet() {
     // Slot 63 is the last: 10.213.252.0/22.
     let nets = [net("n", &["10.213.255.0/24"])];
-    assert!(check_control_subnet("s", 63, "p_control", &nets).is_err());
-    assert!(check_control_subnet("s", 62, "p_control", &nets).is_ok());
-    assert!(check_control_subnet("s", 0, "p_control", &[net("n", &["10.213.0.0/24"])]).is_err());
+    assert!(check_stack_subnets("s", 63, "p", &nets).is_err());
+    assert!(check_stack_subnets("s", 62, "p", &nets).is_ok());
+    assert!(check_stack_subnets("s", 0, "p", &[net("n", &["10.213.0.0/24"])]).is_err());
 }
 
 // Audit minor (commands.rs, `check_control_network`): each network is inspected on its own, so a

@@ -13,6 +13,7 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
+use chelabase_time::{Date, DateExt};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -93,7 +94,7 @@ impl Config {
                 bail!("[functions.{name}] entry must be a path relative to the project's root");
             }
             if let Some(d) = &f.compatibility_date
-                && chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err()
+                && Date::parse_iso(d).is_err()
             {
                 bail!("[functions.{name}] compatibility_date `{d}` isn't a YYYY-MM-DD date");
             }
@@ -149,6 +150,26 @@ mod tests {
 
     fn err(text: &str) -> String {
         format!("{:#}", Config::parse(text).unwrap_err())
+    }
+
+    /// What `compatibility_date` accepts: `%Y-%m-%d` as the old implementation read it, where
+    /// the month and day may have one digit. The replacement has to agree on every case here.
+    #[test]
+    fn compatibility_date_accepts_only_iso_dates() {
+        let check = |d: &str| {
+            Config::parse(&format!(
+                "[project]\nurl = \"http://x\"\n[functions.f]\nentry = \"f.ts\"\ncompatibility_date = \"{d}\"\n"
+            ))
+            .is_ok()
+        };
+        assert!(check("2026-11-01"));
+        assert!(!check("2026-13-01"), "month 13");
+        assert!(!check("20261101"), "no dashes");
+        assert!(!check(""), "empty");
+        assert!(!check("2026-11-01x"), "trailing text");
+        assert!(!check("2026-02-30"), "no such day");
+        // `%m`/`%d` took one digit, and the check accepted it.
+        assert!(check("2026-1-1"), "one-digit month and day");
     }
 
     #[test]

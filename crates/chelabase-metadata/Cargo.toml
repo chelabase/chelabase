@@ -8,9 +8,10 @@ description = "Metadata database access stubs for Chelabase"
 [dependencies]
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }
-chrono = { workspace = true }
+chelabase-time = { workspace = true }
 croner = { workspace = true }
-chrono-tz = { workspace = true }
+# Function schedules: croner's jiff backend and jiff's bundled time zones.
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -25,3 +26,4 @@ openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }

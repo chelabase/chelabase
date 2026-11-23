@@ -20,7 +20,7 @@ use chelabase_identity::{
 use chelabase_query::app_users::{NewUserRow, UserRowError};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::api_extract::ApiJson;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -59,7 +59,7 @@ pub struct AppUserView {
     pub id: Uuid,
     pub email: String,
     pub email_verified: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A signed-in session: a short-lived access token and the refresh token that renews it.
@@ -866,6 +866,13 @@ async fn publish_sync(app: &AppUsers, req: SyncRequest) {
     }
 }
 
+/// The project's name for its app users' mail, from the caller's own branch info, passed on as
+/// it is. Identity is the one judge of a name: one it cannot show (blank, too long, not a single
+/// line) is not refused there, the mail names its default, so no name can stop a mail.
+fn mail_name(info: &AppBranchInfo) -> Option<&str> {
+    info.project_name.as_deref()
+}
+
 /// Mails the user a code of `kind`, within [`reserve_code_issue`]: at most five of a kind an
 /// hour per user, whatever flow asks. The answer never says whether one went out; a failure is
 /// only logged. Identity keeps a live code sent under a minute ago (`CodeRecentlySent`): nothing
@@ -876,7 +883,8 @@ async fn send_code(s: &AppState, info: &AppBranchInfo, user_id: Uuid, kind: Code
         info!(kind = kind.as_str(), "an app user's code limit is used up; nothing sent");
         return;
     };
-    let request = CodeRequest::new(&user, kind, Delivery::Email);
+    let mut request = CodeRequest::new(&user, kind, Delivery::Email);
+    request.project_name = mail_name(info);
     match s.identity.create_code(&pool(info), &request).await {
         Ok(_) => {}
         Err(IdentityError::CodeRecentlySent) => {
@@ -893,7 +901,7 @@ fn pending(id: Uuid, email: &str) -> Response {
             id,
             email: email.to_string(),
             email_verified: false,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         },
         verification_required: true,
     };
@@ -1570,7 +1578,7 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
         let Some(slot) = reserve_code_issue(&s.limiter, CodeKind::EmailChange, &sub) else {
             return Err(too_many());
         };
-        return match s.identity.create_email_change_code(&pool, &sub, &email, None).await {
+        return match s.identity.create_email_change_code(&pool, &sub, &email, mail_name(&info)).await {
             Ok(_) => {
                 let body = EmailChangePending { confirmation_required: true };
                 Ok((StatusCode::ACCEPTED, Json(body)).into_response())
@@ -1585,7 +1593,7 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
             Err(e) => Err(email_write_refused(e)),
         };
     }
-    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true).await {
+    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true, mail_name(&info)).await {
         return Err(email_write_refused(e));
     }
     publish_sync(
@@ -1651,7 +1659,7 @@ async fn change_email_confirm(
     }
     match s
         .identity
-        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim())
+        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim(), mail_name(&info))
         .await
     {
         Ok(_) => {}

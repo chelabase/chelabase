@@ -22,7 +22,7 @@ use chelabase_metadata::{
 use chelabase_routes::orchestrator as ep;
 use chelabase_types::api_error::{ApiError, ErrorEnvelope};
 use chelabase_types::{ApiPath, BranchId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use utoipa::ToSchema;
@@ -139,7 +139,7 @@ struct TriggerView {
     #[schema(required = true)]
     last_delivery_error: Option<String>,
     #[schema(required = true)]
-    last_delivered_at: Option<DateTime<Utc>>,
+    last_delivered_at: Option<Timestamp>,
 }
 
 impl From<TriggerRecord> for TriggerView {

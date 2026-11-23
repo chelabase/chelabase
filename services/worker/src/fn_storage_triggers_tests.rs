@@ -10,7 +10,7 @@ use chelabase_nats::storage_objects::{
     self, ObjectActor, ObjectEvent, ObjectEventType, ObjectFrom,
 };
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, TimeDelta, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use uuid::Uuid;
 
 use crate::fn_schedules::Invoker;
@@ -19,8 +19,8 @@ use crate::fn_storage_triggers::{
 };
 use crate::storage_webhooks::backoff;
 
-fn at(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, 0).unwrap()
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(secs).unwrap()
 }
 
 fn target(events: &[&str], bucket: Option<&str>, prefix: Option<&str>) -> StorageTriggerTarget {
@@ -37,7 +37,7 @@ fn target(events: &[&str], bucket: Option<&str>, prefix: Option<&str>) -> Storag
     }
 }
 
-fn event(kind: ObjectEventType, bucket: &str, name: &str, time: DateTime<Utc>) -> ObjectEvent {
+fn event(kind: ObjectEventType, bucket: &str, name: &str, time: Timestamp) -> ObjectEvent {
     ObjectEvent {
         id: Uuid::new_v4(),
         kind,
@@ -197,7 +197,7 @@ async fn fn_storage_triggers_nak_with_backoff_until_a_2xx() {
     let invoker = FakeInvoker::new(vec![Ok(500), Err("connection refused".into()), Ok(200)]);
     let (d, recorder) = delivery(invoker.clone());
     let t = target(&["object.created"], Some("avatars"), None);
-    let t0 = Utc::now();
+    let t0 = Timestamp::now();
     let e = event(ObjectEventType::Created, "avatars", "a.png", t0);
     let payload = serde_json::to_vec(&e).unwrap();
     let mut nexts = Vec::new();
@@ -253,7 +253,7 @@ async fn fn_storage_triggers_events_older_than_24h_are_dropped_and_counted() {
     let invoker = FakeInvoker::new(vec![Ok(503)]);
     let (d, recorder) = delivery(invoker.clone());
     let t = target(&["object.created"], None, None);
-    let now = Utc::now();
+    let now = Timestamp::now();
     let stale =
         serde_json::to_vec(&event(ObjectEventType::Created, "a", "b", now - MAX_AGE)).unwrap();
     assert_eq!(d.process(&t, &stale, 1, now, 0.0).await, Next::Dropped);
@@ -262,7 +262,7 @@ async fn fn_storage_triggers_events_older_than_24h_are_dropped_and_counted() {
         ObjectEventType::Created,
         "a",
         "b",
-        now - MAX_AGE + TimeDelta::seconds(1),
+        now - MAX_AGE + chelabase_time::seconds(1),
     );
     let almost = serde_json::to_vec(&almost).unwrap();
     assert!(matches!(
@@ -270,7 +270,7 @@ async fn fn_storage_triggers_events_older_than_24h_are_dropped_and_counted() {
         Next::Retry(_)
     ));
     assert_eq!(
-        d.process(&t, &almost, 10, now + TimeDelta::seconds(1), 0.0)
+        d.process(&t, &almost, 10, now + chelabase_time::seconds(1), 0.0)
             .await,
         Next::Dropped
     );
@@ -445,7 +445,7 @@ async fn fn_storage_triggers_consumers_follow_the_triggers() {
 
     // a disabled (gone), then re-enabled an hour later (a new enabled_since).
     let again = StorageTriggerTarget {
-        enabled_since: a.enabled_since + TimeDelta::hours(1),
+        enabled_since: a.enabled_since + chelabase_time::hours(1),
         ..a.clone()
     };
     reconcile(&bus, &mut running, vec![again.clone()], &idle).await;
@@ -506,7 +506,7 @@ async fn deliveries_share_one_in_flight_bound() {
     let recorder = Arc::new(FakeRecorder::default());
     let d = Arc::new(Delivery::new(blocking.clone(), recorder));
     let total = BOUND + 10;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let tasks: Vec<_> = (0..total)
         .map(|i| {
             let d = d.clone();
@@ -568,7 +568,7 @@ async fn one_database_holds_at_most_its_share() {
         release: tokio::sync::Semaphore::new(0),
     });
     let d = Arc::new(Delivery::new(invoker.clone(), Arc::new(FakeRecorder::default())));
-    let now = Utc::now();
+    let now = Timestamp::now();
     let spawn = |database: u128, i: usize| {
         let d = d.clone();
         let mut t = target(&["object.created"], None, None);

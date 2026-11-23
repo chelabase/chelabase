@@ -27,7 +27,7 @@ use chelabase_secrets::{Purpose, SecretKey, derive_key, open, open_role_password
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_identity::{IdentityError, Missing, Pool};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::Deserialize;
 use serde_json::json;
 use hmac::{Hmac, KeyInit, Mac};
@@ -216,9 +216,10 @@ async fn end_identity_sessions<M, L>(state: &InternalState<M, L>, sessions: &[Ap
 
 // --- Branch info -----------------------------------------------------------------------------
 
-/// What `auth` needs for a branch: the project's app-user settings, the branch the users table
-/// lives on (`target_branch_id`, R5) and how to reach it as the sync role (`sync`, or null
-/// when that branch has no running compute or no sync password yet).
+/// What `auth` needs for a branch: the project's app-user settings and name (app-user mail
+/// shows it), the branch the users table lives on (`target_branch_id`, R5) and how to reach it
+/// as the sync role (`sync`, or null when that branch has no running compute or no sync
+/// password yet).
 async fn branch_info<M, L>(State(state): AppState<M, L>, Path(branch_id): Path<Uuid>) -> Response
 where
     M: NeonMetadataPort,
@@ -235,11 +236,11 @@ where
         Ok(None) => return disabled(),
         Err(e) => return internal("app branch info", e),
     };
-    match m.project_by_id(project).await {
-        Ok(Some(p)) if p.status == ProjectStatus::Active => {}
+    let project_name = match m.project_by_id(project).await {
+        Ok(Some(p)) if p.status == ProjectStatus::Active => p.name,
         Ok(_) => return disabled(),
         Err(e) => return internal("app branch info", e),
-    }
+    };
     let auth = match m.project_auth(project).await {
         Ok(Some(a)) => a,
         Ok(None) => return disabled(),
@@ -271,6 +272,7 @@ where
         "schema": auth.schema_name,
         "table": auth.table_name,
         "target_branch_id": target.id,
+        "project_name": project_name,
         "sync": sync,
     }))
     .into_response()
@@ -346,7 +348,7 @@ where
     let id = Uuid::new_v4();
     let token = new_refresh_token(&state.secrets, id);
     let ttl = state.app_refresh_ttl.min(APP_SESSION_CAP);
-    let expires_at = Utc::now() + chrono::Duration::from_std(ttl).expect("ttl fits");
+    let expires_at = Timestamp::now() + ttl;
     let row = NewAppSession {
         id,
         project_id: body.project_id,
@@ -534,7 +536,7 @@ struct RevokeUserSessions {
     #[serde(default)]
     keep_session_id: Option<Uuid>,
     #[serde(default)]
-    created_before: Option<DateTime<Utc>>,
+    created_before: Option<Timestamp>,
 }
 
 async fn revoke_user_sessions<M, L>(
@@ -570,7 +572,7 @@ where
 {
     match state.metadata.app_session(id).await {
         Ok(Some(s)) => Json(json!({
-            "live": s.revoked_at.is_none() && s.expires_at > Utc::now(),
+            "live": s.revoked_at.is_none() && s.expires_at > Timestamp::now(),
             "project_id": s.project_id,
             "user_id": s.user_id,
         }))

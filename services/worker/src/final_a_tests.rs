@@ -9,7 +9,7 @@ use chelabase_metadata::personal_logins::PersonalLoginRecord;
 use chelabase_secrets::{open_member_role_password, seal_member_role_password};
 use chelabase_types::access::PlatformRole;
 use chelabase_types::{BranchId, DatabaseId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use uuid::Uuid;
 
 use crate::OWNER_ROLE;
@@ -26,8 +26,8 @@ fn h(s: &str) -> String {
     hex::encode(s.as_bytes())
 }
 
-fn far() -> DateTime<Utc> {
-    chrono::TimeZone::with_ymd_and_hms(&Utc, 2099, 1, 2, 3, 4, 5).unwrap()
+fn far() -> Timestamp {
+    Timestamp::from_ymd_hms(2099, 1, 2, 3, 4, 5).unwrap()
 }
 
 fn scram(password: &str) -> String {
@@ -46,7 +46,7 @@ fn groups(roles: &[&str]) -> String {
 }
 
 /// A marked role's lines, its memberships ours and shaped.
-fn marked(name: &str, verifier: &str, until: DateTime<Utc>, memberships: &[&str]) -> String {
+fn marked(name: &str, verifier: &str, until: Timestamp, memberships: &[&str]) -> String {
     let mut out = format!(
         "r {n} t f f t\nk {n}\np {n} {}\nu {n} {}\n",
         h(verifier),

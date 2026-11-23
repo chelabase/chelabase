@@ -172,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(serve_storage_webhook_test(worker.clone(), nats.clone(), webhooks));
 
+    // Before the schedule loop's first claim: list the stored schedules the current cron parser
+    // rejects (log + `last_error`). Awaited, so the loop only starts after the report; it never
+    // fails the worker.
+    worker::schedule_report::run(worker.metadata.inner()).await;
     match &functions.invoke {
         Some((url, token)) => {
             let invoker: Arc<dyn worker::fn_schedules::Invoker> =
@@ -416,6 +420,10 @@ async fn serve_reset_password(worker: Arc<RealWorker>, client: async_nats::Clien
 // --- Reconcile ---------------------------------------------------------------
 
 async fn reconcile_loop(worker: Arc<RealWorker>, js: async_nats::jetstream::Context) {
+    // compute-network-reach: computes off the compute and control networks are moved at once,
+    // before the first pass (which creates them again), and then at the start of every pass.
+    // It asks Docker only.
+    worker.migrate_compute_networks().await;
     // First pass after one period, so queued jobs are picked up (and their rows
     // refreshed) before reconcile judges anything stale.
     let mut every = tokio::time::interval_at(

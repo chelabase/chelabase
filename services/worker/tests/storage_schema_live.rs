@@ -14,6 +14,7 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use worker::config::RealWorker;
-use worker::data_api::schema_check_sql;
+use worker::data_api::{DATA_API_SCHEMA_STAMP, DATA_API_SCHEMA_VERSION, newer_data_api_schema, schema_check_sql};
 use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
@@ -210,7 +211,7 @@ ROLLBACK;"
     async fn direct(&self, user: &str, password: &str, sql: &str) -> Result<String, String> {
         let locator = DockerLocator::connect(
             &std::env::var("CHELABASE_COMPUTE_NETWORK")
-                .unwrap_or_else(|_| "chelabase_compute".into()),
+                .unwrap_or_else(|_| "chelabase_compute-internal".into()),
             &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
         )
         .expect("the Docker client");
@@ -739,7 +740,7 @@ async fn bootstrap(fx: &Fx) {
 /// A psql session to the compute that stays open (stdin piped).
 async fn session(fx: &Fx, user: &str, password: &str) -> tokio::process::Child {
     let locator = DockerLocator::connect(
-        &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute".into()),
+        &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute-internal".into()),
         &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
     )
     .expect("the Docker client");
@@ -2114,14 +2115,14 @@ async fn storage_api_app_user_live() {
 impl Fx {
     /// An app-user access token for `user` in this project, with a live session.
     async fn user_token(&self, user: Uuid) -> String {
-        self.user_session(user, chrono::Duration::hours(1)).await.0
+        self.user_session(user, chelabase_time::hours(1)).await.0
     }
 
     /// [`Fx::user_token`] with a session that lives `life`: the token and the session's id.
-    async fn user_session(&self, user: Uuid, life: chrono::Duration) -> (String, Uuid) {
+    async fn user_session(&self, user: Uuid, life: std::time::Duration) -> (String, Uuid) {
         use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
         let sid = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let mut hash = [0u8; 32];
         hash[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         self.metadata
@@ -2856,14 +2857,14 @@ async fn storage_urls_app_user_live() {
         objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
         let public = fx.public_key().await;
         let user = Uuid::new_v4();
-        let (token, sid) = fx.user_session(user, chrono::Duration::minutes(10)).await;
+        let (token, sid) = fx.user_session(user, chelabase_time::minutes(10)).await;
         let headers = [("chelabase-user", token.as_str())];
         // B1: the keyless PUT runs as the user (the key's own role, anon, has no policy).
         let (status, up) = mint_with("upload/sign", "files/mine.txt", &public, json!({ "expires_in": 3600 }), &headers).await;
         assert_eq!(status, 200, "{up}");
         // S3: no longer than the session's 10 minutes.
         let exp = up["expires_at"].as_i64().unwrap();
-        assert!(exp <= chrono::Utc::now().timestamp() + 600, "{up}");
+        assert!(exp <= Timestamp::now().timestamp() + 600, "{up}");
         let (status, b) = keyless_with("PUT", up["signed_url"].as_str().unwrap(), b"mine".to_vec(), &[]).await;
         assert_eq!(status, 200, "{b}");
         assert_eq!(fx.value("SELECT owner FROM storage.objects WHERE name = 'mine.txt'").await, user.to_string());
@@ -4783,7 +4784,7 @@ async fn storage_webhooks(fx: &Fx, host: &str) {
         .expect("a delivery within 90 s")
         .expect("the endpoint still listens");
     let signature = got.headers.get("chelabase-signature").expect("a signature").clone();
-    let now = chrono::Utc::now().timestamp();
+    let now = Timestamp::now().timestamp();
     assert_eq!(worker::storage_webhooks::verify(&signing, &signature, &got.body, now, 300), Ok(()));
     let event: Value = serde_json::from_slice(&got.body).unwrap();
     assert_eq!(event["type"], "object.created");
@@ -4996,6 +4997,331 @@ async fn review(fx: &Fx) {
     ] {
         assert!(keys.contains(&key.to_string()), "{key} hidden: {keys:?}");
     }
+}
+
+// --- data-api-schema-stamp m1 (#198): the chelabase data API schema's stamp -----------------
+
+/// Everything the data API installs in `chelabase`, as one text: relations, functions (owner,
+/// ACL, whole definition: `prosrc` is empty for the `BEGIN ATOMIC` claim helpers), the event triggers (owner, state, function, comment) and the schema itself.
+const CHELABASE_SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDER BY x)) FROM (
+  SELECT c.relname || ':' || c.relkind::text || ':' || c.relowner::regrole || ':' || coalesce(c.relacl::text, '') AS x
+    FROM pg_class c WHERE c.relnamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT p.oid::regprocedure || ':' || p.proowner::regrole || ':' || p.prosecdef || ':' || coalesce(p.proacl::text, '') || ':' || md5(pg_catalog.pg_get_functiondef(p.oid))
+    FROM pg_proc p WHERE p.pronamespace = 'chelabase'::regnamespace
+  UNION ALL SELECT 'evt:' || e.evtname || ':' || e.evtowner::regrole || ':' || e.evtenabled::text || ':' || e.evtfoid::regprocedure || ':' || coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>')
+    FROM pg_event_trigger e WHERE e.evtname LIKE 'chelabase%'
+  UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '')
+    FROM pg_namespace n WHERE n.nspname = 'chelabase'
+) s";
+
+/// The stamp trigger's comment (`<none>` without one), whether a superuser owns it, and its
+/// function.
+const DDL_TRIGGER_SQL: &str = "SELECT coalesce(obj_description(e.oid, 'pg_event_trigger'), '<none>') || ' ' || r.rolsuper || ' ' || e.evtfoid::regprocedure
+  FROM pg_event_trigger e JOIN pg_roles r ON r.oid = e.evtowner WHERE e.evtname = 'chelabase_schema_version_ddl'";
+
+/// A newer worker's schema: stamp 99 and a function only it makes (the bootstrap
+/// superuser's, so no tamper).
+const MAKE_NEWER_SQL: &str = "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;";
+
+impl Fx {
+    async fn data_api_check(&self, schema: &str) -> String {
+        last_line(&self.admin(&schema_check_sql(schema, Some(&self.verifier().await), Some(&self.elevated_verifier().await))).await)
+    }
+
+    async fn quarantines(&self) -> u32 {
+        self.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase\\_quarantine\\_%'")
+            .await
+            .parse()
+            .unwrap()
+    }
+
+    async fn authenticator_password(&self) -> String {
+        let main = self.metadata.get_branch(self.main).await.unwrap().unwrap();
+        open_credential(
+            &self.worker.key,
+            &main.id.to_string(),
+            Purpose::Authenticator,
+            main.authenticator_password_enc.as_deref().expect("authenticator password"),
+        )
+        .unwrap()
+    }
+
+    /// This worker's install, freshly stamped: the trigger a superuser's on its own function.
+    async fn assert_current(&self, what: &str) {
+        assert_eq!(
+            self.value(DDL_TRIGGER_SQL).await,
+            format!("{DATA_API_SCHEMA_STAMP} true chelabase.bump_schema_version()"),
+            "{what}"
+        );
+        assert_eq!(
+            self.value("SELECT to_regprocedure('chelabase.from_v99()') IS NULL AND (SELECT prosrc LIKE '%CB002%' FROM pg_proc WHERE oid = to_regprocedure('chelabase.cap_response(text,bigint)'))").await,
+            "t",
+            "{what}: this worker's functions"
+        );
+        assert_eq!(self.data_api_check("public").await, "t", "{what}");
+    }
+
+    /// A bootstrap that quarantines and installs afresh.
+    async fn assert_quarantined_by_bootstrap(&self, what: &str) {
+        let before = self.quarantines().await;
+        bootstrap(self).await;
+        assert_eq!(self.quarantines().await, before + 1, "{what}: quarantined");
+        self.assert_current(what).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn data_api_schema_versions_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { data_api_versions(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn data_api_versions(fx: &Fx) {
+    // 1. AC 10: a fresh provision is stamped.
+    fx.assert_current("fresh").await;
+    assert_eq!(fx.quarantines().await, 0);
+
+    // 2. AC 1: a valid newer stamp, a function only it has and a body this worker would
+    // rewrite: nothing in chelabase changes, nothing is quarantined, the check is healthy.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE OR REPLACE FUNCTION chelabase.cap_response(result text, budget bigint) RETURNS text LANGUAGE sql AS $$ SELECT result $$")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "t", "a newer schema is healthy here");
+    let before = fx.value(CHELABASE_SHAPE_SQL).await;
+    bootstrap(fx).await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "a newer chelabase schema was changed");
+    assert_eq!(fx.quarantines().await, 0);
+    assert_eq!(
+        fx.value(DDL_TRIGGER_SQL).await,
+        "chelabase data api schema 99 true chelabase.bump_schema_version()"
+    );
+    assert_eq!(fx.data_api_check("public").await, "t");
+    // The script itself, through psql: the gate skips the DDL and the warning names both
+    // versions.
+    let out = fx
+        .admin(&worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, &fx.elevated_verifier().await, "public"))
+        .await;
+    assert_eq!(
+        newer_data_api_schema(&out),
+        Some(format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}; it was left alone").as_str()),
+        "{out}"
+    );
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "the script changed a newer schema");
+
+    // 3. AC 2: a newer stamp and a default schema changed meanwhile: authenticator's login
+    // and the new schema's grants are still applied, chelabase still untouched.
+    fx.admin("CREATE SCHEMA reporting AUTHORIZATION postgres; ALTER ROLE authenticator NOLOGIN;")
+        .await;
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "reporting")
+        .await
+        .expect("set default schema");
+    assert_eq!(fx.data_api_check("reporting").await, "f", "the login and USAGE still count");
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value("SELECT bool_and(has_schema_privilege(r, 'reporting', 'USAGE')) FROM unnest(ARRAY['authenticator', 'anon', 'authenticated']) r")
+            .await,
+        "t"
+    );
+    assert_eq!(
+        fx.value("SELECT string_agg(defaclobjtype::text, ',' ORDER BY defaclobjtype) FROM pg_default_acl WHERE defaclnamespace = 'reporting'::regnamespace AND defaclrole = 'postgres'::regrole")
+            .await,
+        "S,f,r"
+    );
+    fx.direct("authenticator", &fx.authenticator_password().await, "SELECT 1")
+        .await
+        .expect("authenticator logs in with the branch's password");
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, before, "chelabase changed");
+    assert_eq!(fx.data_api_check("reporting").await, "t");
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "public")
+        .await
+        .expect("reset default schema");
+
+    // 4. AC 9: the escape hatch for a permanent rollback.
+    fx.admin("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS NULL").await;
+    assert_eq!(fx.data_api_check("public").await, "f", "no stamp");
+    fx.assert_quarantined_by_bootstrap("escape hatch").await;
+
+    // 5. AC 3, 4: a trigger the owner made, with the owner's comment, is no stamp.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl; CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    let forge = "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';";
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    assert_eq!(fx.data_api_check("public").await, "f", "owner-forged");
+    fx.assert_quarantined_by_bootstrap("owner-forged, schema present").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin(worker::data_api::REMOVE_DATA_API_SQL).await;
+    assert_eq!(fx.value("SELECT to_regnamespace('chelabase') IS NULL").await, "t");
+    fx.owner(forge).await.expect("the owner makes an event trigger");
+    let before = fx.quarantines().await;
+    bootstrap(fx).await;
+    assert_eq!(fx.quarantines().await, before, "nothing to quarantine");
+    fx.assert_current("owner-forged, schema removed").await;
+    fx.owner("DROP FUNCTION public.forged_evt()").await.expect("drop the forged function");
+
+    fx.admin("CREATE FUNCTION public.other_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+DROP EVENT TRIGGER chelabase_schema_version_ddl;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.other_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;")
+        .await;
+    assert_eq!(fx.data_api_check("public").await, "f", "another function");
+    fx.assert_quarantined_by_bootstrap("a superuser's trigger on another function").await;
+    fx.admin("DROP FUNCTION public.other_evt()").await;
+
+    // 6. AC 6, 7, 8: a real tamper quarantines whatever the stamp says.
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE FUNCTION chelabase.owners() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; ALTER FUNCTION chelabase.owners() OWNER TO postgres;")
+        .await;
+    fx.assert_quarantined_by_bootstrap("newer, a function the owner owns").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.admin("CREATE ROLE dsv_member LOGIN; GRANT chelabase_admin TO dsv_member;").await;
+    fx.assert_quarantined_by_bootstrap("newer, a member").await;
+    assert_eq!(
+        fx.value("SELECT pg_has_role('dsv_member', 'chelabase_admin', 'MEMBER')").await,
+        "f",
+        "the membership is revoked"
+    );
+    fx.admin("DROP ROLE dsv_member").await;
+
+    fx.admin(MAKE_NEWER_SQL).await;
+    fx.owner("CREATE EXTENSION hstore SCHEMA chelabase")
+        .await
+        .expect("the owner installs a trusted extension in chelabase");
+    assert_eq!(
+        fx.value("SELECT extnamespace = 'chelabase'::regnamespace FROM pg_extension WHERE extname = 'hstore'").await,
+        "t"
+    );
+    fx.assert_quarantined_by_bootstrap("newer, a trusted extension").await;
+    fx.admin("DROP EXTENSION hstore").await;
+
+    // 7. AC 5: older, missing and unparseable stamps are installed over.
+    for (what, comment) in [
+        ("older", "'chelabase data api schema 0'"),
+        ("missing", "NULL"),
+        ("unparseable", "'chelabase data api schema x'"),
+    ] {
+        fx.admin(&format!(
+            "COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment};
+CREATE FUNCTION chelabase.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$;"
+        ))
+        .await;
+        assert_eq!(fx.data_api_check("public").await, "f", "{what}");
+        fx.assert_quarantined_by_bootstrap(what).await;
+    }
+}
+
+// --- data-api-schema-stamp m2 (#199): the app users scripts refuse a newer chelabase -------
+
+/// `chelabase_auth_sync`'s attributes and password (`<none>` without the role).
+const AUTH_SYNC_SQL: &str = "SELECT coalesce((SELECT rolcanlogin || ' ' || rolinherit || ' ' || rolbypassrls || ' ' || rolconnlimit || ' ' || coalesce(rolpassword, '<none>')
+  FROM pg_authid WHERE rolname = 'chelabase_auth_sync'), '<none>')";
+
+/// The claim helpers' definitions. They're `BEGIN ATOMIC`, so `prosrc` is empty (the body is
+/// in `prosqlbody`): compare the whole definition, as [`CHELABASE_SHAPE_SQL`] does.
+const HELPERS_DEF_SQL: &str = "SELECT string_agg(proname || ':' || md5(pg_get_functiondef(oid)), ',' ORDER BY proname) FROM pg_proc
+  WHERE pronamespace = 'chelabase'::regnamespace AND proname IN ('claims', 'user_id', 'user_email')";
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn app_users_newer_schema_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { app_users_newer_schema(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn app_users_newer_schema(fx: &Fx) {
+    use worker::app_users_sql::{claim_helpers_sql, newer_data_api_error, users_bootstrap_sql};
+    // The scripts as the worker runs them (admin_sql, as cloud_admin, in the auth database).
+    let enable = |password: &str| {
+        users_bootstrap_sql("public", "users", &chelabase_neon::scram::verifier(password), OWNER)
+    };
+    let helpers = claim_helpers_sql();
+
+    // 1. AC 3, current stamp: both scripts run as today.
+    fx.assert_current("fresh").await;
+    fx.admin(&enable("first-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, "<none>", "the enable made chelabase_auth_sync");
+
+    // 2. AC 1, 2: a valid newer stamp, and helper bodies this worker would rewrite (the
+    // bootstrap superuser's, so no tamper). Each script errors naming both versions and
+    // changes nothing: not chelabase, not the role, not the helpers.
+    fx.admin(MAKE_NEWER_SQL).await;
+    let unrewritten = fx.value(CHELABASE_SHAPE_SQL).await;
+    fx.admin(
+        "CREATE OR REPLACE FUNCTION chelabase.user_email() RETURNS text LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT 'v99'; END;
+CREATE OR REPLACE FUNCTION chelabase.claims() RETURNS jsonb LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC SELECT '{\"v\": 99}'::jsonb; END;",
+    )
+    .await;
+    let shape = fx.value(CHELABASE_SHAPE_SQL).await;
+    assert_ne!(shape, unrewritten, "the shape hash sees a BEGIN ATOMIC helper's body");
+    let auth_sync = fx.value(AUTH_SYNC_SQL).await;
+    let prosrc = fx.value(HELPERS_DEF_SQL).await;
+    let why = format!("the chelabase schema is version 99, newer than this worker's {DATA_API_SCHEMA_VERSION}");
+    for (what, script) in [("enable", enable("second-password")), ("claim helpers", helpers.clone())] {
+        let e = fx.admin_on(&fx.ep, &script).await.expect_err(what);
+        assert_eq!(newer_data_api_error(&e), Some(why.as_str()), "{what}: {e}");
+        assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape, "{what} changed a newer chelabase");
+        assert_eq!(fx.value(AUTH_SYNC_SQL).await, auth_sync, "{what} changed chelabase_auth_sync");
+        assert_eq!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what} rewrote the claim helpers");
+    }
+    // The protect triggers are still there and enabled (the guard runs before their drop).
+    assert_eq!(
+        fx.value("SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'chelabase_users_protect_%' AND evtenabled <> 'D'").await,
+        "2"
+    );
+    // m1 audit nit: the data API bootstrap left the newer schema alone; with one of its event
+    // triggers disabled the machinery check still fails, and the script says so.
+    let data_api = worker::data_api::data_api_sql(OWNER, &fx.authenticator_password().await, &fx.elevated_verifier().await, "public");
+    let flagged = |out: &str| out.lines().any(|l| l.trim_end() == worker::data_api::NEWER_MACHINERY_OFF);
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && !flagged(&out), "{out}");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions DISABLE").await;
+    assert_eq!(fx.data_api_check("public").await, "f");
+    let out = fx.admin(&data_api).await;
+    assert!(newer_data_api_schema(&out).is_some() && flagged(&out), "{out}");
+    assert_eq!(fx.data_api_check("public").await, "f", "left disabled: the loop the warning names");
+    fx.admin("ALTER EVENT TRIGGER chelabase_extension_functions ENABLE").await;
+    assert_eq!(fx.value(CHELABASE_SHAPE_SQL).await, shape);
+
+    // 3. AC 3: older and missing stamps run as today.
+    for (what, comment) in [("older", "'chelabase data api schema 0'"), ("missing", "NULL")] {
+        fx.admin(&format!("COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS {comment}")).await;
+        fx.admin(&enable(&format!("{what}-password"))).await;
+        fx.admin(&helpers).await;
+        assert_ne!(fx.value(HELPERS_DEF_SQL).await, prosrc, "{what}: the helpers are this worker's");
+    }
+
+    // 4. AC 3: an owner-forged stamp never blocks either script.
+    fx.admin("DROP EVENT TRIGGER chelabase_schema_version_ddl").await;
+    fx.owner(
+        "CREATE FUNCTION public.forged_evt() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+CREATE EVENT TRIGGER chelabase_schema_version_ddl ON ddl_command_end EXECUTE FUNCTION public.forged_evt();
+COMMENT ON EVENT TRIGGER chelabase_schema_version_ddl IS 'chelabase data api schema 99';",
+    )
+    .await
+    .expect("the owner makes an event trigger");
+    let before = fx.value(AUTH_SYNC_SQL).await;
+    fx.admin(&enable("forged-password")).await;
+    fx.admin(&helpers).await;
+    assert_ne!(fx.value(AUTH_SYNC_SQL).await, before, "the enable set the new password");
 }
 
 // --- Which of chelabase_storage's sessions are void is a record on the login -----------------

@@ -28,7 +28,7 @@ use chelabase_neon::ComputeBackend;
 use chelabase_types::BranchId;
 use chelabase_types::access::{Grant, GrantSources, PlatformRole, tenant_admin_effective};
 use chelabase_types::role_name::check_login_role_name;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ pub(crate) struct PersonalPlan {
 
 /// Whether a record is wanted on a branch at `now`: its member qualifies, it isn't revoked or
 /// expired, and it has a verifier (pure).
-pub fn record_wanted(record: &PersonalLoginRecord, now: DateTime<Utc>) -> bool {
+pub fn record_wanted(record: &PersonalLoginRecord, now: Timestamp) -> bool {
     record.qualifies
         && !record.revoked
         && record.valid_until > now
@@ -115,7 +115,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .role_copies(ep)
             .await
             .map_err(|e| format!("reading the personal rows: {e}"))?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let scoped: Vec<&PersonalLoginRecord> = records
             .iter()
             .filter(|r| member.is_none_or(|m| m == r.member_id))
@@ -230,8 +230,8 @@ mod tests {
         hex::encode(s.as_bytes())
     }
 
-    fn far() -> DateTime<Utc> {
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2099, 1, 2, 3, 4, 5).unwrap()
+    fn far() -> Timestamp {
+        Timestamp::from_ymd_hms(2099, 1, 2, 3, 4, 5).unwrap()
     }
 
     fn scram(password: &str) -> String {
@@ -251,7 +251,7 @@ mod tests {
     }
 
     /// A marked role's lines, its memberships ours and shaped.
-    fn marked(name: &str, verifier: &str, until: DateTime<Utc>, memberships: &[&str]) -> String {
+    fn marked(name: &str, verifier: &str, until: Timestamp, memberships: &[&str]) -> String {
         let mut out = format!(
             "r {n} t f f t\nk {n}\np {n} {}\nu {n} {}\n",
             h(verifier),
@@ -593,7 +593,7 @@ mod tests {
             api_owner_level: false,
             pending: false,
             attributes_pending: false,
-            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            created_at: Timestamp::UNIX_EPOCH,
             attributes: RoleAttributes::default(),
         }
     }
@@ -716,7 +716,7 @@ mod tests {
             prefix: "p".into(),
             sealed: None,
             databases: None,
-            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            created_at: Timestamp::UNIX_EPOCH,
             revoked_at: None,
             last_used_at: None,
             role_oid: None,

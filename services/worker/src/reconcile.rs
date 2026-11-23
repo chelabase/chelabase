@@ -8,6 +8,7 @@ use anyhow::Context;
 use chelabase_metadata::{
     BranchKind, BranchStatus, DatabaseStatus, EndpointState, LiveBranch, LiveDatabase,
 };
+use chelabase_neon::backend::{AttachedCompute, LegacyNetwork, NetworkRef, NetworkRemoval};
 use chelabase_neon::{ComputeBackend, NeonId, StorconError};
 use chelabase_types::{BranchId, DatabaseId};
 use reqwest::StatusCode;
@@ -511,6 +512,40 @@ struct RoundRobin {
     resync: HashSet<BranchId>,
 }
 
+/// What one network migration step did ([`Worker::migrate_compute_networks`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NetworkMigration {
+    /// Computes removed because they weren't on exactly the compute and control networks.
+    pub removed: Vec<String>,
+    /// Computes that should have been removed, with the error.
+    pub failed: Vec<(String, String)>,
+    /// Computes off the networks but mid-create, left alone.
+    pub mid_create: Vec<String>,
+    /// Legacy networks removed.
+    pub networks_removed: Vec<String>,
+    /// Legacy networks kept because something is attached, with the members' names.
+    pub networks_kept: Vec<(String, Vec<String>)>,
+    /// Why the computes couldn't be checked this time (the listing or a network inspect
+    /// failed); the legacy networks are still handled.
+    pub error: Option<String>,
+}
+
+/// Whether `compute` is attached to exactly the `expected` networks: each by id (by name when
+/// Docker gave no id), and nothing else.
+pub fn on_expected_networks(compute: &AttachedCompute, expected: &[NetworkRef]) -> bool {
+    let same = |n: &NetworkRef, e: &NetworkRef| {
+        if n.id.is_empty() {
+            n.name == e.name
+        } else {
+            n.id == e.id
+        }
+    };
+    compute.networks.len() == expected.len()
+        && expected
+            .iter()
+            .all(|e| compute.networks.iter().any(|n| same(n, e)))
+}
+
 /// A running provision must stop (and clean up) once a delete has begun.
 pub fn should_abort_provision(status: DatabaseStatus) -> bool {
     matches!(status, DatabaseStatus::Deleting | DatabaseStatus::Deleted)
@@ -584,8 +619,87 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         published
     }
 
+    /// compute-network-reach: moves this stack's computes onto the compute and control
+    /// networks. A compute attached to anything but exactly those two (by id; one when they
+    /// are the same network) is removed by its container id, and the reconcile creates it
+    /// again on the right networks (its data lives in the pageserver and safekeepers). A
+    /// container that was never started is a create in flight and is left alone. Then each
+    /// listed legacy network that exists with nothing attached is removed; one still in use is
+    /// kept and its members are logged (one line per network per pass).
+    ///
+    /// It asks Docker only, never the metadata database or the storage controller, so it runs
+    /// while either is down. Every error is logged and reported, never returned: the next pass
+    /// tries again.
+    pub async fn migrate_compute_networks(&self) -> NetworkMigration {
+        let mut report = NetworkMigration::default();
+        match self.computes.compute_networks().await {
+            Err(e) => {
+                let e = format!("{e:#}");
+                warn!("can't check which networks the computes are on: {e}");
+                report.error = Some(e);
+            }
+            Ok(found) => {
+                for compute in found.computes {
+                    if on_expected_networks(&compute, &found.expected) {
+                        continue;
+                    }
+                    let networks: Vec<&str> =
+                        compute.networks.iter().map(|n| n.name.as_str()).collect();
+                    if compute.mid_create {
+                        info!(endpoint_id = %compute.endpoint_id, ?networks, "compute off the compute networks is mid-create; leaving it");
+                        report.mid_create.push(compute.endpoint_id);
+                        continue;
+                    }
+                    info!(endpoint_id = %compute.endpoint_id, ?networks, "compute isn't on exactly the compute and control networks; removing it so reconcile creates it again");
+                    match self
+                        .computes
+                        .remove_compute_container(&compute.endpoint_id, &compute.container_id)
+                        .await
+                    {
+                        Ok(()) => report.removed.push(compute.endpoint_id),
+                        Err(e) => {
+                            let e = format!("{e:#}");
+                            warn!(endpoint_id = %compute.endpoint_id, "removing a compute off the compute networks: {e}");
+                            report.failed.push((compute.endpoint_id, e));
+                        }
+                    }
+                }
+            }
+        }
+        for network in self.computes.legacy_networks().await {
+            match network {
+                LegacyNetwork::Missing { .. } => {}
+                LegacyNetwork::Unreadable { name, error } => {
+                    warn!(network = %name, "can't inspect legacy network: {error}");
+                }
+                LegacyNetwork::Present { network, members } if !members.is_empty() => {
+                    info!(network = %network.name, members = %members.join(", "), "legacy network still has members; keeping it");
+                    report.networks_kept.push((network.name, members));
+                }
+                LegacyNetwork::Present { network, .. } => {
+                    match self.computes.remove_network(&network).await {
+                        Ok(NetworkRemoval::Removed) => {
+                            info!(network = %network.name, "removed legacy network");
+                            report.networks_removed.push(network.name);
+                        }
+                        Ok(NetworkRemoval::Gone) => {}
+                        Ok(NetworkRemoval::Occupied) => {
+                            info!(network = %network.name, "legacy network is still in use; keeping it");
+                            report.networks_kept.push((network.name, Vec::new()));
+                        }
+                        Err(e) => {
+                            warn!(network = %network.name, "removing legacy network: {e:#}");
+                        }
+                    }
+                }
+            }
+        }
+        report
+    }
+
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
-    /// and the next action still runs.
+    /// and the next action still runs. The network migration step runs first, whatever
+    /// happens to the rest of the pass.
     ///
     /// Serial on purpose. Each recreated compute (`RecreateBranchCompute`, `FinishSwitch`) is
     /// waited for, up to `ready_timeout` (60 s in production), so after a mass outage one pass
@@ -604,6 +718,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         &self,
         clock: &(dyn Fn() -> Instant + Sync),
     ) -> Result<(), String> {
+        self.migrate_compute_networks().await;
         let snapshot = self.observe().await.map_err(|e| format!("{e:#}"))?;
         let given_login = self.roll_out_elevated_logins(&snapshot).await;
         let mut actions = plan(&snapshot);
@@ -1249,6 +1364,7 @@ mod tests {
     use chelabase_metadata::BranchKind;
 
     use super::*;
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{
         FRESH_HEAD, FakeWorker, Journal, entries, pending_branch, position, ready_branch,
         ready_database, worker,
@@ -2239,7 +2355,7 @@ mod tests {
         let (id, _ep) = provision(&w, &journal).await;
         let main = w.metadata.main(id).id;
         let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(3600);
         {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&silent).unwrap();
@@ -2266,7 +2382,7 @@ mod tests {
         let silent = merge(MergeStatus::Online);
         let busy = merge(MergeStatus::Applying);
         let idle = merge(MergeStatus::Draft);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(300);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(300);
         for m in [silent, idle] {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&m).unwrap();
@@ -2289,7 +2405,7 @@ mod tests {
         let (id, _ep) = provision(&w, &journal).await;
         let main = w.metadata.main(id).id;
         let silent = w.metadata.insert_merge(id, main, main, MergeDirection::IntoParent, MergeStatus::Online);
-        let long_ago = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        let long_ago = Timestamp::now() - chelabase_time::seconds(3600);
         let age = |w: &crate::fakes::FakeWorker, at| {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&silent).unwrap();
@@ -2302,11 +2418,11 @@ mod tests {
         assert!(resumed(&w).await.is_empty());
         assert_eq!(w.metadata.merge_row(silent).claimed_at, Some(long_ago), "the claim isn't touched");
         // A worker claimed it after the hand-back, then went silent again: handed back.
-        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(1000));
-        age(&w, chrono::Utc::now() - chrono::Duration::seconds(600));
+        w.metadata.state().handed_back.insert(silent, Timestamp::now() - chelabase_time::seconds(1000));
+        age(&w, Timestamp::now() - chelabase_time::seconds(600));
         assert_eq!(resumed(&w).await.len(), 1);
         // The window passed with no claim: handed back (the job was lost).
-        w.metadata.state().handed_back.insert(silent, chrono::Utc::now() - chrono::Duration::seconds(3600));
+        w.metadata.state().handed_back.insert(silent, Timestamp::now() - chelabase_time::seconds(3600));
         age(&w, long_ago);
         assert_eq!(resumed(&w).await.len(), 1);
     }
@@ -2323,7 +2439,7 @@ mod tests {
             let mut state = w.metadata.state();
             let row = state.merges.get_mut(&m).unwrap();
             row.result = Some(serde_json::json!({ "after": { "choice": "reset", "requested": true } }));
-            row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+            row.updated_at = Timestamp::now() - chelabase_time::seconds(3600);
         }
         assert_eq!(
             resumed(&w).await,
@@ -2341,7 +2457,7 @@ mod tests {
         let mut state = w.metadata.state();
         let row = state.merges.get_mut(&m).unwrap();
         row.result = Some(serde_json::json!({ "after": after }));
-        row.updated_at = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        row.updated_at = Timestamp::now() - chelabase_time::seconds(3600);
         m
     }
 
@@ -2363,7 +2479,7 @@ mod tests {
     async fn a_lost_finish_is_handed_back_once_per_rehand_window() {
         let (w, journal) = worker();
         let m = drifted_with_after(&w, &journal, serde_json::json!({ "choice": "reset", "requested": true })).await;
-        let ago = |secs| chrono::Utc::now() - chrono::Duration::seconds(secs);
+        let ago = |secs: u64| Timestamp::now() - chelabase_time::seconds(secs);
         w.metadata.state().handed_back.insert(m, ago(15 * 60));
         assert!(resumed(&w).await.is_empty(), "handed back 15 minutes ago");
         w.metadata.state().handed_back.insert(m, ago(31 * 60));
@@ -2473,7 +2589,7 @@ mod tests {
         assert!(
             position(
                 &journal,
-                &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass")
+                &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r")
             )
             .is_some()
         );
@@ -2489,7 +2605,7 @@ mod tests {
         w.reconcile_once().await.unwrap();
         let checked = pos(
             &journal,
-            &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT to_regclass"),
+            &format!("compute.sql {ep} app SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r"),
         );
         assert!(checked < pos(&journal, &format!("compute.sql {ep} app BEGIN;")));
     }
@@ -3870,7 +3986,7 @@ mod tests {
 
         w.reconcile_once().await.unwrap();
 
-        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp; SELECT to_regclass")).is_some();
+        let checked = |db: &str| position(&journal, &format!("compute.sql {ep} {db} SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r")).is_some();
         assert!(checked("app") && checked("healthy") && checked("broken") && !checked("off"));
         // Each database is checked against its own default schema.
         let check_in = |db: &str| {
@@ -4247,5 +4363,511 @@ mod tests {
         pass_at(&w, t0, 10).await;
         assert_eq!(creates(&journal, &main_ep), 1, "{:?}", entries(&journal));
         assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
+    }
+}
+
+/// compute-network-reach m2: the network migration step, over the fakes.
+#[cfg(test)]
+mod network_migration_tests {
+    use chelabase_neon::backend::fake::{container_id, net};
+    use chelabase_neon::backend::{LegacyNetwork, NetworkRef};
+    use chelabase_neon::ComputeBackend;
+
+    use super::NetworkMigration;
+    use crate::fakes::{FakeWorker, Journal, entries, position, ready_database, worker};
+
+    /// A ready database's main endpoint, with the journal cleared.
+    async fn ready(w: &FakeWorker, journal: &Journal) -> String {
+        let db = ready_database(w).await;
+        let ep = w.metadata.main(db).endpoint_id.unwrap();
+        journal.lock().unwrap().clear();
+        ep
+    }
+
+    fn attach(w: &FakeWorker, ep: &str, networks: &[NetworkRef]) {
+        w.computes
+            .networks
+            .lock()
+            .unwrap()
+            .attached
+            .insert(ep.to_string(), networks.to_vec());
+    }
+
+    fn legacy(w: &FakeWorker, networks: Vec<LegacyNetwork>) {
+        w.computes.networks.lock().unwrap().legacy = networks;
+    }
+
+    fn present(name: &str, members: &[&str]) -> LegacyNetwork {
+        LegacyNetwork::Present {
+            network: net(name),
+            members: members.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    fn count(journal: &Journal, entry: &str) -> usize {
+        entries(journal).iter().filter(|e| *e == entry).count()
+    }
+
+    fn network_removals(journal: &Journal) -> Vec<String> {
+        entries(journal)
+            .into_iter()
+            .filter(|e| e.starts_with("network.remove "))
+            .collect()
+    }
+
+    async fn where_is(w: &FakeWorker, ep: &str) -> Vec<NetworkRef> {
+        w.computes
+            .compute_networks()
+            .await
+            .unwrap()
+            .computes
+            .into_iter()
+            .find(|c| c.endpoint_id == ep)
+            .map(|c| c.networks)
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_compute_on_a_legacy_network_is_replaced() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("compute_old"), net("control_old")]);
+        legacy(
+            &w,
+            vec![
+                present("compute_old", &[&format!("chelabase-main-compute-{ep}")]),
+                present("control_old", &[&format!("chelabase-main-compute-{ep}")]),
+            ],
+        );
+
+        w.reconcile_once().await.unwrap();
+
+        let removed = position(&journal, &format!("compute.remove_container {ep}"))
+            .unwrap_or_else(|| panic!("not removed: {:?}", entries(&journal)));
+        let created = position(&journal, &format!("compute.create {ep}"))
+            .unwrap_or_else(|| panic!("not created again: {:?}", entries(&journal)));
+        assert!(removed < created, "{:?}", entries(&journal));
+        assert_eq!(where_is(&w, &ep).await, [net("compute"), net("control")]);
+        assert_eq!(
+            network_removals(&journal),
+            ["network.remove compute_old", "network.remove control_old"]
+        );
+
+        // Idempotent: the next pass finds nothing to move and recreates nothing.
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert_eq!(count(&journal, &format!("compute.remove_container {ep}")), 0);
+        assert_eq!(count(&journal, &format!("compute.create {ep}")), 0);
+        assert_eq!(network_removals(&journal), Vec::<String>::new());
+    }
+
+    // One of the two networks only, or the two and one more: either is off the networks.
+    #[tokio::test]
+    async fn a_compute_on_one_network_only_is_replaced() {
+        for networks in [
+            vec![net("compute")],
+            vec![net("control")],
+            vec![net("compute"), net("control"), net("elsewhere")],
+            // The right name, attached by an id that isn't the network's now (it was
+            // recreated under the same name).
+            vec![
+                NetworkRef {
+                    name: "compute".into(),
+                    id: "net-compute-before".into(),
+                },
+                net("control"),
+            ],
+        ] {
+            let (w, journal) = worker();
+            let ep = ready(&w, &journal).await;
+            attach(&w, &ep, &networks);
+
+            let report = w.migrate_compute_networks().await;
+
+            assert_eq!(report.removed, std::slice::from_ref(&ep), "{networks:?}");
+            w.reconcile_once().await.unwrap();
+            assert_eq!(count(&journal, &format!("compute.create {ep}")), 1, "{networks:?}");
+            assert_eq!(where_is(&w, &ep).await, [net("compute"), net("control")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_compute_mid_create_is_not_removed() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("compute")]);
+        w.computes
+            .networks
+            .lock()
+            .unwrap()
+            .mid_create
+            .insert(ep.clone());
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(report.mid_create, std::slice::from_ref(&ep));
+        assert_eq!(report.removed, Vec::<String>::new());
+        assert_eq!(count(&journal, &format!("compute.remove_container {ep}")), 0);
+    }
+
+    #[tokio::test]
+    async fn equal_compute_and_control_networks_expect_one() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        w.computes.networks.lock().unwrap().expected = vec![net("compute")];
+        attach(&w, &ep, &[net("compute")]);
+
+        let report = w.migrate_compute_networks().await;
+        assert_eq!(report, NetworkMigration::default());
+
+        attach(&w, &ep, &[net("compute"), net("control")]);
+        let report = w.migrate_compute_networks().await;
+        assert_eq!(report.removed, [ep]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_legacy_network_is_removed() {
+        let (w, journal) = worker();
+        legacy(&w, vec![present("compute_old", &[])]);
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(report.networks_removed, ["compute_old"]);
+        assert_eq!(network_removals(&journal), ["network.remove compute_old"]);
+        assert_eq!(
+            w.computes.networks.lock().unwrap().legacy,
+            [LegacyNetwork::Missing {
+                name: "compute_old".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_occupied_legacy_network_is_kept() {
+        let (w, journal) = worker();
+        legacy(&w, vec![present("compute_old", &["someone-else", "another"])]);
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(
+            report.networks_kept,
+            [(
+                "compute_old".to_string(),
+                vec!["someone-else".to_string(), "another".to_string()]
+            )]
+        );
+        assert_eq!(report.networks_removed, Vec::<String>::new());
+        assert_eq!(network_removals(&journal), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_missing_legacy_network_is_not_an_error() {
+        let (w, journal) = worker();
+        legacy(
+            &w,
+            vec![LegacyNetwork::Missing {
+                name: "compute_old".into(),
+            }],
+        );
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(report, NetworkMigration::default());
+        assert_eq!(network_removals(&journal), Vec::<String>::new());
+    }
+
+    // Only the listed legacy networks are ever removed: never one a compute was moved off
+    // that isn't listed, and never the compute or control network.
+    #[tokio::test]
+    async fn only_listed_networks_are_removed() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("unlisted"), net("control")]);
+        legacy(&w, vec![present("compute_old", &[])]);
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(report.removed, [ep]);
+        assert_eq!(network_removals(&journal), ["network.remove compute_old"]);
+    }
+
+    #[tokio::test]
+    async fn one_failed_removal_does_not_stop_the_pass() {
+        let (w, journal) = worker();
+        let db = ready_database(&w).await;
+        let first = w.metadata.main(db).endpoint_id.unwrap();
+        let db2 = w.metadata.insert_database("other", chelabase_metadata::DatabaseStatus::Pending);
+        w.handle_provision(db2, "other").await.unwrap();
+        let second = w.metadata.main(db2).endpoint_id.unwrap();
+        journal.lock().unwrap().clear();
+        attach(&w, &first, &[net("compute_old")]);
+        attach(&w, &second, &[net("compute_old")]);
+        w.computes
+            .networks
+            .lock()
+            .unwrap()
+            .fail_remove
+            .insert(first.clone());
+        legacy(&w, vec![present("compute_old", &[])]);
+
+        let report = w.migrate_compute_networks().await;
+
+        assert_eq!(report.removed, std::slice::from_ref(&second));
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, first);
+        assert!(report.failed[0].1.contains("injected removal failure"), "{report:?}");
+        // The pass goes on, and the next one retries.
+        w.computes.networks.lock().unwrap().fail_remove.clear();
+        let report = w.migrate_compute_networks().await;
+        assert_eq!(report.removed, [first]);
+        assert_eq!(report.failed, Vec::new());
+    }
+
+    // The step asks Docker only: with the metadata database and the storage controller both
+    // failing, the pass errs but the compute is still removed.
+    #[tokio::test]
+    async fn migration_runs_while_the_metadata_database_is_down() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("compute_old")]);
+        legacy(&w, vec![present("compute_old", &[])]);
+        w.metadata.state().fail = Some("list_live_for_reconcile");
+        *w.storage.fail.lock().unwrap() = Some("list_tenant_ids");
+
+        assert!(w.reconcile_once().await.is_err());
+
+        assert_eq!(count(&journal, &format!("compute.remove_container {ep}")), 1, "{:?}", entries(&journal));
+        assert_eq!(network_removals(&journal), ["network.remove compute_old"]);
+        assert!(!w.computes.list().await.unwrap().contains(&ep));
+    }
+
+    // A listing that fails is reported; the legacy networks are still handled and nothing is
+    // removed blind.
+    #[tokio::test]
+    async fn a_failed_listing_removes_no_compute() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("compute_old")]);
+        w.computes.networks.lock().unwrap().fail_listing = Some("network stack_control is not internal".into());
+        legacy(&w, vec![present("compute_old", &[])]);
+
+        let report = w.migrate_compute_networks().await;
+
+        assert!(report.error.as_deref().is_some_and(|e| e.contains("not internal")), "{report:?}");
+        assert_eq!(report.removed, Vec::<String>::new());
+        assert_eq!(count(&journal, &format!("compute.remove_container {ep}")), 0);
+        assert_eq!(report.networks_removed, ["compute_old"]);
+    }
+
+    /// One fault W1 injects into the migration step.
+    #[derive(Debug, Clone, Copy)]
+    enum Fault {
+        /// `compute_networks` fails.
+        Listing,
+        /// Removing the n-th database's compute fails.
+        RemoveCompute(usize),
+        /// `legacy_networks` can't read this network.
+        Unreadable(&'static str),
+        /// `remove_network` fails on this network.
+        NetworkError(&'static str),
+        /// Docker refuses to remove this network as in use.
+        Occupied(&'static str),
+    }
+
+    const LEGACY: [&str; 3] = ["compute_old", "control_old", "other_old"];
+
+    fn apply(w: &FakeWorker, faults: &[Fault], eps: &[String]) {
+        let mut n = w.computes.networks.lock().unwrap();
+        for f in faults {
+            match *f {
+                Fault::Listing => n.fail_listing = Some("injected listing failure".into()),
+                Fault::RemoveCompute(i) => {
+                    n.fail_remove.insert(eps[i].clone());
+                }
+                Fault::Unreadable(name) => {
+                    n.unreadable.insert(name.into());
+                }
+                Fault::NetworkError(name) => {
+                    n.fail_remove_network.insert(name.into());
+                }
+                Fault::Occupied(name) => {
+                    n.occupied.insert(name.into());
+                }
+            }
+        }
+    }
+
+    fn clear(w: &FakeWorker) {
+        let mut n = w.computes.networks.lock().unwrap();
+        n.fail_listing = None;
+        n.fail_remove.clear();
+        n.unreadable.clear();
+        n.fail_remove_network.clear();
+        n.occupied.clear();
+    }
+
+    /// A worker process that started again over the same Docker, metadata and storage: nothing
+    /// in memory survives.
+    fn restarted(w: FakeWorker) -> FakeWorker {
+        let (mut fresh, _) = worker();
+        fresh.metadata = w.metadata;
+        fresh.storage = w.storage;
+        fresh.computes = w.computes;
+        fresh.cache = w.cache;
+        fresh.pusher = w.pusher;
+        fresh
+    }
+
+    /// Two ready databases whose computes are on both legacy networks, a compute mid-create off
+    /// the networks (on none of the legacy ones), and a third legacy network that only someone
+    /// else's container holds. Returns the two endpoints.
+    async fn upgrade_world(w: &FakeWorker, journal: &Journal) -> Vec<String> {
+        let first = ready_database(w).await;
+        let second = w.metadata.insert_database("other", chelabase_metadata::DatabaseStatus::Pending);
+        w.handle_provision(second, "other").await.unwrap();
+        // Sorted, the order the backend lists computes in (and so the order they are removed).
+        let mut eps: Vec<String> = [first, second]
+            .into_iter()
+            .map(|db| w.metadata.main(db).endpoint_id.unwrap())
+            .collect();
+        eps.sort();
+        let names: Vec<String> = eps.iter().map(|ep| format!("chelabase-main-compute-{ep}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        for ep in &eps {
+            attach(w, ep, &[net("compute_old"), net("control_old")]);
+        }
+        w.computes.insert("ep-mid");
+        attach(w, "ep-mid", &[net("compute")]);
+        w.computes.networks.lock().unwrap().mid_create.insert("ep-mid".into());
+        legacy(
+            w,
+            vec![
+                present("compute_old", &names),
+                present("control_old", &names),
+                present("other_old", &["someone-else"]),
+            ],
+        );
+        journal.lock().unwrap().clear();
+        eps
+    }
+
+    /// What must hold after every pass, faults or not: the foreign member and its network, and
+    /// the compute mid-create, are never touched.
+    fn never_touched(w: &FakeWorker, journal: &Journal, case: &str) {
+        let log = entries(journal);
+        assert!(
+            !log.iter().any(|e| e == "compute.remove_container ep-mid" || e == "network.remove other_old"),
+            "{case}: {log:?}"
+        );
+        let n = w.computes.networks.lock().unwrap();
+        assert!(n.mid_create.contains("ep-mid"), "{case}");
+        assert!(
+            n.legacy.contains(&present("other_old", &["someone-else"])),
+            "{case}: {:?}",
+            n.legacy
+        );
+    }
+
+    /// One migration-related action in `journal`.
+    fn migration_actions(journal: &Journal) -> Vec<String> {
+        entries(journal)
+            .into_iter()
+            .filter(|e| {
+                e.starts_with("compute.remove_container ")
+                    || e.starts_with("network.remove ")
+                    || e.starts_with("compute.create ")
+            })
+            .collect()
+    }
+
+    /// Passes with `faults` active for `faulty` passes (the worker restarting after them when
+    /// `restart`), then clean passes: they reach the migrated state and stay there.
+    async fn converges(faults: &[Fault], faulty: usize, restart: bool) {
+        let case = format!("{faults:?} for {faulty} pass(es), restart {restart}");
+        let (mut w, journal) = worker();
+        let eps = upgrade_world(&w, &journal).await;
+        for _ in 0..faulty {
+            apply(&w, faults, &eps);
+            w.reconcile_once().await.unwrap_or_else(|e| panic!("{case}: the pass failed: {e}"));
+            never_touched(&w, &journal, &case);
+        }
+        clear(&w);
+        if restart {
+            w = restarted(w);
+        }
+        for _ in 0..3 {
+            w.reconcile_once().await.unwrap_or_else(|e| panic!("{case}: {e}"));
+            never_touched(&w, &journal, &case);
+        }
+        for ep in &eps {
+            assert_eq!(where_is(&w, ep).await, [net("compute"), net("control")], "{case}: {ep}");
+        }
+        let n = w.computes.networks.lock().unwrap().legacy.clone();
+        assert_eq!(
+            n,
+            [
+                LegacyNetwork::Missing { name: "compute_old".into() },
+                LegacyNetwork::Missing { name: "control_old".into() },
+                present("other_old", &["someone-else"]),
+            ],
+            "{case}"
+        );
+        // A fixpoint: the next pass moves nothing.
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert_eq!(migration_actions(&journal), Vec::<String>::new(), "{case}");
+        never_touched(&w, &journal, &case);
+    }
+
+    // W1: every fault the step can meet, for one and for two passes, with and without the
+    // worker restarting afterwards, and all of them at once. Each pass errs nowhere, touches
+    // neither the foreign member nor the compute mid-create, and once the faults clear the
+    // passes reach the migrated state and stay there.
+    #[tokio::test]
+    async fn the_migration_converges_after_any_fault() {
+        let mut singles = vec![Fault::Listing, Fault::RemoveCompute(0), Fault::RemoveCompute(1)];
+        for name in LEGACY {
+            singles.extend([Fault::Unreadable(name), Fault::NetworkError(name), Fault::Occupied(name)]);
+        }
+        let mut cases: Vec<Vec<Fault>> = singles.iter().map(|f| vec![*f]).collect();
+        cases.push(singles.clone());
+        for faults in &cases {
+            for faulty in [1, 2] {
+                for restart in [false, true] {
+                    converges(faults, faulty, restart).await;
+                }
+            }
+        }
+    }
+
+    // W1: the worker restarts between removing a compute and creating it again: the new
+    // process, with nothing in memory, creates it on the right networks.
+    #[tokio::test]
+    async fn a_restart_between_the_removal_and_the_recreate_converges() {
+        let (w, journal) = worker();
+        let eps = upgrade_world(&w, &journal).await;
+        let report = w.migrate_compute_networks().await;
+        assert_eq!(report.removed, eps);
+        assert_eq!(count(&journal, &format!("compute.create {}", eps[0])), 0);
+        let w = restarted(w);
+        w.reconcile_once().await.unwrap();
+        for ep in &eps {
+            assert_eq!(where_is(&w, ep).await, [net("compute"), net("control")], "{ep}");
+        }
+        never_touched(&w, &journal, "restart");
+    }
+
+    // The container removed is the one listed, by id.
+    #[tokio::test]
+    async fn the_removal_names_the_listed_container() {
+        let (w, journal) = worker();
+        let ep = ready(&w, &journal).await;
+        attach(&w, &ep, &[net("compute_old")]);
+        let listed = w.computes.compute_networks().await.unwrap();
+        assert_eq!(listed.computes[0].container_id, container_id(&ep));
+
+        w.migrate_compute_networks().await;
+
+        assert!(!w.computes.list().await.unwrap().contains(&ep));
     }
 }

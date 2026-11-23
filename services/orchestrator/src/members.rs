@@ -44,7 +44,7 @@ use chelabase_identity::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -129,7 +129,7 @@ pub trait MembersPort: Send + Sync + 'static {
     fn admin_claimed_since(
         &self,
         tenant: TenantId,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
     /// The tenant's access log, newest first; `member` keeps the events whose target or actor
@@ -178,7 +178,7 @@ pub trait MembersPort: Send + Sync + 'static {
         database: Uuid,
         role_name: &str,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> impl Future<Output = Result<PersonalLogin, LoginWriteError>> + Send;
 
     /// A live login's new verifier and `valid_until`, on the record and every row (P8).
@@ -187,7 +187,7 @@ pub trait MembersPort: Send + Sync + 'static {
         member: Uuid,
         database: Uuid,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> impl Future<Output = Result<(PersonalLogin, Vec<LoginEndpoint>), LoginWriteError>> + Send;
 
     /// Deletes the member's record on `database` (any status); returns where its rows were.
@@ -327,7 +327,7 @@ pub trait MembersPort: Send + Sync + 'static {
         &self,
         actor: Uuid,
         invite: Uuid,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
         token_hash: [u8; 32],
     ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
 
@@ -454,7 +454,7 @@ impl MembersPort for MetadataClient {
         MetadataClient::open_signup(self, tenant).await
     }
 
-    async fn admin_claimed_since(&self, tenant: TenantId, since: DateTime<Utc>) -> Result<bool, MetadataError> {
+    async fn admin_claimed_since(&self, tenant: TenantId, since: Timestamp) -> Result<bool, MetadataError> {
         MetadataClient::admin_claimed_since(self, tenant, since).await
     }
 
@@ -494,7 +494,7 @@ impl MembersPort for MetadataClient {
         database: Uuid,
         role_name: &str,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> Result<PersonalLogin, LoginWriteError> {
         MetadataClient::create_personal_login(self, member, database, role_name, scram_verifier, valid_until)
             .await
@@ -505,7 +505,7 @@ impl MembersPort for MetadataClient {
         member: Uuid,
         database: Uuid,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> Result<(PersonalLogin, Vec<LoginEndpoint>), LoginWriteError> {
         MetadataClient::reset_personal_login(self, member, database, scram_verifier, valid_until).await
     }
@@ -631,7 +631,7 @@ impl MembersPort for MetadataClient {
         &self,
         actor: Uuid,
         invite: Uuid,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
         token_hash: [u8; 32],
     ) -> Result<(), AccessWriteError> {
         MetadataClient::resend_invite(self, actor, invite, expires_at, token_hash).await
@@ -720,7 +720,7 @@ impl MemberRolesQueue for NatsPorts {
 /// How long an invite lives. The identity service's invite code lives as long (72 hours, its
 /// `CODE_TTL_MS.invite`; a test there pins the two together), and accept-invite checks the
 /// invite's own `expires_at`.
-const INVITE_LIFETIME_HOURS: i64 = 72;
+const INVITE_LIFETIME_HOURS: u64 = 72;
 
 /// Invite mails and codes per person per hour, first invites and resends together, in this
 /// process. Each new code resets that code's wrong-guess count, so this is what bounds the
@@ -779,13 +779,13 @@ pub(crate) struct Member {
     /// What the member can reach, over the projects the caller can see.
     access: MemberAccess,
     /// When the member row was made (an invited member's: when they were invited).
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// When an invited member first signed in.
     #[schema(required = true)]
-    accepted_at: Option<DateTime<Utc>>,
+    accepted_at: Option<Timestamp>,
     /// When the member was suspended; `null` unless suspended (or removed after a suspension).
     #[schema(required = true)]
-    suspended_at: Option<DateTime<Utc>>,
+    suspended_at: Option<Timestamp>,
     /// The member who suspended it; `null` unless suspended, and for a member suspended before
     /// this was recorded.
     #[schema(required = true)]
@@ -893,7 +893,7 @@ fn member_access(
 pub(crate) struct Invite {
     id: Uuid,
     /// When its code stops working (72 hours after it was sent); resend it for a new one.
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
 }
 
 impl Member {
@@ -1041,7 +1041,7 @@ pub(crate) struct InviteResult {
 pub(crate) struct ResentInvite {
     id: Uuid,
     /// When its new code stops working.
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     /// With `delivery: "link"`: the new `/accept-invite` link. It is shown this once, never
     /// stored or logged, and the response is `Cache-Control: no-store`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1185,7 +1185,7 @@ pub(crate) struct AccessEvent {
     before: Option<Value>,
     #[schema(value_type = Option<Object>, required = true)]
     after: Option<Value>,
-    at: DateTime<Utc>,
+    at: Timestamp,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2083,8 +2083,8 @@ fn invite_closed() -> ApiError {
     ApiError::new(409, ErrorCode::InviteClosed, "the invite is no longer open")
 }
 
-fn invite_expiry() -> DateTime<Utc> {
-    Utc::now() + chrono::Duration::hours(INVITE_LIFETIME_HOURS)
+fn invite_expiry() -> Timestamp {
+    Timestamp::now() + chelabase_time::hours(INVITE_LIFETIME_HOURS)
 }
 
 fn identity_client<M, J>(state: &AppState<M, J>) -> Result<&Identity, ApiError> {

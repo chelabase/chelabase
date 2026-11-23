@@ -22,7 +22,7 @@ use chelabase_routes::orchestrator as ep;
 use chelabase_types::ApiPath;
 use chelabase_types::BranchId;
 use chelabase_types::api_error::{ApiError, ErrorEnvelope};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use utoipa::ToSchema;
@@ -111,7 +111,12 @@ struct ScheduleView {
     enabled: bool,
     /// When it runs next.
     #[schema(required = true)]
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
+    /// Why the schedule was switched off, `null` normally: the cron or time zone no longer
+    /// parses, or it has no upcoming time. Cleared when the schedule next gets a time (a
+    /// worker pass, or a successful change).
+    #[schema(required = true)]
+    last_error: Option<String>,
 }
 
 impl From<ScheduleRecord> for ScheduleView {
@@ -122,6 +127,7 @@ impl From<ScheduleRecord> for ScheduleView {
             timezone: s.timezone,
             enabled: s.enabled,
             next_run_at: s.next_run_at,
+            last_error: s.last_error,
         }
     }
 }
@@ -262,7 +268,7 @@ where
             if function.kind != FunctionKind::Function {
                 return Err(unprocessable("a schedule needs a function: a service is never run on a schedule (deploy a function that calls it)"));
             }
-            let next_run_at = schedule.next_after(Utc::now());
+            let next_run_at = schedule.next_after(Timestamp::now());
             let schedule_id = state
                 .metadata
                 .add_schedule(&NewSchedule {
@@ -281,6 +287,7 @@ where
                 timezone: timezone.to_owned(),
                 enabled: true,
                 next_run_at,
+                last_error: None,
             };
             Ok((StatusCode::CREATED, Json(view)).into_response())
         }
@@ -353,7 +360,17 @@ where
                     request.enabled,
                 )
                 .await
-                .map_err(|e| metadata_error("update schedule", e))?
+                .map_err(|e| match e {
+                    // The stored cron or zone no longer parses (a PATCH without it): the same
+                    // 422 naming the field as a bad value in the request.
+                    MetadataError::InvalidFunction(m) if m.starts_with("cron: ") => {
+                        invalid(ScheduleError::Cron(m["cron: ".len()..].to_owned()))
+                    }
+                    MetadataError::InvalidFunction(m) if m.starts_with("timezone: ") => {
+                        invalid(ScheduleError::Timezone(m["timezone: ".len()..].to_owned()))
+                    }
+                    e => metadata_error("update schedule", e),
+                })?
                 .ok_or_else(schedule_not_found)?;
             info!(request_id = %principal.request_id, branch_id = %branch.id, function = %name, schedule = %schedule_id, "function schedule changed");
             Ok(Json(ScheduleView::from(changed)).into_response())

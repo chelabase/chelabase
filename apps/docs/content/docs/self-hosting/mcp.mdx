@@ -1,0 +1,85 @@
+---
+title: MCP server
+description: Turn on the mcp compose profile, every setting and its default, the audit log lines, and what to expect when a run stalls the runtime.
+---
+
+The member guide is [MCP](/using/mcp). This page is what an operator runs and sets. For the design, see [MCP internals](/architecture/mcp).
+
+## What runs
+
+| Piece | Role |
+|---|---|
+| `mcp` | The MCP server. Its public listener (8095) is behind the gateway at `/mcp`; its internal listener (8096) is on the `mcp-sandbox` network, the only address the runtime can reach. It verifies member tokens with `auth/member-jwt.pub`, the one secret it mounts, and makes the API calls of each run through the gateway as the member. |
+| `mcp-runtime` | workerd, running the model's code, one fresh isolate per run. Its only network is the internal `mcp-sandbox`, shared with `mcp` alone: no route to any other service and none out. No secret, no setting but its memory limit, no published port, no volume. Non-root, read-only, every capability dropped. |
+
+## Turn it on
+
+Both run only with the `mcp` profile, which is off by default. Without it nothing of theirs starts or is pulled. In `.env`:
+
+```bash
+COMPOSE_PROFILES=mcp
+CHELABASE_MCP_URL=http://mcp-public:8095
+```
+
+`CHELABASE_MCP_URL` tells the gateway where the server is. Blank, the gateway answers 404 on `/mcp`. If you also use the `services` profile, list both: `COMPOSE_PROFILES=mcp,services`. Then `docker compose up -d`.
+
+Members connect with the `chelabase mcp` bridge or a direct URL: see [Connect a client](/using/mcp/connect). `/mcp` is on the API host ([Hosts](/self-hosting/hosts)).
+
+## Settings
+
+Blank means the default. The compose file passes each of these to the service that reads it: `mcp`, except `CHELABASE_MCP_URL` (the gateway) and `CHELABASE_MCP_RUNTIME_MEMORY` (`mcp-runtime`).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CHELABASE_MCP_URL` | none | The gateway's upstream for `/mcp`. Compose: `http://mcp-public:8095`. |
+| `CHELABASE_MCP_ALLOWED_ORIGINS` | none | An allow-list, comma separated, for clients that send an `Origin` header. A request with an `Origin` that isn't listed answers 403; clients that send none (the bridge, coding agents) are unaffected. Browsers can't call `/mcp` directly today: the route has no CORS, so a preflight answers 405 and answers carry no CORS headers. |
+| `CHELABASE_MCP_LOG_CODE` | `0` | `1` writes each tool call's code to its audit line. `0` or `1` only. |
+| `CHELABASE_MCP_TIMEOUT_MS` | `30000` | A tool call's wall clock. 1000 to 60000. |
+| `CHELABASE_MCP_RESULT_MAX_BYTES` | `24000` | The largest tool result, in bytes of JSON text. 1 KiB to 4 MiB. A longer one is cut with a marker. |
+| `CHELABASE_MCP_CALLS_PER_MINUTE` | `60` | Tool calls a member may make a minute. |
+| `CHELABASE_MCP_MEMBER_CONCURRENCY` | `2` | Runs one member may have in flight. |
+| `CHELABASE_MCP_CONCURRENCY` | `8` | Runs in flight overall. |
+| `CHELABASE_MCP_MAX_CALLS` | `50` | API calls one `execute` run may make. 1 to 1000. |
+| `CHELABASE_MCP_RESPONSE_MAX_BYTES` | `1048576` | The largest API answer `execute` reads. 1024 to 8388608 (8 MiB). A larger one answers `response_too_large` to the code, and so does an answer whose JSON form is over 8 MiB. |
+| `CHELABASE_MCP_RUNTIME_MEMORY` | `512m` | The runtime container's memory limit (a compose size), with swap equal to it. Every run shares it. |
+
+The member access token's lifetime (`CHELABASE_MEMBER_ACCESS_TTL_SECS`, which auth allows down to 60) must be above the run timeout plus 10 seconds (and above 60), or `mcp` refuses every token as too short-lived and MCP doesn't work. The defaults (300 and 30 s) are fine.
+
+A value out of range stops the service at start with a message naming the variable. A call refused for a limit answers `rate_limited` with `retry_after_ms`.
+
+The service also reads `CHELABASE_MCP_LISTEN`, `CHELABASE_MCP_INTERNAL_LISTEN`, `CHELABASE_MCP_RUNTIME_URL` and `CHELABASE_MCP_API_URL`; the compose file sets them, and they matter only for an install that runs the service another way. Unset, `CHELABASE_MCP_RUNTIME_URL` makes every call answer `runtime_unavailable`, and unset `CHELABASE_MCP_API_URL` makes every API call answer `upstream_unavailable`.
+
+**Failed token checks aren't rate-limited inside `mcp`.** Behind the gateway there is no cheap per-client key, a refusal costs one signature check, and a bucket shared by every client would let a flood of bad tokens lock out members with good ones. Nothing limits them today; they should be limited per address at the gateway or in front of it (#395).
+
+## The audit log
+
+`mcp` writes two kinds of `info` lines on the target `mcp::audit`. Neither holds a token, a result or a request body.
+
+**`tool call`**, one per `tools/call`:
+
+| Field | Value |
+|---|---|
+| `request_id` | The gateway's request id. |
+| `member`, `tenant` | The member's id and tenant, from the verified token. |
+| `credential` | `member`. |
+| `read_only` | Whether the connection is read-only. |
+| `tool` | `search`, `execute`, or `unknown` for a name that isn't ours. |
+| `code_sha256`, `code_bytes` | A hash and the length of the code. |
+| `code` | The code itself, only with `CHELABASE_MCP_LOG_CODE=1`. |
+| `destructive` | The flag as sent. |
+| `duration_ms` | Time taken. |
+| `outcome` | `ok`, a tool error code, `invalid_params` (nothing ran) or `client_disconnected`. |
+| `result_bytes`, `truncated` | The size of the result text and whether it was cut. |
+| `exec_id` | The run's id; empty when nothing ran. |
+
+**`api call`**, one per API call a run makes or is refused: `exec_id`, `member`, `operation`, `class`, `method`, `path_template` (the template, never the concrete path), `status`, `request_bytes`, `response_bytes` and `refusal` (the code when the server refused it, `cut` for a call ended with its run, otherwise empty). A call that was cut when its run ended has `status=0`. Join the two kinds on `exec_id`.
+
+Code can hold what a member typed into a prompt, so it stays out of the log unless you turn `CHELABASE_MCP_LOG_CODE` on. The hash lets you match a call to code you recorded elsewhere.
+
+## When a run stalls the runtime
+
+- **Code that only awaits forever** ends at the time limit with `timeout`; the runtime is unaffected.
+- **A busy loop** (`for (;;) {}`) keeps workerd busy. The runtime's watchdog ends and restarts it after about 8 seconds, before the time limit, so the run answers `runtime_unavailable`. Runs in flight at that moment answer the same, and calls succeed again within about 10 seconds. Compose restarts the container (`restart: always`).
+- **Memory.** A run's JavaScript heap stops at 128 MiB, but buffers sit outside it, so only the container's limit (`CHELABASE_MCP_RUNTIME_MEMORY`) bounds them. The kernel kills workerd past it and the restart policy starts it again. Runs in flight then answer `runtime_unavailable`.
+
+None of these reaches another service: the runtime has no route to one.

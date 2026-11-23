@@ -65,7 +65,10 @@ struct Proxy {
     state: Arc<Mutex<ProxyState>>,
 }
 
-async fn proxy_handle(State((st, upstream)): State<(Arc<Mutex<ProxyState>>, String)>, req: Request) -> Response {
+async fn proxy_handle(
+    State((st, upstream, http)): State<(Arc<Mutex<ProxyState>>, String, reqwest::Client)>,
+    req: Request,
+) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = to_bytes(Body::new(body), 1 << 20).await.unwrap_or_default();
     let call = format!("{} {}", parts.method, parts.uri.path());
@@ -112,7 +115,7 @@ async fn proxy_handle(State((st, upstream)): State<(Arc<Mutex<ProxyState>>, Stri
         return (StatusCode::from_u16(status).unwrap(), body).into_response();
     }
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-    let mut forward = reqwest::Client::new().request(parts.method.clone(), format!("{upstream}{path}"));
+    let mut forward = http.request(parts.method.clone(), format!("{upstream}{path}"));
     for name in ["authorization", "content-type"] {
         if let Some(v) = parts.headers.get(name) {
             forward = forward.header(name, v.clone());
@@ -129,7 +132,7 @@ impl Proxy {
         let state = Arc::new(Mutex::new(ProxyState::default()));
         let app = axum::Router::new()
             .fallback(proxy_handle)
-            .with_state((state.clone(), upstream.to_string()));
+            .with_state((state.clone(), upstream.to_string(), reqwest::Client::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -180,6 +183,11 @@ impl Proxy {
             release,
             proxy: self.clone(),
         }
+    }
+
+    /// As new: no calls seen, and no hooks, raw answers, delays or holds.
+    fn reset(&self) {
+        *self.state.lock().unwrap() = ProxyState::default();
     }
 
     /// Hooks, raw answers, delays and holds are over.
@@ -327,6 +335,8 @@ impl PendingInsert for FakePending {
 
 struct H {
     fake: FakeIdentity,
+    /// One client for the fake, so its connections are pooled.
+    fake_client: chelabase_identity::Identity,
     proxy: Proxy,
     internal: FakeInternal,
     /// In front of `internal`, to fail an orchestrator call.
@@ -354,7 +364,7 @@ fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
         "project_id": project, "status": "enabled",
         "email_verification": verification, "on_delete": "delete",
         "auth_database_id": Uuid::nil(), "pg_database": "app", "schema": "public",
-        "table": "users", "target_branch_id": target,
+        "table": "users", "target_branch_id": target, "project_name": "Acme",
         "sync": {"branch_id": target, "host": std::net::Ipv4Addr::LOCALHOST.to_string(), "port": 5432, "database": "app",
             "user": "chelabase_auth_sync", "password": "pw", "schema": "public", "table": "users"},
     })
@@ -442,6 +452,7 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         .unwrap()
     });
     H {
+        fake_client: fake.client(),
         fake,
         proxy,
         internal,
@@ -464,6 +475,25 @@ async fn harness() -> H {
 }
 
 impl H {
+    /// Starts over in a new project, branch and key on the same servers, as a fresh
+    /// [`harness`] would: the fakes forget every call, session and forced answer, and the
+    /// service's per-project limits and per-branch cache start empty, so nothing of an earlier
+    /// case reaches the next. Servers and their connections stay, so a long run of cases
+    /// takes a fixed number of ports.
+    fn next_project(&mut self) {
+        self.proxy.reset();
+        self.iproxy.reset();
+        self.internal.reset();
+        self.db.journal.lock().unwrap().clear();
+        self.db.rows.lock().unwrap().clear();
+        self.db.set(Fail::Nothing);
+        self.project = Uuid::new_v4();
+        self.branch = Uuid::new_v4();
+        self.key = Uuid::new_v4();
+        self.fake.with_pool(&self.pool());
+        self.internal.set_branch(self.branch, info(self.project, self.branch, false));
+    }
+
     fn pool(&self) -> Pool {
         Pool::App(self.project)
     }
@@ -638,8 +668,7 @@ impl H {
 
     async fn add_user_in(&self, pool: Pool, email: &str, password: &str, verified: bool) -> String {
         self.fake.with_pool(&pool);
-        self.fake
-            .client()
+        self.fake_client
             .create_user(
                 &pool,
                 &chelabase_identity::NewUser {
@@ -1511,11 +1540,13 @@ fn refresh_model(p: Peek, o: Orch, i: Ident) -> Outcome {
 
 /// One case of the matrix: the first refresh against the model, and, when it answered 503,
 /// a retry with the same token once every fault is over and (for a current token) the grace
-/// has ended, as after a long outage (#59). Returns what differs from the model.
-async fn refresh_case(p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
+/// has ended, as after a long outage (#59). Returns what differs from the model. The case runs
+/// in a new project of `h` ([`H::next_project`]).
+async fn refresh_case(h: &mut H, p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
     use Ident as I;
     use Orch as O;
-    let h = harness().await;
+    h.next_project();
+    let h = &*h;
     let pool = h.pool();
     let lookup_pattern = format!("GET {}/sessions/", h.pool_path());
     if t == Timing::GraceEndsInLookup {
@@ -1527,7 +1558,7 @@ async fn refresh_case(p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
     let owner = if i == I::OtherUser { &other } else { &user };
     let (identity_session, _) = h.fake.with_session(&pool, owner);
     let lookup = format!("GET {}/sessions/{identity_session}", h.pool_path());
-    let client = h.fake.client();
+    let client = &h.fake_client;
     match i {
         I::Live | I::OtherUser => {}
         I::Banned => h.fake.ban(&pool, &user),
@@ -1689,19 +1720,21 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         I::Malformed200,
     ];
     let total = peeks.len() * idents.len() * (orchs.len() + 1);
-    // One task per peek answer; each runs its cases in turn.
+    // One task per peek answer; each runs its cases in turn on one harness of its own, so the
+    // ports the run takes don't grow with the number of cases.
     let tasks: Vec<_> = peeks
         .into_iter()
         .map(|p| {
             tokio::spawn(async move {
+                let mut h = harness().await;
                 let mut wrong = Vec::new();
                 for o in orchs {
                     for i in idents {
-                        wrong.extend(refresh_case(p, o, i, Timing::Steady).await);
+                        wrong.extend(refresh_case(&mut h, p, o, i, Timing::Steady).await);
                     }
                 }
                 for i in idents {
-                    wrong.extend(refresh_case(p, O::Grace, i, Timing::GraceEndsInLookup).await);
+                    wrong.extend(refresh_case(&mut h, p, O::Grace, i, Timing::GraceEndsInLookup).await);
                 }
                 wrong
             })
@@ -3355,7 +3388,7 @@ impl H {
         let client = self.fake.client();
         let pw = (kind == CodeKind::Reset).then_some(NEW_PW);
         let guess = async |code: &str| match kind {
-            CodeKind::EmailChange => client.confirm_email_change(&self.pool(), user, next, code).await.unwrap_err(),
+            CodeKind::EmailChange => client.confirm_email_change(&self.pool(), user, next, code, None).await.unwrap_err(),
             _ => client.verify_code(&self.pool(), user, kind, code, pw).await.unwrap_err(),
         };
         for _ in 0..2 {
@@ -3555,4 +3588,90 @@ async fn code_checks_answer_a_known_and_an_unknown_email_alike() {
 /// [`code`], for tests with a local `code`.
 fn code_of(a: &Ans) -> &str {
     code(a)
+}
+
+// #314: app-user mail names the project (from the caller's own branch info), not the platform.
+/// The project each mailed code of the fake named, as `(kind, project)`.
+fn code_projects(h: &H) -> Vec<(CodeKind, Option<String>)> {
+    h.fake.codes_sent().into_iter().map(|c| (c.kind, c.project)).collect()
+}
+
+#[tokio::test]
+async fn code_mails_carry_the_project_name() {
+    let h = harness_opts(true, 1, true).await;
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let id = h.add_user("bob@example.com", true).await;
+    let a = h.post("password-reset", json!({"email": "bob@example.com"}), None).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let s = h.sign_in("bob@example.com", PW).await;
+    assert_eq!(h.change_email("bob@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    assert_eq!(h.last_code(&id, CodeKind::Reset).len(), 6);
+    let acme = Some("Acme".to_string());
+    assert_eq!(
+        code_projects(&h),
+        vec![
+            (CodeKind::Verify, acme.clone()),
+            (CodeKind::Reset, acme.clone()),
+            (CodeKind::EmailChange, acme),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn email_changed_notice_carries_the_project_name() {
+    // With verification: the notice goes when the code is confirmed.
+    let h = harness_opts(true, 1, true).await;
+    h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let a = h.confirm_email_change("ada@new.example", &sent, access(&s)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| (n.email, n.project)).collect();
+    assert_eq!(notices, vec![("ada@example.com".to_string(), Some("Acme".to_string()))]);
+    // Without verification: the change applies at once and the notice goes with it.
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s)).await.status, StatusCode::NO_CONTENT);
+    let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| (n.email, n.project)).collect();
+    assert_eq!(notices, vec![("ada@example.com".to_string(), Some("Acme".to_string()))]);
+}
+
+#[tokio::test]
+async fn a_project_name_identity_would_refuse_still_mails_under_the_default_name() {
+    // A project name may hold a line break; identity cannot show that as a `project_name`, so the
+    // mail goes out under the service's default name instead of not at all.
+    let h = harness_opts(true, 1, true).await;
+    let mut branch = info(h.project, h.branch, true);
+    branch["project_name"] = json!("Acme\nInc");
+    h.internal.set_branch(h.branch, branch);
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)]);
+}
+
+#[tokio::test]
+async fn a_project_named_only_a_byte_order_mark_mails_under_the_default_name() {
+    // JavaScript's `trim()` strips U+FEFF and Rust's does not, so identity treats these names
+    // as blank. Identity is the one judge of a name: it falls back to the default, so the code
+    // and the email-changed notice still go.
+    for name in ["\u{feff}", "\u{feff} "] {
+        let h = harness_opts(true, 1, true).await;
+        let mut branch = info(h.project, h.branch, true);
+        branch["project_name"] = json!(name);
+        h.internal.set_branch(h.branch, branch);
+        let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+        assert_eq!(code_projects(&h), vec![(CodeKind::Verify, None)], "{name:?}");
+        h.add_user("bob@example.com", true).await;
+        let s = h.sign_in("bob@example.com", PW).await;
+        assert_eq!(h.change_email("bob@new.example", access(&s)).await.status, StatusCode::ACCEPTED);
+        let sent = h.email_change_codes().pop().unwrap().2;
+        let a = h.confirm_email_change("bob@new.example", &sent, access(&s)).await;
+        assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+        let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| n.project).collect();
+        assert_eq!(notices, vec![None], "{name:?}");
+    }
 }

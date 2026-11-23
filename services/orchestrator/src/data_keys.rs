@@ -19,7 +19,7 @@ use chelabase_secrets::{Purpose, open_credential, seal_credential};
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{ApiPath, BranchId};
 use chelabase_types::data_key::{self, DataKeyKind};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use chelabase_types::api_error::ErrorEnvelope;
 use chelabase_types::data_api_schema::DataApiSchema;
 use serde::{Deserialize, Serialize};
@@ -64,9 +64,9 @@ struct DataKey {
     role: String,
     name: String,
     prefix: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     #[schema(required = true)]
-    last_used_at: Option<DateTime<Utc>>,
+    last_used_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<String>,
     /// A secret key whose role is owner-level (superuser, CREATEROLE, CREATEDB, REPLICATION or a

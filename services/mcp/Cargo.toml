@@ -1,0 +1,45 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase MCP server: search and execute over the Chelabase API for a signed-in member"
+
+[lib]
+name = "mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chelabase-auth = { workspace = true }
+chelabase-types = { workspace = true }
+# The protocol's types and its stateless Streamable HTTP server.
+# chelabase/rmcp at upstream PR #1474 (chrono behind a default feature; drop the fork once a release has it).
+rmcp = { git = "https://github.com/chelabase/rmcp", rev = "9043cdfa8694d83bf506c2f3eb0313ec173edd7e", default-features = false, features = ["server", "transport-streamable-http-server"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+# Declared here for later milestones so they don't write this file or the lock in a shared
+# wave: the runtime client (m7), the result cache (m7), the API client and its query types
+# (m11), and the random source (mcp-oauth, mcp-sealed).
+chelabase-http = { workspace = true }
+chelabase-query = { workspace = true }
+moka = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+chelabase-auth = { workspace = true, features = ["test-support"] }
+# The gateway's own route matcher: the property test checks the host's matcher against it.
+chelabase-routes = { workspace = true }
+proptest = { workspace = true }

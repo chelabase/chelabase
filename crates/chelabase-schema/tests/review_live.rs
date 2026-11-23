@@ -318,3 +318,86 @@ async fn a_user_owned_storage_schema_is_reviewed() {
     meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
     meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
 }
+
+// #189: `chelabase_guard` is skipped only when a superuser owns it (the DDL guard's script runs
+// as one). A `chelabase_guard` schema the owner made in its own database, where another role can
+// create, is reviewed like any other: a planted SECURITY DEFINER function, a trigger on a table
+// there and the function a trigger on a user table runs there are listed.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_user_owned_chelabase_guard_schema_is_reviewed() {
+    let meta = connect(&url()).await;
+    let mut random = [0u8; 6];
+    getrandom::fill(&mut random).unwrap();
+    let name = format!("rv_{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let (owner, dev) = (format!("{name}_owner"), format!("{name}_dev"));
+    meta.batch_execute(&format!("CREATE ROLE {owner} LOGIN; CREATE ROLE {dev};")).await.unwrap();
+    meta.batch_execute(&format!("CREATE DATABASE {name} OWNER {owner}")).await.unwrap();
+    let db = connect(&url_for(&name)).await;
+    db.batch_execute(&format!(
+        "SET ROLE {owner};
+         CREATE SCHEMA chelabase_guard;
+         GRANT USAGE, CREATE ON SCHEMA chelabase_guard TO {dev};
+         CREATE TABLE public.users (a int);
+         GRANT TRIGGER ON public.users TO {dev};
+         RESET ROLE;
+         SET ROLE {dev};
+         CREATE FUNCTION chelabase_guard.f_planted() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         CREATE FUNCTION chelabase_guard.f_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE chelabase_guard.t (a int);
+         CREATE TRIGGER tg BEFORE INSERT ON chelabase_guard.t FOR EACH ROW EXECUTE FUNCTION chelabase_guard.f_trg();
+         CREATE TRIGGER tg_users BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION chelabase_guard.f_trg();
+         RESET ROLE;"
+    ))
+    .await
+    .unwrap();
+
+    let keys: Vec<String> = scan(&db, &owner).await.into_iter().map(|i| i.key).collect();
+    assert_eq!(
+        keys,
+        [
+            "app/function/chelabase_guard.f_planted()",
+            "app/function/chelabase_guard.f_trg()",
+            "app/trigger/chelabase_guard.tg(chelabase_guard.t)",
+            "app/trigger/public.tg_users(public.users)",
+        ],
+        "a chelabase_guard schema that isn't a superuser's is reviewed"
+    );
+
+    drop(db);
+    meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
+    meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
+}
+
+// #189: the guard's own `chelabase_guard` (a superuser's, as the guard script leaves it) still
+// gives no findings, even for a function in it that a non-Admin role owns.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_superuser_owned_chelabase_guard_schema_gives_no_findings() {
+    let meta = connect(&url()).await;
+    let mut random = [0u8; 6];
+    getrandom::fill(&mut random).unwrap();
+    let name = format!("rv_{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let (owner, dev) = (format!("{name}_owner"), format!("{name}_dev"));
+    meta.batch_execute(&format!("CREATE ROLE {owner} LOGIN; CREATE ROLE {dev};")).await.unwrap();
+    meta.batch_execute(&format!("CREATE DATABASE {name} OWNER {owner}")).await.unwrap();
+    let db = connect(&url_for(&name)).await;
+    assert_eq!(one(&db, "SELECT pg_catalog.current_setting('is_superuser')").await, "on", "the test connects as a superuser");
+    db.batch_execute(&format!(
+        "CREATE SCHEMA chelabase_guard;
+         ALTER SCHEMA chelabase_guard OWNER TO CURRENT_USER;
+         REVOKE ALL ON SCHEMA chelabase_guard FROM PUBLIC;
+         CREATE FUNCTION chelabase_guard.refuse_ddl() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN END';
+         CREATE FUNCTION chelabase_guard.f_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+         ALTER FUNCTION chelabase_guard.f_definer() OWNER TO {dev};"
+    ))
+    .await
+    .unwrap();
+
+    let keys: Vec<String> = scan(&db, &owner).await.into_iter().map(|i| i.key).collect();
+    assert!(keys.is_empty(), "the guard's own schema is skipped: {keys:?}");
+
+    drop(db);
+    meta.batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
+    meta.batch_execute(&format!("DROP ROLE {dev}; DROP ROLE {owner};")).await.unwrap();
+}

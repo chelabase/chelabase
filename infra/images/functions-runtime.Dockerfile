@@ -8,9 +8,9 @@
 FROM debian:trixie-slim@sha256:89c1ea91e897f0fe0a3731595330bc45b8bdef4047464a07116f891a94054b31 AS workerd
 ARG TARGETARCH
 # Bump all three together; each sha512 is the version's `dist.integrity` in the npm registry.
-ARG WORKERD_VERSION=1.20261023.1
-ARG WORKERD_SHA512_AMD64=VHQ6jKFSihjR2+x1buby8XTdBLLJztVnYiB7OLOTYO8aDXB+c1Rd2410PdgFuFYc4AgFEk6PCJLyCLL5L1KBnw==
-ARG WORKERD_SHA512_ARM64=ilpRHzfDN8YFRM5CLRKuFw40x/LJBS89yVdhdQmxehlVDuBqjKpJB++zPFbTgKRRFaNupgnXc8RHktXAIhgCmQ==
+ARG WORKERD_VERSION=1.20261119.1
+ARG WORKERD_SHA512_AMD64=aaDf78smiN12Uuwtg6TG6iLVS61sLpy/7DC5PYORf2+TCYw/bygcaqqb8zQJ+XwZ3xYhm/Ws80c/yMMhCMTFYA==
+ARG WORKERD_SHA512_ARM64=LkyAvTMcKqRUP73HRScWWwTSz3pw09um1hxR+rcGdvsGzao8IR59XXTp/tul6kFdVBL2mD8U3X6j2O8t7I4viw==
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \

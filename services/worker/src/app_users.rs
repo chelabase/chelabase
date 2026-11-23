@@ -15,14 +15,15 @@ use chelabase_nats::{AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppU
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::app_users_sql::{
     USERS_OUTDATED_SQL, USERS_ROWS_SQL, USERS_SYNC_ROLE, USERS_TEARDOWN_SQL, claim_helpers_sql,
-    gone_call_sql, upsert_call_sql, users_bootstrap_sql, users_table_exists_sql,
+    gone_call_sql, newer_data_api_error, upsert_call_sql, users_bootstrap_sql,
+    users_table_exists_sql,
 };
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{OWNER_ROLE, Worker, credentials};
@@ -41,9 +42,9 @@ pub struct UserRow {
     pub id: Uuid,
     pub email: String,
     pub email_verified: bool,
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<Timestamp>,
     #[serde(default)]
-    pub banned_at: Option<DateTime<Utc>>,
+    pub banned_at: Option<Timestamp>,
 }
 
 /// The project's app-user pool. Only ever built from the project's own id, so a drop can't
@@ -219,6 +220,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .admin_sql(ep, &auth.pg_database, &script)
             .await
             .map(drop)
+            .map_err(newer_data_api_refusal)
     }
 
     /// The branch hook (create, reset, restore, compute re-creation): the users bootstrap when
@@ -328,6 +330,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     self.computes
                         .admin_sql(&ep, &database.name, &helpers)
                         .await
+                        .map_err(newer_data_api_refusal)
                         .map_err(|e| {
                             format!(
                                 "installing the claim helpers on branch {}, database {}: {e:#}",
@@ -751,6 +754,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 }
 
+/// An app users script that stopped at the newer-stamp guard (a newer worker manages the
+/// database's `chelabase` schema): an error saying so, naming both versions. Still an error,
+/// so the caller's failure path runs; any other error passes through unchanged.
+fn newer_data_api_refusal(e: anyhow::Error) -> anyhow::Error {
+    match newer_data_api_error(&format!("{e:#}")) {
+        Some(why) => anyhow::anyhow!(
+            "a newer worker manages this database's data API ({why}); retry once the deploy finishes"
+        ),
+        None => e,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use chelabase_identity::mock::FakeIdentity;
@@ -761,6 +776,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::app_users_sql::{
         USERS_ROWS_SQL, USERS_TEARDOWN_SQL, claim_helpers_sql, gone_call_sql, upsert_call_sql,
         users_bootstrap_sql,
@@ -1003,7 +1019,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn created() -> DateTime<Utc> {
+    fn created() -> Timestamp {
         "2026-10-03T10:00:00Z".parse().unwrap()
     }
 
@@ -1167,6 +1183,60 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert!(s.fake.calls().is_empty());
+    }
+
+    /// AC 1 and 2, the failure path: a script that refused a newer `chelabase` fails the
+    /// enable (the row ends `failed`, naming both versions), never reports success, and fails
+    /// the branch hook too.
+    #[tokio::test]
+    async fn a_newer_chelabase_fails_the_app_users_enable() {
+        use crate::data_api::NEWER_DATA_API_MARK;
+        let why = "the chelabase schema is version 99, newer than this worker's 1";
+        let refused = format!(
+            "psql in compute ep exited with 3: psql:<stdin>:6: ERROR:  {NEWER_DATA_API_MARK}: {why}\nCONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE"
+        );
+        let assert_refused = |error: &str| {
+            assert!(error.contains(why), "{error}");
+            assert!(
+                error.contains("a newer worker manages this database's data API")
+                    && error.contains("retry once the deploy finishes"),
+                "{error}"
+            );
+        };
+
+        // The users bootstrap.
+        let s = setup(AppUsersStatus::Enabling).await;
+        *s.w.computes.fail_sql_containing.lock().unwrap() = Some((BOOTSTRAP.into(), refused.clone()));
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!(auth.status, AppUsersStatus::Failed);
+        assert_refused(&auth.error.unwrap());
+        // The branch hook (create, reset, restore) fails the same way.
+        let mut s = setup(AppUsersStatus::Enabled).await;
+        s.w.identity = None;
+        *s.w.computes.fail_sql_containing.lock().unwrap() = Some((BOOTSTRAP.into(), refused.clone()));
+        let e = s
+            .w
+            .bootstrap_users_for(s.main.id, s.db, &ep(&s.main))
+            .await
+            .unwrap_err();
+        assert_refused(&format!("{e:#}"));
+
+        // The claim helpers in another served database.
+        let s = setup(AppUsersStatus::Enabling).await;
+        s.w.metadata
+            .state()
+            .db_rows
+            .get_mut(&s.main.id)
+            .unwrap()
+            .push(FakeDbRow::new("extra", DataApiState::On, "api"));
+        *s.w.computes.fail_sql_containing.lock().unwrap() = Some((HELPERS.into(), refused));
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!(auth.status, AppUsersStatus::Failed);
+        let error = auth.error.unwrap();
+        assert!(error.contains("database extra"), "{error}");
+        assert_refused(&error);
     }
 
     #[tokio::test]
@@ -2358,13 +2428,13 @@ pub(crate) mod tests {
 
     // --- The periodic pass ------------------------------------------------------------
 
-    fn age_auth(s: &Setup, project: ProjectId, minutes: i64) {
+    fn age_auth(s: &Setup, project: ProjectId, minutes: u64) {
         s.w.metadata
             .state()
             .project_auth
             .get_mut(&project)
             .unwrap()
-            .updated_at = Utc::now() - chrono::Duration::minutes(minutes);
+            .updated_at = Timestamp::now() - chelabase_time::minutes(minutes);
     }
 
     #[tokio::test]
@@ -2395,14 +2465,14 @@ pub(crate) mod tests {
             let mut state = s.w.metadata.state();
             let row = state.projects.get_mut(&p).unwrap();
             row.status = ProjectStatus::Deleting;
-            row.updated_at = Utc::now() - chrono::Duration::minutes(minutes);
+            row.updated_at = Timestamp::now() - chelabase_time::minutes(minutes);
         }
         // Sessions revoked 8 days ago are purged; one revoked an hour ago stays.
         let old = s.w.metadata.add_session(s.project, user, "zs-old");
         let recent = s.w.metadata.add_session(s.project, user, "zs-recent");
         for (id, ago) in [
-            (old, chrono::Duration::days(8)),
-            (recent, chrono::Duration::hours(1)),
+            (old, chelabase_time::days(8)),
+            (recent, chelabase_time::hours(1)),
         ] {
             s.w.metadata
                 .state()
@@ -2410,7 +2480,7 @@ pub(crate) mod tests {
                 .iter_mut()
                 .find(|x| x.id == id)
                 .unwrap()
-                .revoked_at = Some(Utc::now() - ago);
+                .revoked_at = Some(Timestamp::now() - ago);
         }
 
         s.w.app_users_reconcile_once().await;

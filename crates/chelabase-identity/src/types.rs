@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::Deserialize;
 use std::fmt;
 use uuid::Uuid;
@@ -27,8 +27,8 @@ pub struct User {
     pub name: String,
     pub email_verified: bool,
     pub banned: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A user as the single-user read shows them.
@@ -64,8 +64,8 @@ pub struct UserPage {
 pub struct SessionView {
     pub id: String,
     pub user_id: String,
-    pub expires_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

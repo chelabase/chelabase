@@ -39,7 +39,15 @@
 #      Docker socket holder, each caller's bearer, and no shared network for service containers
 #      (the runner gives each its own at run time, audit B3; the functions service binds none of
 #      them).
-# Every render takes every profile (sites, runner, services), so profiled services
+#   9. the MCP server and its sandbox runtime (mcp-core m8): profile `mcp` only (a render without
+#      it has neither); `mcp-runtime` alone with `mcp` on the internal `mcp-sandbox` network, with
+#      no secret, volume, port or setting; `mcp` mounts only the member public key and binds its
+#      public listener on the default network's alias, its internal one on `mcp-sandbox`'s; each
+#      has an exact set of compose keys (nothing like cap_add, pid or devices can be added).
+#  10. compute-egress (compute-network-reach m4): no secret, in either render. It has no `secrets`,
+#      no mount of the `secrets` volume or of the keys or state dir, and no Docker socket; the
+#      workbench gives it one read-only bind, its host-built binary, and nothing else.
+# Every render takes every profile (sites, runner, services, compute-egress, mcp), so profiled services
 # are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -58,10 +66,15 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile compute-egress --profile mcp >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
+# The workbench runs mcp from m12 (#356) on. Until its overlay defines the service, the base's mcp
+# can't render under it (it waits for init-secrets, which the overlay turns off), so the workbench
+# render takes --profile mcp, and check 9 covers it, once the overlay has `mcp`.
+wb_mcp=()
+if grep -qE '^  mcp:' "$dir/docker-compose.workbench.yml"; then wb_mcp=(--profile mcp); fi
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services --profile compute-egress "${wb_mcp[@]}" \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -202,6 +215,7 @@ realtime	realtime/ticket.key	ro
 realtime	realtime/internal.token	ro
 realtime	realtime-tls	ro
 realtime	auth/member-jwt.pub	ro
+mcp	auth/member-jwt.pub	ro
 EOF
 
 # 1. The table.
@@ -266,7 +280,9 @@ for render in base wb; do
   boundary identity/secret "identity" "$render" "$tmp/readers.$render"
   boundary identity/db.password "identity${boot}" "$render" "$tmp/readers.$render"
   boundary auth/member-jwt.key "auth" "$render" "$tmp/readers.$render"
-  boundary auth/member-jwt.pub "auth gateway orchestrator realtime" "$render" "$tmp/readers.$render"
+  mcp=" mcp"
+  [[ "$render" == wb && ${#wb_mcp[@]} -eq 0 ]] && mcp=""
+  boundary auth/member-jwt.pub "auth gateway${mcp} orchestrator realtime" "$render" "$tmp/readers.$render"
   boundary gateway/internal-signing.pem "gateway" "$render" "$tmp/readers.$render"
   boundary tokens/auth-identity.token "auth identity" "$render" "$tmp/readers.$render"
   boundary tokens/orchestrator-identity.token "identity orchestrator" "$render" "$tmp/readers.$render"
@@ -477,8 +493,8 @@ for render in base wb; do
       err "$render: $svc must not be on the runtime's network"
   done
   got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
-  # m13b: `compute` (no alias: it dials computes and listens on nothing there).
-  [[ "$got" == '{"compute":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
+  # m13b: `compute-internal` (no alias: it dials computes and listens on nothing there).
+  [[ "$got" == '{"compute-internal":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
 # #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
@@ -551,6 +567,109 @@ sr="$(jq -c '.services["service-runner"] | {read_only, image: (.image | sub(":.*
   err "service-runner runs its release image read-only: got $sr"
 [[ "$(jq -r '.services["service-runner"].environment.CHELABASE_SERVICE_RUNNER_URL // ""' "$tmp/base.json")" == http://service-runner-control:8094 ]] ||
   err "CHELABASE_SERVICE_RUNNER_URL is the runner's control alias"
+
+# 9. The MCP server and its sandbox runtime (mcp-core m8), in the base render and, once its overlay
+# has them (see the renders above), the workbench's; each takes --profile mcp, and a missing
+# service fails here.
+renders=(base)
+[[ ${#wb_mcp[@]} -eq 0 ]] || renders+=(wb)
+for render in "${renders[@]}"; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  for svc in mcp mcp-runtime; do
+    jq -e --arg s "$svc" '.services[$s]' "$f" >/dev/null || { err "$render: no $svc service (is --profile mcp rendered?)"; continue; }
+    [[ "$(jq -c --arg s "$svc" '.services[$s].profiles // []' "$f")" == '["mcp"]' ]] ||
+      err "$render: $svc runs in profile mcp only (off by default)"
+    ! jq -e --arg s "$svc" 'any(.services[$s].volumes[]?; (.source // "") | contains("docker.sock"))' "$f" >/dev/null ||
+      err "$render: $svc mounts the Docker socket"
+  done
+  # The sandbox network: internal, and exactly the two services on it; the runtime on nothing else.
+  got="$(members mcp-sandbox "$f")"
+  [[ "$got" == "mcp mcp-runtime " ]] || err "$render: the mcp-sandbox network holds [$got], expected [mcp mcp-runtime ]"
+  [[ "$(jq -r '.networks["mcp-sandbox"].internal // false' "$f")" == true ]] || err "$render: the mcp-sandbox network must be internal"
+  got="$(jq -c '.services["mcp-runtime"].networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
+  [[ "$got" == '{"mcp-sandbox":[]}' ]] || err "$render: mcp-runtime is on $got, expected mcp-sandbox only, no alias"
+  # The runtime: no volume, port, secret, setting or env file; the hardening of the functions
+  # runtime; swap equal to memory, so the container limit bounds ArrayBuffer memory (m3 audit).
+  rt="$(jq -c '.services["mcp-runtime"] // {} | {volumes: (.volumes // []), ports: (.ports // []), expose: (.expose // []),
+    secrets: (.secrets // []), environment: (.environment // {}), env_file: (.env_file // []), volumes_from: (.volumes_from // []),
+    user, read_only, cap_drop, security_opt, restart, privileged: (.privileged // false), network_mode: (.network_mode // null),
+    pids: (.pids_limit == 256), mem: (.mem_limit != null and .mem_limit == .memswap_limit)}' "$f")"
+  [[ "$rt" == '{"volumes":[],"ports":[],"expose":[],"secrets":[],"environment":{},"env_file":[],"volumes_from":[],"user":"65532:65532","read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"restart":"always","privileged":false,"network_mode":null,"pids":true,"mem":true}' ]] ||
+    err "$render: mcp-runtime holds nothing and is hardened like the functions runtime: got $rt"
+  # Its host service is mcp's internal listener, on the sandbox network's alias.
+  rt_cmd="$(jq -r '.services["mcp-runtime"].command // [] | join(" ")' "$f")"
+  [[ "$rt_cmd" == "/usr/local/bin/workerd serve --experimental --external-addr host=mcp-internal:8096 /etc/mcp-runtime/config.capnp" ]] ||
+    err "$render: the runtime's host must be mcp-internal:8096; command: $rt_cmd"
+  # mcp: on the default network (the gateway's upstream, and its way to the API host) and the
+  # sandbox network, each listener on its own network's alias (plus loopback for the healthcheck),
+  # never 0.0.0.0; no published port.
+  got="$(jq -c '.services.mcp.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
+  [[ "$got" == '{"default":["mcp-public"],"mcp-sandbox":["mcp-internal"]}' ]] || err "$render: mcp's networks and aliases: got $got"
+  menv="$(jq -c '.services.mcp.environment // {} | if type == "array" then map(split("=") | {(.[0]): (.[1:] | join("="))}) | add else . end
+    | {CHELABASE_MCP_LISTEN, CHELABASE_MCP_INTERNAL_LISTEN, CHELABASE_MCP_RUNTIME_URL, CHELABASE_MCP_API_URL}' "$f")"
+  # execute's API calls go to the gateway on the default network, at the port it listens on there
+  # (.env.example's CHELABASE_PUBLIC_PORT in the base render, the stack's gateway port in the
+  # workbench's); with the Host header at the API host.
+  gw_port=8000
+  [[ "$render" == wb ]] && gw_port=8137
+  [[ "$menv" == '{"CHELABASE_MCP_LISTEN":"mcp-public:8095,127.0.0.1:8095","CHELABASE_MCP_INTERNAL_LISTEN":"mcp-internal:8096","CHELABASE_MCP_RUNTIME_URL":"http://mcp-runtime:8080","CHELABASE_MCP_API_URL":"http://gateway:'"$gw_port"'"}' ]] ||
+    err "$render: mcp binds its aliases only, one listener per network, reaches the runtime by name and the API through the gateway: got $menv"
+  [[ "$(jq -c '[.services.mcp.ports // [], .services.mcp.expose // []]' "$f")" == '[[],[]]' ]] || err "$render: mcp publishes or exposes a port"
+  # Nothing else joins the sandbox network or uses the runtime's or mcp's internal name.
+  got="$(jq -r '.services | to_entries[] | select(.key != "mcp" and .key != "mcp-runtime")
+    | select(.value | tojson | test("mcp-internal|mcp-runtime:")) | .key' "$f" | sort | tr '\n' ' ')"
+  [[ -z "$got" ]] || err "$render: [$got] names the runtime or mcp's internal listener"
+done
+# Exact key sets in the base file (audit S2, N1): a key outside these (cap_add, privileged, pid,
+# ipc, devices, extra_hosts, dns, tmpfs, env_file, ports, …) fails here, whatever its value; the
+# checks above pin the values of the keys that are allowed. The runtime keeps its image's
+# entrypoint (the watchdog).
+got="$(jq -c '.services["mcp-runtime"] // {} | keys' "$tmp/base.json")"
+[[ "$got" == '["cap_drop","command","entrypoint","healthcheck","image","mem_limit","memswap_limit","networks","pids_limit","profiles","read_only","restart","security_opt","user"]' ]] ||
+  err "mcp-runtime has other compose keys than the allowed set: got $got"
+[[ "$(jq -c '.services["mcp-runtime"].entrypoint' "$tmp/base.json")" == null ]] || err "mcp-runtime keeps its image's entrypoint (the watchdog)"
+got="$(jq -c '.services.mcp // {} | keys' "$tmp/base.json")"
+[[ "$got" == '["cap_drop","command","depends_on","entrypoint","environment","healthcheck","image","networks","profiles","read_only","restart","security_opt","volumes"]' ]] ||
+  err "mcp has other compose keys than the allowed set: got $got"
+# mcp's mounts in the base file: exactly the member public key, read-only, from the volume; no
+# other volume, bind or secret. The runtime is in check 1's table with no line (it mounts nothing).
+got="$(jq -c '.services.mcp // {} | [(.volumes // [])[] | {type, source, target, read_only, subpath: .volume.subpath}] + [(.secrets // [])[]]' "$tmp/base.json")"
+[[ "$got" == '[{"type":"volume","source":"secrets","target":"/run/chelabase/secrets/auth/member-jwt.pub","read_only":true,"subpath":"auth/member-jwt.pub"}]' ]] ||
+  err "mcp mounts exactly auth/member-jwt.pub, read-only: got $got"
+[[ "$(jq -r '.services.mcp.environment.CHELABASE_MEMBER_JWT_PUBLIC_KEY // ""' "$tmp/base.json")" == /run/chelabase/secrets/auth/member-jwt.pub ]] ||
+  err "mcp reads the member public key at the path it mounts"
+mi="$(jq -c '.services.mcp // {} | {read_only, cap_drop, security_opt, user, entrypoint, command, image: ((.image // "") | sub(":.*"; ""))}' "$tmp/base.json")"
+[[ "$mi" == '{"read_only":true,"cap_drop":["ALL"],"security_opt":["no-new-privileges:true"],"user":null,"entrypoint":null,"command":null,"image":"ghcr.io/chelabase/mcp"}' ]] ||
+  err "mcp runs its release image's binary as its user, read-only, with no capability: got $mi"
+img="$(jq -r '.services["mcp-runtime"].image // ""' "$tmp/base.json")"
+[[ "$img" == ghcr.io/chelabase/mcp-runtime:* ]] || err "mcp-runtime runs the ghcr.io/chelabase/mcp-runtime release image: got $img"
+# The gateway's upstream is off (blank: 404 on /mcp) until .env sets it with the profile.
+[[ "$(jq -r '.services.gateway.environment.CHELABASE_MCP_URL // "unset"' "$tmp/base.json")" == "" ]] ||
+  err "the gateway's CHELABASE_MCP_URL defaults to blank"
+# Without the profile neither service is there (nothing new starts or is pulled).
+compose chelabase-boundary "$root/infra/compose/.env.example" -f "$root/infra/compose/docker-compose.yml" --profile services >"$tmp/noprofile.json" ||
+  err "rendering the base file without the mcp profile failed"
+got="$(jq -r '.services | keys[] | select(. == "mcp" or . == "mcp-runtime")' "$tmp/noprofile.json" | tr '\n' ' ')"
+[[ -z "$got" ]] || err "without --profile mcp the render still has [$got]"
+
+# 10. compute-egress sees no secret: no compose secret, no volume that reaches the secrets volume,
+# the keys or the state dir or the Docker socket, and no setting that names a secret file.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  [[ "$(jq -r '.services | has("compute-egress")' "$f")" == true ]] || err "$render: no compute-egress service"
+  got="$(jq -r --arg k "$keys" --arg st "$state" '.services["compute-egress"] | [
+      ((.secrets // [])[] | "compose secret \(.source)"),
+      ((.volumes // [])[] | select(.type != "bind" or (.read_only | not) or ((.source // "") | test("/target/debug/compute-egress$") | not))
+        | "volume \(.type) \(.source // "") -> \(.target)"),
+      ((.volumes // [])[] | select((.source // "") | (startswith($k + "/") or startswith($st + "/") or contains("docker.sock")))
+        | "mount \(.source)"),
+      ((.volumes_from // [])[] | "volumes_from \(.)"),
+      ((.environment // {}) | to_entries[] | select(.key | test("(_FILE|_KEY|_PASSWORD|_TOKEN|_SECRET|_URL|_URI)$")) | "setting \(.key)")
+    ] | join(", ")' "$f")"
+  [[ -z "$got" ]] || err "$render: compute-egress reaches a secret or something it must not: $got"
+done
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

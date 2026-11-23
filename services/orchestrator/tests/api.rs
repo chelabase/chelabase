@@ -1076,7 +1076,7 @@ async fn list_branches_carries_where_each_history_begins() {
     let t = branching().await;
     let dev = t.ready("dev");
     let backup = t.backup(dev);
-    let start: chrono::DateTime<chrono::Utc> = "2026-09-20T09:00:00Z".parse().unwrap();
+    let start: Timestamp = "2026-09-20T09:00:00Z".parse().unwrap();
     for id in [dev, backup] {
         t.metadata.branches.lock().unwrap().get_mut(&id).unwrap().history_start = Some(start);
     }
@@ -1150,7 +1150,7 @@ async fn create_branch_takes_a_parent_and_a_point() {
         .await;
     assert_eq!(resp.status(), 202);
     let body: Value = resp.json().await.unwrap();
-    let at: chrono::DateTime<chrono::Utc> = "2026-09-30T12:00:00Z".parse().unwrap();
+    let at: Timestamp = "2026-09-30T12:00:00Z".parse().unwrap();
     assert_eq!(t.metadata.branch(BranchId(body["id"].as_str().unwrap().parse().unwrap())).branched_at_time, Some(at));
     assert!(matches!(t.published().last(), Some(BranchJob::Create { at: Some(PointInTime::Timestamp(x)), .. }) if *x == at));
 }
@@ -1516,7 +1516,7 @@ async fn restore_works_on_main() {
 async fn restore_before_the_branch_history_begins_is_refused() {
     let t = branching().await;
     let dev = t.ready("dev");
-    let start: chrono::DateTime<chrono::Utc> = "2026-09-30T12:00:00Z".parse().unwrap();
+    let start: Timestamp = "2026-09-30T12:00:00Z".parse().unwrap();
     {
         let mut branches = t.metadata.branches.lock().unwrap();
         let b = branches.get_mut(&dev).unwrap();
@@ -1542,6 +1542,163 @@ async fn restore_before_the_branch_history_begins_is_refused() {
     assert!(t.published().is_empty());
     let ok = t.send(Method::POST, &path, Some(json!({ "at": { "lsn": "0/2000000" } }))).await;
     assert_eq!(ok.status(), 202);
+}
+
+// m8: a point in time is RFC 3339 with an offset, read as the same instant in any offset; a
+// bare time and a word are refused with the same 422, and the window the error reports keeps
+// the 0, 3, 6 or 9 fraction digits of the stored time.
+#[tokio::test]
+async fn point_in_time_accepts_offsets_and_refuses_bare_times() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let path = format!("{}/restore", t.branch(dev));
+    let noon: Timestamp = "2026-09-30T12:00:00Z".parse().unwrap();
+    for ts in ["2026-09-30T12:00:00Z", "2026-09-30T14:00:00+02:00"] {
+        let resp = t.send(Method::POST, &t.branches(), Some(json!({ "name": format!("b-{}", ts.len()), "at": { "timestamp": ts } }))).await;
+        assert_eq!(resp.status(), 202, "{ts}");
+        assert!(matches!(t.published().last(), Some(BranchJob::Create { at: Some(PointInTime::Timestamp(x)), .. }) if *x == noon), "{ts}");
+    }
+    for ts in ["2026-09-30 12:00:00", "yesterday"] {
+        let err = error_of(t.send(Method::POST, &path, Some(json!({ "at": { "timestamp": ts } }))).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{ts}");
+        assert_eq!(
+            message_of(&err),
+            format!("invalid timestamp {ts:?}: use RFC 3339, like 2026-09-30T12:00:00Z"),
+            "{ts}"
+        );
+    }
+    for (begins, text) in [
+        ("2026-09-30T12:00:00Z", "2026-09-30T12:00:00Z"),
+        ("2026-09-30T12:00:00.5Z", "2026-09-30T12:00:00.500Z"),
+        ("2026-09-30T12:00:00.000123Z", "2026-09-30T12:00:00.000123Z"),
+        ("2026-09-30T12:00:00.000000123Z", "2026-09-30T12:00:00.000000123Z"),
+    ] {
+        let start: Timestamp = begins.parse().unwrap();
+        t.metadata.branches.lock().unwrap().get_mut(&dev).unwrap().history_start = Some(start);
+        let err = error_of(t.send(Method::POST, &path, Some(json!({ "at": { "timestamp": "2026-09-30T11:00:00Z" } }))).await, 422).await;
+        assert_eq!(
+            message_of(&err),
+            format!("the time 2026-09-30T11:00:00Z is before dev's history begins ({text})")
+        );
+    }
+}
+
+// m8: a role's `valid_until` beyond what the time type holds is a 422 naming the field, on
+// create and update, and nothing reaches the worker.
+#[tokio::test]
+async fn a_role_valid_until_beyond_the_supported_range_is_refused() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    for beyond in ["9999-12-31T00:00:00Z", "9999-12-30T22:00:01Z", "9999-12-30T23:00:00+00:00"] {
+        let err = error_of(
+            t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "late", "valid_until": beyond }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "{beyond}");
+        assert_eq!(err["error"]["field"], "valid_until", "{beyond}: {err}");
+        let err = error_of(
+            t.send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": beyond }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(err["error"]["field"], "valid_until", "{beyond}: {err}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    // The last second the type holds is still accepted.
+    let resp = t
+        .send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": "9999-12-30T22:00:00Z" })))
+        .await;
+    assert_eq!(resp.status(), 202);
+}
+
+// #397 / drop-chrono m13 F1, F2: a role's `valid_until` the API accepts is one Postgres stores
+// and the worker reads back as the same instant. Before year 1 Postgres can't take it as the
+// worker writes it (an RFC 3339 literal), so it's the field's 422 and nothing is queued; the
+// range's last second, to the nanosecond, is accepted (it's stored as the last microsecond).
+#[tokio::test]
+async fn a_role_valid_until_postgres_cant_round_trip_is_refused() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    for before in [
+        "-5000-01-01T00:00:00Z",
+        "-4713-11-24T00:00:00Z",
+        "0000-01-01T00:00:00Z",
+        "0000-12-31T23:59:59.999999999Z",
+        "0001-01-01T00:00:00+00:01",
+    ] {
+        let err = error_of(
+            t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "early", "valid_until": before }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "{before}");
+        assert_eq!(err["error"]["field"], "valid_until", "{before}: {err}");
+        assert_eq!(
+            message_of(&err),
+            "valid_until is between 0001-01-01T00:00:00Z and 9999-12-30T22:00:00.999999999Z",
+            "{before}"
+        );
+        let err = error_of(
+            t.send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": before }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(err["error"]["field"], "valid_until", "{before}: {err}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    for edge in ["0001-01-01T00:00:00Z", "9999-12-30T22:00:00.5Z", "9999-12-30T22:00:00.999999999Z"] {
+        let resp = t
+            .send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": edge })))
+            .await;
+        assert_eq!(resp.status(), 202, "{edge}");
+    }
+}
+
+// m13: a timestamp in a request body past the time type's range, malformed, or without an
+// offset is a 4xx `invalid_request` with the usual error body on every management endpoint
+// that takes one (a role's `valid_until`, a branch's or a restore's point in time), never a
+// 500, and nothing is queued.
+#[tokio::test]
+async fn an_out_of_range_timestamp_is_a_400_not_a_500() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let restore = format!("{}/restore", t.branch(dev));
+    for ts in [
+        "9999-12-31T23:59:59.999999999Z",
+        "9999-12-30T22:00:01Z",
+        "10000-01-01T00:00:00Z",
+        "+10000-01-01T00:00:00Z",
+        "-10000-01-01T00:00:00Z",
+        "2026-09-30T25:00:00Z",
+        "2026-02-30T12:00:00Z",
+        "2026-09-30T12:00:00",
+        "2026-09-30",
+    ] {
+        let requests = [
+            (Method::POST, t.roles(dev), json!({ "name": "late", "valid_until": ts })),
+            (Method::PATCH, format!("{}/app", t.roles(dev)), json!({ "valid_until": ts })),
+            (Method::POST, t.branches(), json!({ "name": "old", "at": { "timestamp": ts } })),
+            (Method::POST, restore.clone(), json!({ "at": { "timestamp": ts } })),
+        ];
+        for (method, path, body) in requests {
+            let resp = t.send(method.clone(), &path, Some(body)).await;
+            let status = resp.status().as_u16();
+            assert!((400..500).contains(&status), "{method} {path} with {ts}: {status}");
+            let err: Value = resp.json().await.unwrap();
+            assert_eq!(code_of(&err), "invalid_request", "{method} {path} with {ts}: {err}");
+            assert!(!message_of(&err).is_empty(), "{method} {path} with {ts}: {err}");
+        }
+    }
+    assert!(t.published().is_empty());
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
 }
 
 #[tokio::test]
@@ -2832,7 +2989,7 @@ fn role_row(name: &str, origin: RoleOrigin, level: RoleLevel, password: Password
         level,
         login: true,
         password,
-        created_at: chrono::Utc::now(),
+        created_at: Timestamp::now(),
         pending: false,
         attributes: RoleAttributes::default(),
     }
@@ -3036,7 +3193,7 @@ async fn create_role_accepts_new_fields() {
     let attributes = RoleAttributes {
         inherit: false,
         connection_limit: 3,
-        valid_until: chrono::DateTime::from_timestamp(1_900_000_000, 0),
+        valid_until: Timestamp::from_unix_seconds(1_900_000_000),
         bypass_rls: true,
         member_of: vec!["readers".into()],
         member_no_set: vec![],
@@ -5636,7 +5793,7 @@ async fn a_webhook_test_asks_the_worker_and_answers_the_attempt() {
             outcome: "http_error".into(),
             status: Some(500),
             duration_ms: 31,
-            attempted_at: chrono::Utc::now(),
+            attempted_at: Timestamp::now(),
         },
     ));
     let attempts: Value = t.send(Method::GET, &format!("{}/{id}/attempts", t.webhooks()), None).await.json().await.unwrap();
@@ -5790,7 +5947,7 @@ async fn saved_query_name_taken_is_409() {
 #[tokio::test]
 async fn saved_query_cap_is_409() {
     let t = branching().await;
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     for i in 0..orchestrator::sql_editor::SAVED_QUERY_CAP {
         let q = SavedQuery {
             id: uuid::Uuid::new_v4(),
@@ -6037,6 +6194,43 @@ async fn risky_statement_needs_confirm() {
     let resp = t.run_sql(main, with(run_body("TRUNCATE notes"), "confirm", json!(false))).await;
     assert_eq!(code_of(&error_of(resp, 409).await), "sql_confirm_required");
     assert_eq!(t.compute_lookups(), 0);
+}
+
+// mcp-core m5 (#349): a read-only script is parsed before anything connects; a refused one
+// names its first offender and runs nothing. `confirm` and a timeout past 300 s are refused.
+#[tokio::test]
+async fn read_only_refusals_open_nothing() {
+    let t = sql_app().await;
+    let main = t.main();
+    let read_only = |sql: &str| with(run_body(sql), "read_only", json!(true));
+    for (sql, statement, kind) in [
+        ("SELECT 1; COMMIT; SELECT 2", 1, "TransactionStmt"),
+        ("SET default_transaction_read_only = off", 0, "VariableSetStmt"),
+        ("SELECT 1; SELECT 2; DO $$ BEGIN END $$", 2, "DoStmt"),
+        ("INSERT INTO notes (body) VALUES ('x')", 0, "InsertStmt"),
+        ("SELEC 1", 0, "unparsed"),
+    ] {
+        let err = error_of(t.run_sql(main, read_only(sql)).await, 422).await;
+        assert_eq!(code_of(&err), "read_only_script_refused", "{sql}: {err}");
+        assert_eq!(err["error"]["statement"], statement, "{sql}: {err}");
+        assert_eq!(err["error"]["kind"], kind, "{sql}: {err}");
+    }
+    let many = vec!["SELECT 1"; 101].join(";");
+    let err = error_of(t.run_sql(main, read_only(&many)).await, 422).await;
+    assert_eq!(err["error"]["kind"], "too_many_statements", "{err}");
+    for body in [
+        with(read_only("SELECT 1"), "confirm", json!(true)),
+        with(read_only("SELECT 1"), "timeout_ms", json!(300_001)),
+    ] {
+        let err = error_of(t.run_sql(main, body.clone()).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}: {err}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    // An allowed script gets as far as the compute (none runs here); no guard holds it back,
+    // even on a protected branch.
+    t.set_protected(main);
+    let resp = t.run_sql(main, read_only("EXPLAIN ANALYZE SELECT 1; SHOW search_path")).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
 }
 
 #[tokio::test]
@@ -6571,10 +6765,41 @@ async fn sql_confirm_required_is_audited_without_sql() {
         format!("sql_sha256={sha}"),
         "protected=false".to_string(),
         "confirmed=false".to_string(),
+        "read_only=false".to_string(),
     ] {
         assert!(line.contains(&field), "{field} missing from {line}");
     }
     assert!(!text.contains("secret_table_4111"), "SQL reached the log:\n{text}");
+}
+
+#[tokio::test]
+async fn read_only_script_refusal_is_audited_without_sql() {
+    use sha2::Digest;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let t = sql_app().await;
+    let main = t.main();
+    let sql = "SELECT 1; DELETE FROM secret_table_4112";
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, with(json!({ "run_id": id, "sql": sql }), "read_only", json!(true))).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "read_only_script_refused");
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 1, "{text}");
+    let sha = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+    for field in [
+        "user=user-1".to_string(),
+        format!("branch_id={}", main.as_uuid()),
+        "role=owner".to_string(),
+        format!("run_id={id}"),
+        "outcome=read_only_script_refused".to_string(),
+        "refused=DeleteStmt".to_string(),
+        "read_only=true".to_string(),
+        format!("sql_sha256={sha}"),
+    ] {
+        assert!(audit[0].contains(&field), "{field} missing from {}", audit[0]);
+    }
+    assert!(!text.contains("secret_table_4112"), "SQL reached the log:\n{text}");
 }
 
 #[tokio::test]
@@ -9357,7 +9582,7 @@ async fn saved_query_edit_by_author_or_admin() {
     assert_eq!(t.send_as("dev-a", Method::DELETE, &again, None).await.status(), 204);
 
     // Saved before members: no author.
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     let old = SavedQuery {
         id: uuid::Uuid::new_v4(),
         name: "old".into(),
@@ -9529,7 +9754,7 @@ async fn create_database_needs_project_admin() {
 #[tokio::test]
 async fn app_user_routes_apply_the_auth_database_override() {
     let w = member_world(Mode::SelfHosted).await;
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     let enabled = |database_id: DatabaseId| ProjectAuth {
         project_id: w.project,
         status: AppUsersStatus::Enabled,
@@ -9987,7 +10212,7 @@ async fn drafting_user_steps_stays_developer() {
 #[tokio::test]
 async fn delete_database_refuses_the_app_auth_database() {
     let w = member_world(Mode::SelfHosted).await;
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     w.metadata.project_auths.lock().unwrap().insert(
         w.project,
         ProjectAuth {
@@ -10130,8 +10355,8 @@ async fn invite_creates_identity_user_and_invited_member() {
     assert_eq!((member["email"].as_str(), member["status"].as_str()), (Some("new@example.com"), Some("invited")));
     assert_eq!(member["tenant_admin"], false);
     let invite_id = member["invite"]["id"].as_str().unwrap().to_string();
-    let expires: chrono::DateTime<chrono::Utc> = member["invite"]["expires_at"].as_str().unwrap().parse().unwrap();
-    let hours = (expires - chrono::Utc::now()).num_minutes();
+    let expires: Timestamp = member["invite"]["expires_at"].as_str().unwrap().parse().unwrap();
+    let hours = expires.since(Timestamp::now()).as_mins();
     assert!((71 * 60..=72 * 60).contains(&hours), "the invite lives 72 h: {hours} min");
 
     // The identity service: a passwordless user in the members pool, and only the invite code,
@@ -11160,7 +11385,7 @@ async fn list_members_reports_has_access_and_created_at() {
     .await;
     let bare_invite = body_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(json!({ "email": "none@x.com", "grants": [] }))).await).await;
     assert_eq!(invited["member"]["has_access"], true);
-    assert!(invited["member"]["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().is_ok());
+    assert!(invited["member"]["created_at"].as_str().unwrap().parse::<Timestamp>().is_ok());
     assert_eq!(bare_invite["member"]["has_access"], false);
 
     let list = body_of(t.send(DEFAULT_SUB, Method::GET, "/v1/members", None).await).await;
@@ -11174,11 +11399,11 @@ async fn list_members_reports_has_access_and_created_at() {
     ] {
         let m = find(id.to_string());
         assert_eq!(m["has_access"], want, "{m}");
-        assert!(m["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().is_ok(), "{m}");
+        assert!(m["created_at"].as_str().unwrap().parse::<Timestamp>().is_ok(), "{m}");
     }
     // `created_at` is the row's own: the same in the write's answer and the list, and later
     // invites are later.
-    let at = |m: &Value| m["created_at"].as_str().unwrap().parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+    let at = |m: &Value| m["created_at"].as_str().unwrap().parse::<Timestamp>().unwrap();
     let listed_invited = find(invited["member"]["id"].as_str().unwrap().to_string());
     let listed_bare_invite = find(bare_invite["member"]["id"].as_str().unwrap().to_string());
     assert_eq!(at(&listed_invited), at(&invited["member"]));
@@ -13818,7 +14043,7 @@ fn seed_event(
         database_id: None,
         before: None,
         after: None,
-        at: chrono::Utc::now(),
+        at: Timestamp::now(),
         actor_email: None,
         target_email: None,
         project_name: None,
@@ -14029,7 +14254,7 @@ fn add_database(w: &MemberWorld, project: ProjectId, name: &str, endpoint: &str)
 fn revoked(reason: RevokeReason) -> impl FnOnce(&mut FakeLogin) {
     move |l| {
         l.login.status = LoginStatus::Revoked;
-        l.login.revoked_at = Some(chrono::Utc::now());
+        l.login.revoked_at = Some(Timestamp::now());
         l.login.revoked_reason = Some(reason);
         l.verifier = None;
     }
@@ -14099,12 +14324,12 @@ impl Pl {
 
 /// `valid_until` of a login view is about 90 days from now (D4).
 fn assert_ninety_days(login: &Value) {
-    let until: chrono::DateTime<chrono::Utc> = login["valid_until"]
+    let until: Timestamp = login["valid_until"]
         .as_str()
         .unwrap_or_else(|| panic!("no valid_until: {login}"))
         .parse()
         .unwrap();
-    let hours = (until - chrono::Utc::now()).num_hours();
+    let hours = until.since(Timestamp::now()).as_hours();
     assert!((89 * 24..=90 * 24).contains(&hours), "valid_until {until} is not 90 days out");
 }
 
@@ -14237,7 +14462,7 @@ async fn create_replacing_an_expired_login_clears_the_cache_for_its_old_rows() {
     let p = pl_world().await;
     p.seed(&p.alice, "alice_old");
     p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), |l| {
-        l.login.valid_until = chrono::Utc::now() - chrono::Duration::minutes(1);
+        l.login.valid_until = Timestamp::now() - chelabase_time::minutes(1);
         l.login.status = LoginStatus::Expired;
     });
     assert_eq!(p.put_login(&p.alice.1, "alice_new").await.status(), 201);
@@ -14345,7 +14570,7 @@ async fn reset_renews_valid_until_and_clears_the_cache() {
     let p = pl_world().await;
     p.seed(&p.alice, "alice_login");
     p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), |l| {
-        l.login.valid_until = chrono::Utc::now() + chrono::Duration::days(3)
+        l.login.valid_until = Timestamp::now() + chelabase_time::days(3)
     });
     let before = p.t.w.metadata.personal_login(p.alice.0, p.db()).unwrap().verifier.unwrap();
     let resp = p.reset_login(&p.alice.1).await;
@@ -15288,7 +15513,7 @@ fn membership_change_setup(t: &Branching) -> BranchId {
     let (revoked, _) = t.seed_secret_key(dev, "old", "gone");
     for (key, _) in t.metadata.keys.lock().unwrap().iter_mut() {
         if key.id == revoked {
-            key.revoked_at = Some(chrono::Utc::now());
+            key.revoked_at = Some(Timestamp::now());
         }
     }
     t.seed_secret_key(t.main(), "other", "elsewhere");
@@ -16020,7 +16245,7 @@ async fn member_token_removed_member_403() {
 async fn member_token_wrong_tenant_403_no_jit() {
     let w = member_world(Mode::SelfHosted).await;
     w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
-    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
+    w.metadata.set_admin_claim(w.tenant, Some(Timestamp::now() - chelabase_time::minutes(5)));
     // A member of another tenant names this one.
     let other = TenantId::new();
     w.metadata.bind_org("org-2", other);
@@ -17131,6 +17356,29 @@ async fn refused_invites_of_a_removed_email_spend_no_invite_budget() {
     assert_eq!(&calls[before..], &[] as &[String], "no identity call");
     assert_nothing_sent(&t);
     created(t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("gone@x.com", "email"))).await).await;
+}
+
+// #315: the actor authenticated as a tenant admin and is demoted before the invite's write: the
+// write re-reads the actor and answers as for a non-admin, the member stays removed.
+#[tokio::test]
+async fn readmission_by_an_admin_demoted_before_the_write_is_refused() {
+    for path in ["project", "tenant"] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "back@x.com");
+        t.w.metadata.set_member(t.w.tenant, &sub, |m| m.email = Some("back@x.com".into()));
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204);
+        let tenant = t.w.tenant;
+        t.w.metadata.race_invite_write_once(move |md| md.set_member(tenant, DEFAULT_SUB, |m| m.tenant_admin = false));
+        let resp = if path == "project" {
+            t.send(DEFAULT_SUB, Method::POST, &project_invite_path(&t), Some(project_invite_body("back@x.com", "email"))).await
+        } else {
+            t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "back@x.com", "viewer", &[]))).await
+        };
+        assert_tenant_admin_needed(&error_of(resp, 403).await);
+        let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+        assert_eq!((stored.id, stored.status, stored.offboarded), (member, MemberStatus::Removed, true), "{path}");
+        assert!(t.w.metadata.invites.lock().unwrap().is_empty(), "{path}: no invite");
+    }
 }
 
 // A tenant admin's removal commits between the invite's reads and its write: the write's own

@@ -505,7 +505,7 @@ pub trait MetadataPort:
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chelabase_time::Timestamp>,
     ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
 
     /// The `project_auth` row whose auth database is `db`, if any.
@@ -1144,7 +1144,7 @@ impl MetadataPort for MetadataClient {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chelabase_time::Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
     }

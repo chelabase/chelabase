@@ -20,7 +20,7 @@ Projects run their own migrations and setup scripts through Chelabase's proxy. `
 | `login` | `true` | `false` makes a `NOLOGIN` role, a group, with no password. |
 | `inherit` | `true` | `INHERIT` or `NOINHERIT`. |
 | `connection_limit` | `-1` | `-1` is no limit; lower values are refused with `role_attribute_not_allowed`. |
-| `valid_until` | never | When the password stops working (RFC 3339). |
+| `valid_until` | never | When the password stops working (RFC 3339, from `0001-01-01T00:00:00Z` to `9999-12-30T22:00:00.999999999Z`; outside that it's a 422 naming the field). |
 | `bypass_rls` | `false` | `BYPASSRLS`: the role ignores row-level security. |
 | `member_of` | none | Roles it becomes a member of. |
 

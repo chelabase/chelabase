@@ -17,7 +17,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chelabase_time::{Timestamp, TimestampExt, days};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,11 +27,11 @@ use std::time::Duration;
 pub const TOKEN: &str = "test-identity-token";
 
 /// Session lifetime, as the service sets it per pool: 30 days for members, 90 for app users.
-fn session_ttl(pool: &str) -> ChronoDuration {
+fn session_ttl(pool: &str) -> Duration {
     if pool == "members" {
-        ChronoDuration::days(30)
+        days(30)
     } else {
-        ChronoDuration::days(90)
+        days(90)
     }
 }
 const MIN_PASSWORD: usize = 8;
@@ -46,8 +46,8 @@ pub(crate) struct FUser {
     pub verified: bool,
     pub banned: bool,
     pub ban_reason: Option<String>,
-    pub created: DateTime<Utc>,
-    pub updated: DateTime<Utc>,
+    pub created: Timestamp,
+    pub updated: Timestamp,
 }
 
 #[derive(Clone, Debug)]
@@ -55,8 +55,8 @@ pub(crate) struct FSession {
     pub id: String,
     pub token: String,
     pub user_id: String,
-    pub created: DateTime<Utc>,
-    pub expires: DateTime<Utc>,
+    pub created: Timestamp,
+    pub expires: Timestamp,
 }
 
 #[derive(Default)]
@@ -78,6 +78,8 @@ pub struct SentCode {
     pub code: String,
     /// The `link` the mail carried, if any.
     pub link: Option<String>,
+    /// The `project_name` the mail named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 /// What a test may read of a fake user.
@@ -105,6 +107,8 @@ pub struct ChangeNotice {
     pub user_id: String,
     /// The previous address, which the notice went to.
     pub email: String,
+    /// The `project_name` the notice named; `None` is the service's default (`Chelabase`).
+    pub project: Option<String>,
 }
 
 struct Fault {
@@ -120,7 +124,7 @@ pub(crate) struct Inner {
     pub pools: HashMap<String, PoolState>,
     pub calls: Vec<String>,
     pub next: u64,
-    pub skew: ChronoDuration,
+    pub skew: Duration,
     pub down: bool,
     pub email_configured: bool,
     pub sent: Vec<SentCode>,
@@ -130,8 +134,8 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    pub fn now(&self) -> DateTime<Utc> {
-        Utc::now() + self.skew
+    pub fn now(&self) -> Timestamp {
+        Timestamp::now().checked_add(self.skew).expect("the skewed clock stays in range")
     }
     pub fn id(&mut self, prefix: &str) -> String {
         self.next += 1;
@@ -164,8 +168,8 @@ pub(crate) fn refuse(status: u16, code: &'static str, message: &str) -> Refusal 
     (status, code, message.to_string())
 }
 
-fn ts(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+fn ts(t: Timestamp) -> String {
+    t.to_rfc3339_millis()
 }
 
 pub(crate) fn user_out(u: &FUser) -> Value {
@@ -223,6 +227,23 @@ pub(crate) fn str_field<'a>(body: &'a Value, key: &str) -> Result<&'a str, Refus
     }
 }
 
+/// `project_name`, judged as the service judges it: a name it cannot show is not refused, it is
+/// left out and the mail names the default (`None`). Unusable is: not a string, blank (the
+/// service's `trim` is JavaScript's, which also strips U+FEFF), over 128 UTF-16 units, or
+/// holding a control character or line separator.
+pub(crate) fn project_field(body: &Value) -> Option<String> {
+    let name = body.get("project_name")?.as_str()?;
+    let blank = name
+        .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .is_empty();
+    let usable = !blank
+        && name.encode_utf16().count() <= 128
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}');
+    usable.then(|| name.to_string())
+}
+
 fn bool_field(body: &Value, key: &str) -> Result<bool, Refusal> {
     match body.get(key) {
         None => Ok(false),
@@ -246,7 +267,7 @@ pub(crate) fn user_idx(p: &PoolState, id: &str) -> Result<usize, Refusal> {
 /// service does when it finds one.
 fn live_session(
     p: &mut PoolState,
-    now: DateTime<Utc>,
+    now: Timestamp,
     find: impl Fn(&FSession) -> bool,
 ) -> Option<(FSession, FUser)> {
     let s = p
@@ -448,6 +469,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             let email = check_email(str_field(body, "email")?)?;
             let verified = bool_field(body, "email_verified")?;
             let notify = bool_field(body, "notify_previous")?;
+            let project = project_field(body);
             if p.users.iter().any(|u| u.email == email && u.id != *id) {
                 return Err(refuse(409, "conflict", "another user has this email"));
             }
@@ -464,6 +486,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                     pool: name.clone(),
                     user_id: id.to_string(),
                     email: previous,
+                    project,
                 });
             }
             (200, Some(json!({ "user": out })))
@@ -473,6 +496,8 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             check_password(password)?;
             let at = user_idx(p, id)?;
             p.users[at].password = Some(password.to_string());
+            // A new password ends every session of the user, whoever called this route.
+            p.sessions.retain(|s| s.user_id != *id);
             (200, Some(json!({ "status": true })))
         }
         ("POST", ["users", id, "verify-email"]) => {
@@ -524,7 +549,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 token: format!("tok-{}", tick()),
                 user_id: u.id.clone(),
                 created: now,
-                expires: now + session_ttl(&name),
+                expires: now.checked_add(session_ttl(&name)).expect("in range"),
             };
             let out = json!({ "session_id": s.id, "session_token": s.token, "user": user_out(&u) });
             p.sessions.push(s);
@@ -642,7 +667,7 @@ impl FakeIdentity {
             pools: HashMap::new(),
             calls: Vec::new(),
             next: 0,
-            skew: ChronoDuration::zero(),
+            skew: Duration::ZERO,
             down: false,
             email_configured: true,
             sent: Vec::new(),
@@ -723,7 +748,7 @@ impl FakeIdentity {
                 token: token.clone(),
                 user_id: user_id.to_string(),
                 created: now,
-                expires: now + session_ttl(&name),
+                expires: now.checked_add(session_ttl(&name)).expect("in range"),
             });
             (id, token)
         })
@@ -746,7 +771,7 @@ impl FakeIdentity {
 
     /// Moves the fake's clock forward (session and code expiry).
     pub fn advance(&self, by: Duration) {
-        self.with(|i| i.skew += ChronoDuration::from_std(by).unwrap());
+        self.with(|i| i.skew += by);
     }
 
     /// While down, every call answers 503.
@@ -832,5 +857,40 @@ impl FakeIdentity {
                 .get(&pool.to_string())
                 .map_or(0, |p| p.sessions.len())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    /// The text the mock writes is `.mmmZ`: sub-millisecond digits are cut, and a whole second
+    /// still shows `.000`.
+    #[test]
+    fn user_and_session_timestamps_are_millisecond_text() {
+        let frac = at("2026-09-30T12:00:00.123456789Z");
+        let whole = at("2026-09-30T12:00:00Z");
+        let user = FUser {
+            id: "u".into(),
+            email: "a@b.c".into(),
+            password: None,
+            name: "n".into(),
+            verified: true,
+            banned: false,
+            ban_reason: None,
+            created: frac,
+            updated: whole,
+        };
+        let u = user_out(&user);
+        assert_eq!(u["created_at"], "2026-09-30T12:00:00.123Z");
+        assert_eq!(u["updated_at"], "2026-09-30T12:00:00.000Z");
+        let session = FSession { id: "s".into(), token: "t".into(), user_id: "u".into(), created: whole, expires: frac };
+        let s = session_out(&session);
+        assert_eq!(s["created_at"], "2026-09-30T12:00:00.000Z");
+        assert_eq!(s["expires_at"], "2026-09-30T12:00:00.123Z");
     }
 }

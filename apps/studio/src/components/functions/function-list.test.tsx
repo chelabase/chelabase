@@ -207,4 +207,46 @@ describe("FunctionList", () => {
     expect(await screen.findByText(DEV_COMMAND)).toBeInTheDocument();
     expect(DEV_COMMAND).toBe("chelabase functions dev --watch");
   });
+
+  describe("secrets on a service need a tenant admin", () => {
+    const open = async (level: Level, over: Record<string, unknown>, tenantAdmin = false) => {
+      const user = userEvent.setup();
+      const me = meAs(level);
+      me.member.tenant_admin = tenantAdmin;
+      const f = fakeFetch({
+        [`GET ${base("b2")}`]: () => jsonResponse([fn("echo", { enabled: true, ...over })]),
+        [`GET ${base("b2")}/echo/deployments`]: () => jsonResponse(DEPLOYMENTS),
+        [`GET ${base("b2")}/echo/secrets`]: () => jsonResponse(["TOKEN"]),
+      });
+      const caps = projectCaps(me as never, "p1", "d1");
+      renderWithQuery(
+        <ProjectCapsContext.Provider value={caps}>
+          <FunctionList databaseId="d1" branchId="b2" apiUrl="http://api.test" />
+        </ProjectCapsContext.Provider>,
+        { fetch: f },
+      );
+      await user.click(await screen.findByRole("button", { name: "echo" }));
+      await screen.findByText("TOKEN");
+    };
+
+    it("service_secrets_are_read_only_for_a_non_tenant_admin", async () => {
+      await open("admin", { kind: "service" });
+      expect(screen.getByRole("button", { name: "Replace TOKEN" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Delete TOKEN" })).toBeDisabled();
+      expect(screen.getByLabelText("Secret name")).toBeDisabled();
+      expect(screen.getAllByText(/tenant admin/i).length).toBeGreaterThan(0);
+    });
+
+    it("service_secrets_are_editable_for_a_tenant_admin", async () => {
+      await open("admin", { kind: "service" }, true);
+      expect(screen.getByRole("button", { name: "Replace TOKEN" })).toBeEnabled();
+      expect(screen.getByLabelText("Secret name")).toBeEnabled();
+    });
+
+    it("function_secrets_stay_editable_for_a_developer", async () => {
+      await open("developer", { kind: "function" });
+      expect(screen.getByRole("button", { name: "Replace TOKEN" })).toBeEnabled();
+      expect(screen.getByLabelText("Secret name")).toBeEnabled();
+    });
+  });
 });

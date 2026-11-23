@@ -1,0 +1,32 @@
+---
+title: MCP
+description: Let a coding agent work with your projects through two tools, search and execute, as the signed-in member.
+---
+
+<AlphaNotice />
+
+The MCP server lets an AI client that speaks the [Model Context Protocol](https://modelcontextprotocol.io) (Claude Code, Cursor, Claude Desktop, VS Code and others) work with Chelabase as you. It offers two tools:
+
+| Tool | What it does |
+|---|---|
+| `search` | Runs a short piece of JavaScript against the API's OpenAPI document, so the model finds the operation it needs without loading the whole spec. |
+| `execute` | Runs a short piece of JavaScript that calls the Management API with `chelabase.request`, as the signed-in member. |
+
+The model writes the code; the server runs it in a sandbox with no network of its own. Every API call the code makes goes back through the server, which checks it against a table of operations and then makes it with your member token. So the model can do what you can do in Studio, and no more: your role, your project access and every API rule still apply.
+
+The server is off by default. An operator turns it on with the `mcp` compose profile: see [MCP server](/self-hosting/mcp). If `/mcp` answers 404 on your instance, it isn't enabled.
+
+## What is covered
+
+- 163 operations of the API can be called from `execute`. 59 are reads, 14 are writes and 90 are destructive, which need a flag ([Safety](/using/mcp/safety)).
+- 6 operations are not available: the five storage upload routes and function deployment, which carry binary data. Bridge file transfers are planned for the `mcp-sealed` epic.
+- Operations whose answer is a credential (database passwords and connection strings, data API keys, signing secrets, invite links, signed storage URLs) answer `secrets_unavailable` for now. Sealed handles for them are planned for the `mcp-sealed` epic.
+- Sign-in for remote and web clients (OAuth) is coming in the `mcp-oauth` epic. Today a client connects with your member token, through the bridge below.
+
+## Where to go next
+
+- [Connect a client](/using/mcp/connect): `chelabase mcp`, with Claude Code as the worked example.
+- [The two tools](/using/mcp/tools): their shape and three worked examples.
+- [Safety](/using/mcp/safety): the destructive flag, read-only mode and how SQL runs.
+- [Limits and errors](/using/mcp/limits-and-errors): time, size and rate limits, truncation and every tool error code.
+- [MCP internals](/architecture/mcp): the request path and what is and isn't guaranteed.

@@ -32,7 +32,7 @@ const mine = await db.from('users').select('id', 'display_name'); // only the si
 | `changePassword({ currentPassword, password })` | Change the signed-in user's password. Returns a fresh session. |
 | `onChange(callback)` | Subscribe to `signed_in`, `signed_out` and `refreshed`; returns the unsubscribe function. |
 
-The client keeps the refresh token in `localStorage` in browsers and in memory elsewhere. Pass your own `{ get, set, remove }` (sync or async) as `auth.storage` to change that, and `auth.autoRefresh: false` to turn off the background refresh timer:
+The client keeps the refresh token in `localStorage` in browsers and in memory elsewhere. That is convenient for an app with no server, but any script on the page can read `localStorage`, so for a browser app we recommend the cookie mode, which keeps the refresh token in an `HttpOnly` cookie out of script reach: see [Server rendering](/using/client/ssr). Pass your own `{ get, set, remove }` (sync or async) as `auth.storage` to change that, and `auth.autoRefresh: false` to turn off the background refresh timer:
 
 ```ts twoslash
 import { createClient } from '@chelabase/client';

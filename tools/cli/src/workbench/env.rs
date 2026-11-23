@@ -96,23 +96,55 @@ pub fn cidr_overlaps(a: &str, b: &str) -> bool {
     (a ^ b) & mask == 0
 }
 
-/// Refuses a start when a network other than the stack's own (`own_network`) holds an IPv4 subnet
-/// overlapping the slot's control subnet: Docker would fail the stack's network with "Pool
-/// overlaps" after the images and builds, and the message would not name the slot.
-pub fn check_control_subnet(
+/// One stack's compute network (`<project>_compute-internal`): the subnet Compose creates and the
+/// range Docker assigns compute addresses from (the upper `/23`); the lower `/23` is for static
+/// addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeNet {
+    pub subnet: String,
+    pub range: String,
+    /// The egress service's address (`.2` of the first `/24`): in the subnet, in the lower `/23`
+    /// (never in `range`, which Docker hands out from, first address first), and not the network
+    /// or gateway address.
+    pub egress_ip: String,
+}
+
+/// Slot `k` (0..=63): subnet `10.212.{4k}.0/22`, Docker-assigned addresses from
+/// `10.212.{4k+2}.0/23`, the egress service at `10.212.{4k}.2`. Disjoint from every slot's control subnet (`10.213.0.0/16`).
+pub fn compute_net(slot: u8) -> ComputeNet {
+    let base = u16::from(slot) * 4;
+    ComputeNet {
+        subnet: format!("10.212.{base}.0/22"),
+        range: format!("10.212.{}.0/23", base + 2),
+        egress_ip: format!("10.212.{base}.2"),
+    }
+}
+
+/// Refuses a start when a Docker network holds an IPv4 subnet overlapping the slot's control or
+/// compute subnet: Docker would fail the stack's network with "Pool overlaps" after the images
+/// and builds, and the message would not name the slot. The stack's own networks may hold them:
+/// the internal ones Compose made last time, and the legacy ones (`<project>_control`,
+/// `<project>_compute`), which `up` removes before Compose creates the new ones.
+pub fn check_stack_subnets(
     slug: &str,
     slot: u8,
-    own_network: &str,
+    project: &str,
     networks: &[NetworkSubnets],
 ) -> anyhow::Result<()> {
-    let wanted = control_net(slot).subnet;
-    for net in networks.iter().filter(|n| n.name != own_network) {
-        if let Some(subnet) = net.subnets.iter().find(|s| cidr_overlaps(s, &wanted)) {
-            anyhow::bail!(
-                "stack {slug} (control slot {slot}) needs the subnet {wanted}, but the Docker network {} holds {subnet}; remove that network (`docker network rm {}`) or free the slot",
-                net.name,
-                net.name
-            );
+    let own: Vec<String> = [compute_network(project), control_network(project)]
+        .into_iter()
+        .chain(legacy_networks(project))
+        .collect();
+    let wanted = [control_net(slot).subnet, compute_net(slot).subnet];
+    for net in networks.iter().filter(|n| !own.contains(&n.name)) {
+        for want in &wanted {
+            if let Some(subnet) = net.subnets.iter().find(|s| cidr_overlaps(s, want)) {
+                anyhow::bail!(
+                    "stack {slug} (control slot {slot}) needs the subnet {want}, but the Docker network {} holds {subnet}; remove that network (`docker network rm {}`) or free the slot",
+                    net.name,
+                    net.name
+                );
+            }
         }
     }
     Ok(())
@@ -179,6 +211,8 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     // Edge functions m11: the service runner (profile `services`); without it the name doesn't
     // resolve and container services answer `runner_unavailable`.
     ("CHELABASE_SERVICE_RUNNER_URL", "http://service-runner-control:8094"),
+    // mcp-core m2/m12: the gateway's MCP upstream (the public listener's alias).
+    ("CHELABASE_MCP_URL", "http://mcp-public:8095"),
     ("CHELABASE_STUDIO_UPSTREAM", "http://studio:3000"),
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
@@ -266,9 +300,22 @@ fn path(p: &Path) -> String {
     p.display().to_string()
 }
 
-/// The Docker network a stack's computes run on (`CHELABASE_COMPUTE_NETWORK`, P4).
+/// The Docker network a stack's computes run on (`CHELABASE_COMPUTE_NETWORK`, P4): internal, with
+/// an isolated bridge gateway (compute-network-reach).
 pub fn compute_network(project: &str) -> String {
-    format!("{project}_compute")
+    format!("{project}_compute-internal")
+}
+
+/// The network the orchestrator, realtime and the runner reach computes on
+/// (`CHELABASE_COMPUTE_CONTROL_NETWORK`): internal, with an isolated bridge gateway.
+pub fn control_network(project: &str) -> String {
+    format!("{project}_control-internal")
+}
+
+/// The ordinary bridges of earlier releases (`compute`, `control`), which `up` removes once their
+/// members are gone (`CHELABASE_LEGACY_COMPUTE_NETWORKS`).
+pub fn legacy_networks(project: &str) -> [String; 2] {
+    [format!("{project}_compute"), format!("{project}_control")]
 }
 
 /// Renders `stack.env`: every `KEY=VALUE` line of `example` in its order (overlaid keys get the
@@ -338,33 +385,47 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
     for (key, value) in SERVICE_KEYS {
         lines.set(key, *value);
     }
+    // The MCP live tests' endpoint (the runner's `CHELABASE_MCP_LIVE_URL`); their token is
+    // `chelabase dev token`'s.
+    if let Some((_, api)) = lines.0.iter().find(|(k, _)| k == "CHELABASE_ENTRY_API_URL") {
+        let live = format!("{api}/mcp");
+        lines.set("CHELABASE_MCP_LIVE_URL", live);
+    }
     // Ruling (e): only the gateway's X-Forwarded-For counts (computes reach auth directly).
     lines.set("CHELABASE_AUTH_TRUSTED_PROXY", "gateway");
     lines.set("CHELABASE_CONTROL_PLANE_URI", "http://orchestrator:8083");
     // P4/W14: computes get the stack's own network, without NATS, Valkey or any database.
     lines.set("CHELABASE_COMPUTE_NETWORK", compute_network(input.project));
     let control = control_net(input.control_slot);
+    lines.set("CHELABASE_COMPUTE_CONTROL_NETWORK", control_network(input.project));
     lines.set(
-        "CHELABASE_COMPUTE_CONTROL_NETWORK",
-        format!("{}_control", input.project),
+        "CHELABASE_LEGACY_COMPUTE_NETWORKS",
+        legacy_networks(input.project).join(","),
     );
-    lines.set("CHELABASE_CONTROL_SUBNET", control.subnet.as_str());
+    lines.set("CHELABASE_CONTROL_INTERNAL_SUBNET", control.subnet.as_str());
     lines.set(
-        "CHELABASE_CONTROL_COMPUTE_RANGE",
+        "CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE",
         control.compute_range.as_str(),
     );
+    let compute = compute_net(input.control_slot);
+    lines.set("CHELABASE_COMPUTE_SUBNET", compute.subnet.as_str());
+    lines.set("CHELABASE_COMPUTE_RANGE", compute.range.as_str());
+    // compute-network-reach: the egress service's address on the compute network, and the resolver
+    // computes are created with (the same address).
+    lines.set("CHELABASE_COMPUTE_EGRESS_IP", compute.egress_ip.as_str());
+    lines.set("CHELABASE_COMPUTE_EGRESS_DNS", compute.egress_ip.as_str());
     lines.set(
-        "CHELABASE_ORCHESTRATOR_CONTROL_IP",
+        "CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP",
         control.orchestrator_ip.as_str(),
     );
-    lines.set("CHELABASE_RUNNER_CONTROL_IP", control.runner_ip.as_str());
+    lines.set("CHELABASE_RUNNER_CONTROL_INTERNAL_IP", control.runner_ip.as_str());
     lines.set(
         "CHELABASE_MEMBER_LOGIN_CIDRS",
         format!("{}/32,{}/32", control.orchestrator_ip, control.runner_ip),
     );
     // Realtime's own address on `control` (outside the computes' range) and the two addresses the
     // `chelabase_realtime` login is allowed from: realtime and the runner (it runs realtime).
-    lines.set("CHELABASE_REALTIME_CONTROL_IP", control.realtime_ip.as_str());
+    lines.set("CHELABASE_REALTIME_CONTROL_INTERNAL_IP", control.realtime_ip.as_str());
     lines.set(
         "CHELABASE_REALTIME_LOGIN_CIDRS",
         format!("{}/32,{}/32", control.realtime_ip, control.runner_ip),
@@ -492,3 +553,4 @@ mod mask_tests {
         assert_eq!(checkout_mask(&other, &keys), Some(other.join(".chelabase")));
     }
 }
+

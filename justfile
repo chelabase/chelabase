@@ -82,6 +82,7 @@ sweep-dbs-test:
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
     CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest -p chelabase-storage-service document_is_current
+    CHELABASE_BLESS=1 cargo test -p mcp spec_bundle_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
 
@@ -89,9 +90,10 @@ api-gen:
 deny-install:
     cargo install cargo-deny --version 0.20.2 --locked
 
-# RustSec advisories, yanked crates and licenses against Cargo.lock (deny.toml); fix by upgrading, never by an unapproved ignore
+# RustSec advisories, yanked crates, licenses and banned crates (chrono, chrono-tz, humantime) against
+# Cargo.lock (deny.toml); fix by upgrading, never by an unapproved ignore
 deny:
-    cargo deny check advisories licenses
+    cargo deny check advisories licenses bans
 
 # Everything CI checks offline: the shell script tests, the Rust checks and the web checks.
 # CI runs the same recipes, each limited to what a pull request affects (scripts/ci-affected.sh).
@@ -110,10 +112,12 @@ check-scripts:
     scripts/tests/compose-overlay-equiv.sh
     scripts/tests/compose-secret-boundary.sh
     scripts/tests/compose-proxy-ca.sh
+    scripts/tests/compose-compute-network-internal.sh
     scripts/tests/compose-no-fixed-secrets.sh
     scripts/tests/compose-env-tunables.sh
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
+    scripts/tests/wt-from-origin.sh
     scripts/tests/retired-names.sh
     scripts/tests/no-copyleft.sh
     scripts/tests/compose-image-pins.sh
@@ -226,7 +230,35 @@ sweep-builds days="14":
       fi
     done
 
+# Fetch origin once (quiet) and print where `ref` should start from: `origin/<ref>` when that exists
+# and local `<ref>` has nothing origin lacks, else `ref` as given (a SHA, `origin/...`, a local-only or
+# locally-ahead branch). A failed fetch (offline) prints `ref` and warns on stderr. Never fails.
+_wt-resolve ref:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+    ref="$1"
+    if ! git -C "$main" fetch origin --prune --quiet; then
+      echo "warning: git fetch origin failed; starting from local refs, which may be behind origin" >&2
+      printf '%s\n' "$ref"
+      exit 0
+    fi
+    case "$ref" in
+      origin/* | HEAD) printf '%s\n' "$ref"; exit 0 ;;
+    esac
+    if ! git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
+      printf '%s\n' "$ref"
+    elif git -C "$main" show-ref --verify --quiet "refs/heads/$ref" &&
+      ! git -C "$main" merge-base --is-ancestor "refs/heads/$ref" "refs/remotes/origin/$ref"; then
+      echo "warning: local $ref has commits that aren't on origin/$ref: starting from local $ref" >&2
+      printf '%s\n' "$ref"
+    else
+      printf 'origin/%s\n' "$ref"
+    fi
+
 # New worktree at .worktrees/<branch with / as ->; creates the branch from base if it is new.
+# Fetches origin first: a new branch starts from origin/<base>, and a branch that exists only on origin
+# is checked out from there. An existing local branch is used as it is (with a warning if it is behind).
 # It starts no stack: a task worktree records the base's stack in `.workbench-stack` (no build when
 # a worktree has the base checked out); a main-based one gets its own from `just workbench up`.
 wt-add branch base="main":
@@ -236,10 +268,19 @@ wt-add branch base="main":
     branch="$1"
     base="$2"
     dir="$main/.worktrees/${branch//\//-}"
+    start="$("{{just_executable()}}" --justfile "{{justfile()}}" _wt-resolve "$base")"
     if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+      up="$(git -C "$main" rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null || true)"
+      [ -n "$up" ] || up="origin/$branch"
+      if git -C "$main" rev-parse --verify --quiet "$up^{commit}" >/dev/null &&
+        ! git -C "$main" merge-base --is-ancestor "$up" "$branch"; then
+        echo "warning: local $branch is behind or has diverged from $up; checked out as it is" >&2
+      fi
       git -C "$main" worktree add "$dir" "$branch"
+    elif git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      git -C "$main" worktree add --track -b "$branch" "$dir" "origin/$branch"
     else
-      git -C "$main" worktree add "$dir" -b "$branch" "$base"
+      git -C "$main" worktree add "$dir" -b "$branch" "$start"
     fi
     ln -s "$main/.chelabase" "$dir/.chelabase"
     if [ "$base" != main ] && [ "$base" != origin/main ]; then
@@ -252,7 +293,7 @@ wt-add branch base="main":
 # A reusable worktree at .worktrees/<name>: made on first use, then switched in place, so its
 # target/ stays warm and only the changed crates rebuild. It refuses while the slot has changes.
 # Agents take a slot of the shared pool through wt-claim, which calls this.
-# With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
+# (wt-claim passes it origin/<ref>.) With `branch`: check it out, creating it from `ref` if it is new; an existing branch is
 # fast-forwarded to `ref` when it has no commits of its own, and is never reset. Without: a
 # detached checkout of `ref`. The slot records the stack of `ref`'s worktree, like wt-add.
 wt-slot name ref branch="":
@@ -331,6 +372,8 @@ wt-claim ref branch="":
     ref="$1"
     branch="${2:-}"
     max="${CHELABASE_WT_POOL_MAX:-8}"
+    # Fetch origin once; a branch name with an origin counterpart (main, epic/x) starts from origin's.
+    ref="$("{{just_executable()}}" --justfile "{{justfile()}}" _wt-resolve "$ref")"
     git -C "$main" rev-parse --verify --quiet "$ref^{commit}" >/dev/null ||
       { echo "wt-claim: $ref isn't a branch or a commit" >&2; exit 1; }
     mkdir -p "$common/wt-slots"
@@ -562,6 +605,12 @@ app-users-e2e:
 compute-network-e2e:
     cargo run -q -p chelabase -- workbench run scripts/compute-network-e2e.sh
 
+# Live check of compute egress (compute-network-reach): from a real compute, a listed destination
+# answers (dblink, postgres_fdw, a subscription) and an unlisted name, an unlisted port and a direct
+# address don't. Attaches the stack's compute-egress container to a test network for the run.
+compute-egress-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/compute-egress-e2e.sh
+
 # Live check of SeaweedFS's bucket boundary (object-storage m2): neon and storage identities each
 # reach only their own bucket (list, write, copy), no unauthenticated port is reachable, no key in inspect
 storage-iam-e2e:
@@ -579,6 +628,12 @@ storage-e2e *args:
 functions-runtime-test:
     docker buildx bake -f infra/images/docker-bake.hcl --load functions-runtime
     node --test infra/functions-runtime/tests/
+
+# CI runs this when infra/mcp-runtime/ changes. Needs Docker, no stack.
+# The MCP sandbox runtime's node tests, against a freshly baked image in throwaway containers
+mcp-runtime-test:
+    docker buildx bake -f infra/images/docker-bake.hcl --load mcp-runtime
+    node --test infra/mcp-runtime/tests/
 
 # Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
 # it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
@@ -631,6 +686,11 @@ role-e2e:
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
 
+# Live MCP check: the official TypeScript client over `chelabase mcp` against the stack's /mcp
+# (needs the stack up with the mcp profile; its busy-loop check restarts mcp-runtime)
+mcp-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/mcp-e2e.sh
+
 # Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
 # revocation on grant loss (compute suspended), suspend, revoke-now, offboarding, expiry
 personal-logins-e2e:
@@ -654,6 +714,12 @@ auth-e2e:
 # Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
 selfhost-e2e:
     scripts/selfhost-e2e.sh
+
+# compute-network-reach: the production upgrade from main's release on the legacy networks, with
+# only `docker compose up -d --wait`. Builds this checkout's images (UPGRADE_PROD_E2E_IMAGES=local uses
+# `just images`'s); UPGRADE_PROD_E2E_DRY_RUN=1 only renders the configs.
+upgrade-prod-e2e:
+    scripts/upgrade-prod-e2e.sh
 
 # The self-hosted install behind a TLS proxy with no port in the hosts (#24): nginx with a
 # throwaway CA in front of a throwaway project, on the local release images (`just images`;

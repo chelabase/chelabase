@@ -434,6 +434,34 @@ impl<B: ComputeBackend, M: WorkerMetadata> ComputeBackend for StoppingBackend<B,
         self.inner.list_not_running().await
     }
 
+    async fn compute_networks(&self) -> anyhow::Result<chelabase_neon::backend::ComputeNetworks> {
+        self.inner.compute_networks().await
+    }
+
+    async fn legacy_networks(&self) -> Vec<chelabase_neon::backend::LegacyNetwork> {
+        self.inner.legacy_networks().await
+    }
+
+    /// No compute-stopping signal: the network migration asks Docker only (it runs while the
+    /// metadata database is down), and the branch's compute comes straight back on the right
+    /// networks.
+    async fn remove_compute_container(
+        &self,
+        endpoint_id: &str,
+        container_id: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .remove_compute_container(endpoint_id, container_id)
+            .await
+    }
+
+    async fn remove_network(
+        &self,
+        network: &chelabase_neon::backend::NetworkRef,
+    ) -> anyhow::Result<chelabase_neon::backend::NetworkRemoval> {
+        self.inner.remove_network(network).await
+    }
+
     async fn admin_sql_with(
         &self,
         endpoint_id: &str,

@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -83,8 +83,8 @@ pub struct ProjectAuth {
     pub table_name: String,
     pub email_verification: bool,
     pub on_delete: OnDelete,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,10 +134,10 @@ pub struct AppSession {
     pub project_id: ProjectId,
     pub user_id: Uuid,
     pub identity_session_id: String,
-    pub created_at: DateTime<Utc>,
-    pub last_used_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_used_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
 }
 
 #[derive(Clone)]
@@ -147,7 +147,7 @@ pub struct NewAppSession<'a> {
     pub user_id: Uuid,
     pub identity_session_id: &'a str,
     pub refresh_hash: [u8; 32],
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for NewAppSession<'_> {
@@ -231,6 +231,12 @@ pub enum PeekOutcome {
     Invalid,
 }
 
+/// Whether a session created at `created_at` has reached its `cap` at `now`. A `cap` too large
+/// to add to `created_at` counts as reached, never as "no cap".
+fn cap_reached(now: Timestamp, created_at: Timestamp, cap: Duration) -> bool {
+    created_at.checked_add(cap).is_none_or(|end| now >= end)
+}
+
 /// Revokes the session locked in `tx` for a reused refresh token.
 async fn revoke_reused(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -258,8 +264,8 @@ fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
         table_name: r.get("table_name"),
         email_verification: r.get("email_verification"),
         on_delete: OnDelete::parse(r.get("on_delete"))?,
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
     })
 }
 
@@ -709,11 +715,8 @@ impl MetadataClient {
         if session.project_id != project || session.revoked_at.is_some() {
             return Ok(RefreshOutcome::Invalid);
         }
-        let now: DateTime<Utc> = row.get("now");
-        let cap_end = chrono::Duration::from_std(next.cap)
-            .ok()
-            .and_then(|cap| session.created_at.checked_add_signed(cap));
-        if now >= session.expires_at || cap_end.is_some_and(|end| now >= end) {
+        let now: Timestamp = row.try_get("now")?;
+        if now >= session.expires_at || cap_reached(now, session.created_at, next.cap) {
             sqlx::query("UPDATE app_sessions SET revoked_at = now() WHERE id = $1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -745,7 +748,7 @@ impl MetadataClient {
             .await?;
             RefreshOutcome::Rotated(session_from_row(&rotated))
         } else if previous.as_deref() == Some(presented.as_slice()) {
-            let grace_until: Option<DateTime<Utc>> = row.get("grace_until");
+            let grace_until: Option<Timestamp> = row.try_get("grace_until")?;
             let sealed: Option<String> = row.get("grace_refresh_sealed");
             match (grace_until, sealed) {
                 (Some(until), Some(sealed)) if until > now => RefreshOutcome::Grace { session, sealed },
@@ -791,11 +794,8 @@ impl MetadataClient {
         if session.project_id != project || session.revoked_at.is_some() {
             return Ok(PeekOutcome::Invalid);
         }
-        let now: DateTime<Utc> = row.get("now");
-        let cap_end = chrono::Duration::from_std(cap)
-            .ok()
-            .and_then(|cap| session.created_at.checked_add_signed(cap));
-        if now >= session.expires_at || cap_end.is_some_and(|end| now >= end) {
+        let now: Timestamp = row.try_get("now")?;
+        if now >= session.expires_at || cap_reached(now, session.created_at, cap) {
             return Ok(PeekOutcome::Invalid);
         }
         let current: Vec<u8> = row.get("refresh_hash");
@@ -805,7 +805,7 @@ impl MetadataClient {
         } else if previous.as_deref() == Some(presented.as_slice()) {
             // The grace answer needs the sealed token too, as in `refresh_app_session`; peek
             // only checks that it is there and never reads it.
-            let grace_until: Option<DateTime<Utc>> = row.get("grace_until");
+            let grace_until: Option<Timestamp> = row.try_get("grace_until")?;
             let sealed: bool = row.get("has_sealed");
             match grace_until {
                 Some(until) if until > now && sealed => PeekOutcome::Live { session, grace: true },
@@ -870,7 +870,7 @@ impl MetadataClient {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         Ok(sqlx::query(
             "UPDATE app_sessions SET revoked_at = now()
@@ -948,5 +948,28 @@ impl MetadataClient {
         .execute(&self.pool)
         .await?
         .rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(secs: i64) -> Timestamp {
+        Timestamp::from_unix_seconds(1_700_000_000 + secs).unwrap()
+    }
+
+    /// The cap ends a session exactly at `created_at + cap`; a cap too large to add to the
+    /// creation time is a cap reached (today's code skipped it, i.e. no cap).
+    #[test]
+    fn a_cap_too_large_to_add_never_means_no_cap() {
+        let day = chelabase_time::days(1);
+        assert!(!cap_reached(t(86_399), t(0), day));
+        assert!(cap_reached(t(86_400), t(0), day));
+        assert!(cap_reached(t(86_401), t(0), day));
+        assert!(cap_reached(t(0), t(0), Duration::MAX), "u64::MAX seconds overflows the add");
+        assert!(cap_reached(t(0), t(0), chelabase_time::days(365 * 1_000_000)));
+        // The 90-day constant used in production is far from overflow.
+        assert!(!cap_reached(t(0), t(0), chelabase_time::days(90)));
     }
 }

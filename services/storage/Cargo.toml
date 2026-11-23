@@ -22,7 +22,7 @@ hmac = { workspace = true }
 infer = { workspace = true }
 sha2 = { workspace = true }
 chelabase-http = { workspace = true }
-chrono = { workspace = true }
+chelabase-time = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 axum = { workspace = true }

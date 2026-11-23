@@ -4,29 +4,38 @@
 use crate::app_users::internal::MemberTenants;
 use crate::guard::{RateLimiter, Slot};
 use chelabase_identity::CodeKind;
-use chrono::{DateTime, Utc};
+use chelabase_time::{SignedDuration, Timestamp, TimestampExt, days, seconds};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
 /// The wall clock, which tests can move forward. A session's age is the one thing it measures.
 #[derive(Clone, Default)]
-pub struct Clock(Arc<AtomicI64>);
+pub struct Clock(Arc<AtomicU64>);
 
 impl Clock {
-    pub fn now(&self) -> DateTime<Utc> {
-        Utc::now() + chrono::Duration::seconds(self.0.load(Ordering::Relaxed))
+    pub fn now(&self) -> Timestamp {
+        Timestamp::now()
+            .checked_add(seconds(self.0.load(Ordering::Relaxed)))
+            .expect("the test clock stays in range")
     }
 
     pub fn advance(&self, by: Duration) {
-        self.0.fetch_add(by.as_secs() as i64, Ordering::Relaxed);
+        self.0.fetch_add(by.as_secs(), Ordering::Relaxed);
     }
 }
 
 /// How long a member session can mint tokens, counted from its `created_at`. Identity's own
 /// expiry says the same (`session.expiresIn`); this holds even if a read there ever slid it.
-pub const ABSOLUTE_LIFETIME: chrono::Duration = chrono::Duration::days(30);
+pub const ABSOLUTE_LIFETIME: Duration = days(30);
+
+/// Whether a session created at `created_at` is past [`ABSOLUTE_LIFETIME`] at `now`. Strict:
+/// exactly 30 days old is still valid; a `created_at` after `now` is valid too.
+pub fn past_absolute_lifetime(now: Timestamp, created_at: Timestamp) -> bool {
+    // Signed: a `created_at` after `now` is a negative age, never past the lifetime.
+    now.since(created_at) > SignedDuration::try_from(ABSOLUTE_LIFETIME).expect("30 days fits")
+}
 
 /// Codes of one kind a user can be sent per hour. Identity bounds the guesses itself (a stored
 /// failure budget per user and kind, and no new code within a minute of a live one); this bounds
@@ -76,6 +85,36 @@ pub fn choose(tenants: &MemberTenants, wanted: Option<&str>) -> Choice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clock_offset_adds_whole_seconds() {
+        let clock = Clock::default();
+        clock.advance(Duration::from_secs(90));
+        let before = Timestamp::now();
+        let now = clock.now();
+        let after = Timestamp::now();
+        let ahead = seconds(90);
+        assert!(
+            before.checked_add(ahead).unwrap() <= now && now <= after.checked_add(ahead).unwrap(),
+            "{before} {now} {after}"
+        );
+        assert_eq!(ABSOLUTE_LIFETIME.as_secs(), 2_592_000);
+    }
+
+    #[test]
+    fn absolute_lifetime_edges_are_unchanged() {
+        let now = Timestamp::now();
+        let age = |secs: i64| {
+            let d = seconds(secs.unsigned_abs());
+            if secs < 0 { now.checked_add(d) } else { now.checked_sub(d) }.unwrap()
+        };
+        assert!(!past_absolute_lifetime(now, age(2_592_000)), "exactly 30 days is valid");
+        assert!(past_absolute_lifetime(now, age(2_592_001)), "30 days + 1 s is refused");
+        assert!(!past_absolute_lifetime(now, age(-5)), "created after now is valid");
+        assert!(!past_absolute_lifetime(now, age(0)));
+        let far_ahead = now.checked_add(days(31)).unwrap();
+        assert!(!past_absolute_lifetime(now, far_ahead), "created far after now is valid, not an absolute age");
+    }
 
     const A: Uuid = Uuid::from_u128(1);
     const B: Uuid = Uuid::from_u128(2);

@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_metadata::members::AccessAction;
 use chelabase_metadata::personal_logins::AccessEventInput;
 use chelabase_metadata::{
@@ -82,7 +82,7 @@ pub(crate) struct BranchRole {
     /// Live data API secret keys that name this role while it is owner-level: the keys the
     /// data API refuses (empty for a plain role).
     blocked_keys: Vec<RoleInUseKey>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// Written but not yet applied to the compute; applied when the compute next runs.
     pending: bool,
     /// INHERIT: the role uses its groups' privileges without `SET ROLE`.
@@ -90,7 +90,7 @@ pub(crate) struct BranchRole {
     /// The most connections the role may hold at once; `-1` is no limit.
     connection_limit: i32,
     /// When the role's password stops working; `null` is never.
-    valid_until: Option<DateTime<Utc>>,
+    valid_until: Option<Timestamp>,
     /// BYPASSRLS on its own (an owner-level role has it too, through the owner's attributes).
     bypass_rls: bool,
     /// The roles it's a direct member of, by name (`neon_superuser` isn't listed).
@@ -160,11 +160,43 @@ fn no_connection_limit() -> i32 {
 }
 
 /// A field that tells "absent" (`None`) from `null` (`Some(None)`).
-fn double_option<'de, D>(d: D) -> Result<Option<Option<DateTime<Utc>>>, D::Error>
+fn double_option<'de, D>(d: D) -> Result<Option<Option<RequestedExpiry>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<DateTime<Utc>>::deserialize(d).map(Some)
+    Option::<RequestedExpiry>::deserialize(d).map(Some)
+}
+
+/// A `valid_until` as the request gave it: a time, or a well-formed one past the range the
+/// time type holds. [`check_valid_until`] refuses the latter, and a time outside Postgres'
+/// round-trip range, with a 422 naming the field (a malformed one fails the body's parse, as
+/// any other bad field does).
+#[derive(Debug, Clone, Copy)]
+enum RequestedExpiry {
+    At(Timestamp),
+    BeyondRange,
+}
+
+impl<'de> Deserialize<'de> for RequestedExpiry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RequestedExpiry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an RFC 3339 formatted date and time string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<RequestedExpiry, E> {
+                match value.parse::<Timestamp>() {
+                    Ok(at) => Ok(RequestedExpiry::At(at)),
+                    Err(err) if err.is_beyond_range() => Ok(RequestedExpiry::BeyondRange),
+                    Err(err) => Err(E::custom(err)),
+                }
+            }
+        }
+        d.deserialize_str(Visitor)
+    }
 }
 
 /// A role to create. Only the attributes listed here can be set; any other field is refused.
@@ -189,7 +221,8 @@ pub(crate) struct CreateRoleRequest {
     connection_limit: i32,
     /// When the password stops working. Default: never.
     #[serde(default)]
-    valid_until: Option<DateTime<Utc>>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    valid_until: Option<RequestedExpiry>,
     /// BYPASSRLS: the role ignores row-level security. Default `false`.
     #[serde(default)]
     bypass_rls: bool,
@@ -219,13 +252,35 @@ pub(crate) struct UpdateRoleRequest {
     /// `null` clears the expiry.
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<String>, format = DateTime, nullable = true)]
-    valid_until: Option<Option<DateTime<Utc>>>,
+    valid_until: Option<Option<RequestedExpiry>>,
     #[serde(default)]
     bypass_rls: Option<bool>,
     /// The new list of the role's other memberships, with the create's rules
     /// (`pg_*` and Chelabase's own groups stay).
     #[serde(default)]
     member_of: Option<Vec<String>>,
+}
+
+/// The time a `valid_until` names, or a 422 naming the field for one that doesn't round trip
+/// through Postgres ([`Timestamp::round_trips_through_pg`]: [`Timestamp::PG_ROUND_TRIP_MIN`] to
+/// [`Timestamp::MAX`]). Before it, Postgres refuses the literal the worker writes; past it, the
+/// database holds a time the type can't hand back. Either way the role would never converge.
+/// This is the API's half of `chelabase_time`'s "Postgres round trip" invariant; the worker's
+/// catalog read is the other.
+fn check_valid_until(valid_until: Option<RequestedExpiry>) -> Result<Option<Timestamp>, ApiError> {
+    match valid_until {
+        None => Ok(None),
+        Some(RequestedExpiry::At(at)) if at.round_trips_through_pg() => Ok(Some(at)),
+        Some(RequestedExpiry::At(_) | RequestedExpiry::BeyondRange) => Err(ApiError::invalid_request(
+            422,
+            format!(
+                "valid_until is between {} and {}",
+                Timestamp::PG_ROUND_TRIP_MIN.to_rfc3339_auto(),
+                Timestamp::MAX.to_rfc3339_auto()
+            ),
+        )
+        .with_extra("field", serde_json::Value::String("valid_until".into()))),
+    }
 }
 
 /// The 422 for a membership the rules refuse.
@@ -602,6 +657,10 @@ where
         }
         Err(err) => return err.into_response(),
     }
+    let valid_until = match check_valid_until(request.valid_until) {
+        Ok(at) => at,
+        Err(err) => return err.into_response(),
+    };
     if let Err(err) = check_settings(
         &request.name,
         owner_name(&record),
@@ -616,7 +675,7 @@ where
             login: request.login,
             inherit: request.inherit,
             connection_limit: request.connection_limit,
-            valid_until: request.valid_until,
+            valid_until,
             bypass_rls: request.bypass_rls,
             member_of: request.member_of.clone(),
             ..RoleCreateRequest::login(branch.id, &request.name, request.owner_level)
@@ -630,7 +689,7 @@ where
                 "owner_level": request.owner_level,
                 "inherit": request.inherit,
                 "connection_limit": request.connection_limit,
-                "valid_until": request.valid_until,
+                "valid_until": valid_until,
                 "bypass_rls": request.bypass_rls,
                 "member_of": request.member_of,
             },
@@ -1131,6 +1190,11 @@ where
     if let Err(err) = not_personal(&state, &record, &role).await {
         return err.into_response();
     }
+    // `Some(None)` clears the expiry; `None` leaves it.
+    let valid_until = match request.valid_until.map(check_valid_until).transpose() {
+        Ok(v) => v,
+        Err(err) => return err.into_response(),
+    };
     if let Err(err) = check_settings(&role, owner, request.connection_limit, request.member_of.as_deref()) {
         return err.into_response();
     }
@@ -1147,7 +1211,7 @@ where
             "owner_level": request.owner_level,
             "inherit": request.inherit,
             "connection_limit": request.connection_limit,
-            "valid_until": request.valid_until.map(|v| v.map_or(json!("cleared"), |d| json!(d))),
+            "valid_until": valid_until.map(|v| v.map_or(json!("cleared"), |d| json!(d))),
             "bypass_rls": request.bypass_rls,
             "member_of": request.member_of,
         },
@@ -1166,7 +1230,7 @@ where
             login: request.login,
             inherit: request.inherit,
             connection_limit: request.connection_limit,
-            valid_until: request.valid_until,
+            valid_until,
             bypass_rls: request.bypass_rls,
             member_of: request.member_of,
             ..RoleUpdateRequest::new(branch.id, &role)
@@ -1246,7 +1310,7 @@ struct RoleSessionView {
     /// The client's `application_name` (empty when it set none).
     application_name: String,
     /// When the session started.
-    backend_start: DateTime<Utc>,
+    backend_start: Timestamp,
 }
 
 /// The worker's sessions answer as the API's response or error.
@@ -1329,6 +1393,43 @@ where
     match sessions_result(reply) {
         Ok(sessions) => Json(sessions).into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod valid_until_tests {
+    use super::*;
+
+    /// A body's `valid_until` as the request parses it.
+    fn requested(s: &str) -> RequestedExpiry {
+        serde_json::from_value(serde_json::Value::String(s.into())).unwrap()
+    }
+
+    /// #397 / drop-chrono m13 F1, F2: the check accepts exactly the instants that round trip
+    /// through Postgres as the worker writes and reads them, across the boundary instants of
+    /// both ends (the worker's own test feeds the same predicate through its read path).
+    #[test]
+    fn the_check_accepts_exactly_what_round_trips_through_postgres() {
+        let mut instants = Vec::new();
+        for edge in [Timestamp::MIN, Timestamp::PG_ROUND_TRIP_MIN, Timestamp::PG_ROUND_TRIP_MAX, Timestamp::MAX] {
+            for nanos in [0u64, 1, 999, 1_000, 1_001, 500_000_000, 999_999_999, 1_000_000_000, 86_400_000_000_000] {
+                let d = std::time::Duration::from_nanos(nanos);
+                instants.extend(edge.checked_add(d));
+                instants.extend(edge.checked_sub(d));
+            }
+        }
+        for at in instants {
+            let accepted = check_valid_until(Some(requested(&at.to_rfc3339_auto())));
+            assert_eq!(accepted.is_ok(), at.round_trips_through_pg(), "{at:?}");
+            if let Ok(stored) = accepted {
+                assert_eq!(stored, Some(at), "{at:?}");
+            }
+        }
+        // Past the type's range, it's the same 422.
+        for beyond in ["-10000-01-01T00:00:00Z", "9999-12-30T22:00:01Z"] {
+            let err = check_valid_until(Some(requested(beyond))).unwrap_err();
+            assert_eq!(err.status, 422, "{beyond}");
+        }
     }
 }
 

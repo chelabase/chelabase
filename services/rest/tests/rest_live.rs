@@ -19,6 +19,7 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use chelabase_time::TimestampExt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1193,7 +1194,7 @@ async fn restore_rewinds_the_schema_and_the_old_shape_is_served() {
         let select_all = json!({"v":1,"op":"select","from":"h"});
         assert_eq!(l.auth(select_all.clone()).await.ok(), &json!([{"a":1}]));
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = chrono::Utc::now();
+        let noted = chelabase_time::Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         l.owner("ALTER TABLE h ADD COLUMN b int DEFAULT 2;").await;
         assert_eq!(

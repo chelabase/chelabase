@@ -2,7 +2,7 @@
 //! plan, rehearsal, result) and its event log.
 
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, QueryBuilder, Row};
 use uuid::Uuid;
@@ -283,10 +283,10 @@ pub struct MergeRecord {
     pub result: Option<serde_json::Value>,
     pub rebaselined: bool,
     pub error: Option<String>,
-    pub claimed_at: Option<DateTime<Utc>>,
+    pub claimed_at: Option<Timestamp>,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A merge to create (status `computing`).
@@ -427,7 +427,7 @@ pub struct MergeEvent {
     pub id: i64,
     pub merge_id: Uuid,
     /// Assigned on insert (ignored by `append_merge_event`).
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// `status`, `step` or `note`.
     pub kind: String,
     pub step_id: Option<String>,
@@ -443,7 +443,7 @@ impl MergeEvent {
         Self {
             id: 0,
             merge_id,
-            at: Utc::now(),
+            at: Timestamp::now(),
             kind: kind.to_string(),
             step_id: None,
             phase: None,
@@ -478,10 +478,10 @@ fn merge_from_row(r: &PgRow) -> Result<MergeRecord, MetadataError> {
         result: r.get("result"),
         rebaselined: r.get("rebaselined"),
         error: r.get("error"),
-        claimed_at: r.get("claimed_at"),
+        claimed_at: r.try_get("claimed_at")?,
         created_by: r.get("created_by"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
     })
 }
 
