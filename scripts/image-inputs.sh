@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the fifteen release images
+#   scripts/image-inputs.sh images                  the sixteen release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD

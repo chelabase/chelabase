@@ -63,7 +63,7 @@ The replication login `chelabase_realtime` is `NOBYPASSRLS` and not a superuser,
 
 With the `mcp` profile on, `/mcp` lets an AI client call the Management API as the signed-in member. The only credential it takes is a member token, checked in `mcp` before anything is read. Model-written code runs in a runtime with no network and no secret, on an internal network shared with `mcp` alone; each API call it makes is checked against a table of operations and made with the member's own token, which the code never sees. A destructive operation needs a flag, a read-only connection runs reads only, and operations that answer with a credential are refused.
 
-What isn't covered: data the member stored (table rows, SQL results, object contents, logs) is returned as it is and may hold credentials; a read-only SQL run still permits locks, `pg_sleep` and, with `dblink` or a foreign-data wrapper installed, writes through a separate session; the flag is set by the model, so it confirms intent only if the client asks the user; and failed token checks are limited at the gateway, not in `mcp`. See [MCP server](/architecture/mcp).
+What isn't covered: data the member stored (table rows, SQL results, object contents, logs) is returned as it is and may hold credentials; a read-only SQL run still permits locks, `pg_sleep` and, with `dblink` or a foreign-data wrapper installed, writes through a separate session; the flag is set by the model, so it confirms intent only if the client asks the user; and failed token checks are not limited in `mcp`, and nothing limits them yet: they should be limited at the gateway or in front of it (#395). See [MCP server](/architecture/mcp).
 
 ## What is not a boundary
 
