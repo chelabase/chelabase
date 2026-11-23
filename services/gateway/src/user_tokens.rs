@@ -7,6 +7,7 @@
 //! - A session counts as dead when the answer says so (`live: false` / `revoked: true`), when
 //!   its `expires_at` is in the past, when it is unknown (404) or belongs to another project.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_auth::app_token::{AppClaims, AppTokenError, AppTokenVerifier};
 use moka::future::Cache;
 use serde::Deserialize;
@@ -40,17 +41,17 @@ struct SessionAnswer {
     #[serde(default)]
     revoked: Option<bool>,
     #[serde(default)]
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<chelabase_time::Timestamp>,
     #[serde(default)]
     project_id: Option<Uuid>,
 }
 
 impl SessionAnswer {
     fn into_liveness(self) -> Liveness {
-        self.into_liveness_at(chrono::Utc::now())
+        self.into_liveness_at(Timestamp::now())
     }
 
-    fn into_liveness_at(self, now: chrono::DateTime<chrono::Utc>) -> Liveness {
+    fn into_liveness_at(self, now: chelabase_time::Timestamp) -> Liveness {
         let flagged_live = match (self.live, self.revoked) {
             (_, Some(true)) | (Some(false), _) => false,
             (Some(true), _) | (None, Some(false)) => true,
@@ -164,6 +165,7 @@ pub(crate) mod test_support {
     use axum::{Json, Router};
     use chelabase_auth::app_token::{APP_ISSUER, AppTokenSigner, app_audience};
     use chelabase_auth::internal::generate_keypair_pem;
+    use chelabase_time::hours;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -207,8 +209,8 @@ pub(crate) mod test_support {
                         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
                     }
                     let session = mock.sessions.lock().unwrap().get(&id).cloned();
-                    let future = chrono::Utc::now() + chrono::Duration::hours(1);
-                    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+                    let future = Timestamp::now().checked_add(hours(1)).unwrap().to_rfc3339_auto();
+                    let past = Timestamp::now().checked_sub(hours(1)).unwrap().to_rfc3339_auto();
                     match session {
                         Some(Session::Live(p)) => (
                             StatusCode::OK,
@@ -245,7 +247,7 @@ pub(crate) mod test_support {
     }
 
     pub fn claims(project: Uuid, sid: Uuid, exp_in_secs: i64) -> AppClaims {
-        let now = chrono::Utc::now().timestamp();
+        let now = Timestamp::now().timestamp();
         AppClaims {
             iss: APP_ISSUER.to_string(),
             aud: app_audience(project),
@@ -268,16 +270,16 @@ mod tests {
 
     #[test]
     fn a_token_expires_at_its_instant_not_after() {
-        let now = chrono::Utc::now();
-        let us = chrono::Duration::microseconds(1);
+        let now = Timestamp::now();
+        let us = std::time::Duration::from_micros(1);
         let live_at = |at| {
             SessionAnswer { live: Some(true), revoked: None, expires_at: Some(at), project_id: None }
                 .into_liveness_at(now)
                 .live
         };
         assert!(!live_at(now), "expires now: expired");
-        assert!(!live_at(now - us), "1 us in the past: expired");
-        assert!(live_at(now + us), "1 us in the future: valid");
+        assert!(!live_at(now.checked_sub(us).unwrap()), "1 us in the past: expired");
+        assert!(live_at(now.checked_add(us).unwrap()), "1 us in the future: valid");
     }
 
     #[tokio::test]
