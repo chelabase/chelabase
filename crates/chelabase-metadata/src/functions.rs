@@ -20,7 +20,7 @@
 //! | 2 | `branches`, by id | `FOR SHARE`: the target branch (per-branch writes), every live branch of the database (kind change, delete) | `protect_branch`, branch tombstone `UPDATE`; DDL receiver, key rotation `FOR NO KEY UPDATE` |
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes; a rollover's guarded switch) | branch create copies (insert), tombstone purge (delete) |
-//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone | branch create copies (insert), tombstone purge (delete) |
+//! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone; `record_schedule_errors` `FOR UPDATE` in `id` order, alone (no branch or function row) | branch create copies (insert), tombstone purge (delete) |
 //! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
@@ -70,7 +70,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::schedule::{Schedule, advance};
+use crate::schedule::{Schedule, ScheduleProblem, advance};
 use crate::{MetadataClient, MetadataError};
 
 /// A function's bundle may be at most 10 MiB.
@@ -272,6 +272,19 @@ pub struct ScheduleRecord {
     pub timezone: String,
     pub next_run_at: Option<DateTime<Utc>>,
     pub enabled: bool,
+    /// Why the schedule was switched off (see [`ScheduleProblem`]); `None` normally.
+    pub last_error: Option<String>,
+}
+
+/// A schedule the startup report found unable to run: the `cron` and `timezone` it parsed
+/// and the parser's typed problem. [`MetadataClient::record_schedule_errors`] writes only the
+/// problem's text, and only while the row still has this cron and time zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleFault {
+    pub id: Uuid,
+    pub cron: String,
+    pub timezone: String,
+    pub problem: ScheduleProblem,
 }
 
 /// One schedule as the startup report reads it ([`MetadataClient::list_schedules_for_report`]).
@@ -793,8 +806,8 @@ pub(crate) async fn copy_branch_functions(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at, enabled)
-         SELECT gen_random_uuid(), $2, function_id, cron, timezone, next_run_at, enabled
+        "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at, enabled, last_error)
+         SELECT gen_random_uuid(), $2, function_id, cron, timezone, next_run_at, enabled, last_error
          FROM function_schedules WHERE branch_id = $1",
     )
     .bind(parent)
@@ -1934,7 +1947,7 @@ impl MetadataClient {
         branch: BranchId,
     ) -> Result<Vec<ScheduleRecord>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, branch_id, function_id, cron, timezone, next_run_at, enabled
+            "SELECT id, branch_id, function_id, cron, timezone, next_run_at, enabled, last_error
              FROM function_schedules WHERE branch_id = $1 ORDER BY created_at, id",
         )
         .bind(branch.as_uuid())
@@ -1949,8 +1962,64 @@ impl MetadataClient {
             timezone: r.get("timezone"),
             next_run_at: r.get("next_run_at"),
             enabled: r.get("enabled"),
+            last_error: r.get("last_error"),
         })
         .collect())
+    }
+
+    /// The startup report's write: sets `last_error` (the problem's text, at most 500
+    /// characters) on each schedule that still has the `cron` and `timezone` the fault was
+    /// computed from, and nothing else of it. An unknown id, or a row a PATCH changed since,
+    /// is left alone. Takes only `function_schedules` row locks (4a), in `id` order, and
+    /// nothing after them.
+    pub async fn record_schedule_errors(&self, faults: &[ScheduleFault]) -> Result<(), MetadataError> {
+        // One entry per id (the last wins), in id order.
+        let mut by_id: std::collections::BTreeMap<Uuid, &ScheduleFault> = std::collections::BTreeMap::new();
+        for f in faults {
+            by_id.insert(f.id, f);
+        }
+        let (mut ids, mut crons, mut zones, mut reasons) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (id, f) in by_id {
+            let reason = f.problem.reason();
+            if reason.is_empty() {
+                continue;
+            }
+            ids.push(id);
+            crons.push(f.cron.clone());
+            zones.push(f.timezone.clone());
+            reasons.push(reason);
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        // Lock first, in id order, only the rows that still match: an `UPDATE … FROM` locks in
+        // plan order.
+        sqlx::query(
+            "SELECT s.id FROM function_schedules s
+             JOIN unnest($1::uuid[], $2::text[], $3::text[]) AS v(id, cron, tz)
+               ON s.id = v.id AND s.cron = v.cron AND s.timezone = v.tz
+             ORDER BY s.id FOR UPDATE OF s",
+        )
+        .bind(&ids)
+        .bind(&crons)
+        .bind(&zones)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE function_schedules AS s SET last_error = v.err
+             FROM unnest($1::uuid[], $2::text[], $3::text[], $4::text[]) AS v(id, cron, tz, err)
+             WHERE s.id = v.id AND s.cron = v.cron AND s.timezone = v.tz",
+        )
+        .bind(ids)
+        .bind(crons)
+        .bind(zones)
+        .bind(reasons)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_check)?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Every schedule on every branch, for the startup report: id order, `limit` rows after
@@ -2017,7 +2086,8 @@ impl MetadataClient {
             next = schedule.next_after(row.get("now"));
         }
         sqlx::query(
-            "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5
+            "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5,
+                    last_error = NULL
              WHERE id = $1",
         )
         .bind(id)
@@ -2037,6 +2107,7 @@ impl MetadataClient {
             timezone: new_tz.to_owned(),
             next_run_at: next,
             enabled: new_enabled,
+            last_error: None,
         }))
     }
 
@@ -2118,7 +2189,8 @@ impl MetadataClient {
         .fetch_all(&mut *tx)
         .await?;
         let mut claimed = Vec::with_capacity(rows.len());
-        let (mut ids, mut nexts, mut enabled) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ids, mut nexts, mut enabled, mut errors) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for r in &rows {
             let cron: String = r.get("cron");
             let step = advance(
@@ -2136,6 +2208,7 @@ impl MetadataClient {
             ids.push(id);
             nexts.push(step.next);
             enabled.push(step.enabled);
+            errors.push(step.error);
             claimed.push(ClaimedSchedule {
                 id,
                 branch_id: BranchId(r.get("branch_id")),
@@ -2148,13 +2221,16 @@ impl MetadataClient {
         }
         if !ids.is_empty() {
             sqlx::query(
-                "UPDATE function_schedules AS s SET next_run_at = v.next, enabled = v.enabled
-                 FROM unnest($1::uuid[], $2::timestamptz[], $3::bool[]) AS v(id, next, enabled)
+                "UPDATE function_schedules AS s SET next_run_at = v.next, enabled = v.enabled,
+                        last_error = v.error
+                 FROM unnest($1::uuid[], $2::timestamptz[], $3::bool[], $4::text[])
+                      AS v(id, next, enabled, error)
                  WHERE s.id = v.id",
             )
             .bind(ids)
             .bind(nexts)
             .bind(enabled)
+            .bind(errors)
             .execute(&mut *tx)
             .await?;
         }

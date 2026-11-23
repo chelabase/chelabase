@@ -48,11 +48,13 @@ pub use ddl::DdlTx;
 pub use functions::{
     BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
     FunctionRecord, MAX_BUNDLE_SIZE, MAX_IN_FLIGHT_PER_DATABASE, MAX_LAST_ERROR_CHARS, MAX_SCHEDULES_PER_FUNCTION, MAX_TRIGGERS_PER_FUNCTION, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
-    NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleRecord, ScheduleReportRow,
+    NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleFault, ScheduleRecord, ScheduleReportRow,
     ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
     secret_write_allowed, secrets_env_bytes, valid_function_name, valid_secret_name,
 };
-pub use schedule::{Advance, Schedule, ScheduleError, advance};
+pub use schedule::{
+    Advance, SCHEDULE_ERROR_MAX_CHARS, NO_UPCOMING_TIME, Schedule, ScheduleError, ScheduleProblem, advance,
+};
 pub use merges::{
     APPLY_PHASES, BranchBusy, MergeAction, MergeCreate, MergeDirection, MergeDraftPatch,
     MergeEvent, MergeRecord, MergeState, MergeStatus, MergeStatusPatch, MergeWrite, NewMerge,

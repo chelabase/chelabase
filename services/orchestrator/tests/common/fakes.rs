@@ -5790,6 +5790,7 @@ impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
             timezone: s.timezone.to_string(),
             next_run_at: s.next_run_at,
             enabled: true,
+            last_error: None,
         });
         Ok(id)
     }
@@ -5820,6 +5821,7 @@ impl orchestrator::functions_schedules::SchedulesPort for FakeMetadata {
             s.next_run_at = parsed.next_after(chrono::Utc::now());
         }
         (s.cron, s.timezone, s.enabled) = (new_cron, new_tz, new_enabled);
+        s.last_error = None;
         Ok(Some(s.clone()))
     }
 

@@ -15,6 +15,13 @@ export interface FunctionSchedule {
   enabled: boolean;
   id: string;
   /**
+     * Why the schedule was switched off, `null` normally: the cron or time zone no longer
+     * parses, or it has no upcoming time. Cleared when the schedule next gets a time (a
+     * worker pass, or a successful change).
+     * @nullable
+     */
+  last_error: string | null;
+  /**
      * When it runs next.
      * @nullable
      */
