@@ -6,10 +6,9 @@ license.workspace = true
 description = "Timestamps, dates and duration parsing for Chelabase"
 
 [dependencies]
-chrono = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
-# Postgres codecs for `Timestamp` and `Date` once they are jiff-backed.
+# Postgres codecs for `Timestamp` and `Date`.
 sqlx = { workspace = true, optional = true }
 jiff-sqlx = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
@@ -22,8 +21,6 @@ sqlx = ["dep:sqlx", "dep:jiff-sqlx"]
 openapi = ["dep:utoipa"]
 
 [dev-dependencies]
-# The oracle for `parse_duration` while it is still in the tree.
-humantime = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

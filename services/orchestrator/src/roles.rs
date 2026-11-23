@@ -160,11 +160,42 @@ fn no_connection_limit() -> i32 {
 }
 
 /// A field that tells "absent" (`None`) from `null` (`Some(None)`).
-fn double_option<'de, D>(d: D) -> Result<Option<Option<Timestamp>>, D::Error>
+fn double_option<'de, D>(d: D) -> Result<Option<Option<RequestedExpiry>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<Timestamp>::deserialize(d).map(Some)
+    Option::<RequestedExpiry>::deserialize(d).map(Some)
+}
+
+/// A `valid_until` as the request gave it: a time, or a well-formed one past the range the
+/// time type holds, which [`check_valid_until`] refuses with a 422 naming the field (a
+/// malformed one fails the body's parse, as any other bad field does).
+#[derive(Debug, Clone, Copy)]
+enum RequestedExpiry {
+    At(Timestamp),
+    BeyondRange,
+}
+
+impl<'de> Deserialize<'de> for RequestedExpiry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RequestedExpiry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an RFC 3339 formatted date and time string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<RequestedExpiry, E> {
+                match value.parse::<Timestamp>() {
+                    Ok(at) => Ok(RequestedExpiry::At(at)),
+                    Err(err) if err.is_beyond_range() => Ok(RequestedExpiry::BeyondRange),
+                    Err(err) => Err(E::custom(err)),
+                }
+            }
+        }
+        d.deserialize_str(Visitor)
+    }
 }
 
 /// A role to create. Only the attributes listed here can be set; any other field is refused.
@@ -189,7 +220,8 @@ pub(crate) struct CreateRoleRequest {
     connection_limit: i32,
     /// When the password stops working. Default: never.
     #[serde(default)]
-    valid_until: Option<Timestamp>,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    valid_until: Option<RequestedExpiry>,
     /// BYPASSRLS: the role ignores row-level security. Default `false`.
     #[serde(default)]
     bypass_rls: bool,
@@ -219,7 +251,7 @@ pub(crate) struct UpdateRoleRequest {
     /// `null` clears the expiry.
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<String>, format = DateTime, nullable = true)]
-    valid_until: Option<Option<Timestamp>>,
+    valid_until: Option<Option<RequestedExpiry>>,
     #[serde(default)]
     bypass_rls: Option<bool>,
     /// The new list of the role's other memberships, with the create's rules
@@ -228,32 +260,22 @@ pub(crate) struct UpdateRoleRequest {
     member_of: Option<Vec<String>>,
 }
 
-/// The latest and earliest instants `valid_until` may name: the range of the time type that
-/// will replace chrono (`9999-12-30T22:00:00.999999999Z` and `-9999-01-02T01:59:59Z`).
-/// Beyond them the role would be stored with a time the database can't hand back.
-fn valid_until_range() -> (Timestamp, Timestamp) {
-    let latest = Timestamp::from_ymd_hms(9999, 12, 30, 22, 0, 0)
-        .expect("in range")
-        .checked_add(std::time::Duration::from_nanos(999_999_999))
-        .expect("in range");
-    let earliest = Timestamp::from_ymd_hms(-9999, 1, 2, 1, 59, 59).expect("in range");
-    (earliest, latest)
-}
-
-/// 422 naming `valid_until` for a time outside [`valid_until_range`].
-fn check_valid_until(valid_until: Option<Timestamp>) -> Result<(), ApiError> {
-    let (earliest, latest) = valid_until_range();
+/// The time a `valid_until` names, or a 422 naming the field for one past the time type's
+/// range ([`Timestamp::MIN`] to [`Timestamp::MAX`]): the role would be stored with a time the
+/// database can't hand back.
+fn check_valid_until(valid_until: Option<RequestedExpiry>) -> Result<Option<Timestamp>, ApiError> {
     match valid_until {
-        Some(at) if at < earliest || at > latest => Err(ApiError::invalid_request(
+        None => Ok(None),
+        Some(RequestedExpiry::At(at)) => Ok(Some(at)),
+        Some(RequestedExpiry::BeyondRange) => Err(ApiError::invalid_request(
             422,
             format!(
                 "valid_until is between {} and {}",
-                earliest.to_rfc3339_auto(),
-                latest.to_rfc3339_auto()
+                Timestamp::MIN.to_rfc3339_auto(),
+                Timestamp::MAX.to_rfc3339_auto()
             ),
         )
         .with_extra("field", serde_json::Value::String("valid_until".into()))),
-        _ => Ok(()),
     }
 }
 
@@ -631,9 +653,10 @@ where
         }
         Err(err) => return err.into_response(),
     }
-    if let Err(err) = check_valid_until(request.valid_until) {
-        return err.into_response();
-    }
+    let valid_until = match check_valid_until(request.valid_until) {
+        Ok(at) => at,
+        Err(err) => return err.into_response(),
+    };
     if let Err(err) = check_settings(
         &request.name,
         owner_name(&record),
@@ -648,7 +671,7 @@ where
             login: request.login,
             inherit: request.inherit,
             connection_limit: request.connection_limit,
-            valid_until: request.valid_until,
+            valid_until,
             bypass_rls: request.bypass_rls,
             member_of: request.member_of.clone(),
             ..RoleCreateRequest::login(branch.id, &request.name, request.owner_level)
@@ -662,7 +685,7 @@ where
                 "owner_level": request.owner_level,
                 "inherit": request.inherit,
                 "connection_limit": request.connection_limit,
-                "valid_until": request.valid_until,
+                "valid_until": valid_until,
                 "bypass_rls": request.bypass_rls,
                 "member_of": request.member_of,
             },
@@ -1163,9 +1186,11 @@ where
     if let Err(err) = not_personal(&state, &record, &role).await {
         return err.into_response();
     }
-    if let Err(err) = check_valid_until(request.valid_until.flatten()) {
-        return err.into_response();
-    }
+    // `Some(None)` clears the expiry; `None` leaves it.
+    let valid_until = match request.valid_until.map(check_valid_until).transpose() {
+        Ok(v) => v,
+        Err(err) => return err.into_response(),
+    };
     if let Err(err) = check_settings(&role, owner, request.connection_limit, request.member_of.as_deref()) {
         return err.into_response();
     }
@@ -1182,7 +1207,7 @@ where
             "owner_level": request.owner_level,
             "inherit": request.inherit,
             "connection_limit": request.connection_limit,
-            "valid_until": request.valid_until.map(|v| v.map_or(json!("cleared"), |d| json!(d))),
+            "valid_until": valid_until.map(|v| v.map_or(json!("cleared"), |d| json!(d))),
             "bypass_rls": request.bypass_rls,
             "member_of": request.member_of,
         },
@@ -1201,7 +1226,7 @@ where
             login: request.login,
             inherit: request.inherit,
             connection_limit: request.connection_limit,
-            valid_until: request.valid_until,
+            valid_until,
             bypass_rls: request.bypass_rls,
             member_of: request.member_of,
             ..RoleUpdateRequest::new(branch.id, &role)

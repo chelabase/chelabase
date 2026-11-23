@@ -3896,8 +3896,7 @@ async fn list_roles_password_states() {
 }
 
 // A role's `valid_until` can be set in SQL or reported by compute to a value past what the time
-// type holds (year 9999 and later). Reading it never panics: it is no expiry, or the instant
-// itself while the type can hold it.
+// type holds (9999-12-31, and later years). Reading it never panics: it is no expiry.
 #[tokio::test]
 #[ignore]
 async fn a_far_future_role_expiry_from_compute_is_handled_without_a_panic() {
@@ -3933,8 +3932,116 @@ async fn a_far_future_role_expiry_from_compute_is_handled_without_a_panic() {
     cleanup(&client, id).await;
     for (far, listed, copied) in seen {
         for read in [listed, copied] {
-            // No expiry, or the stored instant (the year-9999 value is the same one a day on).
-            assert!(read.is_none_or(|t| t.timestamp() >= 253_402_214_400), "{far}: {read:?}");
+            assert_eq!(read, None, "{far}: read as no expiry");
+        }
+    }
+}
+
+// m13: rows the chrono build wrote (here, SQL literals at second, millisecond and microsecond
+// precision) read back through the jiff-backed types and written back unchanged keep their
+// stored value to the microsecond, in both protocols. Values past the type's range in the
+// compute-fillable `valid_until` (9999-12-31, years 10000 and later) read as no expiry, on
+// every role of the endpoint, and its owner still lists and its copies (what the resync reads)
+// still load.
+#[tokio::test]
+#[ignore]
+async fn rows_written_before_the_swap_read_back_equal() {
+    use sqlx::Row;
+    let client = client().await;
+    const LITERALS: &[&str] = &[
+        "2026-09-30 12:00:00+00",
+        "2026-09-30 12:00:00.5+00",
+        "2026-09-30 12:00:00.123+00",
+        "2026-09-30 12:00:00.123456+00",
+        "1999-12-31 23:59:59.999999+00",
+        "1969-12-31 23:59:59.999999+00",
+        "2026-09-30 17:45:00.000001+05:45",
+        "9999-12-30 21:59:59.999999+00",
+    ];
+    // The codec: decode each stored literal, bind it back, and compare in SQL.
+    for lit in LITERALS {
+        let sql = format!("SELECT '{lit}'::timestamptz AS t");
+        let binary = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).fetch_one(client.pool()).await.unwrap();
+        let text = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_one(client.pool()).await.unwrap();
+        for read in [binary.get::<Timestamp, _>("t"), text.get::<Timestamp, _>("t")] {
+            let same: bool = sqlx::query_scalar("SELECT $1::timestamptz = $2::timestamptz")
+                .bind(read)
+                .bind(*lit)
+                .fetch_one(client.pool())
+                .await
+                .unwrap();
+            assert!(same, "{lit} read as {read:?}");
+        }
+    }
+
+    // A role row: read through the listing, written back through an update, unchanged.
+    let (id, ep) = ready_database(&client).await;
+    let attrs = RoleAttributes::default();
+    let role = NewApiRole {
+        name: "kept",
+        owner_level: false,
+        login: false,
+        attributes: &attrs,
+        verifier: None,
+        password_enc: None,
+        change_id: uuid::Uuid::new_v4(),
+    };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let mut mismatched = Vec::new();
+    for lit in LITERALS {
+        sqlx::query("UPDATE neon_roles SET valid_until = $2::timestamptz WHERE endpoint_id = $1 AND name = 'kept'")
+            .bind(&ep)
+            .bind(*lit)
+            .execute(client.pool())
+            .await
+            .unwrap();
+        let listed = client.list_roles(&ep).await.unwrap();
+        let attributes = listed.iter().find(|r| r.name == "kept").unwrap().attributes.clone();
+        assert!(attributes.valid_until.is_some(), "{lit}");
+        let change = ApiRoleChange {
+            owner_level: false,
+            login: false,
+            attributes,
+            secret: SecretChange::Keep,
+            change_id: uuid::Uuid::new_v4(),
+        };
+        client.update_api_role(&ep, "kept", &change, 10).await.unwrap();
+        let same: bool = sqlx::query_scalar(
+            "SELECT valid_until = $2::timestamptz FROM neon_roles WHERE endpoint_id = $1 AND name = 'kept'",
+        )
+        .bind(&ep)
+        .bind(*lit)
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+        if !same {
+            mismatched.push(*lit);
+        }
+    }
+
+    // Past the range, on the API role and on the owner: no expiry, and the reads still work.
+    let mut far_reads = Vec::new();
+    for far in ["9999-12-31 00:00:00+00", "9999-12-30 22:00:01+00", "10000-01-01 00:00:00+00", "200000-06-01 00:00:00+00"] {
+        sqlx::query("UPDATE neon_roles SET valid_until = $2::timestamptz WHERE endpoint_id = $1")
+            .bind(&ep)
+            .bind(far)
+            .execute(client.pool())
+            .await
+            .unwrap();
+        let listed = client.list_roles(&ep).await;
+        let copies = client.role_copies(&ep).await;
+        far_reads.push((far, listed.map_err(|e| e.to_string()), copies.map_err(|e| e.to_string())));
+    }
+    cleanup(&client, id).await;
+    assert!(mismatched.is_empty(), "changed by a read and write-back: {mismatched:?}");
+    for (far, listed, copies) in far_reads {
+        let listed = listed.unwrap_or_else(|e| panic!("{far}: list_roles failed: {e}"));
+        let (copies, _) = copies.unwrap_or_else(|e| panic!("{far}: role_copies failed: {e}"));
+        assert!(listed.iter().any(|r| r.origin == RoleOrigin::Owner), "{far}: the owner lists");
+        assert_eq!(listed.len(), 2, "{far}");
+        assert_eq!(copies.len(), 2, "{far}");
+        for valid_until in listed.iter().map(|r| r.attributes.valid_until).chain(copies.iter().map(|c| c.attributes.valid_until)) {
+            assert_eq!(valid_until, None, "{far}: read as no expiry");
         }
     }
 }

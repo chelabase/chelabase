@@ -1614,6 +1614,48 @@ async fn a_role_valid_until_beyond_the_supported_range_is_refused() {
     assert_eq!(resp.status(), 202);
 }
 
+// m13: a timestamp in a request body past the time type's range, malformed, or without an
+// offset is a 4xx `invalid_request` with the usual error body on every management endpoint
+// that takes one (a role's `valid_until`, a branch's or a restore's point in time), never a
+// 500, and nothing is queued.
+#[tokio::test]
+async fn an_out_of_range_timestamp_is_a_400_not_a_500() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    let restore = format!("{}/restore", t.branch(dev));
+    for ts in [
+        "9999-12-31T23:59:59.999999999Z",
+        "9999-12-30T22:00:01Z",
+        "10000-01-01T00:00:00Z",
+        "+10000-01-01T00:00:00Z",
+        "-10000-01-01T00:00:00Z",
+        "2026-09-30T25:00:00Z",
+        "2026-02-30T12:00:00Z",
+        "2026-09-30T12:00:00",
+        "2026-09-30",
+    ] {
+        let requests = [
+            (Method::POST, t.roles(dev), json!({ "name": "late", "valid_until": ts })),
+            (Method::PATCH, format!("{}/app", t.roles(dev)), json!({ "valid_until": ts })),
+            (Method::POST, t.branches(), json!({ "name": "old", "at": { "timestamp": ts } })),
+            (Method::POST, restore.clone(), json!({ "at": { "timestamp": ts } })),
+        ];
+        for (method, path, body) in requests {
+            let resp = t.send(method.clone(), &path, Some(body)).await;
+            let status = resp.status().as_u16();
+            assert!((400..500).contains(&status), "{method} {path} with {ts}: {status}");
+            let err: Value = resp.json().await.unwrap();
+            assert_eq!(code_of(&err), "invalid_request", "{method} {path} with {ts}: {err}");
+            assert!(!message_of(&err).is_empty(), "{method} {path} with {ts}: {err}");
+        }
+    }
+    assert!(t.published().is_empty());
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    assert_eq!(t.metadata.branch(dev).status, BranchStatus::Ready);
+}
+
 #[tokio::test]
 async fn restore_refusals() {
     let t = branching().await;

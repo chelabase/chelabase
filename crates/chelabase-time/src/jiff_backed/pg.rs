@@ -1,4 +1,4 @@
-//! Postgres codecs for the jiff-backed types, written to match sqlx 0.9's chrono codecs.
+//! Postgres codecs for [`Timestamp`] and [`Date`], written to match sqlx 0.9's chrono codecs.
 //!
 //! Encoding goes through `jiff_sqlx`: a `timestamptz` bind is the microseconds since
 //! `2000-01-01T00:00:00Z`, cut toward 2000 as chrono's `num_microseconds` cuts it, and a `date`
@@ -27,7 +27,7 @@ const PG_EPOCH_DATE: jiff::civil::Date = jiff::civil::date(2000, 1, 1);
 
 /// A binary `timestamptz`: `micros` microseconds after `2000-01-01T00:00:00Z`. Postgres's
 /// `infinity` (`i64::MAX`), `-infinity` (`i64::MIN`) and anything past jiff's range are errors.
-pub fn decode_pg_binary_micros(micros: i64) -> Result<Timestamp, BoxDynError> {
+fn decode_pg_binary_micros(micros: i64) -> Result<Timestamp, BoxDynError> {
     PG_EPOCH
         .checked_add(SignedDuration::from_micros(micros))
         .map(Timestamp)
@@ -37,7 +37,7 @@ pub fn decode_pg_binary_micros(micros: i64) -> Result<Timestamp, BoxDynError> {
 /// A text `timestamptz` as Postgres prints it with `DateStyle` ISO, in any session `TimeZone`
 /// (`2026-09-30 12:00:00.5+00`, `2026-09-30 17:45:00+05:45`, `1900-01-01 05:41:16+05:41:16`).
 /// The offset is applied; `infinity`, `BC` dates and years past 9999 are errors.
-pub fn decode_pg_text(s: &str) -> Result<Timestamp, BoxDynError> {
+fn decode_pg_text(s: &str) -> Result<Timestamp, BoxDynError> {
     // jiff's ISO 8601 parser takes a space for `T`, `±HH`, `±HH:MM` and `±HH:MM:SS` offsets.
     let t: jiff::Timestamp = s
         .parse()
@@ -46,7 +46,7 @@ pub fn decode_pg_text(s: &str) -> Result<Timestamp, BoxDynError> {
 }
 
 /// A text `date` as Postgres prints it with `DateStyle` ISO (`2026-09-30`).
-pub fn decode_pg_date_text(s: &str) -> Result<Date, BoxDynError> {
+fn decode_pg_date_text(s: &str) -> Result<Date, BoxDynError> {
     let d: jiff::civil::Date = s
         .parse()
         .map_err(|e| format!("date {s:?} didn't parse: {e}"))?;

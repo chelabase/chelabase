@@ -7,7 +7,6 @@ description = "NATS JetStream subject names and helpers for Chelabase"
 
 [dependencies]
 chelabase-types = { workspace = true }
-chrono = { workspace = true }
 chelabase-time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

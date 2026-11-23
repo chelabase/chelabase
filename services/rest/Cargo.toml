@@ -60,7 +60,6 @@ chelabase-neon = { workspace = true }
 # U15 (f5b) tests: the fake compute's TLS server (`crates/chelabase-query/tests/common/tls_pg.rs`).
 rustls = { workspace = true }
 chelabase-secrets = { workspace = true }
-chrono = { workspace = true }
 chelabase-time = { workspace = true }
 # The live tests' own admin sessions (the service itself runs on tokio-postgres).
 sqlx = { workspace = true }
