@@ -26,7 +26,7 @@ use chelabase_routes::orchestrator as ep;
 use chelabase_types::access::PlatformRole;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiJson, ApiPath, ProjectId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
@@ -73,8 +73,8 @@ pub(crate) struct Team {
     member_ids: Option<Vec<Uuid>>,
     /// The team's grants on the projects the caller can see, by project id.
     projects: Vec<TeamProjectAccess>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
 }
 
 /// What a team gives its members on one project.

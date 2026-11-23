@@ -597,6 +597,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::{Timestamp, TimestampExt};
     use chelabase_types::protection::{ReviewItemKind, ReviewReason, ReviewReasonKind};
 
     fn item(key: &str) -> ReviewItem {
@@ -620,7 +621,7 @@ mod tests {
     }
 
     fn branch(ack: Option<(&str, &[&str])>) -> BranchRecord {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         BranchRecord {
             id: BranchId::new(),
             database_id: chelabase_types::DatabaseId::new(),

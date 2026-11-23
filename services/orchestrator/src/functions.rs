@@ -473,7 +473,7 @@ use chelabase_types::ApiPath;
 use chelabase_types::access::{Access, PlatformRole};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::data_key::{self, DataKeyKind};
-use chrono::{DateTime, NaiveDate, Utc};
+use chelabase_time::{Date, Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -576,7 +576,7 @@ struct Function {
     id: Uuid,
     name: String,
     kind: Kind,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// The deployment active on the branch.
     #[schema(required = true)]
     deployment_id: Option<Uuid>,
@@ -593,7 +593,7 @@ struct Function {
     #[schema(required = true)]
     last_error: Option<String>,
     #[schema(required = true)]
-    updated_at: Option<DateTime<Utc>>,
+    updated_at: Option<Timestamp>,
     /// A service's health on the branch (checked every 15 s); null before the first check, and
     /// for a function.
     #[schema(required = true)]
@@ -617,10 +617,10 @@ struct Deployment {
     bundle_sha256: Option<String>,
     #[schema(required = true)]
     bundle_size: Option<i64>,
-    compatibility_date: NaiveDate,
+    compatibility_date: Date,
     /// The member who deployed it.
     created_by: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     #[schema(required = true)]
     note: Option<String>,
     /// A service's spec (`{backend: "external", url, health_path}`); null for a function.
@@ -693,7 +693,7 @@ struct CreateDeploymentRequest {
     /// A service's target (needs a tenant admin).
     spec: Option<ServiceSpec>,
     /// Defaults to the manifest's `compatibilityDate`.
-    compatibility_date: Option<NaiveDate>,
+    compatibility_date: Option<Date>,
     note: Option<String>,
     /// Make it the active deployment on the branch (default true). The function stays enabled
     /// or disabled as it was; a new one starts disabled.
@@ -1412,7 +1412,7 @@ impl Rollouts {
     }
 
     fn begin(&self, branch: BranchId, function: Uuid, deployment: Uuid) -> Rollout {
-        let r = Rollout { deployment_id: deployment, state: RolloutState::Pending, error: None, started_at: Utc::now() };
+        let r = Rollout { deployment_id: deployment, state: RolloutState::Pending, error: None, started_at: Timestamp::now() };
         self.inner.lock().expect("not poisoned").insert((branch, function), r.clone());
         r
     }
@@ -1452,7 +1452,7 @@ struct Rollout {
     /// Why it failed (the previous deployment still serves).
     #[schema(required = true)]
     error: Option<String>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 /// `pending` while the new container is started and checked; `failed` when it never passed.
@@ -1725,6 +1725,11 @@ fn sink_error(err: SinkError) -> ApiError {
     }
 }
 
+/// The manifest's `compatibilityDate`: a `YYYY-MM-DD` string, or nothing.
+fn manifest_compatibility_date(manifest: &serde_json::Value) -> Option<Date> {
+    manifest.get("compatibilityDate").and_then(|d| d.as_str()?.parse::<Date>().ok())
+}
+
 /// A function's bundle checked and stored with the functions service: `(sha256, size)` and
 /// its compatibility date. The branch's access is checked again after the upload.
 #[allow(clippy::too_many_arguments)]
@@ -1735,10 +1740,10 @@ async fn stored_bundle<M, J>(
     function: &FunctionRecord,
     manifest: &[u8],
     sha256: &str,
-    compatibility_date: Option<NaiveDate>,
+    compatibility_date: Option<Date>,
     id: Uuid,
     branch_id: Uuid,
-) -> Result<((String, i64), NaiveDate), ApiError>
+) -> Result<((String, i64), Date), ApiError>
 where
     M: MetadataPort,
     J: JobPort,
@@ -1759,9 +1764,7 @@ where
     }
     let compatibility_date = match compatibility_date {
         Some(date) => date,
-        None => parsed
-            .get("compatibilityDate")
-            .and_then(|d| d.as_str()?.parse::<NaiveDate>().ok())
+        None => manifest_compatibility_date(&parsed)
             .ok_or_else(|| unprocessable("no compatibility_date, and the manifest has no compatibilityDate"))?,
     };
     if function.kind != FunctionKind::Function {
@@ -1829,7 +1832,7 @@ where
                 if !is_tenant_admin(&principal) {
                     return Err(tenant_admin_needed());
                 }
-                (None, checked_spec(&state, spec).await?, Utc::now().date_naive())
+                (None, checked_spec(&state, spec).await?, Timestamp::now().utc_date())
             }
             (None, Some(manifest), Some(sha256)) => {
                 let (bundle, date) = stored_bundle(&state, &principal, &record, &function, manifest.get().as_bytes(), sha256, request.compatibility_date, id, branch_id).await?;
@@ -2163,6 +2166,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::DateExt;
     use chelabase_types::container_env::reserved_container_env_name;
 
     /// Exhaustive over kind x tenant admin x (delete, set with a plain, reserved or other-case
@@ -2188,6 +2192,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// m8: a compatibility date is stored as given, read from the manifest when the request has
+    /// none, and refused when it isn't a real `YYYY-MM-DD` date.
+    #[test]
+    fn compatibility_date_is_stored_defaulted_or_refused() {
+        let request = |body: &str| serde_json::from_str::<CreateDeploymentRequest>(body);
+        let date = |y, m, d| Date::ymd(y, m, d).unwrap();
+        assert_eq!(request(r#"{"compatibility_date":"2026-11-01"}"#).unwrap().compatibility_date, Some(date(2026, 11, 1)));
+        assert_eq!(request("{}").unwrap().compatibility_date, None);
+        for bad in ["2026-13-01", "2026-02-30", "20261101", "yesterday", "2026-11-01T00:00:00Z", ""] {
+            assert!(request(&format!(r#"{{"compatibility_date":"{bad}"}}"#)).is_err(), "{bad}");
+        }
+        assert!(request(r#"{"compatibility_date":null}"#).unwrap().compatibility_date.is_none());
+        let manifest = |d: serde_json::Value| manifest_compatibility_date(&serde_json::json!({ "compatibilityDate": d }));
+        assert_eq!(manifest("2026-11-01".into()), Some(date(2026, 11, 1)));
+        assert_eq!(manifest("2026-13-01".into()), None);
+        assert_eq!(manifest(serde_json::Value::Null), None);
+        assert_eq!(manifest(20261101.into()), None);
+        assert_eq!(manifest_compatibility_date(&serde_json::json!({})), None);
     }
 
     #[test]

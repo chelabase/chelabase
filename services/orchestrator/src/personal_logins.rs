@@ -26,7 +26,7 @@ use chelabase_types::access::PlatformRole;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::role_name::{RoleNameError, check_login_role_name};
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -39,7 +39,7 @@ use crate::roles::{name_error, owner_name};
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort};
 
 /// D4: a login's `VALID UNTIL`, from its creation or last reset.
-const LOGIN_LIFETIME_DAYS: i64 = 90;
+const LOGIN_LIFETIME_DAYS: u64 = 90;
 
 /// The answer for a login that isn't there or isn't the caller's to touch: one message for
 /// every case, so it tells nothing apart (and isn't a route's generic "not found").
@@ -111,11 +111,11 @@ pub(crate) struct PersonalLoginView {
     /// The Postgres role name, the same on every branch.
     role_name: String,
     /// When the password stops working (90 days after its creation or last reset).
-    valid_until: DateTime<Utc>,
-    created_at: DateTime<Utc>,
+    valid_until: Timestamp,
+    created_at: Timestamp,
     status: PersonalLoginStatus,
     #[schema(required = true)]
-    revoked_at: Option<DateTime<Utc>>,
+    revoked_at: Option<Timestamp>,
     #[schema(required = true)]
     revoked_reason: Option<PersonalLoginRevokeReason>,
 }
@@ -394,8 +394,8 @@ fn caller_id(principal: &AuthPrincipal) -> Result<Uuid, ApiError> {
         .ok_or_else(|| internal("personal login", "allowed a caller with no member row"))
 }
 
-fn valid_until() -> DateTime<Utc> {
-    Utc::now() + chrono::Duration::days(LOGIN_LIFETIME_DAYS)
+fn valid_until() -> Timestamp {
+    Timestamp::now() + chelabase_time::days(LOGIN_LIFETIME_DAYS)
 }
 
 // --- Routes ------------------------------------------------------------------------------------
@@ -824,8 +824,8 @@ mod tests {
                 project_id: Uuid::nil(),
                 database_name: "web1".into(),
                 role_name: "alice_login".into(),
-                valid_until: Utc::now(),
-                created_at: Utc::now(),
+                valid_until: Timestamp::now(),
+                created_at: Timestamp::now(),
                 revoked_at: None,
                 revoked_reason: None,
                 status: LoginStatus::Active,

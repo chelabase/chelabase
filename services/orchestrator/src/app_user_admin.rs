@@ -19,7 +19,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use chelabase_metadata::{AppUsersStatus, ProjectRecord};
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_query::app_users::{NewUserRow, SYNC_ROLE, SyncTarget, SyncTls, UserRowError};
@@ -74,7 +74,7 @@ pub struct AppUser {
     pub email: String,
     pub email_verified: bool,
     pub state: AppUserState,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl AppUser {
@@ -124,9 +124,9 @@ pub struct UpdateAppUserRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AppUserSession {
     pub id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub last_used_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub last_used_at: Timestamp,
+    pub expires_at: Timestamp,
 }
 
 #[derive(Debug, Deserialize)]
