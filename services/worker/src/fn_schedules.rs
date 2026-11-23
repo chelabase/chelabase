@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use chelabase_metadata::MetadataClient;
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
@@ -37,7 +37,7 @@ pub const MAX_IN_FLIGHT: usize = 64;
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The invocation's body: what the runtime hands the `scheduled` handler as its controller.
-pub fn event_body(cron: &str, scheduled: DateTime<Utc>) -> serde_json::Value {
+pub fn event_body(cron: &str, scheduled: Timestamp) -> serde_json::Value {
     serde_json::json!({
         "type": "scheduled",
         "cron": cron,
@@ -230,13 +230,13 @@ pub async fn schedule_loop(metadata: MetadataClient, invoker: Arc<dyn Invoker>) 
 mod tests {
     use super::*;
     use chelabase_metadata::{Schedule, advance};
-    use chrono::TimeZone;
+    use chelabase_time::TimestampExt;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn at(s: &str) -> Timestamp {
+        Timestamp::parse_rfc3339(s).unwrap()
     }
 
-    fn runs(cron: &str, tz: &str, from: &str, n: usize) -> Vec<DateTime<Utc>> {
+    fn runs(cron: &str, tz: &str, from: &str, n: usize) -> Vec<Timestamp> {
         let s = Schedule::parse(cron, tz).unwrap();
         let mut t = at(from);
         (0..n)
@@ -366,7 +366,7 @@ mod tests {
             database_id: database,
             function_name: "f".into(),
             cron: "* * * * *".into(),
-            run: run.then(Utc::now),
+            run: run.then(Timestamp::now),
             next_run_at: None,
         }
     }
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn fn_schedules_event_body_is_the_runtime_contract() {
-        let t = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t = Timestamp::from_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
         assert_eq!(
             event_body("* * * * *", t),
             serde_json::json!({"type": "scheduled", "cron": "* * * * *", "scheduledTime": 1767225600000_i64})
