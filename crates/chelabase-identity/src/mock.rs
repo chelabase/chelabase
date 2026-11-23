@@ -859,3 +859,38 @@ impl FakeIdentity {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    /// The text the mock writes is `.mmmZ`: sub-millisecond digits are cut, and a whole second
+    /// still shows `.000`.
+    #[test]
+    fn user_and_session_timestamps_are_millisecond_text() {
+        let frac = at("2026-09-30T12:00:00.123456789Z");
+        let whole = at("2026-09-30T12:00:00Z");
+        let user = FUser {
+            id: "u".into(),
+            email: "a@b.c".into(),
+            password: None,
+            name: "n".into(),
+            verified: true,
+            banned: false,
+            ban_reason: None,
+            created: frac,
+            updated: whole,
+        };
+        let u = user_out(&user);
+        assert_eq!(u["created_at"], "2026-09-30T12:00:00.123Z");
+        assert_eq!(u["updated_at"], "2026-09-30T12:00:00.000Z");
+        let session = FSession { id: "s".into(), token: "t".into(), user_id: "u".into(), created: whole, expires: frac };
+        let s = session_out(&session);
+        assert_eq!(s["created_at"], "2026-09-30T12:00:00.000Z");
+        assert_eq!(s["expires_at"], "2026-09-30T12:00:00.123Z");
+    }
+}
