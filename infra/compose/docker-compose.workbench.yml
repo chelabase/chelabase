@@ -562,6 +562,10 @@ services:
       # with --use-aliases), over http. Exactly that host; every other one stays public-only.
       - CHELABASE_WEBHOOKS_ALLOW_HOSTS=runner
       - CHELABASE_WEBHOOKS_ALLOW_HTTP=true
+      # #337, dev only: the periodic passes leave live-test databases (ids only test helpers make,
+      # worker::live_test) to the tests driving them. Here alone: never the base file, stack.env
+      # or the runner (whose in-process workers sweep their own test databases).
+      - CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES=true
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes: !override
       - *checkout-ro

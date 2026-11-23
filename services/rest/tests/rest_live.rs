@@ -161,7 +161,8 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let (worker, metadata) = setup().await;
-    let db = DatabaseId::new();
+    // #337: a live-test id, so the stack's worker leaves the database to this test.
+    let db = worker::live_test::database_id();
     let db_name = format!("rest-{name}-{}", &db.to_string()[..6]);
     metadata
         .insert_database_pending(db, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &db_name)

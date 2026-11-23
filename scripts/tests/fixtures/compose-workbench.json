@@ -2713,7 +2713,8 @@
         "CHELABASE_WEBHOOKS_ALLOW_HOSTS": "runner",
         "CHELABASE_WEBHOOKS_ALLOW_HTTP": "true",
         "CHELABASE_WORKER_FUNCTIONS_TOKEN_FILE": "/m/.chelabase/tokens/worker-functions.token",
-        "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token"
+        "CHELABASE_WORKER_SERVICE_RUNNER_TOKEN_FILE": "/m/.chelabase/tokens/worker-service-runner.token",
+        "CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES": "true"
       },
       "group_add": [
         "973"

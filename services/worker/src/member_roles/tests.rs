@@ -1763,6 +1763,24 @@ async fn the_sweep_reconciles_every_branch_with_members() {
     assert_eq!(branches, expected);
 }
 
+/// #337: with the workbench setting on, the sweep leaves a live test's branches (main and
+/// children) alone; off (the default), it visits them as every other.
+#[tokio::test]
+async fn the_sweep_leaves_live_test_branches_alone_only_with_the_setting() {
+    let (mut w, _journal) = worker();
+    let test_db = w.metadata.insert_database_with_id(
+        crate::live_test::database_id(),
+        "t",
+        chelabase_metadata::DatabaseStatus::Pending,
+    );
+    w.handle_provision(test_db, "t").await.unwrap();
+    crate::fakes::ready_branch(&w, test_db, "dev", BranchId::from(test_db)).await;
+    ready_database(&w).await;
+    assert_eq!(w.sweep_member_roles_once().await, (3, 0), "off: every branch");
+    w.skip_live_test_databases = true;
+    assert_eq!(w.sweep_member_roles_once().await, (1, 0), "on: the platform's branch only");
+}
+
 fn locked(role_name: &str, roles: &[&str]) -> DesiredMemberRole {
     DesiredMemberRole { locked: true, ..desired(role_name, roles, false) }
 }

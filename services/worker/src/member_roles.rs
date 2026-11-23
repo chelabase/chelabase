@@ -2280,6 +2280,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         reply
     }
 
+    /// #337: the branches the sweep leaves to live tests. With the setting on, the live
+    /// branches are listed to find each one's database; a failed listing leaves only the live
+    /// tests' main branches (whose id is the database's) out.
+    async fn member_sweep_live_tests(&self) -> crate::live_test::LiveTests {
+        if !self.skip_live_test_databases {
+            return crate::live_test::LiveTests::off();
+        }
+        let branches = match self.metadata.list_live_branches_for_reconcile().await {
+            Ok(branches) => branches,
+            Err(e) => {
+                warn!("member-role sweep: listing the branches' databases: {e}");
+                Vec::new()
+            }
+        };
+        crate::live_test::LiveTests::new(true, branches.iter().map(|b| (b.id, b.database_id)))
+    }
+
     /// I2: one pass of the periodic sweep, the backstop for lost or failed reconciles: every
     /// ready normal branch of a live database is reconciled once (PB R12: members or not, as
     /// the protected-branch guard's backstop too).
@@ -2292,9 +2309,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 return (0, 0);
             }
         };
+        let live_tests = self.member_sweep_live_tests().await;
         let (mut done, mut failures) = (0, 0);
         for branch in branches {
             let branch = BranchId::from(branch);
+            if live_tests.skips(branch) {
+                continue;
+            }
             match self.reconcile_member_roles(branch, None).await {
                 MemberRolesReply::Done { .. } => done += 1,
                 MemberRolesReply::Failed { message } => {

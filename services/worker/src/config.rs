@@ -81,6 +81,10 @@ pub struct WorkerConfig {
     /// removed (and legacy networks are cleaned up) even when this is off, because network
     /// isolation outranks a debugging opt-out.
     pub remove_orphans: bool,
+    /// `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES` (default off; #337): the periodic passes
+    /// leave live-test databases ([`crate::live_test`]) to the tests that made them. Only the
+    /// workbench overlay sets it; the self-hosted base file never does.
+    pub skip_live_test_databases: bool,
     /// `CHELABASE_COMPUTE_CONTROL_NETWORK` (default `chelabase_control-internal`): the network
     /// the orchestrator reaches computes on; member logins come from its addresses there.
     pub compute_control_network: String,
@@ -178,6 +182,10 @@ impl WorkerConfig {
                 non_blank(&get, "CHELABASE_MEMBER_ROLES_SWEEP_SECS"),
             )?,
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
+            skip_live_test_databases: skip_live_test_databases(non_blank(
+                &get,
+                crate::live_test::ENV,
+            ))?,
             compute_control_network: or_default(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
                 "chelabase_control-internal",
@@ -356,6 +364,17 @@ fn storage_token_refresh_every(value: Option<String>) -> anyhow::Result<Duration
         _ => Err(anyhow!(
             "{NAME}={value:?}: expected whole seconds from 1 to {max} (half a storage token's life)"
         )),
+    }
+}
+
+/// `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES`: off when unset; `true/1/yes/on` or
+/// `false/0/no/off`. Anything else is a startup error, never a silent default.
+fn skip_live_test_databases(value: Option<String>) -> anyhow::Result<bool> {
+    const NAME: &str = crate::live_test::ENV;
+    match value.map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("false" | "0" | "no" | "off") => Ok(false),
+        Some("true" | "1" | "yes" | "on") => Ok(true),
+        Some(other) => Err(anyhow!("{NAME}={other:?}: expected true or false")),
     }
 }
 
@@ -555,6 +574,7 @@ pub fn build_with(
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,
         remove_orphans: config.remove_orphans,
+        skip_live_test_databases: config.skip_live_test_databases,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
@@ -828,6 +848,7 @@ mod tests {
             app_users_reconcile_every: _,
             member_roles_sweep_every: _,
             remove_orphans: _,
+            skip_live_test_databases: _,
             compute_control_network: _,
             legacy_compute_networks: _,
             compute_egress_dns: _,
@@ -1080,6 +1101,23 @@ mod tests {
                 .to_string();
             assert!(err.contains(VAR), "{bad}: {err}");
         }
+    }
+
+    /// #337: `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES` is off unless explicitly true.
+    #[test]
+    fn config_reads_skip_live_test_databases() {
+        const VAR: &str = crate::live_test::ENV;
+        let with = |v: &str| WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, v)]));
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert!(!c.skip_live_test_databases, "off by default");
+        for off in ["false", "0", "no", "off", " FALSE ", ""] {
+            assert!(!with(off).unwrap().skip_live_test_databases, "{off:?}");
+        }
+        for on in ["true", "1", "yes", "on", " TRUE "] {
+            assert!(with(on).unwrap().skip_live_test_databases, "{on:?}");
+        }
+        let err = with("maybe").unwrap_err().to_string();
+        assert!(err.contains(VAR), "{err}");
     }
 
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: on unless explicitly false (a worker sharing the

@@ -168,6 +168,7 @@ pub(crate) fn rt_worker() -> Rt {
         app_users_reconcile_every: w.app_users_reconcile_every,
         member_roles_sweep_every: w.member_roles_sweep_every,
         remove_orphans: w.remove_orphans,
+        skip_live_test_databases: w.skip_live_test_databases,
         merge_tx_timeout: w.merge_tx_timeout,
         merge_online_step_timeout: w.merge_online_step_timeout,
         resync_requests: w.resync_requests,

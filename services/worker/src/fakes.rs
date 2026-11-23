@@ -527,7 +527,16 @@ impl FakeMetadata {
     /// A database row with the given status and nothing else, and its main branch (same id
     /// and status), as `insert_database_pending` makes them.
     pub fn insert_database(&self, name: &str, status: DatabaseStatus) -> DatabaseId {
-        let id = DatabaseId::new();
+        self.insert_database_with_id(DatabaseId::new(), name, status)
+    }
+
+    /// [`Self::insert_database`] with the id given (a live test's, #337).
+    pub fn insert_database_with_id(
+        &self,
+        id: DatabaseId,
+        name: &str,
+        status: DatabaseStatus,
+    ) -> DatabaseId {
         let now = Timestamp::now();
         let mut state = self.state();
         state.databases.insert(
@@ -4125,6 +4134,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),
         remove_orphans: true,
+        skip_live_test_databases: false,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
         resync_requests: Default::default(),
