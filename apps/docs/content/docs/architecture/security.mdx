@@ -59,6 +59,12 @@ Realtime never sends a row. A change reaches Studio as the primary key of the ro
 
 The replication login `chelabase_realtime` is `NOBYPASSRLS` and not a superuser, and its output plugin emits only keys, never row values. Logins as `chelabase_realtime` are accepted only from realtime's address and the test runner's, and only with realtime's client certificate. An empty `CHELABASE_REALTIME_LOGIN_CIDRS` turns the address rule off. Realtime never holds owner credentials: owner viewers' checks go through the orchestrator. Tickets are single use, last 30 seconds and are sealed in Valkey with a key only realtime holds. Studio sockets end when the member's token expires. See [Realtime](/architecture/realtime).
 
+## The MCP server
+
+With the `mcp` profile on, `/mcp` lets an AI client call the Management API as the signed-in member. The only credential it takes is a member token, checked in `mcp` before anything is read. Model-written code runs in a runtime with no network and no secret, on an internal network shared with `mcp` alone; each API call it makes is checked against a table of operations and made with the member's own token, which the code never sees. A destructive operation needs a flag, a read-only connection runs reads only, and operations that answer with a credential are refused.
+
+What isn't covered: data the member stored (table rows, SQL results, object contents, logs) is returned as it is and may hold credentials; a read-only SQL run still permits locks, `pg_sleep` and, with `dblink` or a foreign-data wrapper installed, writes through a separate session; the flag is set by the model, so it confirms intent only if the client asks the user; and failed token checks are not limited in `mcp`, and nothing limits them yet: they should be limited at the gateway or in front of it (#395). See [MCP server](/architecture/mcp).
+
 ## What is not a boundary
 
 - **The SQL editor's guard** is a confirmation step. A client that sends `confirm: true` skips it, and it looks at statements, not at what they call.

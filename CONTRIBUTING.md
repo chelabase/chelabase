@@ -93,8 +93,8 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just workbench up [--with docs,landing]` | Start this checkout's stack: the Compose services (metadata Postgres, NATS, Valkey, the identity service, the Neon storage stack and proxy, Mailpit), the bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, realtime, Studio) in containers built from your host-built binaries. Waits in line when the stack cap is reached. Prints the URLs |
-| `just workbench restart [app…]` | Rebuild and recreate the named apps (all six Rust apps when none); `studio`, `docs` and `landing` can be named too |
+| `just workbench up [--with docs,landing]` | Start this checkout's stack: the Compose services (metadata Postgres, NATS, Valkey, the identity service, the Neon storage stack and proxy, Mailpit), the bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, realtime, the MCP server, Studio) in containers built from your host-built binaries. Waits in line when the stack cap is reached. Prints the URLs |
+| `just workbench restart [app…]` | Rebuild and recreate the named apps (every Rust app when none); `studio`, `docs` and `landing` can be named too |
 | `just workbench down [--stack <slug>]` | Stop the stack and remove its computes; volumes and state stay |
 | `just workbench purge [--stack <slug>] [--yes]` | `down`, then delete the volumes, state directory and registry entry. Main is purged only when named and confirmed: `just workbench purge --stack main --yes` |
 | `just workbench status` | Every stack: checkout, ports, running or stopped, URLs; then the queue |
@@ -168,6 +168,7 @@ Everything a browser or a script reaches goes through the stack's gateway, by ho
 | http://docs.chelabase.localhost:8000 | The docs site (`just workbench up --with docs`) |
 | http://landing.chelabase.localhost:8000 | The landing page (`just workbench up --with landing`) |
 | http://mail.chelabase.localhost:8000 | Mailpit (workbench only) |
+| http://api.chelabase.localhost:8000/mcp | The MCP endpoint (`mcp` and its sandbox runtime `mcp-runtime`, which `up` builds and starts; `POST` without a bearer answers 401 with the challenge). Its live tests: `just workbench test -p mcp --test runtime -- --run-ignored only` |
 
 `chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack; the rules are on the docs page [Hosts](https://docs.chelabase.com/self-hosting/hosts/).
 

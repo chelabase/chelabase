@@ -48,7 +48,8 @@ fail() {
 }
 
 # The networks that are internal on purpose (no route out); every other network must not be.
-internal_expected="compute-internal control-internal functions functions-control services-control"
+# `mcp-sandbox` (mcp-core m8): `mcp` and its runtime only (compose-secret-boundary.sh check 9).
+internal_expected="compute-internal control-internal functions functions-control mcp-sandbox services-control"
 # Services allowed on `compute-internal` or `control-internal` with only internal networks, and
 # why. Empty today: every member is also on `default` (or its own outbound network).
 declare -A only_internal=()
@@ -382,7 +383,8 @@ check "example overlay" chelabase "$tmp/example.json"
 egress_checks "example overlay" base "$tmp/example.json"
 
 workbench() { # workbench <label> <env file>
-  local profiles=(--profile sites --profile runner --profile services --profile compute-egress)
+  # `mcp`: every workbench compose call turns it on (tools/cli/src/workbench/argv.rs).
+  local profiles=(--profile sites --profile runner --profile services --profile compute-egress --profile mcp)
   render chelabase-feat-x "$2" -f "$base" -f "$dir/docker-compose.workbench.yml" >"$tmp/wb.json" ||
     fail "rendering the workbench overlay ($1) failed"
   check "$1" chelabase-feat-x "$tmp/wb.json"

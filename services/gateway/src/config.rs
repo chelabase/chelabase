@@ -95,6 +95,10 @@ impl GatewayConfig {
         .and_then(|u| u.with_storage(&or("CHELABASE_STORAGE_URL", "http://127.0.0.1:8089")))
         .and_then(|u| u.with_functions(&or("CHELABASE_FUNCTIONS_URL", "http://127.0.0.1:8091")))
         .map_err(anyhow::Error::msg)?;
+        // MCP core m2: optional, no default; unset or blank, `/mcp` isn't routed.
+        if let Some(url) = get("CHELABASE_MCP_URL").filter(|v| !v.trim().is_empty()) {
+            upstreams = upstreams.with_mcp(&url).map_err(|e| anyhow::anyhow!("CHELABASE_MCP_URL: {e}"))?;
+        }
         for (site, var, default, enabled) in sites {
             if enabled {
                 upstreams = upstreams
@@ -417,16 +421,16 @@ mod tests {
     #[test]
     fn realtime_upstream_defaults_to_loopback_8087() {
         let c = GatewayConfig::from_lookup(with(&[])).unwrap();
-        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), "127.0.0.1:8087");
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), Some("127.0.0.1:8087"));
     }
 
     #[test]
     fn realtime_upstream_is_set_by_chelabase_realtime_url() {
         let c = GatewayConfig::from_lookup(with(&[("CHELABASE_REALTIME_URL", "http://realtime:8087/")])).unwrap();
-        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), "realtime:8087");
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Realtime), Some("realtime:8087"));
         // The other upstreams are untouched.
-        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Rest), "127.0.0.1:8085");
-        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Orchestrator), "127.0.0.1:8081");
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Rest), Some("127.0.0.1:8085"));
+        assert_eq!(c.upstreams.addr(chelabase_routes::Service::Orchestrator), Some("127.0.0.1:8081"));
     }
 
     #[test]
@@ -442,6 +446,23 @@ mod tests {
     #[test]
     fn upstreams_new_resolves_realtime_to_the_pinned_default() {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
-        assert_eq!(upstreams.addr(chelabase_routes::Service::Realtime), "127.0.0.1:8087");
+        assert_eq!(upstreams.addr(chelabase_routes::Service::Realtime), Some("127.0.0.1:8087"));
+    }
+
+    // ---- MCP core m2: the optional mcp upstream ----
+
+    #[test]
+    fn mcp_upstream_is_optional_and_set_by_chelabase_mcp_url() {
+        use chelabase_routes::Service;
+        for unset in [&[][..], &[("CHELABASE_MCP_URL", "")], &[("CHELABASE_MCP_URL", "  ")]] {
+            let c = GatewayConfig::from_lookup(with(unset)).unwrap();
+            assert_eq!(c.upstreams.addr(Service::Mcp), None, "{unset:?}");
+        }
+        let c = GatewayConfig::from_lookup(with(&[("CHELABASE_MCP_URL", "http://mcp:8093")])).unwrap();
+        assert_eq!(c.upstreams.addr(Service::Mcp), Some("mcp:8093"));
+        let msg = GatewayConfig::from_lookup(with(&[("CHELABASE_MCP_URL", "https://mcp:8093")]))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("CHELABASE_MCP_URL"), "{msg}");
     }
 }

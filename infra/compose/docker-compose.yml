@@ -18,6 +18,9 @@
 #
 # The identity service (auth-replacement) is internal: no published port, no gateway route.
 #
+# The MCP server and its sandbox runtime run only with the `mcp` profile (COMPOSE_PROFILES=mcp,
+# and CHELABASE_MCP_URL in .env); without it nothing of theirs starts or is pulled.
+#
 # Two services are published: the gateway (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT) and the
 # proxy's Postgres and SQL-over-HTTP ports (CHELABASE_PROXY_ADDR, CHELABASE_PROXY_PORT and
 # CHELABASE_PROXY_HTTP_PORT). Everything else talks over the project network by service name;
@@ -1186,6 +1189,8 @@ services:
       CHELABASE_GATEWAY_TRUSTED_PROXIES: ${CHELABASE_GATEWAY_TRUSTED_PROXIES:-}
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
+      # mcp-core: the MCP server's public listener (profile `mcp`); blank answers 404 on /mcp.
+      CHELABASE_MCP_URL: ${CHELABASE_MCP_URL:-}
     ports:
       - "${CHELABASE_HTTP_ADDR:-127.0.0.1}:${CHELABASE_HTTP_PORT:-${CHELABASE_PUBLIC_PORT:-8000}}:${CHELABASE_PUBLIC_PORT:-8000}"
     # #183: also on the runtime's `functions` network as `gateway-functions`, the address of the
@@ -1542,6 +1547,81 @@ services:
       retries: 3
       start_period: 10s
 
+  # mcp-core (m8): the MCP server, behind the gateway at /mcp, for signed-in members. Profile `mcp`,
+  # off by default (with it, .env sets the gateway's CHELABASE_MCP_URL). It verifies member tokens
+  # with the member public key, the one secret it mounts. Two listeners, each binding its own
+  # network's alias (plus loopback for the healthcheck), never 0.0.0.0: the public one (8095) on
+  # the default network, where the gateway reaches it and where it reaches the API host (the
+  # gateway's alias); the internal one (8096) on `mcp-sandbox`, the only address the runtime has
+  # (the spec bundle and the runs' callbacks).
+  mcp:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/mcp:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["mcp"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      <<: *app-env
+      CHELABASE_MCP_LISTEN: mcp-public:8095,127.0.0.1:8095
+      CHELABASE_MCP_INTERNAL_LISTEN: mcp-internal:8096
+      CHELABASE_MCP_RUNTIME_URL: http://mcp-runtime:8080
+      # execute's API calls go to the gateway on the default network, with Host set to the API host.
+      CHELABASE_MCP_API_URL: http://gateway:${CHELABASE_PUBLIC_PORT:-8000}
+      # .env's tunables (blank = the service's default).
+      CHELABASE_MCP_ALLOWED_ORIGINS: ${CHELABASE_MCP_ALLOWED_ORIGINS:-}
+      CHELABASE_MCP_LOG_CODE: ${CHELABASE_MCP_LOG_CODE:-}
+      CHELABASE_MCP_TIMEOUT_MS: ${CHELABASE_MCP_TIMEOUT_MS:-}
+      CHELABASE_MCP_RESULT_MAX_BYTES: ${CHELABASE_MCP_RESULT_MAX_BYTES:-}
+      CHELABASE_MCP_CALLS_PER_MINUTE: ${CHELABASE_MCP_CALLS_PER_MINUTE:-}
+      CHELABASE_MCP_MEMBER_CONCURRENCY: ${CHELABASE_MCP_MEMBER_CONCURRENCY:-}
+      CHELABASE_MCP_CONCURRENCY: ${CHELABASE_MCP_CONCURRENCY:-}
+      CHELABASE_MCP_MAX_CALLS: ${CHELABASE_MCP_MAX_CALLS:-}
+      CHELABASE_MCP_RESPONSE_MAX_BYTES: ${CHELABASE_MCP_RESPONSE_MAX_BYTES:-}
+    networks:
+      default:
+        aliases: [mcp-public]
+      mcp-sandbox:
+        aliases: [mcp-internal]
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8095/health"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+
+  # mcp-core (m3, m8): workerd running model-written code for `mcp`, one fresh isolate per run,
+  # with no outbound of its own (infra/mcp-runtime/config.capnp). Its one network is the internal
+  # `mcp-sandbox`, shared with `mcp` alone: no route to any other service or out. No secret, no
+  # setting, no published port, no volume; non-root on a read-only root with every capability
+  # dropped. Swap equals memory: ArrayBuffer memory sits outside the V8 heap cap, so only the
+  # container limit bounds it. The image's watchdog ends a stalled workerd and `always` restarts
+  # it. Profile `mcp`, with the server.
+  mcp-runtime:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/mcp-runtime:${CHELABASE_IMAGE_TAG:-unpublished}
+    profiles: ["mcp"]
+    command: ["/usr/local/bin/workerd", "serve", "--experimental",
+              "--external-addr", "host=mcp-internal:8096",
+              "/etc/mcp-runtime/config.capnp"]
+    restart: always
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CHELABASE_MCP_RUNTIME_MEMORY:-512m}
+    memswap_limit: ${CHELABASE_MCP_RUNTIME_MEMORY:-512m}
+    pids_limit: 256
+    networks:
+      mcp-sandbox: {}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/busybox", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:9090/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
   # compute-network-reach: the only way out of `compute-internal`. A forwarder with one listener per
   # destination in CHELABASE_COMPUTE_EGRESS_ALLOW (default empty: nothing leaves) and a resolver that
   # answers those names only; public addresses only are dialled. Profile `compute-egress` (off by
@@ -1659,6 +1739,9 @@ networks:
   # Edge functions (m10): the functions service and the worker to the service runner's API; no
   # route out.
   services-control:
+    internal: true
+  # mcp-core (m8): `mcp` and its sandbox runtime, nothing else; no route out.
+  mcp-sandbox:
     internal: true
 
 volumes:

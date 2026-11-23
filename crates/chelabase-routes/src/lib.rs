@@ -69,6 +69,9 @@ pub enum Service {
     Storage,
     /// Edge functions' invocations (edge functions m4).
     Functions,
+    /// The MCP endpoint and its protected-resource metadata (MCP core m4). Optional: the
+    /// gateway routes it only when `CHELABASE_MCP_URL` is set.
+    Mcp,
 }
 
 impl Service {
@@ -81,6 +84,7 @@ impl Service {
             Service::Realtime => "realtime",
             Service::Storage => "storage",
             Service::Functions => "functions",
+            Service::Mcp => "mcp",
         }
     }
 }
@@ -94,6 +98,9 @@ pub enum Transfer {
     /// A body that may take long to send or answer (object uploads and downloads): long
     /// upstream read and client idle timeouts.
     Stream,
+    /// A request whose answer may start only after minutes (an MCP tool run): a long upstream
+    /// read timeout, the default client idle timeout.
+    SlowAnswer,
 }
 
 /// Which family of hostnames an endpoint is served on.
@@ -115,6 +122,11 @@ pub enum Auth {
     SecretDataKey,
     /// A public data key; a secret key is refused.
     PublicDataKey,
+    /// A bearer the owning service verifies (the `/mcp` routes only: a member token today; MCP access
+    /// tokens come with the `mcp-oauth` epic). The gateway requires one in `Authorization: Bearer` form, mints no
+    /// internal identity, and passes the header on unchanged; without one it answers 401 with
+    /// the MCP `resource_metadata` challenge.
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,9 +167,11 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Every storage route streams ([`Transfer::Stream`]), and Studio's storage routes on the
-    /// orchestrator; every other route is standard.
+    /// orchestrator; `POST /mcp` waits for a tool run ([`Transfer::SlowAnswer`]); every other
+    /// route is standard.
     pub const fn transfer(&self) -> Transfer {
         match self.service {
+            Service::Mcp if same_str(self.name, mcp::ENDPOINT.name) => Transfer::SlowAnswer,
             Service::Storage => Transfer::Stream,
             // m9: Studio's storage routes stream through the orchestrator.
             Service::Orchestrator if starts_with(self.name, orchestrator::STORAGE_PREFIX) => {
@@ -166,6 +180,11 @@ impl Endpoint {
             _ => Transfer::Standard,
         }
     }
+}
+
+/// Whether `a` and `b` are equal (const).
+const fn same_str(a: &str, b: &str) -> bool {
+    a.len() == b.len() && starts_with(a, b)
 }
 
 /// Whether `s` starts with `prefix` (const).
@@ -1619,6 +1638,47 @@ pub mod functions {
         invoke("functions.call_service_path", "/services/v1/{name}/{*rest}", Auth::DataKey, Access::DataKey);
 }
 
+/// MCP core m2: served by `mcp` (m4). `/mcp` takes a bearer the service verifies
+/// ([`Auth::Mcp`]); GET and DELETE are declared so the service can answer them (405). The
+/// protected-resource metadata (RFC 9728) is public, at the root and at the `/mcp` suffix.
+pub mod mcp {
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    const PATH: &str = "/mcp";
+
+    const fn endpoint(name: &'static str, method: Method) -> Endpoint {
+        Endpoint {
+            name,
+            method,
+            path: PATH,
+            scope: Scope::Api,
+            service: Service::Mcp,
+            policy: Policy { auth: Auth::Mcp, cors: Cors::None, access: Access::SignedIn },
+            websocket: false,
+        }
+    }
+
+    const fn metadata(name: &'static str, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method: Method::Get,
+            path,
+            scope: Scope::Api,
+            service: Service::Mcp,
+            policy: Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public },
+            websocket: false,
+        }
+    }
+
+    pub const ENDPOINT: Endpoint = endpoint("mcp.endpoint", Method::Post);
+    pub const ENDPOINT_GET: Endpoint = endpoint("mcp.endpoint_get", Method::Get);
+    pub const ENDPOINT_DELETE: Endpoint = endpoint("mcp.endpoint_delete", Method::Delete);
+    pub const PROTECTED_RESOURCE: Endpoint =
+        metadata("mcp.protected_resource", "/.well-known/oauth-protected-resource");
+    pub const PROTECTED_RESOURCE_MCP: Endpoint =
+        metadata("mcp.protected_resource_mcp", "/.well-known/oauth-protected-resource/mcp");
+}
+
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
@@ -1852,6 +1912,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
     functions::INVOKE_PUBLIC_PATH,
     functions::CALL_SERVICE,
     functions::CALL_SERVICE_PATH,
+    mcp::ENDPOINT,
+    mcp::ENDPOINT_GET,
+    mcp::ENDPOINT_DELETE,
+    mcp::PROTECTED_RESOURCE,
+    mcp::PROTECTED_RESOURCE_MCP,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1867,11 +1932,27 @@ pub fn match_endpoint(scope: Scope, method: &str, path: &str) -> Match {
     match_in(ENDPOINTS, scope, method, path)
 }
 
+/// [`match_endpoint`] over the endpoints of the services `served` accepts: another service's
+/// routes don't exist (an optional service without an upstream answers as an unknown path).
+pub fn match_served(scope: Scope, method: &str, path: &str, served: impl Fn(Service) -> bool) -> Match {
+    match_where(ENDPOINTS, scope, method, path, served)
+}
+
 fn match_in(endpoints: &'static [Endpoint], scope: Scope, method: &str, path: &str) -> Match {
+    match_where(endpoints, scope, method, path, |_| true)
+}
+
+fn match_where(
+    endpoints: &'static [Endpoint],
+    scope: Scope,
+    method: &str,
+    path: &str,
+    served: impl Fn(Service) -> bool,
+) -> Match {
     let mut best: Option<(&'static Endpoint, Vec<bool>)> = None;
     let mut allowed = Vec::new();
 
-    for ep in endpoints.iter().filter(|ep| ep.scope == scope) {
+    for ep in endpoints.iter().filter(|ep| ep.scope == scope && served(ep.service)) {
         let Some(specificity) = path_specificity(ep.path, path) else {
             continue;
         };
@@ -2047,6 +2128,7 @@ mod tests {
         for ep in ENDPOINTS
             .iter()
             .filter(|e| e.service != Service::Storage && !e.name.starts_with(orchestrator::STORAGE_PREFIX))
+            .filter(|e| e.name != mcp::ENDPOINT.name)
         {
             assert_eq!(ep.transfer(), Transfer::Standard, "{}", ep.name);
         }
@@ -2601,6 +2683,9 @@ mod tests {
                 Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
                     assert_eq!(access, Access::DataKey, "{}", ep.name)
                 }
+                // The mcp service verifies the bearer (a member token today; MCP access
+                // tokens come with mcp-oauth) and calls the API as that member.
+                Auth::Mcp => assert_eq!(access, Access::SignedIn, "{}", ep.name),
                 Auth::Management => assert!(
                     !matches!(access, Access::Public | Access::DataKey),
                     "{}: a management route needs a member access level, not {access:?}",
@@ -2880,6 +2965,12 @@ mod tests {
             // Realtime (RT1 T3, S18): membership is checked at join, not here.
             ("realtime.ticket", Access::SignedIn),
             ("realtime.socket", Access::Public),
+            // MCP core m2: the bearer is the mcp service's to verify; it acts for a member.
+            ("mcp.endpoint", Access::SignedIn),
+            ("mcp.endpoint_get", Access::SignedIn),
+            ("mcp.endpoint_delete", Access::SignedIn),
+            ("mcp.protected_resource", Access::Public),
+            ("mcp.protected_resource_mcp", Access::Public),
         ];
         for (name, access) in table {
             let ep = ENDPOINTS
@@ -3259,6 +3350,114 @@ mod tests {
         assert_eq!(
             match_endpoint(Scope::Api, "POST", &format!("{base}/hello")),
             Match::MethodNotAllowed(vec![Method::Put, Method::Patch, Method::Delete])
+        );
+    }
+
+    // ---- MCP core m2: the `/mcp` endpoint and its protected-resource metadata ----
+
+    /// The MCP routes are API-host routes (`Scope::Api`), exactly these five, all served by
+    /// `mcp`.
+    #[test]
+    fn mcp_routes_are_api_host_only() {
+        let mut routes: Vec<_> = ENDPOINTS
+            .iter()
+            .filter(|e| e.service == Service::Mcp)
+            .map(|e| (e.method, e.path, e.name))
+            .collect();
+        routes.sort_by_key(|r| (r.1, r.0.as_str()));
+        assert_eq!(
+            routes,
+            vec![
+                (Method::Get, "/.well-known/oauth-protected-resource", "mcp.protected_resource"),
+                (Method::Get, "/.well-known/oauth-protected-resource/mcp", "mcp.protected_resource_mcp"),
+                (Method::Delete, "/mcp", "mcp.endpoint_delete"),
+                (Method::Get, "/mcp", "mcp.endpoint_get"),
+                (Method::Post, "/mcp", "mcp.endpoint"),
+            ]
+        );
+        for ep in ENDPOINTS.iter().filter(|e| e.service == Service::Mcp) {
+            assert_eq!(ep.scope, Scope::Api, "{}", ep.name);
+            assert!(!ep.websocket, "{}", ep.name);
+        }
+        assert_eq!(Service::Mcp.name(), "mcp");
+        for (method, name) in [("POST", "mcp.endpoint"), ("GET", "mcp.endpoint_get"), ("DELETE", "mcp.endpoint_delete")] {
+            assert_eq!(found(method, "/mcp"), name);
+        }
+        assert_eq!(
+            match_endpoint(Scope::Api, "PUT", "/mcp"),
+            Match::MethodNotAllowed(vec![Method::Post, Method::Get, Method::Delete])
+        );
+        for path in ["/mcp/", "/mcp/x", "/v1/mcp"] {
+            assert!(
+                !matches!(match_endpoint(Scope::Api, "POST", path), Match::Found(ep) if ep.service == Service::Mcp),
+                "{path}"
+            );
+        }
+    }
+
+    /// The MCP bearer policy (the gateway checks only that a bearer is there and passes it on)
+    /// is on the `/mcp` routes and on no other endpoint, and only `POST /mcp` gets the long
+    /// upstream read timeout.
+    #[test]
+    fn mcp_policy_is_only_on_mcp_endpoints() {
+        let bearer = Policy { auth: Auth::Mcp, cors: Cors::None, access: Access::SignedIn };
+        for ep in ENDPOINTS {
+            if ep.policy.auth == Auth::Mcp {
+                assert_eq!(ep.service, Service::Mcp, "{}: Auth::Mcp outside the mcp service", ep.name);
+                assert_eq!(ep.path, "/mcp", "{}", ep.name);
+            }
+            if ep.service == Service::Mcp && ep.path == "/mcp" {
+                assert_eq!(ep.policy, bearer, "{}", ep.name);
+            }
+        }
+        for name in ["mcp.endpoint", "mcp.endpoint_get", "mcp.endpoint_delete"] {
+            let ep = ENDPOINTS.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(ep.policy, bearer, "{name}");
+        }
+        assert_eq!(mcp::ENDPOINT.transfer(), Transfer::SlowAnswer);
+        for ep in ENDPOINTS.iter().filter(|e| e.name != "mcp.endpoint") {
+            assert_ne!(ep.transfer(), Transfer::SlowAnswer, "{}", ep.name);
+        }
+    }
+
+    /// The protected-resource metadata (RFC 9728) is a public GET from any origin, at the
+    /// root and at the `/mcp` path suffix.
+    #[test]
+    fn metadata_routes_are_public_gets() {
+        let open = Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public };
+        for (path, name) in [
+            ("/.well-known/oauth-protected-resource", "mcp.protected_resource"),
+            ("/.well-known/oauth-protected-resource/mcp", "mcp.protected_resource_mcp"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, "GET", path) else {
+                panic!("GET {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy, ep.service), (name, open, Service::Mcp), "{path}");
+            assert_eq!(ep.transfer(), Transfer::Standard, "{path}");
+            assert_eq!(
+                match_endpoint(Scope::Api, "POST", path),
+                Match::MethodNotAllowed(vec![Method::Get]),
+                "{path}"
+            );
+        }
+    }
+
+    /// The table filtered by the services the gateway serves: a service left out answers as
+    /// an unknown path, method mismatches included.
+    #[test]
+    fn an_unserved_service_routes_nowhere() {
+        let no_mcp = |s: Service| s != Service::Mcp;
+        for (method, path) in [
+            ("POST", "/mcp"),
+            ("PUT", "/mcp"),
+            ("GET", "/.well-known/oauth-protected-resource"),
+            ("POST", "/.well-known/oauth-protected-resource/mcp"),
+        ] {
+            assert_eq!(match_served(Scope::Api, method, path, no_mcp), Match::NotFound, "{method} {path}");
+        }
+        assert_eq!(
+            match_served(Scope::Api, "GET", "/v1/me", no_mcp),
+            Match::Found(&orchestrator::ME)
         );
     }
 }

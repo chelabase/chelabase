@@ -4,6 +4,7 @@ mod dev;
 mod functions;
 mod generate;
 mod login;
+mod mcp;
 mod neon;
 mod paths;
 mod services;
@@ -48,6 +49,15 @@ enum Commands {
         /// Allow a plain-http URL on a non-local host (the password is sent unencrypted)
         #[arg(long)]
         insecure: bool,
+    },
+    /// Relay MCP messages between stdin/stdout and the instance's /mcp endpoint
+    Mcp {
+        /// The instance's API URL (default: the only login)
+        #[arg(long, env = "CHELABASE_URL")]
+        url: Option<String>,
+        /// Ask the server to run read-only
+        #[arg(long)]
+        read_only: bool,
     },
     /// Deploy and manage edge functions on a branch
     Functions {
@@ -394,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
             email,
             insecure,
         } => login::run(&url, email, insecure).await,
+        Commands::Mcp { url, read_only } => mcp::run(url, read_only).await,
         Commands::Functions { target, command } => functions::run(target, command).await,
         Commands::Services { target, command } => services::run(target, command).await,
         Commands::Workbench { command } => {

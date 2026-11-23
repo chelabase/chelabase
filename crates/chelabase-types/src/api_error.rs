@@ -69,6 +69,9 @@ pub enum ErrorCode {
     UserTokenWithSecretKey,
     RunIdInUse,
     SqlConfirmRequired,
+    /// 422: a read-only SQL run's script holds a statement other than `SELECT`, `SHOW` or
+    /// `EXPLAIN`, doesn't parse, or holds more than 100 statements; nothing ran.
+    ReadOnlyScriptRefused,
     SqlRunLimit,
     SchemaTooLarge,
     SavedQueryNameTaken,
@@ -165,7 +168,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 107] = [
+    pub const ALL: [ErrorCode; 108] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantRequired,
@@ -224,6 +227,7 @@ impl ErrorCode {
         Self::UserTokenWithSecretKey,
         Self::RunIdInUse,
         Self::SqlConfirmRequired,
+        Self::ReadOnlyScriptRefused,
         Self::SqlRunLimit,
         Self::SchemaTooLarge,
         Self::SavedQueryNameTaken,
@@ -335,6 +339,7 @@ impl ErrorCode {
             Self::UserTokenWithSecretKey => "user_token_with_secret_key",
             Self::RunIdInUse => "run_id_in_use",
             Self::SqlConfirmRequired => "sql_confirm_required",
+            Self::ReadOnlyScriptRefused => "read_only_script_refused",
             Self::SqlRunLimit => "sql_run_limit",
             Self::SchemaTooLarge => "schema_too_large",
             Self::SavedQueryNameTaken => "saved_query_name_taken",
@@ -486,7 +491,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 107] = [
+    const ALL: [(ErrorCode, &str); 108] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantRequired, "tenant_required"),
@@ -545,6 +550,7 @@ mod tests {
         (ErrorCode::UserTokenWithSecretKey, "user_token_with_secret_key"),
         (ErrorCode::RunIdInUse, "run_id_in_use"),
         (ErrorCode::SqlConfirmRequired, "sql_confirm_required"),
+        (ErrorCode::ReadOnlyScriptRefused, "read_only_script_refused"),
         (ErrorCode::SqlRunLimit, "sql_run_limit"),
         (ErrorCode::SchemaTooLarge, "schema_too_large"),
         (ErrorCode::SavedQueryNameTaken, "saved_query_name_taken"),

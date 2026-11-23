@@ -28,6 +28,10 @@ const WEBSOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
 /// A transfer route's (`Transfer::Stream`: object storage) upstream read timeout: an upload's
 /// answer comes only once its whole body is in (1 GiB at 1 MiB/s is about 17 minutes).
 const TRANSFER_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+/// `POST /mcp`'s upstream read timeout (`Transfer::SlowAnswer`): above the longest tool run
+/// the mcp service allows (60 s, and it gives up 2 s after), so the service answers a
+/// timeout itself; an answer that never starts is cut here.
+const SLOW_ANSWER_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// A transfer route's client idle timeout (the longest the client may pause sending its body).
 const TRANSFER_CLIENT_IDLE: Duration = Duration::from_secs(300);
 
@@ -201,7 +205,11 @@ impl ProxyHttp for Gateway {
             (None, Some(plan)) => {
                 let (timeout, _) =
                     api_timeouts(plan.endpoint, session.is_upgrade_req(), self.read_timeout);
-                (self.upstreams.addr(plan.endpoint.service), timeout)
+                let service = plan.endpoint.service;
+                let addr = self.upstreams.addr(service).ok_or_else(|| {
+                    Error::explain(ErrorType::ConnectError, format!("no upstream for the {} service", service.name()))
+                })?;
+                (addr, timeout)
             }
             (None, None) => return Err(Error::explain(ErrorType::InternalError, "no proxy plan")),
         };
@@ -477,7 +485,8 @@ async fn resolve_upstream(addr: &str) -> Vec<SocketAddr> {
 
 /// An API route's upstream read timeout and client idle timeout (`None`: the default): a
 /// websocket upgrade's [`WEBSOCKET_READ_TIMEOUT`] both ways, a transfer route's
-/// [`TRANSFER_READ_TIMEOUT`] and [`TRANSFER_CLIENT_IDLE`], else `configured` and the default.
+/// [`TRANSFER_READ_TIMEOUT`] and [`TRANSFER_CLIENT_IDLE`], `POST /mcp`
+/// [`SLOW_ANSWER_READ_TIMEOUT`] (or `configured` when longer), else `configured` and the default.
 /// No route has a body cap at the gateway.
 fn api_timeouts(
     endpoint: &chelabase_routes::Endpoint,
@@ -489,6 +498,7 @@ fn api_timeouts(
     }
     match endpoint.transfer() {
         chelabase_routes::Transfer::Stream => (TRANSFER_READ_TIMEOUT, Some(TRANSFER_CLIENT_IDLE)),
+        chelabase_routes::Transfer::SlowAnswer => (SLOW_ANSWER_READ_TIMEOUT.max(configured), None),
         chelabase_routes::Transfer::Standard => (configured, None),
     }
 }
@@ -1058,5 +1068,23 @@ mod tests {
     fn explicit_status_is_kept_and_internal_errors_are_500() {
         assert_eq!(failure_status(&ErrorSource::Internal, &ErrorType::HTTPStatus(413)), 413);
         assert_eq!(failure_status(&ErrorSource::Internal, &ErrorType::InternalError), 500);
+    }
+
+    /// MCP core m2: `POST /mcp` waits for a tool run (up to 120 s plus the service's own
+    /// margin), so neither the configured 60 s nor a lower one cuts it; it still has a limit.
+    #[test]
+    fn a_slow_mcp_answer_is_not_cut_at_the_default_timeout() {
+        use chelabase_routes::mcp;
+        for configured in [Duration::from_secs(1), CONFIGURED] {
+            let (read, idle) = api_timeouts(&mcp::ENDPOINT, false, configured);
+            assert!(read > Duration::from_secs(125), "{read:?}");
+            assert!(read <= Duration::from_secs(600), "a never-starting answer is still cut: {read:?}");
+            assert_eq!(idle, None, "the request body is small: the default client idle timeout");
+        }
+        // An operator's longer setting is kept.
+        let long = Duration::from_secs(900);
+        assert_eq!(api_timeouts(&mcp::ENDPOINT, false, long).0, long);
+        // The metadata routes are plain ones.
+        assert_eq!(api_timeouts(&mcp::PROTECTED_RESOURCE, false, CONFIGURED), (CONFIGURED, None));
     }
 }

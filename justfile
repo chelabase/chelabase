@@ -82,6 +82,7 @@ sweep-dbs-test:
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
     CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest -p chelabase-storage-service document_is_current
+    CHELABASE_BLESS=1 cargo test -p mcp spec_bundle_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
 
@@ -627,6 +628,12 @@ functions-runtime-test:
     docker buildx bake -f infra/images/docker-bake.hcl --load functions-runtime
     node --test infra/functions-runtime/tests/
 
+# CI runs this when infra/mcp-runtime/ changes. Needs Docker, no stack.
+# The MCP sandbox runtime's node tests, against a freshly baked image in throwaway containers
+mcp-runtime-test:
+    docker buildx bake -f infra/images/docker-bake.hcl --load mcp-runtime
+    node --test infra/mcp-runtime/tests/
+
 # Live edge functions story through the gateway (#181): deploy a function on a fresh branch, call
 # it with the branch's public key, disable it (404 within 2 s), redeploy it (new code within 2 s)
 # and call a public function on the keyless form. Shared-state: writes and removes its own rows.
@@ -677,6 +684,11 @@ role-e2e:
 # Mailpit as the identity service's SMTP server)
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
+
+# Live MCP check: the official TypeScript client over `chelabase mcp` against the stack's /mcp
+# (needs the stack up with the mcp profile; its busy-loop check restarts mcp-runtime)
+mcp-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/mcp-e2e.sh
 
 # Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
 # revocation on grant loss (compute suspended), suspend, revoke-now, offboarding, expiry

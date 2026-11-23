@@ -58,7 +58,7 @@ expect 'brand-new-dir/file.txt' $'rust=full\nweb=full'
 expect 'crates/brand-new-crate/src/lib.rs' $'rust=full\nweb=full'
 expect 'packages/design/tokens.css' $'rust=none\nweb=@chelabase/studio @chelabase/design @chelabase/docs @chelabase/landing'
 expect 'packages/neon-e2e/check.mjs' $'rust=none\nweb=none'
-expect_has 'openapi/management.json' rust= orchestrator
+expect_has 'openapi/management.json' rust= orchestrator mcp
 expect_has 'openapi/management.json' web= @chelabase/management-client @chelabase/studio
 expect_has 'packages/client/fixtures/gen/db.ts' rust= chelabase-query chelabase-typegen chelabase
 # A file only a dependency reads selects its dependents too.
@@ -69,8 +69,13 @@ expect 'packages/client/README.md' $'rust=none\nweb=@chelabase/client @chelabase
 expect 'apps/docs/content/docs/architecture/gateway.mdx' $'rust=none\nweb=@chelabase/docs'
 expect 'apps/docs/content/docs/reference/access.mdx' $'rust=chelabase-routes\nweb=@chelabase/studio @chelabase/docs'
 expect 'packages/client/fixtures/gen/db.ts' $'rust=chelabase-query chelabase-typegen chelabase\nweb=@chelabase/client @chelabase/docs'
-expect 'openapi/management.json' $'rust=orchestrator\nweb=@chelabase/management-client @chelabase/studio @chelabase/docs'
-expect 'openapi/data.json' $'rust=chelabase-query rest\nweb=@chelabase/studio @chelabase/docs'
+expect 'openapi/management.json' $'rust=orchestrator mcp\nweb=@chelabase/management-client @chelabase/studio @chelabase/docs'
+expect 'openapi/data.json' $'rust=chelabase-query rest mcp\nweb=@chelabase/studio @chelabase/docs'
+# The MCP spec bundle: built into the mcp library, read by no web package.
+expect 'openapi/mcp.json' $'rust=mcp\nweb=none'
+# Handlers the MCP's secret-field table cites (services/mcp/src/secret_fields.rs).
+expect_has 'services/orchestrator/src/members.rs' rust= orchestrator mcp
+expect_has 'services/orchestrator/src/sql_editor/routes.rs' rust= orchestrator mcp
 # The docs build renders all three documents as its API reference (api-source.server.ts).
 expect_has 'openapi/login.json' web= @chelabase/docs
 expect 'infra/compose/.env.example' $'rust=realtime chelabase\nweb=@chelabase/studio @chelabase/docs @chelabase/landing'
@@ -78,6 +83,8 @@ expect 'infra/compose/nats/nats.conf' $'rust=none\nweb=none'
 expect 'scripts/neon-images.sh' $'rust=chelabase-neon chelabase\nweb=none'
 # The workbench CLI hashes the functions runtime's inputs into its image tag.
 expect $'infra/functions-runtime/supervisor.js\ninfra/images/functions-runtime.Dockerfile' $'rust=chelabase\nweb=none'
+# The workbench CLI hashes the MCP sandbox runtime's inputs into its image tag.
+expect $'infra/mcp-runtime/runner.js\ninfra/mcp-runtime/config.capnp\ninfra/mcp-runtime/watchdog.sh\ninfra/images/mcp-runtime.Dockerfile' $'rust=chelabase\nweb=none'
 [[ "$(CI_AFFECTED_FILES= scripts/ci-affected.sh)" == $'rust=none\nweb=none' ]] || fail "an empty list selects nothing"
 
 # --- 2. Outside-crate reads -----------------------------------------------------------------
@@ -158,9 +165,10 @@ eval "$(sed -n '/^rust_reads=(/,/^)/p' scripts/ci-affected.sh)"
 declare -A used=()
 # Check <package>'s <kind> reference to <path> against the table; prints the matching row index.
 check_row() { # <package> <kind> <path> <where>
-  local pkg="$1" kind="$2" p="$3" at="$4" i d pat mode pkgs ok=0
-  # Another member's files select it and its dependents; a full trigger selects everything.
-  for d in "${member_dirs[@]}"; do [[ "$p" != "$d"/* ]] || return 0; done
+  local pkg="$1" kind="$2" p="$3" at="$4" i d pat mode pkgs ok=0 member=0
+  # Another member's files select it and its dependents, so they need a row only when the
+  # reader isn't one of those (`covered` checks that); a full trigger selects everything.
+  for d in "${member_dirs[@]}"; do [[ "$p" != "$d"/* ]] || member=1; done
   [[ -d "$p" || "$(rust_of "$p")" != full ]] || return 0
   for i in "${!rust_reads[@]}"; do
     read -r pat mode pkgs <<<"${rust_reads[$i]}"
@@ -178,7 +186,7 @@ check_row() { # <package> <kind> <path> <where>
     fi
     ok=1
   done
-  ((ok)) || fail "$at reads $p ($kind), but no rust_reads row matching it names $pkg"
+  ((ok || member)) || fail "$at reads $p ($kind), but no rust_reads row matching it names $pkg"
 }
 
 mapfile -t member_dirs < <(cargo metadata --no-deps --format-version 1 |

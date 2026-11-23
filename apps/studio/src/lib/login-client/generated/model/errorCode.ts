@@ -70,6 +70,7 @@ export const ErrorCode = {
   user_token_with_secret_key: 'user_token_with_secret_key',
   run_id_in_use: 'run_id_in_use',
   sql_confirm_required: 'sql_confirm_required',
+  read_only_script_refused: 'read_only_script_refused',
   sql_run_limit: 'sql_run_limit',
   schema_too_large: 'schema_too_large',
   saved_query_name_taken: 'saved_query_name_taken',

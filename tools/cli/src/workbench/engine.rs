@@ -50,6 +50,8 @@ pub trait Engine {
     fn neon_images(&self, stack: &Stack) -> anyhow::Result<Vec<(String, String)>>;
     /// The functions runtime image's tag, built when missing.
     fn functions_runtime_image(&self, stack: &Stack) -> anyhow::Result<String>;
+    /// The MCP runtime image's tag, built when missing.
+    fn mcp_runtime_image(&self, stack: &Stack) -> anyhow::Result<String>;
     /// `cargo build` of `apps` in the stack's checkout (and the CLI when `cli`).
     fn cargo_build(&self, stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()>;
     /// The stack's keys and auth files; which auth files changed.

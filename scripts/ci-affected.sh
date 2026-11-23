@@ -30,8 +30,25 @@ web_full=(package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc 'tsconfig*.json
 # `closure` also selects their dependents: the read is in library code. Name the files read, not
 # their directory. scripts/tests/ci-affected.sh checks every row against the Rust sources.
 rust_reads=(
-  'openapi/management.json                                   self     orchestrator'
-  'openapi/data.json                                         self     rest chelabase-query'
+  'openapi/management.json                                   self     orchestrator mcp'
+  'openapi/data.json                                         self     rest chelabase-query mcp'
+  'openapi/mcp.json                                          closure  mcp'
+  # services/mcp/src/secret_fields.rs (library code) cites these handlers for what each answer
+  # carries.
+  'services/orchestrator/src/app_user_admin.rs               closure  mcp'
+  'services/orchestrator/src/console.rs                      closure  mcp'
+  'services/orchestrator/src/data_api_types.rs               closure  mcp'
+  'services/orchestrator/src/data_keys.rs                    closure  mcp'
+  'services/orchestrator/src/functions.rs                    closure  mcp'
+  'services/orchestrator/src/lib.rs                          closure  mcp'
+  'services/orchestrator/src/members.rs                      closure  mcp'
+  'services/orchestrator/src/merges.rs                       closure  mcp'
+  'services/orchestrator/src/personal_logins.rs              closure  mcp'
+  'services/orchestrator/src/roles.rs                        closure  mcp'
+  'services/orchestrator/src/sql_editor/routes.rs            closure  mcp'
+  'services/orchestrator/src/storage_webhooks.rs             closure  mcp'
+  'services/orchestrator/src/table_api/read.rs               closure  mcp'
+  'services/orchestrator/src/table_api/rows.rs               closure  mcp'
   'openapi/login.json                                        self     auth'
   'apps/studio/package.json                                  self     orchestrator'
   'apps/studio/src/lib/role-rules.fixtures.json              self     orchestrator'
@@ -46,6 +63,8 @@ rust_reads=(
   'infra/workbench/*                                         self     chelabase'
   'infra/functions-runtime/*                                 self     chelabase'
   'infra/images/functions-runtime.Dockerfile                 self     chelabase'
+  'infra/mcp-runtime/*                                       self     chelabase'
+  'infra/images/mcp-runtime.Dockerfile                       self     chelabase'
   'infra/neon/NEON_REF                                       closure  bench-data-api'
   'scripts/compute-network-e2e.sh                            self     orchestrator'
   'scripts/neon-images.sh                                    self     chelabase-neon chelabase'
@@ -65,7 +84,8 @@ web_reads=(
 
 # Paths no Rust or web check reads.
 no_checks=('*.md' 'docs/*' '.github/*' '.claude/*' '.cursor/*' .mcp.json 'LICENSE*' .gitignore
-  .dockerignore 'infra/images/*' 'infra/neon/*' 'infra/compose/*' 'infra/workbench/*' 'scripts/*')
+  .dockerignore 'infra/images/*' 'infra/neon/*' 'infra/compose/*' 'infra/workbench/*' 'scripts/*'
+  'infra/mcp-runtime/*')
 
 # The packages `just check-web` checks, in its order.
 web_checked=(@chelabase/management-client @chelabase/studio @chelabase/client @chelabase/design

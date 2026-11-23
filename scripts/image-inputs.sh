@@ -2,7 +2,7 @@
 # The inputs of each release image, derived from the build graphs, and which images changed
 # since their pins (the 12-hex commit in each pin of infra/compose/docker-compose.yml).
 #
-#   scripts/image-inputs.sh images                  the thirteen release images
+#   scripts/image-inputs.sh images                  the sixteen release images
 #   scripts/image-inputs.sh inputs <image>          its input paths, one per line
 #   scripts/image-inputs.sh changed [<image>...]    those (default: all) whose inputs differ
 #                                                   between their pin commit and HEAD
@@ -20,8 +20,8 @@
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
 #                 .cargo/ (storage's package is chelabase-storage-service, functions'
 #                 chelabase-functions, service-runner's chelabase-service-runner, compute-egress's
-#                 chelabase-compute-egress; the others are
-#                 named after their image)
+#                 chelabase-compute-egress; the others are named after their image); mcp also
+#                 openapi/mcp.json, which it embeds
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
 #                 the build reads outside the graph: studio.Caddyfile, openapi/,
@@ -30,13 +30,15 @@
 #                 pnpm-workspace.yaml, identity.Dockerfile
 #   functions-runtime  infra/functions-runtime (the supervisor, its config and the watchdog) and
 #                 functions-runtime.Dockerfile
+#   mcp-runtime   infra/mcp-runtime (the runner, its config and the watchdog) and
+#                 mcp-runtime.Dockerfile
 # A pin commit missing from history (or no pin yet: the default tag `unpublished`) counts as
 # changed, with a warning.
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init studio identity functions-runtime)
-rust=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init studio identity functions-runtime mcp mcp-runtime)
+rust=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init mcp)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
@@ -99,9 +101,12 @@ inputs() { # inputs <image>
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/identity.Dockerfile ;;
     functions-runtime)
       printf '%s\n' infra/functions-runtime infra/images/functions-runtime.Dockerfile ;;
+    mcp-runtime)
+      printf '%s\n' infra/mcp-runtime infra/images/mcp-runtime.Dockerfile ;;
     *)
       rust_dirs "$1"
       rust_dirs "${rust[@]}" | sed 's#$#/Cargo.toml#'
+      [[ "$1" != mcp ]] || echo openapi/mcp.json
       printf '%s\n' Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml .cargo ;;
   esac
 }
@@ -179,6 +184,7 @@ case "$cmd" in
       copies "$root/infra/images/studio.Dockerfile" studio || rc=1
       copies "$root/infra/images/identity.Dockerfile" identity || rc=1
       copies "$root/infra/images/functions-runtime.Dockerfile" functions-runtime || rc=1
+      copies "$root/infra/images/mcp-runtime.Dockerfile" mcp-runtime || rc=1
       [[ $rc -eq 0 ]] && echo "image-inputs: every Dockerfile COPY is within its images' inputs"
       exit $rc
     fi ;;

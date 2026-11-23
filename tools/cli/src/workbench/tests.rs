@@ -619,6 +619,8 @@ fn compose_always_names_its_project_file_and_env() {
             "/w/infra/compose/docker-compose.workbench.yml",
             "--env-file",
             "/s/env/stack.env",
+            "--profile",
+            "mcp",
             "ps",
             "-q"
         ]
@@ -859,6 +861,55 @@ fn functions_is_one_of_the_stacks_rust_apps() {
     assert!(INFRA.contains(&"functions-runtime"), "{INFRA:?}");
     assert!(!RUST_APPS.contains(&"functions-runtime"));
     assert_eq!(restart_targets(&["functions".into()]).unwrap(), ["functions"]);
+}
+
+// mcp-core m12 (#356): `up` builds, records and restarts the MCP server with the other Rust apps
+// and starts it with the late apps; its runtime is infra (an image, no binary).
+#[test]
+fn mcp_is_a_rust_app_and_its_runtime_is_infra() {
+    use super::commands::{APPS, INFRA, LATE_APPS, PROFILE_RUST_APPS, RUST_APPS, build_packages, restart_targets};
+    assert!(RUST_APPS.contains(&"mcp"), "{RUST_APPS:?}");
+    assert!(APPS.contains(&"mcp"), "{APPS:?}");
+    assert!(LATE_APPS.contains(&"mcp"), "{LATE_APPS:?}");
+    assert!(INFRA.contains(&"mcp-runtime"), "{INFRA:?}");
+    assert!(!RUST_APPS.contains(&"mcp-runtime") && !APPS.contains(&"mcp-runtime"));
+    assert!(!PROFILE_RUST_APPS.contains(&"mcp"));
+    assert_eq!(build_packages(&["mcp"], false), ["-p", "mcp"]);
+    assert_eq!(restart_targets(&["mcp".into()]).unwrap(), ["mcp"]);
+    assert!(restart_targets(&[]).unwrap().contains(&"mcp".to_string()));
+}
+
+// The MCP runtime's image is built from the Dockerfile and `infra/mcp-runtime/*`, tagged by their
+// content, and its tag is not the functions runtime's.
+#[test]
+fn mcp_runtime_image_inputs() {
+    use super::commands::{MCP_RUNTIME_INPUTS, mcp_runtime_tag};
+    assert_eq!(MCP_RUNTIME_INPUTS[0], "infra/images/mcp-runtime.Dockerfile");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for rel in ["config.capnp", "runner.js", "watchdog.sh"] {
+        let input = format!("infra/mcp-runtime/{rel}");
+        assert!(MCP_RUNTIME_INPUTS.contains(&input.as_str()), "{input}");
+    }
+    for rel in MCP_RUNTIME_INPUTS {
+        assert!(root.join(rel).is_file(), "{rel} exists in the checkout");
+    }
+    // Every file the Dockerfile copies from the checkout is an input.
+    let dockerfile = std::fs::read_to_string(root.join(MCP_RUNTIME_INPUTS[0])).unwrap();
+    for line in dockerfile.lines().filter(|l| l.starts_with("COPY infra/")) {
+        for src in line.split_whitespace().skip(1).filter(|w| w.starts_with("infra/")) {
+            assert!(MCP_RUNTIME_INPUTS.contains(&src), "{src} is copied but not an input");
+        }
+    }
+    let tag = mcp_runtime_tag(&root).unwrap();
+    assert!(tag.starts_with("wb-") && tag.len() == 15, "{tag}");
+}
+
+// m12: the gateway's upstream and the live tests' endpoint are in stack.env.
+#[test]
+fn the_stack_env_points_the_gateway_and_the_live_tests_at_mcp() {
+    let env = parse(&render_stack_env(EXAMPLE, &input()));
+    assert_eq!(env["CHELABASE_MCP_URL"], "http://mcp-public:8095");
+    assert_eq!(env["CHELABASE_MCP_LIVE_URL"], format!("{}/mcp", env["CHELABASE_ENTRY_API_URL"]));
 }
 
 // auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be
