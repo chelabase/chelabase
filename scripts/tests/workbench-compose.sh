@@ -593,7 +593,9 @@ skip_var=CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES
 [[ "$(q ".services.worker.environment.$skip_var // empty")" == true ]] || fail "the workbench worker sets $skip_var=true"
 [[ "$(q "[.services | to_entries[] | select(.value.environment[\"$skip_var\"] != null) | .key] | join(\" \")")" == worker ]] ||
   fail "$skip_var is set on the worker alone"
-named="$(cd "$root" && git grep -l -e "$skip_var" -- infra tools scripts .github ':!scripts/tests/workbench-compose.sh' || true)"
+# The overlay-equivalence snapshot is a rendering of the workbench overlay, so it names it too.
+named="$(cd "$root" && git grep -l -e "$skip_var" -- infra tools scripts .github ':!scripts/tests/workbench-compose.sh' \
+  ':!scripts/tests/fixtures/compose-workbench.json' || true)"
 [[ "$named" == infra/compose/docker-compose.workbench.yml ]] ||
   fail "only infra/compose/docker-compose.workbench.yml may name $skip_var; got:
 $named"
