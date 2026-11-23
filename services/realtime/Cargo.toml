@@ -34,6 +34,8 @@ dotenvy = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
+# #319: each viewer's bounded delivered set.
+lru = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }
 # The process-wide aws-lc-rs provider for Valkey TLS (S7).
