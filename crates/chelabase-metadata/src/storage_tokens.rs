@@ -2,7 +2,7 @@
 //! liveness its signed URLs re-check. Single statements, one table each (`data_api_keys` is
 //! only read).
 
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
@@ -63,7 +63,7 @@ impl MetadataClient {
         token_id: Uuid,
         key_id: Uuid,
         claims: &serde_json::Value,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<bool, MetadataError> {
         sqlx::query(
             "DELETE FROM storage_upload_tokens WHERE expires_at < now() - interval '1 day'",

@@ -66,7 +66,7 @@
 use chelabase_secrets::SecretKey;
 use chelabase_types::container_env::reserved_container_env_name;
 use chelabase_types::{BranchId, DatabaseId};
-use chrono::{DateTime, NaiveDate, Utc};
+use chelabase_time::{Date, Timestamp};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 use tracing::warn;
@@ -169,7 +169,7 @@ pub struct FunctionRecord {
     pub database_id: DatabaseId,
     pub name: String,
     pub kind: FunctionKind,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// A deployment to record. A function has a bundle (`bundle_sha256` and `bundle_size`); a
@@ -181,7 +181,7 @@ pub struct NewDeployment<'a> {
     pub bundle_sha256: Option<&'a str>,
     pub bundle_size: Option<i64>,
     pub spec: &'a serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub created_by: &'a str,
     pub note: Option<&'a str>,
 }
@@ -193,9 +193,9 @@ pub struct DeploymentRecord {
     pub bundle_sha256: Option<String>,
     pub bundle_size: Option<i64>,
     pub spec: serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub note: Option<String>,
 }
 
@@ -217,7 +217,7 @@ pub struct BranchFunction {
     /// again ([`MetadataClient::settle_run_as_mint`]).
     pub run_as_unmintable: Option<RunAsUnmintable>,
     pub last_error: Option<String>,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// m9: what the last health check of the active deployment saw (`healthy` or
     /// `unhealthy`); `None` before any, and for a function.
     pub health: Option<String>,
@@ -249,7 +249,7 @@ pub struct ResolvedFunction {
     pub deployment_id: Uuid,
     pub bundle_sha256: Option<String>,
     pub spec: serde_json::Value,
-    pub compatibility_date: NaiveDate,
+    pub compatibility_date: Date,
     pub auth: FunctionAuth,
     pub enabled: bool,
     pub run_as_role: Option<String>,
@@ -262,7 +262,7 @@ pub struct NewSchedule<'a> {
     pub function_id: Uuid,
     pub cron: &'a str,
     pub timezone: &'a str,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,7 +272,7 @@ pub struct ScheduleRecord {
     pub function_id: Uuid,
     pub cron: String,
     pub timezone: String,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     pub enabled: bool,
     /// Why the schedule was switched off (see [`crate::ScheduleProblem`]); `None` normally.
     pub last_error: Option<String>,
@@ -299,8 +299,8 @@ pub struct ClaimedSchedule {
     pub function_name: String,
     pub cron: String,
     /// The tick to run, `None` when nothing runs ([`Advance::run`]).
-    pub run: Option<DateTime<Utc>>,
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub run: Option<Timestamp>,
+    pub next_run_at: Option<Timestamp>,
 }
 
 /// A trigger to add. `table`: `schema_name`, `table_name` and events from insert, update and
@@ -327,7 +327,7 @@ pub struct TriggerRecord {
     pub source: TriggerSource,
     pub enabled: bool,
     pub state: TriggerState,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
     pub pg_database: String,
     pub schema_name: Option<String>,
     pub table_name: Option<String>,
@@ -341,7 +341,7 @@ pub struct TriggerRecord {
     /// m13: why the last failed delivery failed; cleared by a delivery.
     pub last_delivery_error: Option<String>,
     /// m13: when an event was last delivered.
-    pub last_delivered_at: Option<DateTime<Utc>>,
+    pub last_delivered_at: Option<Timestamp>,
     /// m13b: events the outbox bound removed undelivered (dead ones past the cap or the
     /// retention, a disabled trigger's queued ones).
     pub dropped_count: i64,
@@ -374,7 +374,7 @@ pub struct StorageTriggerTarget {
     pub bucket: Option<String>,
     pub prefix: Option<String>,
     pub events: Vec<String>,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
 }
 
 /// One table trigger's install, as the worker reports it
@@ -383,7 +383,7 @@ pub struct StorageTriggerTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerInstall {
     pub id: Uuid,
-    pub enabled_since: DateTime<Utc>,
+    pub enabled_since: Timestamp,
     pub error: Option<String>,
 }
 
@@ -702,7 +702,7 @@ fn function_from_row(r: &PgRow) -> Result<FunctionRecord, MetadataError> {
         database_id: DatabaseId(r.get("database_id")),
         name: r.get("name"),
         kind: FunctionKind::parse(r.get("kind"))?,
-        created_at: r.get("created_at"),
+        created_at: r.try_get("created_at")?,
     })
 }
 
@@ -733,7 +733,7 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         source: TriggerSource::parse(r.get("source"))?,
         enabled: r.get("enabled"),
         state: TriggerState::parse(r.get("state"))?,
-        enabled_since: r.get("enabled_since"),
+        enabled_since: r.try_get("enabled_since")?,
         pg_database: r.get("pg_database"),
         schema_name: r.get("schema_name"),
         table_name: r.get("table_name"),
@@ -744,7 +744,7 @@ fn trigger_from_row(r: &PgRow) -> Result<TriggerRecord, MetadataError> {
         dead_count: r.get("dead_count"),
         dropped_count: r.get("dropped_count"),
         last_delivery_error: r.get("last_delivery_error"),
-        last_delivered_at: r.get("last_delivered_at"),
+        last_delivered_at: r.try_get("last_delivered_at")?,
     })
 }
 
@@ -1986,7 +1986,7 @@ impl MetadataClient {
         let (mut locked, mut reasons) = (Vec::new(), Vec::new());
         for row in rows {
             let (cron, timezone): (String, String) = (row.get("cron"), row.get("timezone"));
-            if let Err(problem) = next_run(&cron, &timezone, row.get("now")) {
+            if let Err(problem) = next_run(&cron, &timezone, row.try_get("now")?) {
                 locked.push(row.get::<Uuid, _>("id"));
                 reasons.push(problem.reason());
             }
@@ -2067,9 +2067,9 @@ impl MetadataClient {
         let new_tz = timezone.unwrap_or(&was.1);
         let new_enabled = enabled.unwrap_or(was.2);
         let schedule = Schedule::parse(new_cron, new_tz).map_err(|e| invalid(e.to_string()))?;
-        let mut next: Option<DateTime<Utc>> = row.get("next_run_at");
+        let mut next: Option<Timestamp> = row.try_get("next_run_at")?;
         if new_cron != was.0 || new_tz != was.1 || (new_enabled && !was.2) {
-            next = schedule.next_after(row.get("now"));
+            next = schedule.next_after(row.try_get("now")?);
         }
         sqlx::query(
             "UPDATE function_schedules SET cron = $2, timezone = $3, enabled = $4, next_run_at = $5,
@@ -2182,8 +2182,8 @@ impl MetadataClient {
             let step = advance(
                 &cron,
                 r.get("timezone"),
-                r.get("next_run_at"),
-                r.get("now"),
+                r.try_get("next_run_at")?,
+                r.try_get("now")?,
                 r.get("function_enabled"),
             );
             let id: Uuid = r.get("id");
@@ -2523,7 +2523,7 @@ impl MetadataClient {
             return Ok(0);
         }
         let ids: Vec<Uuid> = installs.iter().map(|i| i.id).collect();
-        let since: Vec<DateTime<Utc>> = installs.iter().map(|i| i.enabled_since).collect();
+        let since: Vec<Timestamp> = installs.iter().map(|i| i.enabled_since).collect();
         let errors: Vec<Option<String>> = installs
             .iter()
             .map(|i| i.error.as_ref().map(|e| e.chars().take(MAX_LAST_ERROR_CHARS).collect()))

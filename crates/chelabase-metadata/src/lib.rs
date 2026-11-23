@@ -1094,8 +1094,8 @@ mod tests {
             slug: slug.into(),
             status: ProjectStatus::Active,
             error: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: <chelabase_time::Timestamp as chelabase_time::TimestampExt>::now(),
+            updated_at: <chelabase_time::Timestamp as chelabase_time::TimestampExt>::now(),
         }
     }
 

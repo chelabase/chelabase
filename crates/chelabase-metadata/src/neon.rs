@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use crate::{BranchStatus, MetadataClient, MetadataError, ServedDatabase};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use chelabase_types::BranchId;
 use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
@@ -162,7 +162,7 @@ pub struct RoleAttributes {
     pub inherit: bool,
     /// `-1`: no limit.
     pub connection_limit: i32,
-    pub valid_until: Option<DateTime<Utc>>,
+    pub valid_until: Option<Timestamp>,
     /// BYPASSRLS on its own (an owner-level role has it through the owner's attributes).
     pub bypass_rls: bool,
     /// The roles it's a direct member of (`neon_superuser` excluded), sorted.
@@ -270,7 +270,7 @@ pub struct RoleCopy {
     /// attributes and memberships, and the compute hasn't confirmed them yet. Only then does the
     /// resync drive them onto the compute; otherwise it records the catalog's.
     pub attributes_pending: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub attributes: RoleAttributes,
 }
 
@@ -303,7 +303,7 @@ pub struct RoleRow {
     pub password: PasswordState,
     /// Written but not yet applied to the compute.
     pub pending: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub attributes: RoleAttributes,
 }
 
@@ -544,7 +544,13 @@ fn attributes_from_row(row: &sqlx::postgres::PgRow) -> Result<RoleAttributes, Me
     Ok(RoleAttributes {
         inherit: row.try_get("inherit")?,
         connection_limit: row.try_get("connection_limit")?,
-        valid_until: row.try_get("valid_until")?,
+        valid_until: match row.try_get("valid_until") {
+            Ok(v) => v,
+            // A value the time type cannot hold (set in SQL, or reported by compute) is read as
+            // no expiry; the API refuses such input.
+            Err(sqlx::Error::ColumnDecode { .. }) => None,
+            Err(e) => return Err(e.into()),
+        },
         bypass_rls: row.try_get("bypass_rls")?,
         member_of: row.try_get("member_of")?,
         member_no_set: row.try_get("member_no_set")?,
@@ -588,6 +594,7 @@ impl std::fmt::Debug for NeonRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     // c3 (P10): a personal login's row origin, stored as `'personal'`, serialised the same.
     #[test]
@@ -646,7 +653,7 @@ mod tests {
             api_owner_level: false,
             pending: true,
             attributes_pending: false,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             attributes: RoleAttributes::default(),
         };
         let shown = format!("{copy:?}");

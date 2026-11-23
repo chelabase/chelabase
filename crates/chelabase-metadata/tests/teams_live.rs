@@ -8,7 +8,7 @@ use chelabase_metadata::teams::{TeamChange, TeamWrite, TeamWriteError};
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_types::access::PlatformRole;
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
-use chrono::{Duration, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -534,7 +534,7 @@ async fn invite_teams_are_deduplicated_and_revoking_drops_them() {
     let invite = NewInvite {
         identity_user_id: "zi",
         email: "i@x.com",
-        expires_at: Utc::now() + Duration::days(7),
+        expires_at: Timestamp::now() + chelabase_time::days(7),
         token_hash: [7; 32],
         grants: &[],
         teams: &teams,
