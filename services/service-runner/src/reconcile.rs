@@ -575,7 +575,7 @@ mod tests {
     /// Re-audit B1: a deleted function's container (no row, no pending deployment) goes on the
     /// first pass, however young.
     #[test]
-    fn audit_deleted_function_container_removed_at_once() {
+    fn a_deleted_function_container_is_removed_at_once() {
         let k = key();
         let c = Container {
             created: NOW - 5,
@@ -589,7 +589,7 @@ mod tests {
 
     /// Re-audit B2: a disabled row's young container of another deployment is removed at once.
     #[test]
-    fn audit_disabled_row_stops_a_young_pending_container() {
+    fn disabled_row_stops_a_young_pending_container() {
         let active = key();
         let pending = Key {
             deployment_id: Uuid::new_v4(),
@@ -622,7 +622,7 @@ mod tests {
     /// Re-audit N1: a container created in the future (a remote engine's clock ahead) gets no
     /// grace.
     #[test]
-    fn audit_future_created_gets_no_grace() {
+    fn a_container_created_in_the_future_gets_no_grace() {
         let active = key();
         let pending = Key {
             deployment_id: Uuid::new_v4(),

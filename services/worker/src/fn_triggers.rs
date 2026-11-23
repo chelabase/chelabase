@@ -12,8 +12,8 @@
 //! `run_as_unmintable` the sweep never retries. It writes only through
 //! `MetadataClient::settle_run_as_mint`, which checks, under the function's locks, that the
 //! member's choice is still the one checked.
-//! `audit_run_as_mint_never_overrides_a_concurrent_change` and
-//! `audit_child_run_as_key_needs_the_approved_oid` test it.
+//! `run_as_mint_never_overrides_a_concurrent_change` and
+//! `child_run_as_key_needs_the_approved_oid` test it.
 //!
 //! **Invariant (tenants).** No action by a role without the owner's or Admin's rights can
 //! fail, disable or stall the install, and the sweep never blocks tenant writes for more than
@@ -29,8 +29,8 @@
 //! gate), so no key or run-as role is ever bound to it. One qualification: a transaction that
 //! holds a lock on a triggered table itself delays that table's `CREATE TRIGGER` until it
 //! ends (the sweep gives up after the lock_timeout and comes back), as any DDL would.
-//! `audit_sweep_never_blocks_tenant_writes`, `audit_unprivileged_role_cannot_disable_the_triggers`,
-//! `audit_owner_role_never_backs_a_key` and `audit_squatted_advisory_lock_never_stalls_the_install`
+//! `sweep_never_blocks_tenant_writes`, `unprivileged_role_cannot_disable_the_triggers`,
+//! `owner_role_never_backs_a_key` and `squatted_advisory_lock_never_stalls_the_install`
 //! test it, and the attack matrix carries each move.
 //!
 //! **Invariant (dispatch, m13b).** The dispatch login [`DISPATCH`] holds exactly its

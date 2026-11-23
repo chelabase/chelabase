@@ -636,7 +636,7 @@ mod fn_triggers {
     /// their JSON types. No hostile function runs, as anyone.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_hostile_casts_never_run_in_enqueue() {
+    async fn hostile_casts_never_run_in_enqueue() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(
@@ -688,7 +688,7 @@ mod fn_triggers {
     /// runs a planted function; a stray function in the schema is dropped.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_named_grants_and_a_tampered_outbox_are_repaired() {
+    async fn named_grants_and_a_tampered_outbox_are_repaired() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int); CREATE TABLE public.seen (who text); GRANT INSERT ON public.seen TO PUBLIC;").await;
@@ -753,7 +753,7 @@ mod fn_triggers {
     /// and keeps the rows of its own triggers.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_sweep_after_a_failed_create_sync_drops_foreign_events() {
+    async fn sweep_after_a_failed_create_sync_drops_foreign_events() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int)").await;
@@ -797,7 +797,7 @@ mod fn_triggers {
     /// once the check runs, clearing the error.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_child_run_as_key_retried_until_minted() {
+    async fn child_run_as_key_retried_until_minted() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE ROLE reporter NOLOGIN").await;
@@ -1143,7 +1143,7 @@ mod fn_triggers {
     /// there by another installed trigger) doesn't install its database trigger.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_failed_row_never_installed() {
+    async fn a_failed_row_is_never_installed() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int)").await;
@@ -1176,7 +1176,7 @@ mod fn_triggers {
     /// trigger running `enqueue()`, so nothing keeps filling an outbox nobody reads.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_refusal_after_install_drops_the_triggers() {
+    async fn refusal_after_install_drops_the_triggers() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int)").await;
@@ -1198,7 +1198,7 @@ mod fn_triggers {
     /// doesn't refuse the install; the grant is revoked.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_a_grant_to_the_owner_role_is_revoked_not_refused() {
+    async fn a_grant_to_the_owner_role_is_revoked_not_refused() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int); ALTER TABLE public.orders OWNER TO postgres").await;
@@ -1223,7 +1223,7 @@ mod fn_triggers {
     /// change the machinery.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_member_cannot_escalate() {
+    async fn database_owner_cannot_escalate() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int); ALTER TABLE public.orders OWNER TO postgres").await;
@@ -1262,7 +1262,7 @@ mod fn_triggers {
     /// while the worker checks it keeps it cleared; the mint writes nothing.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_run_as_mint_never_overrides_a_concurrent_change() {
+    async fn run_as_mint_never_overrides_a_concurrent_change() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE ROLE reporter NOLOGIN").await;
@@ -1306,7 +1306,7 @@ mod fn_triggers {
     /// for a later namesake; a namesake with another OID is `changed`; neither is retried.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_child_run_as_key_needs_the_approved_oid() {
+    async fn child_run_as_key_needs_the_approved_oid() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE ROLE ghost NOLOGIN; CREATE ROLE twin NOLOGIN")
@@ -1397,7 +1397,7 @@ mod fn_triggers {
     /// place (the catalog rows of the schema, the outbox and `enqueue()` keep their `xmin`).
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_sweep_never_blocks_tenant_writes() {
+    async fn sweep_never_blocks_tenant_writes() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int)").await;
@@ -1447,7 +1447,7 @@ mod fn_triggers {
     /// is never granted to `authenticator` and the next sync still finds it clean.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_owner_role_never_backs_a_key() {
+    async fn owner_role_never_backs_a_key() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int)").await;
@@ -1479,7 +1479,7 @@ mod fn_triggers {
     /// owner (taking the role out of it would change their row security).
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_unprivileged_role_cannot_disable_the_triggers() {
+    async fn unprivileged_role_cannot_disable_the_triggers() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int); CREATE TABLE public.mine (id int); ALTER TABLE public.mine OWNER TO postgres").await;
@@ -1527,7 +1527,7 @@ mod fn_triggers {
     /// retried, never failed).
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_squatted_advisory_lock_never_stalls_the_install() {
+    async fn squatted_advisory_lock_never_stalls_the_install() {
         with_fx(|fx| async move {
             let main = fx.main;
             // A login role with no rights at all, in a session of its own (the holder check
@@ -2087,7 +2087,7 @@ mod fn_triggers {
     /// delivered (deleted, never delivered again) and releases the rest.
     #[tokio::test]
     #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-    async fn audit_mid_batch_metadata_error_settles_delivered_rows() {
+    async fn mid_batch_metadata_error_settles_delivered_rows() {
         with_fx(|fx| async move {
             let main = fx.main;
             fx.sql(main, "CREATE TABLE public.orders (id int PRIMARY KEY);").await;
