@@ -350,29 +350,32 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
 /// The startup report on real Postgres: two schedules stored with crons an older parser
 /// accepted (inserted directly), one healthy. After the report the two have their reason in
 /// `last_error` and nothing else changed; the first claim after it disables both by today's
-/// rule and keeps the reason. (`main` awaits the report before it spawns the claim loop, so the
+/// rule and keeps the reason. A third broken schedule that is already disabled is counted
+/// and logged but keeps `last_error` NULL. (`main` awaits the report before it spawns the claim loop, so the
 /// claim here follows it the same way.)
 #[tokio::test]
 #[ignore]
 async fn the_report_precedes_the_first_claim() {
     let s = Scratch::new().await;
     let (_db, branch, function) = s.function("reported", true).await;
-    let insert = |cron: &'static str| {
+    let insert = |cron: &'static str, enabled: bool| {
         let pool = s.pool().clone();
         async move {
             sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
-                 VALUES (gen_random_uuid(), $1, $2, $3, 'UTC', now() - interval '1 minute') RETURNING id",
+                "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, enabled, next_run_at)
+                 VALUES (gen_random_uuid(), $1, $2, $3, 'UTC', $4, now() - interval '1 minute') RETURNING id",
             )
             .bind(branch.as_uuid())
             .bind(function)
             .bind(cron)
+            .bind(enabled)
             .fetch_one(&pool)
             .await
             .unwrap()
         }
     };
-    let (jan, ell, healthy) = (insert("0 0 * * jan").await, insert("0 0 * * L").await, insert("*/5 * * * *").await);
+    let (jan, ell, healthy) = (insert("0 0 * * jan", true).await, insert("0 0 * * L", true).await, insert("*/5 * * * *", true).await);
+    let off = insert("0 0 * * jan", false).await;
     let state = |id: Uuid| {
         let pool = s.pool().clone();
         async move {
@@ -386,8 +389,9 @@ async fn the_report_precedes_the_first_claim() {
         }
     };
     let before = (state(jan).await, state(ell).await, state(healthy).await);
+    let off_before = state(off).await;
 
-    assert_eq!(worker::schedule_report::run(&s.client).await, Some(2));
+    assert_eq!(worker::schedule_report::run(&s.client).await, Some(3), "the disabled one is counted too");
 
     for (id, was) in [(jan, &before.0), (ell, &before.1)] {
         let now = state(id).await;
@@ -395,6 +399,8 @@ async fn the_report_precedes_the_first_claim() {
         assert_eq!((&now.0, &now.1, now.2, now.3), (&was.0, &was.1, was.2, was.3), "nothing else changed");
     }
     assert_eq!(state(healthy).await, before.2, "the healthy schedule is untouched");
+    assert_eq!(state(off).await, off_before, "a disabled broken schedule is logged only: last_error stays NULL");
+    assert!(off_before.4.is_none() && !off_before.2);
 
     s.client.claim_due_schedules(64, &[]).await.unwrap();
     for id in [jan, ell] {

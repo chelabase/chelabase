@@ -63,7 +63,7 @@ Still accepted, unchanged: `0 0 * * MON-FRI`, `0 0 1 JAN *`, `0 0 * * 5L` and `*
 
 ### After an upgrade
 
-When the worker starts, before it runs any schedule, it checks every stored schedule, enabled or not, against the current cron parser and time zone list. It logs one warning for each schedule that no longer parses (its id, branch, function name, cron, time zone, whether it is enabled, and the parser's reason) and one summary line that ends with the count (`rejected=0` when none). It also writes the reason to each such schedule's `last_error`, so the management API and Studio show it before the schedule is switched off. Nothing else about the schedule changes: it is still disabled at its next due time, as above.
+When the worker starts, before it runs any schedule, it checks every stored schedule, enabled or not, against the current cron parser and time zone list. It logs one warning for each schedule that no longer parses (its id, branch, function name, cron, time zone, whether it is enabled, and the parser's reason) and one summary line that ends with the count (`rejected=0` when none). It also writes the reason to the `last_error` of each such schedule that is still enabled, so the management API and Studio show it before the schedule is switched off. Schedules already switched off are only logged and get no `last_error`. Nothing else about the schedule changes: it is still disabled at its next due time, as above.
 
 To fix one, PATCH a valid `cron` (and `timezone`, if that was the problem) together with `"enabled": true`. That turns the schedule back on and clears `last_error`. Editing a stopped schedule in Studio sends `enabled` for you.
 

@@ -8,6 +8,12 @@
 //! `last_error` ([`MetadataClient::record_schedule_errors`], which derives the reason itself
 //! from the locked row). It changes nothing else: the schedules then follow the invalid-cron
 //! rule unchanged. A failed read or write is logged and never stops the worker.
+//!
+//! Only **enabled** failing schedules are passed to `record_schedule_errors`; a failing
+//! schedule that is already disabled is logged and never gets a `last_error`. That keeps the
+//! invariant "`last_error` set implies the worker switched the schedule off" true, so
+//! Studio's "Stopped" block (whose edit sends `enabled: true`) never turns on a schedule a
+//! user switched off themselves.
 
 use chelabase_metadata::{
     MetadataClient, MetadataError, Schedule, ScheduleReportRow,
@@ -64,7 +70,7 @@ pub async fn run(store: &dyn ScheduleStore) -> Option<usize> {
         let Some(last) = page.last() else { break };
         after = Some(last.id);
         let full = page.len() as i64 == PAGE;
-        let mut failing = Vec::new();
+        let (mut failing, mut to_record) = (0usize, Vec::new());
         for row in &page {
             if let Err(why) = Schedule::parse(&row.cron, &row.timezone) {
                 warn!(
@@ -76,15 +82,18 @@ pub async fn run(store: &dyn ScheduleStore) -> Option<usize> {
                     enabled = row.enabled,
                     "stored schedule no longer parses and will be switched off when it comes due: {why}"
                 );
-                failing.push(row.id);
+                failing += 1;
+                if row.enabled {
+                    to_record.push(row.id);
+                }
             }
         }
         checked += page.len();
-        rejected += failing.len();
-        if !failing.is_empty()
-            && let Err(e) = store.record_schedule_errors(&failing).await
+        rejected += failing;
+        if !to_record.is_empty()
+            && let Err(e) = store.record_schedule_errors(&to_record).await
         {
-            error!(count = failing.len(), "the schedule report could not record the reasons in last_error: {e}");
+            error!(count = to_record.len(), "the schedule report could not record the reasons in last_error: {e}");
         }
         if !full {
             break;
@@ -208,15 +217,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_only_the_failing_ids() {
+    async fn records_only_the_failing_enabled_ids() {
         let (_logs, _g) = Captured::capture();
         let (a, b, c) = (row("0 0 * * jan", "UTC", true), row("*/5 * * * *", "UTC", true), row("0 0 * * *", "Nope/Zone", false));
-        let store = FakeSchedules::new(vec![a.clone(), b, c.clone()]);
+        let d = row("0 0 * * L", "UTC", true);
+        let store = FakeSchedules::new(vec![a.clone(), b, c, d.clone()]);
         run(&store).await;
-        let mut want = vec![a.id, c.id];
+        let mut want = vec![a.id, d.id];
         want.sort();
-        assert_eq!(store.recorded(), vec![want], "in id order, one call");
+        assert_eq!(store.recorded(), vec![want], "in id order, one call, enabled ones only");
         assert_eq!(store.reads(), 1, "the report only reads and records");
+    }
+
+    #[tokio::test]
+    async fn logs_a_failing_disabled_schedule_but_records_only_the_enabled_one() {
+        let (logs, _g) = Captured::capture();
+        let (on, off) = (row("0 0 * * jan", "UTC", true), row("0 0 * * L", "UTC", false));
+        let store = FakeSchedules::new(vec![on.clone(), off.clone()]);
+        assert_eq!(run(&store).await, Some(2), "both are counted as rejected");
+        let warns = logs.lines("WARN");
+        assert_eq!(warns.len(), 2, "{warns:?}");
+        for id in [on.id, off.id] {
+            assert!(warns.iter().any(|w| w.contains(&id.to_string())), "{id} logged: {warns:?}");
+        }
+        assert_eq!(store.recorded(), vec![vec![on.id]], "the disabled one never gets a last_error");
     }
 
     #[tokio::test]
