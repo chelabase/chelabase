@@ -569,6 +569,11 @@ impl FakeInternal {
         self.inner.lock().unwrap().peek_error = Some((status, code.map(str::to_string)));
     }
 
+    /// As new: no branches, sessions, calls or forced answers.
+    pub fn reset(&self) {
+        *self.inner.lock().unwrap() = FakeState::default();
+    }
+
     /// Peeks and refreshes answer from the sessions again.
     pub fn clear_answers(&self) {
         let mut st = self.inner.lock().unwrap();

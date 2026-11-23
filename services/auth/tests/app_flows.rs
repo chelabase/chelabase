@@ -65,7 +65,10 @@ struct Proxy {
     state: Arc<Mutex<ProxyState>>,
 }
 
-async fn proxy_handle(State((st, upstream)): State<(Arc<Mutex<ProxyState>>, String)>, req: Request) -> Response {
+async fn proxy_handle(
+    State((st, upstream, http)): State<(Arc<Mutex<ProxyState>>, String, reqwest::Client)>,
+    req: Request,
+) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = to_bytes(Body::new(body), 1 << 20).await.unwrap_or_default();
     let call = format!("{} {}", parts.method, parts.uri.path());
@@ -112,7 +115,7 @@ async fn proxy_handle(State((st, upstream)): State<(Arc<Mutex<ProxyState>>, Stri
         return (StatusCode::from_u16(status).unwrap(), body).into_response();
     }
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-    let mut forward = reqwest::Client::new().request(parts.method.clone(), format!("{upstream}{path}"));
+    let mut forward = http.request(parts.method.clone(), format!("{upstream}{path}"));
     for name in ["authorization", "content-type"] {
         if let Some(v) = parts.headers.get(name) {
             forward = forward.header(name, v.clone());
@@ -129,7 +132,7 @@ impl Proxy {
         let state = Arc::new(Mutex::new(ProxyState::default()));
         let app = axum::Router::new()
             .fallback(proxy_handle)
-            .with_state((state.clone(), upstream.to_string()));
+            .with_state((state.clone(), upstream.to_string(), reqwest::Client::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -180,6 +183,11 @@ impl Proxy {
             release,
             proxy: self.clone(),
         }
+    }
+
+    /// As new: no calls seen, and no hooks, raw answers, delays or holds.
+    fn reset(&self) {
+        *self.state.lock().unwrap() = ProxyState::default();
     }
 
     /// Hooks, raw answers, delays and holds are over.
@@ -327,6 +335,8 @@ impl PendingInsert for FakePending {
 
 struct H {
     fake: FakeIdentity,
+    /// One client for the fake, so its connections are pooled.
+    fake_client: chelabase_identity::Identity,
     proxy: Proxy,
     internal: FakeInternal,
     /// In front of `internal`, to fail an orchestrator call.
@@ -442,6 +452,7 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         .unwrap()
     });
     H {
+        fake_client: fake.client(),
         fake,
         proxy,
         internal,
@@ -464,6 +475,25 @@ async fn harness() -> H {
 }
 
 impl H {
+    /// Starts over in a new project, branch and key on the same servers, as a fresh
+    /// [`harness`] would: the fakes forget every call, session and forced answer, and the
+    /// service's per-project limits and per-branch cache start empty, so nothing of an earlier
+    /// case reaches the next. Servers and their connections stay, so a long run of cases
+    /// takes a fixed number of ports.
+    fn next_project(&mut self) {
+        self.proxy.reset();
+        self.iproxy.reset();
+        self.internal.reset();
+        self.db.journal.lock().unwrap().clear();
+        self.db.rows.lock().unwrap().clear();
+        self.db.set(Fail::Nothing);
+        self.project = Uuid::new_v4();
+        self.branch = Uuid::new_v4();
+        self.key = Uuid::new_v4();
+        self.fake.with_pool(&self.pool());
+        self.internal.set_branch(self.branch, info(self.project, self.branch, false));
+    }
+
     fn pool(&self) -> Pool {
         Pool::App(self.project)
     }
@@ -638,8 +668,7 @@ impl H {
 
     async fn add_user_in(&self, pool: Pool, email: &str, password: &str, verified: bool) -> String {
         self.fake.with_pool(&pool);
-        self.fake
-            .client()
+        self.fake_client
             .create_user(
                 &pool,
                 &chelabase_identity::NewUser {
@@ -1511,11 +1540,13 @@ fn refresh_model(p: Peek, o: Orch, i: Ident) -> Outcome {
 
 /// One case of the matrix: the first refresh against the model, and, when it answered 503,
 /// a retry with the same token once every fault is over and (for a current token) the grace
-/// has ended, as after a long outage (#59). Returns what differs from the model.
-async fn refresh_case(p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
+/// has ended, as after a long outage (#59). Returns what differs from the model. The case runs
+/// in a new project of `h` ([`H::next_project`]).
+async fn refresh_case(h: &mut H, p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
     use Ident as I;
     use Orch as O;
-    let h = harness().await;
+    h.next_project();
+    let h = &*h;
     let pool = h.pool();
     let lookup_pattern = format!("GET {}/sessions/", h.pool_path());
     if t == Timing::GraceEndsInLookup {
@@ -1527,7 +1558,7 @@ async fn refresh_case(p: Peek, o: Orch, i: Ident, t: Timing) -> Option<String> {
     let owner = if i == I::OtherUser { &other } else { &user };
     let (identity_session, _) = h.fake.with_session(&pool, owner);
     let lookup = format!("GET {}/sessions/{identity_session}", h.pool_path());
-    let client = h.fake.client();
+    let client = &h.fake_client;
     match i {
         I::Live | I::OtherUser => {}
         I::Banned => h.fake.ban(&pool, &user),
@@ -1689,19 +1720,21 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         I::Malformed200,
     ];
     let total = peeks.len() * idents.len() * (orchs.len() + 1);
-    // One task per peek answer; each runs its cases in turn.
+    // One task per peek answer; each runs its cases in turn on one harness of its own, so the
+    // ports the run takes don't grow with the number of cases.
     let tasks: Vec<_> = peeks
         .into_iter()
         .map(|p| {
             tokio::spawn(async move {
+                let mut h = harness().await;
                 let mut wrong = Vec::new();
                 for o in orchs {
                     for i in idents {
-                        wrong.extend(refresh_case(p, o, i, Timing::Steady).await);
+                        wrong.extend(refresh_case(&mut h, p, o, i, Timing::Steady).await);
                     }
                 }
                 for i in idents {
-                    wrong.extend(refresh_case(p, O::Grace, i, Timing::GraceEndsInLookup).await);
+                    wrong.extend(refresh_case(&mut h, p, O::Grace, i, Timing::GraceEndsInLookup).await);
                 }
                 wrong
             })
