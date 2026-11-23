@@ -1607,8 +1607,8 @@ mod fn_triggers {
                 })
                 .collect())
         }
-        async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String> {
-            self.inner.targets(limit).await
+        async fn targets(&self, limit: i64, running: &[(BranchId, String)]) -> Result<Vec<(BranchId, String)>, String> {
+            self.inner.targets(limit, running).await
         }
         async fn record(&self, b: BranchId, d: &[chelabase_metadata::TriggerDelivery]) -> Result<(), String> {
             self.inner.record(b, d).await

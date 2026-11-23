@@ -2454,22 +2454,46 @@ impl MetadataClient {
     }
 
     /// m13: up to `limit` (ready branch of a live database, Postgres database) pairs with at
-    /// least one `installed`, enabled table trigger: where the dispatcher runs. A read. In a
-    /// random order (m13b, N2): past `limit`, no branch always loses.
+    /// least one `installed`, enabled table trigger: where the dispatcher runs. A read.
+    ///
+    /// #297: shared across tenants round-robin. Each tenant's targets are ranked (the ones in
+    /// `running`, the dispatcher's current sessions, first; then at random), and the pick
+    /// takes every tenant's first, then every tenant's second, and so on, up to `limit`. So
+    /// the pick has `min(limit, targets)` rows, and a tenant holds two more than another only
+    /// when that other has no target left out (max-min fair to within one). Within a round,
+    /// running targets go first, so a pick fed its own result back is the same set: sessions
+    /// inside their tenant's share are never moved, and the dispatcher doesn't churn. Past
+    /// `limit`, which tenants get the last round's extra one is random among the non-running
+    /// (m13b, N2: no tenant always loses).
     pub async fn dispatch_targets(
         &self,
         limit: i64,
+        running: &[(BranchId, String)],
     ) -> Result<Vec<(BranchId, String)>, MetadataError> {
+        let (run_branches, run_dbs): (Vec<Uuid>, Vec<String>) =
+            running.iter().map(|(b, db)| (b.as_uuid(), db.clone())).unzip();
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "SELECT branch_id, pg_database FROM (
-               SELECT DISTINCT t.branch_id, t.pg_database
+            "WITH targets AS (
+               SELECT DISTINCT t.branch_id, t.pg_database, p.tenant_id
                FROM function_triggers t JOIN branches b ON b.id = t.branch_id
-               JOIN databases d ON d.id = b.database_id
+               JOIN databases d ON d.id = b.database_id JOIN projects p ON p.id = d.project_id
                WHERE t.source = 'table' AND t.state = 'installed' AND t.enabled
-                 AND b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')) targets
-             ORDER BY random() LIMIT $1",
+                 AND b.status = 'ready' AND d.status NOT IN ('deleting', 'deleted')),
+             marked AS (
+               SELECT g.*, (g.branch_id, g.pg_database) IN (
+                   SELECT * FROM unnest($2::uuid[], $3::text[])) AS running
+               FROM targets g),
+             ranked AS (
+               SELECT branch_id, pg_database, running,
+                      row_number() OVER (PARTITION BY tenant_id ORDER BY running DESC, random())
+                        AS turn
+               FROM marked)
+             SELECT branch_id, pg_database FROM ranked
+             ORDER BY turn, running DESC, random() LIMIT $1",
         )
         .bind(limit)
+        .bind(&run_branches)
+        .bind(&run_dbs)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(b, db)| (BranchId(b), db)).collect())

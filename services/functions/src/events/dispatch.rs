@@ -30,6 +30,7 @@ use chelabase_query::server_tls::ServerTls;
 use chelabase_types::BranchId;
 use tokio_postgres::Client;
 use tokio_postgres::types::ToSql;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -60,8 +61,9 @@ pub trait EventsMetadata: Send + Sync + 'static {
     async fn branch(&self, branch: BranchId) -> Result<Option<BranchRecord>, String>;
     async fn triggers(&self, branch: BranchId) -> Result<Vec<TriggerRecord>, String>;
     async fn functions(&self, branch: BranchId) -> Result<Vec<BranchFunction>, String>;
-    /// (ready branch, Postgres database) pairs with an installed, enabled table trigger.
-    async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String>;
+    /// Up to `limit` (ready branch, Postgres database) pairs with an installed, enabled table
+    /// trigger, shared fairly across tenants with the `running` ones preferred (#297).
+    async fn targets(&self, limit: i64, running: &[Target]) -> Result<Vec<Target>, String>;
     async fn record(&self, branch: BranchId, deliveries: &[TriggerDelivery]) -> Result<(), String>;
 }
 
@@ -82,8 +84,8 @@ impl EventsMetadata for MetadataClient {
             .await
             .map_err(|e| format!("listing the functions: {e}"))
     }
-    async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String> {
-        self.dispatch_targets(limit)
+    async fn targets(&self, limit: i64, running: &[Target]) -> Result<Vec<Target>, String> {
+        self.dispatch_targets(limit, running)
             .await
             .map_err(|e| format!("listing the databases to dispatch: {e}"))
     }
@@ -615,59 +617,152 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
     }
 
     /// One target's session: passes, woken by notifications or the sweep, until one says
-    /// stop. `Ok` when the target is done.
-    async fn session(&self, branch: BranchId, db: &str) -> Result<(), String> {
+    /// stop or the supervisor does (#297: checked between passes and while idle, so a claimed
+    /// batch is always settled). `Ok` when the target is done or stopped.
+    async fn session(&self, branch: BranchId, db: &str, stop: &mut watch::Receiver<bool>) -> Result<(), String> {
         let Some(mut s) = self.open(branch, db).await? else {
             return Ok(());
         };
         loop {
+            if *stop.borrow() {
+                return Ok(());
+            }
             match self.pass(&mut s).await? {
                 Pass::Stop => return Ok(()),
                 Pass::More => {}
                 Pass::Idle(idle) => {
-                    self.wait(&mut s, idle).await?;
+                    tokio::select! {
+                        woken = self.wait(&mut s, idle) => {
+                            woken?;
+                        }
+                        // A stop, or the supervisor gone.
+                        _ = stop.changed() => return Ok(()),
+                    }
                 }
             }
         }
     }
 
-    /// One target's task: sessions until one ends the target; a failed one waits [`RETRY`].
-    pub async fn run_target(self: Arc<Self>, branch: BranchId, db: String) {
+    /// One target's task: sessions until one ends the target or the supervisor stops it; a
+    /// failed one waits [`RETRY`].
+    pub async fn run_target(self: Arc<Self>, branch: BranchId, db: String, mut stop: watch::Receiver<bool>) {
         loop {
-            match self.session(branch, &db).await {
+            match self.session(branch, &db, &mut stop).await {
                 Ok(()) => return,
                 Err(e) => {
                     warn!(branch_id = %branch, database = %db, "function events: {e}");
-                    tokio::time::sleep(RETRY).await;
+                    if *stop.borrow() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(RETRY) => {}
+                        _ = stop.changed() => return,
+                    }
                 }
             }
         }
     }
 
-    /// The supervisor: every [`SUPERVISE_EVERY`], a task for each target without one, up to
-    /// [`MAX_TARGETS`] at once.
+    /// The supervisor: a [`Supervisor`] of up to [`MAX_TARGETS`] sessions, ticked every
+    /// [`SUPERVISE_EVERY`].
     pub async fn supervise(self: Arc<Self>) {
-        let mut tasks: HashMap<(BranchId, String), tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut supervisor = Supervisor::new(self, MAX_TARGETS);
         let mut every = tokio::time::interval(SUPERVISE_EVERY);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
-            tasks.retain(|_, t| !t.is_finished());
-            let targets = match self.meta.targets(MAX_TARGETS as i64).await {
-                Ok(targets) => targets,
-                Err(e) => {
-                    warn!("function events: {e}");
-                    continue;
-                }
-            };
-            for target in targets {
-                if tasks.len() >= MAX_TARGETS || tasks.contains_key(&target) {
-                    continue;
-                }
-                let (branch, db) = target.clone();
-                tasks.insert(target, tokio::spawn(self.clone().run_target(branch, db)));
+            supervisor.tick().await;
+        }
+    }
+}
+
+/// One target's task and the switch that stops it (between passes).
+struct Task {
+    handle: tokio::task::JoinHandle<()>,
+    stop: watch::Sender<bool>,
+}
+
+/// The dispatcher's sessions (#297): each tick, the metadata's fair pick of up to `cap`
+/// targets, with the running sessions preferred; then [`plan_tick`]: sessions the pick left
+/// out are told to stop, and picked targets without one start, never more than `cap` tasks
+/// at once (a stopping one counts until it ends).
+pub struct Supervisor<M, S> {
+    dispatcher: Arc<Dispatcher<M, S>>,
+    cap: usize,
+    tasks: HashMap<Target, Task>,
+}
+
+impl<M: EventsMetadata, S: ConnSource> Supervisor<M, S> {
+    pub fn new(dispatcher: Arc<Dispatcher<M, S>>, cap: usize) -> Self {
+        Supervisor { dispatcher, cap, tasks: HashMap::new() }
+    }
+
+    /// The targets with a task: `true` when told to stop and still finishing.
+    pub fn live(&self) -> HashMap<Target, bool> {
+        self.tasks.iter().map(|(k, t)| (k.clone(), *t.stop.borrow())).collect()
+    }
+
+    /// One tick: forget ended tasks, read the pick, stop and start as [`plan_tick`] says.
+    pub async fn tick(&mut self) {
+        self.tasks.retain(|_, t| !t.handle.is_finished());
+        let live = self.live();
+        let running: Vec<Target> = live.iter().filter(|(_, stopping)| !**stopping).map(|(k, _)| k.clone()).collect();
+        let picked = match self.dispatcher.meta.targets(self.cap as i64, &running).await {
+            Ok(picked) => picked,
+            Err(e) => {
+                warn!("function events: {e}");
+                return;
+            }
+        };
+        let tick = plan_tick(&live, &picked, self.cap);
+        for target in &tick.stop {
+            if let Some(task) = self.tasks.get(target) {
+                debug!(branch_id = %target.0, database = %target.1, "function events: left out of the pick (over its tenant's share, or gone), stopping");
+                let _ = task.stop.send(true);
             }
         }
+        for target in tick.start {
+            let (branch, db) = target.clone();
+            let (stop, rx) = watch::channel(false);
+            let handle = tokio::spawn(self.dispatcher.clone().run_target(branch, db, rx));
+            self.tasks.insert(target, Task { handle, stop });
+        }
+    }
+}
+
+/// A dispatch target: (branch, Postgres database).
+pub type Target = (BranchId, String);
+
+/// What one supervisor tick does.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tick {
+    /// Running sessions to stop (between passes).
+    pub stop: Vec<Target>,
+    /// Targets to start a session for, in the pick's order.
+    pub start: Vec<Target>,
+}
+
+/// One supervisor tick (#297), given the targets with a task (`true`: told to stop, still
+/// finishing its pass) and the metadata's fair pick, made with the running ones preferred:
+/// stop every running session the pick left out (its tenant is over its share, or the target
+/// is gone), and start picked targets without a task, in the pick's order, while fewer than
+/// `cap` tasks exist. A stopping task still counts toward `cap` until it ends, so there are
+/// never more than `cap` connections; its slot goes to the pick on a later tick.
+pub fn plan_tick(live: &HashMap<Target, bool>, picked: &[Target], cap: usize) -> Tick {
+    let wanted: std::collections::HashSet<&Target> = picked.iter().collect();
+    let free = cap.saturating_sub(live.len());
+    Tick {
+        stop: live
+            .iter()
+            .filter(|(t, stopping)| !**stopping && !wanted.contains(t))
+            .map(|(t, _)| t.clone())
+            .collect(),
+        start: picked
+            .iter()
+            .filter(|t| !live.contains_key(*t))
+            .take(free)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -775,5 +870,435 @@ mod tests {
         assert_eq!((d.dropped, d.dead, d.delivered), (2, 1, true));
         assert_eq!(d.error.as_deref(), Some("the function answered 500"));
         assert!(!t.0.contains_key(&gone));
+    }
+
+    /// #297's model of `dispatch_targets` (the live tests hold the SQL to the same three
+    /// properties: fair to within one, running first, a fixed point): each tenant's targets,
+    /// running first, then shuffled; then round-robin across tenants, running first within a
+    /// round, up to `limit`.
+    fn model_pick(
+        tenants: &[Vec<Target>],
+        running: &std::collections::HashSet<Target>,
+        limit: usize,
+        rng: &mut u64,
+    ) -> Vec<Target> {
+        // A seeded shuffle (xorshift64 keys), so a failing case replays.
+        let mut shuffle = |ts: &mut Vec<Target>| {
+            let mut keyed: Vec<(u64, Target)> = ts
+                .drain(..)
+                .map(|t| {
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 7;
+                    *rng ^= *rng << 17;
+                    (*rng, t)
+                })
+                .collect();
+            keyed.sort_by_key(|(k, _)| *k);
+            ts.extend(keyed.into_iter().map(|(_, t)| t));
+        };
+        let mut ranked: Vec<Vec<Target>> = tenants
+            .iter()
+            .map(|ts| {
+                let mut ts = ts.clone();
+                shuffle(&mut ts);
+                ts.sort_by_key(|t| !running.contains(t));
+                ts
+            })
+            .collect();
+        let mut out = Vec::new();
+        for turn in 0.. {
+            let mut round: Vec<Target> = ranked.iter_mut().filter_map(|ts| ts.get(turn).cloned()).collect();
+            if round.is_empty() {
+                break;
+            }
+            shuffle(&mut round);
+            round.sort_by_key(|t| !running.contains(t));
+            out.extend(round);
+        }
+        out.truncate(limit);
+        out
+    }
+
+    /// #297: the supervisor shares its sessions fairly whatever it starts from (for example
+    /// one tenant holding every slot) and then stays put. With every tenant's candidates
+    /// fixed, a session told to stop finishing within `d` ticks, and a fair pick, after
+    /// `d + 1` ticks: tasks never exceed the cap; the running sessions are `min(cap,
+    /// candidates)`, each a candidate; a tenant holds two more than another only when that
+    /// other has no candidate left out; and no tick stops a session again.
+    #[test]
+    fn supervisor_shares_sessions_fairly_and_settles() {
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+        let strategy = (
+            proptest::collection::vec(0usize..30, 1..6),
+            1usize..40,
+            1usize..4,
+            1u64..,
+        );
+        proptest::test_runner::TestRunner::new(ProptestConfig { cases: 256, ..ProptestConfig::default() })
+            .run(&strategy, |(sizes, cap, delay, seed)| {
+                let mut rng = seed;
+                let tenants: Vec<Vec<Target>> = sizes
+                    .iter()
+                    .map(|&k| (0..k).map(|_| (BranchId(Uuid::new_v4()), "app".to_string())).collect())
+                    .collect();
+                // The worst start: the biggest tenant holds every slot it can, plus one
+                // target that is no longer a candidate.
+                let big = (0..tenants.len()).max_by_key(|&i| tenants[i].len()).unwrap();
+                let mut live: HashMap<Target, Option<usize>> = tenants[big]
+                    .iter()
+                    .take(cap.saturating_sub(1))
+                    .map(|t| (t.clone(), None))
+                    .collect();
+                live.insert((BranchId(Uuid::new_v4()), "gone".to_string()), None);
+                let total: usize = sizes.iter().sum();
+                for tick in 0..delay + 4 {
+                    // Sessions told to stop finish once their in-flight pass does.
+                    live.retain(|_, stop| stop.is_none_or(|left| left > 0));
+                    for left in live.values_mut().flatten() {
+                        *left -= 1;
+                    }
+                    let running: HashSet<Target> =
+                        live.iter().filter(|(_, s)| s.is_none()).map(|(t, _)| t.clone()).collect();
+                    let picked = model_pick(&tenants, &running, cap, &mut rng);
+                    let view: HashMap<Target, bool> = live.iter().map(|(t, s)| (t.clone(), s.is_some())).collect();
+                    let plan = plan_tick(&view, &picked, cap);
+                    if tick > delay {
+                        prop_assert!(plan.stop.is_empty(), "tick {tick} stops {:?}", plan.stop);
+                    }
+                    for t in &plan.stop {
+                        prop_assert_eq!(live.insert(t.clone(), Some(delay - 1)), Some(None), "stops a running one");
+                    }
+                    for t in plan.start {
+                        prop_assert!(live.insert(t, None).is_none(), "starts a live one");
+                    }
+                    prop_assert!(live.len() <= cap, "{} tasks over the cap {cap}", live.len());
+                    if tick > delay {
+                        let running: Vec<&Target> = live.iter().filter(|(_, s)| s.is_none()).map(|(t, _)| t).collect();
+                        prop_assert_eq!(running.len(), cap.min(total), "tick {}", tick);
+                        let n: Vec<usize> = tenants
+                            .iter()
+                            .map(|ts| ts.iter().filter(|t| running.contains(t)).count())
+                            .collect();
+                        prop_assert_eq!(n.iter().sum::<usize>(), running.len(), "only candidates run");
+                        for i in 0..n.len() {
+                            for j in 0..n.len() {
+                                prop_assert!(
+                                    n[i] <= n[j] + 1 || n[j] == sizes[j],
+                                    "tick {tick}: {n:?} of {sizes:?}, cap {cap}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// #297's stop path, against a plain Postgres set up as the worker's install leaves a
+    /// compute (`chelabase_functions.outbox` owned by its owner role, the bare dispatch login
+    /// granted exactly its allowlist, `neon.timeline_id` set on the database). The metadata is
+    /// a fake. Run with a superuser URL to a throwaway server:
+    ///
+    /// ```text
+    /// CHELABASE_FUNCTIONS_TEST_PG_URL=postgres://user:pw@127.0.0.1:5432/postgres \
+    ///   cargo nextest run -p chelabase-functions supervisor_stop --run-ignored only
+    /// ```
+    mod stop_live {
+        use super::*;
+        use chelabase_metadata::{BranchKind, FunctionKind, TriggerSource, TriggerState};
+        use chelabase_pgsession::{ConnInfo, Settings};
+        use chelabase_schema::exclusions::{
+            FUNCTIONS_DISPATCH_OUTBOX_GRANTS, FUNCTIONS_DISPATCH_SCHEMA_GRANTS, FUNCTIONS_SCHEMA,
+        };
+        use chelabase_time::Timestamp;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const OWNER: &str = "chelabase_functions_owner";
+        const TIMELINE: &str = "0123456789abcdef0123456789abcdef";
+        const PASSWORD: &str = "dispatch-test-password";
+
+        struct Meta {
+            branch: BranchRecord,
+            trigger: TriggerRecord,
+            function: BranchFunction,
+            pick: Mutex<Vec<Target>>,
+        }
+
+        #[async_trait::async_trait]
+        impl EventsMetadata for Meta {
+            async fn branch(&self, b: BranchId) -> Result<Option<BranchRecord>, String> {
+                Ok((b == self.branch.id).then(|| self.branch.clone()))
+            }
+            async fn triggers(&self, b: BranchId) -> Result<Vec<TriggerRecord>, String> {
+                Ok(if b == self.branch.id { vec![self.trigger.clone()] } else { Vec::new() })
+            }
+            async fn functions(&self, b: BranchId) -> Result<Vec<BranchFunction>, String> {
+                Ok(if b == self.branch.id { vec![self.function.clone()] } else { Vec::new() })
+            }
+            async fn targets(&self, _: i64, _: &[Target]) -> Result<Vec<Target>, String> {
+                Ok(self.pick.lock().unwrap().clone())
+            }
+            async fn record(&self, _: BranchId, _: &[TriggerDelivery]) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        struct Source {
+            host: String,
+            port: u16,
+        }
+
+        impl ConnSource for Source {
+            async fn fetch(&self, _: Uuid) -> Result<ConnInfo, ConnError> {
+                Ok(ConnInfo {
+                    host: self.host.clone(),
+                    port: self.port,
+                    server_name: None,
+                    database: "postgres".into(),
+                    database_id: None,
+                    user: LOGIN.into(),
+                    password: PASSWORD.into(),
+                    elevated: None,
+                    settings: Settings {
+                        max_rows: 1000,
+                        statement_timeout_ms: 30_000,
+                        max_connections: 10,
+                        storage_max_connections: 2,
+                    },
+                    databases: Vec::new(),
+                })
+            }
+        }
+
+        /// Answers 200, but each delivery first waits for a permit; the first one tells
+        /// `entered` (a batch is then claimed and in flight).
+        struct Gate {
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            permits: tokio::sync::Semaphore,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Invoker for Gate {
+            async fn deliver(&self, _: BranchId, _: &str, _: Vec<u8>) -> Result<u16, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                self.permits.acquire().await.unwrap().forget();
+                Ok(200)
+            }
+        }
+
+        fn branch_record(id: BranchId) -> BranchRecord {
+            let now = Timestamp::now();
+            BranchRecord {
+                id,
+                database_id: chelabase_types::DatabaseId::new(),
+                name: "main".into(),
+                parent_branch_id: None,
+                kind: BranchKind::Normal,
+                status: BranchStatus::Ready,
+                timeline_id: Some(TIMELINE.into()),
+                pending_timeline_id: None,
+                pending_timeline_at: None,
+                superseded_timeline_id: None,
+                endpoint_id: None,
+                owner_password_enc: None,
+                branched_at_time: None,
+                branched_at_lsn: None,
+                error: None,
+                created_at: now,
+                updated_at: now,
+                history_start: None,
+                authenticator_password_enc: None,
+                protected: false,
+                guard_logins: true,
+                review_ack_hash: None,
+                review_ack_keys: Vec::new(),
+            }
+        }
+
+        async fn superuser(config: &tokio_postgres::Config, db: &str) -> Client {
+            let mut config = config.clone();
+            config.dbname(db);
+            let (client, conn) = config.connect(tokio_postgres::NoTls).await.expect("the test Postgres");
+            tokio::spawn(conn);
+            client
+        }
+
+        /// An event row for `trigger` on this timeline.
+        async fn enqueue(c: &Client, trigger: Uuid, id: i32) {
+            let payload = serde_json::json!({"type": "INSERT", "schema": "public", "table": "orders",
+                "record": {"id": id}, "old_record": null, "txid": 42});
+            c.execute(
+                "INSERT INTO chelabase_functions.outbox (trigger_id, payload, timeline_id) VALUES ($1, $2::text::jsonb, $3)",
+                &[&trigger, &payload.to_string(), &TIMELINE],
+            )
+            .await
+            .unwrap();
+        }
+
+        /// A session the pick leaves out while it delivers a batch is told to stop; it settles
+        /// the batch (no row left on its lease), claims nothing more and ends; until it ends
+        /// its slot still counts toward the cap, and the next tick gives the slot away.
+        #[tokio::test]
+        #[ignore]
+        async fn supervisor_stop_settles_the_batch_and_frees_the_slot() {
+            let url = std::env::var("CHELABASE_FUNCTIONS_TEST_PG_URL").expect("CHELABASE_FUNCTIONS_TEST_PG_URL");
+            let config: tokio_postgres::Config = url.parse().unwrap();
+            let (host, port) = match (&config.get_hosts()[0], config.get_ports().first()) {
+                (tokio_postgres::config::Host::Tcp(h), p) => (h.clone(), p.copied().unwrap_or(5432)),
+                _ => panic!("a TCP host"),
+            };
+            let base = config.get_dbname().unwrap_or("postgres").to_string();
+            let admin = superuser(&config, &base).await;
+            let db = format!("fn_stop_{}", &Uuid::new_v4().simple().to_string()[..8]);
+            admin.batch_execute(&format!("CREATE DATABASE {db}")).await.unwrap();
+            admin
+                .batch_execute(&format!(
+                    "ALTER DATABASE {db} SET neon.timeline_id = '{TIMELINE}';
+                     DO $$ BEGIN
+                       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{OWNER}') THEN
+                         CREATE ROLE {OWNER} NOLOGIN NOINHERIT;
+                       END IF;
+                       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{LOGIN}') THEN
+                         CREATE ROLE {LOGIN} LOGIN NOINHERIT PASSWORD '{PASSWORD}';
+                         ALTER ROLE {LOGIN} SET search_path = pg_catalog, pg_temp;
+                       END IF;
+                     END $$;"
+                ))
+                .await
+                .unwrap();
+            let c = superuser(&config, &db).await;
+            c.batch_execute(&format!(
+                "CREATE TABLE public.orders (id int PRIMARY KEY);
+                 CREATE SCHEMA {FUNCTIONS_SCHEMA} AUTHORIZATION {OWNER};
+                 REVOKE ALL ON SCHEMA {FUNCTIONS_SCHEMA} FROM PUBLIC;
+                 CREATE TABLE {FUNCTIONS_SCHEMA}.outbox (
+                   id bigserial PRIMARY KEY, trigger_id uuid NOT NULL, payload jsonb NOT NULL,
+                   attempts integer NOT NULL DEFAULT 0,
+                   next_attempt_at timestamptz NOT NULL DEFAULT pg_catalog.now(),
+                   status text NOT NULL DEFAULT 'pending', timeline_id text,
+                   created_at timestamptz NOT NULL DEFAULT pg_catalog.now());
+                 ALTER TABLE {FUNCTIONS_SCHEMA}.outbox OWNER TO {OWNER};
+                 REVOKE ALL ON TABLE {FUNCTIONS_SCHEMA}.outbox FROM PUBLIC;
+                 SET ROLE {OWNER};
+                 GRANT {} ON SCHEMA {FUNCTIONS_SCHEMA} TO {LOGIN};
+                 GRANT {} ON TABLE {FUNCTIONS_SCHEMA}.outbox TO {LOGIN};
+                 RESET ROLE;",
+                FUNCTIONS_DISPATCH_SCHEMA_GRANTS.join(", "),
+                FUNCTIONS_DISPATCH_OUTBOX_GRANTS.join(", "),
+            ))
+            .await
+            .unwrap();
+
+            let branch = BranchId::new();
+            let function_id = Uuid::new_v4();
+            let trigger = TriggerRecord {
+                id: Uuid::new_v4(),
+                branch_id: branch,
+                function_id,
+                source: TriggerSource::Table,
+                enabled: true,
+                state: TriggerState::Installed,
+                enabled_since: Timestamp::now(),
+                pg_database: db.clone(),
+                schema_name: Some("public".into()),
+                table_name: Some("orders".into()),
+                bucket: None,
+                prefix: None,
+                events: vec!["insert".into()],
+                last_error: None,
+                dead_count: 0,
+                dropped_count: 0,
+                last_delivery_error: None,
+                last_delivered_at: None,
+            };
+            let function = BranchFunction {
+                function_id,
+                name: "hello".into(),
+                kind: FunctionKind::Function,
+                deployment_id: Uuid::new_v4(),
+                enabled: true,
+                auth: chelabase_metadata::FunctionAuth::Key,
+                run_as_role: None,
+                run_as_key_id: None,
+                run_as_role_oid: None,
+                run_as_unmintable: None,
+                last_error: None,
+                updated_at: Timestamp::now(),
+                health: None,
+            };
+            let target: Target = (branch, db.clone());
+            let meta = Arc::new(Meta {
+                branch: branch_record(branch),
+                trigger: trigger.clone(),
+                function,
+                pick: Mutex::new(vec![target.clone()]),
+            });
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let gate = Arc::new(Gate {
+                entered: Mutex::new(Some(entered_tx)),
+                permits: tokio::sync::Semaphore::new(0),
+                calls: AtomicUsize::new(0),
+            });
+            enqueue(&c, trigger.id, 1).await;
+            let dispatcher = Arc::new(Dispatcher::new(meta.clone(), Source { host, port }, None, gate.clone()));
+            let mut sup = Supervisor::new(dispatcher, 1);
+
+            // The session starts and claims the first event; its delivery is in flight.
+            sup.tick().await;
+            assert_eq!(sup.live(), HashMap::from([(target.clone(), false)]));
+            tokio::time::timeout(Duration::from_secs(30), entered)
+                .await
+                .expect("the session delivers the first event")
+                .unwrap();
+            let leased: (i32, bool) = {
+                let r = c
+                    .query_one("SELECT attempts, next_attempt_at > now() + interval '10 minutes' FROM chelabase_functions.outbox", &[])
+                    .await
+                    .unwrap();
+                (r.get(0), r.get(1))
+            };
+            assert_eq!(leased, (1, true), "the batch is claimed on its lease");
+            // A second event comes after the claim.
+            enqueue(&c, trigger.id, 2).await;
+
+            // The pick moves to another target: this session is told to stop, and with a cap
+            // of one the other target can't start while it is finishing.
+            let other: Target = (BranchId::new(), db.clone());
+            *meta.pick.lock().unwrap() = vec![other.clone()];
+            sup.tick().await;
+            assert_eq!(sup.live(), HashMap::from([(target.clone(), true)]), "stopping, still counted");
+
+            // The delivery answers: the session settles its batch and ends.
+            gate.permits.add_permits(1);
+            let handle = &mut sup.tasks.get_mut(&target).unwrap().handle;
+            tokio::time::timeout(Duration::from_secs(20), handle)
+                .await
+                .expect("a stopped session ends once its batch is settled")
+                .unwrap();
+            let rows: Vec<(i64, String, i32)> = c
+                .query("SELECT id, status, attempts FROM chelabase_functions.outbox ORDER BY id", &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect();
+            assert_eq!(rows.len(), 1, "the delivered event is deleted: {rows:?}");
+            assert_eq!((rows[0].1.as_str(), rows[0].2), ("pending", 0), "the later event was never claimed: {rows:?}");
+            assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+
+            // The next tick forgets the ended task and gives its slot to the pick.
+            sup.tick().await;
+            assert_eq!(sup.live().keys().collect::<Vec<_>>(), vec![&other]);
+
+            drop(c);
+            admin.batch_execute(&format!("DROP DATABASE {db} WITH (FORCE)")).await.unwrap();
+        }
     }
 }
