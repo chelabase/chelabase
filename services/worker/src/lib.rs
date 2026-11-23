@@ -66,6 +66,7 @@ pub mod roles;
 mod rt1_tests;
 pub mod rt_events;
 pub mod safekeepers;
+pub mod schedule_report;
 pub mod schema_base;
 pub mod settings;
 pub mod storage_schema;

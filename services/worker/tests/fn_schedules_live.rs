@@ -346,3 +346,61 @@ async fn fn_schedules_claim_shares_slots_across_databases() {
     assert!(before.iter().all(|(_, t)| *t < Timestamp::now()), "they were due");
     s.finish().await;
 }
+
+/// The startup report on real Postgres: two schedules stored with crons an older parser
+/// accepted (inserted directly), one healthy. After the report the two have their reason in
+/// `last_error` and nothing else changed; the first claim after it disables both by today's
+/// rule and keeps the reason. (`main` awaits the report before it spawns the claim loop, so the
+/// claim here follows it the same way.)
+#[tokio::test]
+#[ignore]
+async fn the_report_precedes_the_first_claim() {
+    let s = Scratch::new().await;
+    let (_db, branch, function) = s.function("reported", true).await;
+    let insert = |cron: &'static str| {
+        let pool = s.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
+                 VALUES (gen_random_uuid(), $1, $2, $3, 'UTC', now() - interval '1 minute') RETURNING id",
+            )
+            .bind(branch.as_uuid())
+            .bind(function)
+            .bind(cron)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (jan, ell, healthy) = (insert("0 0 * * jan").await, insert("0 0 * * L").await, insert("*/5 * * * *").await);
+    let state = |id: Uuid| {
+        let pool = s.pool().clone();
+        async move {
+            sqlx::query_as::<_, (String, String, bool, Option<chelabase_time::Timestamp>, Option<String>)>(
+                "SELECT cron, timezone, enabled, next_run_at, last_error FROM function_schedules WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let before = (state(jan).await, state(ell).await, state(healthy).await);
+
+    assert_eq!(worker::schedule_report::run(&s.client).await, Some(2));
+
+    for (id, was) in [(jan, &before.0), (ell, &before.1)] {
+        let now = state(id).await;
+        assert!(now.4.as_deref().is_some_and(|e| e.starts_with("cron:")), "reason: {:?}", now.4);
+        assert_eq!((&now.0, &now.1, now.2, now.3), (&was.0, &was.1, was.2, was.3), "nothing else changed");
+    }
+    assert_eq!(state(healthy).await, before.2, "the healthy schedule is untouched");
+
+    s.client.claim_due_schedules(64, &[]).await.unwrap();
+    for id in [jan, ell] {
+        let now = state(id).await;
+        assert!(!now.2 && now.3.is_none(), "disabled with no next time");
+        assert!(now.4.as_deref().is_some_and(|e| e.starts_with("cron:")), "the reason is kept: {:?}", now.4);
+    }
+    s.finish().await;
+}
