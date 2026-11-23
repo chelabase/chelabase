@@ -716,30 +716,62 @@ async fn an_unreachable_runtime_is_502() {
     assert_eq!(resp.status(), 502);
 }
 
+/// Sends a public-key `POST /functions/v1/hello` over a raw socket: the request head with
+/// `framing` (a `content-length` or `transfer-encoding` line), then `body`, and returns the
+/// response's status. It writes nothing past `body` and never closes its write side, so the
+/// status comes from the service's reply to the bytes it was sent, never from a client that
+/// raced the service's close. A service that waits for more bytes fails the timeout.
+async fn raw_post_status(h: &H, framing: &str, body: &[u8]) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = h.public.strip_prefix("http://").unwrap();
+    let token = h.identity(Cred::Public, h.branch, "functions").unwrap();
+    let head = format!(
+        "POST /functions/v1/hello HTTP/1.1\r\nhost: {addr}\r\n{IDENTITY_HEADER}: {token}\r\n\
+         chelabase-forwarded-key: {PUBLIC_KEY}\r\n{framing}\r\n\r\n"
+    );
+    let exchange = async {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body).await.unwrap();
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the connection closed before a response head");
+            resp.extend_from_slice(&buf[..n]);
+        }
+        resp
+    };
+    let resp = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the service answered within 10s");
+    let line = String::from_utf8_lossy(&resp);
+    let line = line.lines().next().unwrap();
+    let status = line
+        .strip_prefix("HTTP/1.1 ")
+        .unwrap_or_else(|| panic!("{line}"));
+    status[..3].parse().unwrap()
+}
+
 #[tokio::test]
 async fn bodies_over_6_mib_are_413() {
     let h = harness().await;
-    let big = vec![b'x'; 6 * 1024 * 1024 + 1];
-    let resp = h
-        .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
-        .body(big)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 413);
-    // Streamed without a length, too.
-    let chunks = futures_util::stream::iter(
-        (0..7).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1024 * 1024])),
-    );
-    let resp = h
-        .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
-        .body(reqwest::Body::wrap_stream(chunks))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 413);
+    const MAX: usize = 6 * 1024 * 1024;
+    // A declared length over the limit is refused from the head alone: no body byte is sent.
+    let status = raw_post_status(&h, &format!("content-length: {}", MAX + 1), &[]).await;
+    assert_eq!(status, 413);
+    // Streamed without a length: six 1 MiB chunks and one more byte, then the client waits.
+    // The service has read every byte sent, so it answers rather than resetting a writer.
+    let mut chunked = Vec::new();
+    for len in [1024 * 1024; 6].into_iter().chain([1]) {
+        chunked.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+        chunked.resize(chunked.len() + len, b'x');
+        chunked.extend_from_slice(b"\r\n");
+    }
+    let status = raw_post_status(&h, "transfer-encoding: chunked", &chunked).await;
+    assert_eq!(status, 413);
     assert_eq!(h.calls(), 0);
-    let exact = vec![b'x'; 6 * 1024 * 1024];
+    let exact = vec![b'x'; MAX];
     let resp = h
         .call(reqwest::Method::POST, "/functions/v1/hello", Cred::Public)
         .body(exact)
