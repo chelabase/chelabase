@@ -10,7 +10,7 @@
  */
 export interface RunSqlRequest {
   /**
-     * `true` runs statements the guard would hold back.
+     * `true` runs statements the guard would hold back. Refused with `read_only`.
      * @nullable
      */
   confirm?: boolean | null;
@@ -19,6 +19,15 @@ export interface RunSqlRequest {
      * @nullable
      */
   database?: string | null;
+  /**
+     * `true` runs every statement inside one transaction Postgres holds read-only: any write
+     * is refused by Postgres, including one a function called from a `SELECT` makes. Only
+     * `SELECT` (with `WITH`, `VALUES`, `TABLE`), `SHOW` and `EXPLAIN` may appear at the top
+     * level; any other statement refuses the whole script before anything runs. The
+     * timeout is at most 300000. Absent means `false`.
+     * @nullable
+     */
+  read_only?: boolean | null;
   /**
      * The role to `SET ROLE` to first; null or absent runs as the owner.
      * @nullable

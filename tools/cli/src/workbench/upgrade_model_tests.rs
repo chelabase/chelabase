@@ -571,6 +571,10 @@ impl Engine for Fake {
         Ok("wb-model".into())
     }
 
+    fn mcp_runtime_image(&self, _: &Stack) -> anyhow::Result<String> {
+        Ok("wb-model".into())
+    }
+
     fn cargo_build(&self, _: &Stack, apps: &[&str], _: bool) -> anyhow::Result<()> {
         self.w
             .borrow_mut()

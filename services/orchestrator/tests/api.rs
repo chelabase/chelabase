@@ -6039,6 +6039,43 @@ async fn risky_statement_needs_confirm() {
     assert_eq!(t.compute_lookups(), 0);
 }
 
+// mcp-core m5 (#349): a read-only script is parsed before anything connects; a refused one
+// names its first offender and runs nothing. `confirm` and a timeout past 300 s are refused.
+#[tokio::test]
+async fn read_only_refusals_open_nothing() {
+    let t = sql_app().await;
+    let main = t.main();
+    let read_only = |sql: &str| with(run_body(sql), "read_only", json!(true));
+    for (sql, statement, kind) in [
+        ("SELECT 1; COMMIT; SELECT 2", 1, "TransactionStmt"),
+        ("SET default_transaction_read_only = off", 0, "VariableSetStmt"),
+        ("SELECT 1; SELECT 2; DO $$ BEGIN END $$", 2, "DoStmt"),
+        ("INSERT INTO notes (body) VALUES ('x')", 0, "InsertStmt"),
+        ("SELEC 1", 0, "unparsed"),
+    ] {
+        let err = error_of(t.run_sql(main, read_only(sql)).await, 422).await;
+        assert_eq!(code_of(&err), "read_only_script_refused", "{sql}: {err}");
+        assert_eq!(err["error"]["statement"], statement, "{sql}: {err}");
+        assert_eq!(err["error"]["kind"], kind, "{sql}: {err}");
+    }
+    let many = vec!["SELECT 1"; 101].join(";");
+    let err = error_of(t.run_sql(main, read_only(&many)).await, 422).await;
+    assert_eq!(err["error"]["kind"], "too_many_statements", "{err}");
+    for body in [
+        with(read_only("SELECT 1"), "confirm", json!(true)),
+        with(read_only("SELECT 1"), "timeout_ms", json!(300_001)),
+    ] {
+        let err = error_of(t.run_sql(main, body.clone()).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{body}: {err}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    // An allowed script gets as far as the compute (none runs here); no guard holds it back,
+    // even on a protected branch.
+    t.set_protected(main);
+    let resp = t.run_sql(main, read_only("EXPLAIN ANALYZE SELECT 1; SHOW search_path")).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+}
+
 #[tokio::test]
 async fn protected_branch_holds_inserts() {
     let t = sql_app().await;
@@ -6571,10 +6608,41 @@ async fn sql_confirm_required_is_audited_without_sql() {
         format!("sql_sha256={sha}"),
         "protected=false".to_string(),
         "confirmed=false".to_string(),
+        "read_only=false".to_string(),
     ] {
         assert!(line.contains(&field), "{field} missing from {line}");
     }
     assert!(!text.contains("secret_table_4111"), "SQL reached the log:\n{text}");
+}
+
+#[tokio::test]
+async fn read_only_script_refusal_is_audited_without_sql() {
+    use sha2::Digest;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let t = sql_app().await;
+    let main = t.main();
+    let sql = "SELECT 1; DELETE FROM secret_table_4112";
+    let id = uuid::Uuid::new_v4();
+    let resp = t.run_sql(main, with(json!({ "run_id": id, "sql": sql }), "read_only", json!(true))).await;
+    assert_eq!(code_of(&error_of(resp, 422).await), "read_only_script_refused");
+    let text = logs.text();
+    let audit: Vec<&str> = text.lines().filter(|l| l.contains("sql run")).collect();
+    assert_eq!(audit.len(), 1, "{text}");
+    let sha = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+    for field in [
+        "user=user-1".to_string(),
+        format!("branch_id={}", main.as_uuid()),
+        "role=owner".to_string(),
+        format!("run_id={id}"),
+        "outcome=read_only_script_refused".to_string(),
+        "refused=DeleteStmt".to_string(),
+        "read_only=true".to_string(),
+        format!("sql_sha256={sha}"),
+    ] {
+        assert!(audit[0].contains(&field), "{field} missing from {}", audit[0]);
+    }
+    assert!(!text.contains("secret_table_4112"), "SQL reached the log:\n{text}");
 }
 
 #[tokio::test]

@@ -1,0 +1,69 @@
+---
+title: Connect a client
+description: Configure Claude Code, Cursor, Claude Desktop or VS Code with chelabase mcp, or call /mcp directly with a member token.
+---
+
+<AlphaNotice />
+
+The server answers at `/mcp` on your instance's API host (for example `http://api.chelabase.localhost:8000/mcp`). It takes a member access token, which is short-lived (at most 15 minutes, 5 by default). The server refuses a token unless it has at least the larger of 60 seconds and the run timeout plus 10 seconds left (60 seconds with the default 30-second timeout). There are two ways to connect.
+
+## The bridge: `chelabase mcp`
+
+Most clients start a local command and talk to it over stdin and stdout. `chelabase mcp` is that command. It reads the session `chelabase login` stored, refreshes the token when it runs out, and relays each message to `/mcp`.
+
+```bash
+chelabase login --url http://api.chelabase.localhost:8000 --email you@example.com
+chelabase mcp --url http://api.chelabase.localhost:8000
+```
+
+You don't run the second command yourself: the client does. The options:
+
+| Option | What it does |
+|---|---|
+| `--url <URL>` | The instance's API URL. Also read from `CHELABASE_URL`. Without it, the only instance you are signed in to. |
+| `--read-only` | Asks the server to run this connection read-only: only `read` operations run, whatever `destructive` says. |
+
+With no usable sign-in the command exits at once and tells you to run `chelabase login`. Only protocol messages go to stdout; diagnostics go to stderr, and the token is never printed. If the instance refuses a token, the bridge fetches a fresh one and retries once.
+
+### Claude Code
+
+```bash
+claude mcp add chelabase -- chelabase mcp --url http://api.chelabase.localhost:8000
+```
+
+For a read-only connection, add `--read-only` after `mcp`:
+
+```bash
+claude mcp add chelabase-readonly -- chelabase mcp --url http://api.chelabase.localhost:8000 --read-only
+```
+
+Start Claude Code and run `/mcp`: `chelabase` should be listed with the tools `search` and `execute`.
+
+### Cursor, Claude Desktop and VS Code
+
+These clients take the same command in their MCP configuration file. Claude Desktop and Cursor use an `mcpServers` object:
+
+```json
+{
+  "mcpServers": {
+    "chelabase": {
+      "command": "chelabase",
+      "args": ["mcp", "--url", "http://api.chelabase.localhost:8000"]
+    }
+  }
+}
+```
+
+VS Code uses a `servers` object (in `.vscode/mcp.json`) with the same `command` and `args`, and `"type": "stdio"`. If the client can't find `chelabase`, give `command` as a full path.
+
+## Direct URL
+
+A client that can send an `Authorization: Bearer <member token>` header can call `https://<api host>/mcp` itself, with the Streamable HTTP transport. The server is stateless: it issues no session, takes `POST` only (other methods answer 405), and refuses a browser `Origin` unless the operator lists it. A `Chelabase-MCP-Read-Only: true` header asks for a read-only connection.
+
+Because a member token lasts minutes, a direct connection needs something that keeps the token fresh. The bridge does; most clients don't. Sign-in for remote and web clients (OAuth, so a client can register and a member can consent) is coming in the `mcp-oauth` epic. It isn't available yet.
+
+## Protocol versions
+
+The server speaks the 2026-07-28 revision and the one before it, 2025-11-25. A client asking for another revision gets a `400` listing the supported ones. The official TypeScript SDK (1.32.2) negotiates 2025-11-25.
+
+A 2026-07-28 client doesn't send `initialize`. It starts with `server/discover` and puts the revision and its capabilities in the `_meta` of every request (`io.modelcontextprotocol/protocolVersion` and `clientCapabilities`). An `initialize` that names 2026-07-28 is negotiated down to 2025-11-25. From 2026-07-28 on, each request also needs the `Mcp-Method` header, and a tool call needs `Mcp-Name`; the bridge sends both.
