@@ -1,9 +1,24 @@
 import { describe, expect, it } from "vitest";
-import { cronReason, initialScheduleForm, scheduleFormReducer, scheduleFormReason, timezoneReason } from "./functions-schedules";
+import { cronReason, scheduleStatus, initialScheduleForm, scheduleFormReducer, scheduleFormReason, timezoneReason } from "./functions-schedules";
 
 describe("cronReason", () => {
   it("accepts_common_crons", () => {
     for (const cron of ["* * * * *", "*/15 * * * *", "0 9 * * 1-5", "30 2 1,15 * *", "0 0 * JAN,JUL MON", "5-55/10 0-23/2 * * 0", "0 12 * * 7", "  0 0 * * *  "]) {
+      expect(cronReason(cron), cron).toBeNull();
+    }
+  });
+
+  it("refuses_names_in_the_wrong_field_and_a_bare_L", () => {
+    expect(cronReason("0 0 * * jan")).toMatch(/day of week/);
+    expect(cronReason("mon * * * *")).toMatch(/minute/);
+    expect(cronReason("0 0 * * L")).toMatch(/day of week/);
+    expect(cronReason("0 0 L * *")).toMatch(/day of month/);
+    expect(cronReason("0 0 * * 9L")).toMatch(/day of week/);
+    expect(cronReason("0 0 * * L5")).toMatch(/day of week/);
+  });
+
+  it("accepts_names_in_their_own_field_and_nth_last_weekday", () => {
+    for (const cron of ["0 0 * * MON-FRI", "0 0 1 JAN *", "0 0 * * 5L", "*/5 9-17 * * MON-FRI"]) {
       expect(cronReason(cron), cron).toBeNull();
     }
   });
@@ -61,5 +76,21 @@ describe("scheduleFormReducer", () => {
     expect(scheduleFormReason({ editing: null, cron: "*/5 * * * *", timezone: "UTC" })).toBeNull();
     expect(scheduleFormReason({ editing: null, cron: "", timezone: "UTC" })).toMatch(/cron/);
     expect(scheduleFormReason({ editing: null, cron: "* * * * *", timezone: "Nowhere" })).toMatch(/time zone/);
+  });
+});
+
+describe("scheduleStatus", () => {
+  const base = { id: "s1", cron: "0 9 * * *", timezone: "UTC", enabled: false, next_run_at: null };
+
+  it("is_stopped_with_the_reason", () => {
+    const reason = 'cron: not a 5-field cron (<b>&)';
+    expect(scheduleStatus({ ...base, last_error: reason })).toEqual({ kind: "stopped", reason });
+  });
+
+  it("is_not_stopped_without_a_reason", () => {
+    expect(scheduleStatus({ ...base, last_error: null })).toEqual({ kind: "off" });
+    expect(scheduleStatus({ ...base, last_error: "" })).toEqual({ kind: "off" });
+    expect(scheduleStatus(base as never)).toEqual({ kind: "off" });
+    expect(scheduleStatus({ ...base, enabled: true, last_error: null })).toEqual({ kind: "on" });
   });
 });

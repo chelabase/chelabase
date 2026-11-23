@@ -15,6 +15,8 @@ function itemOk(item: string, f: (typeof FIELDS)[number]): boolean {
   const [range, step, ...extra] = item.split("/");
   if (extra.length > 0) return false;
   if (step !== undefined && !(/^\d+$/.test(step) && Number(step) >= 1)) return false;
+  // "5L": the last Friday of the month. Only day of week takes it; a bare "L" is refused.
+  if (f.max === 7 && /^[0-7]L$/.test(range)) return true;
   if (range === "*" || (range === "?" && f.names !== undefined && f.max === 7)) return true;
   const value = (v: string): number | null => {
     if (/^\d+$/.test(v)) return Number(v);
@@ -44,6 +46,15 @@ export function cronReason(raw: string): string | null {
     }
   }
   return null;
+}
+
+/** What a schedule's row says about it: running, switched off by the user, or stopped by the worker. */
+export type ScheduleStatus = { kind: "on" } | { kind: "off" } | { kind: "stopped"; reason: string };
+
+/** `last_error` wins; an older API without the field (undefined) or an empty one never reads as stopped. */
+export function scheduleStatus(s: Pick<FunctionSchedule, "enabled"> & { last_error?: string | null }): ScheduleStatus {
+  if (typeof s.last_error === "string" && s.last_error !== "") return { kind: "stopped", reason: s.last_error };
+  return { kind: s.enabled ? "on" : "off" };
 }
 
 /** Why a time zone can't be sent: blank, or one this browser doesn't know as IANA. */
