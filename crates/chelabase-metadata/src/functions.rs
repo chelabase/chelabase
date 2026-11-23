@@ -2131,12 +2131,7 @@ impl MetadataClient {
             let id: Uuid = r.get("id");
             if !step.enabled {
                 // Said once: the row is disabled below, so no later claim sees it.
-                let timezone: String = r.get("timezone");
-                let reason = match Schedule::parse(&cron, &timezone) {
-                    Err(e) => e.to_string(),
-                    Ok(_) => "no later time".to_owned(),
-                };
-                warn!(schedule = %id, %cron, %timezone, %reason, "disabling a schedule that can no longer run");
+                log_disabled_schedule(id, &cron, r.get("timezone"));
             }
             ids.push(id);
             nexts.push(step.next);
@@ -2569,6 +2564,15 @@ impl MetadataClient {
     }
 }
 
+/// The `warn` a claim logs for a schedule it switches off, naming the schedule and why.
+fn log_disabled_schedule(id: Uuid, cron: &str, timezone: &str) {
+    let reason = match Schedule::parse(cron, timezone) {
+        Err(e) => e.to_string(),
+        Ok(_) => "no later time".to_owned(),
+    };
+    warn!(schedule = %id, %cron, %timezone, %reason, "disabling a schedule that can no longer run");
+}
+
 #[cfg(test)]
 #[path = "functions_lock_model.rs"]
 mod lock_model;
@@ -2576,6 +2580,43 @@ mod lock_model;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn logged(f: impl FnOnce()) -> String {
+        let out = Captured::default();
+        let writer = out.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A claim that switches a schedule off says so at `warn`, with the schedule id and why.
+    #[test]
+    fn disabling_a_schedule_warns_with_its_id_and_reason() {
+        let id = Uuid::parse_str("5b1f0c1e-7d57-4a4e-9a52-2f0f6d1d9c11").unwrap();
+        let text = logged(|| log_disabled_schedule(id, "0 0 * * jan", "UTC"));
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains(&id.to_string()), "{text}");
+        assert!(text.contains("0 0 * * jan"), "{text}");
+        let reason = Schedule::parse("0 0 * * jan", "UTC").unwrap_err().to_string();
+        assert!(text.contains(&reason), "reason {reason:?} missing: {text}");
+
+        let text = logged(|| log_disabled_schedule(id, "0 0 30 2 *", "UTC"));
+        assert!(text.contains(&id.to_string()) && text.contains("no later time"), "{text}");
+    }
 
     /// O2: exhaustive over kind x tenant admin x (delete, or set a plain, reserved or
     /// other-case name): only a tenant admin writes a service's secret, a reserved name is
