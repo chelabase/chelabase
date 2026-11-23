@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use chelabase_types::TenantId;
 use chelabase_types::access::PlatformRole;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
@@ -94,9 +94,9 @@ pub struct PersonalLogin {
     pub project_id: Uuid,
     pub database_name: String,
     pub role_name: String,
-    pub valid_until: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub valid_until: Timestamp,
+    pub created_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
     pub revoked_reason: Option<RevokeReason>,
     pub status: LoginStatus,
 }
@@ -108,7 +108,7 @@ pub struct PersonalLoginRecord {
     pub database_id: Uuid,
     pub role_name: String,
     pub scram_verifier: Option<String>,
-    pub valid_until: DateTime<Utc>,
+    pub valid_until: Timestamp,
     pub revoked: bool,
     pub qualifies: bool,
 }
@@ -165,7 +165,7 @@ macro_rules! login_columns {
 }
 
 fn login_from_row(r: &PgRow) -> Result<PersonalLogin, sqlx::Error> {
-    let revoked_at: Option<DateTime<Utc>> = r.try_get("revoked_at")?;
+    let revoked_at: Option<Timestamp> = r.try_get("revoked_at")?;
     let reason: Option<String> = r.try_get("revoked_reason")?;
     let revoked_reason = reason
         .map(|s| {
@@ -424,7 +424,7 @@ impl MetadataClient {
         database: Uuid,
         role_name: &str,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> Result<PersonalLogin, LoginWriteError> {
         let mut tx = self.pool.begin().await?;
         let Some(m) = lock_member(&mut tx, member).await? else {
@@ -530,7 +530,7 @@ impl MetadataClient {
         member: Uuid,
         database: Uuid,
         scram_verifier: &str,
-        valid_until: DateTime<Utc>,
+        valid_until: Timestamp,
     ) -> Result<(PersonalLogin, Vec<LoginEndpoint>), LoginWriteError> {
         let mut tx = self.pool.begin().await?;
         let Some(m) = lock_member(&mut tx, member).await? else {

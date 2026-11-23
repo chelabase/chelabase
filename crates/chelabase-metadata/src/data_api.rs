@@ -43,7 +43,7 @@ use std::fmt;
 
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use chelabase_types::data_key::DataKeyKind;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
@@ -105,9 +105,9 @@ pub struct DataKeyRecord {
     pub name: String,
     pub prefix: String,
     pub sealed: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
+    pub revoked_at: Option<Timestamp>,
     /// The databases the key may reach; `None` is every served database.
     pub databases: Option<Vec<String>>,
     /// A secret key's role identity; `None` for the public key and keys not backfilled yet.
@@ -243,9 +243,9 @@ fn key_from_row(r: &PgRow) -> Result<DataKeyRecord, MetadataError> {
         name: r.get("name"),
         prefix: r.get("prefix"),
         sealed: r.get("sealed"),
-        created_at: r.get("created_at"),
-        last_used_at: r.get("last_used_at"),
-        revoked_at: r.get("revoked_at"),
+        created_at: r.try_get("created_at")?,
+        last_used_at: r.try_get("last_used_at")?,
+        revoked_at: r.try_get("revoked_at")?,
         databases: r.get("databases"),
         role_oid: r.get("role_oid"),
         role_timeline: r.get("role_timeline"),
@@ -872,6 +872,7 @@ fn bind_new_key<'q>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     // E26: a rotation keeps the old key's identity. Same timeline: the OIDs must match. The
     // check ran on another timeline (or the old key has none recorded): the OID must match and
@@ -938,7 +939,7 @@ mod tests {
             name: key.name.clone(),
             prefix: key.prefix.clone(),
             sealed: key.sealed.clone(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             last_used_at: None,
             revoked_at: None,
             databases: None,

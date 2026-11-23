@@ -15,7 +15,7 @@ use chelabase_metadata::{
 };
 use chelabase_types::access::PlatformRole;
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-use chrono::{Duration, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
@@ -231,8 +231,8 @@ impl Scratch {
     }
 }
 
-fn in_days(n: i64) -> chrono::DateTime<Utc> {
-    Utc::now() + Duration::days(n)
+fn in_days(n: u64) -> Timestamp {
+    Timestamp::now() + chelabase_time::days(n)
 }
 
 // P8 race: the worker passes the verifier it read; a reset since then wins, so an old password

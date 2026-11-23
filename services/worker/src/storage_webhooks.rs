@@ -47,8 +47,7 @@ pub const EVENT_TYPE_HEADER: &str = "chelabase-event-type";
 /// Each request's whole time.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// An event is retried for this long after it happened, then dropped.
-pub const MAX_AGE: Duration =
-    Duration::from_secs(chelabase_metadata::STORAGE_WEBHOOK_RETRY_WINDOW.num_seconds() as u64);
+pub const MAX_AGE: Duration = chelabase_metadata::STORAGE_WEBHOOK_RETRY_WINDOW;
 /// An endpoint failing for this long running is disabled (a run ends at a success, or after a
 /// quiet spell longer than [`MAX_AGE`]: see [`chelabase_metadata::FailureRun`]).
 pub const DISABLE_AFTER: Duration = chelabase_time::hours(72);

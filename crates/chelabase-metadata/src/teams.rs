@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use chelabase_types::TenantId;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -34,8 +34,8 @@ pub struct TeamRecord {
     pub name: String,
     pub description: String,
     pub created_by: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A team with its grants on non-deleted projects (by project id) and its members (by id).
@@ -205,8 +205,8 @@ type TeamRow = (
     String,
     String,
     Option<Uuid>,
-    DateTime<Utc>,
-    DateTime<Utc>,
+    Timestamp,
+    Timestamp,
 );
 
 fn record(

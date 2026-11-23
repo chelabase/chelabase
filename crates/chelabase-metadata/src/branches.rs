@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chelabase_types::{BranchId, DatabaseId, TenantId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, Postgres, Row, Transaction};
@@ -121,7 +121,7 @@ pub struct BranchRecord {
     /// Created by a reset or restore, not yet switched to.
     pub pending_timeline_id: Option<String>,
     /// When `pending_timeline_id` was recorded; `None` without one.
-    pub pending_timeline_at: Option<DateTime<Utc>>,
+    pub pending_timeline_at: Option<Timestamp>,
     /// Switched away from by a reset, not yet deleted.
     pub superseded_timeline_id: Option<String>,
     /// `None` for backups, and until provisioning records one.
@@ -129,15 +129,15 @@ pub struct BranchRecord {
     /// Owner password, sealed with `chelabase-secrets` (aad = branch id).
     pub owner_password_enc: Option<String>,
     /// What the user asked for, if a time.
-    pub branched_at_time: Option<DateTime<Utc>>,
+    pub branched_at_time: Option<Timestamp>,
     /// What it resolved to.
     pub branched_at_lsn: Option<String>,
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// Where the branch's history begins: the commit time at its timeline's branch point, or
     /// when the timeline was made. `None` when unknown.
-    pub history_start: Option<DateTime<Utc>>,
+    pub history_start: Option<Timestamp>,
     /// The `authenticator` role's password on this branch, sealed with `chelabase-secrets`
     /// (purpose `authenticator`); `None` until the data API is set up for it.
     pub authenticator_password_enc: Option<String>,
@@ -159,7 +159,7 @@ pub struct NewBranch<'a> {
     pub database_id: DatabaseId,
     pub name: &'a str,
     pub parent_branch_id: BranchId,
-    pub branched_at_time: Option<DateTime<Utc>>,
+    pub branched_at_time: Option<Timestamp>,
     pub branched_at_lsn: Option<&'a str>,
 }
 
@@ -310,16 +310,16 @@ fn branch_from_row(r: &PgRow) -> Result<BranchRecord, MetadataError> {
         status: BranchStatus::parse(r.get("status"))?,
         timeline_id: r.get("timeline_id"),
         pending_timeline_id: r.get("pending_timeline_id"),
-        pending_timeline_at: r.get("pending_timeline_at"),
+        pending_timeline_at: r.try_get("pending_timeline_at")?,
         superseded_timeline_id: r.get("superseded_timeline_id"),
         endpoint_id: r.get("endpoint_id"),
         owner_password_enc: r.get("owner_password_enc"),
-        branched_at_time: r.get("branched_at_time"),
+        branched_at_time: r.try_get("branched_at_time")?,
         branched_at_lsn: r.get("branched_at_lsn"),
         error: r.get("error"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
-        history_start: r.get("history_start"),
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
+        history_start: r.try_get("history_start")?,
         authenticator_password_enc: r.get("authenticator_password_enc"),
         protected: r.get("protected"),
         guard_logins: r.get("guard_logins"),
@@ -1114,7 +1114,7 @@ impl MetadataClient {
         id: BranchId,
         sealed_password: &str,
         branched_at_lsn: Option<&str>,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_database_of_main(&mut tx, id).await?;
@@ -1185,7 +1185,7 @@ impl MetadataClient {
         &self,
         id: BranchId,
         expected_pending: &str,
-        history_start: Option<DateTime<Utc>>,
+        history_start: Option<Timestamp>,
         branched_at_lsn: &str,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
@@ -1243,7 +1243,7 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_database_of_branch(&mut tx, id).await?;
-        let current: Option<(Uuid, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        let current: Option<(Uuid, Option<String>, Option<Timestamp>)> = sqlx::query_as(
             "SELECT database_id, timeline_id, history_start FROM branches
              WHERE id = $1 AND status = 'resetting' AND pending_timeline_id = $2
              FOR UPDATE",

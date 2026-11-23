@@ -22,7 +22,7 @@ mod functions {
     use chelabase_types::data_key::{self, DataKeyKind};
     use chelabase_secrets::SecretKey;
     use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
-    use chrono::{NaiveDate, Utc};
+    use chelabase_time::{Date, Timestamp, TimestampExt};
     use sqlx::postgres::PgPoolOptions;
     use sqlx::{AssertSqlSafe, PgPool};
     use uuid::Uuid;
@@ -60,7 +60,7 @@ mod functions {
                 .connect(&url())
                 .await
                 .expect("metadata Postgres reachable (is the workbench stack up?)");
-            let secs = Utc::now().timestamp() as u32;
+            let secs = Timestamp::now().timestamp() as u32;
             let name = format!("cm_{secs:08x}{}", &Uuid::new_v4().simple().to_string()[..4]);
             sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
                 .execute(&meta)
@@ -342,8 +342,8 @@ mod functions {
         }
     }
 
-    fn date() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()
+    fn date() -> Date {
+        Date::from_ymd_opt(2026, 11, 1).unwrap()
     }
 
     fn sha(c: char) -> String {
@@ -939,7 +939,7 @@ mod functions {
             TriggerState::Installed,
             "storage triggers start installed"
         );
-        let before = Utc::now();
+        let before = Timestamp::now();
         let child = s.branch(db, main, "dev").await;
         let triggers = s.client.list_triggers(child).await.unwrap();
         let table = triggers
@@ -957,7 +957,7 @@ mod functions {
             .unwrap();
         assert_eq!(storage.state, TriggerState::Installed);
         assert!(
-            storage.enabled_since >= before - chrono::Duration::seconds(5)
+            storage.enabled_since >= before - chelabase_time::seconds(5)
                 && storage.enabled_since > parent_storage.enabled_since,
             "the child never replays the parent's events"
         );
@@ -1725,7 +1725,7 @@ mod functions {
                     function_id: f,
                     cron: "* * * * *",
                     timezone: "UTC",
-                    next_run_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                    next_run_at: Some(Timestamp::now() - chelabase_time::minutes(1)),
                 })
                 .await
                 .unwrap();
@@ -2159,7 +2159,7 @@ mod functions {
         let f = s.function(db, "hello").await;
         let g = s.function(db, "other").await;
         let c = &s.client;
-        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::days(1), 6);
+        let past = (Timestamp::now() - chelabase_time::days(1)).trunc_micros();
         let id = c
             .add_schedule(&NewSchedule {
                 branch_id: main,
@@ -2173,7 +2173,7 @@ mod functions {
         let off = c.update_schedule(main, f, id, None, None, Some(false)).await.unwrap().unwrap();
         assert_eq!((off.enabled, off.next_run_at), (false, Some(past)), "only the flag changes");
         let on = c.update_schedule(main, f, id, None, None, Some(true)).await.unwrap().unwrap();
-        assert!(on.enabled && on.next_run_at.unwrap() > Utc::now(), "on again: the next tick");
+        assert!(on.enabled && on.next_run_at.unwrap() > Timestamp::now(), "on again: the next tick");
         let moved = c
             .update_schedule(main, f, id, Some("0 9 * * *"), Some("Europe/London"), None)
             .await
@@ -2204,7 +2204,7 @@ mod functions {
         s.client.set_active_deployment(main, f, d).await.unwrap();
         assert!(s.client.set_enabled(main, f, true).await.unwrap());
         let c = &s.client;
-        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::hours(1), 6);
+        let past = (Timestamp::now() - chelabase_time::hours(1)).trunc_micros();
         let mut ids = Vec::new();
         for cron in ["0 0 * * jan", "* * * * *"] {
             let id = c
@@ -2231,6 +2231,38 @@ mod functions {
         assert_eq!((row(ids[0]).enabled, row(ids[0]).next_run_at), (false, None));
         assert!(row(ids[1]).enabled);
         assert!(c.claim_due_schedules(50, &[]).await.unwrap().is_empty(), "disabled once");
+        s.finish().await;
+    }
+
+    /// The claim writes every claimed row's next time through one `timestamptz[]` bind (with a
+    /// NULL where the schedule was disabled), and an empty claim binds nothing: each stored row
+    /// holds what the claim returned, and a claim with nothing due is empty.
+    #[tokio::test]
+    #[ignore]
+    async fn array_binds_of_times_update_every_row() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let d = s.deployment(f, &sha('a')).await;
+        s.client.set_active_deployment(main, f, d).await.unwrap();
+        assert!(s.client.set_enabled(main, f, true).await.unwrap());
+        let c = &s.client;
+        assert!(c.claim_due_schedules(50, &[]).await.unwrap().is_empty(), "nothing due: an empty claim");
+        let a = due_schedule(&s, main, f, "* * * * *", "UTC").await;
+        let b = due_schedule(&s, main, f, "0 9 * * MON", "Europe/London").await;
+        let broken = due_schedule(&s, main, f, "0 0 * * jan", "UTC").await;
+        let claimed = c.claim_due_schedules(50, &[]).await.unwrap();
+        assert_eq!(claimed.len(), 3, "{claimed:?}");
+        for id in [a, b, broken] {
+            let got = claimed.iter().find(|x| x.id == id).unwrap();
+            let (enabled, next, _, _, _) = stored(&s, id).await;
+            assert_eq!(next, got.next_run_at, "the stored next time is the claimed one");
+            assert_eq!(enabled, id != broken);
+        }
+        assert!(claimed.iter().find(|x| x.id == a).unwrap().next_run_at.is_some());
+        assert!(claimed.iter().find(|x| x.id == b).unwrap().next_run_at.is_some());
+        assert_eq!(claimed.iter().find(|x| x.id == broken).unwrap().next_run_at, None);
+        assert!(c.claim_due_schedules(50, &[]).await.unwrap().is_empty(), "advanced: nothing due again");
         s.finish().await;
     }
 
@@ -2263,7 +2295,7 @@ mod functions {
     /// A due, enabled schedule of an enabled function, its stored cron and zone written
     /// directly (the API refuses ones that don't parse); its id.
     async fn due_schedule(s: &Scratch, main: BranchId, f: Uuid, cron: &str, tz: &str) -> Uuid {
-        let past = chrono::SubsecRound::trunc_subsecs(Utc::now() - chrono::Duration::hours(1), 6);
+        let past = (Timestamp::now() - chelabase_time::hours(1)).trunc_micros();
         let id = s
             .client
             .add_schedule(&NewSchedule { branch_id: main, function_id: f, cron: "* * * * *", timezone: "UTC", next_run_at: Some(past) })
@@ -2279,7 +2311,7 @@ mod functions {
         id
     }
 
-    async fn stored(s: &Scratch, id: Uuid) -> (bool, Option<chrono::DateTime<Utc>>, Option<String>, String, String) {
+    async fn stored(s: &Scratch, id: Uuid) -> (bool, Option<Timestamp>, Option<String>, String, String) {
         sqlx::query_as("SELECT enabled, next_run_at, last_error, cron, timezone FROM function_schedules WHERE id = $1")
             .bind(id)
             .fetch_one(s.pool())
@@ -2821,6 +2853,53 @@ mod functions {
         assert!(s.client.list_deployments(Uuid::new_v4()).await.unwrap().is_empty());
         s.finish().await;
     }
+    /// The install's `enabled_since` goes out and comes back as a `timestamptz[]` and must match
+    /// the stored value to the microsecond: rows with non-zero microseconds, read and bound
+    /// back, are all settled (`rows_affected` is the number of installs), and a value one
+    /// microsecond off settles nothing.
+    #[tokio::test]
+    #[ignore]
+    async fn installs_match_on_microsecond_enabled_since() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.function(db, "hello").await;
+        let c = &s.client;
+        let a = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        let b = c.add_trigger(&table_trigger(main, f, &["delete"])).await.unwrap();
+        for (id, stamp) in [(a, "2026-01-01 00:00:00.123457+00"), (b, "2026-01-01 00:00:00.000001+00")] {
+            sqlx::query("UPDATE function_triggers SET enabled_since = $2::timestamptz WHERE id = $1")
+                .bind(id)
+                .bind(stamp)
+                .execute(s.pool())
+                .await
+                .unwrap();
+        }
+        let read = c.list_triggers(main).await.unwrap();
+        let since = |id: Uuid| read.iter().find(|t| t.id == id).unwrap().enabled_since;
+        assert_eq!(since(a).timestamp_micros() % 1_000_000, 123_457);
+        assert_eq!(since(b).timestamp_micros() % 1_000_000, 1);
+        let off = since(a) + std::time::Duration::from_micros(1);
+        assert_eq!(
+            c.settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: off, error: None }])
+                .await
+                .unwrap(),
+            0,
+            "a microsecond off is another generation"
+        );
+        let settled = c
+            .settle_trigger_installs(
+                main,
+                &[
+                    TriggerInstall { id: a, enabled_since: since(a), error: None },
+                    TriggerInstall { id: b, enabled_since: since(b), error: None },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled, 2);
+        s.finish().await;
+    }
+
     /// m8: the worker settles only the generation of a row it read (`enabled_since`): a row
     /// pended again meanwhile (a reset or restore) stays pending; an install becomes
     /// `installed` (error cleared), a failure `failed` with its error; a settled row is never
@@ -2837,7 +2916,7 @@ mod functions {
         let read = c.list_triggers(main).await.unwrap();
         let since = |id: Uuid| read.iter().find(|t| t.id == id).unwrap().enabled_since;
         assert_eq!(c.trigger_sweep_branches(10).await.unwrap(), vec![(main, true)]);
-        let stale = since(a) - chrono::Duration::seconds(1);
+        let stale = since(a) - chelabase_time::seconds(1);
         let settled = c
             .settle_trigger_installs(main, &[TriggerInstall { id: a, enabled_since: stale, error: None }])
             .await

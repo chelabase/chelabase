@@ -11,7 +11,7 @@ use chelabase_metadata::{
     STORAGE_WEBHOOK_ATTEMPTS_KEPT, STORAGE_WEBHOOK_CAP, StorageWebhookAttempt, StorageWebhookPatch,
 };
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
-use chrono::{Duration, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
@@ -45,7 +45,7 @@ impl Scratch {
             .connect(&url())
             .await
             .expect("metadata Postgres reachable (is the workbench stack up?)");
-        let secs = Utc::now().timestamp() as u32;
+        let secs = Timestamp::now().timestamp() as u32;
         let name = format!("cm_{secs:08x}{}", &Uuid::new_v4().simple().to_string()[..4]);
         sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&meta)
@@ -105,7 +105,7 @@ impl Scratch {
     }
 }
 
-fn attempt(outcome: &str, at: chrono::DateTime<Utc>) -> StorageWebhookAttempt {
+fn attempt(outcome: &str, at: Timestamp) -> StorageWebhookAttempt {
     StorageWebhookAttempt {
         event_id: Uuid::new_v4(),
         event_type: "object.created".into(),
@@ -328,7 +328,7 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
     let s = Scratch::new().await;
     let db = s.database().await;
     let id = s.webhook(db, "https://example.com/hook").await;
-    let t0 = Utc::now() - Duration::days(4);
+    let t0 = Timestamp::now() - chelabase_time::days(4);
 
     let first = s
         .client
@@ -341,7 +341,7 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
     );
     let again = s
         .client
-        .record_storage_webhook_attempt(id, &attempt("timeout", t0 + Duration::hours(1)))
+        .record_storage_webhook_attempt(id, &attempt("timeout", t0 + chelabase_time::hours(1)))
         .await
         .unwrap();
     assert_eq!(again, first, "the run keeps its start");
@@ -350,7 +350,7 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
 
     let ok = s
         .client
-        .record_storage_webhook_attempt(id, &attempt("delivered", t0 + Duration::hours(2)))
+        .record_storage_webhook_attempt(id, &attempt("delivered", t0 + chelabase_time::hours(2)))
         .await
         .unwrap();
     assert_eq!(ok, None);
@@ -392,7 +392,7 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
 
     for _ in 0..STORAGE_WEBHOOK_ATTEMPTS_KEPT + 5 {
         s.client
-            .record_storage_webhook_attempt(id, &attempt("http_error", Utc::now()))
+            .record_storage_webhook_attempt(id, &attempt("http_error", Timestamp::now()))
             .await
             .unwrap();
     }
@@ -422,7 +422,7 @@ async fn attempts_track_the_failure_run_and_stay_bounded() {
     assert!(s.client.delete_storage_webhook(db, id).await.unwrap());
     assert_eq!(
         s.client
-            .record_storage_webhook_attempt(id, &attempt("delivered", Utc::now()))
+            .record_storage_webhook_attempt(id, &attempt("delivered", Timestamp::now()))
             .await
             .unwrap(),
         None
@@ -438,14 +438,14 @@ async fn a_failure_after_a_quiet_spell_starts_a_new_run() {
     let s = Scratch::new().await;
     let db = s.database().await;
     let id = s.webhook(db, "https://example.com/hook").await;
-    let t0 = Utc::now() - Duration::days(5);
+    let t0 = Timestamp::now() - chelabase_time::days(5);
     for h in 0..=24 {
         s.client
-            .record_storage_webhook_attempt(id, &attempt("http_error", t0 + Duration::hours(h)))
+            .record_storage_webhook_attempt(id, &attempt("http_error", t0 + chelabase_time::hours(h)))
             .await
             .unwrap();
     }
-    let back = t0 + Duration::days(4);
+    let back = t0 + chelabase_time::days(4);
     let since = s
         .client
         .record_storage_webhook_attempt(id, &attempt("http_error", back))
@@ -461,7 +461,7 @@ async fn a_failure_after_a_quiet_spell_starts_a_new_run() {
     // Within the window the run goes on.
     let next = s
         .client
-        .record_storage_webhook_attempt(id, &attempt("timeout", back + Duration::hours(1)))
+        .record_storage_webhook_attempt(id, &attempt("timeout", back + chelabase_time::hours(1)))
         .await
         .unwrap();
     assert_eq!(next, since);
@@ -478,13 +478,13 @@ async fn an_out_of_order_attempt_never_moves_the_last_attempt_back() {
     let s = Scratch::new().await;
     let db = s.database().await;
     let id = s.webhook(db, "https://example.com/hook").await;
-    let newer = Utc::now() - Duration::minutes(1);
+    let newer = Timestamp::now() - chelabase_time::minutes(1);
     s.client
         .record_storage_webhook_attempt(id, &attempt("http_error", newer))
         .await
         .unwrap();
     s.client
-        .record_storage_webhook_attempt(id, &attempt("timeout", newer - Duration::seconds(30)))
+        .record_storage_webhook_attempt(id, &attempt("timeout", newer - chelabase_time::seconds(30)))
         .await
         .unwrap();
     let w = s.client.get_storage_webhook(db, id).await.unwrap().unwrap();

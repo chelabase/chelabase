@@ -24,7 +24,7 @@ use chelabase_metadata::{
 use chelabase_types::access::{GrantSources, PlatformRole, qualifies, tenant_admin_effective};
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 use serde_json::json;
-use chrono::{Duration, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use sqlx::postgres::PgPoolOptions;
@@ -219,8 +219,8 @@ fn grant(role: PlatformRole, roles: &[&str]) -> GrantRow {
     }
 }
 
-fn week() -> chrono::DateTime<Utc> {
-    Utc::now() + Duration::days(7)
+fn week() -> Timestamp {
+    Timestamp::now() + chelabase_time::days(7)
 }
 
 /// An invite token's SHA-256 (any 32 bytes will do for these tests).
@@ -796,12 +796,12 @@ async fn expired_invite_does_not_activate() {
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn admin_claimed_since_reads_the_claim_event() {
     let s = Scratch::new().await;
-    let hour_ago = Utc::now() - Duration::hours(1);
+    let hour_ago = Timestamp::now() - chelabase_time::hours(1);
     let claimed = s.tenant().await;
     assert!(!s.client.admin_claimed_since(claimed, hour_ago).await.unwrap());
     s.client.ensure_member_first_comer_for_tests(claimed, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
     assert!(s.client.admin_claimed_since(claimed, hour_ago).await.unwrap());
-    assert!(!s.client.admin_claimed_since(claimed, Utc::now() + Duration::minutes(1)).await.unwrap());
+    assert!(!s.client.admin_claimed_since(claimed, Timestamp::now() + chelabase_time::minutes(1)).await.unwrap());
     let bootstrapped = s.tenant().await;
     s.client.bootstrap_admin(bootstrapped, "boss", "b@x.com").await.unwrap();
     assert!(!s.client.admin_claimed_since(bootstrapped, hour_ago).await.unwrap());
@@ -1195,7 +1195,7 @@ async fn every_write_logs_one_event() {
     );
     one_event!(
         "invite_resent",
-        c.resend_invite(a.id, invite, week() + Duration::days(1), TOKEN)
+        c.resend_invite(a.id, invite, week() + chelabase_time::days(1), TOKEN)
             .await
             .unwrap()
     );
@@ -1253,7 +1253,7 @@ async fn every_write_logs_one_event() {
     );
     // A repeated bootstrap writes nothing at all (M4): the row isn't even touched.
     let stamp = || async {
-        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+        sqlx::query_scalar::<_, Timestamp>(
             "SELECT updated_at FROM members WHERE id = $1",
         )
         .bind(boot.id)
@@ -2202,7 +2202,7 @@ async fn member_listings_report_has_access() {
     let list = c.list_member_listings(t).await.unwrap();
     let has = |id: Uuid| list.iter().find(|l| l.member.id == id).unwrap().has_access;
     assert_eq!((has(a.id), has(granted.id), has(bare.id)), (true, true, false));
-    assert!(list.iter().all(|l| l.created_at <= Utc::now()));
+    assert!(list.iter().all(|l| l.created_at <= Timestamp::now()));
     let one = c.member_listing(granted.id).await.unwrap().unwrap();
     assert_eq!((one.member.id, one.has_access), (granted.id, true));
     // An override alone is not access: the grant is what gives it.
@@ -2303,10 +2303,10 @@ async fn invite_expiry_follows_the_unclosed_invite() {
     assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), None);
     let (_, invite) = c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[])).await.unwrap();
     let stored = |sql: &'static str| async move {
-        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(sql).bind(invite).fetch_one(c.pool()).await.unwrap()
+        sqlx::query_scalar::<_, Timestamp>(sql).bind(invite).fetch_one(c.pool()).await.unwrap()
     };
     let open = stored("SELECT expires_at FROM invites WHERE id = $1").await;
-    assert!(open > Utc::now());
+    assert!(open > Timestamp::now());
     assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some((open, true)));
     // Expired: still answered, with its past expiry, not open (by the database's clock).
     let past = stored("UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1 RETURNING expires_at").await;
@@ -2341,12 +2341,12 @@ async fn invite_expiry_prefers_an_open_invite_to_a_newer_expired_one() {
         .execute(c.pool())
         .await
         .unwrap();
-    let open: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT expires_at FROM invites WHERE id = $1")
+    let open: Timestamp = sqlx::query_scalar("SELECT expires_at FROM invites WHERE id = $1")
         .bind(older)
         .fetch_one(c.pool())
         .await
         .unwrap();
-    let past: chrono::DateTime<Utc> = sqlx::query_scalar(
+    let past: Timestamp = sqlx::query_scalar(
         "UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1 RETURNING expires_at",
     )
     .bind(newer)
@@ -2637,8 +2637,8 @@ async fn member_status_write_matrix() {
 const V1: &str = "SCRAM-SHA-256$4096:c2FsdDE=$c3RvcmVkMQ==:c2VydmVyMQ==";
 const V2: &str = "SCRAM-SHA-256$4096:c2FsdDI=$c3RvcmVkMg==:c2VydmVyMg==";
 
-fn in_days(n: i64) -> chrono::DateTime<Utc> {
-    Utc::now() + Duration::days(n)
+fn in_days(n: u64) -> Timestamp {
+    Timestamp::now() + chelabase_time::days(n)
 }
 
 /// A tenant with its first (claiming) tenant admin, one project and a ready database whose main
@@ -3049,7 +3049,7 @@ fn level_of(l: u8) -> PlatformRole {
 async fn check_logins(
     s: &Scratch,
     t: TenantId,
-    revoked_seen: &mut std::collections::BTreeSet<(Uuid, Uuid, chrono::DateTime<Utc>)>,
+    revoked_seen: &mut std::collections::BTreeSet<(Uuid, Uuid, Timestamp)>,
 ) -> Result<(), String> {
     use sqlx::Row;
     let rows = sqlx::query(
@@ -3070,7 +3070,7 @@ async fn check_logins(
     for r in rows {
         let member: Uuid = r.get("member_id");
         let database: Uuid = r.get("database_id");
-        let created: chrono::DateTime<Utc> = r.get("created_at");
+        let created: Timestamp = r.get("created_at");
         let live: bool = r.get("live");
         let status: String = r.get("status");
         let tenant_admin: bool = r.get("tenant_admin");
@@ -3359,7 +3359,7 @@ async fn reset_sets_every_proxy_row_to_the_new_verifier() {
     c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
     let until = in_days(120);
     let (login, eps) = c.reset_personal_login(alice, h.db, V2, until).await.unwrap();
-    assert!((login.valid_until - until).num_milliseconds().abs() < 1, "{} vs {until}", login.valid_until);
+    assert!(login.valid_until.since(until).abs().as_millis() < 1, "{} vs {until}", login.valid_until);
     assert_eq!(login.status, LoginStatus::Active);
     let want = sorted(vec![endpoint(h.db, &h.ep, "alice"), endpoint(child, &child_ep, "alice")]);
     assert_eq!(sorted(eps), want);
@@ -3742,7 +3742,7 @@ async fn suspend_and_reinstate_are_idempotent() {
 }
 
 /// `(suspended_at, suspended_by)` as the `members` row stores them (D10).
-async fn suspension_of(s: &Scratch, member: Uuid) -> (Option<chrono::DateTime<Utc>>, Option<Uuid>) {
+async fn suspension_of(s: &Scratch, member: Uuid) -> (Option<Timestamp>, Option<Uuid>) {
     sqlx::query_as("SELECT suspended_at, suspended_by FROM members WHERE id = $1")
         .bind(member)
         .fetch_one(s.client.pool())
@@ -3763,9 +3763,9 @@ async fn suspend_records_when_and_by_whom_and_reinstate_clears() {
     c.set_tenant_admin(Some(h.admin), second, true).await.unwrap();
     assert_eq!(suspension_of(&s, alice).await, (None, None), "an active member has neither");
 
-    let before = Utc::now() - Duration::seconds(5);
+    let before = Timestamp::now() - chelabase_time::seconds(5);
     c.suspend_member(h.admin, alice).await.unwrap();
-    let after = Utc::now() + Duration::seconds(5);
+    let after = Timestamp::now() + chelabase_time::seconds(5);
     let (at, by) = suspension_of(&s, alice).await;
     let at = at.expect("suspended_at is set");
     assert!(before <= at && at <= after, "{at} not within {before}..{after}");
@@ -3868,9 +3868,9 @@ async fn the_suspended_by_migration_backfills_suspended_members() {
     let with_event = s.member_row_before_d10(h.t, "ev", "suspended").await;
     let without = s.member_row_before_d10(h.t, "noev", "suspended").await;
     let active = s.member_row_before_d10(h.t, "act", "active").await;
-    let old = Utc::now() - Duration::days(30);
-    let newer = Utc::now() - Duration::days(10);
-    let stamp = Utc::now() - Duration::days(3);
+    let old = Timestamp::now() - chelabase_time::days(30);
+    let newer = Timestamp::now() - chelabase_time::days(10);
+    let stamp = Timestamp::now() - chelabase_time::days(3);
     sqlx::query("UPDATE members SET updated_at = $2 WHERE id = $1")
         .bind(without)
         .bind(stamp)
@@ -3899,10 +3899,10 @@ async fn the_suspended_by_migration_backfills_suspended_members() {
 
     let (at, by) = suspension_of(&s, with_event).await;
     let at = at.expect("backfilled from the event");
-    assert!((at - newer).num_milliseconds().abs() < 1000, "the latest event wins: {at}");
+    assert!(at.since(newer).abs().as_millis() < 1000, "the latest event wins: {at}");
     assert_eq!(by, Some(h.admin));
     let (at, by) = suspension_of(&s, without).await;
-    assert_eq!(at.map(|t| (t - stamp).num_milliseconds().abs() < 1000), Some(true), "updated_at: {at:?}");
+    assert_eq!(at.map(|t| t.since(stamp).abs().as_millis() < 1000), Some(true), "updated_at: {at:?}");
     assert_eq!(by, None);
     assert_eq!(suspension_of(&s, active).await, (None, None));
     s.finish().await;
@@ -6204,7 +6204,7 @@ async fn setup_claim_refused_once_an_admin_exists() {
 async fn setup_claim_window_opens_at_the_first_admin_claim() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
-    let hour_ago = Utc::now() - Duration::hours(1);
+    let hour_ago = Timestamp::now() - chelabase_time::hours(1);
     let n = setup_nonce(&s, t).await;
     s.client.claim_setup(t, n, "user-a", None).await.unwrap();
     assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "binding opens no window");
@@ -6228,7 +6228,7 @@ async fn setup_claim_bystander_never_blocks_stale_replacement() {
     // window that would make B pending is shut, so nothing is written.
     assert!(not_admitted(s.client.admit_member(t, "user-b", "b@x.com", "B", Admission::Closed).await));
     assert!(
-        !s.client.admin_claimed_since(t, Utc::now() - Duration::hours(1)).await.unwrap(),
+        !s.client.admin_claimed_since(t, Timestamp::now() - chelabase_time::hours(1)).await.unwrap(),
         "no window before A's first request: B is not made pending"
     );
     assert_eq!(s.member_count(t).await, 0);
