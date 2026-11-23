@@ -244,7 +244,7 @@ A bad user token never falls back to the key's own role.
 
 ## MCP tool errors
 
-These come from the MCP server's tools (`search` and `execute`), not the HTTP API. A failed tool call is a tool result with `isError: true` and one text block: `{"error": {"code", "message"}}`, with `retry_after_ms` on `rate_limited`, `operations` on a refusal, and `calls` (each `{operation, status}`) whenever an `execute` run made API calls and ended in `calls_unfinished`, `timeout`, `threw` or a refusal. A call listed as `unknown` may have been applied. See [Limits and errors](/using/mcp/limits-and-errors) for the detail.
+These come from the MCP server's tools (`search` and `execute`), not the HTTP API. A failed tool call is a tool result with `isError: true` and one text block: `{"error": {"code", "message"}}`, with `retry_after_ms` on `rate_limited`, `operations` on a refusal, and `calls` (each `{operation, status}`) on every error of an `execute` run that made API calls. A call listed with a status number was made and answered; one listed as `unknown` may have been applied. See [Limits and errors](/using/mcp/limits-and-errors) for the detail.
 
 | Code | Meaning |
 |---|---|
@@ -258,7 +258,7 @@ These come from the MCP server's tools (`search` and `execute`), not the HTTP AP
 | `read_only_connection` | A read-only connection called an operation that isn't a read. |
 | `calls_unfinished` | The code returned while an API call it made had no answer. `calls` lists them. |
 
-Inside `execute`, `chelabase.request` answers these as an API-shaped error instead of throwing: `operation_not_allowed` (403), `destructive_flag_required` (403), `read_only_connection` (403), `secrets_unavailable` (403), `too_many_calls` (429), `request_too_large` (413), `invalid_request` (400), `response_too_large` (502), `binary_body` (502), `upstream_unavailable` (502) and `timeout` (504).
+Inside `execute`, `chelabase.request` answers these as an API-shaped error instead of throwing: `operation_not_allowed` (403), `destructive_flag_required` (403), `read_only_connection` (403), `secrets_unavailable` (403), `too_many_calls` (429), `request_too_large` (413), `invalid_request` (400), `response_too_large` (502), `binary_body` (502), `upstream_unavailable` (502) and `timeout` (504). It throws only for a call it can't send: bad arguments, a body that isn't JSON, or a call over 4 MiB as JSON.
 
 ## Data API errors
 

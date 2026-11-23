@@ -17,17 +17,20 @@
 //! 5. `runSql` without the run's `destructive` flag, or on a read-only connection, gets
 //!    `read_only: true` whatever the code sent. The body is then classed
 //!    ([`crate::policy::classify`]) and the same re-serialized value is what is forwarded.
-//! 6. A read-only connection makes `read` calls only; a `destructive` one needs the flag.
-//! 7. An operation that answers with a credential is not sent: no sealer is configured yet
-//!    (epic `mcp-sealed`), so it answers `secrets_unavailable`.
+//! 6. An operation that answers with a credential is not sent: no sealer is configured yet
+//!    (epic `mcp-sealed`), so it answers `secrets_unavailable`, before the class is checked (it
+//!    neither asks for the flag nor makes the run refused).
+//! 7. A read-only connection makes `read` calls only; a `destructive` one needs the flag.
 //! 8. Forwarded to `CHELABASE_MCP_API_URL` (the gateway) with `Host` set to the API host, the
 //!    member's bearer, `Chelabase-Via-Mcp: 1`, a fresh `x-request-id`, and of the sandbox's
 //!    headers only `accept` and `x-upsert`. Redirects are not followed. The call is cut at the
 //!    run's deadline or when the run ends.
 //! 9. The sandbox gets `{status, ok, headers, body}` with only `content-type`, `retry-after`
 //!    and `x-request-id`; JSON bodies parsed, other text as text. A body over
-//!    `CHELABASE_MCP_RESPONSE_MAX_BYTES` is `response_too_large`, a non-UTF-8 one
-//!    `binary_body`, and one holding the member's token `secrets_unavailable`.
+//!    `CHELABASE_MCP_RESPONSE_MAX_BYTES` is `response_too_large`, and so is an answer whose
+//!    JSON text is over [`RUNNER_ANSWER_MAX_BYTES`] (the runner's cap: it would throw in the
+//!    code instead); a non-UTF-8 body is `binary_body`, and one holding the member's token
+//!    `secrets_unavailable`.
 //!
 //! A refusal the host makes is answered as an API-shaped error (the runner takes only statuses
 //! 100–599): `{status, ok: false, headers: {}, body: {error: {code, message}}}`.
@@ -62,12 +65,14 @@
 //!    The entry is marked when the handler hands its answer back, the last synchronous step
 //!    before the answer goes out; a call answered `timeout` stays unanswered.
 //! 3. **Unanswered calls make the result an error with `calls`.** Whenever an entry is
-//!    unanswered, the tool result is an error listing every forwarded call (`status`: the
-//!    number, `upstream_unavailable` or `unknown`), whatever the code returned or threw:
-//!    the run's refusal if it was refused, `timeout` if the host's deadline passed or the
-//!    runner timed out, the code's own error (`threw`, …) if it threw, else
-//!    [`CALLS_UNFINISHED`]. A refused run's error and a timed-out run's error list `calls`
-//!    whenever any call was forwarded.
+//!    unanswered, the tool result is an error, whatever the code returned or threw: the run's
+//!    refusal if it was refused, `timeout` if the host's deadline passed or the runner timed
+//!    out, the code's own error (`threw`, `runtime_unavailable`, …) if it ended in one, else
+//!    [`CALLS_UNFINISHED`].
+//! 4. **Every error lists `calls`.** A tool error of an `execute` run that forwarded any call
+//!    lists every forwarded call (`status`: the number, `upstream_unavailable` or `unknown`),
+//!    whatever the error: a write that got its answer before the code threw or the runtime
+//!    died is reported as made, so it is not retried blindly.
 //!
 //! Calls are never kept running past the run to learn their outcome: unanswered is the end
 //! state, reported as `unknown`.
@@ -97,15 +102,20 @@ pub const CALLS_UNFINISHED: &str = "calls_unfinished";
 pub const DEFAULT_RESPONSE_MAX_BYTES: usize = 1 << 20;
 /// The largest request body forwarded (after re-serializing).
 pub const MAX_REQUEST_BODY_BYTES: usize = 1 << 20;
-/// The header every forwarded call carries; routes that must never be reached from `execute`
-/// refuse a request with it.
+/// The header every forwarded call carries. It is reserved: no route reads it yet; one that
+/// must never be reached from `execute` can refuse a request carrying it.
 pub const VIA_MCP_HEADER: &str = "chelabase-via-mcp";
 /// The sandbox's request headers that are forwarded; every other one is dropped.
 pub const FORWARDED_REQUEST_HEADERS: [&str; 2] = ["accept", "x-upsert"];
 /// The answer headers the sandbox sees.
 pub const ANSWER_HEADERS: [&str; 3] = ["content-type", "retry-after", "x-request-id"];
-/// The most of an envelope read (the runner caps it at 1 MiB of JSON text).
-const MAX_ENVELOPE_BYTES: usize = 4 << 20;
+/// The most of an envelope read. The runner sends at most this many bytes of JSON text, so a
+/// body over [`MAX_REQUEST_BODY_BYTES`] reaches the host and answers `request_too_large`.
+pub const MAX_ENVELOPE_BYTES: usize = 4 << 20;
+/// The largest answer the runner reads (`MAX_HOST_ANSWER_BYTES` in `runner.js`). An answer
+/// whose JSON text is larger is refused `response_too_large` here, so every answer the host
+/// marks delivered reaches the code.
+pub const RUNNER_ANSWER_MAX_BYTES: usize = 8 << 20;
 
 /// The callback's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +125,9 @@ pub struct HostConfig {
     pub api_url: Option<String>,
     /// `CHELABASE_MCP_MAX_CALLS` (1–1000, default 50).
     pub max_calls: u32,
-    /// `CHELABASE_MCP_RESPONSE_MAX_BYTES` (1 KiB–16 MiB, default 1 MiB).
+    /// `CHELABASE_MCP_RESPONSE_MAX_BYTES` (1 KiB–8 MiB, default 1 MiB): the most of an API
+    /// answer's body read. The answer the code gets must also fit the runner's cap
+    /// ([`RUNNER_ANSWER_MAX_BYTES`]) as JSON.
     pub response_max_bytes: usize,
 }
 
@@ -156,10 +168,10 @@ impl HostConfig {
             Some(v) => v
                 .parse::<usize>()
                 .ok()
-                .filter(|n| (1024..=16 << 20).contains(n))
+                .filter(|n| (1024..=RUNNER_ANSWER_MAX_BYTES).contains(n))
                 .with_context(|| {
                     format!(
-                        "CHELABASE_MCP_RESPONSE_MAX_BYTES must be from 1024 to 16777216, not {v:?}"
+                        "CHELABASE_MCP_RESPONSE_MAX_BYTES must be from 1024 to 8388608, not {v:?}"
                     )
                 })?,
         };
@@ -200,7 +212,12 @@ pub enum Code {
     UpstreamUnavailable,
     SecretsUnavailable,
     RequestTooLarge,
+    /// A query value that isn't a string, number or boolean (`invalid_request`).
     InvalidRequest,
+    /// A body that can't be written as JSON (`invalid_request`).
+    UnserializableBody,
+    /// `runSql` with `copy_out` (`operation_not_allowed`).
+    CopyOut,
     /// An integer outside i64/u64, or a decimal serde_json would round (`invalid_request`).
     InexactNumber,
     Timeout,
@@ -211,7 +228,7 @@ pub enum Code {
 impl Code {
     pub fn as_str(self) -> &'static str {
         match self {
-            Code::OperationNotAllowed => "operation_not_allowed",
+            Code::OperationNotAllowed | Code::CopyOut => "operation_not_allowed",
             Code::DestructiveFlagRequired => "destructive_flag_required",
             Code::ReadOnlyConnection => "read_only_connection",
             Code::TooManyCalls => "too_many_calls",
@@ -220,7 +237,9 @@ impl Code {
             Code::UpstreamUnavailable => "upstream_unavailable",
             Code::SecretsUnavailable => "secrets_unavailable",
             Code::RequestTooLarge => "request_too_large",
-            Code::InvalidRequest | Code::InexactNumber => "invalid_request",
+            Code::InvalidRequest | Code::UnserializableBody | Code::InexactNumber => {
+                "invalid_request"
+            }
             Code::Timeout => "timeout",
             Code::Cut => "cut",
         }
@@ -230,12 +249,13 @@ impl Code {
     fn status(self) -> u16 {
         match self {
             Code::OperationNotAllowed
+            | Code::CopyOut
             | Code::DestructiveFlagRequired
             | Code::ReadOnlyConnection
             | Code::SecretsUnavailable => 403,
             Code::TooManyCalls => 429,
             Code::RequestTooLarge => 413,
-            Code::InvalidRequest | Code::InexactNumber => 400,
+            Code::InvalidRequest | Code::UnserializableBody | Code::InexactNumber => 400,
             Code::ResponseTooLarge | Code::BinaryBody | Code::UpstreamUnavailable => 502,
             Code::Timeout | Code::Cut => 504,
         }
@@ -259,6 +279,10 @@ impl Code {
             }
             Code::RequestTooLarge => "the request body is over 1 MiB",
             Code::InvalidRequest => "query values must be strings, numbers or booleans",
+            Code::UnserializableBody => "the request body can't be sent as JSON",
+            Code::CopyOut => {
+                "copy_out is not available through execute: send runSql without it and read the rows from its answer"
+            }
             Code::InexactNumber => {
                 "a number in the request is an integer outside the 64-bit range or a decimal that can't be carried exactly: send it as a string"
             }
@@ -627,7 +651,9 @@ async fn handle<'a>(
 
     // A refused run stays refused; a later call the gates would refuse is named too.
     if let Some(refusal) = journal.refusal() {
-        if let (Some(op), Some(_)) = (operation, gate(class).filter(|_| class != Class::Excluded)) {
+        if let (Some(op), Some(_)) = (operation, gate(class).filter(|_| class != Class::Excluded))
+            && !secret_fields::answers_with_credential(op)
+        {
             journal.refuse(refusal.code, op);
         }
         return refuse(line, refusal.code);
@@ -644,14 +670,21 @@ async fn handle<'a>(
         return refuse(line, Code::OperationNotAllowed);
     };
     if class == Class::Excluded {
-        return refuse(line, Code::OperationNotAllowed);
+        // The one operation in the bundle a body excludes.
+        let code = if operation == "runSql" {
+            Code::CopyOut
+        } else {
+            Code::OperationNotAllowed
+        };
+        return refuse(line, code);
+    }
+    // Never sent, so neither the flag nor a read-only connection is asked about it.
+    if secret_fields::answers_with_credential(operation) {
+        return refuse(line, Code::SecretsUnavailable);
     }
     if let Some(code) = gate(class) {
         let code = journal.refuse(code, operation);
         return refuse(line, code);
-    }
-    if secret_fields::answers_with_credential(operation) {
-        return refuse(line, Code::SecretsUnavailable);
     }
     // serde_json (without `arbitrary_precision`) would forward such a number rounded.
     if !exact {
@@ -659,7 +692,7 @@ async fn handle<'a>(
     }
     let body = match body.as_ref().map(serde_json::to_vec).transpose() {
         Ok(body) => body,
-        Err(_) => return refuse(line, Code::InvalidRequest),
+        Err(_) => return refuse(line, Code::UnserializableBody),
     };
     if body
         .as_ref()
@@ -935,9 +968,14 @@ async fn send(
         "headers": headers,
         "body": body,
     });
+    let text = answer.to_string();
     // The member's token never reaches the sandbox, even when an upstream echoes it.
-    if answer.to_string().contains(token) {
+    if text.contains(token) {
         return Err((Code::SecretsUnavailable, size));
+    }
+    // What the runner would refuse (and throw on in the code) is refused here, answered.
+    if text.len() > RUNNER_ANSWER_MAX_BYTES {
+        return Err((Code::ResponseTooLarge, size));
     }
     Ok((status, answer, size))
 }
@@ -1033,6 +1071,8 @@ mod tests {
         assert_eq!(config.api_url.as_deref(), Some("http://gateway:8000"));
         assert_eq!(config.max_calls, 10);
         assert_eq!(config.response_max_bytes, 2048);
+        let lookup = |n: &str| (n == "CHELABASE_MCP_RESPONSE_MAX_BYTES").then(|| "8388608".into());
+        assert_eq!(HostConfig::from_lookup(lookup).unwrap().response_max_bytes, 8 << 20);
         for (name, bad) in [
             ("CHELABASE_MCP_API_URL", "gateway:8000"),
             ("CHELABASE_MCP_API_URL", "http://gateway:8000/v1"),
@@ -1041,6 +1081,8 @@ mod tests {
             ("CHELABASE_MCP_MAX_CALLS", "0"),
             ("CHELABASE_MCP_MAX_CALLS", "1001"),
             ("CHELABASE_MCP_RESPONSE_MAX_BYTES", "10"),
+            // Over the runner's 8 MiB answer cap: such an answer could never reach the code.
+            ("CHELABASE_MCP_RESPONSE_MAX_BYTES", "8388609"),
         ] {
             let lookup = move |n: &str| (n == name).then(|| bad.to_owned());
             assert!(HostConfig::from_lookup(lookup).is_err(), "{name}={bad}");

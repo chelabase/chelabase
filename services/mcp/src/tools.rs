@@ -79,6 +79,7 @@ declare const spec: {
     description?: string;
     tags: string[];
     "x-class": "read" | "write" | "destructive";
+    "x-class-rule"?: string;
     parameters?: { name: string; in: "path" | "query" | "header"; required?: boolean; schema: object }[];
     requestBody?: { content: Record<string, { schema: object }> };
     responses: Record<string, { description: string; content?: Record<string, { schema: object }> }>;
@@ -117,8 +118,14 @@ declare const chelabase: {
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string;                    // a path template from `search`, with its parameters filled in
     query?: Record<string, string | number | boolean>;
+    headers?: Record<string, string>; // only `accept` and `x-upsert` are sent
     body?: unknown;                  // sent as JSON
-  }): Promise<{ status: number; ok: boolean; body: unknown }>;
+  }): Promise<{
+    status: number;
+    ok: boolean;
+    headers: Record<string, string>; // only `content-type`, `retry-after` and `x-request-id`
+    body: unknown;
+  }>;
 };
 
 `request` does not throw on 4xx or 5xx: check `ok` and read the error from `body.error`. Find paths, \
@@ -156,7 +163,10 @@ const READ_ONLY_NOTE: &str =
 fn search_description() -> String {
     format!(
         "{SEARCH_INTRO}\n\n{SEARCH_SHAPE}\n\nTags: {}. `x-class` says what an operation does: `read`, \
-`write` or `destructive`; `execute` needs `destructive: true` for a `destructive` one.\n\n{SEARCH_EXAMPLES}",
+`write` or `destructive`; `execute` needs `destructive: true` for a `destructive` one. When \
+`x-class-rule` is present, the class of each call depends on its request body as that sentence \
+says, and `x-class` is the most it can be: only a call the rule makes `destructive` needs \
+`destructive: true`.\n\n{SEARCH_EXAMPLES}",
         FACTS.tags.join(", ")
     )
 }
@@ -462,7 +472,8 @@ pub async fn call(
 /// The tool error that replaces an `execute` run's outcome, with its code (the invariant in
 /// [`crate::host`]'s module doc): the run's sticky refusal (whatever the code returned, so a
 /// `try` cannot hide it), a timeout, or, whenever a forwarded call never got its answer to the
-/// code, an error listing the calls so a write that may have happened is never silent.
+/// code, an error listing the calls so a write that may have happened is never silent. Every
+/// error of a run that forwarded a call lists `calls`.
 fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'static str)> {
     let made = journal.made();
     let calls: Vec<Value> = made
@@ -509,7 +520,9 @@ fn execute_error(journal: &Journal, outcome: &Outcome) -> Option<(String, &'stat
             };
             Some((error(timeout, message, None), timeout))
         }
-        Outcome::Error { code, message } if unknown => {
+        // Any other error lists the calls made: one answered before the code threw (or the
+        // runtime died) may have been a write.
+        Outcome::Error { code, message } if !made.is_empty() => {
             Some((error(code.as_str(), message, None), code.as_str()))
         }
         Outcome::Value(_) if unknown => Some((

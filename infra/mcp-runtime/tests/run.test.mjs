@@ -84,6 +84,23 @@ describe("mcp runtime /run", () => {
     assert.deepEqual(lines, [`POST /internal/exec/${execId}/request`, `POST /internal/exec/${execId}/request`]);
   });
 
+  test("a body over the host's 1 MiB reaches the host; an envelope over 4 MiB throws", async () => {
+    host.requests.length = 0;
+    const code = `async () => {
+      const r = await chelabase.request({ method: "POST", path: "/v1/x", body: { pad: "x".repeat(2 << 20) } });
+      // 1.5 M characters, 4.5 MiB of UTF-8: the cap counts bytes.
+      const big = await chelabase.request({ method: "POST", path: "/v1/x", body: { pad: "\u20ac".repeat(1536 * 1024) } })
+        .then(() => "sent", (e) => e.message);
+      return { status: r.status, echoed: r.body.echo.body.pad.length, big };
+    }`;
+    const { body } = await runCode(rt, job(code, { kind: "execute", host }));
+    assert.equal(body.ok, true, JSON.stringify(body).slice(0, 2000));
+    assert.equal(body.result.status, 200);
+    assert.equal(body.result.echoed, 2 << 20);
+    assert.match(body.result.big, /over 4 MiB/);
+    assert.equal(host.requests.length, 1);
+  });
+
   test("the runner's caller headers never reach the host or the sandbox", async () => {
     host.requests.length = 0;
     const res = await fetch(new URL("/run", rt.url), {

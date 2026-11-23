@@ -50,6 +50,8 @@ struct Gate {
     auth: Authenticator,
     /// The 401 message, naming the least lifetime a token needs.
     unauthorized: String,
+    /// That lifetime, in seconds: `min_remaining_secs` in the 401 body.
+    min_remaining: u64,
     challenge: HeaderValue,
     allowed_origins: Vec<String>,
 }
@@ -73,7 +75,8 @@ pub fn router(
 ) -> Router {
     let api_base = settings.api_base.trim_end_matches('/').to_owned();
     let challenge = format!(r#"Bearer resource_metadata="{api_base}{METADATA_MCP_PATH}""#);
-    // An `execute` must not outlive its credential: the run's timeout plus 10 s.
+    // An `execute` must not outlive its credential: at least the larger of 60 s and the run's
+    // timeout plus 10 s must be left on a token.
     let auth = Authenticator::new(verifier)
         .with_min_remaining(settings.limits.timeout.as_secs_f64().ceil() as u64 + EXECUTE_MARGIN_SECS);
     let gate = Arc::new(Gate {
@@ -81,6 +84,7 @@ pub fn router(
             "a member token with at least {} seconds left is required",
             auth.min_remaining()
         ),
+        min_remaining: auth.min_remaining(),
         auth,
         challenge: HeaderValue::from_str(&challenge)
             .expect("the API origin is a valid header value"),
@@ -154,11 +158,14 @@ async fn gate_request(State(gate): State<Arc<Gate>>, mut request: Request, next:
     let caller: Caller = match gate.auth.authenticate(request.headers()) {
         Ok(caller) => caller,
         Err(_) => {
-            let mut response = error(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                &gate.unauthorized,
-            );
+            // `min_remaining_secs` lets a client tell a token too short-lived ever to pass
+            // (the member access TTL is too short) from an old one.
+            let body = json!({"error": {
+                "code": "unauthorized",
+                "message": gate.unauthorized,
+                "min_remaining_secs": gate.min_remaining,
+            }});
+            let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
             response
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, gate.challenge.clone());

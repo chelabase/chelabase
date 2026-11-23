@@ -4,7 +4,7 @@
 #
 #   runner  the only worker; port 8080 for the `mcp` service (POST /run), 127.0.0.1:9090 for
 #           the watchdog's probe. Its own outbound is `none`; it reaches only HOST.
-#   host    the `mcp` service's internal listener (`mcp-internal:8080`;
+#   host    the `mcp` service's internal listener (`mcp-internal:8096`, its compose address;
 #           `--external-addr host=<host:port>` moves it). The runner calls it at two paths
 #           only: GET /internal/spec and POST /internal/exec/{exec_id}/request.
 #   none    no address at all.
@@ -16,7 +16,7 @@ using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
     (name = "runner", worker = .runner),
-    (name = "host", external = (address = "mcp-internal:8080", http = ())),
+    (name = "host", external = (address = "mcp-internal:8096", http = ())),
     (name = "none", network = (allow = [])),
   ],
   sockets = [

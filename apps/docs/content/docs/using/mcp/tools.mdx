@@ -9,7 +9,7 @@ Both tools take `code`: an async arrow function, as a string, up to 64 KiB. The 
 
 ## `search`
 
-The code sees one global, `spec`: the Chelabase API as an OpenAPI 3.1 object with every `$ref` resolved inline. It is far too large to return whole. Each operation carries `operationId`, `summary`, `tags`, `parameters`, `requestBody`, `responses`, its `x-errors` and an `x-class` of `read`, `write` or `destructive`. `info["x-spec-hash"]` identifies the version. `search` makes no API call, so it is always read-only.
+The code sees one global, `spec`: the Chelabase API as an OpenAPI 3.1 object with every `$ref` resolved inline. It is far too large to return whole. Each operation carries `operationId`, `summary`, `tags`, `parameters`, `requestBody`, `responses`, its `x-errors` and an `x-class` of `read`, `write` or `destructive`. Four operations (`consoleQuery`, `runSql`, `storageCreateBucket` and `applySchemaChanges`) also carry `x-class-rule`: one sentence saying how the request body decides each call's class. Their `x-class` is `destructive`, the most a call can be, and only a call the rule makes destructive needs `destructive: true`. `info["x-spec-hash"]` identifies the version. `search` makes no API call, so it is always read-only.
 
 ## `execute`
 
@@ -20,11 +20,17 @@ chelabase.request(req: {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   path: string;                       // a path from `search`, with its parameters filled in
   query?: Record<string, string | number | boolean>;
+  headers?: Record<string, string>;   // only `accept` and `x-upsert` are sent
   body?: unknown;                     // sent as JSON
-}): Promise<{ status: number; ok: boolean; body: unknown }>
+}): Promise<{
+  status: number;
+  ok: boolean;
+  headers: Record<string, string>;    // only `content-type`, `retry-after` and `x-request-id`
+  body: unknown;
+}>
 ```
 
-`request` does not throw on a 4xx or 5xx. Check `ok` and read the error from `body.error`. Only paths and methods that name an operation in the spec can be called, and each call is made as you, with your token, which the code never sees. A refusal by the server comes back the same way, as `{status: 403, ok: false, body: {error: {code}}}` (for example `operation_not_allowed` or `destructive_flag_required`). A method outside GET, HEAD, POST, PUT, PATCH and DELETE throws.
+`request` does not throw on a 4xx or 5xx. Check `ok` and read the error from `body.error`. Only paths and methods that name an operation in the spec can be called, and each call is made as you, with your token, which the code never sees. A refusal by the server comes back the same way, as `{status: 403, ok: false, body: {error: {code}}}` (for example `operation_not_allowed` or `destructive_flag_required`). A method outside GET, HEAD, POST, PUT, PATCH and DELETE throws; HEAD names no operation, so it answers `operation_not_allowed`. `runSql` with `copy_out` isn't available through `execute` either: it answers `operation_not_allowed`, and the rows come back in the answer of a `runSql` without it. For the few cases where `request` throws, see [Limits and errors](/using/mcp/limits-and-errors#errors-the-code-sees-from-chelabaserequest).
 
 Anything the code writes with `console.log` reaches the model as a second text block, cut at 4 KiB.
 
