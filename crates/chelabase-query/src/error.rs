@@ -29,6 +29,9 @@ pub struct QueryFailure {
     pub detail: Option<String>,
     pub hint: Option<String>,
     pub sqlstate: Option<String>,
+    /// Nothing of the request ran, and its connection is gone: the caller may run it once
+    /// more on a fresh connection ([`crate::pipeline::once_more_on_fresh_connection`]).
+    fresh_connection: bool,
 }
 
 impl QueryFailure {
@@ -40,7 +43,26 @@ impl QueryFailure {
             detail: None,
             hint: None,
             sqlstate: None,
+            fresh_connection: false,
         }
+    }
+
+    /// Whether nothing of the request ran and it may run once more on a fresh connection
+    /// ([`crate::pipeline::once_more_on_fresh_connection`]).
+    pub fn retries_on_fresh_connection(&self) -> bool {
+        self.fresh_connection
+    }
+
+    /// This failure, marked: nothing of the request ran ([`Self::retries_on_fresh_connection`]).
+    pub(crate) fn on_fresh_connection(mut self) -> Self {
+        self.fresh_connection = true;
+        self
+    }
+
+    /// This failure, as the request's answer: never retried again.
+    pub(crate) fn settled(mut self) -> Self {
+        self.fresh_connection = false;
+        self
     }
 
     pub fn invalid_query(message: impl Into<String>) -> Self {
@@ -83,6 +105,7 @@ impl QueryFailure {
                 detail: err.detail().map(str::to_owned),
                 hint: err.hint().map(str::to_owned),
                 sqlstate: Some(sqlstate.to_owned()),
+                fresh_connection: false,
             },
             None => Self::internal(request_id, format!("{sqlstate}: {}", err.message())),
         }

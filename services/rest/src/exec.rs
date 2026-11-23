@@ -529,26 +529,31 @@ impl<S: ConnSource> Engine<S> {
         } else {
             Guard::Key(data)
         };
-        let conn = self
-            .acquire_for(branch, &database.name, &data.role, guard, request_id)
-            .await?;
-        conn.with_role_session(&data.role, &data.claims, guard.role_oid(), async |session| {
-            // `run` sends `[ROLLBACK;] BEGIN; RESET_SQL`, `COMMIT` and `RESET_SQL` itself.
-            Ok::<_, Failure>(
+        // Each run takes its own connection and lets go of it (its session ends) before it
+        // returns: when nothing of the request ran on a connection that had to be discarded,
+        // the second run is on a fresh one, through the role's checks again.
+        let out = chelabase_query::pipeline::once_more_on_fresh_connection(|| async move {
+            let conn = self
+                .acquire_for(branch, &database.name, &data.role, guard, request_id)
+                .await?;
+            conn.with_role_session(&data.role, &data.claims, guard.role_oid(), async |session| {
+                // `run` sends `[ROLLBACK;] BEGIN; RESET_SQL`, `COMMIT` and `RESET_SQL` itself.
                 session
                     .run(
-                    &self.cache,
-                    (branch, &database.name),
-                    &session.settings(database),
-                    self.max_response_bytes,
-                    op,
-                    request_id,
-                )
-                .await?,
-            )
+                        &self.cache,
+                        (branch, &database.name),
+                        &session.settings(database),
+                        self.max_response_bytes,
+                        op,
+                        request_id,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|e| Failure::from(no_role(e)))
         })
-        .await
-        .map_err(no_role)?
+        .await?;
+        Ok(out?)
     }
 
     /// `GET /data/v1/schema?database=`: what the key's role can reach in the database,
