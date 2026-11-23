@@ -8,7 +8,7 @@ import { SchedulesSection } from "./schedules-section";
 import { AWAKE_NOTE, TriggersSection } from "./triggers-section";
 
 const F = "/v1/databases/d1/branches/b1/functions/hello";
-const SCHEDULE = { id: "s1", cron: "0 9 * * *", timezone: "UTC", enabled: true, next_run_at: null };
+const SCHEDULE = { id: "s1", cron: "0 9 * * *", timezone: "UTC", enabled: true, next_run_at: null, last_error: null };
 const TRIGGER = {
   id: "t1", source: "table", pg_database: "app", schema: "public", table: "orders", bucket: null, prefix: null, events: ["insert"],
   enabled: true, state: "installed", last_error: null, last_delivery_error: null, dead_count: 2, dropped_count: 0, last_delivered_at: null,
@@ -82,6 +82,18 @@ describe("SchedulesSection", () => {
     await user.type(screen.getByLabelText("Cron"), "* * * * *");
     await user.click(screen.getByRole("button", { name: "Add schedule" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("a service can't have schedules");
+  });
+
+  it("shows_why_a_schedule_is_stopped_as_text", async () => {
+    const reason = "cron: not a 5-field cron (<b>x</b> & y)";
+    render(<SchedulesSection databaseId="d1" branchId="b1" name="hello" canChange={false} />, {
+      [`GET ${F}/schedules`]: () => jsonResponse([{ ...SCHEDULE, enabled: false, last_error: reason }, { ...SCHEDULE, id: "s2", cron: "5 * * * *" }]),
+    });
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    expect(screen.getAllByText("Stopped")).toHaveLength(1);
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    expect(screen.getByText(/Edit the cron or time zone/)).toBeInTheDocument();
+    expect(screen.queryByText(/next/)).toBeNull();
   });
 
   it("viewer_is_read_only", async () => {

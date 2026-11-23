@@ -10,7 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { functionErrorText, useToggles } from "@/lib/functions";
-import { initialScheduleForm, scheduleFormReason, scheduleFormReducer } from "@/lib/functions-schedules";
+import { initialScheduleForm, scheduleFormReason, scheduleFormReducer, scheduleStatus } from "@/lib/functions-schedules";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
 
@@ -85,6 +85,7 @@ export function SchedulesSection({ databaseId, branchId, name, canChange }: Sche
         <ul className="divide-y divide-line border border-line">
           {schedules.map((s) => {
             const err = toggles.error(s.id);
+            const status = scheduleStatus(s);
             return (
               <li key={s.id} className="space-y-1 px-3 py-2">
                 <div className="flex items-center gap-3">
@@ -102,7 +103,7 @@ export function SchedulesSection({ databaseId, branchId, name, canChange }: Sche
                     <p className="font-mono text-xs">{s.cron}</p>
                     <p className="text-xs text-chalk-dim">
                       {s.timezone}
-                      {s.next_run_at && toggles.enabled(s.id, s.enabled) && (
+                      {status.kind !== "stopped" && s.next_run_at && toggles.enabled(s.id, s.enabled) && (
                         <>
                           {" · next "}
                           <time dateTime={s.next_run_at} title={utc(s.next_run_at)}>
@@ -123,6 +124,16 @@ export function SchedulesSection({ databaseId, branchId, name, canChange }: Sche
                     </Button>
                   </ReadOnlyHint>
                 </div>
+                {status.kind === "stopped" && (
+                  <div className="space-y-0.5 text-xs">
+                    <p className="break-words text-coral">
+                      <span className="font-medium">Stopped</span>
+                      {" · "}
+                      <span>{status.reason}</span>
+                    </p>
+                    <p className="text-chalk-dim">Edit the cron or time zone to turn it back on.</p>
+                  </div>
+                )}
                 {err && (
                   <p role="alert" className="text-xs text-coral">
                     {err}
