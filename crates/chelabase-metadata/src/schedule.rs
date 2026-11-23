@@ -123,12 +123,16 @@ pub const SCHEDULE_ERROR_MAX_CHARS: usize = 500;
 /// What `last_error` says for a schedule that parsed but has no time left.
 pub const NO_UPCOMING_TIME: &str = "no upcoming time";
 
-/// Why a stored schedule can't run: the parser's typed error, or a cron that parses but never
-/// fires again. The only source of `last_error` text ([`ScheduleFault`]).
+/// Why a stored schedule can't run: the parser's typed error, a cron that parses but never
+/// fires again, or a search for its next time that failed. Only [`next_run`] makes one from a
+/// stored cron and time zone, and it is the only source of `last_error` text: a claim
+/// ([`advance`]) and the startup report ([`crate::MetadataClient::record_schedule_errors`])
+/// both derive it from the row itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleProblem {
     Invalid(ScheduleError),
     NoUpcomingTime,
+    SearchFailed(croner::errors::CronError),
 }
 
 impl ScheduleProblem {
@@ -138,8 +142,22 @@ impl ScheduleProblem {
         let text = match self {
             ScheduleProblem::Invalid(e) => e.to_string(),
             ScheduleProblem::NoUpcomingTime => NO_UPCOMING_TIME.to_owned(),
+            ScheduleProblem::SearchFailed(e) => format!("cron: the next time could not be computed ({e})"),
         };
         text.chars().take(SCHEDULE_ERROR_MAX_CHARS).collect()
+    }
+}
+
+/// A stored schedule's first time strictly after `now`, or why it has none.
+pub fn next_run(cron: &str, timezone: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, ScheduleProblem> {
+    let schedule = Schedule::parse(cron, timezone).map_err(ScheduleProblem::Invalid)?;
+    match schedule.try_next_after(now) {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(ScheduleProblem::NoUpcomingTime),
+        Err(e) => {
+            warn!(cron, timezone, error = %e, "schedule search failed; switching the schedule off");
+            Err(ScheduleProblem::SearchFailed(e))
+        }
     }
 }
 
@@ -152,12 +170,9 @@ pub fn advance(
     now: DateTime<Utc>,
     function_enabled: bool,
 ) -> Advance {
-    let (next, problem) = match Schedule::parse(cron, timezone) {
-        Err(e) => (None, Some(ScheduleProblem::Invalid(e))),
-        Ok(s) => match s.next_after(now) {
-            Some(t) => (Some(t), None),
-            None => (None, Some(ScheduleProblem::NoUpcomingTime)),
-        },
+    let (next, problem) = match next_run(cron, timezone, now) {
+        Ok(t) => (Some(t), None),
+        Err(p) => (None, Some(p)),
     };
     Advance {
         next,
@@ -292,5 +307,25 @@ mod tests {
         assert_eq!(text.chars().count(), SCHEDULE_ERROR_MAX_CHARS);
         assert!(text.starts_with("timezone: éé"));
         assert_eq!(ScheduleProblem::NoUpcomingTime.reason(), "no upcoming time");
+    }
+
+    #[test]
+    fn a_search_failure_has_its_own_reason() {
+        // Audit N2: a croner failure other than its search limit isn't "no upcoming time".
+        let why = ScheduleProblem::SearchFailed(croner::errors::CronError::InvalidTime).reason();
+        assert!(why.starts_with("cron: the next time could not be computed ("), "{why}");
+        assert_ne!(why, NO_UPCOMING_TIME);
+    }
+
+    #[test]
+    fn next_run_derives_the_reason_from_the_schedule() {
+        let now = at("2026-06-01T10:00:00Z");
+        assert_eq!(next_run("*/15 * * * *", "UTC", now), Ok(at("2026-06-01T10:15:00Z")));
+        assert_eq!(next_run("0 0 30 2 *", "UTC", now), Err(ScheduleProblem::NoUpcomingTime));
+        assert_eq!(
+            next_run("0 0 * * jan", "UTC", now),
+            Err(ScheduleProblem::Invalid(Schedule::parse("0 0 * * jan", "UTC").unwrap_err()))
+        );
+        assert!(matches!(next_run("* * * * *", "Mars/Olympus", now), Err(ScheduleProblem::Invalid(ScheduleError::Timezone(_)))));
     }
 }
