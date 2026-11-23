@@ -85,7 +85,9 @@ mod fn_triggers {
             // The stack's orchestrator migrates the shared metadata database; this suite never
             // does, it only refuses to run against one behind this checkout.
             stack_is_migrated(&metadata).await;
-            let id = DatabaseId::new();
+            // #337: a live-test id, so the stack's worker leaves the database (and its
+            // branches) to this suite.
+            let id = worker::live_test::database_id();
             let name = format!("fn-{}", &id.to_string()[..8]);
             let project = metadata
                 .create_project(DEMO_TENANT_ID.into(), &name)

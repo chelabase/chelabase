@@ -45,6 +45,7 @@ mod f4_tests;
 mod fakes;
 #[cfg(test)]
 mod final_a_tests;
+pub mod live_test;
 pub mod login_lockdown;
 pub mod member_roles;
 pub mod schema_guard;
@@ -144,6 +145,10 @@ pub struct Worker<M, S, C, N, P> {
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,
+    /// `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES` (#337, workbench only, default off): the
+    /// periodic passes leave live-test databases ([`live_test`]) to their tests. Off: no
+    /// marker is ever looked at.
+    pub skip_live_test_databases: bool,
     /// How long a merge's phase 1 transaction (and each phase 1a step) may take before its
     /// backend is cancelled (P3: 16 min, above the script's own 15 min `statement_timeout`).
     pub merge_tx_timeout: Duration,

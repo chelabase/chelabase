@@ -14,6 +14,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use reqwest::StatusCode;
 use tracing::{error, info, warn};
 
+use crate::live_test::LiveTests;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{COMPUTE_SETTINGS_VERSION, Worker};
 
@@ -697,6 +698,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         report
     }
 
+    /// #337: the branches this pass leaves to live tests ([`crate::live_test`]); none unless
+    /// `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES` is on.
+    pub(crate) fn live_tests(&self, branches: &[LiveBranch]) -> LiveTests {
+        LiveTests::new(
+            self.skip_live_test_databases,
+            branches.iter().map(|b| (b.id, b.database_id)),
+        )
+    }
+
     /// One reconcile pass. `Err` only when observing fails; each action's error is logged
     /// and the next action still runs. The network migration step runs first, whatever
     /// happens to the rest of the pass.
@@ -721,7 +731,19 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.migrate_compute_networks().await;
         let snapshot = self.observe().await.map_err(|e| format!("{e:#}"))?;
         let given_login = self.roll_out_elevated_logins(&snapshot).await;
+        let live_tests = self.live_tests(&snapshot.branches);
         let mut actions = plan(&snapshot);
+        // #337 (workbench only): a live test's branches get no health-check bootstrap, enable
+        // retry or resync from this worker; their tests drive those. Everything else stands.
+        let before = actions.len();
+        actions.retain(|a| !live_tests.skips_action(a));
+        if !live_tests.branches().is_empty() {
+            info!(
+                branches = ?live_tests.branches(),
+                skipped_actions = before - actions.len(),
+                "reconcile: leaving live-test branches to their tests"
+            );
+        }
         // Their whole-branch bootstrap just ran.
         actions.retain(|a| {
             !matches!(a, Action::BootstrapDataApi { branch_id, database: None } if given_login.contains(branch_id))
@@ -781,8 +803,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         // Edge functions m8: branches with a table trigger still to install, or a child's run-as
         // key still to mint.
-        self.sync_pending_fn_triggers().await;
-        self.sync_pending_run_as().await;
+        self.sync_pending_fn_triggers_except(&live_tests).await;
+        self.sync_pending_run_as_except(&live_tests).await;
         Ok(())
     }
 
@@ -858,9 +880,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             })
             .map(|d| d.id)
             .collect();
+        // #337: a live test's branches stay out of the round-robin (and its cursor).
+        let live_tests = self.live_tests(&branches);
         let checkable: Vec<LiveBranch> = branches
             .iter()
             .filter(|b| !missing_tenant.contains(&b.database_id))
+            .filter(|b| !live_tests.skips(b.id))
             .cloned()
             .collect();
         let running: HashSet<String> = computes.difference(&not_running).cloned().collect();
@@ -968,6 +993,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         let listed: Vec<BranchId> = missing.iter().filter(|id| !candidates.contains(id)).copied().collect();
         candidates.extend(listed);
+        // #337: a live test bootstraps its own branches.
+        let live_tests = self.live_tests(&snapshot.branches);
+        candidates.retain(|id| !live_tests.skips(*id));
         let batch = login_rollout_batch(&candidates, &snapshot.branches, &running, LOGIN_ROLLOUT_PER_PASS);
         if batch.is_empty() {
             return HashSet::new();
@@ -2663,6 +2691,61 @@ mod tests {
         journal.lock().unwrap().clear();
         w.reconcile_once().await.unwrap();
         assert!(position(&journal, "metadata.apply_resync").is_some());
+    }
+
+    /// #337: with `CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES` on, a pass gives a live-test
+    /// database's branches no health check, bootstrap or resync (their test drives those);
+    /// off (self-hosted, the default) it reconciles them as every other branch.
+    #[tokio::test]
+    async fn marked_databases_are_skipped_only_with_the_test_setting() {
+        const HEALTH: &str = "app SET search_path = pg_catalog, pg_temp; SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r";
+        const CATALOG_READ: &str = "postgres SET search_path = pg_catalog, pg_temp;";
+        let (mut w, journal) = worker();
+        let marked = w.metadata.insert_database_with_id(
+            crate::live_test::database_id(),
+            "app",
+            DatabaseStatus::Pending,
+        );
+        w.handle_provision(marked, "app").await.unwrap();
+        let marked_ep = w.metadata.main(marked).endpoint_id.unwrap();
+        let (plain, plain_ep) = provision(&w, &journal).await;
+        // Both lack the `chelabase` schema, and both lose their authenticator password.
+        w.computes.answer("to_regclass('chelabase.schema_version')", "f\n");
+        let lose_passwords = |w: &FakeWorker| {
+            let mut state = w.metadata.state();
+            for id in [marked, plain] {
+                state.branches.get_mut(&BranchId::from(id)).unwrap().authenticator_password_enc = None;
+            }
+        };
+        let touched = |ep: &str| {
+            entries(&journal)
+                .into_iter()
+                .filter(|e| e.starts_with(&format!("compute.sql {ep} ")))
+                .collect::<Vec<_>>()
+        };
+
+        // Off: both are checked, bootstrapped and resynced.
+        lose_passwords(&w);
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        for (id, ep) in [(marked, &marked_ep), (plain, &plain_ep)] {
+            assert!(position(&journal, &format!("compute.sql {ep} {HEALTH}")).is_some(), "{ep} checked");
+            assert!(position(&journal, &format!("compute.sql {ep} app BEGIN;")).is_some(), "{ep} bootstrapped");
+            assert!(position(&journal, &format!("compute.sql {ep} {CATALOG_READ}")).is_some(), "{ep} resynced");
+            assert!(w.metadata.main(id).authenticator_password_enc.is_some());
+        }
+
+        // On: the marked database's branch is left alone; the other one is reconciled as before.
+        w.skip_live_test_databases = true;
+        lose_passwords(&w);
+        journal.lock().unwrap().clear();
+        w.reconcile_once().await.unwrap();
+        assert_eq!(touched(&marked_ep), Vec::<String>::new(), "the live test's compute is left alone");
+        assert!(w.metadata.main(marked).authenticator_password_enc.is_none(), "not bootstrapped");
+        assert!(position(&journal, &format!("compute.sql {plain_ep} {HEALTH}")).is_some());
+        assert!(position(&journal, &format!("compute.sql {plain_ep} app BEGIN;")).is_some());
+        assert!(position(&journal, &format!("compute.sql {plain_ep} {CATALOG_READ}")).is_some());
+        assert!(w.metadata.main(plain).authenticator_password_enc.is_some());
     }
 
     #[tokio::test]

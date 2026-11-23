@@ -585,4 +585,16 @@ egress_ip="$(sed -n 's/^CHELABASE_COMPUTE_EGRESS_IP=//p' "$fixture")"
   fail "compute-egress has the workbench's test allow-list"
 [[ "$(q '.services["compute-egress"].environment.CHELABASE_COMPUTE_EGRESS_DENY')" == "192.88.99.16/28" ]] ||
   fail "compute-egress has the workbench's test deny list (egress-blocked.test's address)"
+# #337: the worker setting that leaves live-test databases to their tests is the workbench's
+# alone. The overlay sets it on the worker and nowhere else (never the runner, whose in-process
+# workers sweep their own test databases); the self-hosted files, the example env and the
+# stack.env the CLI writes never name it, so a self-hosted worker runs with its default (off).
+skip_var=CHELABASE_WORKER_SKIP_LIVE_TEST_DATABASES
+[[ "$(q ".services.worker.environment.$skip_var // empty")" == true ]] || fail "the workbench worker sets $skip_var=true"
+[[ "$(q "[.services | to_entries[] | select(.value.environment[\"$skip_var\"] != null) | .key] | join(\" \")")" == worker ]] ||
+  fail "$skip_var is set on the worker alone"
+named="$(cd "$root" && git grep -l -e "$skip_var" -- infra tools scripts .github ':!scripts/tests/workbench-compose.sh' || true)"
+[[ "$named" == infra/compose/docker-compose.workbench.yml ]] ||
+  fail "only infra/compose/docker-compose.workbench.yml may name $skip_var; got:
+$named"
 echo "workbench-compose: ok"

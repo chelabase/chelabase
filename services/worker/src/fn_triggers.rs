@@ -158,6 +158,7 @@ use uuid::Uuid;
 
 use crate::Worker;
 use crate::data_api::RoleCheck;
+use crate::live_test::LiveTests;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::resync::SYSTEM_DATABASE;
 use crate::review::review_databases_sql;
@@ -1578,6 +1579,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// changed database trigger is put back; one whose table is gone fails), each pass taking
     /// the least recently attempted. A `failed` row never comes back here.
     pub async fn sync_pending_fn_triggers(&self) {
+        self.sync_pending_fn_triggers_except(&LiveTests::off()).await;
+    }
+
+    /// [`Self::sync_pending_fn_triggers`] leaving `live_tests`' branches alone (#337, the
+    /// reconcile pass's). A skipped branch still counts as attempted, so it goes to the back
+    /// of the queue and never holds the batch.
+    pub(crate) async fn sync_pending_fn_triggers_except(&self, live_tests: &LiveTests) {
         let Some(meta) = self.metadata.functions() else {
             return;
         };
@@ -1588,6 +1596,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         };
         for branch in self.sweep_batch(Sweep::Triggers, from, &candidates) {
             self.attempted(Sweep::Triggers, branch);
+            if live_tests.skips(branch) {
+                continue;
+            }
             // m13: drop, then forget. The drops read before a complete sync are cleared after it:
             // that sync no longer wanted their triggers, so it dropped them.
             let drops = match meta.trigger_drops(branch).await {
@@ -1613,6 +1624,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// branch with a function that has a `run_as_role` and no key, chosen by state alone,
     /// each pass taking the least recently attempted.
     pub async fn sync_pending_run_as(&self) {
+        self.sync_pending_run_as_except(&LiveTests::off()).await;
+    }
+
+    /// [`Self::sync_pending_run_as`] leaving `live_tests`' branches alone (#337), as
+    /// [`Self::sync_pending_fn_triggers_except`] does.
+    pub(crate) async fn sync_pending_run_as_except(&self, live_tests: &LiveTests) {
         let Some(meta) = self.metadata.functions() else {
             return;
         };
@@ -1624,6 +1641,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             };
         for branch in self.sweep_batch(Sweep::RunAs, from, &candidates) {
             self.attempted(Sweep::RunAs, branch);
+            if live_tests.skips(branch) {
+                continue;
+            }
             self.mint_child_run_as(branch).await;
         }
     }

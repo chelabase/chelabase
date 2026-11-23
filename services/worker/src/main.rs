@@ -52,6 +52,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Before anything is contacted, so a missing image is the first thing a user sees.
     let config = WorkerConfig::from_env()?;
+    if config.skip_live_test_databases {
+        warn!(
+            "{} is on: the periodic passes leave live-test databases to their tests (workbench only)",
+            worker::live_test::ENV
+        );
+    }
     let metadata_config = worker::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
     // object-storage m18: where storage webhooks may go (public addresses only, unless allowed).
