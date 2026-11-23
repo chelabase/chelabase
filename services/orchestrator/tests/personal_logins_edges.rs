@@ -424,7 +424,7 @@ async fn revoke_now_counts_live_logins_and_rotated_branches() {
     e.w.metadata
         .seed_personal_login(e.alice.0, web2_id, "alice_old");
     e.w.metadata.edit_personal_login(e.alice.0, web2_id, |l| {
-        l.login.revoked_at = Some(chrono::Utc::now());
+        l.login.revoked_at = Some(Timestamp::now());
         l.login.revoked_reason = Some(RevokeReason::AccessLost);
         l.verifier = None;
     });

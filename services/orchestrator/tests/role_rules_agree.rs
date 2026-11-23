@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_metadata::{PasswordState, RoleAttributes, RoleLevel, RoleOrigin, RoleRow};
 use orchestrator::access::{ChainRefusal, RoleGraph};
 use proptest::prelude::*;
@@ -100,7 +101,7 @@ fn orchestrator_graph(nodes: &[Node]) -> RoleGraph {
             login: n.login,
             password: PasswordState::None,
             pending: false,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            created_at: Timestamp::from_unix_seconds(0).unwrap(),
             attributes: RoleAttributes {
                 bypass_rls: n.bypass_rls,
                 member_of: n.member_of.iter().map(|m| m.0.to_string()).collect(),
