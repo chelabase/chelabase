@@ -355,10 +355,13 @@ pub struct CheckPools {
 }
 
 /// A connection out of the pool; dropping it gives it back (when its session is clean and
-/// open) or closes it.
+/// open) or closes it. A connection whose reset or session check failed is marked broken
+/// ([`chelabase_query::QueryClient::mark_broken`]) and closed when dropped, though its
+/// session may look idle: it never serves another check.
 pub struct PooledClient {
     client: Option<Client>,
     permit: Option<BudgetPermit>,
+    broken: std::sync::atomic::AtomicBool,
     info: Arc<ConnInfo>,
     key: PoolKey,
     pools: Weak<CheckPools>,
@@ -371,12 +374,33 @@ impl std::ops::Deref for PooledClient {
     }
 }
 
+impl chelabase_query::QueryClient for PooledClient {
+    fn client(&self) -> &Client {
+        self
+    }
+
+    fn prepare_cached(
+        &self,
+        sql: &str,
+        types: &[tokio_postgres::types::Type],
+    ) -> impl Future<Output = Result<tokio_postgres::Statement, tokio_postgres::Error>> + Send {
+        Client::prepare_typed(self, sql, types)
+    }
+
+    fn mark_broken(&self) {
+        self.broken.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for PooledClient {
     fn drop(&mut self) {
         let (Some(client), Some(permit)) = (self.client.take(), self.permit.take()) else {
             return;
         };
-        if client.is_closed() || client.transaction_status() != TransactionStatus::Idle {
+        if *self.broken.get_mut()
+            || client.is_closed()
+            || client.transaction_status() != TransactionStatus::Idle
+        {
             return;
         }
         if let Some(pools) = self.pools.upgrade() {
@@ -489,6 +513,7 @@ impl CheckPools {
             return Ok(PooledClient {
                 client: Some(c.client),
                 permit: Some(c.permit),
+                broken: Default::default(),
                 info: c.info,
                 key,
                 pools: Arc::downgrade(self),
@@ -517,6 +542,7 @@ impl CheckPools {
         Ok(PooledClient {
             client: Some(client),
             permit: Some(permit),
+            broken: Default::default(),
             info,
             key,
             pools: Arc::downgrade(self),
@@ -572,5 +598,159 @@ mod login_tests {
             (branch, "main".into(), Login::Elevated),
         );
         assert_ne!(a, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::RESET_SQL;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    /// A Postgres stand-in on 127.0.0.1 that answers simple queries as a transaction would:
+    /// `BEGIN…` leaves a transaction open, `COMMIT`/`ROLLBACK` closes it, and anything else
+    /// (the trailing reset) succeeds, or fails with the session left idle and open when
+    /// `fail_reset`. It counts the connections it accepted and reports each one that ended.
+    struct FakePg {
+        port: u16,
+        accepted: Arc<AtomicUsize>,
+        ended: mpsc::UnboundedReceiver<()>,
+    }
+
+    fn ready(status: u8) -> [u8; 6] {
+        [b'Z', 0, 0, 0, 5, status]
+    }
+
+    fn error_response() -> Vec<u8> {
+        let mut body = Vec::new();
+        for (field, value) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', "XX000"), (b'M', "no reset")] {
+            body.push(field);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut out = vec![b'E'];
+        out.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    async fn fake_pg(fail_reset: bool) -> FakePg {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (ended_tx, ended) = mpsc::unbounded_channel();
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let ended_tx = ended_tx.clone();
+                tokio::spawn(async move {
+                    let len = socket.read_i32().await.unwrap();
+                    let mut startup = vec![0; usize::try_from(len).unwrap() - 4];
+                    socket.read_exact(&mut startup).await.unwrap();
+                    // AuthenticationOk, then ReadyForQuery (idle).
+                    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await.unwrap();
+                    socket.write_all(&ready(b'I')).await.unwrap();
+                    while let Ok(kind) = socket.read_u8().await {
+                        let Ok(len) = socket.read_i32().await else { break };
+                        let mut body = vec![0; usize::try_from(len).unwrap() - 4];
+                        if socket.read_exact(&mut body).await.is_err() || kind != b'Q' {
+                            break;
+                        }
+                        let sql = String::from_utf8_lossy(&body);
+                        let reply = if sql.starts_with("BEGIN") {
+                            ready(b'T').to_vec()
+                        } else if sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK") {
+                            ready(b'I').to_vec()
+                        } else if fail_reset {
+                            [error_response(), ready(b'I').to_vec()].concat()
+                        } else {
+                            ready(b'I').to_vec()
+                        };
+                        if socket.write_all(&reply).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = ended_tx.send(());
+                });
+            }
+        });
+        FakePg {
+            port,
+            accepted,
+            ended,
+        }
+    }
+
+    /// Pools whose lookup already holds `fake`'s address for one branch (no route asked).
+    fn pools_for(fake: &FakePg) -> (Arc<CheckPools>, CheckTarget) {
+        let lookup = Arc::new(ConnLookup::new("http://127.0.0.1:1", "token"));
+        let info: ConnInfo = serde_json::from_value(serde_json::json!({
+            "host": "127.0.0.1", "port": fake.port, "user": "authenticator", "password": "pw",
+        }))
+        .unwrap();
+        let target = CheckTarget {
+            database_id: Uuid::new_v4(),
+            branch_id: Uuid::new_v4(),
+            pg_database: "main".into(),
+        };
+        lookup
+            .cache
+            .lock()
+            .unwrap()
+            .insert(target.branch_id, (Instant::now(), Arc::new(info)));
+        (CheckPools::new(lookup, None), target)
+    }
+
+    fn idle_count(pools: &CheckPools) -> usize {
+        pools.idle.lock().unwrap().values().map(Vec::len).sum()
+    }
+
+    async fn check(pools: &Arc<CheckPools>, target: &CheckTarget) {
+        let client = pools.get(target).await.unwrap();
+        let out = chelabase_query::engine::with_transaction(
+            &client,
+            RESET_SQL,
+            "test",
+            async |_| Ok(()),
+        )
+        .await;
+        assert!(out.is_ok(), "the trailing reset never changes the result: {out:?}");
+    }
+
+    /// A check whose trailing reset failed (the session idle and open, so it looks clean):
+    /// its connection is closed when dropped, its budget share goes back, and the next
+    /// checkout opens a fresh one.
+    #[tokio::test]
+    async fn a_failed_reset_discards_the_connection() {
+        let mut fake = fake_pg(true).await;
+        let (pools, target) = pools_for(&fake);
+        check(&pools, &target).await;
+        assert_eq!(idle_count(&pools), 0, "not returned to the pool");
+        assert!(
+            pools.budget.inner.used.lock().unwrap().get(&target.branch_id).is_none(),
+            "its budget share went back"
+        );
+        tokio::time::timeout(Duration::from_secs(5), fake.ended.recv())
+            .await
+            .expect("the connection is closed")
+            .unwrap();
+        let _next = pools.get(&target).await.unwrap();
+        assert_eq!(fake.accepted.load(Ordering::SeqCst), 2, "a fresh connection");
+    }
+
+    /// A clean check gives its connection back, and the next checkout reuses it.
+    #[tokio::test]
+    async fn a_clean_check_returns_the_connection() {
+        let fake = fake_pg(false).await;
+        let (pools, target) = pools_for(&fake);
+        check(&pools, &target).await;
+        assert_eq!(idle_count(&pools), 1, "returned to the pool");
+        let _next = pools.get(&target).await.unwrap();
+        assert_eq!(fake.accepted.load(Ordering::SeqCst), 1, "reused");
+        assert_eq!(idle_count(&pools), 0);
     }
 }
