@@ -132,7 +132,7 @@ impl StorageConfig {
         let bucket = opt(ENV_BUCKET).ok_or(ConfigError::Missing(ENV_BUCKET))?;
         let duration = |var: &'static str, default: Duration| match opt(var) {
             None => Ok(default),
-            Some(v) => humantime::parse_duration(&v).map_err(|e| ConfigError::Invalid {
+            Some(v) => chelabase_time::parse_duration(&v).map_err(|e| ConfigError::Invalid {
                 var,
                 reason: e.to_string(),
             }),
