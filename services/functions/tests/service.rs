@@ -716,19 +716,26 @@ async fn an_unreachable_runtime_is_502() {
     assert_eq!(resp.status(), 502);
 }
 
-/// Sends a public-key `POST /functions/v1/hello` over a raw socket: the request head with
-/// `framing` (a `content-length` or `transfer-encoding` line), then `body`, and returns the
-/// response's status. It writes nothing past `body` and never closes its write side, so the
-/// status comes from the service's reply to the bytes it was sent, never from a client that
-/// raced the service's close. A service that waits for more bytes fails the timeout.
-async fn raw_post_status(h: &H, framing: &str, body: &[u8]) -> u16 {
+/// Sends `method path` to the listener at `base` over a raw socket: the request head with
+/// `headers` (the body's `content-length` or `transfer-encoding` among them), then `body`, and
+/// returns the response's status. It writes nothing past `body` and never closes its write
+/// side, so the status comes from the service's reply to the bytes it was sent, never from a
+/// client that raced the service's close. A service that waits for more bytes fails the
+/// timeout.
+async fn raw_status(
+    base: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let addr = h.public.strip_prefix("http://").unwrap();
-    let token = h.identity(Cred::Public, h.branch, "functions").unwrap();
-    let head = format!(
-        "POST /functions/v1/hello HTTP/1.1\r\nhost: {addr}\r\n{IDENTITY_HEADER}: {token}\r\n\
-         chelabase-forwarded-key: {PUBLIC_KEY}\r\n{framing}\r\n\r\n"
-    );
+    let addr = base.strip_prefix("http://").unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\nhost: {addr}\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     let exchange = async {
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         sock.write_all(head.as_bytes()).await.unwrap();
@@ -753,12 +760,23 @@ async fn raw_post_status(h: &H, framing: &str, body: &[u8]) -> u16 {
     status[..3].parse().unwrap()
 }
 
+/// [`raw_status`] for a public-key `POST /functions/v1/hello` framed by `framing`.
+async fn raw_post_status(h: &H, framing: (&str, String), body: &[u8]) -> u16 {
+    let token = h.identity(Cred::Public, h.branch, "functions").unwrap();
+    let headers = [
+        (IDENTITY_HEADER, token),
+        ("chelabase-forwarded-key", PUBLIC_KEY.to_owned()),
+        framing,
+    ];
+    raw_status(&h.public, "POST", "/functions/v1/hello", &headers, body).await
+}
+
 #[tokio::test]
 async fn bodies_over_6_mib_are_413() {
     let h = harness().await;
     const MAX: usize = 6 * 1024 * 1024;
     // A declared length over the limit is refused from the head alone: no body byte is sent.
-    let status = raw_post_status(&h, &format!("content-length: {}", MAX + 1), &[]).await;
+    let status = raw_post_status(&h, ("content-length", (MAX + 1).to_string()), &[]).await;
     assert_eq!(status, 413);
     // Streamed without a length: six 1 MiB chunks and one more byte, then the client waits.
     // The service has read every byte sent, so it answers rather than resetting a writer.
@@ -768,7 +786,7 @@ async fn bodies_over_6_mib_are_413() {
         chunked.resize(chunked.len() + len, b'x');
         chunked.extend_from_slice(b"\r\n");
     }
-    let status = raw_post_status(&h, "transfer-encoding: chunked", &chunked).await;
+    let status = raw_post_status(&h, ("transfer-encoding", "chunked".into()), &chunked).await;
     assert_eq!(status, 413);
     assert_eq!(h.calls(), 0);
     let exact = vec![b'x'; MAX];
@@ -936,16 +954,16 @@ async fn bundle_put_and_get() {
     assert_eq!(resp.status(), 404);
     assert_eq!(h.store.list("").await.unwrap().len(), 1);
 
-    // Over 10 MiB: 413.
+    // Over 10 MiB: 413. The limit is on the bytes read, so the client sends exactly one byte
+    // past it and waits: the service has read all of it and answers rather than resetting.
     let big = vec![b' '; 10 * 1024 * 1024 + 1];
-    let resp = put(
-        Some(ORCH),
-        big.clone(),
-        format!("{}/internal/bundles/{}/{}", h.control, h.db, sha(&big)),
-    )
-    .await
-    .unwrap();
-    assert_eq!(resp.status(), 413);
+    let headers = [
+        ("authorization", format!("Bearer {ORCH}")),
+        ("content-length", big.len().to_string()),
+    ];
+    let path = format!("/internal/bundles/{}/{}", h.db, sha(&big));
+    let status = raw_status(&h.control, "PUT", &path, &headers, &big).await;
+    assert_eq!(status, 413);
 }
 
 #[tokio::test]
