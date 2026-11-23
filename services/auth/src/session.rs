@@ -112,6 +112,8 @@ mod tests {
         assert!(past_absolute_lifetime(now, age(2_592_001)), "30 days + 1 s is refused");
         assert!(!past_absolute_lifetime(now, age(-5)), "created after now is valid");
         assert!(!past_absolute_lifetime(now, age(0)));
+        let far_ahead = now.checked_add(days(31)).unwrap();
+        assert!(!past_absolute_lifetime(now, far_ahead), "created far after now is valid, not an absolute age");
     }
 
     const A: Uuid = Uuid::from_u128(1);
