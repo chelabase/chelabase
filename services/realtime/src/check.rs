@@ -342,7 +342,7 @@ impl PgChecker {
         f: impl AsyncFnOnce(&tokio_postgres::Client) -> Result<T, chelabase_query::QueryFailure>,
     ) -> Result<T, CheckError> {
         let client = self.pools.get(target).await?;
-        chelabase_query::engine::with_transaction(&*client, RESET_SQL, REQUEST_ID, f)
+        chelabase_query::engine::with_transaction(&client, RESET_SQL, REQUEST_ID, f)
             .await
             .map_err(failure)
     }
@@ -369,7 +369,7 @@ impl PgChecker {
             oid: None,
         };
         let out = chelabase_query::engine::console_session(
-            &*client,
+            &client,
             &target.pg_database,
             run_as,
             &settings(),
