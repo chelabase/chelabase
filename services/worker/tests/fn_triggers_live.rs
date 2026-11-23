@@ -1379,7 +1379,7 @@ mod fn_triggers {
             assert_eq!(st(dev, g).await.0, None);
             assert!(
                 fx.metadata
-                    .pending_run_as_branches(1000)
+                    .pending_run_as_branches(None, 1000)
                     .await
                     .unwrap()
                     .iter()
