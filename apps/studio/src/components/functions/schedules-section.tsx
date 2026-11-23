@@ -10,7 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { functionErrorText, useToggles } from "@/lib/functions";
-import { initialScheduleForm, scheduleFormReason, scheduleFormReducer, scheduleStatus } from "@/lib/functions-schedules";
+import { initialScheduleForm, scheduleFormBody, scheduleFormReason, scheduleFormReducer, scheduleStatus } from "@/lib/functions-schedules";
 import { relativeTime, utc } from "@/lib/members";
 import { ReadOnlyHint, VIEWER_REASON } from "./read-only-hint";
 
@@ -63,7 +63,7 @@ export function SchedulesSection({ databaseId, branchId, name, canChange }: Sche
   function submit(event: FormEvent) {
     event.preventDefault();
     if (busy || form.cron === "" || reason) return;
-    const body = { cron: form.cron.trim(), timezone: form.timezone.trim() };
+    const body = scheduleFormBody(form);
     void run(
       () => (form.editing ? updateFunctionSchedule(databaseId, branchId, name, form.editing, body) : createFunctionSchedule(databaseId, branchId, name, body)),
       () => dispatch({ type: "reset" }),

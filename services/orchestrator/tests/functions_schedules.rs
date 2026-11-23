@@ -395,6 +395,43 @@ mod functions_schedules {
         assert_eq!(fixed["cron"], "5 * * * *");
     }
 
+    /// A schedule the worker stopped (disabled, `last_error` set) comes back on only when the
+    /// repairing PATCH sends `enabled: true`; a valid cron alone clears `last_error` but leaves
+    /// it off, as the docs and Studio's edit say.
+    #[tokio::test]
+    async fn repairing_a_stopped_schedule_needs_enabled_true() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let base = w.path(w.w.dev, "/hello/schedules");
+        let id = w.schedule(w.w.dev, "hello").await;
+        let item = format!("{base}/{id}");
+        let stop = || {
+            for s in w.w.metadata.functions.lock().unwrap().schedules.iter_mut() {
+                (s.cron, s.enabled, s.next_run_at) = ("0 0 30 2 *".to_owned(), false, None);
+                s.last_error = Some("no upcoming time".to_owned());
+            }
+        };
+
+        stop();
+        let (status, still_off) = w
+            .call("dee", "PATCH", &item, Some(json!({"cron": "5 * * * *"}).to_string()))
+            .await;
+        assert_eq!(status, 200, "{still_off}");
+        assert_eq!(still_off["enabled"], false, "no `enabled`, so it stays off: {still_off}");
+        assert_eq!(still_off.get("last_error"), Some(&Value::Null), "{still_off}");
+
+        stop();
+        let (status, fixed) = w
+            .call("dee", "PATCH", &item, Some(json!({"cron": "5 * * * *", "enabled": true}).to_string()))
+            .await;
+        assert_eq!(status, 200, "{fixed}");
+        assert_eq!(fixed["enabled"], true, "{fixed}");
+        assert_eq!(fixed.get("last_error"), Some(&Value::Null), "{fixed}");
+        assert!(fixed["next_run_at"].is_string(), "a repaired schedule has a next time: {fixed}");
+        let (_, list) = w.call("vic", "GET", &base, None).await;
+        assert_eq!((&list[0]["enabled"], &list[0]["last_error"]), (&json!(true), &Value::Null), "{list}");
+    }
+
     /// m15: a body naming `last_error` is refused and the stored reason stays.
     #[tokio::test]
     async fn a_request_cannot_set_last_error() {

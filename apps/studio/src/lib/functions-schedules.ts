@@ -69,11 +69,15 @@ export function timezoneReason(raw: string): string | null {
   }
 }
 
-/** The schedule form: a new schedule (`editing` null) or one being edited. */
+/**
+ * The schedule form: a new schedule (`editing` null) or one being edited. `repair` is set when
+ * the schedule being edited was stopped by the worker, so saving it turns it back on.
+ */
 export interface ScheduleForm {
   editing: string | null;
   cron: string;
   timezone: string;
+  repair: boolean;
 }
 
 export type ScheduleFormAction =
@@ -82,13 +86,18 @@ export type ScheduleFormAction =
   | { type: "reset" };
 
 export function initialScheduleForm(): ScheduleForm {
-  return { editing: null, cron: "", timezone: "UTC" };
+  return { editing: null, cron: "", timezone: "UTC", repair: false };
 }
 
 export function scheduleFormReducer(state: ScheduleForm, action: ScheduleFormAction): ScheduleForm {
   switch (action.type) {
     case "edit":
-      return { editing: action.schedule.id, cron: action.schedule.cron, timezone: action.schedule.timezone };
+      return {
+        editing: action.schedule.id,
+        cron: action.schedule.cron,
+        timezone: action.schedule.timezone,
+        repair: scheduleStatus(action.schedule).kind === "stopped",
+      };
     case "set":
       return { ...state, [action.field]: action.value };
     case "reset":
@@ -98,4 +107,13 @@ export function scheduleFormReducer(state: ScheduleForm, action: ScheduleFormAct
 
 export function scheduleFormReason(form: ScheduleForm): string | null {
   return cronReason(form.cron) ?? timezoneReason(form.timezone);
+}
+
+/**
+ * The body the form sends (create or PATCH). Repairing a stopped schedule also sends
+ * `enabled: true`: the API keeps a schedule's on/off as it was unless the body says otherwise.
+ */
+export function scheduleFormBody(form: ScheduleForm): { cron: string; timezone: string; enabled?: true } {
+  const body = { cron: form.cron.trim(), timezone: form.timezone.trim() };
+  return form.repair ? { ...body, enabled: true } : body;
 }
