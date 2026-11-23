@@ -189,7 +189,7 @@ side_proxy() {
     -e SIDE_CA_PEM="$pem" -e NEON_INTERNAL_CA_FILE=/tmp/side-ca.crt --entrypoint /bin/sh "$image" \
     -c 'printf "%s\n" "$SIDE_CA_PEM" >/tmp/side-ca.crt && exec "$@"' side "${argv[@]}" >/dev/null ||
     die "could not create the side proxy $name"
-  docker network connect "${project}_compute" "$name"
+  docker network connect "${project}_compute-internal" "$name"
   docker start "$name" >/dev/null
   local ip
   ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"${project}_default\"}}{{.IPAddress}}{{end}}" "$name")"
