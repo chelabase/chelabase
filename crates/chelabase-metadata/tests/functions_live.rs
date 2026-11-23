@@ -3301,7 +3301,7 @@ mod functions {
         let drops = c.trigger_drops(main).await.unwrap();
         assert_eq!(drops.len(), 1, "the disable records a drop");
         assert_eq!(c.trigger_sweep_branches(None, 10).await.unwrap(), vec![(main, true)], "a drop is pending work");
-        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a disabled trigger is never dispatched");
+        assert!(c.dispatch_targets(10, &[]).await.unwrap().is_empty(), "a disabled trigger is never dispatched");
         let on = c.update_trigger(main, f, t, true).await.unwrap().unwrap();
         assert_eq!((on.enabled, on.state, on.last_error), (true, TriggerState::PendingInstall, None));
         assert!(on.enabled_since > off.enabled_since, "a new generation");
@@ -3365,9 +3365,9 @@ mod functions {
         let c = &s.client;
         let t = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
         c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
-        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "pending rows aren't dispatched");
+        assert!(c.dispatch_targets(10, &[]).await.unwrap().is_empty(), "pending rows aren't dispatched");
         install_all(c, main).await;
-        assert_eq!(c.dispatch_targets(10).await.unwrap(), vec![(main, "app".to_string())]);
+        assert_eq!(c.dispatch_targets(10, &[]).await.unwrap(), vec![(main, "app".to_string())]);
         let row = |list: Vec<chelabase_metadata::TriggerRecord>| list.into_iter().find(|r| r.id == t).unwrap();
         let fresh = row(c.list_triggers(main).await.unwrap());
         assert_eq!((fresh.dead_count, fresh.last_delivery_error, fresh.last_delivered_at), (0, None, None));
@@ -3391,8 +3391,216 @@ mod functions {
         let copied = c.list_triggers(child).await.unwrap();
         assert!(copied.iter().all(|r| r.dead_count == 0 && r.dropped_count == 0 && r.last_delivered_at.is_none()), "{copied:?}");
         c.mark_branch_deleted(main).await.unwrap();
-        assert!(c.dispatch_targets(10).await.unwrap().is_empty(), "a deleted branch is never dispatched");
+        assert!(c.dispatch_targets(10, &[]).await.unwrap().is_empty(), "a deleted branch is never dispatched");
         s.finish().await;
+    }
+
+    /// #297: a tenant with `targets` ready branches of one database, each with an installed,
+    /// enabled table trigger on `app`. Seeded in bulk (the API's per-database branch cap and
+    /// one-by-one creates would make a thousand targets slow). Returns its branches.
+    async fn seed_tenant(s: &Scratch, targets: usize) -> Vec<BranchId> {
+        let tenant = Uuid::new_v4();
+        let project = Uuid::new_v4();
+        let db = Uuid::new_v4();
+        let function = Uuid::new_v4();
+        let p = s.pool();
+        sqlx::query("INSERT INTO tenants (id, slug) VALUES ($1, 't-' || $1::text)")
+            .bind(tenant)
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects (id, tenant_id, slug, name) VALUES ($1, $2, 'p', 'p')")
+            .bind(project)
+            .bind(tenant)
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO databases (id, project_id, name, status) VALUES ($1, $2, 'd', 'ready')")
+            .bind(db)
+            .bind(project)
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO branches (id, database_id, name, parent_branch_id, status)
+             SELECT CASE WHEN g = 0 THEN $1 ELSE gen_random_uuid() END, $1,
+                    CASE WHEN g = 0 THEN 'main' ELSE 'b' || g END,
+                    CASE WHEN g = 0 THEN NULL ELSE $1 END, 'ready'
+             FROM generate_series(0, $2 - 1) g ORDER BY g",
+        )
+        .bind(db)
+        .bind(targets as i32)
+        .execute(p)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO functions (id, database_id, name, kind) VALUES ($1, $2, 'f', 'function')")
+            .bind(function)
+            .bind(db)
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO function_triggers
+               (id, branch_id, function_id, source, state, pg_database, schema_name, table_name, events)
+             SELECT gen_random_uuid(), id, $2, 'table', 'installed', 'app', 'public', 'orders', ARRAY['insert']
+             FROM branches WHERE database_id = $1",
+        )
+        .bind(db)
+        .bind(function)
+        .execute(p)
+        .await
+        .unwrap();
+        let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM branches WHERE database_id = $1")
+            .bind(db)
+            .fetch_all(p)
+            .await
+            .unwrap();
+        ids.into_iter().map(BranchId).collect()
+    }
+
+    /// #297: how many of `chosen` each tenant (by its seeded branches) got.
+    fn per_tenant(tenants: &[Vec<BranchId>], chosen: &[(BranchId, String)]) -> Vec<usize> {
+        let owner: std::collections::HashMap<BranchId, usize> = tenants
+            .iter()
+            .enumerate()
+            .flat_map(|(i, bs)| bs.iter().map(move |b| (*b, i)))
+            .collect();
+        let mut n = vec![0; tenants.len()];
+        for (b, db) in chosen {
+            assert_eq!(db, "app");
+            n[owner[b]] += 1;
+        }
+        n
+    }
+
+    /// #297's bound on one pick: `min(limit, candidates)` targets, no target twice, and a
+    /// tenant holds two more than another only when that other has nothing left to pick.
+    fn assert_fair(sizes: &[usize], limit: usize, chosen: &[(BranchId, String)], n: &[usize]) {
+        let distinct: std::collections::HashSet<_> = chosen.iter().collect();
+        assert_eq!(distinct.len(), chosen.len(), "a target twice: {chosen:?}");
+        assert_eq!(chosen.len(), limit.min(sizes.iter().sum()), "work-conserving: {n:?} of {sizes:?}");
+        for i in 0..n.len() {
+            for j in 0..n.len() {
+                assert!(
+                    n[i] <= n[j] + 1 || n[j] == sizes[j],
+                    "tenant {i} holds {} while tenant {j} waits with {} of {}: {n:?} of {sizes:?}, limit {limit}",
+                    n[i],
+                    n[j],
+                    sizes[j]
+                );
+            }
+        }
+    }
+
+    /// #297 AC1: a tenant with a thousand trigger branches doesn't crowd out one with ten.
+    #[tokio::test]
+    #[ignore]
+    async fn dispatch_targets_share_across_tenants() {
+        let s = Scratch::new().await;
+        let tenants = vec![seed_tenant(&s, 1000).await, seed_tenant(&s, 10).await];
+        let chosen = s.client.dispatch_targets(500, &[]).await.unwrap();
+        let n = per_tenant(&tenants, &chosen);
+        assert_eq!(n, vec![490, 10], "all of B's ten are served");
+        assert_fair(&[1000, 10], 500, &chosen, &n);
+        s.finish().await;
+    }
+
+    /// #297 AC2: alone, a tenant uses every target up to the limit.
+    #[tokio::test]
+    #[ignore]
+    async fn dispatch_targets_a_single_tenant_can_use_every_target() {
+        let s = Scratch::new().await;
+        let tenants = vec![seed_tenant(&s, 600).await];
+        let chosen = s.client.dispatch_targets(500, &[]).await.unwrap();
+        assert_eq!(per_tenant(&tenants, &chosen), vec![500]);
+        assert_eq!(s.client.dispatch_targets(1000, &[]).await.unwrap().len(), 600, "every one under the limit");
+        s.finish().await;
+    }
+
+    /// #297 AC3: with fewer targets than tenants, no tenant gets two while another gets none.
+    #[tokio::test]
+    #[ignore]
+    async fn dispatch_targets_with_more_tenants_than_slots() {
+        let s = Scratch::new().await;
+        let mut tenants = vec![seed_tenant(&s, 1000).await];
+        for _ in 0..3 {
+            tenants.push(seed_tenant(&s, 1).await);
+        }
+        let chosen = s.client.dispatch_targets(3, &[]).await.unwrap();
+        let n = per_tenant(&tenants, &chosen);
+        assert!(n.iter().all(|&k| k <= 1), "{n:?}");
+        assert_fair(&[1000, 1, 1, 1], 3, &chosen, &n);
+        s.finish().await;
+    }
+
+    /// #297: the targets of a pick, as a set.
+    fn set(v: &[(BranchId, String)]) -> std::collections::HashSet<(BranchId, String)> {
+        v.iter().cloned().collect()
+    }
+
+    /// #297: when tenant A's sessions hold every slot and B arrives, the pick drops only the
+    /// A sessions over A's share, keeps the rest, and then stays put.
+    #[tokio::test]
+    #[ignore]
+    async fn dispatch_targets_move_only_the_sessions_over_a_share() {
+        let s = Scratch::new().await;
+        let a = seed_tenant(&s, 40).await;
+        let running = s.client.dispatch_targets(20, &[]).await.unwrap();
+        assert_eq!(per_tenant(std::slice::from_ref(&a), &running), vec![20]);
+        let tenants = vec![a, seed_tenant(&s, 40).await];
+        let chosen = s.client.dispatch_targets(20, &running).await.unwrap();
+        assert_eq!(per_tenant(&tenants, &chosen), vec![10, 10]);
+        let kept = chosen.iter().filter(|t| running.contains(t)).count();
+        assert_eq!(kept, 10, "A keeps ten of its running sessions");
+        let again = s.client.dispatch_targets(20, &chosen).await.unwrap();
+        assert_eq!(set(&again), set(&chosen), "a fixed point");
+        s.finish().await;
+    }
+
+    /// #297: the bound holds for any spread of tenants, any limit and any running set, and a
+    /// pick fed back is the same set (property test over
+    /// one scratch database; each case's triggers are removed before the next).
+    #[test]
+    #[ignore]
+    fn dispatch_targets_are_fair_for_any_spread() {
+        use proptest::prelude::*;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let s = rt.block_on(Scratch::new());
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 40,
+            ..ProptestConfig::default()
+        });
+        let strategy = (proptest::collection::vec(0usize..40, 1..8), 1usize..80, 1usize..5);
+        runner
+            .run(&strategy, |(sizes, limit, stride)| {
+                rt.block_on(async {
+                    // Earlier cases' tenants stay, without a trigger (so without a target).
+                    sqlx::raw_sql("DELETE FROM function_triggers").execute(s.pool()).await.unwrap();
+                    let mut tenants = Vec::new();
+                    for &k in &sizes {
+                        tenants.push(if k == 0 { Vec::new() } else { seed_tenant(&s, k).await });
+                    }
+                    // Whatever sessions run (here: every `stride`th target), the pick is fair...
+                    let all: Vec<(BranchId, String)> =
+                        tenants.iter().flatten().map(|b| (*b, "app".to_string())).collect();
+                    let running: Vec<_> = all.iter().step_by(stride).cloned().collect();
+                    let chosen = s.client.dispatch_targets(limit as i64, &running).await.unwrap();
+                    let n = per_tenant(&tenants, &chosen);
+                    assert_fair(&sizes, limit, &chosen, &n);
+                    // ...keeps as many of each tenant's running ones as its share allows...
+                    for (i, bs) in tenants.iter().enumerate() {
+                        let ran = running.iter().filter(|(b, _)| bs.contains(b)).count();
+                        let kept = chosen.iter().filter(|t| bs.contains(&t.0) && running.contains(t)).count();
+                        assert_eq!(kept, ran.min(n[i]), "tenant {i}: {n:?} of {sizes:?}");
+                    }
+                    // ...and, fed back, is a fixed point: the dispatcher never churns.
+                    let again = s.client.dispatch_targets(limit as i64, &chosen).await.unwrap();
+                    assert_eq!(set(&again), set(&chosen), "{n:?} of {sizes:?}, limit {limit}");
+                });
+                Ok(())
+            })
+            .unwrap();
+        rt.block_on(s.finish());
     }
 
     /// m14: the worker's storage targets are the enabled storage triggers of live branches of

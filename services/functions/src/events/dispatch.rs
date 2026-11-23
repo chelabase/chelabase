@@ -30,6 +30,7 @@ use chelabase_query::server_tls::ServerTls;
 use chelabase_types::BranchId;
 use tokio_postgres::Client;
 use tokio_postgres::types::ToSql;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -60,8 +61,9 @@ pub trait EventsMetadata: Send + Sync + 'static {
     async fn branch(&self, branch: BranchId) -> Result<Option<BranchRecord>, String>;
     async fn triggers(&self, branch: BranchId) -> Result<Vec<TriggerRecord>, String>;
     async fn functions(&self, branch: BranchId) -> Result<Vec<BranchFunction>, String>;
-    /// (ready branch, Postgres database) pairs with an installed, enabled table trigger.
-    async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String>;
+    /// Up to `limit` (ready branch, Postgres database) pairs with an installed, enabled table
+    /// trigger, shared fairly across tenants with the `running` ones preferred (#297).
+    async fn targets(&self, limit: i64, running: &[Target]) -> Result<Vec<Target>, String>;
     async fn record(&self, branch: BranchId, deliveries: &[TriggerDelivery]) -> Result<(), String>;
 }
 
@@ -82,8 +84,8 @@ impl EventsMetadata for MetadataClient {
             .await
             .map_err(|e| format!("listing the functions: {e}"))
     }
-    async fn targets(&self, limit: i64) -> Result<Vec<(BranchId, String)>, String> {
-        self.dispatch_targets(limit)
+    async fn targets(&self, limit: i64, running: &[Target]) -> Result<Vec<Target>, String> {
+        self.dispatch_targets(limit, running)
             .await
             .map_err(|e| format!("listing the databases to dispatch: {e}"))
     }
@@ -615,59 +617,126 @@ impl<M: EventsMetadata, S: ConnSource> Dispatcher<M, S> {
     }
 
     /// One target's session: passes, woken by notifications or the sweep, until one says
-    /// stop. `Ok` when the target is done.
-    async fn session(&self, branch: BranchId, db: &str) -> Result<(), String> {
+    /// stop or the supervisor does (#297: checked between passes and while idle, so a claimed
+    /// batch is always settled). `Ok` when the target is done or stopped.
+    async fn session(&self, branch: BranchId, db: &str, stop: &mut watch::Receiver<bool>) -> Result<(), String> {
         let Some(mut s) = self.open(branch, db).await? else {
             return Ok(());
         };
         loop {
+            if *stop.borrow() {
+                return Ok(());
+            }
             match self.pass(&mut s).await? {
                 Pass::Stop => return Ok(()),
                 Pass::More => {}
                 Pass::Idle(idle) => {
-                    self.wait(&mut s, idle).await?;
+                    tokio::select! {
+                        woken = self.wait(&mut s, idle) => {
+                            woken?;
+                        }
+                        // A stop, or the supervisor gone.
+                        _ = stop.changed() => return Ok(()),
+                    }
                 }
             }
         }
     }
 
-    /// One target's task: sessions until one ends the target; a failed one waits [`RETRY`].
-    pub async fn run_target(self: Arc<Self>, branch: BranchId, db: String) {
+    /// One target's task: sessions until one ends the target or the supervisor stops it; a
+    /// failed one waits [`RETRY`].
+    pub async fn run_target(self: Arc<Self>, branch: BranchId, db: String, mut stop: watch::Receiver<bool>) {
         loop {
-            match self.session(branch, &db).await {
+            match self.session(branch, &db, &mut stop).await {
                 Ok(()) => return,
                 Err(e) => {
                     warn!(branch_id = %branch, database = %db, "function events: {e}");
-                    tokio::time::sleep(RETRY).await;
+                    if *stop.borrow() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(RETRY) => {}
+                        _ = stop.changed() => return,
+                    }
                 }
             }
         }
     }
 
-    /// The supervisor: every [`SUPERVISE_EVERY`], a task for each target without one, up to
-    /// [`MAX_TARGETS`] at once.
+    /// The supervisor: every [`SUPERVISE_EVERY`], the metadata's fair pick of up to
+    /// [`MAX_TARGETS`] targets, with the running sessions preferred; then [`plan_tick`]:
+    /// sessions the pick left out are told to stop, and picked targets without one start,
+    /// never more than [`MAX_TARGETS`] tasks at once.
     pub async fn supervise(self: Arc<Self>) {
-        let mut tasks: HashMap<(BranchId, String), tokio::task::JoinHandle<()>> = HashMap::new();
+        struct Task {
+            handle: tokio::task::JoinHandle<()>,
+            stop: watch::Sender<bool>,
+        }
+        let mut tasks: HashMap<Target, Task> = HashMap::new();
         let mut every = tokio::time::interval(SUPERVISE_EVERY);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
-            tasks.retain(|_, t| !t.is_finished());
-            let targets = match self.meta.targets(MAX_TARGETS as i64).await {
-                Ok(targets) => targets,
+            tasks.retain(|_, t| !t.handle.is_finished());
+            let live: HashMap<Target, bool> = tasks.iter().map(|(k, t)| (k.clone(), *t.stop.borrow())).collect();
+            let running: Vec<Target> = live.iter().filter(|(_, stopping)| !**stopping).map(|(k, _)| k.clone()).collect();
+            let picked = match self.meta.targets(MAX_TARGETS as i64, &running).await {
+                Ok(picked) => picked,
                 Err(e) => {
                     warn!("function events: {e}");
                     continue;
                 }
             };
-            for target in targets {
-                if tasks.len() >= MAX_TARGETS || tasks.contains_key(&target) {
-                    continue;
+            let tick = plan_tick(&live, &picked, MAX_TARGETS);
+            for target in &tick.stop {
+                if let Some(task) = tasks.get(target) {
+                    debug!(branch_id = %target.0, database = %target.1, "function events: left out of the pick (over its tenant's share, or gone), stopping");
+                    let _ = task.stop.send(true);
                 }
+            }
+            for target in tick.start {
                 let (branch, db) = target.clone();
-                tasks.insert(target, tokio::spawn(self.clone().run_target(branch, db)));
+                let (stop, rx) = watch::channel(false);
+                let handle = tokio::spawn(self.clone().run_target(branch, db, rx));
+                tasks.insert(target, Task { handle, stop });
             }
         }
+    }
+}
+
+/// A dispatch target: (branch, Postgres database).
+pub type Target = (BranchId, String);
+
+/// What one supervisor tick does.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tick {
+    /// Running sessions to stop (between passes).
+    pub stop: Vec<Target>,
+    /// Targets to start a session for, in the pick's order.
+    pub start: Vec<Target>,
+}
+
+/// One supervisor tick (#297), given the targets with a task (`true`: told to stop, still
+/// finishing its pass) and the metadata's fair pick, made with the running ones preferred:
+/// stop every running session the pick left out (its tenant is over its share, or the target
+/// is gone), and start picked targets without a task, in the pick's order, while fewer than
+/// `cap` tasks exist. A stopping task still counts toward `cap` until it ends, so there are
+/// never more than `cap` connections; its slot goes to the pick on a later tick.
+pub fn plan_tick(live: &HashMap<Target, bool>, picked: &[Target], cap: usize) -> Tick {
+    let wanted: std::collections::HashSet<&Target> = picked.iter().collect();
+    let free = cap.saturating_sub(live.len());
+    Tick {
+        stop: live
+            .iter()
+            .filter(|(t, stopping)| !**stopping && !wanted.contains(t))
+            .map(|(t, _)| t.clone())
+            .collect(),
+        start: picked
+            .iter()
+            .filter(|t| !live.contains_key(*t))
+            .take(free)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -775,5 +844,129 @@ mod tests {
         assert_eq!((d.dropped, d.dead, d.delivered), (2, 1, true));
         assert_eq!(d.error.as_deref(), Some("the function answered 500"));
         assert!(!t.0.contains_key(&gone));
+    }
+
+    /// #297's model of `dispatch_targets` (the live tests hold the SQL to the same three
+    /// properties: fair to within one, running first, a fixed point): each tenant's targets,
+    /// running first, then shuffled; then round-robin across tenants, running first within a
+    /// round, up to `limit`.
+    fn model_pick(
+        tenants: &[Vec<Target>],
+        running: &std::collections::HashSet<Target>,
+        limit: usize,
+        rng: &mut u64,
+    ) -> Vec<Target> {
+        // A seeded shuffle (xorshift64 keys), so a failing case replays.
+        let mut shuffle = |ts: &mut Vec<Target>| {
+            let mut keyed: Vec<(u64, Target)> = ts
+                .drain(..)
+                .map(|t| {
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 7;
+                    *rng ^= *rng << 17;
+                    (*rng, t)
+                })
+                .collect();
+            keyed.sort_by_key(|(k, _)| *k);
+            ts.extend(keyed.into_iter().map(|(_, t)| t));
+        };
+        let mut ranked: Vec<Vec<Target>> = tenants
+            .iter()
+            .map(|ts| {
+                let mut ts = ts.clone();
+                shuffle(&mut ts);
+                ts.sort_by_key(|t| !running.contains(t));
+                ts
+            })
+            .collect();
+        let mut out = Vec::new();
+        for turn in 0.. {
+            let mut round: Vec<Target> = ranked.iter_mut().filter_map(|ts| ts.get(turn).cloned()).collect();
+            if round.is_empty() {
+                break;
+            }
+            shuffle(&mut round);
+            round.sort_by_key(|t| !running.contains(t));
+            out.extend(round);
+        }
+        out.truncate(limit);
+        out
+    }
+
+    /// #297: the supervisor shares its sessions fairly whatever it starts from (for example
+    /// one tenant holding every slot) and then stays put. With every tenant's candidates
+    /// fixed, a session told to stop finishing within `d` ticks, and a fair pick, after
+    /// `d + 1` ticks: tasks never exceed the cap; the running sessions are `min(cap,
+    /// candidates)`, each a candidate; a tenant holds two more than another only when that
+    /// other has no candidate left out; and no tick stops a session again.
+    #[test]
+    fn supervisor_shares_sessions_fairly_and_settles() {
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+        let strategy = (
+            proptest::collection::vec(0usize..30, 1..6),
+            1usize..40,
+            1usize..4,
+            1u64..,
+        );
+        proptest::test_runner::TestRunner::new(ProptestConfig { cases: 256, ..ProptestConfig::default() })
+            .run(&strategy, |(sizes, cap, delay, seed)| {
+                let mut rng = seed;
+                let tenants: Vec<Vec<Target>> = sizes
+                    .iter()
+                    .map(|&k| (0..k).map(|_| (BranchId(Uuid::new_v4()), "app".to_string())).collect())
+                    .collect();
+                // The worst start: the biggest tenant holds every slot it can, plus one
+                // target that is no longer a candidate.
+                let big = (0..tenants.len()).max_by_key(|&i| tenants[i].len()).unwrap();
+                let mut live: HashMap<Target, Option<usize>> = tenants[big]
+                    .iter()
+                    .take(cap.saturating_sub(1))
+                    .map(|t| (t.clone(), None))
+                    .collect();
+                live.insert((BranchId(Uuid::new_v4()), "gone".to_string()), None);
+                let total: usize = sizes.iter().sum();
+                for tick in 0..delay + 4 {
+                    // Sessions told to stop finish once their in-flight pass does.
+                    live.retain(|_, stop| stop.is_none_or(|left| left > 0));
+                    for left in live.values_mut().flatten() {
+                        *left -= 1;
+                    }
+                    let running: HashSet<Target> =
+                        live.iter().filter(|(_, s)| s.is_none()).map(|(t, _)| t.clone()).collect();
+                    let picked = model_pick(&tenants, &running, cap, &mut rng);
+                    let view: HashMap<Target, bool> = live.iter().map(|(t, s)| (t.clone(), s.is_some())).collect();
+                    let plan = plan_tick(&view, &picked, cap);
+                    if tick > delay {
+                        prop_assert!(plan.stop.is_empty(), "tick {tick} stops {:?}", plan.stop);
+                    }
+                    for t in &plan.stop {
+                        prop_assert_eq!(live.insert(t.clone(), Some(delay - 1)), Some(None), "stops a running one");
+                    }
+                    for t in plan.start {
+                        prop_assert!(live.insert(t, None).is_none(), "starts a live one");
+                    }
+                    prop_assert!(live.len() <= cap, "{} tasks over the cap {cap}", live.len());
+                    if tick > delay {
+                        let running: Vec<&Target> = live.iter().filter(|(_, s)| s.is_none()).map(|(t, _)| t).collect();
+                        prop_assert_eq!(running.len(), cap.min(total), "tick {}", tick);
+                        let n: Vec<usize> = tenants
+                            .iter()
+                            .map(|ts| ts.iter().filter(|t| running.contains(t)).count())
+                            .collect();
+                        prop_assert_eq!(n.iter().sum::<usize>(), running.len(), "only candidates run");
+                        for i in 0..n.len() {
+                            for j in 0..n.len() {
+                                prop_assert!(
+                                    n[i] <= n[j] + 1 || n[j] == sizes[j],
+                                    "tick {tick}: {n:?} of {sizes:?}, cap {cap}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }
