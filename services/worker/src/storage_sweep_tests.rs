@@ -218,7 +218,7 @@ async fn sweep_deletes_an_old_unreferenced_blob_only_after_its_mark_outlives_the
 /// Audit S1: the store's clock leaps ahead of the databases' between two passes. The leap is
 /// refused, not taken as the mark's wait.
 #[tokio::test]
-async fn audit_a_store_clock_jump_does_not_collapse_the_mark_wait() {
+async fn sweep_refuses_a_store_clock_jump_as_the_mark_wait() {
     let store = MemoryStore::default();
     let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
     store.set_now(at(0));
@@ -623,7 +623,7 @@ async fn sweep_purge_stays_inside_its_prefix() {
 
 /// Audit N1: a mark older than its blob (a key written again) is not the blob's wait.
 #[tokio::test]
-async fn audit_a_mark_older_than_its_blob_is_not_honoured() {
+async fn sweep_does_not_honour_a_mark_older_than_its_blob() {
     let store = MemoryStore::default();
     let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
     store.set_now(at(0));
@@ -1331,7 +1331,7 @@ mod worker_reads {
     /// Audit B2: a deleted database is queued again by the periodic job until its prefix is
     /// purged, so a lost or swallowed purge request isn't lost for good.
     #[tokio::test]
-    async fn audit_a_deleted_database_is_queued_again_by_the_periodic_job() {
+    async fn sweep_is_queued_again_for_a_deleted_database_by_the_periodic_job() {
         let (mut w, _journal) = worker();
         let store = Arc::new(MemoryStore::default());
         w.blob_store = Some(store.clone());

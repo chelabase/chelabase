@@ -829,11 +829,13 @@ async fn apply(fx: &Fx, model: &mut Model, op: &Op) {
             if role_exists(fx, &role).await && role_exists(fx, POOL[*i]).await {
                 // Spec D3: a member role is managed by Chelabase, so no non-superuser (the owner
                 // included) can grant to it. The refusal changes nothing; the model stays as is.
+                // `admin_sql` runs psql with terse errors, which carry the message but no
+                // SQLSTATE, so the refusal is matched by its message.
                 let err = fx
                     .try_owner("postgres", &format!("GRANT {} TO {role};", POOL[*i]))
                     .await
                     .expect_err("a grant to a member role is refused");
-                assert!(err.contains("42501") && err.contains("is managed by Chelabase"), "{err}");
+                assert!(err.contains("is managed by Chelabase"), "{err}");
             }
         }
         Op::AdminChain(a, b) => {

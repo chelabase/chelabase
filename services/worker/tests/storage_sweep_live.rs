@@ -564,7 +564,7 @@ async fn with_fx(f: fn(Arc<Fx>) -> futures_util::future::BoxFuture<'static, ()>)
 /// and downloads once the database is opened again.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
-async fn audit_m8_live() {
+async fn storage_sweep_keeps_objects_of_a_template_or_closed_database_live() {
     with_fx(|fx| {
         Box::pin(async move {
             let fx = &*fx;
@@ -617,7 +617,7 @@ async fn audit_m8_live() {
 /// from the backup downloads it.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
-async fn audit_m8_backup_live() {
+async fn storage_sweep_keeps_an_object_only_a_backup_references_live() {
     with_fx(|fx| {
         Box::pin(async move {
             let fx = &*fx;

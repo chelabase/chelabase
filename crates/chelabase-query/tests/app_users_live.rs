@@ -29,7 +29,10 @@ struct Scratch {
     admin: PgConnection,
     target: SyncTarget,
     db: PgUsersDb,
-    /// Set by `finish`; otherwise `Drop` (a failed assertion) drops the schema.
+    /// Cluster-wide roles the test makes, dropped after the schema by `finish` or `Drop`.
+    /// A name goes in before its `CREATE ROLE` runs.
+    roles: Vec<String>,
+    /// Set by `finish`; otherwise `Drop` (a failed assertion) drops the schema and the roles.
     finished: bool,
 }
 
@@ -82,6 +85,7 @@ impl Scratch {
             admin,
             target,
             db: PgUsersDb::new(),
+            roles: Vec::new(),
             finished: false,
         }
     }
@@ -103,18 +107,25 @@ impl Scratch {
         )))
         .execute(&mut self.admin)
         .await;
+        // After the schema: a role holding a grant on its table can't be dropped before it.
+        for role in &self.roles {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
+                .execute(&mut self.admin)
+                .await;
+        }
         self.finished = true;
     }
 }
 
 impl Drop for Scratch {
-    /// A test that panicked before `finish`: the schema is dropped on a runtime of its own
-    /// (the test's runtime is unwinding).
+    /// A test that panicked before `finish`: the schema, then the roles, are dropped on a
+    /// runtime of its own (the test's runtime is unwinding).
     fn drop(&mut self) {
         if self.finished {
             return;
         }
         let schema = self.target.schema.clone();
+        let roles = std::mem::take(&mut self.roles);
         let _ = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -133,12 +144,17 @@ impl Drop for Scratch {
                 .bind(&schema)
                 .execute(&mut admin)
                 .await;
-                sqlx::query(sqlx::AssertSqlSafe(format!(
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DROP SCHEMA IF EXISTS {schema} CASCADE"
                 )))
                 .execute(&mut admin)
-                .await
-                .ok()
+                .await;
+                for role in &roles {
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
+                        .execute(&mut admin)
+                        .await;
+                }
+                Some(())
             })
         })
         .join();
@@ -273,6 +289,8 @@ async fn table_or_public_insert_grant_is_unknown_column() {
     let mut s = Scratch::new().await;
     let schema = s.target.schema.clone();
     let member = format!("{schema}_member");
+    // Registered before it exists, so a panic anywhere below still drops it.
+    s.roles.push(member.clone());
     let exec = |sql: String| sqlx::query(sqlx::AssertSqlSafe(sql));
     exec(format!("REVOKE INSERT (secret_col) ON {schema}.users FROM authenticated"))
         .execute(&mut s.admin)
@@ -306,9 +324,6 @@ async fn table_or_public_insert_grant_is_unknown_column() {
     }
     let rows = s.count().await;
     s.finish().await;
-    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {member}")))
-        .execute(&mut PgConnection::connect(&url()).await.unwrap())
-        .await;
     outcome.unwrap();
     assert_eq!(rows, grants.len() as i64, "one row per direct-grant insert");
 }

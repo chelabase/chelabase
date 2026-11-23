@@ -1244,7 +1244,7 @@ mod tests {
     /// Re-audit S1: a slot holds at most two running containers however many deployments are
     /// ensured in a row.
     #[tokio::test]
-    async fn audit_a_slot_holds_at_most_two_containers() {
+    async fn a_slot_holds_at_most_two_containers() {
         let fake = Arc::new(Fake::default());
         let r = runner(&fake, "a");
         let base = new_key();
@@ -1337,7 +1337,7 @@ mod tests {
     /// Re-audit S2: a Docker Hub reference matches the engine's short form, never another
     /// repository's digest.
     #[tokio::test]
-    async fn audit_docker_hub_names_match_exactly() {
+    async fn docker_hub_names_match_exactly() {
         let fake = Arc::new(Fake::default());
         let r = runner(&fake, "a");
         let d1 = format!("sha256:{}", "1".repeat(64));

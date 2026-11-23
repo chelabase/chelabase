@@ -2877,17 +2877,17 @@ mod key_phase_tests {
     }
 
     #[test]
-    fn audit_missing_server_key() {
+    fn a_missing_server_key_is_remade_with_its_cert() {
         repairs(|d| std::fs::remove_file(d.join("server.key")).unwrap(), &["ca.crt", "ca.key", "client.crt", "client.key"]);
     }
 
     #[test]
-    fn audit_missing_client_crt() {
+    fn a_missing_client_crt_is_remade_with_its_key() {
         repairs(|d| std::fs::remove_file(d.join("client.crt")).unwrap(), &["ca.crt", "ca.key", "server.crt", "server.key"]);
     }
 
     #[test]
-    fn audit_missing_ca_key() {
+    fn a_missing_ca_key_remakes_the_whole_set() {
         repairs(|d| std::fs::remove_file(d.join("ca.key")).unwrap(), &[]);
     }
 
