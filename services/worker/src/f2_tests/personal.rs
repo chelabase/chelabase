@@ -5,7 +5,7 @@
 
 use chelabase_metadata::{RoleAttributes, RoleCopy, RoleLevel, RoleOrigin};
 use chelabase_types::role_name::is_reserved_target;
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 
 use super::{PENCIL, PREFIX_ONLY};
 use crate::OWNER_ROLE;
@@ -55,7 +55,7 @@ pub(crate) fn row(name: &str, origin: RoleOrigin, verifier: Option<&str>) -> Rol
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
-        created_at: DateTime::<Utc>::UNIX_EPOCH,
+        created_at: Timestamp::UNIX_EPOCH,
         attributes: RoleAttributes::default(),
     }
 }

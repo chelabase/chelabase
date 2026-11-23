@@ -7,6 +7,7 @@
 //! just workbench test -p worker --test compute_fork_live -- --run-ignored only
 //! ```
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -768,7 +769,7 @@ async fn a_recreated_personal_login_is_marked_again() {
                         db.id.as_uuid(),
                         "bob",
                         &verifier,
-                        chrono::Utc::now() + chrono::Duration::days(90),
+                        Timestamp::now() + chelabase_time::days(90),
                     )
                     .await
                     .expect("the record");

@@ -9,6 +9,7 @@
 //! `pending_timeline_id` and `superseded_timeline_id`. A guarded write that returns false
 //! means a delete landed: the run removes what it made, and the delete job owns the rest.
 
+use chelabase_time::{SignedDuration, Timestamp, TimestampExt};
 use chelabase_metadata::{BranchKind, BranchRecord, BranchStatus, MetadataError};
 use chelabase_nats::PointInTime;
 use chelabase_neon::{ComputeBackend, Lsn, NeonId, StorconError};
@@ -553,7 +554,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             let bound = STUCK_DETACH_SECS + chelabase_neon::storcon::DETACH_TIMEOUT.as_secs() as i64;
             let young = branch
                 .pending_timeline_at
-                .is_some_and(|at| chrono::Utc::now() - at < chrono::Duration::seconds(bound));
+                .is_some_and(|at| Timestamp::now().since(at) < SignedDuration::from_secs(bound));
             match self.restore_maybe_detaching(&target, pending).await {
                 PendingState::Unknown(err) => return self.still_resetting(id, err).await,
                 PendingState::Detaching(err) if young => {
@@ -1786,14 +1787,14 @@ mod tests {
     async fn a_restore_hands_the_old_history_to_the_backup_and_keeps_it_on_the_branch() {
         let (w, journal) = worker();
         let s = setup(&w, &journal).await;
-        let old: chrono::DateTime<chrono::Utc> = "2026-09-20T09:00:00Z".parse().unwrap();
+        let old: Timestamp = "2026-09-20T09:00:00Z".parse().unwrap();
         w.metadata
             .state()
             .branches
             .get_mut(&s.dev)
             .unwrap()
             .history_start = Some(old);
-        let commit: chrono::DateTime<chrono::Utc> = "2026-09-29T10:00:00Z".parse().unwrap();
+        let commit: Timestamp = "2026-09-29T10:00:00Z".parse().unwrap();
         *w.storage.timestamp_at.lock().unwrap() = Some(commit);
         claim(&w, s.dev);
         let backup = BranchId::new();
@@ -1814,7 +1815,7 @@ mod tests {
     async fn a_restore_resuming_a_detach_keeps_the_branchs_history_start() {
         let (w, journal) = worker();
         let s = setup(&w, &journal).await;
-        let old: chrono::DateTime<chrono::Utc> = "2026-09-20T09:00:00Z".parse().unwrap();
+        let old: Timestamp = "2026-09-20T09:00:00Z".parse().unwrap();
         w.metadata
             .state()
             .branches
@@ -1825,7 +1826,7 @@ mod tests {
         *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::TimesOut;
         restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::Works;
-        let commit: chrono::DateTime<chrono::Utc> = "2026-09-29T10:00:00Z".parse().unwrap();
+        let commit: Timestamp = "2026-09-29T10:00:00Z".parse().unwrap();
         *w.storage.timestamp_at.lock().unwrap() = Some(commit);
 
         restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap();
@@ -1840,11 +1841,11 @@ mod tests {
         for commit in [Some("2026-09-30T10:00:00Z"), None] {
             let (w, journal) = worker();
             let s = setup(&w, &journal).await;
-            let commit = commit.map(|c| c.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+            let commit = commit.map(|c| c.parse::<Timestamp>().unwrap());
             *w.storage.timestamp_at.lock().unwrap() = commit;
             created_all_at(&w, "2026-09-01T00:00:00Z");
             claim(&w, s.dev);
-            let before = chrono::Utc::now();
+            let before = Timestamp::now();
 
             reset(&w, s.dev).await.unwrap();
 
@@ -3101,6 +3102,30 @@ mod tests {
         assert!(!has(&journal, "storage.delete_timeline"));
     }
 
+    /// A pending timeline stamped after now (a clock step back, or another host's clock) is
+    /// young: the difference is negative, below any bound, so reconcile doesn't delete it.
+    #[tokio::test]
+    async fn a_timeline_stamped_after_now_is_young() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        claim(&w, s.dev);
+        *w.storage.detach.lock().unwrap() = crate::fakes::FakeDetach::TimesOut;
+        restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
+        let pending = w.metadata.branch(s.dev).pending_timeline_id.unwrap();
+        w.metadata.state().branches.get_mut(&s.dev).unwrap().pending_timeline_at =
+            Some(Timestamp::now() + chelabase_time::days(365));
+        w.metadata.state().branch_ages.insert(s.dev, STALE_PROVISION_SECS + 1);
+        journal.lock().unwrap().clear();
+
+        let _ = w.finish_switch(s.dev).await;
+
+        assert!(!has(&journal, "storage.delete_timeline"), "{:?}", entries(&journal));
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Resetting);
+        assert_eq!(dev.pending_timeline_id.as_deref(), Some(pending.as_str()));
+        assert!(w.storage.timeline(&s.tenant, &pending).is_some());
+    }
+
     #[tokio::test]
     async fn a_detach_stuck_past_the_bound_fails_the_branch_and_deletes_nothing() {
         let (w, journal) = worker();
@@ -3108,20 +3133,20 @@ mod tests {
         restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         let pending = w.metadata.branch(s.dev).pending_timeline_id.unwrap();
         // Recorded just inside the bound: still retried.
-        let bound = chrono::Duration::seconds(STUCK_DETACH_SECS);
-        let recorded = |ago: chrono::Duration| {
+        let bound = std::time::Duration::from_secs(STUCK_DETACH_SECS as u64);
+        let recorded = |ago: std::time::Duration| {
             w.metadata
                 .state()
                 .branches
                 .get_mut(&s.dev)
                 .unwrap()
-                .pending_timeline_at = Some(chrono::Utc::now() - ago);
+                .pending_timeline_at = Some(Timestamp::now() - ago);
         };
-        recorded(bound - chrono::Duration::seconds(30));
+        recorded(bound - chelabase_time::seconds(30));
         restore(&w, s.dev, at_lsn("0/2000000")).await.unwrap_err();
         assert_eq!(w.metadata.branch(s.dev).status, BranchStatus::Resetting);
 
-        recorded(bound + chrono::Duration::seconds(1));
+        recorded(bound + chelabase_time::seconds(1));
         restore(&w, s.dev, at_lsn("0/2000000"))
             .await
             .expect("given up: the job is acked");
@@ -3212,7 +3237,7 @@ mod tests {
         // Just past the job's bound a detach started at the end may still run: left alone.
         let recorded = |w: &FakeWorker, secs: i64| {
             w.metadata.state().branches.get_mut(&s.dev).unwrap().pending_timeline_at =
-                Some(chrono::Utc::now() - chrono::Duration::seconds(secs));
+                Some(Timestamp::now() - chelabase_time::seconds(secs as u64));
         };
         recorded(&w, STUCK_DETACH_SECS + 1);
         stale(&w);

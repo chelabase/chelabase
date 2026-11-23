@@ -28,7 +28,7 @@ use chelabase_schema::plan::{
 };
 use chelabase_schema::sql::{literal, qualified};
 use chelabase_types::BranchId;
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
@@ -276,9 +276,8 @@ fn role_patch(m: &RolePatchModel) -> Result<RolePatch, Fail> {
     })
 }
 
-fn timestamp(at: &str) -> Result<DateTime<Utc>, Fail> {
-    DateTime::parse_from_rfc3339(at)
-        .map(|t| t.with_timezone(&Utc))
+fn timestamp(at: &str) -> Result<Timestamp, Fail> {
+    Timestamp::parse_rfc3339(at)
         .map_err(|e| Fail::failed(format!("VALID UNTIL {at:?}: {e}")))
 }
 

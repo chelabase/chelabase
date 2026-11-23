@@ -20,6 +20,7 @@
 //! - **Staleness:** every `cb_m_` role's `rolpassword` is its row's password (the SCRAM
 //!   verifier checked against the stored password), and a second reconcile changes nothing.
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::process::Stdio;
@@ -1378,7 +1379,7 @@ async fn restore_brings_back_no_revoked_role() {
         let role = member_role_name(m);
         let before = fx.password(fx.main, &role).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = chrono::Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.grant(m, PlatformRole::Developer, &["billing"]).await;
         fx.reconcile(fx.main).await;

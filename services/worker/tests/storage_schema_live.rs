@@ -14,6 +14,7 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use chelabase_time::{Timestamp, TimestampExt};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2114,14 +2115,14 @@ async fn storage_api_app_user_live() {
 impl Fx {
     /// An app-user access token for `user` in this project, with a live session.
     async fn user_token(&self, user: Uuid) -> String {
-        self.user_session(user, chrono::Duration::hours(1)).await.0
+        self.user_session(user, chelabase_time::hours(1)).await.0
     }
 
     /// [`Fx::user_token`] with a session that lives `life`: the token and the session's id.
-    async fn user_session(&self, user: Uuid, life: chrono::Duration) -> (String, Uuid) {
+    async fn user_session(&self, user: Uuid, life: std::time::Duration) -> (String, Uuid) {
         use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
         let sid = Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         let mut hash = [0u8; 32];
         hash[..16].copy_from_slice(Uuid::new_v4().as_bytes());
         self.metadata
@@ -2856,14 +2857,14 @@ async fn storage_urls_app_user_live() {
         objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
         let public = fx.public_key().await;
         let user = Uuid::new_v4();
-        let (token, sid) = fx.user_session(user, chrono::Duration::minutes(10)).await;
+        let (token, sid) = fx.user_session(user, chelabase_time::minutes(10)).await;
         let headers = [("chelabase-user", token.as_str())];
         // B1: the keyless PUT runs as the user (the key's own role, anon, has no policy).
         let (status, up) = mint_with("upload/sign", "files/mine.txt", &public, json!({ "expires_in": 3600 }), &headers).await;
         assert_eq!(status, 200, "{up}");
         // S3: no longer than the session's 10 minutes.
         let exp = up["expires_at"].as_i64().unwrap();
-        assert!(exp <= chrono::Utc::now().timestamp() + 600, "{up}");
+        assert!(exp <= Timestamp::now().timestamp() + 600, "{up}");
         let (status, b) = keyless_with("PUT", up["signed_url"].as_str().unwrap(), b"mine".to_vec(), &[]).await;
         assert_eq!(status, 200, "{b}");
         assert_eq!(fx.value("SELECT owner FROM storage.objects WHERE name = 'mine.txt'").await, user.to_string());
@@ -4783,7 +4784,7 @@ async fn storage_webhooks(fx: &Fx, host: &str) {
         .expect("a delivery within 90 s")
         .expect("the endpoint still listens");
     let signature = got.headers.get("chelabase-signature").expect("a signature").clone();
-    let now = chrono::Utc::now().timestamp();
+    let now = Timestamp::now().timestamp();
     assert_eq!(worker::storage_webhooks::verify(&signing, &signature, &got.body, now, 300), Ok(()));
     let event: Value = serde_json::from_slice(&got.body).unwrap();
     assert_eq!(event["type"], "object.created");

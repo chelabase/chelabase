@@ -103,6 +103,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+use chelabase_time::{Timestamp, TimestampExt};
     use crate::app_users::tests::setup;
 
     fn set_deleting(s: &crate::app_users::tests::Setup) {
@@ -343,7 +344,7 @@ mod tests {
                 .projects
                 .get_mut(&s.project)
                 .unwrap()
-                .updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+                .updated_at = Timestamp::now() - chelabase_time::minutes(10);
         };
         set_deleting(&s);
         databases_gone(&s);

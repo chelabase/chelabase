@@ -2451,12 +2451,12 @@ use chelabase_types::role_name::mark_personal_login_sql;
 use crate::fakes::{entries, position};
 
 /// A fixed `VALID UNTIL` far ahead.
-fn far() -> DateTime<Utc> {
-    chrono::TimeZone::with_ymd_and_hms(&Utc, 2099, 1, 2, 3, 4, 5).unwrap()
+fn far() -> Timestamp {
+    Timestamp::from_ymd_hms(2099, 1, 2, 3, 4, 5).unwrap()
 }
 
-fn days(n: i64) -> chrono::Duration {
-    chrono::Duration::days(n)
+fn days(n: u64) -> std::time::Duration {
+    chelabase_time::days(n)
 }
 
 /// A whole SCRAM verifier for `password`.
@@ -2486,7 +2486,7 @@ fn personal_actual(
     role: &str,
     memberships: Vec<ActualMembership>,
     verifier: &str,
-    valid_until: Option<DateTime<Utc>>,
+    valid_until: Option<Timestamp>,
 ) -> ActualMemberRole {
     ActualMemberRole {
         role_name: role.into(),
@@ -2502,7 +2502,7 @@ fn personal_actual(
 fn marked_lines(
     name: &str,
     verifier: &str,
-    valid_until: Option<DateTime<Utc>>,
+    valid_until: Option<Timestamp>,
     memberships: &[&str],
 ) -> String {
     let until = valid_until.map_or("-".to_string(), |t| t.timestamp_micros().to_string());
@@ -2525,7 +2525,7 @@ fn login_record(
     member: Uuid,
     name: &str,
     verifier: Option<&str>,
-    valid_until: DateTime<Utc>,
+    valid_until: Timestamp,
     revoked: bool,
     qualifies: bool,
 ) {
@@ -2626,13 +2626,12 @@ fn add_tenant_admin(w: &FakeWorker, db: chelabase_types::DatabaseId) -> Uuid {
 }
 
 /// The `VALID UNTIL '<ts>'` instant of `sql` (RFC 3339).
-fn valid_until_in(sql: &str) -> DateTime<Utc> {
+fn valid_until_in(sql: &str) -> Timestamp {
     let at = sql.find("VALID UNTIL '").unwrap_or_else(|| panic!("no VALID UNTIL: {sql}"));
     let rest = &sql[at + "VALID UNTIL '".len()..];
     let literal = &rest[..rest.find('\'').expect(sql)];
-    DateTime::parse_from_rfc3339(literal)
+    Timestamp::parse_rfc3339(literal)
         .unwrap_or_else(|e| panic!("VALID UNTIL {literal:?} isn't RFC 3339: {e}"))
-        .with_timezone(&Utc)
 }
 
 #[test]
@@ -2715,6 +2714,39 @@ fn plan_creates_marks_and_locks_in_one_transaction() {
             Grant { role: "alice".into(), granted: "billing".into() },
         ]
     );
+}
+
+/// The `VALID UNTIL` literal keeps six fraction digits and a `Z`, whatever the value's own
+/// fraction.
+#[test]
+fn member_valid_until_literal_is_unchanged() {
+    let whole = Timestamp::from_ymd_hms(2099, 1, 2, 3, 4, 5).unwrap();
+    for (at, text) in [
+        (whole, "'2099-01-02T03:04:05.000000Z'"),
+        (whole + std::time::Duration::from_millis(500), "'2099-01-02T03:04:05.500000Z'"),
+        (whole + std::time::Duration::from_micros(123_456), "'2099-01-02T03:04:05.123456Z'"),
+    ] {
+        assert_eq!(valid_until_literal(&at), text);
+    }
+}
+
+/// A finite expiry the time type can't hold (`9999-12-31` and beyond) reads as no expiry, as
+/// `infinity` (`-`) does; the line's other readings stay: a number is the instant, empty or
+/// non-numeric is refused.
+#[test]
+fn a_far_future_member_expiry_parses() {
+    let line = |until: &str| {
+        format!("r {n} t f f t\nk {n}\np {n} {v}\nu {n} {until}\n", n = h("bob"), v = h("SCRAM-b"))
+    };
+    let until = |field: &str| parse_member_catalog(&line(field)).map(|c| c.personal["bob"].valid_until);
+    assert_eq!(until("-"), Ok(None));
+    assert_eq!(until("1900000000123456"), Ok(Some(Timestamp::from_unix_micros(1_900_000_000_123_456).unwrap())));
+    for far in ["253402214400000000", "253402207201000000", "9223372036854775807", "9223372036854775808"] {
+        assert_eq!(until(far), Ok(None), "{far}");
+    }
+    assert!(until("").is_err());
+    assert!(until("soon").is_err());
+    assert!(until("-9223372036854775809").is_err());
 }
 
 /// D2: the record's `VALID UNTIL` is set back wherever the catalog differs (a copy, a restore,
@@ -2947,7 +2979,7 @@ async fn plan_drops_an_expired_login() {
     let (branch, ep, member) = setup(&w, &["billing"]).await;
     let id = db_of(&w, branch);
     let verifier = scram("pw");
-    let past = Utc::now() - days(1);
+    let past = Timestamp::now() - days(1);
     login_record(&w, id, member, "alice", Some(&verifier), past, false, true);
     w.computes.answer_at(
         &ep,
@@ -3239,7 +3271,7 @@ async fn convergence_follows_the_desired_set_exhaustively() {
         let id = db_of(&w, branch);
         let other = add_member(&w, id, &["billing"]);
         let verifier = scram("pw");
-        let until = if expired { Utc::now() - days(1) } else { far() };
+        let until = if expired { Timestamp::now() - days(1) } else { far() };
         if has_record {
             let kept = (!revoked).then_some(verifier.as_str());
             login_record(&w, id, m, "alice", kept, until, revoked, qualifies);

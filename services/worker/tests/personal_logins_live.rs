@@ -28,7 +28,7 @@ use chelabase_neon::{ComputeBackend, ComputeLocator};
 use chelabase_types::access::PlatformRole;
 use chelabase_types::role_name::is_marked_sql;
 use chelabase_types::{BranchId, DatabaseId, TenantId};
-use chrono::Utc;
+use chelabase_time::{Timestamp, TimestampExt};
 use uuid::Uuid;
 use worker::config::RealWorker;
 
@@ -193,7 +193,7 @@ impl Fx {
                 self.id.as_uuid(),
                 name,
                 &verifier,
-                Utc::now() + chrono::Duration::days(90),
+                Timestamp::now() + chelabase_time::days(90),
             )
             .await
             .unwrap_or_else(|e| panic!("create the login {name}: {e:?}"));
@@ -456,7 +456,7 @@ async fn a_restore_before_deletion_brings_no_login_back() {
         fx.reconcile(fx.main).await;
         assert!(fx.role_exists(&fx.ep, "pl_carol").await);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let noted = Utc::now();
+        let noted = Timestamp::now();
         tokio::time::sleep(Duration::from_secs(2)).await;
         fx.metadata
             .delete_personal_login(m, m, fx.id.as_uuid())
@@ -664,7 +664,7 @@ async fn a_reset_password_works_and_the_old_one_is_refused_on_every_branch() {
                 m,
                 fx.id.as_uuid(),
                 &verifier,
-                Utc::now() + chrono::Duration::days(90),
+                Timestamp::now() + chelabase_time::days(90),
             )
             .await
             .expect("reset");
