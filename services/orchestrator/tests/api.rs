@@ -1614,6 +1614,51 @@ async fn a_role_valid_until_beyond_the_supported_range_is_refused() {
     assert_eq!(resp.status(), 202);
 }
 
+// #397 / drop-chrono m13 F1, F2: a role's `valid_until` the API accepts is one Postgres stores
+// and the worker reads back as the same instant. Before year 1 Postgres can't take it as the
+// worker writes it (an RFC 3339 literal), so it's the field's 422 and nothing is queued; the
+// range's last second, to the nanosecond, is accepted (it's stored as the last microsecond).
+#[tokio::test]
+async fn a_role_valid_until_postgres_cant_round_trip_is_refused() {
+    let t = branching().await;
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    for before in [
+        "-5000-01-01T00:00:00Z",
+        "-4713-11-24T00:00:00Z",
+        "0000-01-01T00:00:00Z",
+        "0000-12-31T23:59:59.999999999Z",
+        "0001-01-01T00:00:00+00:01",
+    ] {
+        let err = error_of(
+            t.send(Method::POST, &t.roles(dev), Some(json!({ "name": "early", "valid_until": before }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(code_of(&err), "invalid_request", "{before}");
+        assert_eq!(err["error"]["field"], "valid_until", "{before}: {err}");
+        assert_eq!(
+            message_of(&err),
+            "valid_until is between 0001-01-01T00:00:00Z and 9999-12-30T22:00:00.999999999Z",
+            "{before}"
+        );
+        let err = error_of(
+            t.send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": before }))).await,
+            422,
+        )
+        .await;
+        assert_eq!(err["error"]["field"], "valid_until", "{before}: {err}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty());
+    for edge in ["0001-01-01T00:00:00Z", "9999-12-30T22:00:00.5Z", "9999-12-30T22:00:00.999999999Z"] {
+        let resp = t
+            .send(Method::PATCH, &format!("{}/app", t.roles(dev)), Some(json!({ "valid_until": edge })))
+            .await;
+        assert_eq!(resp.status(), 202, "{edge}");
+    }
+}
+
 // m13: a timestamp in a request body past the time type's range, malformed, or without an
 // offset is a 4xx `invalid_request` with the usual error body on every management endpoint
 // that takes one (a role's `valid_until`, a branch's or a restore's point in time), never a

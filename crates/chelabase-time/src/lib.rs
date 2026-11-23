@@ -50,7 +50,10 @@
 //!
 //! - **Range.** jiff's instants run from `-9999-01-02T01:59:59Z` to
 //!   `9999-12-30T22:00:00.999999999Z` (chrono's to about ±262,000 years); its dates from
-//!   `-9999-01-01` to `9999-12-31`. Outside it, constructors return `None`, parsers and serde
+//!   `-9999-01-01` to `9999-12-31`. The constructors (`from_unix_seconds`, `from_unix_millis`,
+//!   `from_unix_micros`, `from_ymd_hms`), the parsers and serde all accept exactly that range,
+//!   its last second included (`from_unix_micros(253_402_207_200_999_999)` is
+//!   `9999-12-30T22:00:00.999999Z`). Outside it, constructors return `None`, parsers and serde
 //!   fail with chrono's "input is out of range" ([`ParseError::is_beyond_range`] tells it from
 //!   a malformed string), and a Postgres decode returns an error. So
 //!   `9999-12-31T23:59:59.999999999Z` (and any instant on 9999-12-31 after 22:00) is an error,
@@ -70,6 +73,30 @@
 //!   type-mismatch error messages.
 //! - **`Debug`** is the `to_rfc3339_auto` form (chrono's today too), but isn't a contract.
 //!   `Hash` values differ from chrono's.
+//!
+//! # Postgres round trip
+//!
+//! A value Chelabase writes into a Postgres `timestamptz` as text and reads back as whole
+//! microseconds (a role's `VALID UNTIL`: the worker writes [`TimestampExt::to_rfc3339_micros`]
+//! and reads `extract(epoch …)` microseconds into [`TimestampExt::from_unix_micros`]) comes
+//! back as itself, truncated to the microsecond, exactly when
+//! [`Timestamp::round_trips_through_pg`] holds: from [`Timestamp::PG_ROUND_TRIP_MIN`]
+//! (`0001-01-01T00:00:00Z`) to [`Timestamp::MAX`], which is stored as
+//! [`Timestamp::PG_ROUND_TRIP_MAX`] (`9999-12-30T22:00:00.999999Z`).
+//!
+//! - Below year 1, Postgres keeps instants to `4714-11-24 00:00:00+00 BC`, but only reads them
+//!   in its own `… BC` text: an RFC 3339 literal with the year `0000` or a signed year is an
+//!   error, and RFC 3339 has no year before `0000` for the API to write back.
+//! - Past [`Timestamp::MAX`], Postgres keeps instants (to 294276 AD) this type doesn't hold.
+//!
+//! **The invariant:** every role `valid_until` the management API accepts is a value Postgres
+//! stores and the worker reads back as the same instant, so a resync never re-issues
+//! `ALTER ROLE` for a value the API accepted. The orchestrator accepts exactly the instants
+//! [`Timestamp::round_trips_through_pg`] holds for; the worker's catalog SELECTs and its parse
+//! read everything up to [`Timestamp::PG_ROUND_TRIP_MAX`] as an instant (later is "no
+//! expiry"). Tests: `tests/pg_round_trip.rs` here (and `tests/pg_live.rs` against Postgres),
+//! the orchestrator's `valid_until_tests`, and the worker's `*_reads_back_equal` model and
+//! property tests in `resync.rs`.
 //!
 //! # Old call → new call
 //!

@@ -168,8 +168,9 @@ where
 }
 
 /// A `valid_until` as the request gave it: a time, or a well-formed one past the range the
-/// time type holds, which [`check_valid_until`] refuses with a 422 naming the field (a
-/// malformed one fails the body's parse, as any other bad field does).
+/// time type holds. [`check_valid_until`] refuses the latter, and a time outside Postgres'
+/// round-trip range, with a 422 naming the field (a malformed one fails the body's parse, as
+/// any other bad field does).
 #[derive(Debug, Clone, Copy)]
 enum RequestedExpiry {
     At(Timestamp),
@@ -260,18 +261,21 @@ pub(crate) struct UpdateRoleRequest {
     member_of: Option<Vec<String>>,
 }
 
-/// The time a `valid_until` names, or a 422 naming the field for one past the time type's
-/// range ([`Timestamp::MIN`] to [`Timestamp::MAX`]): the role would be stored with a time the
-/// database can't hand back.
+/// The time a `valid_until` names, or a 422 naming the field for one that doesn't round trip
+/// through Postgres ([`Timestamp::round_trips_through_pg`]: [`Timestamp::PG_ROUND_TRIP_MIN`] to
+/// [`Timestamp::MAX`]). Before it, Postgres refuses the literal the worker writes; past it, the
+/// database holds a time the type can't hand back. Either way the role would never converge.
+/// This is the API's half of `chelabase_time`'s "Postgres round trip" invariant; the worker's
+/// catalog read is the other.
 fn check_valid_until(valid_until: Option<RequestedExpiry>) -> Result<Option<Timestamp>, ApiError> {
     match valid_until {
         None => Ok(None),
-        Some(RequestedExpiry::At(at)) => Ok(Some(at)),
-        Some(RequestedExpiry::BeyondRange) => Err(ApiError::invalid_request(
+        Some(RequestedExpiry::At(at)) if at.round_trips_through_pg() => Ok(Some(at)),
+        Some(RequestedExpiry::At(_) | RequestedExpiry::BeyondRange) => Err(ApiError::invalid_request(
             422,
             format!(
                 "valid_until is between {} and {}",
-                Timestamp::MIN.to_rfc3339_auto(),
+                Timestamp::PG_ROUND_TRIP_MIN.to_rfc3339_auto(),
                 Timestamp::MAX.to_rfc3339_auto()
             ),
         )
@@ -1389,6 +1393,43 @@ where
     match sessions_result(reply) {
         Ok(sessions) => Json(sessions).into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod valid_until_tests {
+    use super::*;
+
+    /// A body's `valid_until` as the request parses it.
+    fn requested(s: &str) -> RequestedExpiry {
+        serde_json::from_value(serde_json::Value::String(s.into())).unwrap()
+    }
+
+    /// #397 / drop-chrono m13 F1, F2: the check accepts exactly the instants that round trip
+    /// through Postgres as the worker writes and reads them, across the boundary instants of
+    /// both ends (the worker's own test feeds the same predicate through its read path).
+    #[test]
+    fn the_check_accepts_exactly_what_round_trips_through_postgres() {
+        let mut instants = Vec::new();
+        for edge in [Timestamp::MIN, Timestamp::PG_ROUND_TRIP_MIN, Timestamp::PG_ROUND_TRIP_MAX, Timestamp::MAX] {
+            for nanos in [0u64, 1, 999, 1_000, 1_001, 500_000_000, 999_999_999, 1_000_000_000, 86_400_000_000_000] {
+                let d = std::time::Duration::from_nanos(nanos);
+                instants.extend(edge.checked_add(d));
+                instants.extend(edge.checked_sub(d));
+            }
+        }
+        for at in instants {
+            let accepted = check_valid_until(Some(requested(&at.to_rfc3339_auto())));
+            assert_eq!(accepted.is_ok(), at.round_trips_through_pg(), "{at:?}");
+            if let Ok(stored) = accepted {
+                assert_eq!(stored, Some(at), "{at:?}");
+            }
+        }
+        // Past the type's range, it's the same 422.
+        for beyond in ["-10000-01-01T00:00:00Z", "9999-12-30T22:00:01Z"] {
+            let err = check_valid_until(Some(requested(beyond))).unwrap_err();
+            assert_eq!(err.status, 422, "{beyond}");
+        }
     }
 }
 

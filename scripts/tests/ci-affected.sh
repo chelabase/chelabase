@@ -51,6 +51,8 @@ expect 'services/gateway/src/lib.rs' $'rust=gateway\nweb=none'
 expect_has 'crates/chelabase-types/src/lib.rs' rust= chelabase-types orchestrator gateway chelabase
 expect $'crates/chelabase-types/src/lib.rs\ncrates/chelabase-http/src/lib.rs\ncrates/chelabase-secrets/src/lib.rs\ncrates/chelabase-typegen/src/lib.rs\ncrates/chelabase-storage/src/lib.rs' $'rust=full\nweb=none'
 expect 'Cargo.lock' $'rust=full\nweb=none'
+# The ban test runs in the deny job, which only a Rust selection starts.
+expect 'scripts/tests/deny-bans.sh' $'rust=full\nweb=none'
 expect 'pnpm-lock.yaml' $'rust=none\nweb=full'
 expect 'brand-new-dir/file.txt' $'rust=full\nweb=full'
 expect 'crates/brand-new-crate/src/lib.rs' $'rust=full\nweb=full'
