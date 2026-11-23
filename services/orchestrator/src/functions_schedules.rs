@@ -22,7 +22,7 @@ use chelabase_routes::orchestrator as ep;
 use chelabase_types::ApiPath;
 use chelabase_types::BranchId;
 use chelabase_types::api_error::{ApiError, ErrorEnvelope};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use utoipa::ToSchema;
@@ -111,7 +111,7 @@ struct ScheduleView {
     enabled: bool,
     /// When it runs next.
     #[schema(required = true)]
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
     /// Why the schedule was switched off, `null` normally: the cron or time zone no longer
     /// parses, or it has no upcoming time. Cleared when the schedule next gets a time (a
     /// worker pass, or a successful change).
@@ -268,7 +268,7 @@ where
             if function.kind != FunctionKind::Function {
                 return Err(unprocessable("a schedule needs a function: a service is never run on a schedule (deploy a function that calls it)"));
             }
-            let next_run_at = schedule.next_after(Utc::now());
+            let next_run_at = schedule.next_after(Timestamp::now());
             let schedule_id = state
                 .metadata
                 .add_schedule(&NewSchedule {

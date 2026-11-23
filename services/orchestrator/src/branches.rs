@@ -20,7 +20,7 @@ use chelabase_nats::rt::ProjectEvent;
 use chelabase_nats::{BranchJob, DatabaseSettingsJob, JobEnvelope, PointInTime};
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{ApiJson, ApiPath, BranchId};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use utoipa::ToSchema;
@@ -74,13 +74,13 @@ struct Branch {
     #[schema(required = true)]
     port: Option<u16>,
     #[schema(required = true)]
-    branched_at_time: Option<DateTime<Utc>>,
+    branched_at_time: Option<Timestamp>,
     #[schema(required = true)]
     branched_at_lsn: Option<String>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// Where the branch's history begins (null when unknown); Studio's lower bound for a point.
     #[schema(required = true)]
-    history_start: Option<DateTime<Utc>>,
+    history_start: Option<Timestamp>,
     #[schema(required = true)]
     error: Option<String>,
     /// A protected branch can't be deleted or reset to its parent (restore still works), and
@@ -243,7 +243,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 }
 
 mod docs {
-    use chrono::{DateTime, Utc};
+    use chelabase_time::Timestamp;
     use serde::Serialize;
     use utoipa::ToSchema;
 
@@ -253,7 +253,7 @@ mod docs {
     #[allow(dead_code)]
     pub(super) enum PointInTime {
         /// A moment, RFC 3339.
-        Timestamp { timestamp: DateTime<Utc> },
+        Timestamp { timestamp: Timestamp },
         /// A Postgres LSN, `hex/hex`.
         Lsn { lsn: String },
     }
@@ -270,8 +270,8 @@ struct AtBody {
 impl AtBody {
     fn parse(self) -> Result<PointInTime, String> {
         match (self.timestamp, self.lsn) {
-            (Some(ts), None) => DateTime::parse_from_rfc3339(&ts)
-                .map(|t| PointInTime::Timestamp(t.with_timezone(&Utc)))
+            (Some(ts), None) => Timestamp::parse_rfc3339(&ts)
+                .map(PointInTime::Timestamp)
                 .map_err(|_| {
                     format!("invalid timestamp {ts:?}: use RFC 3339, like 2026-09-30T12:00:00Z")
                 }),
@@ -307,9 +307,9 @@ fn within_history(branch: &BranchRecord, at: &PointInTime) -> Result<(), String>
         PointInTime::Timestamp(time) => match branch.history_start {
             Some(begins) if *time < begins => Err(format!(
                 "the time {} is before {}'s history begins ({})",
-                time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                time.to_rfc3339_auto(),
                 branch.name,
-                begins.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+                begins.to_rfc3339_auto()
             )),
             _ => Ok(()),
         },
@@ -888,8 +888,8 @@ struct RestoreAccepted {
 }
 
 /// `<name>-before-restore-<yyyymmddThhmmssZ>`, with `<name>` cut so the whole fits in 63.
-fn backup_name(name: &str, now: DateTime<Utc>) -> String {
-    let suffix = format!("-before-restore-{}", now.format("%Y%m%dT%H%M%SZ"));
+fn backup_name(name: &str, now: Timestamp) -> String {
+    let suffix = format!("-before-restore-{}", now.to_iso8601_basic());
     let keep = MAX_NAME_LEN.saturating_sub(suffix.len());
     let base: String = name.chars().take(keep).collect();
     format!("{base}{suffix}")
@@ -954,7 +954,7 @@ where
         return resp.into_response();
     }
     let backup_id = BranchId::new();
-    let backup_name = backup_name(&branch.name, Utc::now());
+    let backup_name = backup_name(&branch.name, Timestamp::now());
     let job = JobEnvelope {
         job_id: Uuid::new_v4(),
         payload: BranchJob::Restore {

@@ -274,7 +274,7 @@ impl Au {
 
     /// The project's `project_auth` row in `status`; when enabled its pool exists.
     fn set_auth(&self, status: AppUsersStatus) {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.metadata.project_auths.lock().unwrap().insert(
             self.project.id,
             ProjectAuth {
@@ -374,7 +374,7 @@ impl Au {
     /// An identity session for the user, and a live app session (in metadata) behind it.
     fn add_session(&self, user: uuid::Uuid) -> String {
         let (identity_session, _) = self.fake().with_session(&self.pool(), &user.to_string());
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         self.metadata.app_sessions.lock().unwrap().push(AppSession {
             id: uuid::Uuid::new_v4(),
             project_id: self.project.id,
@@ -382,7 +382,7 @@ impl Au {
             identity_session_id: identity_session.clone(),
             created_at: now,
             last_used_at: now,
-            expires_at: now + chrono::Duration::days(30),
+            expires_at: now + chelabase_time::days(30),
             revoked_at: None,
         });
         identity_session
@@ -919,8 +919,8 @@ async fn list_projects_batches_the_auth_read() {
             table_name: "users".into(),
             email_verification: false,
             on_delete: OnDelete::Delete,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         },
     );
     let body: Value = send(&app, Method::GET, "/v1/projects", "org-1", None)
@@ -1888,7 +1888,7 @@ async fn a_503_without_a_client_still_revoked_sessions() {
         (Method::DELETE, ""),
     ] {
         let id = uuid::Uuid::new_v4();
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         au.metadata.app_sessions.lock().unwrap().push(AppSession {
             id: uuid::Uuid::new_v4(),
             project_id: au.project.id,
@@ -1896,7 +1896,7 @@ async fn a_503_without_a_client_still_revoked_sessions() {
             identity_session_id: "s".into(),
             created_at: now,
             last_used_at: now,
-            expires_at: now + chrono::Duration::days(30),
+            expires_at: now + chelabase_time::days(30),
             revoked_at: None,
         });
         let (status, body) = au.call(method.clone(), &format!("/users/{id}{rest}"), None).await;

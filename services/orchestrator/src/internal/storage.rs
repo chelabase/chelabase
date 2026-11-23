@@ -17,7 +17,7 @@ use chelabase_types::access::{PlatformRole, Requested};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_neon::ComputeLocator;
 use chelabase_secrets::{Purpose, derive_key};
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::error;
@@ -209,7 +209,7 @@ struct NewToken {
     token_id: Uuid,
     key_id: Uuid,
     claims: Value,
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
 }
 
 /// Why an upload token's app session doesn't let it through.
@@ -226,7 +226,7 @@ async fn session_of<M, L>(
     state: &InternalState<M, L>,
     claims: &Value,
     key_id: Uuid,
-) -> Result<Option<DateTime<Utc>>, NotLive>
+) -> Result<Option<Timestamp>, NotLive>
 where
     M: NeonMetadataPort,
     L: ComputeLocator,
@@ -249,7 +249,7 @@ where
     match state.metadata.app_session(sid).await {
         Ok(Some(s))
             if s.revoked_at.is_none()
-                && s.expires_at > Utc::now()
+                && s.expires_at > Timestamp::now()
                 && s.project_id == key.project_id =>
         {
             Ok(Some(s.expires_at))

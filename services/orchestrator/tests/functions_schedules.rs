@@ -156,9 +156,9 @@ mod functions_schedules {
         assert_eq!(made["cron"], "0 9 * * MON-FRI");
         assert_eq!(made["timezone"], "Europe/London");
         assert_eq!(made["enabled"], true);
-        let next: chrono::DateTime<chrono::Utc> =
+        let next: Timestamp =
             serde_json::from_value(made["next_run_at"].clone()).unwrap();
-        assert!(next > chrono::Utc::now());
+        assert!(next > Timestamp::now());
         let id = made["id"].as_str().unwrap().to_string();
 
         let (status, utc) = w
@@ -366,6 +366,33 @@ mod functions_schedules {
             .await;
         assert_eq!(status, 200, "{off}");
         assert_eq!(off.get("last_error"), Some(&Value::Null), "update: {off}");
+    }
+
+    /// m8: a stored schedule whose cron the parser now rejects: a PATCH that leaves the cron out
+    /// is a 422 naming `cron` (never a 500), a valid cron repairs it, and GET lists it throughout.
+    #[tokio::test]
+    async fn patching_a_schedule_whose_cron_stopped_parsing_is_a_422_and_a_new_cron_repairs_it() {
+        let w = world().await;
+        w.function(w.w.dev, "hello").await;
+        let base = w.path(w.w.dev, "/hello/schedules");
+        let id = w.schedule(w.w.dev, "hello").await;
+        for s in w.w.metadata.functions.lock().unwrap().schedules.iter_mut() {
+            s.cron = "* * * * * *".to_owned();
+        }
+        let item = format!("{base}/{id}");
+        for body in [json!({"enabled": true}), json!({"timezone": "Europe/Paris"})] {
+            let (status, err) = w.call("dee", "PATCH", &item, Some(body.to_string())).await;
+            assert_eq!(status, 422, "{body}: {err}");
+            assert_eq!(err["error"]["field"], "cron", "{body}: {err}");
+            let (status, list) = w.call("vic", "GET", &base, None).await;
+            assert_eq!(status, 200, "{list}");
+            assert_eq!(list[0]["cron"], "* * * * * *", "{list}");
+        }
+        let (status, fixed) = w
+            .call("dee", "PATCH", &item, Some(json!({"cron": "5 * * * *"}).to_string()))
+            .await;
+        assert_eq!(status, 200, "{fixed}");
+        assert_eq!(fixed["cron"], "5 * * * *");
     }
 
     /// m15: a body naming `last_error` is refused and the stored reason stays.

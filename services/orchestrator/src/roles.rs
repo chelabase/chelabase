@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chelabase_time::{Timestamp, TimestampExt};
 use chelabase_metadata::members::AccessAction;
 use chelabase_metadata::personal_logins::AccessEventInput;
 use chelabase_metadata::{
@@ -82,7 +82,7 @@ pub(crate) struct BranchRole {
     /// Live data API secret keys that name this role while it is owner-level: the keys the
     /// data API refuses (empty for a plain role).
     blocked_keys: Vec<RoleInUseKey>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     /// Written but not yet applied to the compute; applied when the compute next runs.
     pending: bool,
     /// INHERIT: the role uses its groups' privileges without `SET ROLE`.
@@ -90,7 +90,7 @@ pub(crate) struct BranchRole {
     /// The most connections the role may hold at once; `-1` is no limit.
     connection_limit: i32,
     /// When the role's password stops working; `null` is never.
-    valid_until: Option<DateTime<Utc>>,
+    valid_until: Option<Timestamp>,
     /// BYPASSRLS on its own (an owner-level role has it too, through the owner's attributes).
     bypass_rls: bool,
     /// The roles it's a direct member of, by name (`neon_superuser` isn't listed).
@@ -160,11 +160,11 @@ fn no_connection_limit() -> i32 {
 }
 
 /// A field that tells "absent" (`None`) from `null` (`Some(None)`).
-fn double_option<'de, D>(d: D) -> Result<Option<Option<DateTime<Utc>>>, D::Error>
+fn double_option<'de, D>(d: D) -> Result<Option<Option<Timestamp>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<DateTime<Utc>>::deserialize(d).map(Some)
+    Option::<Timestamp>::deserialize(d).map(Some)
 }
 
 /// A role to create. Only the attributes listed here can be set; any other field is refused.
@@ -189,7 +189,7 @@ pub(crate) struct CreateRoleRequest {
     connection_limit: i32,
     /// When the password stops working. Default: never.
     #[serde(default)]
-    valid_until: Option<DateTime<Utc>>,
+    valid_until: Option<Timestamp>,
     /// BYPASSRLS: the role ignores row-level security. Default `false`.
     #[serde(default)]
     bypass_rls: bool,
@@ -219,13 +219,42 @@ pub(crate) struct UpdateRoleRequest {
     /// `null` clears the expiry.
     #[serde(default, deserialize_with = "double_option")]
     #[schema(value_type = Option<String>, format = DateTime, nullable = true)]
-    valid_until: Option<Option<DateTime<Utc>>>,
+    valid_until: Option<Option<Timestamp>>,
     #[serde(default)]
     bypass_rls: Option<bool>,
     /// The new list of the role's other memberships, with the create's rules
     /// (`pg_*` and Chelabase's own groups stay).
     #[serde(default)]
     member_of: Option<Vec<String>>,
+}
+
+/// The latest and earliest instants `valid_until` may name: the range of the time type that
+/// will replace chrono (`9999-12-30T22:00:00.999999999Z` and `-9999-01-02T01:59:59Z`).
+/// Beyond them the role would be stored with a time the database can't hand back.
+fn valid_until_range() -> (Timestamp, Timestamp) {
+    let latest = Timestamp::from_ymd_hms(9999, 12, 30, 22, 0, 0)
+        .expect("in range")
+        .checked_add(std::time::Duration::from_nanos(999_999_999))
+        .expect("in range");
+    let earliest = Timestamp::from_ymd_hms(-9999, 1, 2, 1, 59, 59).expect("in range");
+    (earliest, latest)
+}
+
+/// 422 naming `valid_until` for a time outside [`valid_until_range`].
+fn check_valid_until(valid_until: Option<Timestamp>) -> Result<(), ApiError> {
+    let (earliest, latest) = valid_until_range();
+    match valid_until {
+        Some(at) if at < earliest || at > latest => Err(ApiError::invalid_request(
+            422,
+            format!(
+                "valid_until is between {} and {}",
+                earliest.to_rfc3339_auto(),
+                latest.to_rfc3339_auto()
+            ),
+        )
+        .with_extra("field", serde_json::Value::String("valid_until".into()))),
+        _ => Ok(()),
+    }
 }
 
 /// The 422 for a membership the rules refuse.
@@ -601,6 +630,9 @@ where
             return ApiError::new(409, ErrorCode::RoleExists, "a role with that name already exists").into_response();
         }
         Err(err) => return err.into_response(),
+    }
+    if let Err(err) = check_valid_until(request.valid_until) {
+        return err.into_response();
     }
     if let Err(err) = check_settings(
         &request.name,
@@ -1131,6 +1163,9 @@ where
     if let Err(err) = not_personal(&state, &record, &role).await {
         return err.into_response();
     }
+    if let Err(err) = check_valid_until(request.valid_until.flatten()) {
+        return err.into_response();
+    }
     if let Err(err) = check_settings(&role, owner, request.connection_limit, request.member_of.as_deref()) {
         return err.into_response();
     }
@@ -1246,7 +1281,7 @@ struct RoleSessionView {
     /// The client's `application_name` (empty when it set none).
     application_name: String,
     /// When the session started.
-    backend_start: DateTime<Utc>,
+    backend_start: Timestamp,
 }
 
 /// The worker's sessions answer as the API's response or error.

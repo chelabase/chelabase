@@ -22,7 +22,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::response::{IntoResponse, Response};
 use chelabase_metadata::members::{Admission, InviteDescription, MemberStatus};
 use chelabase_neon::ComputeLocator;
-use chrono::SecondsFormat;
+use chelabase_time::TimestampExt;
 use chelabase_types::TenantId;
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use serde::Deserialize;
@@ -139,7 +139,7 @@ where
     };
     Json(json!({
         "open": found.is_some_and(|(_, open)| open),
-        "expires_at": found.map(|(at, _)| at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        "expires_at": found.map(|(at, _)| at.to_rfc3339_micros()),
     }))
     .into_response()
 }

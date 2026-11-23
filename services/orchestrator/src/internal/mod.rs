@@ -31,7 +31,7 @@ use chelabase_metadata::{
     ProjectRecord, RefreshNext, RefreshOutcome, RefreshProof,
 };
 use chelabase_types::{DatabaseId, ProjectId};
-use chrono::{DateTime, Utc};
+use chelabase_time::Timestamp;
 use chelabase_secrets::SecretKey;
 use chelabase_types::BranchId;
 use uuid::Uuid;
@@ -163,7 +163,7 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
         token_id: Uuid,
         key_id: Uuid,
         claims: &serde_json::Value,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
     /// Spends an upload token once, before its expiry, while its key is live.
@@ -242,7 +242,7 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
 
     /// What the sign-up gate needs for `tenant`; `None` when it doesn't exist.
@@ -287,7 +287,7 @@ pub trait NeonMetadataPort: ConsoleUrlFacts + Send + Sync + 'static {
     fn invite_expiry_for_user(
         &self,
         identity_user_id: &str,
-    ) -> impl Future<Output = Result<Option<(DateTime<Utc>, bool)>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<Option<(Timestamp, bool)>, MetadataError>> + Send;
 
     /// [`MetadataClient::accepted_invites_for_user`]: `(tenant, token_hash)` of each accepted
     /// invite of this identity user, newest first.
@@ -429,7 +429,7 @@ impl NeonMetadataPort for MetadataClient {
         token_id: Uuid,
         key_id: Uuid,
         claims: &serde_json::Value,
-        expires_at: DateTime<Utc>,
+        expires_at: Timestamp,
     ) -> Result<bool, MetadataError> {
         MetadataClient::insert_upload_token(self, token_id, key_id, claims, expires_at).await
     }
@@ -517,7 +517,7 @@ impl NeonMetadataPort for MetadataClient {
         project: ProjectId,
         user: Uuid,
         keep: Option<Uuid>,
-        created_before: Option<DateTime<Utc>>,
+        created_before: Option<Timestamp>,
     ) -> Result<Vec<AppSession>, MetadataError> {
         MetadataClient::revoke_user_sessions(self, project, user, keep, created_before).await
     }
@@ -530,7 +530,7 @@ impl NeonMetadataPort for MetadataClient {
     async fn invite_expiry_for_user(
         &self,
         identity_user_id: &str,
-    ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
+    ) -> Result<Option<(Timestamp, bool)>, MetadataError> {
         MetadataClient::invite_expiry_for_user(self, identity_user_id).await
     }
     async fn signup_facts(&self, tenant: chelabase_types::TenantId) -> Result<Option<SignUpFacts>, MetadataError> {
