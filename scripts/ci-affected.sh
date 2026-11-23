@@ -17,7 +17,7 @@ cd "$(git rev-parse --show-toplevel)"
 # A path no rule matches runs every Rust and web check.
 
 # A change here runs every Rust check.
-rust_full=(Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml deny.toml '.cargo/*' '.config/*'
+rust_full=(Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml deny.toml '.cargo/*' '.config/*' scripts/tests/deny-bans.sh
   justfile .prototools .github/workflows/ci.yml scripts/ci-affected.sh)
 
 # A change here runs every web check.
