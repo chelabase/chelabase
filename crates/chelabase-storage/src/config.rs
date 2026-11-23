@@ -426,4 +426,44 @@ mod tests {
             Duration::from_secs(7)
         );
     }
+
+    fn load_with(var: &'static str, value: &str) -> Result<StorageConfig, ConfigError> {
+        let k = keys("ak", "sk");
+        StorageConfig::from_lookup(env(&[
+            (ENV_ENDPOINT, "http://x"),
+            (ENV_BUCKET, "b"),
+            (ENV_ACCESS_KEY_FILE, &k.access),
+            (ENV_SECRET_KEY_FILE, &k.secret),
+            (var, value),
+        ]))
+    }
+
+    #[test]
+    fn duration_vars_parse_as_before() {
+        for (text, want) in [
+            ("30s", Duration::from_secs(30)),
+            ("5m", Duration::from_secs(300)),
+            ("1h", Duration::from_secs(3600)),
+            ("250ms", Duration::from_millis(250)),
+        ] {
+            let c = load_with(ENV_CONNECT_TIMEOUT, text).unwrap();
+            assert_eq!(c.connect_timeout, want, "{text}");
+            let c = load_with(ENV_REQUEST_TIMEOUT, text).unwrap();
+            assert_eq!(c.request_timeout, want, "{text}");
+            let c = load_with(ENV_STREAM_IDLE_TIMEOUT, text).unwrap();
+            assert_eq!(c.stream_idle_timeout, want, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_bad_duration_names_its_variable() {
+        for var in [ENV_CONNECT_TIMEOUT, ENV_REQUEST_TIMEOUT, ENV_STREAM_IDLE_TIMEOUT] {
+            for bad in ["fast", "10"] {
+                match load_with(var, bad).unwrap_err() {
+                    ConfigError::Invalid { var: v, .. } => assert_eq!(v, var, "{bad}"),
+                    other => panic!("{var}={bad}: {other:?}"),
+                }
+            }
+        }
+    }
 }
