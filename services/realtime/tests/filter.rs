@@ -13,6 +13,7 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use chelabase_query::realtime::key_string;
 use fakes::*;
+use proptest::prelude::*;
 use realtime::check::{
     CONCURRENCY, CheckError, Limiter, VisibilityCache, WINDOW_DEADLINE, group_key,
 };
@@ -1022,4 +1023,321 @@ async fn the_owner_client_converts_with_realtimes_bearer() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, "Bearer rt-bearer");
     assert_eq!(seen[0].1["convert"], true);
+}
+
+// --- #319: each viewer's delivered set is bounded --------------------------------------------
+
+fn fx_bounded(delivered_max: usize) -> Fx {
+    let checker = FakeChecker::new();
+    let limiter = Limiter::new(CONCURRENCY);
+    let cache = VisibilityCache::new(Duration::from_millis(100));
+    let filter = TableFilter::new(
+        target(),
+        relation(REL, "items"),
+        checker.clone(),
+        limiter.clone(),
+        cache.clone(),
+        FilterSettings {
+            delivered_max,
+            ..FilterSettings::default()
+        },
+    );
+    Fx {
+        checker,
+        limiter,
+        cache,
+        filter,
+    }
+}
+
+fn evicted() -> ChannelEvent {
+    ChannelEvent::Resync {
+        reason: "evicted".into(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivered_set_is_bounded() {
+    let mut f = fx_bounded(3);
+    f.checker.hide(Some("reader"), &[]);
+    let mut rls = f.viewer(1, role("reader"), false);
+    let mut bypass = f.viewer(2, role("billing"), true);
+    for i in 1..=10 {
+        let k = i.to_string();
+        f.checker.insert_rows(REL, &[&k]);
+        f.deliver(&window(&[&k], &[], &[]), &[10 + i]).await;
+        assert_eq!(
+            drain(&mut rls),
+            vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &[&k])])]
+        );
+        drain(&mut bypass);
+        assert!(f.filter.delivered_len(1).unwrap() <= 3, "after key {k}");
+        assert!(f.filter.delivered_len(2).unwrap() <= 3, "after key {k}");
+    }
+    // One window past the bound at once.
+    let many: Vec<String> = (20..30).map(|i| i.to_string()).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    f.checker.insert_rows(REL, &refs);
+    f.deliver(&window(&refs, &[], &[]), &[30]).await;
+    assert_eq!(
+        drain(&mut rls),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Insert, &refs)])]
+    );
+    assert_eq!(f.filter.delivered_len(1), Some(3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_evicted_key_resyncs() {
+    let mut f = fx_bounded(2);
+    f.checker.hide(Some("reader"), &[]);
+    let mut rx = f.viewer(1, role("reader"), false);
+    f.checker.insert_rows(REL, &["1", "2", "3"]);
+    for (i, k) in ["1", "2", "3"].into_iter().enumerate() {
+        f.deliver(&window(&[k], &[], &[]), &[10 + i as u64]).await;
+    }
+    drain(&mut rx);
+    // 1 was evicted by 3; an update delivers it again (and evicts 2, the least recent).
+    f.deliver(&window(&[], &["1"], &[]), &[20]).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Update, &["1"])])],
+        "an update of an evicted key is a plain update"
+    );
+    f.checker.delete_rows(REL, &["1", "2", "3"]);
+    f.deliver(&window(&[], &[], &["1"]), &[21]).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &["1"])])],
+        "a key delivered again counts for deletes"
+    );
+    f.deliver(&window(&[], &[], &["2"]), &[22]).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![evicted()],
+        "an evicted key's delete can't be decided: the viewer refetches"
+    );
+    f.deliver(&window(&[], &[], &["3"]), &[23]).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &["3"])])],
+        "after the resync, remembered keys behave as before"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_evicted_key_resync_that_finds_a_full_sink_is_owed_as_overflow() {
+    let mut f = fx_bounded(1);
+    f.checker.hide(Some("reader"), &[]);
+    let (tx, mut rx) = mpsc::channel(2);
+    f.filter.add(1, role("reader"), false, tx);
+    f.checker.insert_rows(REL, &["1", "2"]);
+    f.deliver(&window(&["1"], &[], &[]), &[10]).await;
+    f.deliver(&window(&["2"], &[], &[]), &[11]).await;
+    // The sink is full: the evicted key's resync is dropped and owed.
+    f.checker.delete_rows(REL, &["1"]);
+    f.deliver(&window(&[], &[], &["1"]), &[12]).await;
+    assert_eq!(drain(&mut rx).len(), 2, "the two inserts only");
+    f.checker.insert_rows(REL, &["3"]);
+    f.deliver(&window(&["3"], &[], &[]), &[13]).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![ChannelEvent::Resync {
+            reason: "overflow".into()
+        }]
+    );
+}
+
+// The model: a viewer of a bounded filter against one of an unbounded filter, over the same
+// rows. Its client applies the events it gets; on a resync it reads the page again (every row
+// it can see) and reports that page as its view, as Studio does after a resync or a join.
+// Bounding the set may cost resyncs, never a key it can't see, and never a stale row the
+// unbounded viewer wouldn't also have.
+
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    Insert(u8),
+    Update(u8),
+    Delete(u8),
+    Hide(u8),
+    Unhide(u8),
+}
+
+fn op() -> impl Strategy<Value = Op> {
+    let k = 0u8..10;
+    prop_oneof![
+        3 => k.clone().prop_map(Op::Insert),
+        2 => k.clone().prop_map(Op::Update),
+        3 => k.clone().prop_map(Op::Delete),
+        1 => k.clone().prop_map(Op::Hide),
+        1 => k.prop_map(Op::Unhide),
+    ]
+}
+
+/// Applies a viewer's events to its client's rows.
+fn apply(rows: &mut HashSet<String>, events: &[ChannelEvent]) {
+    for e in events {
+        let ChannelEvent::Rows(changes) = e else {
+            panic!("unexpected event {e:?}");
+        };
+        for c in changes {
+            let keys = c
+                .keys
+                .clone()
+                .expect("an RLS viewer gets keyed changes only");
+            match c.op {
+                ChangeOp::Insert | ChangeOp::Update => rows.extend(keys),
+                ChangeOp::Delete => {
+                    for k in keys {
+                        rows.remove(&k);
+                    }
+                }
+                ChangeOp::Changed => panic!("no changed in the model"),
+            }
+        }
+    }
+}
+
+fn inserted_or_updated(events: &[ChannelEvent]) -> Vec<Change> {
+    events
+        .iter()
+        .flat_map(|e| match e {
+            ChannelEvent::Rows(changes) => changes.clone(),
+            _ => vec![],
+        })
+        .filter(|c| matches!(c.op, ChangeOp::Insert | ChangeOp::Update))
+        .collect()
+}
+
+async fn run_bounded_model(windows: Vec<Vec<Op>>) -> Result<(), TestCaseError> {
+    const BOUND: usize = 3;
+    let checker = FakeChecker::new();
+    checker.hide(Some("reader"), &[]);
+    let filter = |max: usize| {
+        TableFilter::new(
+            target(),
+            relation(REL, "items"),
+            checker.clone(),
+            Limiter::new(CONCURRENCY),
+            VisibilityCache::new(Duration::from_millis(100)),
+            FilterSettings {
+                delivered_max: max,
+                ..FilterSettings::default()
+            },
+        )
+    };
+    let mut reference = filter(usize::MAX);
+    let mut bounded = filter(BOUND);
+    let (tx, mut ref_rx) = mpsc::channel(256);
+    reference.add(1, role("reader"), false, tx);
+    let (tx, mut b_rx) = mpsc::channel(256);
+    bounded.add(1, role("reader"), false, tx);
+
+    let mut exists: HashSet<String> = HashSet::new();
+    let mut hidden: HashSet<String> = HashSet::new();
+    let mut ref_rows: HashSet<String> = HashSet::new();
+    let mut b_rows: HashSet<String> = HashSet::new();
+    for (xid, ops) in windows.into_iter().enumerate() {
+        let (mut ins, mut upd, mut del) = (vec![], vec![], vec![]);
+        let mut used = HashSet::new();
+        for op in ops {
+            let (Op::Insert(k) | Op::Update(k) | Op::Delete(k) | Op::Hide(k) | Op::Unhide(k)) = op;
+            let k = k.to_string();
+            if !used.insert(k.clone()) {
+                continue;
+            }
+            let key = ks(&k);
+            match op {
+                Op::Insert(_) if !exists.contains(&key) => {
+                    checker.insert_rows(REL, &[&k]);
+                    exists.insert(key);
+                    ins.push(k);
+                }
+                Op::Insert(_) | Op::Update(_) => {
+                    if exists.contains(&key) {
+                        upd.push(k);
+                    }
+                }
+                Op::Delete(_) => {
+                    // A key that doesn't exist (or never reached the viewer) too.
+                    checker.delete_rows(REL, &[&k]);
+                    exists.remove(&key);
+                    del.push(k);
+                }
+                Op::Hide(_) | Op::Unhide(_) => {
+                    if matches!(op, Op::Hide(_)) {
+                        checker.hide(Some("reader"), &[&k]);
+                        hidden.insert(key.clone());
+                    } else {
+                        checker.unhide(Some("reader"), &[&k]);
+                        hidden.remove(&key);
+                    }
+                    if exists.contains(&key) {
+                        upd.push(k);
+                    }
+                }
+            }
+        }
+        let w = RelWindow {
+            rel: REL,
+            changed: false,
+            inserts: ins.iter().map(|k| texts(k)).collect(),
+            updates: upd.iter().map(|k| texts(k)).collect(),
+            deletes: del.iter().map(|k| texts(k)).collect(),
+        };
+        let xid = 100 + xid as u64;
+        reference.deliver(&w, &[xid], Instant::now()).await;
+        bounded.deliver(&w, &[xid], Instant::now()).await;
+        let visible: HashSet<String> = exists.difference(&hidden).cloned().collect();
+
+        let r = drain(&mut ref_rx);
+        apply(&mut ref_rows, &r);
+        let b = drain(&mut b_rx);
+        if b == vec![evicted()] {
+            // The client reads its page again and reports it.
+            b_rows = visible.clone();
+            let mut page: Vec<String> = b_rows.iter().cloned().collect();
+            page.sort();
+            bounded.view(1, page).await;
+            prop_assert_eq!(drain(&mut b_rx), vec![]);
+        } else {
+            prop_assert_eq!(
+                inserted_or_updated(&b),
+                inserted_or_updated(&r),
+                "the same checks release the same keys"
+            );
+            apply(&mut b_rows, &b);
+        }
+        for c in inserted_or_updated(&b) {
+            for k in c.keys.unwrap() {
+                prop_assert!(visible.contains(&k), "{k} released but not visible");
+            }
+        }
+        prop_assert!(bounded.delivered_len(1).unwrap() <= BOUND);
+        let stale = |rows: &HashSet<String>| -> HashSet<String> {
+            rows.difference(&visible).cloned().collect()
+        };
+        prop_assert!(
+            stale(&b_rows).is_subset(&stale(&ref_rows)),
+            "the bounded viewer holds stale rows {:?} the unbounded one doesn't ({:?})",
+            stale(&b_rows),
+            stale(&ref_rows)
+        );
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    #[test]
+    fn a_bounded_delivered_set_costs_only_resyncs(
+        windows in proptest::collection::vec(proptest::collection::vec(op(), 1..4), 1..40),
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(run_bounded_model(windows))?;
+    }
 }

@@ -28,6 +28,8 @@ For each (branch, Postgres database) with a viewer, one realtime instance holds 
 
 Before a key reaches a viewer, realtime checks that the viewer could read that row: viewers are grouped by acting identity, and each group runs one short read-only query (2 s timeout) as that identity against pooled `authenticator` connections (at most 4 per compute per instance). Owner viewers' checks go to the orchestrator, because realtime never holds owner credentials. A check that fails or times out sends that group a keyless `changed`, never keys. The invariant is that a viewer receives a key only if, at the moment of the check, their own read would return that row.
 
+A delete reaches a viewer under row-level security only for a key on its screen or delivered to it. Realtime remembers the last 4,096 keys delivered to each viewer. A delete of an older key that may have been delivered sends that viewer `resync` (reason `evicted`), and Studio reads the page again. A storage channel forgets those keys instead, so a missed delete shows on the next reload.
+
 ## Ports
 
 Realtime listens on two ports inside the stack's network. Neither is published on the host.

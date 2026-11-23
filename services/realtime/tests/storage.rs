@@ -1506,3 +1506,33 @@ async fn storage_join_refused_by_the_orchestrator_is_forbidden_and_revocation_le
         "{e}"
     );
 }
+
+// --- #319: a bucket filter forgets an evicted key ---------------------------------------------
+
+/// A bucket filter's viewer forgets the key its bounded delivered set evicts, as it forgets a
+/// trimmed carried key (B4): the evicted key's later delete sends nothing, not even a resync,
+/// since every bucket's windows reach this filter and a resync on another bucket's delete would
+/// be a frame not derived from this bucket. The worst case is a missed frame.
+#[tokio::test(start_paused = true)]
+async fn a_bucket_filter_forgets_an_evicted_key() {
+    let mut f = fx_with(
+        Limiter::new(8),
+        FilterSettings {
+            delivered_max: 1,
+            ..FilterSettings::default()
+        },
+    );
+    let mut rx = f.viewer(1, role("authenticated"), false);
+    f.deliver(&window(&[O1], &[], &[])).await;
+    f.deliver(&window(&[O3], &[], &[])).await;
+    assert_eq!(f.filter.delivered_len(1), Some(1));
+    drain(&mut rx);
+    f.checker.delete_rows(REL, &[O1, O3]);
+    f.deliver(&window(&[], &[], &[O1])).await;
+    assert_eq!(drain(&mut rx), vec![], "O1 was evicted: forgotten");
+    f.deliver(&window(&[], &[], &[O3])).await;
+    assert_eq!(
+        drain(&mut rx),
+        vec![ChannelEvent::Rows(vec![keyed(ChangeOp::Delete, &[O3])])]
+    );
+}

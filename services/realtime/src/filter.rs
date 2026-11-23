@@ -23,6 +23,11 @@
 //! - Sinks are written with `try_send`, never awaited (T7's audit rule). A full sink drops that
 //!   viewer's event; the next delivery to it sends `resync {reason: "overflow"}` instead of that
 //!   window's rows (the refetch covers them), until a resync gets through.
+//! - #319: each viewer remembers at most [`FilterSettings::delivered_max`] delivered keys, the
+//!   least recently delivered evicted first. An RLS viewer's delete of a key that may have been
+//!   evicted (not on its screen, not remembered) sends `resync {reason: "evicted"}` instead of
+//!   that window's rows: the viewer refetches and reports its screen again, as after a join.
+//!   A bucket filter forgets an evicted key instead (see below).
 //! - S30: windows are delivered in order; one still unresolved [`crate::check::WINDOW_DEADLINE`]
 //!   after it closed is sent as keyless `changed`.
 //! - The R12 cache is flushed on every window (the source flushes it for the whole database).
@@ -64,6 +69,9 @@
 //! - A key its read no longer returns (an update that moved the object to another bucket or hid
 //!   it, a re-check) leaves the viewer's view and delivered sets, so that object's later delete
 //!   never reaches it; so does a key once its keyed delete is sent.
+//! - #319: a key its bounded delivered set evicts is forgotten (its later delete sends nothing,
+//!   not even a resync: a resync on another bucket's delete would be a frame not derived from
+//!   this bucket).
 //! - B3: a view frame's check runs without the filter, so windows may be delivered meanwhile.
 //!   [`TableFilter::set_view`] confirms no key that a delivery since the check was made brought
 //!   or forgot, and nothing after a keyless window since. The filter logs those keys only while
@@ -78,12 +86,14 @@
 //! and only a key whose conversion is in that answer is released.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chelabase_query::realtime::{Relation, key_string, key_text_allowed, keys_supported};
 use futures_util::future::join_all;
+use lru::LruCache;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Instant;
@@ -112,10 +122,12 @@ pub struct FilterSettings {
     pub retry_max: Duration,
     /// A bucket filter logs at most this many keys for view checks in flight ([`VIEW_LOG`]).
     pub view_log: usize,
+    /// Each viewer remembers at most this many delivered keys ([`DELIVERED_MAX`]).
+    pub delivered_max: usize,
 }
 
 impl Default for FilterSettings {
-    /// 8, 2 s, 50 ms, 5 s, 1000, 10, 250 ms, 5 s, 4096.
+    /// 8, 2 s, 50 ms, 5 s, 1000, 10, 250 ms, 5 s, 4096, 4096.
     fn default() -> Self {
         Self {
             concurrency: CONCURRENCY,
@@ -127,6 +139,7 @@ impl Default for FilterSettings {
             retry_first: RETRY_FIRST,
             retry_max: RETRY_MAX,
             view_log: VIEW_LOG,
+            delivered_max: DELIVERED_MAX,
         }
     }
 }
@@ -138,11 +151,92 @@ struct Viewer {
     sink: mpsc::Sender<ChannelEvent>,
     /// R19: the keys on its screen.
     view: HashSet<String>,
-    /// Keys delivered to it (inserted or updated) and not deleted since.
-    delivered: HashSet<String>,
+    /// Keys delivered to it (inserted or updated) and not deleted since, bounded (#319).
+    delivered: Delivered,
     /// An event was dropped on a full sink (here, or a status the source dropped): the next
     /// delivery is a resync.
     overflowed: Arc<AtomicBool>,
+    /// A delete of a key its delivered set may have evicted: the next delivery is
+    /// `resync {reason: "evicted"}` instead of its rows.
+    evicted: bool,
+}
+
+/// One viewer's delivered set (#319): at most `max` keys, the least recently delivered evicted
+/// first. A table filter's set also remembers which keys it evicted, as bits of their hashes in
+/// a fixed filter (no false negatives; a false positive costs a resync), so a delete it can no
+/// longer decide is a resync, never a missed or a guessed delete. A bucket filter's set just
+/// forgets an evicted key (as B4 forgets a trimmed one): a resync on a delete of any bucket
+/// would be a frame not derived from this bucket (the storage invariant).
+struct Delivered {
+    keys: LruCache<String, ()>,
+    max: usize,
+    /// Set once something was evicted (table filters only); cleared by a resync.
+    evicted: Option<Box<EvictedBits>>,
+    hasher: RandomState,
+}
+
+/// Bits in [`Delivered`]'s filter of evicted keys (1 KiB per viewer that ever evicted).
+const EVICTED_BITS: usize = 8192;
+type EvictedBits = [u64; EVICTED_BITS / 64];
+
+impl Delivered {
+    fn new(max: usize) -> Self {
+        Self {
+            // Unbounded: the bound is kept here, so nothing is allocated up front.
+            keys: LruCache::unbounded(),
+            max: max.max(1),
+            evicted: None,
+            hasher: RandomState::new(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+    fn contains(&self, k: &str) -> bool {
+        self.keys.contains(k)
+    }
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.keys.iter().map(|(k, _)| k)
+    }
+    fn bit(&self, k: &str) -> (usize, u64) {
+        let h = self.hasher.hash_one(k) as usize % EVICTED_BITS;
+        (h / 64, 1 << (h % 64))
+    }
+    /// Delivers `k` (the most recent now); past the bound the least recent key is evicted, and
+    /// remembered when `remember` (a table filter).
+    fn insert(&mut self, k: &str, remember: bool) {
+        self.keys.put(k.to_owned(), ());
+        while self.keys.len() > self.max {
+            let Some((old, ())) = self.keys.pop_lru() else {
+                break;
+            };
+            if remember {
+                let (word, mask) = self.bit(&old);
+                self.evicted
+                    .get_or_insert_with(|| Box::new([0; EVICTED_BITS / 64]))[word] |= mask;
+            }
+        }
+    }
+    fn remove(&mut self, k: &str) {
+        self.keys.pop(k);
+    }
+    /// Whether `k` may have been evicted (a key never delivered may say yes too).
+    fn maybe_evicted(&self, k: &str) -> bool {
+        self.evicted.as_ref().is_some_and(|bits| {
+            let (word, mask) = self.bit(k);
+            bits[word] & mask != 0
+        })
+    }
+    /// A resync went out: the viewer reads its page again and reports its screen (as after a
+    /// join), so what was evicted before no longer needs deciding.
+    fn resynced(&mut self) {
+        self.evicted = None;
+    }
+    /// A changed relation: nothing delivered under the old one counts.
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.evicted = None;
+    }
 }
 
 /// One visibility check of a viewer's keys, made under the filter and run without it
@@ -223,6 +317,8 @@ pub const RETRY_FIRST: Duration = Duration::from_millis(250);
 pub const RETRY_MAX: Duration = Duration::from_secs(5);
 /// A bucket filter's log of keys touched while view checks are in flight holds at most this many.
 pub const VIEW_LOG: usize = 4096;
+/// Each viewer's delivered set holds at most this many keys (the least recently delivered go).
+pub const DELIVERED_MAX: usize = 4096;
 
 /// What a key comes to in a bucket filter's pending work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,8 +617,9 @@ impl TableFilter {
                 identity,
                 sink,
                 view: HashSet::new(),
-                delivered: HashSet::new(),
+                delivered: Delivered::new(self.settings.delivered_max),
                 overflowed,
+                evicted: false,
             },
         );
     }
@@ -769,7 +866,7 @@ impl TableFilter {
                     let Some(v) = self.viewers.get(id) else {
                         continue;
                     };
-                    for k in v.view.iter().chain(&v.delivered) {
+                    for k in v.view.iter().chain(v.delivered.iter()) {
                         if let Some(texts) = parse_key(k, &self.relation) {
                             p.push(&texts, KeyOp::Recheck);
                         }
@@ -803,6 +900,11 @@ impl TableFilter {
     /// Only the retry's own backoff sets it: no window brings it forward.
     pub fn retry_at(&self) -> Option<Instant> {
         self.retry.map(|(at, _)| at)
+    }
+
+    /// How many delivered keys the viewer's filter remembers (diagnostics and tests).
+    pub fn delivered_len(&self, viewer: u64) -> Option<usize> {
+        self.viewers.get(&viewer).map(|v| v.delivered.len())
     }
 
     /// Every group's carried keys, as key strings (diagnostics and tests).
@@ -967,6 +1069,9 @@ impl TableFilter {
             for k in c.deletes.iter().flatten() {
                 if v.view.contains(k) || v.delivered.contains(k) {
                     push_delete(k, &mut keyed_deletes);
+                } else if v.delivered.maybe_evicted(k) {
+                    // #319: it may have been delivered; refetching is the only safe answer.
+                    v.evicted = true;
                 }
             }
             // W26: a row on its screen that its read no longer returns.
@@ -985,7 +1090,7 @@ impl TableFilter {
             }
         }
         for k in c.inserts.iter().chain(&c.updates) {
-            v.delivered.insert(k.clone());
+            v.delivered.insert(k, !scoped);
         }
         for k in &keyed_deletes {
             v.delivered.remove(k);
@@ -1037,8 +1142,27 @@ impl TableFilter {
             match v.sink.try_send(ChannelEvent::Resync {
                 reason: "overflow".into(),
             }) {
-                Ok(()) => v.overflowed.store(false, Ordering::SeqCst),
+                Ok(()) => {
+                    v.overflowed.store(false, Ordering::SeqCst);
+                    v.evicted = false;
+                    v.delivered.resynced();
+                }
                 Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {}
+            }
+            return;
+        }
+        if v.evicted {
+            // #319: the refetch covers this window's rows too.
+            match v.sink.try_send(ChannelEvent::Resync {
+                reason: "evicted".into(),
+            }) {
+                Ok(()) => {
+                    v.evicted = false;
+                    v.delivered.resynced();
+                }
+                // Owed as an overflow resync, which covers this one.
+                Err(TrySendError::Full(_)) => v.overflowed.store(true, Ordering::SeqCst),
+                Err(TrySendError::Closed(_)) => {}
             }
             return;
         }

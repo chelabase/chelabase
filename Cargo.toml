@@ -140,6 +140,8 @@ tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "38
 pg_query = "6.2.1"
 tokio-util = "0.7.19"
 moka = { version = "0.12.16", features = ["future", "sync"] }
+# Realtime #319: each viewer's bounded delivered set (already in the tree; 0.18 keeps one lru).
+lru = "0.18.5"
 hmac = "0.13.0"
 pbkdf2 = "0.13.0"
 # RT1 S7: rustls TLS for Valkey (platform mode; `CHELABASE_VALKEY_TLS=on`), its crypto from the
