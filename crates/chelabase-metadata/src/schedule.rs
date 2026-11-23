@@ -16,7 +16,7 @@
 //! `next_runs_goldens` keeps the outputs both agreed on, and the zone-name fixture keeps
 //! `chrono-tz` 0.10.4's list. jiff's bundled tzdata (2026f) is the accepted source since.
 
-use chelabase_time::{Timestamp, TimestampExt};
+use chelabase_time::Timestamp;
 use tracing::warn;
 
 /// A schedule's part a caller got wrong ([`Schedule::parse`]).
@@ -93,20 +93,12 @@ impl Schedule {
     }
 
     /// Like [`Schedule::next_after`]: `Ok(None)` when the cron never fires again (croner's
-    /// search limit), `Err` with the reason when the search itself failed (croner's other
-    /// errors, or an instant outside jiff's range).
+    /// search limit), `Err` with croner's reason when the search itself failed.
     pub fn try_next_after(&self, after: Timestamp) -> Result<Option<Timestamp>, String> {
-        let start = jiff::Timestamp::from_nanosecond(after.unix_nanos())
-            .map_err(|e| format!("{} is out of range ({e})", after.to_rfc3339_auto()))?
-            .to_zoned_datetime(self.tz.clone());
+        let start = after.to_jiff().to_zoned_datetime(self.tz.clone());
         let found = never_fires_is_none(self.cron.find_next_occurrence(&start, false))
             .map_err(|e| e.to_string())?;
-        found
-            .map(|next| {
-                let ns = next.timestamp().as_nanosecond();
-                from_unix_nanos(ns).ok_or_else(|| format!("{} is out of range", next.timestamp()))
-            })
-            .transpose()
+        Ok(found.map(|next| Timestamp::from_jiff(next.timestamp())))
     }
 
     fn zone_name(&self) -> &str {
@@ -122,14 +114,6 @@ fn bundled_zone(name: &str) -> Option<jiff::tz::TimeZone> {
     }
     let tz = jiff::tz::TimeZoneDatabase::bundled().get(name).ok()?;
     (tz.iana_name() == Some(name)).then_some(tz)
-}
-
-/// The instant `ns` nanoseconds after the Unix epoch, in whichever type backs [`Timestamp`].
-fn from_unix_nanos(ns: i128) -> Option<Timestamp> {
-    const NS: i128 = 1_000_000_000;
-    let secs = i64::try_from(ns.div_euclid(NS)).ok()?;
-    let sub = u64::try_from(ns.rem_euclid(NS)).ok()?;
-    Timestamp::from_unix_seconds(secs)?.checked_add(std::time::Duration::from_nanos(sub))
 }
 
 /// Only croner's search limit means "no occurrence"; any other error is a failure.
@@ -176,7 +160,7 @@ pub const NO_UPCOMING_TIME: &str = "no upcoming time";
 pub enum ScheduleProblem {
     Invalid(ScheduleError),
     NoUpcomingTime,
-    /// The search error's text (croner's, or an instant outside the supported range).
+    /// croner's search error text.
     SearchFailed(String),
 }
 
@@ -230,6 +214,7 @@ pub fn advance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chelabase_time::TimestampExt;
 
     fn at(s: &str) -> Timestamp {
         Timestamp::parse_rfc3339(s).unwrap()
@@ -480,7 +465,7 @@ mod tests {
         let s = Schedule::parse("* * * * *", "UTC").unwrap();
         assert_eq!(s.next_after(at("2026-01-01T00:00:59.999999999Z")), Some(at("2026-01-01T00:01:00Z")));
         assert_eq!(s.next_after(at("1969-12-31T23:59:30.5Z")), Some(at("1970-01-01T00:00:00Z")));
-        assert_eq!(from_unix_nanos(-1), Some(at("1969-12-31T23:59:59.999999999Z")));
+        assert_eq!(s.next_after(at("1969-12-31T23:59:59.999999999Z")), Some(at("1970-01-01T00:00:00Z")));
     }
 
     /// (cron, zone, start) and the next three runs both backends agreed on before croner's
