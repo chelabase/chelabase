@@ -664,7 +664,7 @@ mod tests {
     use chelabase_types::DatabaseId;
 
     use super::*;
-use chelabase_time::Timestamp;
+    use chelabase_time::Timestamp;
     use crate::fakes::{
         FRESH_HEAD, FakeWorker, Journal, STORAGE_CAUSE, entries, pending_branch, position,
         ready_database, worker,

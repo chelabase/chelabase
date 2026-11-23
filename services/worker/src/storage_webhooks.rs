@@ -861,6 +861,23 @@ mod tests {
         }
     }
 
+    // AC 9: the age test is signed. An event (or a failing-since) stamped after `now`, as a
+    // clock step back leaves it, is young, never old.
+    #[test]
+    fn a_time_after_now_is_never_aged() {
+        let now = at(1_700_000_000);
+        let h = chelabase_time::hours;
+        assert!(!aged(now, now + h(1), Duration::ZERO));
+        assert!(!aged(now, now + h(1), MAX_AGE));
+        assert!(!aged(now, now + h(100), MAX_AGE));
+        assert!(aged(now, now - h(24), MAX_AGE));
+        assert!(!aged(now, now - h(24) + chelabase_time::seconds(1), MAX_AGE));
+        assert_eq!(
+            decide(false, 1, now + h(1), now, Some(now + h(100)), 0.0),
+            Next::Retry(Duration::from_secs(5))
+        );
+    }
+
     #[test]
     fn decide_retries_then_drops_after_a_day_and_disables_after_three() {
         let t0 = at(1_700_000_000);

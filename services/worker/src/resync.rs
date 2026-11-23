@@ -422,7 +422,7 @@ const ROLE_SELECT: &str = "SELECT 'r',
                     WHERE s.member = a.oid AND s.roleid = 'neon_superuser'::regrole)),
        a.rolinherit,
        a.rolconnlimit,
-       coalesce(CASE WHEN isfinite(a.rolvaliduntil)
+       coalesce(CASE WHEN isfinite(a.rolvaliduntil) AND a.rolvaliduntil <= '9999-12-30 22:00:00+00'::timestamptz
                      THEN (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END, ''),
        a.rolbypassrls,
        coalesce((SELECT string_agg(encode(convert_to(g.rolname, 'UTF8'), 'hex')
@@ -536,12 +536,14 @@ fn parse_memberships(field: &str) -> Option<Memberships> {
     })
 }
 
-/// The latest microsecond a VALID UNTIL is read as an instant: `9999-12-30T22:00:00.999999Z`,
-/// the end of what the time type holds (`chelabase_time` names no constant for it). A finite
-/// expiry Postgres accepts past it (`9999-12-31`, `294276-01-01`) is read as none, as
-/// `infinity` is, so the catalog still parses and resync converges; the role is never taken as
-/// expired.
-const LAST_VALID_UNTIL_MICROS: i128 = 253_402_207_200_999_999;
+/// The latest microsecond a VALID UNTIL is read as an instant: `9999-12-30T22:00:00Z`, the last
+/// instant the time type's `from_unix_micros` accepts (`chelabase_time` names no constant for
+/// it; a test pins this to the jiff backing). A finite expiry Postgres accepts past it
+/// (`9999-12-31`, `294276-01-01`) is read as none, as `infinity` is, so the catalog still
+/// parses and resync converges; the role is never taken as expired. The catalog SELECTs apply
+/// the same bound (`'9999-12-30 22:00:00+00'`), so Postgres never has to print a value past `i64`
+/// microseconds.
+const LAST_VALID_UNTIL_MICROS: i128 = 253_402_207_200_000_000;
 
 /// A VALID UNTIL in whole microseconds since the epoch, as Postgres prints it: the instant, or
 /// none for one past [`LAST_VALID_UNTIL_MICROS`]. `None` for anything else, a far past
@@ -3604,7 +3606,7 @@ mod tests {
 
     // A finite expiry Postgres accepts (`9999-12-31`, `294276-01-01`) that the time type can't
     // hold counts as no expiry, as `infinity` does: the line parses, nothing is re-applied
-    // forever and the role is never taken as expired. Independent of the backing type's range.
+    // forever and the role is never taken as expired.
     #[test]
     fn a_far_future_observed_expiry_does_not_block_resync() {
         // 9999-12-31T00:00:00Z, 294276-01-01 (past `i64` microseconds), and a huge one.
@@ -3620,5 +3622,23 @@ mod tests {
         assert_eq!(observed.roles[0].valid_until, None);
         let attributes = observed.roles[0].attributes();
         assert_eq!(attributes_sql(&wanted(&attributes), &observed.roles[0]), None);
+    }
+
+    // The bound is the last instant the jiff-backed time type's constructor accepts, not just
+    // what the parser's own comparison lets through: one microsecond more is read as none.
+    #[test]
+    fn the_expiry_bound_is_the_last_instant_the_jiff_backing_holds() {
+        use chelabase_time::jiff_backed::Timestamp as J;
+        let last = i64::try_from(LAST_VALID_UNTIL_MICROS).unwrap();
+        assert!(<J as TimestampExt>::from_unix_micros(last).is_some());
+        assert!(<J as TimestampExt>::from_unix_micros(last + 1).is_none());
+        assert_eq!(parse_valid_until(&(last + 1).to_string()), Some(None));
+        let seen = role("r", None);
+        let line = role_line(&seen).replacen("|-1||", &format!("|-1|{}|", last + 1), 1);
+        assert_eq!(parse_observed(&line).unwrap().roles[0].valid_until, None);
+        // The SELECTs carry the same bound, so Postgres never casts a value past `i64`
+        // microseconds (`bigint out of range`) before the parser reads it.
+        assert!(ROLE_SELECT.contains("<= '9999-12-30 22:00:00+00'::timestamptz"));
+        assert!(crate::member_roles::member_catalog_sql().contains("> '9999-12-30 22:00:00+00'::timestamptz"));
     }
 }

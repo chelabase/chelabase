@@ -409,6 +409,29 @@ async fn a_personal_login_reaches_only_its_safe_set_through_set_role() {
     .await;
 }
 
+// A personal login whose VALID UNTIL was set past what the time type holds (`9999-12-31`,
+// `294276-01-01`) is read as having none: the member catalog SELECT must not raise `bigint out
+// of range`, and the reconcile sets the record's expiry back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack on the members hub images (end-of-step pass)"]
+async fn a_far_future_valid_until_on_a_login_is_set_back() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        fx.create_login(m, "pl_far", "pl-far-pass").await;
+        fx.reconcile(fx.main).await;
+        for until in ["9999-12-31 00:00:00+00", "294276-01-01 00:00:00+00"] {
+            fx.sql(&fx.ep, &format!("ALTER ROLE pl_far VALID UNTIL '{until}';")).await;
+            fx.reconcile(fx.main).await;
+            let back = fx
+                .sql(&fx.ep, "SELECT rolvaliduntil < now() + interval '91 days' FROM pg_roles WHERE rolname = 'pl_far';")
+                .await;
+            assert_eq!(back.trim(), "t", "{until} set back to the record's");
+        }
+    })
+    .await;
+}
+
 /// D2, S1: a new branch carries no personal row from its parent; its login comes from its own
 /// reconcile, with the record's verifier, marked.
 #[tokio::test(flavor = "multi_thread")]

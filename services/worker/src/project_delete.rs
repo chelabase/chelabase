@@ -103,7 +103,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-use chelabase_time::{Timestamp, TimestampExt};
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::app_users::tests::setup;
 
     fn set_deleting(s: &crate::app_users::tests::Setup) {

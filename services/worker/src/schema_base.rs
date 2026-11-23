@@ -542,7 +542,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-use chelabase_time::{Timestamp, TimestampExt};
+    use chelabase_time::{Timestamp, TimestampExt};
     use crate::fakes::{
         FakeWorker, Journal, entries, pending_branch, position, ready_branch, ready_database,
         worker,
