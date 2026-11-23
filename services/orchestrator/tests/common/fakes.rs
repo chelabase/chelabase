@@ -4544,6 +4544,12 @@ impl orchestrator::members::MembersPort for FakeMetadata {
                 && m.status == MemberStatus::Removed
                 && (m.identity_user_id == identity_user_id || m.email.as_deref() == Some(email.as_str()))
         });
+        // #315, as the store under the tenant lock: the flag counts only while the actor is
+        // still an active tenant admin of the tenant.
+        let readmit_removed = readmit_removed
+            && self.members.lock().unwrap().iter().any(|m| {
+                m.id == actor && m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin
+            });
         if removed && !readmit_removed {
             return Err(AccessWriteError::RemovedMember);
         }

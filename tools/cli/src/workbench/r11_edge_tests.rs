@@ -147,11 +147,11 @@ fn every_nats_subject_is_quoted_and_well_formed() {
 fn computes_off_the_compute_network_are_picked_for_removal() {
     use super::commands::computes_off_network;
     let net = super::env::compute_network("chelabase-feat-x");
-    assert_eq!(net, "chelabase-feat-x_compute");
-    let ps = "chelabase-feat-x-ep-old\tchelabase-feat-x_default,chelabase-feat-x_control\n\
-              /chelabase-feat-x-ep-new\tchelabase-feat-x_compute,chelabase-feat-x_control\n\
+    assert_eq!(net, "chelabase-feat-x_compute-internal");
+    let ps = "chelabase-feat-x-ep-old\tchelabase-feat-x_default,chelabase-feat-x_compute\n\
+              /chelabase-feat-x-ep-new\tchelabase-feat-x_compute-internal,chelabase-feat-x_control-internal\n\
               chelabase-feat-x-ep-stopped\t\n\
-              chelabase-feat-x-ep-near\tchelabase-feat-x_compute2\n\
+              chelabase-feat-x-ep-near\tchelabase-feat-x_compute-internal2\n\
               \n";
     assert_eq!(
         computes_off_network(ps, &net),

@@ -53,9 +53,11 @@ Self-hosted Chelabase runs on one machine with Docker Compose.
 
 ### Requirements
 
-- Docker Engine 26.0 or newer (the install mounts volume sub-paths).
+- Docker Engine 28.0 or newer (the install mounts volume sub-paths, and the databases' internal networks use the engine's isolated bridge mode).
 - Docker Compose 2.30 or newer. Check with `docker compose version`.
 - A checkout of this repository, for `infra/compose`.
+
+Databases have no outbound network access by default: they can't reach the host, your network or the internet. To let them connect to hosts you list (for `postgres_fdw`, `dblink` or a subscription), turn on the `compute-egress` profile; see [Compute egress](https://docs.chelabase.com/self-hosting/compute-egress/).
 
 Running Chelabase needs nothing else on the host. The [Install](https://docs.chelabase.com/self-hosting/install/#requirements) page lists what the machine needs.
 
@@ -83,7 +85,7 @@ The defaults run on one machine and serve Studio at <http://studio.chelabase.loc
 
 After the claim, sign-up is closed: you invite everyone else, or switch open sign-up on and approve requests.
 
-The [Install](https://docs.chelabase.com/self-hosting/install/) page covers the rest: the settings, choosing your own secrets, your own domain with TLS behind a reverse proxy ([Hosts](https://docs.chelabase.com/self-hosting/hosts/)), email (SMTP), upgrades, and stopping or uninstalling.
+The [Install](https://docs.chelabase.com/self-hosting/install/) page covers the rest: the settings, choosing your own secrets, your own domain with TLS behind a reverse proxy ([Hosts](https://docs.chelabase.com/self-hosting/hosts/)), email (SMTP), upgrades (including the first one onto the isolated networks), and stopping or uninstalling.
 
 ## First database
 

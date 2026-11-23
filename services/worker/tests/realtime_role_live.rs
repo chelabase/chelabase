@@ -371,6 +371,8 @@ async fn compute_stopping_is_published_before_a_reset_stops_the_compute() {
     }, DockerSettings {
         network: config.compute_network.clone(),
         control_network: config.compute_control_network.clone(),
+        legacy_networks: Vec::new(),
+        egress_dns: None,
     })
     .expect("a compute backend for the stack's computes (CHELABASE_STACK)");
     let ep_slot = Arc::new(Mutex::new(None));

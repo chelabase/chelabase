@@ -26,6 +26,10 @@ pub struct AppBranchInfo {
     pub target_branch_id: Uuid,
     /// `None` while the target has no running compute or no sync role.
     pub sync: Option<SyncTarget>,
+    /// The project's name, shown in its app users' mail. `None` from an orchestrator that
+    /// doesn't send it: the mail then names the service's default.
+    #[serde(default)]
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

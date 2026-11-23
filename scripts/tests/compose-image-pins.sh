@@ -30,11 +30,12 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner)
-# Images added before their first release (none right now).
+images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner compute-egress)
+# Images added before their first release: compute-egress (compute-network-reach), behind the
+# compose profile `compute-egress`. Its first `pin-images.sh` run pins it and drops it from here.
 unpublished=()
 # Every profile of the base file, so a render sees every service.
-profiles=(--profile services)
+profiles=(--profile services --profile compute-egress)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }

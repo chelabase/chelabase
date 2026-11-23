@@ -50,6 +50,7 @@ rust_reads=(
   'scripts/compute-network-e2e.sh                            self     orchestrator'
   'scripts/neon-images.sh                                    self     chelabase-neon chelabase'
   'scripts/neon-e2e.sh                                       self     chelabase'
+  'scripts/tests/fixtures/workbench-stack.env                self     chelabase'
   'services/identity/openapi.json                            self     chelabase-identity'
 )
 # The same for the web packages (their tests and builds read these; not checked by a guard).

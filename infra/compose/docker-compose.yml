@@ -21,7 +21,7 @@
 # Two services are published: the gateway (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT) and the
 # proxy's Postgres and SQL-over-HTTP ports (CHELABASE_PROXY_ADDR, CHELABASE_PROXY_PORT and
 # CHELABASE_PROXY_HTTP_PORT). Everything else talks over the project network by service name;
-# computes get their own `compute` network.
+# computes get their own internal `compute-internal` network.
 #
 # The workbench passes `-f docker-compose.yml -f docker-compose.workbench.yml --env-file
 # <state>/env/stack.env`: the overlay runs the dev loop on this file (its host-built binaries,
@@ -114,10 +114,17 @@ x-app-env: &app-env
   CHELABASE_AUTH_TRUSTED_PROXY: gateway
   CHELABASE_CONTROL_PLANE_URI: http://orchestrator:8083
   CHELABASE_COMPUTE_IMAGE: *compute-image
-  CHELABASE_COMPUTE_NETWORK: ${COMPOSE_PROJECT_NAME}_compute
-  CHELABASE_COMPUTE_CONTROL_NETWORK: ${COMPOSE_PROJECT_NAME}_control
-  CHELABASE_MEMBER_LOGIN_CIDRS: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:-10.214.0.10}/32
-  CHELABASE_REALTIME_LOGIN_CIDRS: ${CHELABASE_REALTIME_CONTROL_IP:-10.214.0.12}/32
+  CHELABASE_COMPUTE_NETWORK: ${COMPOSE_PROJECT_NAME}_compute-internal
+  CHELABASE_COMPUTE_CONTROL_NETWORK: ${COMPOSE_PROJECT_NAME}_control-internal
+  # The resolver computes are created with: the `compute-egress` service's pinned address on
+  # `compute-internal`. Set with the profile on or off; with it off nothing listens there, so a
+  # lookup of a name outside the stack times out.
+  CHELABASE_COMPUTE_EGRESS_DNS: ${CHELABASE_COMPUTE_EGRESS_IP:-10.214.8.2}
+  # The networks of releases before compute-network-reach (ordinary bridges): the worker moves
+  # computes off them and removes them once empty.
+  CHELABASE_LEGACY_COMPUTE_NETWORKS: ${COMPOSE_PROJECT_NAME}_compute,${COMPOSE_PROJECT_NAME}_control
+  CHELABASE_MEMBER_LOGIN_CIDRS: ${CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP:-10.214.4.10}/32
+  CHELABASE_REALTIME_LOGIN_CIDRS: ${CHELABASE_REALTIME_CONTROL_INTERNAL_IP:-10.214.4.12}/32
   CHELABASE_STORAGE_TOKEN_REFRESH_SECS: ${CHELABASE_STORAGE_TOKEN_REFRESH_SECS:-3600}
   CHELABASE_SECRETS_KEY: /run/chelabase/secrets/secrets/secrets.key
   CHELABASE_INTERNAL_SIGNING_KEY: /run/chelabase/secrets/gateway/internal-signing.pem
@@ -148,7 +155,7 @@ services:
   # `docker compose run --rm --no-deps --user 10001:10001 --entrypoint chelabase-init init-secrets setup-code --dir /var/lib/chelabase/secrets`
   # (the code is in the logs of the container that made it; a recreated init-secrets has none).
   init-secrets:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:fa22016812ff33513547a256397ef2ac74e9dcc8bcff8005bf52e7aa729e6264}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:a2fe0de399903c6826f82bbbb1c0ff51d564dfee6e76dea2829cc86c63794c4f}
     restart: "no"
     user: "0"
     network_mode: none
@@ -273,7 +280,7 @@ services:
   # migrated the metadata database (chelabase-init bootstrap); retries readiness on its own and
   # is never restarted, so `up --wait` reports a failure. Writes only bootstrap/ (its lock).
   init-bootstrap:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:fa22016812ff33513547a256397ef2ac74e9dcc8bcff8005bf52e7aa729e6264}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:a2fe0de399903c6826f82bbbb1c0ff51d564dfee6e76dea2829cc86c63794c4f}
     restart: "no"
     group_add: ["70"]
     command: ["chelabase-init", "bootstrap", "--out", "/run/chelabase/secrets/bootstrap"]
@@ -524,7 +531,7 @@ services:
       - --auth-token-path=/run/safekeeper-data.jwt
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - neon_safekeeper1_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
@@ -563,7 +570,7 @@ services:
       - --auth-token-path=/run/safekeeper-data.jwt
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - neon_safekeeper2_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
@@ -602,7 +609,7 @@ services:
       - --auth-token-path=/run/safekeeper-data.jwt
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - neon_safekeeper3_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
@@ -722,7 +729,7 @@ services:
         exec pageserver -D /data/.neon --auth-token-file=/run/safekeeper-data.jwt
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - neon_pageserver_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
@@ -855,7 +862,7 @@ services:
       - "${CHELABASE_PROXY_ADDR:-127.0.0.1}:${CHELABASE_PROXY_HTTP_PORT:-4444}:4444"
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - neon_proxy_tls:/tls:ro
       - {type: volume, source: secrets, target: /run/valkey-proxy.password, read_only: true, volume: {subpath: valkey/proxy.password}}
@@ -891,7 +898,7 @@ services:
   # Its image is a pinned release image like the apps' (CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick it too).
   identity:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:54d9135d79d7cca458bf739e7537cce2c1da518bb179da2f44c872048b17efb5}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:277f08e2c590f2e618e94aa7342f306002d8664639adc85165695e418e4fc216}
     restart: unless-stopped
     user: "10001:10001"
     read_only: true
@@ -963,7 +970,7 @@ services:
         condition: service_healthy
 
   orchestrator:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:909785dcf7402e657aab072f4108844929511fd8a559d1a262a6dbc2965698b7}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:867abf23de4b6d315b122805b89c53b20515edce32fd3d29ca02a6ea84b21285}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1012,15 +1019,15 @@ services:
       # functions service checks every connection). Blank: https to public addresses only.
       CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}
       CHELABASE_SERVICES_ALLOW_HTTP: ${CHELABASE_SERVICES_ALLOW_HTTP:-}
-    # The default network for the apps, `control` for its TLS connections to computes (a static
-    # address in the member-login rule), and `compute` (P4): computes call its hooks listener
+    # The default network for the apps, `control-internal` for its TLS connections to computes (a static
+    # address in the member-login rule), and `compute-internal` (P4): computes call its hooks listener
     # (8083) as `orchestrator`. `functions-control` (m4b): the functions service's internal
     # listener, for bundle uploads.
     networks:
       default: {}
-      control:
-        ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:-10.214.0.10}
-      compute: {}
+      control-internal:
+        ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_INTERNAL_IP:-10.214.4.10}
+      compute-internal: {}
       functions-control: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
@@ -1060,7 +1067,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:6ca68ddbdc930bac7388a643d064c8f2e3779a95abacc3212aa29d28c3d1b8c2}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:6cc2292bc2d34624a12af5c9bf05637bcf3dba2efe0ced0dd0d8917a2582c3b8}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1117,7 +1124,7 @@ services:
     # service runner's API.
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
       functions-control: {}
       services-control: {}
     volumes:
@@ -1170,7 +1177,7 @@ services:
   # member tokens' issuer only: the gateway serves nothing there.
   # Liveness only in its healthcheck (`/_gateway/ready` waits for its member verify key).
   gateway:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:0628a09fb6d675abced06166ac84832bf4fc90cc10749f612be59c8142d2ba20}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:840b1814a72121402e5ec2e2add9e3f3c40f7ea60e397d5c816155d624d99b1b}
     restart: unless-stopped
     # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
     environment:
@@ -1208,7 +1215,7 @@ services:
   # computes reach it directly: only the gateway's X-Forwarded-For counts
   # (CHELABASE_AUTH_TRUSTED_PROXY=gateway, ruling (e)).
   auth:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:e7b3fb18cce9c7d510925e9c6eb36c599036cc761d87a7c2d04e36e1f6a35555}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:01099e50fd017de507269f68438bc6767100d69d3c4ac836c88de94e749d48da}
     restart: unless-stopped
     # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
     environment:
@@ -1223,7 +1230,7 @@ services:
       CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/cookie.key, read_only: true, volume: {subpath: auth/cookie.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.key, read_only: true, volume: {subpath: auth/app-jwt.key}}
@@ -1242,7 +1249,7 @@ services:
         condition: service_completed_successfully
 
   rest:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:a41c1a80e23b79e3f14c0067d4f8922668caaae12e3d146f516edec725279386}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:2542f08a02be096b045d3001468526817cd80f3c1bb79edd3a024ccd7f4e26cf}
     restart: unless-stopped
     # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
     environment:
@@ -1251,7 +1258,7 @@ services:
     # P4: the data API dials computes on the compute network.
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
@@ -1270,7 +1277,7 @@ services:
   # /health, which waits for the OIDC audiences. It verifies the gateway's identity on ticket
   # requests.
   realtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:90de168616d32b5ca39e3e2474599b3453ac095b6f88ff2009ab796fad55dabf}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:1137c7c510dc89377c7837a974be6ea7493ad847694fd5758c9dd6170aff97d4}
     restart: unless-stopped
     # S1: its own credentials, from its own files below; Valkey TLS is platform mode's (S7).
     environment:
@@ -1284,14 +1291,14 @@ services:
       CHELABASE_REALTIME_PG_PASSWORD_FILE: /run/chelabase/secrets/realtime/pg.password
       CHELABASE_REALTIME_TICKET_KEY_FILE: /run/chelabase/secrets/realtime/ticket.key
       CHELABASE_REALTIME_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/realtime/internal.token
-    # Realtime's replication connection dials the compute's `replication_host` on `control`
+    # Realtime's replication connection dials the compute's `replication_host` on `control-internal`
     # (from its static address, in the chelabase_realtime login rule); its check connections and
-    # the compute's other listeners are reached on `compute`.
+    # the compute's other listeners are reached on `compute-internal`.
     networks:
       default: {}
-      control:
-        ipv4_address: ${CHELABASE_REALTIME_CONTROL_IP:-10.214.0.12}
-      compute: {}
+      control-internal:
+        ipv4_address: ${CHELABASE_REALTIME_CONTROL_INTERNAL_IP:-10.214.4.12}
+      compute-internal: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
@@ -1324,7 +1331,7 @@ services:
   # Its image is a release image like the apps', pinned the same way (CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick it too).
   storage:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:9b5434e8fd6bbcf8a76c98baa98fae8106e1b3e364a28ca39970eef47be4f7ba}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:a57cdb4bccf91ca2ce617de6676784343cda2e0666c1eceb948b262b2d90ccf2}
     restart: unless-stopped
     read_only: true
     environment:
@@ -1345,7 +1352,7 @@ services:
       CHELABASE_STORAGE_BODY_IDLE_SECS: ${CHELABASE_STORAGE_BODY_IDLE_SECS:-}
     networks:
       default: {}
-      compute: {}
+      compute-internal: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
@@ -1367,7 +1374,7 @@ services:
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:037014021cd38bbef5a08b83f679818ae52d67d48aa62c2c490763c649382403}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:dde816ce1c8e602a47643dbe17babd3d82397980a1b4ec3134e1a77973e1ac58}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
@@ -1384,7 +1391,7 @@ services:
   # run-as key) and the bundles bucket as the `functions` S3 identity, and listens for
   # `chelabase.fn.changed.*` as its own NATS user. On by default, with the runtime.
   functions:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:4062a0de633deba728bcba83599ac6bc0dba8810c81ee15be679f8aab7b1aefc}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:e5f662a3cc8d7998cdc93f475c77057dd86289f15760063797c4c3d3fe0d050b}
     restart: unless-stopped
     read_only: true
     environment:
@@ -1428,7 +1435,7 @@ services:
       # m13b: the database-event dispatcher dials computes as its own login (verified against
       # the compute CA, as rest). It listens on nothing here: its listeners bind the aliases
       # above only.
-      compute: {}
+      compute-internal: {}
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/secrets/secrets.key, read_only: true, volume: {subpath: secrets/secrets.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
@@ -1463,7 +1470,7 @@ services:
   # the internal `services-control` network (the functions service and the worker, each with its
   # own bearer) and loopback; it reads the metadata (desired state) on the default network.
   service-runner:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:6979432a89c6e182b374a11999138d321d2262a064326e94f7c5f7c5dd0e1cd9}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:f7b0e78f7fbe98d5e6d50ff68c69ff294223c81d07e07193b58f5e11c0f0abcd}
     profiles: ["services"]
     restart: unless-stopped
     user: "0"
@@ -1510,7 +1517,7 @@ services:
   # the others: the image's watchdog probes a trivial worker every 2s and after 3 failures ends
   # the container, which `always` restarts. On by default, with the functions service.
   functions-runtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-e1ff97b70ed2@sha256:41aeffbbef4f13274e08a61dbd332ebc93f1a4b10627fcdef5f13130ca225e97}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:fe0204c5526ff3f8d7c9a7fbf2df369ed65109c04389178933d239153f9a93d6}
     # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
     # its listening port, always on the API host.
     command: ["/usr/local/bin/workerd", "serve", "--experimental",
@@ -1535,23 +1542,107 @@ services:
       retries: 3
       start_period: 10s
 
+  # compute-network-reach: the only way out of `compute-internal`. A forwarder with one listener per
+  # destination in CHELABASE_COMPUTE_EGRESS_ALLOW (default empty: nothing leaves) and a resolver that
+  # answers those names only; public addresses only are dialled. Profile `compute-egress` (off by
+  # default: a container that only sits on both networks is exposure without a use). It is the only
+  # member of `compute-egress` (not internal) and joins `compute-internal` at a pinned address outside
+  # the range Docker assigns computes. It has no secret, volume, Docker socket or published port, and
+  # no privilege at any point: a non-root user, a read-only root, no capability and no entrypoint
+  # script. The namespaced sysctls are its only other settings: ports below 1024 (the resolver's 53,
+  # listed ports) bind without a capability, and it never forwards IPv4 packets between its two networks
+  # (a new container inherits the host's forwarding setting). Both its networks are IPv4 only
+  # (`enable_ipv6: false`), so there is no IPv6 to forward and no IPv6 sysctl to fail on a kernel
+  # booted with IPv6 disabled.
+  # The settings map to Kubernetes' Restricted Pod Security Standard, except the two forwarding
+  # sysctls (net.ipv4.ip_forward and net.ipv4.conf.all.forwarding), which aren't on its safe list
+  # and which a Kubernetes deployment doesn't rely on (a pod's network is not routed between
+  # interfaces by default), and `ulimits`, which that standard doesn't cover.
+  # scripts/tests/compose-compute-network-internal.sh checks them. No `default` network.
+  compute-egress:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/compute-egress:${CHELABASE_IMAGE_TAG:-bb1133a33dcd@sha256:fbe30ca725e2887ec758cfa01a2854b3eb00da4dc908307acc145621eafa976c}
+    profiles: ["compute-egress"]
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${CHELABASE_COMPUTE_EGRESS_MEMORY:-256m}
+    pids_limit: 256
+    # Two descriptors per forwarded connection (1024 at once by default) plus the listeners; the
+    # engine's own default can be as low as 1024.
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+      net.ipv4.ip_forward: 0
+      net.ipv4.conf.all.forwarding: 0
+    environment:
+      CHELABASE_COMPUTE_EGRESS_ALLOW: ${CHELABASE_COMPUTE_EGRESS_ALLOW:-}
+      CHELABASE_COMPUTE_EGRESS_LISTEN: ${CHELABASE_COMPUTE_EGRESS_IP:-10.214.8.2}
+      # Never dialled, whatever a listed name resolves to: the stack's own networks.
+      CHELABASE_INTERNAL_SUBNETS: ${CHELABASE_COMPUTE_SUBNET:-10.214.8.0/22},${CHELABASE_CONTROL_INTERNAL_SUBNET:-10.214.4.0/22}
+      # The operator's own refusals on top (IPv4 addresses and networks; blank: none), such as the
+      # host's public addresses. It can only refuse more, never allow anything.
+      CHELABASE_COMPUTE_EGRESS_DENY: ${CHELABASE_COMPUTE_EGRESS_DENY:-}
+      CHELABASE_COMPUTE_EGRESS_HEALTH_PORT: ${CHELABASE_COMPUTE_EGRESS_HEALTH_PORT:-}
+      CHELABASE_COMPUTE_EGRESS_DIAL_TIMEOUT_SECS: ${CHELABASE_COMPUTE_EGRESS_DIAL_TIMEOUT_SECS:-}
+    networks:
+      compute-internal:
+        ipv4_address: ${CHELABASE_COMPUTE_EGRESS_IP:-10.214.8.2}
+      compute-egress: {}
+    healthcheck:
+      test: ["CMD", "compute-egress", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
 networks:
-  # Orchestrator and realtime to computes (<project>_control), with static addresses for the
-  # login rules; computes take addresses from the upper /23 only. Change it in .env when it
-  # overlaps a network of the host (the workbench gives each stack its own).
-  control:
+  # compute-network-reach: computes have no route off `control-internal` and `compute-internal`.
+  # Both are internal (no default route) and their bridge has no host address (gateway mode
+  # `isolated`), so nothing on them reaches the host or a port it publishes, whatever the engine's
+  # direct-routing setting (Docker Engine 28 or later). Every other member is also on a network
+  # that isn't internal (scripts/tests/compose-compute-network-internal.sh).
+  # The keys and the default subnets are new: Compose can't replace the networks of earlier
+  # releases (`compute`, `control`) while computes hold them, and Docker refuses an overlapping
+  # subnet, so `up` creates these beside them and the worker moves computes over and removes the
+  # old ones (CHELABASE_LEGACY_COMPUTE_NETWORKS).
+  #
+  # Orchestrator and realtime to computes (<project>_control-internal), with static addresses for
+  # the login rules in the lower /23; computes take addresses from the upper /23 only. Change it in
+  # .env when it overlaps a network of the host (the workbench gives each stack its own). Its
+  # settings have new names (CHELABASE_CONTROL_INTERNAL_*, CHELABASE_*_CONTROL_INTERNAL_IP), so the
+  # old network's (CHELABASE_CONTROL_SUBNET and its address and range settings) are never read here
+  # and can't put this network on the range the old one still holds.
+  control-internal:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
     ipam:
       config:
-        - subnet: ${CHELABASE_CONTROL_SUBNET:-10.214.0.0/22}
-          ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:-10.214.2.0/23}
-  # RT1 T1 (P4, W14): the computes' own network (<project>_compute, CHELABASE_COMPUTE_NETWORK).
-  # On it: what a compute needs (pageserver, safekeepers, the orchestrator's hooks listener) and
-  # the clients that dial computes (proxy, rest, auth, worker, orchestrator, runner, realtime,
-  # storage, functions).
+        - subnet: ${CHELABASE_CONTROL_INTERNAL_SUBNET:-10.214.4.0/22}
+          ip_range: ${CHELABASE_CONTROL_INTERNAL_COMPUTE_RANGE:-10.214.6.0/23}
+  # RT1 T1 (P4, W14): the computes' own network (<project>_compute-internal,
+  # CHELABASE_COMPUTE_NETWORK). On it: what a compute needs (pageserver, safekeepers, the
+  # orchestrator's hooks listener) and the clients that dial computes (proxy, rest, auth, worker,
+  # orchestrator, runner, realtime, storage, functions).
   # Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the storage broker or controller,
   # the gateway or Studio. Every listener of its members needs a credential or is public by
-  # design (scripts/compute-network-e2e.sh audits each one).
-  compute: {}
+  # design (scripts/compute-network-e2e.sh audits each one). Docker assigns addresses from the
+  # upper /23; the lower /23 is for static addresses. Change it in .env when it overlaps a network
+  # of the host.
+  compute-internal:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${CHELABASE_COMPUTE_SUBNET:-10.214.8.0/22}
+          ip_range: ${CHELABASE_COMPUTE_RANGE:-10.214.10.0/23}
   # Edge functions (m1): the functions service and the runtime, and the gateway's alias for the
   # runtime's `env.CHELABASE` binding (#183); nothing else, no route out.
   functions:
@@ -1562,6 +1653,9 @@ networks:
     internal: true
   # The runtime's only way out (workerd allows public addresses only); nothing else is on it.
   functions-egress: {}
+  # compute-egress's only way out; nothing else is on it. IPv4 only, whatever the engine's default.
+  compute-egress:
+    enable_ipv6: false
   # Edge functions (m10): the functions service and the worker to the service runner's API; no
   # route out.
   services-control:

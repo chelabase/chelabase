@@ -8,7 +8,7 @@
 //! - Every real change of a user's email (`set_email`, `set_email_notifying`, or a confirmed
 //!   `EmailChange`) revokes all of that user's outstanding codes, so a code never comes back
 //!   when the address changes back to the one it was sent to.
-//! - TTL: 15 minutes for verify, reset and email change, 7 days for invite. A new code replaces the old one
+//! - TTL: 15 minutes for verify, reset and email change, 72 hours for invite. A new code replaces the old one
 //!   and resets the attempts. A code allows 5 wrong guesses; after that every guess is refused.
 //! - A live verify, reset or email change code issued less than 60 seconds ago is not replaced:
 //!   [`IdentityError::CodeRecentlySent`](crate::IdentityError::CodeRecentlySent), nothing is
@@ -172,20 +172,25 @@ impl Identity {
     /// verified, and the previous address gets a notice (when SMTP is configured). Another
     /// address, a wrong code or a current address changed since the code was issued is
     /// `CodeInvalid`; `new_email` taken by another user since then is `Conflict` (the code is
-    /// spent); a spent failure budget is `CodeBudgetSpent`.
+    /// spent); a spent failure budget is `CodeBudgetSpent`. `project_name` is shown in the
+    /// notice, as in [`CodeRequest::project_name`].
     pub async fn confirm_email_change(
         &self,
         pool: &Pool,
         user_id: &str,
         new_email: &str,
         code: &str,
+        project_name: Option<&str>,
     ) -> Result<User, IdentityError> {
-        let body = json!({
+        let mut body = json!({
             "user_id": user_id,
             "kind": CodeKind::EmailChange.as_str(),
             "code": code,
             "new_email": new_email,
         });
+        if let Some(name) = project_name {
+            body["project_name"] = Value::String(name.to_string());
+        }
         self.post_verify(pool, body).await
     }
 

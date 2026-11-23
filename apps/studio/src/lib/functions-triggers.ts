@@ -101,3 +101,47 @@ export function triggerTarget(t: Pick<FunctionTrigger, "source" | "pg_database" 
 export function triggersInstalling(triggers: Pick<FunctionTrigger, "state">[]): boolean {
   return triggers.some((t) => t.state === "pending_install");
 }
+
+export const TRIGGERS_DOCS_URL = "https://docs.chelabase.com/using/functions/triggers";
+
+export interface TriggerFailure {
+  /** What went wrong, in one sentence. */
+  cause: string;
+  /** What to do about it. */
+  fix: string;
+}
+
+const RESTART = " Then turn the trigger off and on.";
+
+/** The worker's `last_error` codes (and messages) for a failed install, with what they mean. */
+const TRIGGER_FAILURES: Record<string, TriggerFailure> = {
+  run_as_role_required: {
+    cause: "This function has no run-as role on the branch.",
+    fix: "Set a run-as role on this function." + RESTART,
+  },
+  run_as_role_cannot_read_table: {
+    cause: "The run-as role is gone, or can't read this table.",
+    fix: "Grant SELECT on the table and USAGE on its schema to the run-as role, or set the role again." + RESTART,
+  },
+  run_as_role_subject_to_rls: {
+    cause: "Row level security on this table applies to the run-as role.",
+    fix: "Use a BYPASSRLS run-as role, or the table's owner on a table without FORCE ROW LEVEL SECURITY." + RESTART,
+  },
+  invalid_events: {
+    cause: "This trigger's events aren't valid for a table trigger.",
+    fix: "Delete it and add it again with insert, update or delete.",
+  },
+  "function triggers support plain tables only": {
+    cause: "Table triggers support plain tables only.",
+    fix: "Delete it and pick an ordinary table, not a partitioned table or a view.",
+  },
+  "function triggers can't go on a reserved schema": {
+    cause: "Triggers can't go on a Chelabase or system schema.",
+    fix: "Delete it and pick a table in your own schema.",
+  },
+};
+
+/** Plain guidance for a failed trigger's `last_error`; null for a reason Studio doesn't know (show the raw text). */
+export function describeTriggerFailure(lastError: string): TriggerFailure | null {
+  return Object.hasOwn(TRIGGER_FAILURES, lastError) ? TRIGGER_FAILURES[lastError]! : null;
+}

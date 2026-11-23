@@ -197,6 +197,15 @@ async fn identity_live_reset_revokes_sessions() {
 
 #[tokio::test]
 #[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_set_password_ends_sessions() {
+    with_codes(1, |id, p| async move {
+        common::set_password_ends_sessions(&id, &p[0]).await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
 async fn identity_live_code_strictness() {
     with_codes(1, |id, p| async move {
         common::code_strictness(&id, &p[0]).await

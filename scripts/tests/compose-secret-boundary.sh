@@ -39,7 +39,10 @@
 #      Docker socket holder, each caller's bearer, and no shared network for service containers
 #      (the runner gives each its own at run time, audit B3; the functions service binds none of
 #      them).
-# Every render takes every profile (sites, runner, services), so profiled services
+#   9. compute-egress (compute-network-reach m4): no secret, in either render. It has no `secrets`,
+#      no mount of the `secrets` volume or of the keys or state dir, and no Docker socket; the
+#      workbench gives it one read-only bind, its host-built binary, and nothing else.
+# Every render takes every profile (sites, runner, services, compute-egress), so profiled services
 # are checked.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -58,10 +61,10 @@ compose() { # compose <project> <env file> <-f args…>
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p "$project" --project-directory "$dir" \
     "$@" --env-file "$env_file" config --format json
 }
-compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services >"$tmp/base.json" ||
+compose chelabase-boundary "$dir/.env.example" -f "$dir/docker-compose.yml" --profile services --profile compute-egress >"$tmp/base.json" ||
   { echo "compose-secret-boundary: rendering the base file failed" >&2; exit 1; }
 compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
-  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services \
+  -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" --profile sites --profile runner --profile services --profile compute-egress \
   | jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq" >"$tmp/wb.json" ||
   { echo "compose-secret-boundary: rendering base + overlay failed" >&2; exit 1; }
 
@@ -476,8 +479,8 @@ for render in base wb; do
       err "$render: $svc must not be on the runtime's network"
   done
   got="$(jq -c '.services.functions.networks // {} | to_entries | map({(.key): ((.value // {}).aliases // [])}) | add' "$f")"
-  # m13b: `compute` (no alias: it dials computes and listens on nothing there).
-  [[ "$got" == '{"compute":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
+  # m13b: `compute-internal` (no alias: it dials computes and listens on nothing there).
+  [[ "$got" == '{"compute-internal":[],"default":["functions-public"],"functions":["functions-internal"],"functions-control":["functions-control"],"services-control":[]}' ]] ||
     err "$render: the functions service's network aliases: got $got"
 done
 # #181 (audit S1): the runtime's side serves bundle GETs only, the control side uploads and
@@ -550,6 +553,24 @@ sr="$(jq -c '.services["service-runner"] | {read_only, image: (.image | sub(":.*
   err "service-runner runs its release image read-only: got $sr"
 [[ "$(jq -r '.services["service-runner"].environment.CHELABASE_SERVICE_RUNNER_URL // ""' "$tmp/base.json")" == http://service-runner-control:8094 ]] ||
   err "CHELABASE_SERVICE_RUNNER_URL is the runner's control alias"
+
+# 9. compute-egress sees no secret: no compose secret, no volume that reaches the secrets volume,
+# the keys or the state dir or the Docker socket, and no setting that names a secret file.
+for render in base wb; do
+  f="$tmp/base.json"
+  [[ "$render" == wb ]] && f="$tmp/wb.json"
+  [[ "$(jq -r '.services | has("compute-egress")' "$f")" == true ]] || err "$render: no compute-egress service"
+  got="$(jq -r --arg k "$keys" --arg st "$state" '.services["compute-egress"] | [
+      ((.secrets // [])[] | "compose secret \(.source)"),
+      ((.volumes // [])[] | select(.type != "bind" or (.read_only | not) or ((.source // "") | test("/target/debug/compute-egress$") | not))
+        | "volume \(.type) \(.source // "") -> \(.target)"),
+      ((.volumes // [])[] | select((.source // "") | (startswith($k + "/") or startswith($st + "/") or contains("docker.sock")))
+        | "mount \(.source)"),
+      ((.volumes_from // [])[] | "volumes_from \(.)"),
+      ((.environment // {}) | to_entries[] | select(.key | test("(_FILE|_KEY|_PASSWORD|_TOKEN|_SECRET|_URL|_URI)$")) | "setting \(.key)")
+    ] | join(", ")' "$f")"
+  [[ -z "$got" ]] || err "$render: compute-egress reaches a secret or something it must not: $got"
+done
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

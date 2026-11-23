@@ -19,7 +19,8 @@
 #                 `cargo metadata`), the manifest of every crate any Rust image builds (one cargo
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
 #                 .cargo/ (storage's package is chelabase-storage-service, functions'
-#                 chelabase-functions, service-runner's chelabase-service-runner; the others are
+#                 chelabase-functions, service-runner's chelabase-service-runner, compute-egress's
+#                 chelabase-compute-egress; the others are
 #                 named after their image)
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
@@ -34,8 +35,8 @@
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(cd "$(dirname "$0")/.." && pwd)"
-images=(gateway orchestrator worker rest auth realtime storage functions service-runner init studio identity functions-runtime)
-rust=(gateway orchestrator worker rest auth realtime storage functions service-runner init)
+images=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init studio identity functions-runtime)
+rust=(gateway orchestrator worker rest auth realtime storage functions service-runner compute-egress init)
 envex=infra/compose/.env.example
 common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
@@ -48,6 +49,7 @@ package() { # package <image>: the cargo package it builds (server.Dockerfile's 
     storage) echo chelabase-storage-service ;;
     functions) echo chelabase-functions ;;
     service-runner) echo chelabase-service-runner ;;
+    compute-egress) echo chelabase-compute-egress ;;
     *) echo "$1" ;;
   esac
 }

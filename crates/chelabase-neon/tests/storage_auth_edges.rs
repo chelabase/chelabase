@@ -137,7 +137,7 @@ async fn running_compute_ctl() -> std::net::SocketAddr {
     let network = std::env::var("CHELABASE_COMPUTE_NETWORK")
         .ok()
         .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| "chelabase_compute".into());
+        .unwrap_or_else(|| "chelabase_compute-internal".into());
     let computes = DockerBackend::connect(ComputeSettings {
         image: String::new(),
         control_plane_uri: String::new(),
@@ -146,6 +146,8 @@ async fn running_compute_ctl() -> std::net::SocketAddr {
     }, DockerSettings {
         network: network.clone(),
         control_network: network.clone(),
+        legacy_networks: Vec::new(),
+        egress_dns: None,
     })
     .expect("a Docker client");
     let endpoints = computes.list().await.expect("listing the stack's computes");

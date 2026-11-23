@@ -103,7 +103,7 @@
       ],
       "post": {
         "operationId": "createUser",
-        "summary": "Create a user, with or without a password",
+        "summary": "Create a user, with or without a password (a password outside the length range is 400 `weak_password`)",
         "x-callers": [
           "auth",
           "orchestrator"
@@ -439,6 +439,11 @@
                     "type": "boolean",
                     "default": false,
                     "description": "Mail the previous address that it was replaced, when SMTP is configured and the address changes. A refused send does not fail the request."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the notice `notify_previous` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -493,7 +498,7 @@
       ],
       "put": {
         "operationId": "setPassword",
-        "summary": "Set a user's password (creates the credential if missing)",
+        "summary": "Set a user's password (creates the credential if missing) and revoke all of the user's sessions",
         "x-callers": [
           "auth"
         ],
@@ -1078,7 +1083,7 @@
       "post": {
         "operationId": "createCode",
         "summary": "Issue a six-digit email code for a user, replacing that user's earlier code of the same kind",
-        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). An `invite` code is refused with 409 `invite_refused` for an established account (a password and a verified email); a pre-registered account (no password, or an unverified email) may be invited. A code is bound to the user's email when issued: changing the email kills every outstanding code. An `email_change` code (auth only) requires `new_email`, is only delivered by email and is mailed to `new_email`, never to the current address; it is refused with 409 `conflict` when another user holds `new_email` or it is the user's own address, and with 400 for `delivery: return`. It is bound to the current address and `new_email` together, and nothing changes until it is confirmed. TTL: `verify`, `reset` and `email_change` 15 minutes, `invite` 7 days. A code allows 5 wrong guesses; the next guess, right or wrong, is refused. A new code keeps the user's failure budget for that kind (see `verifyCode`). While a live `verify`, `reset` or `email_change` code issued less than 60 seconds ago stands, a new one of that kind is refused with 429 `code_recently_sent`, nothing is sent and the earlier code keeps working; a consumed, expired or locked-out code is replaced at once, and `invite` codes always are.",
+        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). An `invite` code is refused with 409 `invite_refused` for an established account (a password and a verified email); a pre-registered account (no password, or an unverified email) may be invited. A code is bound to the user's email when issued: changing the email kills every outstanding code. An `email_change` code (auth only) requires `new_email`, is only delivered by email and is mailed to `new_email`, never to the current address; it is refused with 409 `conflict` when another user holds `new_email` or it is the user's own address, and with 400 for `delivery: return`. It is bound to the current address and `new_email` together, and nothing changes until it is confirmed. TTL: `verify`, `reset` and `email_change` 15 minutes, `invite` 72 hours. A code allows 5 wrong guesses; the next guess, right or wrong, is refused. A new code keeps the user's failure budget for that kind (see `verifyCode`). While a live `verify`, `reset` or `email_change` code issued less than 60 seconds ago stands, a new one of that kind is refused with 429 `code_recently_sent`, nothing is sent and the earlier code keeps working; a consumed, expired or locked-out code is replaced at once, and `invite` codes always are.",
         "x-callers": [
           "auth",
           "orchestrator"
@@ -1121,7 +1126,7 @@
                   "project_name": {
                     "type": "string",
                     "maxLength": 128,
-                    "description": "Shown in the email; single line. Default `Chelabase`."
+                    "description": "Shown in the email. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",
@@ -1251,6 +1256,11 @@
                     "type": "string",
                     "maxLength": 320,
                     "description": "Required for `email_change`: the address the code was issued for. Refused for every other kind."
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the email-changed notice an `email_change` sends. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   }
                 }
               }
@@ -1330,7 +1340,8 @@
                 "properties": {
                   "project_name": {
                     "type": "string",
-                    "maxLength": 128
+                    "maxLength": 128,
+                    "description": "Shown in the notice. Default `Chelabase`. A name identity cannot show (blank, over 128 characters, or not a single line) is ignored and the default is used; the name alone never refuses the request."
                   },
                   "link": {
                     "type": "string",
