@@ -98,8 +98,11 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
         let cookie_key_file = var("CHELABASE_AUTH_COOKIE_KEY")?;
-        let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
-            .map_err(|e| anyhow::anyhow!("cookie key: {e}"))?;
+        // The message names the file; SecretsError's own "secrets key:" prefix would misname it.
+        let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file)).map_err(|e| match e {
+            chelabase_secrets::SecretsError::Config(msg) => anyhow::anyhow!("cookie key: {msg}"),
+            other => anyhow::anyhow!("cookie key: {other}"),
+        })?;
         let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
         entry.check_mode(mode).map_err(anyhow::Error::new)?;
         let secure_cookies = secure_cookies(
