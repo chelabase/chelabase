@@ -96,7 +96,11 @@ impl FunctionHost for Workerd {
                 // Connected and sent, then lost: the runtime died with it in flight. A refused
                 // or failed connect (or a request that couldn't be built) only says it is down.
                 let lost = e.is_request() && !e.is_connect() && !e.is_builder();
-                tracing::warn!("the functions runtime didn't answer: {}", e.without_url());
+                if lost {
+                    tracing::warn!("the functions runtime dropped a request in flight (it restarted?): {}", e.without_url());
+                } else {
+                    tracing::warn!("the functions runtime didn't answer: {}", e.without_url());
+                }
                 return Err(if lost { HostError::Dropped } else { HostError::Unreachable });
             }
             Ok(Ok(response)) => response,
