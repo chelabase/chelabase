@@ -24,7 +24,7 @@
 #                 openapi/mcp.json, which it embeds
 #   studio        apps/studio and its workspace: dependencies (pnpm-workspace.yaml globs),
 #                 package.json, pnpm-lock.yaml, pnpm-workspace.yaml, studio.Dockerfile, and what
-#                 the build reads outside the graph: studio.Caddyfile, openapi/,
+#                 the build reads outside the graph: studio.Caddyfile, studio-entrypoint.sh, openapi/,
 #                 infra/compose/.env.example (its pin block left out: pinning rewrites it)
 #   identity      services/identity and its workspace: dependencies, package.json, pnpm-lock.yaml,
 #                 pnpm-workspace.yaml, identity.Dockerfile
@@ -95,7 +95,7 @@ inputs() { # inputs <image>
     studio)
       pnpm_dirs apps/studio
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/studio.Dockerfile \
-        infra/images/studio.Caddyfile openapi "$envex" ;;
+        infra/images/studio.Caddyfile infra/images/studio-entrypoint.sh openapi "$envex" ;;
     identity)
       pnpm_dirs services/identity
       printf '%s\n' package.json pnpm-lock.yaml pnpm-workspace.yaml infra/images/identity.Dockerfile ;;
