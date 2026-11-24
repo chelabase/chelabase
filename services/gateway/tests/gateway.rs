@@ -1729,7 +1729,7 @@ async fn repeated_bad_mcp_bearers_are_limited_per_client_through_the_gateway() {
     let (base, _verify, _gateway) = spawn_gateway_with(
         &api,
         &keys,
-        &[("CHELABASE_MCP_URL", mcp.as_str()), ("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.1")],
+        &[("CHELABASE_MCP_URL", mcp.as_str()), ("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8")],
     )
     .await;
     let client = reqwest::Client::new();
