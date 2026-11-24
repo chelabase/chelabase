@@ -6,6 +6,7 @@ import { EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { inputKind } from "@/lib/console";
 import { temporalKind, type RowColumn, type TemporalKind } from "@/lib/table-editor/rows";
+import { editorNonce } from "@/lib/csp-nonce";
 import { cn } from "@/lib/utils";
 
 /** What an editor saves: a text the caller parses for the column's type, or NULL. */
@@ -336,6 +337,7 @@ export function JsonEditor({ label, initial, invalid, onChange, onKey, onBlur, v
           history(),
           closeBrackets(),
           bracketMatching(),
+          editorNonce(),
           keymap.of([...defaultKeymap, ...historyKeymap]),
           EditorView.lineWrapping,
           jsonTheme,

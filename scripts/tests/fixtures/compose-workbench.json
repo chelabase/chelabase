@@ -2553,6 +2553,8 @@
         }
       ],
       "environment": {
+        "CHELABASE_API_HOST": "api.feat-x.chelabase.localhost:8137",
+        "CHELABASE_PUBLIC_SCHEME": "http",
         "CHELABASE_STUDIO_PORT": "3000"
       },
       "healthcheck": {

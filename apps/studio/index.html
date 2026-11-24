@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- Invite and verification links carry one-use codes; never send them on in a Referer. -->
     <meta name="referrer" content="no-referrer" />
+    <!-- The response's CSP nonce for the <style> elements Studio creates at run time (lib/csp-nonce.ts).
+         The Studio image's Caddy templates this file per request (infra/images/studio.Caddyfile);
+         under the Vite dev server it stays a literal and Studio ignores it. -->
+    <meta property="csp-nonce" nonce="{{placeholder `http.request.uuid`}}" />
     <title>Chelabase Studio</title>
   </head>
   <body>

@@ -7,6 +7,7 @@ import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, Prec, StateEffect, StateField, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
+import { editorNonce } from "@/lib/csp-nonce";
 
 /** What the next run sends: the selection when there is one, else the whole buffer. */
 export type RunText = { text: string; from: number };
@@ -119,6 +120,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
           keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
           errorField,
           theme,
+          editorNonce(),
           syntaxHighlighting(highlight),
           language.current.of(extensions),
           EditorView.contentAttributes.of({ "aria-label": label }),
