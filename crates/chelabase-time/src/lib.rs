@@ -94,7 +94,9 @@
 //! `ALTER ROLE` for a value the API accepted. The orchestrator accepts exactly the instants
 //! [`Timestamp::round_trips_through_pg`] holds for; the worker's catalog SELECTs and its parse
 //! read everything up to [`Timestamp::PG_ROUND_TRIP_MAX`] as an instant (later is "no
-//! expiry"). Tests: `tests/pg_round_trip.rs` here (and `tests/pg_live.rs` against Postgres),
+//! expiry"), and everything before [`Timestamp::PG_ROUND_TRIP_MIN`] (`-infinity` included) as
+//! that floor, so a role Postgres takes as expired is never read as having no expiry (#398).
+//! Tests: `tests/pg_round_trip.rs` here (and `tests/pg_live.rs` against Postgres),
 //! the orchestrator's `valid_until_tests`, and the worker's `*_reads_back_equal` model and
 //! property tests in `resync.rs`.
 //!

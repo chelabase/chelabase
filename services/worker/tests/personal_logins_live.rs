@@ -411,7 +411,8 @@ async fn a_personal_login_reaches_only_its_safe_set_through_set_role() {
 
 // A personal login whose VALID UNTIL was set past what the time type holds (`9999-12-31`,
 // `294276-01-01`) is read as having none: the member catalog SELECT must not raise `bigint out
-// of range`, and the reconcile sets the record's expiry back.
+// of range`, and the reconcile sets the record's expiry back. One expired with `-infinity` or a
+// finite value before year 1 reads as the floor `0001-01-01` (#398) and is set back the same way.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the workbench stack on the members hub images (end-of-step pass)"]
 async fn a_far_future_valid_until_on_a_login_is_set_back() {
@@ -420,11 +421,15 @@ async fn a_far_future_valid_until_on_a_login_is_set_back() {
         fx.grant(m, PlatformRole::Developer, &["billing"]).await;
         fx.create_login(m, "pl_far", "pl-far-pass").await;
         fx.reconcile(fx.main).await;
-        for until in ["9999-12-31 00:00:00+00", "294276-01-01 00:00:00+00"] {
+        for until in ["9999-12-31 00:00:00+00", "294276-01-01 00:00:00+00", "-infinity", "4714-11-24 00:00:00+00 BC"] {
             fx.sql(&fx.ep, &format!("ALTER ROLE pl_far VALID UNTIL '{until}';")).await;
             fx.reconcile(fx.main).await;
             let back = fx
-                .sql(&fx.ep, "SELECT rolvaliduntil < now() + interval '91 days' FROM pg_roles WHERE rolname = 'pl_far';")
+                .sql(
+                    &fx.ep,
+                    "SELECT rolvaliduntil > now() AND rolvaliduntil < now() + interval '91 days' \
+                     FROM pg_roles WHERE rolname = 'pl_far';",
+                )
                 .await;
             assert_eq!(back.trim(), "t", "{until} set back to the record's");
         }

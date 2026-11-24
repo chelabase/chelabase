@@ -171,7 +171,9 @@ pub struct ActualMemberRole {
     /// `pg_authid.rolpassword`.
     pub verifier: Option<String>,
     pub memberships: Vec<ActualMembership>,
-    /// `rolvaliduntil` (`None`: no expiry); read for marked roles (T6).
+    /// `rolvaliduntil` (`None`: none, `infinity` or past [`Timestamp::PG_ROUND_TRIP_MAX`];
+    /// `-infinity` and anything before [`Timestamp::PG_ROUND_TRIP_MIN`] read as that floor, #398);
+    /// read for marked roles (T6).
     pub valid_until: Option<Timestamp>,
 }
 
@@ -680,7 +682,8 @@ pub fn drop_role_sql(role: &str) -> String {
 /// reconciler's own.
 ///
 /// T6: the roles carrying the personal-login marker (`k` lines), with their `VALID UNTIL`
-/// (`u` lines: microseconds since the epoch, `-` for none) and, as a member role's, their
+/// (`u` lines: microseconds since the epoch, `-` for none or `infinity`, `-infinity` as
+/// `0001-01-01`) and, as a member role's, their
 /// memberships (`m`), password (`p`) and leftovers (`l`), and their per-database settings (`s`,
 /// T6-M6; never the role-wide entry, which holds the marker).
 pub fn member_catalog_sql() -> String {
@@ -732,8 +735,11 @@ WHERE starts_with(a.rolname::text, 'cb_m_') OR {a_marked} \
 UNION ALL \
 SELECT 'k ' || {rname} FROM pg_roles r WHERE {r_marked} \
 UNION ALL \
-SELECT 'u ' || {aname} || ' ' || CASE WHEN a.rolvaliduntil IS NULL OR NOT isfinite(a.rolvaliduntil) \
-OR a.rolvaliduntil > '9999-12-30T22:00:00.999999Z'::timestamptz THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
+SELECT 'u ' || {aname} || ' ' || CASE WHEN a.rolvaliduntil IS NULL \
+OR a.rolvaliduntil > '9999-12-30T22:00:00.999999Z'::timestamptz THEN '-' \
+WHEN a.rolvaliduntil < '0001-01-01T00:00:00Z'::timestamptz \
+THEN (extract(epoch FROM '0001-01-01T00:00:00Z'::timestamptz) * 1000000)::bigint::text \
+ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
 FROM pg_authid a WHERE {a_marked} \
 UNION ALL \
 SELECT 'd ' || {dname} || ' ' || {downer} FROM pg_database d \

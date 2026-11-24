@@ -3105,6 +3105,37 @@ async fn a_far_future_valid_until_does_not_break_the_resync() {
     .await;
 }
 
+// #398: a role expired in SQL with `VALID UNTIL '-infinity'` (or a finite value before year 1)
+// is recorded as expired, at the floor `0001-01-01T00:00:00Z`, never as no expiry; a later
+// PATCH of another attribute leaves the catalog's expiry alone, so the role stays expired.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_negative_infinity_valid_until_is_recorded_as_expired() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let at = "SELECT rolvaliduntil FROM pg_roles WHERE rolname = 'app';";
+        for until in ["-infinity", "4714-11-24 00:00:00+00 BC", "0001-01-01 00:00:00+00"] {
+            fx.sql(&format!("ALTER ROLE app VALID UNTIL '{until}';")).await;
+            let set = fx.value(&fx.ep, at).await;
+            fx.worker.resync(fx.main).await.unwrap_or_else(|e| panic!("{until}: {e:#}"));
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let app = rows.iter().find(|r| r.name == "app").unwrap();
+            assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "{until} reads as expired");
+            assert_eq!(fx.value(&fx.ep, at).await, set, "{until}: the resync leaves it");
+            let limit = RolePatch { connection_limit: Some(3), ..RolePatch::default() };
+            assert_eq!(fx.worker.update_role(fx.main, "app", &limit).await, RoleOutcome::Ok, "{until}");
+            fx.worker.resync(fx.main).await.unwrap_or_else(|e| panic!("{until}: {e:#}"));
+            let kept = fx.value(&fx.ep, at).await;
+            assert_eq!(kept, set, "{until}: the PATCH leaves the expiry");
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let app = rows.iter().find(|r| r.name == "app").unwrap();
+            assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "{until} after the PATCH");
+            fx.sql("ALTER ROLE app CONNECTION LIMIT -1;").await;
+        }
+    })
+    .await;
+}
+
 // T14 I2: turning LOGIN on counts toward the login-role cap, in the same transaction as the
 // write (the worker's cap is 50 in the dev stack: a branch near it is built with SQL roles).
 #[tokio::test]
