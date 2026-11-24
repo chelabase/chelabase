@@ -1871,7 +1871,9 @@ async fn mcp_upstream_failures_never_count_as_refusals() {
     let hanging_up = spawn_mcp_hanging_up_upstream().await;
     for (what, mcp) in [("unreachable", unreachable), ("hanging up", hanging_up)] {
         let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
-        let client = reqwest::Client::new();
+        // A fresh connection per request: the gateway may close one after a 502, and a pooled
+        // connection it already closed would fail the next send with a reset.
+        let client = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
         for i in 0..2 * BURST + 1 {
             let resp = client
                 .post(format!("{base}/mcp"))
