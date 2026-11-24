@@ -839,7 +839,7 @@ async fn anon_reads_and_cannot_write() {
 
 /// #320: a public key's anonymous caller gets Postgres's real constraint and `RAISE` errors
 /// with `code`, `message` and `sqlstate` only: no `detail`, no `hint`, and no row value
-/// anywhere in the body (the message names the constraint, never a row). A secret key's
+/// anywhere in the body (a constraint violation's message names the constraint). A secret key's
 /// caller gets `detail` and `hint` for the same failures.
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]

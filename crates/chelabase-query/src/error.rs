@@ -150,8 +150,9 @@ impl QueryFailure {
     }
 
     /// This failure without Postgres's `detail` and `hint`; the status, code, message and
-    /// SQLSTATE stay. The message of a mapped error is Postgres's primary text, which names
-    /// the constraint, column or table but never a row's values (those are in `detail`).
+    /// SQLSTATE stay. The message of a mapped error is Postgres's primary text: a constraint
+    /// violation's names the constraint, table or column (the row's values are in `detail`),
+    /// a value error's quotes the rejected value, and a `RAISE`'s is the function's own.
     pub fn redacted(mut self) -> Self {
         self.detail = None;
         self.hint = None;

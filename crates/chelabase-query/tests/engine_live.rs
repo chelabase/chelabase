@@ -1329,8 +1329,8 @@ async fn failed_work_at_commit_still_closes_the_connection() {
 
 /// #320 against Postgres's own errors: a public key's anonymous caller (hidden) keeps the
 /// code, message and SQLSTATE of each mapped failure and loses `detail` and `hint`, and no
-/// row value is in what is left (the message names a constraint, column or table, never a
-/// row; `detail` is where the values are). Shown keeps Postgres's detail.
+/// row value is in what is left (a constraint violation's message names the constraint, table
+/// or column; `detail` is where the values are). Shown keeps Postgres's detail.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn hidden_failures_carry_no_row_values() {
