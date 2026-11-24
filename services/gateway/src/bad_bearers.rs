@@ -19,12 +19,12 @@
 //!   most tokens left go (the least-limited addresses, which forgetting frees the least). So a
 //!   full map costs one pass per `capacity / 8` new addresses, however many had refilled. A new address is always
 //!   admitted, so a full map never stops limiting new clients, and a limited address is only
-//!   forgotten once nearly every other entry is as limited as it is.
+//!   forgotten once nearly every other entry is as limited as it is ([`TokenBuckets`]).
 
+use crate::buckets::TokenBuckets;
+pub use crate::buckets::retry_after_secs;
 use crate::data_keys::limiter_key;
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Refusals an address may have at once.
@@ -35,20 +35,8 @@ pub const REFILL_EVERY: Duration = Duration::from_secs(2);
 /// The most addresses tracked at once.
 pub const CAPACITY: usize = 100_000;
 
-/// One address's bucket: its tokens at `at` (below the burst, else it has no entry).
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    tokens: f64,
-    at: Instant,
-}
-
 pub struct BadBearerLimiter {
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
-    burst: f64,
-    refill_every: Duration,
-    capacity: usize,
-    /// `Instant::now`, or a test's own clock.
-    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    buckets: TokenBuckets<IpAddr>,
 }
 
 impl Default for BadBearerLimiter {
@@ -61,107 +49,36 @@ impl BadBearerLimiter {
     /// Tests use small limits.
     pub fn with_limits(burst: u32, refill_every: Duration, capacity: usize) -> Self {
         Self {
-            buckets: Mutex::new(HashMap::new()),
-            burst: f64::from(burst.max(1)),
-            refill_every: refill_every.max(Duration::from_millis(1)),
-            capacity: capacity.max(1),
-            clock: Arc::new(Instant::now),
+            buckets: TokenBuckets::new(burst, refill_every.max(Duration::from_millis(1)), capacity),
         }
     }
 
     /// Replaces the clock (tests).
     pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
-        self.clock = Arc::new(clock);
+        self.buckets = self.buckets.with_clock(clock);
         self
     }
 
     /// Whether a request from `ip` may go on; when not, how long until it may. Takes nothing.
     pub fn check(&self, ip: Option<IpAddr>) -> Result<(), Duration> {
-        let key = limiter_key(ip);
-        let now = (self.clock)();
-        let mut buckets = self.lock();
-        let Some(bucket) = buckets.get(&key) else {
-            return Ok(());
-        };
-        let tokens = self.tokens(bucket, now);
-        if tokens >= self.burst {
-            buckets.remove(&key);
-            return Ok(());
-        }
-        if tokens >= 1.0 {
-            return Ok(());
-        }
-        Err(self.refill_every.mul_f64(1.0 - tokens))
+        self.buckets.wait(&limiter_key(ip))
     }
 
     /// `ip` was answered 401 on an mcp endpoint: it takes one token.
     pub fn refused(&self, ip: Option<IpAddr>) {
-        let key = limiter_key(ip);
-        let now = (self.clock)();
-        let mut buckets = self.lock();
-        let tokens = match buckets.get(&key) {
-            Some(bucket) => self.tokens(bucket, now),
-            None => {
-                if buckets.len() >= self.capacity {
-                    self.make_room(&mut buckets, now);
-                }
-                self.burst
-            }
-        };
-        let tokens = (tokens - 1.0).max(-self.burst);
-        buckets.insert(key, Bucket { tokens, at: now });
+        self.buckets.charge(limiter_key(ip));
     }
 
     /// How many addresses have an entry.
     pub fn tracked(&self) -> usize {
-        self.lock().len()
+        self.buckets.tracked()
     }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Bucket>> {
-        self.buckets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// `bucket`'s tokens at `now`, at most the burst.
-    fn tokens(&self, bucket: &Bucket, now: Instant) -> f64 {
-        let refilled = now.saturating_duration_since(bucket.at).as_secs_f64()
-            / self.refill_every.as_secs_f64();
-        (bucket.tokens + refilled).min(self.burst)
-    }
-
-    /// Makes room in a full map: drops refilled entries, then, while the map is still above
-    /// seven eighths of its capacity, the entries with the most tokens left. Always ending at
-    /// most there (however many entries had refilled) bounds the cost: a full pass happens at
-    /// most once per `capacity / 8` new addresses.
-    fn make_room(&self, buckets: &mut HashMap<IpAddr, Bucket>, now: Instant) {
-        buckets.retain(|_, bucket| self.tokens(bucket, now) < self.burst);
-        let target = self.capacity - (self.capacity / 8).max(1);
-        if buckets.len() <= target {
-            return;
-        }
-        let evict = buckets.len() - target;
-        let mut by_tokens: Vec<(f64, IpAddr)> = buckets
-            .iter()
-            .map(|(key, bucket)| (self.tokens(bucket, now), *key))
-            .collect();
-        let first = by_tokens.len() - evict;
-        by_tokens.select_nth_unstable_by(first, |a, b| a.0.total_cmp(&b.0));
-        for (_, key) in &by_tokens[first..] {
-            buckets.remove(key);
-        }
-    }
-}
-
-/// `Retry-After` for a wait: whole seconds, rounded up, at least 1.
-pub fn retry_after_secs(wait: Duration) -> u64 {
-    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
-    secs.max(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
 
     /// A clock the test moves by hand.

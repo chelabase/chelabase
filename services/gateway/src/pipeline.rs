@@ -7,6 +7,7 @@
 use crate::bad_bearers::{retry_after_secs, BadBearerLimiter};
 use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
+use crate::request_limits::RequestLimits;
 use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
 use chelabase_auth::member_token::{MemberTokenError, MemberTokenVerifier};
@@ -60,9 +61,9 @@ const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id, x-c
 /// Any-origin (data key, app user) routes: the request headers `@chelabase/client` sends to the
 /// data API and storage (`x-upsert` and `range` are storage's).
 const CORS_ANY_ALLOW_HEADERS: &str = "authorization, content-type, chelabase-user, x-upsert, range";
-/// Response headers the client reads that aren't CORS-safelisted: an object's `etag`, and a
-/// ranged download's `content-range`.
-const CORS_ANY_EXPOSE_HEADERS: &str = "etag, content-range";
+/// Response headers the client reads that aren't CORS-safelisted: an object's `etag`, a
+/// ranged download's `content-range`, and how long a 429 says to wait (`retry-after`).
+const CORS_ANY_EXPOSE_HEADERS: &str = "etag, content-range, retry-after";
 const CORS_MAX_AGE_SECS: &str = "600";
 
 /// The parts of an incoming request the pipeline looks at.
@@ -152,6 +153,8 @@ pub struct Pipeline {
     mcp_challenge: Option<String>,
     /// Refused `/mcp` bearers per client address (#395).
     bad_bearers: Arc<BadBearerLimiter>,
+    /// Data API and storage requests per key and client (#322).
+    request_limits: Arc<RequestLimits>,
     /// The last readiness `/_gateway/ready` answered ([`READY_UNKNOWN`] before the first), so
     /// its reason is logged once per change, not per probe.
     ready_seen: std::sync::atomic::AtomicU8,
@@ -178,6 +181,7 @@ impl Pipeline {
             users,
             mcp_challenge: None,
             bad_bearers: Arc::new(BadBearerLimiter::default()),
+            request_limits: Arc::new(RequestLimits::default()),
             ready_seen: std::sync::atomic::AtomicU8::new(READY_UNKNOWN),
         }
     }
@@ -200,6 +204,13 @@ impl Pipeline {
     /// Replaces the refused-bearer limiter (tests use small limits and their own clock).
     pub fn with_bad_bearer_limiter(mut self, limiter: Arc<BadBearerLimiter>) -> Self {
         self.bad_bearers = limiter;
+        self
+    }
+
+    /// Replaces the request limits (the configured ones; tests use small limits and their own
+    /// clock).
+    pub fn with_request_limits(mut self, limits: Arc<RequestLimits>) -> Self {
+        self.request_limits = limits;
         self
     }
 
@@ -498,11 +509,11 @@ impl Pipeline {
         }
         // The key's role OID binds the request to the role's identity; a user token runs as
         // `authenticated`, which isn't the key's role, so it carries none.
-        let (role, claims, role_oid) = match header_str(req.headers, USER_TOKEN_HEADER) {
+        let (role, claims, role_oid, user) = match header_str(req.headers, USER_TOKEN_HEADER) {
             None if req.headers.contains_key(USER_TOKEN_HEADER) => {
                 return Err(user_token_error(UserTokenError::Invalid));
             }
-            None => (resolved.role.clone(), json!({}), resolved.role_oid),
+            None => (resolved.role.clone(), json!({}), resolved.role_oid, None),
             Some(_) if resolved.kind == DataKeyKind::Secret => {
                 return Err(data_error(
                     400,
@@ -525,9 +536,17 @@ impl Pipeline {
                         "role": "authenticated", "exp": claims.exp,
                     }),
                     None,
+                    Some(claims.sub),
                 )
             }
         };
+        // #322: the request is about to be proxied (its key and user token, if any, checked):
+        // it draws on its client's bucket. Refusals above never do.
+        if let Err(wait) = self.request_limits.check(service, &resolved, user, req.client_ip) {
+            let mut resp = data_error(429, "rate_limited", "too many requests from this client; retry later");
+            resp.headers.push(("retry-after", retry_after_secs(wait).to_string()));
+            return Err(resp);
+        }
         let vouch = if public_only {
             self.server_vouch(req, &resolved).await
         } else {
@@ -1694,7 +1713,7 @@ mod tests {
             .outcome,
         );
         assert_eq!(header(&plan.response_headers, "access-control-allow-origin"), Some("*"));
-        assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), Some("etag, content-range"));
+        assert_eq!(header(&plan.response_headers, "access-control-expose-headers"), Some("etag, content-range, retry-after"));
     }
 
     /// Review: a function or service reads its own request headers, so the preflight for those
@@ -2901,6 +2920,142 @@ mod tests {
                 assert_eq!(expect_response(mcp_from(&h, "POST", "/mcp", &ip, None).await).status, 401, "{ip}");
             }
             assert_limited(mcp_from(&h, "POST", "/mcp", &ip, Some("Bearer x")).await, &ip);
+        }
+    }
+
+    // ---- #322: data API and storage requests, limited per key and client ----
+
+    /// A data harness whose request limits allow `burst` requests per budget on a frozen clock
+    /// (a drained bucket stays drained however slow the run).
+    async fn limited_data_harness(burst: u32) -> DataHarness {
+        use crate::request_limits::{Budget, RequestLimitsConfig};
+        let mut h = data_harness().await;
+        let frozen = std::time::Instant::now();
+        let budget = Budget { per_second: 1, burst };
+        let config = RequestLimitsConfig { data: budget, storage: budget, shared: false };
+        let limits = RequestLimits::build(&config, 100, Arc::new(move || frozen));
+        h.pipeline = h.pipeline.with_request_limits(Arc::new(limits));
+        h
+    }
+
+    /// A data-key request from `ip` with `key` as its bearer, plus `extra` headers.
+    async fn keyed_from(h: &DataHarness, method: &str, path: &str, key: &str, ip: &str, extra: &[(&str, &str)]) -> Outcome {
+        let bearer = format!("Bearer {key}");
+        let mut pairs = vec![("authorization", bearer.as_str()), ("origin", "https://app.example")];
+        pairs.extend_from_slice(extra);
+        let headers = headers(&pairs);
+        h.pipeline
+            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()) })
+            .await
+            .outcome
+    }
+
+    fn known(h: &DataHarness, kind: DataKeyKind) -> String {
+        let key = dk::new_key(kind);
+        h.mock.set(&key, Answer::Known(dk::resolved(kind)));
+        key
+    }
+
+    fn assert_request_limited(outcome: Outcome, what: &str) {
+        let resp = expect_response(outcome);
+        assert_eq!(resp.status, 429, "{what}");
+        assert_eq!(error_code(&resp), Some("rate_limited"), "{what}");
+        assert_eq!(header(&resp.headers, "retry-after"), Some("1"), "{what}");
+        // The route's CORS headers, so a browser app can read the answer and its Retry-After.
+        assert_eq!(header(&resp.headers, "access-control-allow-origin"), Some("*"), "{what}");
+        let exposed = header(&resp.headers, "access-control-expose-headers").unwrap_or_default();
+        assert!(exposed.split(", ").any(|h| h == "retry-after"), "{what}: {exposed}");
+    }
+
+    const QUERY: &str = "/data/v1/query";
+    const OBJECT: &str = "/storage/v1/object/files/a.txt";
+    const CLIENT: &str = "203.0.113.9";
+
+    #[tokio::test]
+    async fn a_public_key_past_its_limit_gets_429_with_retry_after_and_cors() {
+        let h = limited_data_harness(3).await;
+        let key = known(&h, DataKeyKind::Public);
+        for i in 0..3 {
+            let plan = expect_plan(keyed_from(&h, "POST", QUERY, &key, CLIENT, &[]).await);
+            assert_eq!(plan.endpoint.service, Service::Rest, "request {i}");
+        }
+        for _ in 0..3 {
+            assert_request_limited(keyed_from(&h, "POST", QUERY, &key, CLIENT, &[]).await, "data API");
+        }
+        // Other keys, other clients of the key and storage's own budget are unaffected.
+        let other = known(&h, DataKeyKind::Public);
+        expect_plan(keyed_from(&h, "POST", QUERY, &other, CLIENT, &[]).await);
+        expect_plan(keyed_from(&h, "POST", QUERY, &key, "203.0.113.10", &[]).await);
+        for _ in 0..3 {
+            let plan = expect_plan(keyed_from(&h, "GET", OBJECT, &key, CLIENT, &[]).await);
+            assert_eq!(plan.endpoint.service, Service::Storage);
+        }
+        assert_request_limited(keyed_from(&h, "GET", OBJECT, &key, CLIENT, &[]).await, "storage");
+        // A proxied answer exposes Retry-After too (an upstream's own 429).
+        let plan = expect_plan(keyed_from(&h, "POST", QUERY, &other, CLIENT, &[]).await);
+        assert!(header(&plan.response_headers, "access-control-expose-headers").unwrap().contains("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn refused_requests_take_no_token() {
+        let h = limited_data_harness(2).await;
+        let key = known(&h, DataKeyKind::Public);
+        let unknown = dk::new_key(DataKeyKind::Public);
+        h.mock.set(&unknown, Answer::NotFound);
+        for _ in 0..10 {
+            // Before key resolution: unknown key.
+            let resp = expect_response(keyed_from(&h, "POST", QUERY, &unknown, CLIENT, &[]).await);
+            assert_eq!(resp.status, 401);
+            // After it but refused: the wrong kind of key, a bad user token.
+            let resp = expect_response(keyed_from(&h, "GET", "/data/v1/schema", &key, CLIENT, &[]).await);
+            assert_eq!(resp.status, 401);
+            let resp = expect_response(keyed_from(&h, "POST", QUERY, &key, CLIENT, &[("chelabase-user", "not-a-token")]).await);
+            assert_eq!(resp.status, 401);
+        }
+        for _ in 0..2 {
+            expect_plan(keyed_from(&h, "POST", QUERY, &key, CLIENT, &[]).await);
+        }
+        assert_request_limited(keyed_from(&h, "POST", QUERY, &key, CLIENT, &[]).await, "after two");
+    }
+
+    #[tokio::test]
+    async fn signed_in_users_are_limited_apart_from_anonymous_requests() {
+        let h = limited_data_harness(2).await;
+        let case = user_case(&h, DataKeyKind::Public);
+        h.sessions.set(case.sid, ut::Session::Live(case.project));
+        // Using up the address's anonymous bucket limits no signed-in user from it.
+        for _ in 0..2 {
+            expect_plan(keyed_from(&h, "POST", QUERY, &case.key, CLIENT, &[]).await);
+        }
+        assert_request_limited(keyed_from(&h, "POST", QUERY, &case.key, CLIENT, &[]).await, "anonymous");
+        let alice = user_token(&h, case.project, case.sid, 300);
+        let bob = user_token(&h, case.project, case.sid, 300);
+        for _ in 0..2 {
+            expect_plan(keyed_from(&h, "POST", QUERY, &case.key, CLIENT, &[("chelabase-user", &alice)]).await);
+        }
+        assert_request_limited(
+            keyed_from(&h, "POST", QUERY, &case.key, CLIENT, &[("chelabase-user", &alice)]).await,
+            "alice",
+        );
+        // Another user of the key from the same address has their own bucket.
+        expect_plan(keyed_from(&h, "POST", QUERY, &case.key, CLIENT, &[("chelabase-user", &bob)]).await);
+        // A user is one client from any address.
+        assert_request_limited(
+            keyed_from(&h, "POST", QUERY, &case.key, "198.51.100.1", &[("chelabase-user", &alice)]).await,
+            "alice elsewhere",
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_keys_functions_and_app_auth_are_not_request_limited() {
+        let h = limited_data_harness(1).await;
+        let secret = known(&h, DataKeyKind::Secret);
+        let public = known(&h, DataKeyKind::Public);
+        for _ in 0..20 {
+            expect_plan(keyed_from(&h, "POST", QUERY, &secret, CLIENT, &[]).await);
+            expect_plan(keyed_from(&h, "GET", OBJECT, &secret, CLIENT, &[]).await);
+            expect_plan(keyed_from(&h, "POST", "/functions/v1/hello", &public, CLIENT, &[]).await);
+            expect_plan(keyed_from(&h, "POST", "/auth/v1/app/sign-in", &public, CLIENT, &[]).await);
         }
     }
 }

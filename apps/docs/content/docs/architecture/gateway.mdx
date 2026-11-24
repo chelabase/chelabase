@@ -43,6 +43,21 @@ A data API request carries `Authorization: Bearer <key>`. The gateway:
 
 Cache misses are rate limited to 20 per second per client address, and a request over the limit gets 429 `rate_limited`. The limiter keys on the connection's address, or on the client address forwarded by a proxy listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES`; it ignores `X-Forwarded-For` from anyone else, and groups IPv6 clients by their `/64` prefix. It remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds); past that it evicts entries, and an evicted address starts again with a full allowance. Behind a load balancer every client shares one address.
 
+## Request limits
+
+Data API and storage requests made with a public key are limited at the gateway, after the key and any user token are checked. Each request draws on one token bucket:
+
+- with a verified `Chelabase-User` token, the bucket of that app user on that key, wherever the user is;
+- without one, the bucket of that key and the client's address (the same address as above: the connection's, or one forwarded by a trusted proxy, IPv6 grouped by `/64`).
+
+A bucket holds a burst of requests (default 300) and refills at a steady rate (default 100 a second). Past that, a request gets 429 `rate_limited` with `Retry-After` (whole seconds) and the route's CORS headers; `Retry-After` is exposed to browsers. The 429 itself takes nothing, and neither does a request the gateway refuses (a missing, unknown or wrong kind of key, a bad user token, the cache-miss limit), so a request is never limited twice for one cause. The data API and storage have a budget each, so a page loading many files doesn't hold back its queries; `CHELABASE_GATEWAY_STORAGE_RATE_SHARED=true` makes storage draw on the data API's budget.
+
+- **No bucket for a key as a whole.** The public key ships in every browser, so a shared bucket would let anyone who reads an app's page use up the whole app's allowance. The ceiling is per client: a caller spread over many addresses or many app-user accounts is limited per address or account, not in total.
+- **Secret keys are not limited.** They belong on servers, where one key carries every user's requests from one address; a leaked secret key is answered by revoking it.
+- **One address, many anonymous callers.** Requests without a user token from one address share its bucket: a reverse proxy not listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES`, an app server calling with the public key for its visitors, and functions calling the data API through `env.CHELABASE` without a user token. Send the user's token, list the proxy, use the secret key on the server, or raise the limit.
+- Functions (`/functions/v1/…`, `/services/v1/…`), the app-user auth routes (auth has its own limits) and keyless storage downloads (public and signed URLs) are not limited here.
+- Limits are kept per gateway instance, in memory: with several gateways a client's allowance is one per instance. Each budget remembers at most 100,000 clients; when it is full, those with the most allowance left go first, and a new client is always tracked.
+
 ## Refused MCP bearers
 
 The gateway passes the `/mcp` bearer to `mcp` unchecked, so it counts what `mcp` refuses instead. Every 401 a request to the MCP server gets, the gateway's own for a missing bearer and the one `mcp` answers for a bad, expired or revoked token, counts against the client's address (the same address as above: the connection's, or one forwarded by a trusted proxy, IPv6 grouped by `/64`). An address may have 30 refusals at once and earns one back every 2 seconds. Past that, every `/mcp` request from it gets 429 `rate_limited` with `Retry-After`, before its bearer is looked at, so a good token from that address waits too. The limit is checked when a request arrives, so an address can have as many refusals answered as it has requests in flight before it applies; those refusals still count, which stretches the wait to about a minute at most. A request whose client hangs up before `mcp` answers counts as a refusal too, while a failure of `mcp` itself (502 or 504) never does. Successful requests never count, and the discovery documents (`/.well-known/oauth-protected-resource…`) are never limited.
@@ -76,11 +91,16 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 | `CHELABASE_PUBLIC_SCHEME` | `https` | The scheme clients use; derives Studio's origin and the issuer |
 | `CHELABASE_GATEWAY_TRUSTED_PROXIES` | none | Reverse proxies whose forwarded client address is believed: CIDRs or addresses, comma-separated |
 | `CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS` | `60` | Upstream read timeout |
+| `CHELABASE_GATEWAY_DATA_RATE_PER_SECOND`, `CHELABASE_GATEWAY_DATA_RATE_BURST` | `100`, `300` | Data API [request limits](#request-limits): the refill rate (requests a second) and the burst, per key and client |
+| `CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND`, `CHELABASE_GATEWAY_STORAGE_RATE_BURST` | `100`, `300` | Storage request limits, the same way |
+| `CHELABASE_GATEWAY_STORAGE_RATE_SHARED` | `false` | `true`: storage requests draw on the data API's budget (the storage settings must then be unset) |
 | `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | The orchestrator's internal listener, for key lookups |
 | `CHELABASE_DATA_KEYS_TOKEN` | `chelabase-dev-data-keys` | Bearer for key lookups |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | Bearer for app-user session liveness |
 | `CHELABASE_MEMBER_JWT_PUBLIC_KEY` | unset | Member token verify key (a PEM file, `auth/member-jwt.pub`); unset, every bearer is refused |
 | `CHELABASE_APP_JWT_PUBLIC_KEY` | unset | App-user token verify key (a PEM file); unset, every `Chelabase-User` header is refused |
 | `CHELABASE_INTERNAL_SIGNING_KEY` | none (required) | The key that signs identity tokens (`gateway/internal-signing.pem`) |
+
+A request limit setting that isn't a positive whole number (or `true`/`false` for the switch) stops the gateway at start-up, naming the variable; blank is the default.
 
 The development bearer values (`chelabase-dev-…`) are used only with `CHELABASE_DEV_DEFAULTS=1` (the workbench); otherwise an unset or development bearer stops the service at start-up. Each bearer can also be given as a file through `<NAME>_FILE`.

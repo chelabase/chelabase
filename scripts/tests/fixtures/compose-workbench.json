@@ -743,7 +743,12 @@
       ],
       "environment": {
         "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE": "/m/.chelabase/tokens/app-sessions.token",
-        "CHELABASE_DATA_KEYS_TOKEN_FILE": "/m/.chelabase/tokens/data-keys.token"
+        "CHELABASE_DATA_KEYS_TOKEN_FILE": "/m/.chelabase/tokens/data-keys.token",
+        "CHELABASE_GATEWAY_DATA_RATE_BURST": "",
+        "CHELABASE_GATEWAY_DATA_RATE_PER_SECOND": "",
+        "CHELABASE_GATEWAY_STORAGE_RATE_BURST": "",
+        "CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND": "",
+        "CHELABASE_GATEWAY_STORAGE_RATE_SHARED": ""
       },
       "healthcheck": {
         "interval": "2s",

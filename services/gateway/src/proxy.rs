@@ -610,7 +610,7 @@ mod tests {
             identity: None,
             response_headers: vec![
                 ("access-control-allow-origin", "*".to_string()),
-                ("access-control-expose-headers", "etag, content-range".to_string()),
+                ("access-control-expose-headers", "etag, content-range, retry-after".to_string()),
             ],
             client_ip: None,
             forwarded: Vec::new(),
@@ -634,7 +634,7 @@ mod tests {
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("access-control-expose-headers", "x-trace").unwrap();
         apply_response_headers(&mut response, &plan(&rest::QUERY)).unwrap();
-        assert_eq!(response.headers.get("access-control-expose-headers").unwrap(), "etag, content-range");
+        assert_eq!(response.headers.get("access-control-expose-headers").unwrap(), "etag, content-range, retry-after");
     }
 
     #[test]
