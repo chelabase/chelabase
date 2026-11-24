@@ -53,7 +53,7 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | Service | Internal address | Notes |
 | --- | --- | --- |
 | Studio | `studio:3000` | The web app (dev server) |
-| Orchestrator | `orchestrator:8081` | Management API; internal to the gateway |
+| Orchestrator | `orchestrator-api:8081` | Management API; internal to the gateway. It binds this default-network alias and loopback only, so computes can't connect to it |
 | Orchestrator internal listener | `orchestrator:8083` | For the proxy, `compute_ctl`, the storage controller, the gateway, `rest`, `auth` and realtime |
 | Worker health | `worker:8082` | `/health` |
 | auth | `auth:8084` | Sign-in backend (via the gateway at `/auth/v1`) |

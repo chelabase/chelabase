@@ -17,8 +17,9 @@
 #    Failure path: COMPUTE_NETWORK_E2E_COMPUTE_NET=<a network that is not internal> makes the
 #    probe join it instead of the stack's compute network, and the no-default-route check fails.
 # 1. Reachability: a compute can't reach NATS, Valkey, any database, the identity service, Mailpit, SeaweedFS,
-#    the storage controller, the gateway or Studio, by name or by their default-network address;
-#    it reaches what it needs (pageserver, safekeeper, the orchestrator's hooks listener).
+#    the storage controller, the gateway, Studio or the orchestrator's management API (#318), by
+#    name or by their default-network address; it reaches what it needs (pageserver, safekeeper,
+#    the orchestrator's hooks listener).
 # 2. Port audit (S27): every TCP listener of every container on the compute network (read from
 #    each container's /proc/net/tcp{,6}, loopback excluded) must be in the table below, and each
 #    is probed: it refuses a caller without a credential (and with the old public development
@@ -257,7 +258,8 @@ if tcp_open host.docker.internal "$gateway_port"; then fail "a compute reaches t
 
 # --- 1. reachability ---------------------------------------------------------------------------
 for target in nats:4222 nats:8222 valkey:6379 metadata-db:5432 storcon-db:5432 identity:8080 \
-  mailpit:8025 mailpit:1025 seaweedfs:8333 storage-controller:1234 storage-broker:50051 "gateway:$gateway_port" studio:3000; do
+  mailpit:8025 mailpit:1025 seaweedfs:8333 storage-controller:1234 storage-broker:50051 "gateway:$gateway_port" studio:3000 \
+  orchestrator:8081 orchestrator-api:8081; do
   host="${target%%:*}" port="${target#*:}"
   if tcp_open "$host" "$port"; then fail "a compute reaches $target"; else ok "no route to $target"; fi
   ip="$(default_ip "$host")"
@@ -335,9 +337,22 @@ storage_http_allowlist() { # storage_http_allowlist <host:port> <what>
 audit() { # audit <service> <port>: the check for one listener; returns 1 when it isn't in the table
   local svc="$1" port="$2"
   case "$svc:$port" in
+    # The management API (#318) binds its default-network alias and loopback only, so from the
+    # compute and control networks nothing answers: by name, and at the orchestrator's address on
+    # each of them. (Its hooks listener, 8083, is the positive control.)
     orchestrator:8081)
-      [[ "$(status GET http://orchestrator:8081/health)" == 200 ]] || fail "orchestrator:8081 /health"
-      refused GET http://orchestrator:8081/v1/me "the public API" ;;
+      local oip net
+      if tcp_open orchestrator 8081; then fail "a compute reaches the management API at orchestrator:8081"; else ok "orchestrator:8081 (the management API) isn't reachable by name"; fi
+      for net in "$compute_net" "$control_net"; do
+        oip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"$net\"}}{{.IPAddress}}{{end}}" "$name")"
+        if [[ -z "$oip" ]]; then
+          fail "the orchestrator has no address on $net (the by-address probe can't be made)"
+        elif tcp_open "$oip" 8081; then
+          fail "the management API answers on the orchestrator's $net address $oip"
+        else
+          ok "the management API isn't reachable at the orchestrator's $net address $oip"
+        fi
+      done ;;
     orchestrator:8083)
       refused GET "http://orchestrator:8083/compute/api/v2/computes/ep-$zero32/spec" "the spec hook"
       refused PATCH "http://orchestrator:8083/compute/api/v2/computes/ep-$zero32/ddl" "the DDL hook"

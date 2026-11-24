@@ -195,7 +195,8 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ),
     ("CHELABASE_INTERNAL_URL", "http://orchestrator:8083"),
     ("CHELABASE_REST_INTERNAL_URL", "http://rest:8086"),
-    ("CHELABASE_ORCHESTRATOR_URL", "http://orchestrator:8081"),
+    // #318: the management API by its alias on the default network only (as the base file).
+    ("CHELABASE_ORCHESTRATOR_URL", "http://orchestrator-api:8081"),
     ("CHELABASE_AUTH_URL", "http://auth:8084"),
     ("CHELABASE_REST_URL", "http://rest:8085"),
     // RT1 T7: the gateway's realtime upstream (the ticket and socket routes).
@@ -217,7 +218,9 @@ const SERVICE_KEYS: &[(&str, &str)] = &[
     ("CHELABASE_MAIL_UPSTREAM", "http://mailpit:8025"),
     ("CHELABASE_DOCS_UPSTREAM", "http://docs:3001"),
     ("CHELABASE_LANDING_UPSTREAM", "http://landing:3002"),
-    ("CHELABASE_ORCHESTRATOR_ADDR", "0.0.0.0:8081"),
+    // #318: that alias and loopback (the healthcheck), never 0.0.0.0: no socket on the compute or
+    // control network.
+    ("CHELABASE_ORCHESTRATOR_ADDR", "orchestrator-api:8081,127.0.0.1:8081"),
     ("CHELABASE_WORKER_HEALTH_ADDR", "0.0.0.0:8082"),
     ("CHELABASE_INTERNAL_ADDR", "0.0.0.0:8083"),
     ("CHELABASE_AUTH_ADDR", "0.0.0.0:8084"),

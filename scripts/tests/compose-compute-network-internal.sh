@@ -34,8 +34,17 @@
 #   7. it runs only behind the profile `compute-egress`, so a render without profiles has no such
 #      service; its settings (allow-list, listen address, the stack's subnets, health port and dial
 #      timeout) are wired, and the worker's `CHELABASE_COMPUTE_EGRESS_DNS` is its address.
+# The orchestrator's management listener (#318), in the same renders:
+#   8. CHELABASE_ORCHESTRATOR_ADDR names loopback (the healthcheck, which probes it there) and
+#      aliases only: never an any-address or the service name `orchestrator` (which every network of
+#      the orchestrator resolves). Each alias is declared on the orchestrator's `default` network and
+#      on no other network, by no other service; every CHELABASE_ORCHESTRATOR_URL names one of those
+#      aliases at the listener's port. So the listener has no socket on `compute-internal` or
+#      `control-internal`, and a caller on several networks can't resolve it to one of those.
+#      The workbench's values are in stack.env, which tools/cli/src/workbench/env.rs writes
+#      (`SERVICE_KEYS`); they are read from there.
 # Each check also runs against a fixture service that breaks it (a capability, root, a volume, a
-# second member of an egress network, …), which must fail.
+# second member of an egress network, an any-address management listener, …), which must fail.
 # The workbench slot formula below mirrors tools/cli/src/workbench/env.rs (`control_net`,
 # `compute_net`), whose unit tests pin it.
 set -euo pipefail
@@ -368,10 +377,92 @@ egress_checks() { # egress_checks <label> <mode> <rendered json> (also runs the 
   egress_breaks "a secret-named setting" "$mode" "$json" "$subnet" "$ip_range" "$f.environment.CHELABASE_SECRETS_KEY_FILE = \"/k\""
 }
 
+# --- the management listener (#318) -------------------------------------------------------------
+# mgmt_check <label> <rendered json> <CHELABASE_ORCHESTRATOR_ADDR> <CHELABASE_ORCHESTRATOR_URL…>
+mgmt_check() {
+  local label="$1" json="$2" addr_list="$3" q entry host port="" loopback="" aliases=" " nets owners url
+  shift 3
+  q() { jq -r "$1" "$json"; }
+  [[ -n "${addr_list// /}" ]] || fail "$label: CHELABASE_ORCHESTRATOR_ADDR is unset"
+  for entry in ${addr_list//,/ }; do
+    [[ "$entry" =~ ^(.+):([0-9]+)$ ]] || fail "$label: CHELABASE_ORCHESTRATOR_ADDR entry $entry isn't host:port"
+    host="${BASH_REMATCH[1]}"
+    [[ -z "$port" || "$port" == "${BASH_REMATCH[2]}" ]] || fail "$label: CHELABASE_ORCHESTRATOR_ADDR names two ports"
+    port="${BASH_REMATCH[2]}"
+    case "$host" in
+      0.0.0.0 | "[::]" | :: | "*")
+        fail "$label: the management listener binds the any-address ($entry), so computes reach it" ;;
+      orchestrator)
+        fail "$label: the management listener binds the service name ($entry), which resolves on every network of the orchestrator" ;;
+      127.* | localhost | "[::1]") loopback=1; continue ;;
+    esac
+    nets="$(q "[.services.orchestrator.networks // {} | to_entries[] | select((.value.aliases // []) | index(\"$host\") != null) | .key] | sort | join(\" \")")"
+    [[ "$nets" == default ]] ||
+      fail "$label: the management listener's alias $host is declared on the orchestrator's networks [$nets], not on \`default\` alone"
+    owners="$(q "[.services | to_entries[] | select(.key != \"orchestrator\") | select(.key == \"$host\" or ([(.value.networks // {}) | to_entries[] | (.value.aliases // [])[]] | index(\"$host\") != null)) | .key] | join(\" \")")"
+    [[ -z "$owners" ]] || fail "$label: the management listener's alias $host is also a name of [$owners]"
+    aliases+="$host "
+  done
+  [[ -n "$loopback" ]] || fail "$label: CHELABASE_ORCHESTRATOR_ADDR has no loopback entry for the healthcheck"
+  [[ "$aliases" != " " ]] || fail "$label: CHELABASE_ORCHESTRATOR_ADDR names no default-network alias (the gateway can't reach it)"
+  [[ "$(q '.services.orchestrator.healthcheck.test | if type == "array" then join(" ") else . end')" == *"http://127.0.0.1:$port/health"* ]] ||
+    fail "$label: the orchestrator's healthcheck doesn't probe the management listener on loopback (127.0.0.1:$port)"
+  (($# > 0)) || fail "$label: no CHELABASE_ORCHESTRATOR_URL to check"
+  for url in "$@"; do
+    [[ "$url" =~ ^http://([^/:]+):([0-9]+)/?$ && "$aliases" == *" ${BASH_REMATCH[1]} "* && "${BASH_REMATCH[2]}" == "$port" ]] ||
+      fail "$label: CHELABASE_ORCHESTRATOR_URL $url isn't one of the listener's aliases [${aliases# }] at port $port"
+  done
+  echo "compose-compute-network-internal: ok: $label (management listener on [${addr_list}])"
+}
+# The base renders' values: the orchestrator's setting and every service's URL.
+mgmt_base() { # mgmt_base <label> <json>
+  local urls
+  mapfile -t urls < <(jq -r '[.services[] | .environment.CHELABASE_ORCHESTRATOR_URL? // empty] | unique[]' "$2")
+  mgmt_check "$1" "$2" "$(jq -r '.services.orchestrator.environment.CHELABASE_ORCHESTRATOR_ADDR // empty' "$2")" "${urls[@]}"
+}
+# A fixture that breaks one rule must fail: mgmt_breaks <what> <json> <jq filter> <expect> [addr url]
+mgmt_breaks() {
+  local what="$1" json="$2" filter="$3" expect="$4" out
+  shift 4
+  jq "$filter" "$json" >"$tmp/mgmt-mutant.json" || fail "the fixture filter for $what is wrong"
+  if (($# == 2)); then
+    out="$( (mgmt_check "mutant ($what)" "$tmp/mgmt-mutant.json" "$1" "$2") 2>&1 )" && fail "the management-listener check accepts $what"
+  else
+    out="$( (mgmt_base "mutant ($what)" "$tmp/mgmt-mutant.json") 2>&1 )" && fail "the management-listener check accepts $what"
+  fi
+  [[ "$out" == "compose-compute-network-internal: mutant ($what): "*"$expect"* ]] ||
+    fail "the management-listener check refused $what for another reason (wanted \"$expect\"): $out"
+}
+mgmt_base_checks() { # mgmt_base_checks <label> <json>
+  local json="$2" o='.services.orchestrator'
+  mgmt_base "$1" "$json"
+  mgmt_breaks "an any-address listener" "$json" "$o.environment.CHELABASE_ORCHESTRATOR_ADDR = \"0.0.0.0:8081\"" "any-address"
+  mgmt_breaks "the service name as the listener" "$json" "$o.environment.CHELABASE_ORCHESTRATOR_ADDR = \"orchestrator:8081,127.0.0.1:8081\"" "service name"
+  mgmt_breaks "no loopback entry" "$json" "$o.environment.CHELABASE_ORCHESTRATOR_ADDR |= (split(\",\") | map(select(startswith(\"127.\") | not)) | join(\",\"))" "loopback"
+  mgmt_breaks "the alias on compute-internal" "$json" "$o.networks[\"compute-internal\"].aliases = [\"orchestrator-api\"]" "not on \`default\` alone"
+  mgmt_breaks "the alias on control-internal" "$json" "$o.networks[\"control-internal\"].aliases = [\"orchestrator-api\"]" "not on \`default\` alone"
+  mgmt_breaks "no alias on default" "$json" "$o.networks.default = {}" "not on \`default\` alone"
+  mgmt_breaks "another service with the alias" "$json" ".services.worker.networks.default = {aliases: [\"orchestrator-api\"]}" "also a name of"
+  mgmt_breaks "a URL by the service name" "$json" ".services.realtime.environment.CHELABASE_ORCHESTRATOR_URL = \"http://orchestrator:8081\"" "isn't one of the listener's aliases"
+  mgmt_breaks "a healthcheck off loopback" "$json" "$o.healthcheck.test = [\"CMD-SHELL\", \"curl -fsS http://orchestrator-api:8081/health\"]" "healthcheck"
+}
+# The workbench's stack.env values, from the CLI's SERVICE_KEYS.
+env_rs="$root/tools/cli/src/workbench/env.rs"
+service_key() { sed -n "s|^ *(\"$1\", \"\(.*\)\"),\$|\1|p" "$env_rs"; }
+wb_addr="$(service_key CHELABASE_ORCHESTRATOR_ADDR)"
+wb_url="$(service_key CHELABASE_ORCHESTRATOR_URL)"
+[[ -n "$wb_addr" && -n "$wb_url" ]] || fail "can't read CHELABASE_ORCHESTRATOR_ADDR and _URL from $env_rs"
+mgmt_wb_checks() { # mgmt_wb_checks <label> <json>
+  mgmt_check "$1" "$2" "$wb_addr" "$wb_url"
+  mgmt_breaks "an any-address listener (workbench)" "$2" . "any-address" "0.0.0.0:8081" "$wb_url"
+  mgmt_breaks "a URL by the service name (workbench)" "$2" . "isn't one of the listener's aliases" "$wb_addr" "http://orchestrator:8081"
+}
+
 base="$dir/docker-compose.yml"
 render chelabase "$dir/.env.example" -f "$base" >"$tmp/base.json" || fail "rendering the self-hosted install failed"
 check "self-hosted install" chelabase "$tmp/base.json"
 egress_checks "self-hosted install" base "$tmp/base.json"
+mgmt_base_checks "self-hosted install" "$tmp/base.json"
 # Without the profile there is no egress container: nothing but compute-egress's profile starts it.
 no_profile="$(NEON_IMAGE=neon-storage:placeholder COMPUTE_NODE_IMAGE=neon-compute:placeholder \
   docker compose -p chelabase --project-directory "$dir" -f "$base" --env-file "$dir/.env.example" config --services)" ||
@@ -381,6 +472,7 @@ render chelabase "$dir/.env.example" -f "$base" -f "$dir/docker-compose.example.
   fail "rendering the example overlay failed"
 check "example overlay" chelabase "$tmp/example.json"
 egress_checks "example overlay" base "$tmp/example.json"
+mgmt_base_checks "example overlay" "$tmp/example.json"
 
 workbench() { # workbench <label> <env file>
   # `mcp`: every workbench compose call turns it on (tools/cli/src/workbench/argv.rs).
@@ -389,6 +481,7 @@ workbench() { # workbench <label> <env file>
     fail "rendering the workbench overlay ($1) failed"
   check "$1" chelabase-feat-x "$tmp/wb.json"
   egress_checks "$1" workbench "$tmp/wb.json"
+  mgmt_wb_checks "$1" "$tmp/wb.json"
 }
 workbench "workbench (fixture, slot 1)" "$fixture"
 [[ "$(jq -r '.networks["control-internal"].ipam.config[0].subnet' "$tmp/wb.json")" == "$(sed -n 's/^CHELABASE_CONTROL_INTERNAL_SUBNET=//p' "$fixture")" ]] ||

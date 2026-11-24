@@ -11,7 +11,6 @@ use chelabase_secrets::{key_check_value, verify_key_check, SecretKey};
 use orchestrator::internal::{build_internal_router, config::InternalConfig, InternalState};
 use orchestrator::compute_tls::ComputeTls;
 use orchestrator::{build_router, AppState, Console, NatsPorts, ProxyAddress, RestInternal};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -233,20 +232,37 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(Arc::new(state));
 
-    let addr: SocketAddr = std::env::var("CHELABASE_ORCHESTRATOR_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8081".into())
-        .parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // #318: the management API binds only the addresses named here, each resolved now. Compose
+    // names the default-network alias and loopback, so computes can't connect to it; the
+    // compute-facing endpoints are on the internal listener.
+    let addrs = orchestrator::listen::resolve_listen_addrs(
+        "CHELABASE_ORCHESTRATOR_ADDR",
+        &std::env::var("CHELABASE_ORCHESTRATOR_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".into()),
+    )
+    .await?;
+    let mut listeners = Vec::new();
+    for addr in &addrs {
+        listeners.push(tokio::net::TcpListener::bind(addr).await?);
+    }
     let internal_listener = tokio::net::TcpListener::bind(internal_config.addr).await?;
-    info!("orchestrator listening on {addr}");
+    info!("orchestrator listening on {addrs:?}");
     info!(
         "internal listener (proxy, compute_ctl, storage controller) on {}",
         internal_config.addr
     );
-    tokio::try_join!(
-        async { axum::serve(listener, app).await },
-        async { axum::serve(internal_listener, build_internal_router(internal_state)).await },
-    )?;
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let app = app.clone();
+        servers.spawn(async move { axum::serve(listener, app).await });
+    }
+    servers.spawn(async move {
+        axum::serve(internal_listener, build_internal_router(internal_state)).await
+    });
+    // The first listener to end ends the service.
+    if let Some(ended) = servers.join_next().await {
+        ended??;
+        anyhow::bail!("a listener ended");
+    }
     Ok(())
 }
 
