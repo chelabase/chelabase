@@ -86,8 +86,8 @@ pub const MAX_TRIGGERS_PER_FUNCTION: i64 = 20;
 pub const MAX_IN_FLIGHT_PER_DATABASE: i64 = 8;
 /// One project's share of the worker's schedule run slots, all its databases together: a claim
 /// returns at most this many due schedules per project, less the runs its databases already
-/// have in flight. With the worker's 64 slots, three projects at their share still leave 16.
-pub const MAX_IN_FLIGHT_PER_PROJECT: i64 = 16;
+/// have in flight. With the worker's 64 slots, a project at its share still leaves 32.
+pub const MAX_IN_FLIGHT_PER_PROJECT: i64 = 32;
 /// A secret value may be at most 64 KiB.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 /// A function's secrets on one branch together may be at most 128 KiB, measured as the JSON

@@ -17,7 +17,7 @@
 //! and project's runs in flight (a [`RunGuard`] held by the run's task, released on every way
 //! out of it: done, failed, timed out, panicked or dropped at shutdown), and a claim gives each
 //! database and project only what is left of its share, so one project's due schedules can't
-//! fill every slot: three projects at their share still leave a quarter free. The ones left
+//! fill every slot: a project at its share still leaves half of them free. The ones left
 //! out stay due, untouched. When a run ends whose database or project was at its share, the
 //! loop claims again at once instead of at the next tick. Every bound here is per worker
 //! process: replicas each have their own.
@@ -699,7 +699,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let share = chelabase_metadata::MAX_IN_FLIGHT_PER_PROJECT as usize;
         let project = ProjectId::new();
-        let dbs: Vec<DatabaseId> = (0..4).map(|_| DatabaseId::new()).collect();
+        let dbs: Vec<DatabaseId> = (0..8).map(|_| DatabaseId::new()).collect();
         let batch = (0..share).map(|i| in_project(project, dbs[i % dbs.len()], true)).collect();
         let (held, mut asked, _runs) = looping(batch, MAX_IN_FLIGHT);
         let (t0, _, _) = asked.recv().await.unwrap();

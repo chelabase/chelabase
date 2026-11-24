@@ -4003,8 +4003,9 @@ mod functions {
     /// flight, no project more than its share; a due schedule is left out of a claim only when
     /// the claim is full, or its database or project is at its share; and within a claim the
     /// projects take turns: one gets two more than another only when that other has nothing
-    /// more it may take. So with 64 slots and a project share of 16, one project's due
-    /// schedules can never take more than 16 slots, and three such projects leave 16 free.
+    /// more it may take. So with 64 slots and a project share of 32, one project's due
+    /// schedules can never take more than 32 slots: against one saturated project at least 32
+    /// stay free (against k, at least 64 - 32k: void once 32k >= 64).
     #[test]
     #[ignore]
     fn claim_due_schedules_are_fair_for_any_spread() {
