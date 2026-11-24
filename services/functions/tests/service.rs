@@ -256,6 +256,7 @@ async fn harness_tuned(
         ("hang", FunctionAuth::Key),
         ("hang2", FunctionAuth::Key),
         ("hang3", FunctionAuth::Key),
+        ("queued", FunctionAuth::Key),
         ("users", FunctionAuth::AppUser),
         ("open", FunctionAuth::Public),
     ] {
@@ -1346,15 +1347,19 @@ async fn a_failed_or_dropped_invocation_frees_its_slot() {
     wait_for(|| running(&h, "drip") == 0).await;
 }
 
-/// #295: a runtime that takes a request and drops its connection without answering (what a
-/// watchdog kill does to every request in flight): `hang*` after `hold`, everything else 200.
+/// #295: a runtime that stalls and dies the way workerd does under the watchdog: `hang*` holds
+/// the one thread for `hold`, then the runtime is killed and every connection in flight closes
+/// with no answer, the ones that queued behind it meanwhile included. Anything else, outside
+/// a stall, answers 200 at once.
 async fn dying_runtime(hold: Duration) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let kill_at: Arc<Mutex<Option<tokio::time::Instant>>> = Arc::new(Mutex::new(None));
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
+            let kill_at = kill_at.clone();
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -1364,9 +1369,28 @@ async fn dying_runtime(hold: Duration) -> String {
                         Ok(n) => head.extend_from_slice(&buf[..n]),
                     }
                 }
-                if head.starts_with(b"GET /hang") || head.starts_with(b"POST /hang") {
-                    tokio::time::sleep(hold).await;
-                    return; // dropped: the connection closes with no answer
+                let now = tokio::time::Instant::now();
+                let stalled = {
+                    let mut kill = kill_at.lock().unwrap();
+                    if head.starts_with(b"GET /hang") || head.starts_with(b"POST /hang") {
+                        *kill.get_or_insert(now + hold)
+                    } else {
+                        match *kill {
+                            Some(at) if at > now => at,
+                            _ => {
+                                *kill = None;
+                                now
+                            }
+                        }
+                    }
+                };
+                if stalled > now {
+                    tokio::time::sleep_until(stalled).await;
+                    let mut kill = kill_at.lock().unwrap();
+                    if kill.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                        *kill = None;
+                    }
+                    return; // killed: the connection closes with no answer
                 }
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
@@ -1464,4 +1488,67 @@ async fn restarts_without_a_common_bundle_disable_nothing() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(refused.dir.disabled.lock().unwrap().is_empty(), "a refused connect is no restart");
+}
+
+/// Review B1: the looper's caller hangs up before the kill, and a request queues behind it.
+/// The looper, no longer in flight here, is still the one turned off; the queued request's
+/// function isn't, though it is the only one in flight at each kill.
+#[tokio::test]
+async fn an_abandoned_looper_is_still_the_one_turned_off() {
+    let url = dying_runtime(Duration::from_millis(300)).await;
+    let h = Arc::new(
+        harness_tuned(Some(url), Duration::from_secs(10), |s| {
+            s.with_restart_policy(quick_restarts())
+        })
+        .await,
+    );
+    for i in 0..3 {
+        assert_eq!(status(&h, "hello").await, 200, "restart {i}");
+        let looper = {
+            let h = h.clone();
+            tokio::spawn(async move { status(&h, "hang").await })
+        };
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        looper.abort(); // the caller gives up; the runtime keeps looping
+        let _ = looper.await;
+        assert_eq!(status(&h, "queued").await, 502, "restart {i}: queued behind it, killed");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    wait_for(|| !h.dir.disabled.lock().unwrap().is_empty()).await;
+    let disabled: Vec<Uuid> = h.dir.disabled.lock().unwrap().iter().map(|d| d.1).collect();
+    assert_eq!(disabled, vec![function_id("hang")], "the looper, not the queued function");
+    assert_eq!(status(&h, "queued").await, 200);
+}
+
+/// Review S3: internal callers (schedules, database events, storage triggers) are bounded by
+/// their own limits and never meet the cap, so outside traffic holding every slot of a
+/// function can't make its events fail.
+#[tokio::test]
+async fn internal_calls_are_not_capped() {
+    let h = Arc::new(
+        harness_tuned(None, Duration::from_millis(800), |s| s.with_max_concurrent(1)).await,
+    );
+    let public = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            h.call(reqwest::Method::GET, "/functions/v1/slow", Cred::Public)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    wait_for(|| h.calls() == 1).await;
+    assert_eq!(status(&h, "slow").await, 429, "a second public call is capped");
+    let resp = h
+        .http
+        .post(format!("{}/internal/invoke/{}/slow", h.control, h.branch))
+        .bearer_auth(WORKER)
+        .body(r#"{"type":"scheduled","cron":"* * * * *","scheduledTime":0}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504, "the worker's call reached the runtime (and timed out)");
+    assert_eq!(h.calls(), 2);
+    assert_eq!(public.await.unwrap(), 504);
 }

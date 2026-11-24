@@ -1634,6 +1634,27 @@ mod functions {
         c.set_active_deployment(main, f, other).await.unwrap();
         assert_eq!(state().await, (false, None));
 
+        // Review S2: an explicit disable owns the state: it drops the watchdog's reason, so a
+        // redeploy doesn't turn the function on against the operator.
+        assert!(c.set_enabled(main, f, true).await.unwrap());
+        assert!(c.disable_stalled_function(main, f, &sha('e'), &reason).await.unwrap());
+        assert!(c.set_enabled(main, f, false).await.unwrap());
+        assert_eq!(state().await, (false, None));
+        let after_off = s.deployment(f, &sha('f')).await;
+        c.set_active_deployment(main, f, after_off).await.unwrap();
+        assert_eq!(state().await, (false, None), "off by hand stays off through a redeploy");
+
+        // Review nit: a new deployment of the same bundle is no fix: it stays off, with its
+        // reason.
+        assert!(c.set_enabled(main, f, true).await.unwrap());
+        assert!(c.disable_stalled_function(main, f, &sha('f'), &reason).await.unwrap());
+        let same_bundle = s.deployment(f, &sha('f')).await;
+        c.set_active_deployment(main, f, same_bundle).await.unwrap();
+        assert_eq!(state().await, (false, Some(reason.clone())), "the same bundle again");
+        let fixed_again = s.deployment(f, &sha('a')).await;
+        c.set_active_deployment(main, f, fixed_again).await.unwrap();
+        assert_eq!(state().await, (true, None));
+
         // A deleting branch isn't written.
         assert!(c.set_enabled(main, f, true).await.unwrap());
         sqlx::query("UPDATE branches SET status = 'deleting' WHERE id = $1")
@@ -1896,7 +1917,8 @@ mod functions {
             ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
             // #295: the functions service's watchdog disable (1 to 3, then 4, as set_enabled).
             ("disable_stalled_function", |c, x| Box::pin(async move {
-                c.disable_stalled_function(x.main, x.f, &sha('b'), "disabled by the runtime watchdog: test").await.map(drop)
+                // The fixture's bundle (review S1): the write matches the state row and takes it.
+                c.disable_stalled_function(x.main, x.f, &sha('c'), "disabled by the runtime watchdog: test").await.map(drop)
             })),
             // Review fix: the rest of the function writes.
             ("set_enabled", |c, x| Box::pin(async move { c.set_enabled(x.main, x.f, false).await.map(drop) })),
@@ -2092,6 +2114,22 @@ mod functions {
         } else {
             Err(format!("{dangling} dangling run-as keys, {orphans} orphaned managed keys"))
         }
+    }
+
+    /// Review S1: the lock-order test's `disable_stalled_function` names the fixture's active
+    /// bundle, so on its own it matches (and locks) the state row; the stalled runs wait on it.
+    #[tokio::test]
+    #[ignore]
+    async fn the_lock_order_fixture_runs_the_watchdog_disable_for_real() {
+        let s = Scratch::new().await;
+        let x = s.contended().await;
+        assert!(
+            s.client
+                .disable_stalled_function(x.main, x.f, &sha('c'), "disabled by the runtime watchdog: test")
+                .await
+                .unwrap()
+        );
+        s.finish().await;
     }
 
     /// The invariant behind audit B1 and m2's delete fix: every function write and every

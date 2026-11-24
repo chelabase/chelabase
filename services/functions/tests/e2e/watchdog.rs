@@ -150,6 +150,81 @@ async fn flow(s: &Stack) {
     assert_eq!((status, body.as_str()), (200, "fixed"));
 }
 
+/// Review B1 on the real runtime: the looper's caller gives up after a second (the runtime
+/// keeps looping) and the innocent function's call queues behind it, so at each kill the
+/// innocent call is the one in flight. The looper is still the one turned off.
+async fn abandoned_flow(s: &Stack) {
+    s.deploy("queued", STEADY).await;
+    s.deploy("spin", SPIN).await;
+    let short = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let mut kills = 0;
+    while kills < MAX_KILLS {
+        until_up(s, "queued").await;
+        let gave_up = short
+            .get(format!("{}/functions/v1/spin", s.api))
+            .bearer_auth(&s.key)
+            .send()
+            .await;
+        if let Ok(resp) = &gave_up
+            && resp.status() == 404
+        {
+            break;
+        }
+        assert!(gave_up.is_err(), "the looper's caller gave up: {gave_up:?}");
+        let (status, body) = s.call("/functions/v1/queued", true).await;
+        if status == 502 {
+            kills += 1;
+        } else {
+            assert_eq!(status, 200, "{body}");
+        }
+        if s.listed("spin").await["enabled"] == json!(false) {
+            break;
+        }
+    }
+    let start = Instant::now();
+    let listed = loop {
+        let listed = s.listed("spin").await;
+        if listed["enabled"] == json!(false) || start.elapsed() > Duration::from_secs(5) {
+            break listed;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        listed["enabled"],
+        json!(false),
+        "after {kills} kills: {listed}"
+    );
+    assert!(
+        listed["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(WATCHDOG_DISABLED_PREFIX),
+        "{listed}"
+    );
+    let queued = s.listed("queued").await;
+    assert_eq!(
+        queued["enabled"],
+        json!(true),
+        "the queued function stays on: {queued}"
+    );
+    until_up(s, "queued").await;
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack: just functions-e2e"]
+async fn an_abandoned_looper_is_turned_off_not_the_call_queued_behind_it() {
+    let stack = Arc::new(Stack::new().await);
+    let run = stack.clone();
+    let result = tokio::spawn(async move { abandoned_flow(&run).await }).await;
+    stack.cleanup().await;
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack: just functions-e2e"]
 async fn a_function_that_keeps_stalling_the_runtime_is_turned_off() {

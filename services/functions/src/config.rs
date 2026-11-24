@@ -35,7 +35,7 @@ pub struct Config {
     pub timeout: Duration,
     /// #295: `CHELABASE_FUNCTIONS_MAX_CONCURRENT` (default
     /// [`crate::limits::DEFAULT_MAX_CONCURRENT`]): invocations of one function on one branch
-    /// running at once; one more answers 429 `too_many_requests`.
+    /// running at once; one more answers 429 `too_many_requests`. Internal callers don't count.
     pub max_concurrent: usize,
     /// [`ORCHESTRATOR_TOKEN`] or its `_FILE` (required).
     pub orchestrator_token: String,

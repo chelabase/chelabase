@@ -484,11 +484,20 @@ async fn invoke(
         body,
     };
     // #295: taken only now (the caller checked, the body read) and held until the answer's
-    // body ends or is dropped.
-    let Some(slot) = s.concurrency.try_acquire(branch, resolution.function_id) else {
-        return too_many_requests(s.concurrency.max());
+    // body ends or is dropped. Internal callers (schedules, database events, storage triggers)
+    // are bounded by their own limits and never meet it, so outside traffic can't make them
+    // fail.
+    let slot = if form == Form::Internal {
+        None
+    } else {
+        match s.concurrency.try_acquire(branch, resolution.function_id) {
+            Some(slot) => Some(slot),
+            None => return too_many_requests(s.concurrency.max()),
+        }
     };
-    let flight = s.restarts.start(
+    // Dropped unanswered (the caller hung up, or the timeout), it stays a suspect: the runtime
+    // may still be stuck in it.
+    let mut flight = s.restarts.start(
         Suspect {
             branch,
             function: resolution.function_id,
@@ -499,6 +508,7 @@ async fn invoke(
     match s.host.invoke(&resolution, inv).await {
         Ok(mut resp) => {
             s.restarts.answered(Instant::now());
+            flight.set_answered();
             // The runtime's reason, whatever the status (the supervisor refuses an env header
             // over its cap with a 400): only the supervisor sets the header, it strips a
             // function's copy. A 5xx without one is the function's own.
@@ -534,7 +544,8 @@ async fn invoke(
             {
                 disable_stalled(s, suspect);
             }
-            drop(flight);
+            // Either way the runtime isn't running it.
+            flight.end();
             error(
                 StatusCode::BAD_GATEWAY,
                 "runtime_unavailable",
