@@ -75,9 +75,10 @@ Anything else is the API's own answer: see [Error codes](/reference/errors).
 |---|---|---|
 | 401 | `unauthorized` | No token, a bad or expired one, or one without enough time left (below). |
 | 403 | `forbidden` | A browser `Origin` the operator hasn't allowed. |
+| 429 | `rate_limited` | Too many refused tokens from your address (more than 30 at once; one more every 2 seconds). Every request from it, a good token's too, waits for `Retry-After` seconds. |
 | 405 | `method_not_allowed` | The endpoint takes `POST` only. |
 | 400 | (JSON-RPC `-32022`) | An unsupported protocol revision; the answer lists the supported ones. |
 
 **How much time a token needs.** A token must have at least the larger of 60 seconds and the time limit plus 10 seconds left: 60 s with the default 30 s limit, and 70 s when the limit is at its largest (60 s). The 401 says how many seconds in `min_remaining_secs`. The member access token's lifetime (`CHELABASE_MEMBER_ACCESS_TTL_SECS` on `auth`) must be longer than that, or no token ever passes; `chelabase mcp` says so when a token it has just been issued is refused for its lifetime.
 
-Failed token checks are not rate-limited inside the MCP server: per-address limits belong at the gateway.
+Failed token checks are limited per address by the gateway, not inside the MCP server ([Gateway](/architecture/gateway#refused-mcp-bearers)).

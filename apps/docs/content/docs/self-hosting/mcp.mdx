@@ -49,7 +49,7 @@ A value out of range stops the service at start with a message naming the variab
 
 The service also reads `CHELABASE_MCP_LISTEN`, `CHELABASE_MCP_INTERNAL_LISTEN`, `CHELABASE_MCP_RUNTIME_URL` and `CHELABASE_MCP_API_URL`; the compose file sets them, and they matter only for an install that runs the service another way. Unset, `CHELABASE_MCP_RUNTIME_URL` makes every call answer `runtime_unavailable`, and unset `CHELABASE_MCP_API_URL` makes every API call answer `upstream_unavailable`.
 
-**Failed token checks aren't rate-limited inside `mcp`.** Behind the gateway there is no cheap per-client key, a refusal costs one signature check, and a bucket shared by every client would let a flood of bad tokens lock out members with good ones. Nothing limits them today; they should be limited per address at the gateway or in front of it (#395).
+**Failed token checks are limited per address at the gateway, not inside `mcp`.** `mcp` never sees the client's address, and a bucket shared by every client would let a flood of bad tokens lock out members with good ones. The gateway counts each 401 on `/mcp` against the client's address and answers 429 once an address has too many (see [Gateway](/architecture/gateway#refused-mcp-bearers)). Behind a reverse proxy, list it in `CHELABASE_GATEWAY_TRUSTED_PROXIES`, or every client shares the proxy's address and one bad client slows them all.
 
 ## The audit log
 

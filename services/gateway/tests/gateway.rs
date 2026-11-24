@@ -1694,3 +1694,195 @@ async fn www_authenticate_from_mcp_reaches_the_client() {
         r#"Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp""#
     );
 }
+
+// ---- #395: refused `/mcp` bearers, limited per client address ----
+
+/// An mcp upstream that refuses every bearer but `Bearer good` with a 401, and counts calls.
+async fn spawn_mcp_refusing_upstream() -> (String, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let count = calls.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let count = count.clone();
+        async move {
+            *count.lock().unwrap() += 1;
+            let good = req.headers().get("authorization").is_some_and(|v| v == "Bearer good");
+            if good {
+                (axum::http::StatusCode::OK, Json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {} })))
+            } else {
+                (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid_token" })))
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_bad_mcp_bearers_are_limited_per_client_through_the_gateway() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, calls) = spawn_mcp_refusing_upstream().await;
+    // The test client is 127.0.0.1: trusting it lets `X-Forwarded-For` stand for other clients.
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &api,
+        &keys,
+        &[("CHELABASE_MCP_URL", mcp.as_str()), ("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let post = |from: &'static str, bearer: Option<&'static str>| {
+        let mut req = client.post(format!("{base}/mcp")).header("x-forwarded-for", from).body("{}");
+        if let Some(bearer) = bearer {
+            req = req.header("authorization", bearer);
+        }
+        async move { req.send().await.unwrap() }
+    };
+
+    const BAD: &str = "203.0.113.9";
+    // Half the burst missing bearers (the gateway's 401), half bad ones (the upstream's), with
+    // a good call between each: every refusal is a 401, so none was counted twice, and the
+    // good calls took nothing.
+    for i in 0..BURST {
+        let bearer = if i % 2 == 0 { None } else { Some("Bearer bad") };
+        assert_eq!(post(BAD, bearer).await.status(), 401, "refusal {i}");
+        if i + 1 < BURST {
+            assert_eq!(post(BAD, Some("Bearer good")).await.status(), 200, "good call after refusal {i}");
+        }
+    }
+    // Over the limit: refused at the gateway, a good bearer from that address included.
+    let upstream_calls = *calls.lock().unwrap();
+    for bearer in [Some("Bearer good"), Some("Bearer bad"), None] {
+        let resp = post(BAD, bearer).await;
+        assert_eq!(resp.status(), 429, "{bearer:?}");
+        let wait: u64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=2).contains(&wait), "{wait}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited");
+    }
+    assert_eq!(*calls.lock().unwrap(), upstream_calls, "a limited request never reaches mcp");
+
+    // Another client is served.
+    assert_eq!(post("203.0.113.10", Some("Bearer good")).await.status(), 200);
+    assert_eq!(post("203.0.113.10", Some("Bearer bad")).await.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoofed_forwarded_address_does_not_dodge_the_mcp_limit() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, _calls) = spawn_mcp_refusing_upstream().await;
+    // No trusted proxy: the client's `X-Forwarded-For` is not believed.
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+    let client = reqwest::Client::new();
+    for i in 0..BURST {
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("x-forwarded-for", format!("198.18.0.{i}"))
+            .header("authorization", "Bearer bad")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "refusal {i}");
+    }
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("x-forwarded-for", "198.18.1.1")
+        .header("authorization", "Bearer good")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+}
+
+/// Sends a bad-bearer `POST /mcp` whose body is cut short, hangs up its side and reads to the
+/// end: the client goes away before the gateway reads mcp's answer.
+async fn abandon_bad_mcp_bearer(base: &str) {
+    let addr = base.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer bad\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bad_mcp_bearers_abandoned_before_the_answer_still_count() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, calls) = spawn_mcp_refusing_upstream().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+    // Twice the allowance: a refusal is counted when the gateway logs the request, which can
+    // come just after the client saw the connection close.
+    for _ in 0..2 * BURST {
+        abandon_bad_mcp_bearer(&base).await;
+    }
+    let reached = *calls.lock().unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("authorization", "Bearer good")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        429,
+        "mcp saw {reached} of {} abandoned bad bearers; each must count",
+        2 * BURST
+    );
+}
+
+/// An mcp upstream that reads the request and hangs up without answering.
+async fn spawn_mcp_hanging_up_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_upstream_failures_never_count_as_refusals() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    // A port nothing listens on: every request is a connect failure.
+    let unreachable = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let hanging_up = spawn_mcp_hanging_up_upstream().await;
+    for (what, mcp) in [("unreachable", unreachable), ("hanging up", hanging_up)] {
+        let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+        // A fresh connection per request: the gateway may close one after a 502, and a pooled
+        // connection it already closed would fail the next send with a reset.
+        let client = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        for i in 0..2 * BURST + 1 {
+            let resp = client
+                .post(format!("{base}/mcp"))
+                .header("authorization", "Bearer bad")
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 502, "{what}: request {i} is an upstream failure, never a 429");
+        }
+    }
+}
