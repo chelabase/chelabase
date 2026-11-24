@@ -33,8 +33,12 @@ pub struct Invocation {
 pub enum HostError {
     /// No response head within the timeout (504).
     Timeout,
-    /// The runtime didn't answer (502): down, restarting (the busy-loop watchdog) or refusing.
+    /// The runtime couldn't be reached (502): down, restarting or refusing the connection.
     Unreachable,
+    /// #295: the runtime took the request and then lost the connection without an answer
+    /// (502): its process died with the request in flight (the watchdog's kill, or the
+    /// kernel's past the memory limit).
+    Dropped,
 }
 
 #[async_trait::async_trait]
@@ -89,8 +93,15 @@ impl FunctionHost for Workerd {
             Err(_) => return Err(HostError::Timeout),
             Ok(Err(e)) if e.is_timeout() => return Err(HostError::Timeout),
             Ok(Err(e)) => {
-                tracing::warn!("the functions runtime didn't answer: {}", e.without_url());
-                return Err(HostError::Unreachable);
+                // Connected and sent, then lost: the runtime died with it in flight. A refused
+                // or failed connect (or a request that couldn't be built) only says it is down.
+                let lost = e.is_request() && !e.is_connect() && !e.is_builder();
+                if lost {
+                    tracing::warn!("the functions runtime dropped a request in flight (it restarted?): {}", e.without_url());
+                } else {
+                    tracing::warn!("the functions runtime didn't answer: {}", e.without_url());
+                }
+                return Err(if lost { HostError::Dropped } else { HostError::Unreachable });
             }
             Ok(Ok(response)) => response,
         };

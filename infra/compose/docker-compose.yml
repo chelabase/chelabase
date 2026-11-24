@@ -1463,6 +1463,7 @@ services:
       CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/functions-s3/secret-key
       # .env's tunables (blank = the service's default).
       CHELABASE_FUNCTIONS_TIMEOUT_MS: ${CHELABASE_FUNCTIONS_TIMEOUT_MS:-}
+      CHELABASE_FUNCTIONS_MAX_CONCURRENT: ${CHELABASE_FUNCTIONS_MAX_CONCURRENT:-}
       # External services: hosts allowed to resolve to private addresses, and http (both blank =
       # public https only). The orchestrator checks the same at save time.
       CHELABASE_SERVICES_ALLOW_HOSTS: ${CHELABASE_SERVICES_ALLOW_HOSTS:-}

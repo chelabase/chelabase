@@ -35,6 +35,7 @@ mod db_events;
 mod scheduled;
 mod services;
 mod storage_events;
+mod watchdog;
 
 /// How soon a change must apply (NATS drops the cached resolution).
 const WITHIN: Duration = Duration::from_secs(2);

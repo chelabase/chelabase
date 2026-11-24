@@ -19,7 +19,7 @@
 //! the header is stripped from every HTTP call, the worker's included.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -37,6 +37,10 @@ use crate::bundles::{self, Bundles, MAX_BUNDLE_BYTES, Put};
 use crate::caller::{self, Caller, Form, Refusal};
 use crate::directory::Resolution;
 use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
+use crate::limits::{
+    Concurrency, Credit, DEFAULT_MAX_CONCURRENT, RestartPolicy, Restarts, Suspect, human,
+};
+use futures_util::StreamExt as _;
 use crate::resolver::Resolver;
 
 /// m13: marks a database event to the function (m13b: set by the dispatcher in this process only).
@@ -68,6 +72,10 @@ pub struct AppState {
     /// m9: the external services' proxy; `None` answers 503 there.
     pub services: Option<crate::services::Services>,
     recent_errors: Cache<(Uuid, Uuid), String>,
+    /// #295: invocations running per function, capped.
+    concurrency: Arc<Concurrency>,
+    /// #295: what was in flight when the runtime restarted.
+    restarts: Arc<Restarts>,
 }
 
 impl AppState {
@@ -91,7 +99,27 @@ impl AppState {
                 .max_capacity(10_000)
                 .time_to_live(LAST_ERROR_QUIET)
                 .build(),
+            concurrency: Arc::new(Concurrency::new(DEFAULT_MAX_CONCURRENT)),
+            restarts: Arc::new(Restarts::new(RestartPolicy::default())),
         }
+    }
+
+    /// At most `max` invocations of one function on one branch at once
+    /// (`CHELABASE_FUNCTIONS_MAX_CONCURRENT`).
+    pub fn with_max_concurrent(mut self, max: usize) -> Self {
+        self.concurrency = Arc::new(Concurrency::new(max));
+        self
+    }
+
+    /// When a restart is counted against a function, and when it is reported at error level.
+    pub fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
+        self.restarts = Arc::new(Restarts::new(policy));
+        self
+    }
+
+    /// The invocations running, per function.
+    pub fn concurrency(&self) -> &Concurrency {
+        &self.concurrency
     }
 
     /// Serves `/services/v1` through `services`.
@@ -454,8 +482,33 @@ async fn invoke(
         headers,
         body,
     };
+    // #295: taken only now (the caller checked, the body read) and held until the answer's
+    // body ends or is dropped. Internal callers (schedules, database events, storage triggers)
+    // are bounded by their own limits and never meet it, so outside traffic can't make them
+    // fail.
+    let slot = if form == Form::Internal {
+        None
+    } else {
+        match s.concurrency.try_acquire(branch, resolution.function_id) {
+            Some(slot) => Some(slot),
+            None => return too_many_requests(s.concurrency.max()),
+        }
+    };
+    // Dropped unanswered (the caller hung up, or the timeout), it stays a suspect: the runtime
+    // may still be stuck in it.
+    let mut flight = s.restarts.start(
+        Suspect {
+            branch,
+            function: resolution.function_id,
+            name: name.to_owned(),
+            bundle_sha256: resolution.bundle_sha256.clone(),
+        },
+        Instant::now(),
+    );
     match s.host.invoke(&resolution, inv).await {
         Ok(mut resp) => {
+            s.restarts.answered(Instant::now());
+            flight.set_answered();
             // The runtime's reason, whatever the status (the supervisor refuses an env header
             // over its cap with a 400): only the supervisor sets the header, it strips a
             // function's copy. A 5xx without one is the function's own.
@@ -473,7 +526,7 @@ async fn invoke(
                 record_error(s, branch, &resolution, why);
             }
             strip(resp.headers_mut(), false);
-            resp
+            held_until_the_body_ends(resp, (slot, flight))
         }
         Err(HostError::Timeout) => {
             record_error(s, branch, &resolution, "timed out".into());
@@ -483,14 +536,71 @@ async fn invoke(
                 "the function didn't answer in time",
             )
         }
-        Err(HostError::Unreachable) => {
+        Err(e @ (HostError::Unreachable | HostError::Dropped)) => {
             record_error(s, branch, &resolution, "the runtime didn't answer".into());
+            // The runtime died with this request in flight (`flight` still counts it).
+            if e == HostError::Dropped
+                && let Some(credit) = s.restarts.dropped(Instant::now())
+            {
+                report_restart(&s.restarts.policy(), &credit);
+            }
+            // Either way the runtime isn't running it.
+            flight.end();
             error(
                 StatusCode::BAD_GATEWAY,
                 "runtime_unavailable",
                 "the functions runtime is unavailable; retry shortly",
             )
         }
+    }
+}
+
+/// #295: the cap's answer. Nothing queues and nothing is recorded: the function didn't fail.
+fn too_many_requests(max: usize) -> Response<Body> {
+    let mut resp = error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_requests",
+        &format!("this function already has {max} invocations running; retry shortly"),
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    resp
+}
+
+/// `resp` with `guard` held until its body ends or is dropped (a client that hangs up drops
+/// it): the function runs as long as its body streams.
+fn held_until_the_body_ends(
+    resp: Response<Body>,
+    guard: impl Send + Sync + 'static,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _held = &guard;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// #295: a runtime restart counted against its only suspect, for the operator. Nothing is
+/// turned off automatically: what the service sees can't tell a function that answered and
+/// then kept running (in `ctx.waitUntil`) from the request queued behind it, so a function
+/// named here may be innocent. A warning per counted restart, with the count in the window;
+/// an error at the threshold.
+fn report_restart(policy: &RestartPolicy, c: &Credit) {
+    let Suspect { branch, function, name, bundle_sha256 } = &c.suspect;
+    let window = human(policy.window);
+    if c.reached {
+        tracing::error!(
+            %branch, %function, name = %name, bundle = %bundle_sha256, restarts = c.count,
+            "the functions runtime was restarted {} times within {window}, each time with this function the only one that could have stalled it; it would be disabled: check it, and turn it off with `chelabase functions disable {name}` on its branch if it is the cause (a function that keeps running after it answers, in ctx.waitUntil, can't be told apart from the request queued behind it)",
+            c.count,
+        );
+    } else {
+        tracing::warn!(
+            %branch, %function, name = %name, bundle = %bundle_sha256, restarts = c.count,
+            "the functions runtime restarted with this function the only one that could have stalled it ({} of {} within {window})",
+            c.count, policy.threshold,
+        );
     }
 }
 

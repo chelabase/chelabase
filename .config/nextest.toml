@@ -53,3 +53,12 @@ test-group = "stack-serial"
 [[profile.default.overrides]]
 filter = 'package(mcp) & binary(execute_live)'
 test-group = "stack-serial"
+
+# The functions e2e (#295): the watchdog test busy-loops until the runtime is killed and
+# restarted three times, and every other test there calls that runtime.
+[test-groups.functions-runtime]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(chelabase-functions) & binary(e2e)'
+test-group = "functions-runtime"

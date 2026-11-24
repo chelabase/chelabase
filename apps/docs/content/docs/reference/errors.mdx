@@ -180,8 +180,9 @@ Calls to a [function](/using/functions) (`/functions/v1/…`) and a [service](/u
 | 503 | `functions_unavailable` | Edge functions aren't running on this instance: the gateway can't reach the functions service (the service is stopped or down). |
 | 404 | `function_not_found` | No such function, it's disabled on the branch, it's a service (call it on `/services/v1`), or the keyless `/functions/v1/public/…` form was used for a function that isn't `public`. |
 | 413 | `payload_too_large` | The request body is over 6 MiB. |
+| 429 | `too_many_requests` | The function already has as many invocations running on the branch as it may (32 by default, `CHELABASE_FUNCTIONS_MAX_CONCURRENT`). Nothing is queued; retry after the `Retry-After` seconds. Not recorded as its `last_error`. Schedules and event deliveries are never refused this way. |
 | 504 | `function_timeout` | The function didn't answer within the wall clock (30 s, `CHELABASE_FUNCTIONS_TIMEOUT_MS`). Recorded as its `last_error`. |
-| 502 | `runtime_unavailable` | The functions runtime didn't answer; retry shortly. Recorded as the function's `last_error`. |
+| 502 | `runtime_unavailable` | The functions runtime didn't answer; retry shortly. Recorded as the function's `last_error`. When the runtime keeps restarting with one function as the only possible cause, the functions service logs it; nothing is turned off automatically: see [a busy loop](/using/functions/auth-and-limits#a-busy-loop-stalls-every-function). |
 | 404 | `service_not_found` | No such service, or no deployment on the branch. |
 | 503 | `service_disabled` | The service is turned off on the branch. |
 | 503 | `service_unhealthy` | The service failed its last three health checks. |

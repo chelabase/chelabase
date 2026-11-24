@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         config.orchestrator_token.clone(),
         config.worker_token.clone(),
     )
+    .with_max_concurrent(config.max_concurrent)
     .with_services(services));
     // m13b: database events, as the dispatcher's own login on each branch's compute.
     match &config.compute_ca {

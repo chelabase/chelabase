@@ -33,6 +33,10 @@ pub struct Config {
     pub public_url: String,
     /// `CHELABASE_FUNCTIONS_TIMEOUT_MS` (default 30000): an invocation's wall clock.
     pub timeout: Duration,
+    /// #295: `CHELABASE_FUNCTIONS_MAX_CONCURRENT` (default
+    /// [`crate::limits::DEFAULT_MAX_CONCURRENT`]): invocations of one function on one branch
+    /// running at once; one more answers 429 `too_many_requests`. Internal callers don't count.
+    pub max_concurrent: usize,
     /// [`ORCHESTRATOR_TOKEN`] or its `_FILE` (required).
     pub orchestrator_token: String,
     /// [`WORKER_TOKEN`] or its `_FILE` (required).
@@ -89,6 +93,12 @@ impl Config {
             .ok_or_else(|| {
                 anyhow::anyhow!("CHELABASE_FUNCTIONS_TIMEOUT_MS must be a positive integer")
             })?;
+        let max_concurrent: usize = match non_blank("CHELABASE_FUNCTIONS_MAX_CONCURRENT") {
+            None => crate::limits::DEFAULT_MAX_CONCURRENT,
+            Some(v) => v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                anyhow::anyhow!("CHELABASE_FUNCTIONS_MAX_CONCURRENT must be a positive integer")
+            })?,
+        };
         Ok(Config {
             addr: env_or("CHELABASE_FUNCTIONS_ADDR", "127.0.0.1:8091"),
             internal_addr: env_or("CHELABASE_FUNCTIONS_INTERNAL_ADDR", "127.0.0.1:8092"),
@@ -96,6 +106,7 @@ impl Config {
             runtime_url: env_or("CHELABASE_FUNCTIONS_RUNTIME_URL", "http://127.0.0.1:8080"),
             public_url: entry.api_base(),
             timeout: Duration::from_millis(timeout_ms),
+            max_concurrent,
             orchestrator_token,
             worker_token,
             internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
