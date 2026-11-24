@@ -3864,6 +3864,9 @@ mod tests {
         assert_eq!(optional_bound(ROLE_SELECT, "a.rolvaliduntil < "), Some(floor));
         let member = crate::member_roles::member_catalog_sql();
         assert_eq!(optional_bound(&member, "a.rolvaliduntil < "), Some(floor));
+        // The value the clamp prints is the same floor (its literal is the first `extract`).
+        assert_eq!(sql_bound(ROLE_SELECT, "extract(epoch FROM "), floor);
+        assert_eq!(sql_bound(&member, "extract(epoch FROM "), floor);
         assert_eq!(resync_reads(CatalogExpiry::NegInfinity), Some(floor));
         assert_eq!(member_reads(CatalogExpiry::NegInfinity), Some(floor));
         // The resync records it as expired (a SQL role: the database wins).
@@ -3882,6 +3885,8 @@ mod tests {
             (us(floor) - 1).to_string(),
             PG_FIRST_MICROS.to_string(),
             (us(Timestamp::MIN) - 1).to_string(),
+            us(Timestamp::MIN).to_string(),
+            (us(Timestamp::MIN) + 1).to_string(),
             "-9223372036854775809".to_string(),
         ] {
             assert_eq!(parse_valid_until(&field), Some(Some(floor)), "{field}");
