@@ -31,9 +31,9 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
 done
 digests="${1:-}"
 images=(gateway orchestrator worker rest auth realtime storage init studio identity functions functions-runtime service-runner compute-egress mcp mcp-runtime)
-# Images added before their first release: the MCP server and its runtime (mcp-core m8, profile
-# `mcp`). The first `pin-images.sh` run that pins them drops them from here.
-unpublished=(mcp mcp-runtime)
+# Images added before their first release (none now). The first `pin-images.sh` run that pins
+# one drops it from here.
+unpublished=()
 # Every profile of the base file, so a render sees every service.
 profiles=(--profile services --profile compute-egress --profile mcp)
 re='^ghcr\.io/chelabase/([a-z-]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
