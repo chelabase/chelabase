@@ -47,7 +47,7 @@ pub const SERVICES_ENV: &str = "CHELABASE_SERVICES";
 pub const STACK_HOSTS: &[&str] = &[
     "localhost", "metadata-db", "nats", "valkey", "seaweedfs", "create-bucket", "storage-broker",
     "safekeeper1", "safekeeper2", "safekeeper3", "storcon-db", "storage-controller", "pageserver",
-    "register-safekeepers", "proxy-tls", "proxy", "identity", "orchestrator", "worker", "gateway",
+    "register-safekeepers", "proxy-tls", "proxy", "identity", "orchestrator", "orchestrator-api", "worker", "gateway",
     "gateway-functions", "auth", "rest", "realtime", "storage", "studio", "functions",
     "functions-public", "functions-internal", "functions-control", "functions-runtime",
     "mcp", "mcp-public", "mcp-internal", "mcp-runtime", "service-runner", "service-runner-control", "init-secrets", "init-bootstrap", "mailpit", "control",
