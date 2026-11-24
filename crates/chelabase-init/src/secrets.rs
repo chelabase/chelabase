@@ -1731,7 +1731,10 @@ mod tests {
         assert_eq!(snapshot(&keys), before);
         // #308: a public key the services read strictly is never group-writable, legacy or not:
         // the run fails naming the file and the one-line fix, and changes nothing.
-        for p in STRICT_READ.iter().filter(|p| p.ends_with(".pub") || p.ends_with("verify.pem")) {
+        for p in STRICT_READ
+            .iter()
+            .filter(|p| p.ends_with(".pub") || p.ends_with("verify.pem"))
+        {
             let path = keys.join(p);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
             let before = snapshot(&keys);

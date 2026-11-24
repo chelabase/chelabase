@@ -2933,7 +2933,10 @@ mod key_phase_tests {
         for d in ["auth", "gateway", "neon", "secrets", "orchestrator-tls"] {
             std::fs::set_permissions(keys.join(d), std::fs::Permissions::from_mode(0o775)).unwrap();
         }
-        for f in ["compute-ca/ca.crt", "neon/compute-jwt.pub", "gateway/internal-verify.pem"] {
+        // gateway/internal-verify.pem stays 0644: the services read it strictly (#308), so a
+        // group-writable one fails the key phase naming the file and its `chmod 644`
+        // (chelabase-init's workbench_accepts_its_umask_made_keys_dir).
+        for f in ["compute-ca/ca.crt", "neon/compute-jwt.pub"] {
             std::fs::set_permissions(keys.join(f), std::fs::Permissions::from_mode(0o664)).unwrap();
         }
         let (keys_before, state_before) = (snapshot(&keys, &state), snapshot(&state, &state.join("none")));

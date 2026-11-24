@@ -291,7 +291,14 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
 /// missing or empty. A token file that is there but unsafe to read (a symlink, not a regular
 /// file, readable by its group or others: #308) is an error, and the orchestrator doesn't start.
 fn identity_service() -> anyhow::Result<Option<chelabase_identity::Identity>> {
-    match chelabase_identity::Identity::from_env() {
+    identity_or_refusal(chelabase_identity::Identity::from_env())
+}
+
+/// [`identity_service`]'s decision on what `Identity::from_env` gave.
+fn identity_or_refusal(
+    loaded: Result<chelabase_identity::Identity, chelabase_identity::IdentityError>,
+) -> anyhow::Result<Option<chelabase_identity::Identity>> {
+    match loaded {
         Ok(identity) => Ok(Some(identity)),
         Err(e @ chelabase_identity::IdentityError::TokenFileRefused(_)) => {
             Err(anyhow::anyhow!("CHELABASE_IDENTITY_TOKEN_FILE: {e}"))
@@ -310,4 +317,32 @@ fn env_or(name: &str, default: &str) -> String {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identity_or_refusal;
+    use chelabase_identity::{Identity, IdentityError};
+
+    // #308: an unsafe token file stops the orchestrator at start, naming the setting and the
+    // file; an unset setting or a missing or empty file only leaves member management off.
+    #[test]
+    fn an_unsafe_identity_token_file_stops_the_start() {
+        let refused = IdentityError::TokenFileRefused("refusing /run/t: it is a symlink".into());
+        let err = identity_or_refusal(Err(refused))
+            .map(|_| ())
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            err.contains("CHELABASE_IDENTITY_TOKEN_FILE") && err.contains("/run/t"),
+            "{err}"
+        );
+        let unset = IdentityError::Config("CHELABASE_IDENTITY_URL is unset".into());
+        assert!(identity_or_refusal(Err(unset)).unwrap().is_none());
+        assert!(
+            identity_or_refusal(Ok(Identity::new("http://identity:8080", "t")))
+                .unwrap()
+                .is_some()
+        );
+    }
 }

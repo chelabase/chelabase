@@ -99,10 +99,13 @@ impl Config {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
         let cookie_key_file = var("CHELABASE_AUTH_COOKIE_KEY")?;
         // The message names the file; SecretsError's own "secrets key:" prefix would misname it.
-        let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file)).map_err(|e| match e {
-            chelabase_secrets::SecretsError::Config(msg) => anyhow::anyhow!("cookie key: {msg}"),
-            other => anyhow::anyhow!("cookie key: {other}"),
-        })?;
+        let cookie_key =
+            SecretKey::from_file(std::path::Path::new(&cookie_key_file)).map_err(|e| match e {
+                chelabase_secrets::SecretsError::Config(msg) => {
+                    anyhow::anyhow!("cookie key: {msg}")
+                }
+                other => anyhow::anyhow!("cookie key: {other}"),
+            })?;
         let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
         entry.check_mode(mode).map_err(anyhow::Error::new)?;
         let secure_cookies = secure_cookies(
@@ -367,7 +370,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("auth-identity.token");
         std::fs::write(&file, "tok\n").unwrap();
-        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let path: &'static str = Box::leak(file.to_str().unwrap().to_string().into_boxed_str());
         let both = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", path)];
         assert!(identity_from_lookup(member_vars(&both)).unwrap().is_some());
@@ -382,14 +386,23 @@ mod tests {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let loose = dir.path().join("loose.token");
         std::fs::write(&loose, "tok\n").unwrap();
-        std::fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
         for (bad, what) in [(&link, "symlink"), (&loose, "0640")] {
             let p = bad.to_str().unwrap();
-            let err = identity_from_lookup(vars(&[("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", p)]))
-                .map(|_| ())
-                .expect_err("refused")
-                .to_string();
-            assert!(err.contains(p) && err.contains(what) && err.contains("CHELABASE_IDENTITY_TOKEN_FILE"), "{err}");
+            let err = identity_from_lookup(vars(&[
+                ("CHELABASE_IDENTITY_URL", "http://identity:8080"),
+                ("CHELABASE_IDENTITY_TOKEN_FILE", p),
+            ]))
+            .map(|_| ())
+            .expect_err("refused")
+            .to_string();
+            assert!(
+                err.contains(p)
+                    && err.contains(what)
+                    && err.contains("CHELABASE_IDENTITY_TOKEN_FILE"),
+                "{err}"
+            );
         }
     }
 
