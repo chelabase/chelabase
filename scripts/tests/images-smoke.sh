@@ -64,14 +64,28 @@ done
 # AC3: Studio's index.html on / and a deep link; hashed assets cached long.
 studio="${REPO}/studio:${TAG}"
 if docker image inspect "${studio}" >/dev/null 2>&1; then
+  # #306: without the API host the entry point refuses to render the CSP, so the container exits.
+  if out="$(docker run --rm "${studio}" 2>&1)"; then
+    bad "studio: started without CHELABASE_API_HOST"
+  else
+    [[ "${out}" == *"CHELABASE_API_HOST is required"* ]] && ok "studio: refuses to start without CHELABASE_API_HOST" || bad "studio: no API host: ${out}"
+  fi
   studio_ctr="images-smoke-studio-$$"
-  docker run -d --name "${studio_ctr}" "${studio}" >/dev/null
+  docker run -d --name "${studio_ctr}" -e CHELABASE_PUBLIC_SCHEME=http -e CHELABASE_API_HOST=api.smoke.test:8000 "${studio}" >/dev/null
   ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${studio_ctr}")"
   fetch() { curl -fsS --retry 20 --retry-delay 1 --retry-connrefused "$@"; }
-  root="$(fetch "http://${ip}:3000/")"
-  deep="$(fetch "http://${ip}:3000/app/members")"
+  # The shell carries a fresh CSP nonce per response; compare it with the nonce masked.
+  mask() { sed -E 's/nonce="[^"]*"/nonce=""/'; }
+  root_resp="$(fetch -D - "http://${ip}:3000/" | tr -d '\r')"
+  root="$(mask <<<"${root_resp}" | sed '1,/^$/d')"
+  deep="$(fetch "http://${ip}:3000/app/members" | mask)"
   [[ "${root}" == *'<div id="root"'* || "${root}" == *"<!doctype html>"* || "${root}" == *"<!DOCTYPE html>"* ]] && ok "studio: GET /" || bad "studio: GET / isn't index.html"
   [[ "${deep}" == "${root}" ]] && ok "studio: /app/members is index.html" || bad "studio: /app/members differs from index.html"
+  csp="$(awk 'tolower($1)=="content-security-policy:"{ $1=""; print substr($0, 2) }' <<<"${root_resp}")"
+  [[ "${csp}" == *"connect-src 'self' http://api.smoke.test:8000 ws://api.smoke.test:8000;"* ]] && ok "studio: connect-src names the API origin only" || bad "studio: connect-src in '${csp}'"
+  [[ "${csp}" != *unsafe-inline* && "${csp}" != *" 'unsafe-eval'"* ]] && ok "studio: no 'unsafe-inline' or 'unsafe-eval'" || bad "studio: unsafe source in '${csp}'"
+  header_nonce="$(grep -o "'nonce-[^']*'" <<<"${csp}" | head -1 | sed -E "s/'nonce-(.*)'/\1/")"
+  [[ -n "${header_nonce}" && "${root_resp}" == *"<meta property=\"csp-nonce\" nonce=\"${header_nonce}\""* ]] && ok "studio: the shell carries the header's nonce" || bad "studio: header nonce '${header_nonce}' isn't the shell's"
   asset="$(grep -o '/assets/[^"]*\.js' <<<"${root}" | head -1)"
   if [[ -n "${asset}" ]]; then
     cc="$(fetch -D - -o /dev/null "http://${ip}:3000${asset}" | tr -d '\r' | awk 'tolower($1)=="cache-control:"{ $1=""; print }')"

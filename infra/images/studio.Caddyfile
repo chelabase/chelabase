@@ -8,15 +8,28 @@
 	root * /srv
 	encode zstd gzip
 
-	# The API origin is runtime config, so connect-src names schemes rather than one origin.
-	# http: and ws: are there because self-hosted mode serves the API over plain http on any
-	# host name (CHELABASE_PUBLIC_SCHEME=http), a different origin from Studio's; https:
-	# already allows any host, and an https page still never loads http (mixed content).
-	# media-src names the same schemes: storage previews stream audio and video from a signed
-	# URL on the API host. Images and PDFs preview from a fetched blob: URL instead, so img-src
-	# stays narrow and frame-src admits only blob: beside Studio's own origin.
+	# Studio's Content-Security-Policy (#306). The API origin is runtime config: the entry point
+	# (studio-entrypoint.sh) derives CHELABASE_STUDIO_API_ORIGIN and its websocket form from
+	# CHELABASE_PUBLIC_SCHEME and CHELABASE_API_HOST, and Caddy substitutes them when it parses this
+	# file. connect-src names Studio's own origin and the API's only (management, data, storage
+	# and functions calls go to the API host, realtime is its websocket form). media-src names the
+	# API too: storage previews stream audio and video from a signed URL on the API host. Images
+	# and PDFs preview from a fetched blob: URL instead, so img-src stays narrow and frame-src
+	# admits only blob: beside Studio's own origin.
+	#
+	# style-src has no 'unsafe-inline' (#306). Stylesheets come from Studio's origin. The <style>
+	# elements Studio and CodeMirror create at run time carry this response's nonce, which the
+	# templated shell hands the app in <meta property="csp-nonce"> ({http.request.uuid}: a random
+	# v4 UUID minted once per request, so the header and the shell agree). React's style props go
+	# through the CSSOM, which CSP doesn't govern. The API reference's library (Scalar) creates
+	# three fixed <style> elements it gives no nonce (sonner's and its toasts' styles, its theme
+	# for Studio's configuration), allowed by hash, as is the empty text sonner inserts its
+	# element with before filling it; and it sizes a scrollbar probe through two style
+	# attributes, allowed by hash in style-src-attr ('unsafe-hashes' admits only those exact
+	# values). apps/studio/src/components/api-reference-csp.test.tsx renders the real component
+	# and fails when a Scalar upgrade changes any of them; update the hashes from its message.
 	header {
-		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: http: https:; frame-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' https: wss: http: ws:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'nonce-{http.request.uuid}' 'sha256-ZW1GSuo0pKyEx5Ar7ZC5Dflb/mjatjeTW9aVx0iZAzE=' 'sha256-DLlkYCuDYGe6ME23YkUFB7Tc36rGDeo4mVBFbZX3uaU=' 'sha256-nT0S1Qe6I3DXxjh7v5KM5jmdlxs04kQiH5PEGYxqKcU=' 'sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU='; style-src-attr 'unsafe-hashes' 'sha256-im4bR8m0i9OTwS6FwAG4MKlk4URQdZkDu1Tx9kDpKNw=' 'sha256-v6FGbsebOHJ39qjwyswuNyhVylA7DHti/pqoiIvwbXQ='; img-src 'self' data: blob:; media-src 'self' blob: {$CHELABASE_STUDIO_API_ORIGIN}; frame-src 'self' blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' {$CHELABASE_STUDIO_API_ORIGIN} {$CHELABASE_STUDIO_API_WS_ORIGIN}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "no-referrer"
 	}
@@ -25,9 +38,17 @@
 	@hashed path /assets/*
 	header @hashed Cache-Control "public, max-age=31536000, immutable"
 
-	# Everything else, including deep links, is the SPA shell; it must be revalidated.
+	# Everything else, including deep links, is the SPA shell. It carries this response's nonce,
+	# so it is never stored: a cached shell would pair an old nonce with a new header.
 	@shell not path /assets/*
-	header @shell Cache-Control "no-cache"
+	header @shell Cache-Control "no-store"
+
+	# The shell is a template: it writes the request's nonce into <meta property="csp-nonce">.
+	# Only HTML is templated (Studio's only HTML file is the shell), and the handler drops the
+	# file's ETag and Last-Modified, so the shell is never revalidated into a stale nonce.
+	templates {
+		mime text/html
+	}
 
 	try_files {path} /index.html
 	file_server

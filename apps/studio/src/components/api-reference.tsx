@@ -1,7 +1,8 @@
 import { ApiReferenceReact, type AnyApiReferenceConfiguration } from "@scalar/api-reference-react";
 // Imported as a string and rendered in a <style> below, so it applies only while
 // this page is mounted: Scalar's stylesheet has `body` and `:root` rules that
-// must not outlive the page and restyle the rest of Studio.
+// must not outlive the page and restyle the rest of Studio. The <style> elements
+// carry the response's CSP nonce (style-src has no 'unsafe-inline').
 import scalarCss from "@scalar/api-reference-react/style.css?inline";
 import designScalarCss from "@chelabase/design/scalar.css?inline";
 import { useEffect, useMemo, type CSSProperties } from "react";
@@ -10,6 +11,7 @@ import dataDocument from "../../../../openapi/data.json";
 import { appUserAuthDocument, type ApiDocId } from "@/lib/api-docs";
 import { useAccessToken } from "@/lib/access-token";
 import { useStudioEnv } from "@/lib/env-context";
+import { cspNonce } from "@/lib/csp-nonce";
 
 /**
  * Self-hosted: the document is bundled (no fetch), and nothing calls scalar.com
@@ -45,6 +47,7 @@ export function apiReferenceConfiguration(doc: ApiDocId, apiUrl: string, token: 
 export default function ApiReference({ doc }: { doc: ApiDocId }) {
   const { apiUrl } = useStudioEnv();
   const token = useAccessToken();
+  const nonce = useMemo(() => cspNonce(), []);
   // A new configuration only when the token changes: Scalar re-applies it, so a
   // refreshed token reaches "Try it out" without remounting.
   const configuration = useMemo(() => apiReferenceConfiguration(doc, apiUrl, token), [doc, apiUrl, token]);
@@ -57,9 +60,9 @@ export default function ApiReference({ doc }: { doc: ApiDocId }) {
   );
   return (
     <>
-      <style>{scalarCss}</style>
+      <style nonce={nonce}>{scalarCss}</style>
       {/* The design palette over Scalar's dark theme, scoped to .design-scalar (@chelabase/design/scalar.css). */}
-      <style>{designScalarCss}</style>
+      <style nonce={nonce}>{designScalarCss}</style>
       {/* The shell's sticky header is 52px: Scalar's own sticky sidebar sits under it. */}
       <div
         className="design-scalar"

@@ -1411,13 +1411,16 @@ services:
       seaweedfs:
         condition: service_healthy
 
-  # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
-  # Studio's host.
+  # No secrets. The app fetches its config (/auth/v1/studio-config) through the gateway, on
+  # Studio's host; the image itself takes only the public scheme and the API host, from which its
+  # entry point renders the Content-Security-Policy's API origin (connect-src, media-src).
   studio:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:e5a2b48470151c991afc7337db9a29866402252aef34c136107aa0097b242a41}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
+      CHELABASE_PUBLIC_SCHEME: ${CHELABASE_PUBLIC_SCHEME:-http}
+      CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "-H", "Host: ${CHELABASE_STUDIO_HOST_NAME:-studio.chelabase.localhost}", "http://127.0.0.1:3000/"]
