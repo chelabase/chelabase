@@ -176,6 +176,8 @@ fn token_file_is_read_and_trimmed() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("t");
     std::fs::write(&file, "secret\n").unwrap();
+    // Only its owner may read it (#308).
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     assert!(Identity::from_token_file("http://x", &file).is_ok());
     std::fs::write(&file, "\n").unwrap();
     assert!(matches!(

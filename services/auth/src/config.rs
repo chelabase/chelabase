@@ -94,30 +94,10 @@ fn check_listen(listen: &str, trusted_proxy: bool) -> Result<()> {
     )
 }
 
-/// Readable by group or others (a Unix mode).
-fn too_open(mode: u32) -> bool {
-    mode & 0o077 != 0
-}
-
-fn warn_if_open(path: &str) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path)
-            && too_open(meta.permissions().mode())
-        {
-            tracing::warn!("{path} is readable by other users; chmod 600 it");
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
         let cookie_key_file = var("CHELABASE_AUTH_COOKIE_KEY")?;
-        warn_if_open(&cookie_key_file);
         let cookie_key = SecretKey::from_file(std::path::Path::new(&cookie_key_file))
             .map_err(|e| anyhow::anyhow!("cookie key: {e}"))?;
         let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
@@ -384,6 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("auth-identity.token");
         std::fs::write(&file, "tok\n").unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         let path: &'static str = Box::leak(file.to_str().unwrap().to_string().into_boxed_str());
         let both = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", path)];
         assert!(identity_from_lookup(member_vars(&both)).unwrap().is_some());
@@ -393,6 +374,20 @@ mod tests {
         }
         let gone = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", "/nonexistent/t")];
         assert!(identity_from_lookup(vars(&gone)).is_err());
+        // #308: a symlink or a group-readable token file refuses to start, naming the file.
+        let link = dir.path().join("link.token");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let loose = dir.path().join("loose.token");
+        std::fs::write(&loose, "tok\n").unwrap();
+        std::fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        for (bad, what) in [(&link, "symlink"), (&loose, "0640")] {
+            let p = bad.to_str().unwrap();
+            let err = identity_from_lookup(vars(&[("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", p)]))
+                .map(|_| ())
+                .expect_err("refused")
+                .to_string();
+            assert!(err.contains(p) && err.contains(what) && err.contains("CHELABASE_IDENTITY_TOKEN_FILE"), "{err}");
+        }
     }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -487,14 +482,6 @@ mod tests {
         let err = check_listen("0.0.0.0:8084", false).unwrap_err().to_string();
         assert!(err.contains("CHELABASE_AUTH_TRUSTED_PROXY"), "{err}");
         assert!(check_listen("0.0.0.0:8084", true).is_ok());
-    }
-
-    #[test]
-    fn group_or_world_readable_secrets_are_flagged() {
-        assert!(!too_open(0o600));
-        assert!(!too_open(0o400));
-        assert!(too_open(0o640));
-        assert!(too_open(0o644));
     }
 
     // Self-hosted (the default mode) skips verification; platform requires it.

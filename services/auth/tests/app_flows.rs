@@ -428,6 +428,8 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         ttl: Duration::from_secs(300),
     };
     std::fs::write(&member_config.private_key, &private).unwrap();
+    // Only its owner may read a private key (#308).
+    std::fs::set_permissions(&member_config.private_key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     std::fs::write(&member_config.public_key, &public).unwrap();
     let member_tokens = auth::member_token::MemberTokens::from_config(&member_config, &config.issuer).unwrap();
     let state = Arc::new(AppState {

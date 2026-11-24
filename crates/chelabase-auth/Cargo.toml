@@ -19,6 +19,7 @@ getrandom = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 chelabase-auth = { path = ".", features = ["test-support"] }
 base64 = { workspace = true }
 

@@ -95,6 +95,8 @@ mod tests {
             dir.path().join("member-jwt.pub"),
         );
         std::fs::write(&k, &private).unwrap();
+        // Only its owner may read a private key (#308).
+        std::fs::set_permissions(&k, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         std::fs::write(&p, &public).unwrap();
         let config = MemberTokenConfig {
             private_key: k,

@@ -10,6 +10,7 @@ description = "Typed client for the identity service and an in-memory fake of it
 mock = ["dep:axum", "dep:tokio"]
 
 [dependencies]
+chelabase-types = { workspace = true }
 axum = { workspace = true, optional = true }
 chelabase-http = { workspace = true }
 chelabase-time = { workspace = true }
@@ -22,6 +23,8 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
+tempfile = { workspace = true }
 chelabase-http = { workspace = true }
 tokio = { workspace = true }
 # Enables the fake for this crate's own tests.

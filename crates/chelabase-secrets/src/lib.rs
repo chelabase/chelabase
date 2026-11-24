@@ -8,6 +8,7 @@
 use aes_gcm::aead::{Aead, Generate, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chelabase_types::file_value::{Sensitivity, read_private_file};
 use std::path::Path;
 use thiserror::Error;
 
@@ -51,10 +52,13 @@ impl SecretKey {
         Ok(Self(key))
     }
 
+    /// From a file only its owner can read: a regular file (never a symlink) at mode 0600 or
+    /// 0400 (#308). The error names the file and what's wrong, never the key.
     pub fn from_file(path: &Path) -> Result<Self, SecretsError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| SecretsError::Config(format!("read {}: {e}", path.display())))?;
+        let text = read_private_file(path, Sensitivity::Secret)
+            .map_err(|e| SecretsError::Config(e.to_string()))?;
         Self::from_base64(&text)
+            .map_err(|e| SecretsError::Config(format!("{}: {}", path.display(), e.detail())))
     }
 
     /// From the file named by `CHELABASE_SECRETS_KEY`.
@@ -66,6 +70,16 @@ impl SecretKey {
             )
         })?;
         Self::from_file(Path::new(&path))
+    }
+}
+
+impl SecretsError {
+    /// The message without the `secrets key:` prefix.
+    fn detail(&self) -> String {
+        match self {
+            SecretsError::Config(msg) => msg.clone(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -331,6 +345,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("k");
         std::fs::write(&path, key.to_base64()).unwrap();
+        // Only its owner may read it (#308).
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let loaded = SecretKey::from_file(&path).unwrap();
         let sealed = seal(&key, "db-1", "pw");
         assert_eq!(open(&loaded, "db-1", &sealed).unwrap(), "pw");

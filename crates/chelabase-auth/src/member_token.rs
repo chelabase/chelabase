@@ -10,6 +10,7 @@
 
 use crate::AuthError;
 use crate::app_token::{kid_for, raw_public, read};
+use chelabase_types::file_value::Sensitivity;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
@@ -89,7 +90,11 @@ impl MemberTokenSigner {
     }
 
     pub fn from_pem_files(private: &Path, public: &Path, issuer: &str) -> Result<Self, AuthError> {
-        Self::from_pem(&read(private)?, &read(public)?, issuer)
+        Self::from_pem(
+            &read(private, Sensitivity::Secret)?,
+            &read(public, Sensitivity::Public)?,
+            issuer,
+        )
     }
 
     pub fn kid(&self) -> &str {
@@ -132,7 +137,7 @@ impl MemberTokenVerifier {
     }
 
     pub fn from_pem_file(public: &Path, issuer: &str) -> Result<Self, AuthError> {
-        Self::from_pem(&read(public)?, issuer)
+        Self::from_pem(&read(public, Sensitivity::Public)?, issuer)
     }
 
     /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (a path) with the issuer from `CHELABASE_AUTH_HOST`

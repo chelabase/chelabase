@@ -7,7 +7,9 @@
 //! verify tokens but cannot mint them.
 
 use crate::AuthError;
+use crate::app_token::read;
 use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::file_value::Sensitivity;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -108,8 +110,9 @@ impl InternalSigner {
             .map_err(|e| AuthError::Config(format!("internal signing key: {e}")))
     }
 
+    /// From a PEM file only its owner can read (0600), never a symlink (#308).
     pub fn from_pem_file(path: &Path) -> Result<Self, AuthError> {
-        Self::from_pem(&read_key(path)?)
+        Self::from_pem(&read(path, Sensitivity::Secret)?)
     }
 
     /// From the file named by `CHELABASE_INTERNAL_SIGNING_KEY`.
@@ -187,8 +190,9 @@ impl InternalVerifier {
             .map_err(|e| AuthError::Config(format!("internal verify key: {e}")))
     }
 
+    /// From a PEM file only its owner can write (0644), never a symlink (#308).
     pub fn from_pem_file(path: &Path) -> Result<Self, AuthError> {
-        Self::from_pem(&read_key(path)?)
+        Self::from_pem(&read(path, Sensitivity::Public)?)
     }
 
     /// From the file named by `CHELABASE_INTERNAL_VERIFY_KEY`.
@@ -246,9 +250,6 @@ fn env_path(var: &str) -> Result<String, AuthError> {
     })
 }
 
-fn read_key(path: &Path) -> Result<Vec<u8>, AuthError> {
-    std::fs::read(path).map_err(|e| AuthError::Config(format!("read {}: {e}", path.display())))
-}
 
 fn now_secs() -> u64 {
     SystemTime::now()

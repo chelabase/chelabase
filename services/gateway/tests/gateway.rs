@@ -132,6 +132,9 @@ async fn spawn_gateway_with(
         let workdir = tempfile::tempdir().unwrap();
         let signing_key = workdir.path().join("internal-signing.pem");
         std::fs::write(&signing_key, &private_pem).unwrap();
+        // Only its owner may read a private key (#308).
+        std::fs::set_permissions(&signing_key, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let member_key = workdir.path().join("member-jwt.pub");
         std::fs::write(&member_key, &keys.public_pem).unwrap();
 

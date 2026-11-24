@@ -21,6 +21,10 @@
 //! `O_NOFOLLOW | O_NONBLOCK`, so a name swapped for a symlink or a FIFO is refused or read again,
 //! and never blocks the caller.
 //!
+//! [`read_private_file`] applies the same rules to a key or token file read once at start (the
+//! secrets key, the signing and verify keys, the identity tokens): there a missing, empty or
+//! replaced-while-read file is an error too, so a service refuses to start, naming the file.
+//!
 //! These are the bootstrap's own rules for its output dir (`chelabase-init`'s `fsx`): ids 0644,
 //! secrets 0600, no symlinks. Nothing here ever puts the value in a message: errors and `Debug`
 //! name the variable and the path only.
@@ -219,8 +223,8 @@ impl fmt::Debug for FileValue {
     }
 }
 
-/// `Ok(None)`: missing or empty (not yet). `Err`: present but refused, with the reason (never
-/// the contents).
+/// `Ok(None)`: missing or empty (not yet), or replaced while it was read (read again next
+/// time). `Err`: present but refused, with the reason (never the contents).
 fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String> {
     read_with(path, sensitivity, || {})
 }
@@ -232,20 +236,115 @@ fn read_with(
     sensitivity: Sensitivity,
     between: impl FnOnce(),
 ) -> Result<Option<String>, String> {
+    match checked_read(path, sensitivity, between) {
+        Checked::Text(text) => {
+            let value = text.trim();
+            Ok((!value.is_empty()).then(|| value.to_string()))
+        }
+        Checked::Missing | Checked::Replaced => Ok(None),
+        Checked::Refused(reason) => Err(reason),
+    }
+}
+
+/// Why [`read_private_file`] has no contents for a path. Its `Display` names the path and says
+/// what's wrong, never the contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileError {
+    /// Nothing is at the path.
+    Missing { path: PathBuf },
+    /// The file is empty, or only whitespace.
+    Empty { path: PathBuf },
+    /// The file is there but is not trusted (see the module docs), or can't be read.
+    Refused { path: PathBuf, reason: String },
+}
+
+impl FileError {
+    /// The path the error is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            FileError::Missing { path }
+            | FileError::Empty { path }
+            | FileError::Refused { path, .. } => path,
+        }
+    }
+}
+
+impl fmt::Display for FileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileError::Missing { path } => write!(f, "{} does not exist", path.display()),
+            FileError::Empty { path } => write!(f, "{} is empty", path.display()),
+            FileError::Refused { path, reason } => {
+                write!(f, "refusing {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for FileError {}
+
+/// A key or token file read once, at start, under the same rules as [`FileValue`]: never
+/// through a symlink, only a regular file, at most [`MAX_LEN`] bytes of UTF-8, never writable
+/// by its group or others, and (for [`Sensitivity::Secret`]) never readable by them either
+/// (`chmod 600`; 0400 is fine). The checks are made on the opened descriptor, so a name swapped
+/// between the check and the open is refused, never read. The text is returned as it is (not
+/// trimmed); a blank file is [`FileError::Empty`].
+pub fn read_private_file(path: &Path, sensitivity: Sensitivity) -> Result<String, FileError> {
+    read_private_file_with(path, sensitivity, || {})
+}
+
+/// [`read_private_file`], with `between` run after the name is checked and before it is
+/// opened (tests swap the file there).
+fn read_private_file_with(
+    path: &Path,
+    sensitivity: Sensitivity,
+    between: impl FnOnce(),
+) -> Result<String, FileError> {
+    let path_buf = || path.to_path_buf();
+    match checked_read(path, sensitivity, between) {
+        Checked::Text(text) if text.trim().is_empty() => Err(FileError::Empty { path: path_buf() }),
+        Checked::Text(text) => Ok(text),
+        Checked::Missing => Err(FileError::Missing { path: path_buf() }),
+        Checked::Replaced => Err(FileError::Refused {
+            path: path_buf(),
+            reason: "it was replaced while it was being read; start again".into(),
+        }),
+        Checked::Refused(reason) => Err(FileError::Refused {
+            path: path_buf(),
+            reason,
+        }),
+    }
+}
+
+/// What [`checked_read`] found.
+enum Checked {
+    /// The whole file, as text.
+    Text(String),
+    /// Nothing at the name (before or at the open).
+    Missing,
+    /// What was opened is not what was checked: the name was replaced in between.
+    Replaced,
+    /// Present but refused, with the reason (never the contents).
+    Refused(String),
+}
+
+/// The one implementation of the module's rules, shared by [`FileValue`] and
+/// [`read_private_file`].
+fn checked_read(path: &Path, sensitivity: Sensitivity, between: impl FnOnce()) -> Checked {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     // The name itself, not what it points at.
     let named = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if not_found(&e) => return Ok(None),
-        Err(e) => return Err(format!("reading it: {e}")),
+        Err(e) if not_found(&e) => return Checked::Missing,
+        Err(e) => return Checked::Refused(format!("reading it: {e}")),
     };
     if named.file_type().is_symlink() {
-        return Err("it is a symlink".into());
+        return Checked::Refused("it is a symlink".into());
     }
     if !named.is_file() {
-        return Err("it is not a regular file".into());
+        return Checked::Refused("it is not a regular file".into());
     }
     between();
     // Never follows a symlink and never waits (a FIFO swapped in would otherwise block until a
@@ -259,47 +358,58 @@ fn read_with(
     };
     let mut file = match opened_file {
         Ok(f) => f,
-        Err(e) if not_found(&e) => return Ok(None),
+        Err(e) if not_found(&e) => return Checked::Missing,
         // ELOOP: the name became a symlink since the check.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err("it is a symlink".into()),
-        Err(e) => return Err(format!("opening it: {e}")),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Checked::Refused("it is a symlink".into());
+        }
+        Err(e) => return Checked::Refused(format!("opening it: {e}")),
     };
     // What is checked below is the file that was opened: if the name now points elsewhere
-    // (replaced, or swapped for a symlink, since the check above), try again next time.
-    let opened = file.metadata().map_err(|e| format!("reading it: {e}"))?;
+    // (replaced, or swapped for a symlink, since the check above), it isn't read.
+    let opened = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => return Checked::Refused(format!("reading it: {e}")),
+    };
     if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) || !opened.is_file() {
-        return Ok(None);
+        return Checked::Replaced;
     }
     let mode = opened.mode() & 0o7777;
     if mode & 0o022 != 0 {
-        return Err(format!(
-            "it is writable by its group or others (mode {mode:04o}); chmod go-w it"
+        // A secret's fix is the same whichever bits are loose.
+        let fix = match sensitivity {
+            Sensitivity::Secret => "chmod 600",
+            Sensitivity::SharedSecret => "chmod 640 (or 600)",
+            Sensitivity::Public => "chmod go-w",
+        };
+        return Checked::Refused(format!(
+            "it is writable by its group or others (mode {mode:04o}); {fix} it"
         ));
     }
     if sensitivity == Sensitivity::SharedSecret && mode & 0o007 != 0 {
-        return Err(format!(
+        return Checked::Refused(format!(
             "it holds a secret but is readable by others (mode {mode:04o}); chmod 640 (or 600) it"
         ));
     }
     if sensitivity == Sensitivity::Secret && mode & 0o077 != 0 {
-        return Err(format!(
+        return Checked::Refused(format!(
             "it holds a secret but is readable by its group or others (mode {mode:04o}); chmod 600 it"
         ));
     }
     if opened.len() > MAX_LEN {
-        return Err(format!("it is larger than {MAX_LEN} bytes"));
+        return Checked::Refused(format!("it is larger than {MAX_LEN} bytes"));
     }
     let mut bytes = Vec::new();
-    file.by_ref()
-        .take(MAX_LEN + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("reading it: {e}"))?;
-    if bytes.len() as u64 > MAX_LEN {
-        return Err(format!("it is larger than {MAX_LEN} bytes"));
+    if let Err(e) = file.by_ref().take(MAX_LEN + 1).read_to_end(&mut bytes) {
+        return Checked::Refused(format!("reading it: {e}"));
     }
-    let text = String::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_string())?;
-    let value = text.trim();
-    Ok((!value.is_empty()).then(|| value.to_string()))
+    if bytes.len() as u64 > MAX_LEN {
+        return Checked::Refused(format!("it is larger than {MAX_LEN} bytes"));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Checked::Text(text),
+        Err(_) => Checked::Refused("it is not UTF-8 text".into()),
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +653,156 @@ mod tests {
         .unwrap();
         assert_eq!(file.var(), "X_FILE");
         assert_eq!(file.path(), Some(Path::new("/out/x")));
+    }
+
+    fn private(path: &Path, s: Sensitivity) -> Result<String, FileError> {
+        read_private_file(path, s)
+    }
+
+    // #308: the start-time reader takes what FileValue takes, untrimmed.
+    #[test]
+    fn read_private_file_reads_a_good_file_untrimmed() {
+        let t = tmp();
+        let path = t.0.join("k");
+        write(&path, "-----BEGIN-----\nabc\n-----END-----\n", 0o600);
+        assert_eq!(
+            private(&path, Sensitivity::Secret).unwrap(),
+            "-----BEGIN-----\nabc\n-----END-----\n"
+        );
+        write(&path, "pub\n", 0o644);
+        assert_eq!(private(&path, Sensitivity::Public).unwrap(), "pub\n");
+        write(&path, "ro", 0o400);
+        assert_eq!(private(&path, Sensitivity::Secret).unwrap(), "ro");
+    }
+
+    // Missing and blank are errors naming the file (FileValue's "not yet" is not a pass at start).
+    #[test]
+    fn read_private_file_refuses_missing_and_blank() {
+        let t = tmp();
+        let path = t.0.join("k");
+        let err = private(&path, Sensitivity::Secret).unwrap_err();
+        assert_eq!(err, FileError::Missing { path: path.clone() });
+        assert!(err.to_string().contains(&path.display().to_string()));
+        for blank in ["", " \n\t"] {
+            write(&path, blank, 0o600);
+            let err = private(&path, Sensitivity::Secret).unwrap_err();
+            assert_eq!(err, FileError::Empty { path: path.clone() });
+            assert!(err.to_string().contains("is empty"), "{err}");
+        }
+    }
+
+    // Every refusal FileValue makes, read_private_file makes too, naming the path and the
+    // problem, never the contents.
+    #[test]
+    fn read_private_file_refuses_what_file_value_refuses() {
+        let t = tmp();
+        let target = t.0.join("real");
+        write(&target, "secret-contents", 0o600);
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let dir = t.0.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = t.0.join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let loose = t.0.join("loose");
+        let cases: Vec<(PathBuf, Sensitivity, &str, Option<u32>)> = vec![
+            (link.clone(), Sensitivity::Secret, "symlink", None),
+            (link.clone(), Sensitivity::Public, "symlink", None),
+            (dir.clone(), Sensitivity::Secret, "not a regular file", None),
+            (
+                fifo.clone(),
+                Sensitivity::Secret,
+                "not a regular file",
+                None,
+            ),
+            (loose.clone(), Sensitivity::Secret, "chmod 600", Some(0o640)),
+            (loose.clone(), Sensitivity::Secret, "chmod 600", Some(0o644)),
+            (loose.clone(), Sensitivity::Secret, "chmod 600", Some(0o604)),
+            (
+                loose.clone(),
+                Sensitivity::Public,
+                "chmod go-w",
+                Some(0o664),
+            ),
+            (
+                loose.clone(),
+                Sensitivity::Public,
+                "chmod go-w",
+                Some(0o646),
+            ),
+            (
+                loose.clone(),
+                Sensitivity::SharedSecret,
+                "chmod 640",
+                Some(0o644),
+            ),
+        ];
+        for (path, s, what, mode) in cases {
+            if let Some(mode) = mode {
+                write(&path, "secret-contents", mode);
+            }
+            let err = private(&path, s).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, FileError::Refused { .. }), "{msg}");
+            assert_eq!(err.path(), path.as_path());
+            assert!(
+                msg.contains(&path.display().to_string()) && msg.contains(what),
+                "{msg}"
+            );
+            if let Some(mode) = mode {
+                assert!(msg.contains(&format!("{mode:04o}")), "{msg}");
+            }
+            assert!(!msg.contains("secret-contents"), "{msg}");
+        }
+    }
+
+    // The check is on the opened descriptor: a name replaced between the check and the open
+    // (by another regular file, a symlink or a FIFO) is refused, never read, and never blocks.
+    #[test]
+    fn read_private_file_refuses_a_name_swapped_after_the_check() {
+        let t = tmp();
+        let path = t.0.join("k");
+        let other = t.0.join("other");
+        write(&other, "other-contents", 0o600);
+        type Swap = fn(&Path, &Path);
+        let swaps: [(&str, Swap); 3] = [
+            ("another file", |p, o| {
+                std::fs::remove_file(p).unwrap();
+                std::fs::hard_link(o, p).unwrap();
+            }),
+            ("a symlink", |p, o| {
+                std::fs::remove_file(p).unwrap();
+                std::os::unix::fs::symlink(o, p).unwrap();
+            }),
+            ("a FIFO", |p, _| {
+                std::fs::remove_file(p).unwrap();
+                let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+                // SAFETY: a valid NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            }),
+        ];
+        for (what, swap) in swaps {
+            let _ = std::fs::remove_file(&path);
+            write(&path, "checked", 0o600);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (p, o) = (path.clone(), other.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(read_private_file_with(&p, Sensitivity::Secret, || {
+                    swap(&p, &o)
+                }));
+            });
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{what}: the read blocked"));
+            match got {
+                Err(FileError::Refused { reason, .. }) => {
+                    assert!(!reason.contains("contents"), "{what}: {reason}")
+                }
+                other => panic!("{what}: expected a refusal, got {other:?}"),
+            }
+        }
     }
 
     #[test]

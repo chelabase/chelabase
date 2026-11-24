@@ -111,6 +111,7 @@ check-scripts:
     scripts/tests/compose-secret-argv.sh
     scripts/tests/compose-overlay-equiv.sh
     scripts/tests/compose-secret-boundary.sh
+    scripts/tests/compose-strict-key-files.sh
     scripts/tests/compose-proxy-ca.sh
     scripts/tests/compose-compute-network-internal.sh
     scripts/tests/compose-no-fixed-secrets.sh
