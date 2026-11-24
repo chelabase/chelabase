@@ -65,7 +65,7 @@
 
 use chelabase_secrets::SecretKey;
 use chelabase_types::container_env::reserved_container_env_name;
-use chelabase_types::{BranchId, DatabaseId};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use chelabase_time::{Date, Timestamp};
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Postgres, Row, Transaction};
@@ -84,6 +84,10 @@ pub const MAX_TRIGGERS_PER_FUNCTION: i64 = 20;
 /// One database's share of the worker's schedule run slots: a claim returns at most this many
 /// due schedules per database.
 pub const MAX_IN_FLIGHT_PER_DATABASE: i64 = 8;
+/// One project's share of the worker's schedule run slots, all its databases together: a claim
+/// returns at most this many due schedules per project, less the runs its databases already
+/// have in flight. With the worker's 64 slots, a project at its share still leaves 32.
+pub const MAX_IN_FLIGHT_PER_PROJECT: i64 = 32;
 /// A secret value may be at most 64 KiB.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 /// A function's secrets on one branch together may be at most 128 KiB, measured as the JSON
@@ -296,6 +300,8 @@ pub struct ClaimedSchedule {
     pub branch_id: BranchId,
     /// The database the branch belongs to (the worker's per-database run limit).
     pub database_id: DatabaseId,
+    /// The database's project (the worker's per-project run limit).
+    pub project_id: ProjectId,
     pub function_name: String,
     pub cron: String,
     /// The tick to run, `None` when nothing runs ([`Advance::run`]).
@@ -2121,12 +2127,16 @@ impl MetadataClient {
     }
 
     /// The worker's claim: up to `limit` enabled schedules due by the database's `now()` (or
-    /// with no time yet) on a live branch of a live database, oldest due first, so that no
-    /// database has more than [`MAX_IN_FLIGHT_PER_DATABASE`] runs in flight: it gets at most
-    /// that many minus its entry in `in_flight` (the runs the worker already has going per
-    /// database; a database at the limit gets none). Only the chosen rows are locked
-    /// `FOR UPDATE SKIP LOCKED` (so concurrent claimers never take the same row) and advanced
-    /// by [`advance`] in the same transaction; the rest stay due, untouched, for a later claim
+    /// with no time yet) on a live branch of a live database, so that no database has more
+    /// than [`MAX_IN_FLIGHT_PER_DATABASE`] runs in flight and no project more than
+    /// [`MAX_IN_FLIGHT_PER_PROJECT`]. `in_flight` is the runs the worker already has going per
+    /// database; a database gets at most its share minus its own entry, and a project at most
+    /// its share minus the sum of its databases' entries (a database or project at its share
+    /// gets none). Within a database and a project the oldest due go first; across projects
+    /// the claim takes turns (every project's first before any project's second), so a small
+    /// `limit` is shared too. Only the chosen rows are locked `FOR UPDATE SKIP LOCKED` (so
+    /// concurrent claimers never take the same row, nor wait on one) and advanced by
+    /// [`advance`] in the same transaction; the rest stay due, untouched, for a later claim
     /// (where they run coalesced). The caller runs the ones with [`ClaimedSchedule::run`] after
     /// this returns (at most once: a failed run isn't retried).
     pub async fn claim_due_schedules(
@@ -2140,32 +2150,54 @@ impl MetadataClient {
             .map(|(d, n)| (d.as_uuid(), i64::try_from(*n).unwrap_or(i64::MAX)))
             .unzip();
         let rows = sqlx::query(
-            "SELECT s.id, s.branch_id, ranked.database_id, f.name, s.cron, s.timezone,
-                    s.next_run_at, coalesce(bf.enabled, false) AS function_enabled, now() AS now
+            "SELECT s.id, s.branch_id, ranked.database_id, ranked.project_id, f.name, s.cron,
+                    s.timezone, s.next_run_at, coalesce(bf.enabled, false) AS function_enabled,
+                    now() AS now
              FROM (
-                 SELECT s.id, b.database_id,
-                        $2 - coalesce(r.n, 0) AS allowed,
+                 -- Second, within each project: the rows its databases' shares let through,
+                 -- oldest first, as many as the project's own share leaves room for.
+                 SELECT id, database_id, project_id, project_allowed,
                         row_number() OVER (
-                            PARTITION BY b.database_id
-                            ORDER BY s.next_run_at NULLS FIRST, s.id
-                        ) AS rn
-                 FROM function_schedules s
-                 JOIN branches b ON b.id = s.branch_id AND b.status NOT IN ('deleting', 'deleted')
-                 JOIN databases db ON db.id = b.database_id
-                                  AND db.status NOT IN ('deleting', 'deleted')
-                 LEFT JOIN unnest($3::uuid[], $4::bigint[]) AS r(database_id, n)
-                   ON r.database_id = b.database_id
-                 WHERE s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+                            PARTITION BY project_id ORDER BY next_run_at NULLS FIRST, id
+                        ) AS turn
+                 FROM (
+                     -- First, within each database: oldest first, up to its share.
+                     SELECT s.id, s.next_run_at, b.database_id, db.project_id,
+                            $2 - coalesce(r.n, 0) AS db_allowed,
+                            $5 - coalesce(pr.n, 0) AS project_allowed,
+                            row_number() OVER (
+                                PARTITION BY b.database_id
+                                ORDER BY s.next_run_at NULLS FIRST, s.id
+                            ) AS db_rn
+                     FROM function_schedules s
+                     JOIN branches b ON b.id = s.branch_id
+                                    AND b.status NOT IN ('deleting', 'deleted')
+                     JOIN databases db ON db.id = b.database_id
+                                      AND db.status NOT IN ('deleting', 'deleted')
+                     LEFT JOIN unnest($3::uuid[], $4::bigint[]) AS r(database_id, n)
+                       ON r.database_id = b.database_id
+                     -- A project's runs in flight: all its databases', due rows or not (and
+                     -- whatever their status: a run outlives its database's tombstone).
+                     LEFT JOIN (
+                         SELECT d.project_id, sum(u.n) AS n
+                         FROM unnest($3::uuid[], $4::bigint[]) AS u(database_id, n)
+                         JOIN databases d ON d.id = u.database_id
+                         GROUP BY d.project_id
+                     ) pr ON pr.project_id = db.project_id
+                     WHERE s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
+                 ) by_database
+                 WHERE db_rn <= db_allowed
              ) ranked
              JOIN function_schedules s ON s.id = ranked.id
              JOIN functions f ON f.id = s.function_id AND f.database_id = ranked.database_id
              LEFT JOIN branch_functions bf
                ON bf.branch_id = s.branch_id AND bf.function_id = s.function_id
-             WHERE ranked.rn <= ranked.allowed
+             WHERE ranked.turn <= ranked.project_allowed
                -- Due is checked again on the locked row: a claimer that advanced it since the
                -- ranking read it leaves it out here, never claimed twice.
                AND s.enabled AND (s.next_run_at IS NULL OR s.next_run_at <= now())
-             ORDER BY s.next_run_at NULLS FIRST, s.id
+             -- Projects take turns: every project's first row, then every project's second.
+             ORDER BY ranked.turn, s.next_run_at NULLS FIRST, s.id
              LIMIT $1
              FOR UPDATE OF s SKIP LOCKED",
         )
@@ -2173,6 +2205,7 @@ impl MetadataClient {
         .bind(MAX_IN_FLIGHT_PER_DATABASE)
         .bind(running_db)
         .bind(running_n)
+        .bind(MAX_IN_FLIGHT_PER_PROJECT)
         .fetch_all(&mut *tx)
         .await?;
         let mut claimed = Vec::with_capacity(rows.len());
@@ -2200,6 +2233,7 @@ impl MetadataClient {
                 id,
                 branch_id: BranchId(r.get("branch_id")),
                 database_id: DatabaseId(r.get("database_id")),
+                project_id: ProjectId(r.get("project_id")),
                 function_name: r.get("name"),
                 cron,
                 run: step.run,

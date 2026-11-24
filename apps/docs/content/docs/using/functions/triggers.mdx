@@ -91,7 +91,7 @@ A storage event says which object changed, not what is in it. A function that re
 
 ## Limits and counters
 
-A function has at most 20 triggers (table and storage together) on a branch; adding another answers 409 `conflict`. A worker delivers at most 32 storage-trigger events at once across all triggers, at most 8 of them for one database and 4 for one trigger; the rest wait their turn and are not redelivered for waiting.
+A function has at most 20 triggers (table and storage together) on a branch; adding another answers 409 `conflict`. A worker delivers at most 32 storage-trigger events at once across all triggers, at most 8 of them for one database and 4 for one trigger; the rest wait their turn and are not redelivered for waiting. These bounds apply per worker process: with several worker replicas, each delivers up to its own 32.
 
 A trigger reports, besides its `state`:
 

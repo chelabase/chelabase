@@ -3876,4 +3876,230 @@ mod functions {
         assert_eq!(again.len(), 15);
         s.finish().await;
     }
+
+    /// #298: a project (its own tenant) with one ready database per entry of `due`, database
+    /// `i` holding `due[i]` schedules of function `f` that fell due `age_secs` ago. They run once
+    /// a year, so a claimed one isn't due again. Seeded in bulk. Returns its databases.
+    async fn seed_project(s: &Scratch, due: &[usize], age_secs: i64) -> Vec<DatabaseId> {
+        let (tenant, project) = (Uuid::new_v4(), Uuid::new_v4());
+        let p = s.pool();
+        sqlx::query("INSERT INTO tenants (id, slug) VALUES ($1, 't-' || $1::text)")
+            .bind(tenant)
+            .execute(p)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects (id, tenant_id, slug, name) VALUES ($1, $2, 'p', 'p')")
+            .bind(project)
+            .bind(tenant)
+            .execute(p)
+            .await
+            .unwrap();
+        let mut dbs = Vec::new();
+        for (i, &n) in due.iter().enumerate() {
+            let (db, function) = (Uuid::new_v4(), Uuid::new_v4());
+            sqlx::query("INSERT INTO databases (id, project_id, name, status) VALUES ($1, $2, $3, 'ready')")
+                .bind(db)
+                .bind(project)
+                .bind(format!("d{i}"))
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO branches (id, database_id, name, status) VALUES ($1, $1, 'main', 'ready')")
+                .bind(db)
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO functions (id, database_id, name, kind) VALUES ($1, $2, 'f', 'function')")
+                .bind(function)
+                .bind(db)
+                .execute(p)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
+                 SELECT gen_random_uuid(), $1, $2, '0 0 1 1 *', 'UTC', now() - make_interval(secs => $4)
+                 FROM generate_series(1, $3)",
+            )
+            .bind(db)
+            .bind(function)
+            .bind(n as i32)
+            .bind(age_secs as f64)
+            .execute(p)
+            .await
+            .unwrap();
+            dbs.push(DatabaseId(db));
+        }
+        dbs
+    }
+
+    /// #298: how many of `claimed` each project (by its seeded databases) got.
+    fn per_project(projects: &[Vec<DatabaseId>], claimed: &[chelabase_metadata::ClaimedSchedule]) -> Vec<usize> {
+        projects
+            .iter()
+            .map(|dbs| claimed.iter().filter(|c| dbs.contains(&c.database_id)).count())
+            .collect()
+    }
+
+    /// #298 AC1: one project with eight databases full of slow due schedules doesn't take every
+    /// run slot from a project with one. Within one claim the projects take turns (a claim of
+    /// two takes one of each, though the big project's rows are older); the big project never
+    /// holds more than its share however many of its databases are under theirs; and while its
+    /// runs are still in flight, the other project's next due schedule is claimed in that pass.
+    #[tokio::test]
+    #[ignore]
+    async fn claim_due_schedules_shares_per_project() {
+        use chelabase_metadata::{MAX_IN_FLIGHT_PER_DATABASE, MAX_IN_FLIGHT_PER_PROJECT};
+        let (db_share, share) = (MAX_IN_FLIGHT_PER_DATABASE as usize, MAX_IN_FLIGHT_PER_PROJECT as usize);
+        let s = Scratch::new().await;
+        let big = seed_project(&s, &[20; 8], 3600).await;
+        let small = seed_project(&s, &[1], 60).await;
+        let projects = vec![big.clone(), small.clone()];
+        let mut in_flight: std::collections::HashMap<DatabaseId, usize> = Default::default();
+        let mut take = |claimed: &[chelabase_metadata::ClaimedSchedule]| {
+            for c in claimed {
+                *in_flight.entry(c.database_id).or_default() += 1;
+            }
+            in_flight.iter().map(|(d, n)| (*d, *n)).collect::<Vec<_>>()
+        };
+
+        let first = s.client.claim_due_schedules(2, &[]).await.unwrap();
+        assert_eq!(per_project(&projects, &first), vec![1, 1], "one each, by turns");
+        let running = take(&first);
+
+        let second = s.client.claim_due_schedules(50, &running).await.unwrap();
+        assert_eq!(per_project(&projects, &second), vec![share - 1, 0], "the big project fills only its share");
+        let running = take(&second);
+        for db in &big {
+            let n = running.iter().find(|(d, _)| d == db).map_or(0, |(_, n)| *n);
+            assert!(n <= db_share, "{n} runs of one database");
+        }
+
+        // The small project's run ended; the big one's are slow and still running.
+        let running: Vec<_> = running.into_iter().filter(|(d, _)| !small.contains(d)).collect();
+        let more = sqlx::query(
+            "INSERT INTO function_schedules (id, branch_id, function_id, cron, timezone, next_run_at)
+             SELECT gen_random_uuid(), branch_id, function_id, cron, timezone, now() - interval '1 second'
+             FROM function_schedules WHERE branch_id = $1 LIMIT 1",
+        )
+        .bind(small[0].as_uuid())
+        .execute(s.pool())
+        .await
+        .unwrap();
+        assert_eq!(more.rows_affected(), 1);
+        let third = s.client.claim_due_schedules(50, &running).await.unwrap();
+        assert_eq!(per_project(&projects, &third), vec![0, 1], "claimed in the same pass");
+
+        // A run of the big project ends: exactly one more of it is claimed.
+        let mut running = running;
+        running[0].1 -= 1;
+        let fourth = s.client.claim_due_schedules(50, &running).await.unwrap();
+        assert_eq!(per_project(&projects, &fourth), vec![1, 0]);
+        s.finish().await;
+    }
+
+    /// #298: the claim's bounds, over several passes of a simulated worker (64 slots, a claim
+    /// of at most 50, runs ending at random between passes), for any spread of projects,
+    /// databases and due schedules: no database ever has more than its share of runs in
+    /// flight, no project more than its share; a due schedule is left out of a claim only when
+    /// the claim is full, or its database or project is at its share; and within a claim the
+    /// projects take turns: one gets two more than another only when that other has nothing
+    /// more it may take. So with 64 slots and a project share of 32, one project's due
+    /// schedules can never take more than 32 slots: against one saturated project at least 32
+    /// stay free (against k, at least 64 - 32k: void once 32k >= 64).
+    #[test]
+    #[ignore]
+    fn claim_due_schedules_are_fair_for_any_spread() {
+        use chelabase_metadata::{MAX_IN_FLIGHT_PER_DATABASE, MAX_IN_FLIGHT_PER_PROJECT};
+        use proptest::prelude::*;
+        use std::collections::HashMap;
+        let (db_share, share) = (MAX_IN_FLIGHT_PER_DATABASE as usize, MAX_IN_FLIGHT_PER_PROJECT as usize);
+        const SLOTS: usize = 64;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let s = rt.block_on(Scratch::new());
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+            cases: 24,
+            ..ProptestConfig::default()
+        });
+        let strategy = (
+            proptest::collection::vec(proptest::collection::vec(0usize..14, 1..6), 1..6),
+            1u64..,
+        );
+        runner
+            .run(&strategy, |(spread, seed)| {
+                rt.block_on(async {
+                    sqlx::raw_sql("DELETE FROM function_schedules").execute(s.pool()).await.unwrap();
+                    let mut projects = Vec::new();
+                    let mut due: HashMap<DatabaseId, usize> = HashMap::new();
+                    for dues in &spread {
+                        let dbs = seed_project(&s, dues, 60).await;
+                        due.extend(dbs.iter().copied().zip(dues.iter().copied()));
+                        projects.push(dbs);
+                    }
+                    let mut rng = seed;
+                    let mut in_flight: HashMap<DatabaseId, usize> = HashMap::new();
+                    for pass in 0..6 {
+                        // Runs end at random (xorshift64, so a failing case replays).
+                        for n in in_flight.values_mut() {
+                            let ended = (0..*n)
+                                .filter(|_| {
+                                    rng ^= rng << 13;
+                                    rng ^= rng >> 7;
+                                    rng ^= rng << 17;
+                                    rng % 2 == 0
+                                })
+                                .count();
+                            *n -= ended;
+                        }
+                        in_flight.retain(|_, n| *n > 0);
+                        let busy: usize = in_flight.values().sum();
+                        let limit = (SLOTS - busy).min(50);
+                        let running: Vec<_> = in_flight.iter().map(|(d, n)| (*d, *n)).collect();
+                        let claimed = if limit == 0 {
+                            Vec::new()
+                        } else {
+                            s.client.claim_due_schedules(limit as i64, &running).await.unwrap()
+                        };
+                        let ctx = format!("pass {pass}: {spread:?}, in flight {busy}, limit {limit}");
+                        assert!(claimed.len() <= limit, "{ctx}");
+                        let got = |db: &DatabaseId| claimed.iter().filter(|c| c.database_id == *db).count();
+                        let held = |db: &DatabaseId| in_flight.get(db).copied().unwrap_or(0);
+                        let mut n = Vec::new();
+                        let mut may = Vec::new();
+                        for dbs in &projects {
+                            let project_held: usize = dbs.iter().map(held).sum();
+                            let project_room = share.saturating_sub(project_held);
+                            let wanted: usize = dbs.iter().map(|d| db_share.saturating_sub(held(d)).min(due[d])).sum();
+                            let took: usize = dbs.iter().map(got).sum();
+                            for d in dbs {
+                                assert!(got(d) <= db_share.saturating_sub(held(d)), "{ctx}: over a database's share");
+                                assert!(got(d) <= due[d], "{ctx}: more than was due");
+                            }
+                            assert!(took <= project_room, "{ctx}: over a project's share");
+                            n.push(took);
+                            may.push(project_room.min(wanted));
+                        }
+                        // Work-conserving: below the limit, every project took all it may.
+                        if claimed.len() < limit {
+                            assert_eq!(n, may, "{ctx}: left out a schedule with room for it");
+                        }
+                        for i in 0..n.len() {
+                            for j in 0..n.len() {
+                                assert!(n[i] <= n[j] + 1 || n[j] == may[j], "{ctx}: took {n:?}, may {may:?}");
+                            }
+                        }
+                        for c in &claimed {
+                            *due.get_mut(&c.database_id).unwrap() -= 1;
+                            *in_flight.entry(c.database_id).or_default() += 1;
+                        }
+                        for dbs in &projects {
+                            let total: usize = dbs.iter().map(|d| in_flight.get(d).copied().unwrap_or(0)).sum();
+                            assert!(total <= share, "{ctx}: a project holds {total} slots");
+                        }
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
+        rt.block_on(s.finish());
+    }
 }

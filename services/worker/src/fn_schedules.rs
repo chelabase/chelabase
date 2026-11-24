@@ -12,19 +12,24 @@
 //! run, coalesced, once a slot frees.
 //!
 //! One database never holds more than [`chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE`] of
-//! those slots: [`DatabaseRuns`] counts each database's runs in flight (a [`RunGuard`] held by
-//! the run's task, released on every way out of it: done, failed, timed out, panicked or
-//! dropped at shutdown), and a claim gives each database only what is left of its share, so
-//! one tenant's due schedules can't fill every slot. The ones left out stay due, untouched.
+//! those slots, and one project (all its databases) never more than
+//! [`chelabase_metadata::MAX_IN_FLIGHT_PER_PROJECT`]: [`DatabaseRuns`] counts each database's
+//! and project's runs in flight (a [`RunGuard`] held by the run's task, released on every way
+//! out of it: done, failed, timed out, panicked or dropped at shutdown), and a claim gives each
+//! database and project only what is left of its share, so one project's due schedules can't
+//! fill every slot: a project at its share still leaves half of them free. The ones left
+//! out stay due, untouched. When a run ends whose database or project was at its share, the
+//! loop claims again at once instead of at the next tick. Every bound here is per worker
+//! process: replicas each have their own.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chelabase_metadata::MetadataClient;
-use chelabase_types::{BranchId, DatabaseId};
+use chelabase_metadata::{ClaimedSchedule, MetadataClient, MetadataError};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use chelabase_time::Timestamp;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 /// How often the loop claims.
@@ -98,47 +103,120 @@ impl Invoker for HttpInvoker {
     }
 }
 
-/// The runs in flight per database. Cheap to clone (shared).
+/// The runs in flight per database and per project. Cheap to clone (shared).
 #[derive(Clone, Default)]
-pub struct DatabaseRuns(Arc<Mutex<HashMap<DatabaseId, usize>>>);
+pub struct DatabaseRuns(Arc<Shared>);
 
-/// One run's count in [`DatabaseRuns`]; dropping it (on any exit of the run's task) gives it
-/// back.
+#[derive(Default)]
+struct Shared {
+    counts: Mutex<Counts>,
+    /// Signalled when a run of a database or project at its share ends (one stored permit,
+    /// so runs ending while the loop claims wake it once, after that claim).
+    ended_at_share: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Counts {
+    databases: HashMap<DatabaseId, usize>,
+    projects: HashMap<ProjectId, usize>,
+}
+
+/// One run's count in [`DatabaseRuns`] (and, once it has one, its run slot); dropping it (on
+/// any exit of the run's task) gives both back.
 pub struct RunGuard {
     runs: DatabaseRuns,
     database: DatabaseId,
+    project: ProjectId,
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+/// Takes one off `key`'s count, dropping it at zero. The count it had.
+fn decrement<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: &K) -> usize {
+    let Some(n) = map.get_mut(key) else {
+        return 0;
+    };
+    let was = *n;
+    *n -= 1;
+    if *n == 0 {
+        map.remove(key);
+    }
+    was
 }
 
 impl DatabaseRuns {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<DatabaseId, usize>> {
-        // The map is only ever incremented and decremented: a poisoned lock holds valid data.
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn counts(&self) -> std::sync::MutexGuard<'_, Counts> {
+        // The counts are only ever incremented and decremented: a poisoned lock holds valid data.
+        self.0.counts.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Counts a run of `database` until the guard drops.
-    pub fn enter(&self, database: DatabaseId) -> RunGuard {
-        *self.map().entry(database).or_insert(0) += 1;
+    /// Counts a run of `database` (in `project`) until the guard drops.
+    pub fn enter(&self, database: DatabaseId, project: ProjectId) -> RunGuard {
+        let mut c = self.counts();
+        *c.databases.entry(database).or_insert(0) += 1;
+        *c.projects.entry(project).or_insert(0) += 1;
         RunGuard {
             runs: self.clone(),
             database,
+            project,
+            slot: None,
         }
     }
 
-    /// Every database with runs in flight and how many, for the claim.
+    /// Every database with runs in flight and how many, for the claim (which sums a project's
+    /// from its databases').
     pub fn in_flight(&self) -> Vec<(DatabaseId, usize)> {
-        self.map().iter().map(|(d, n)| (*d, *n)).collect()
+        self.counts().databases.iter().map(|(d, n)| (*d, *n)).collect()
+    }
+
+    /// Resolves once a run ends whose database or project was at its share (the claim had
+    /// to hold it back), or at once when one did since the last call.
+    pub async fn ended_at_share(&self) {
+        self.0.ended_at_share.notified().await;
+    }
+}
+
+impl RunGuard {
+    /// The run's slot, given back with the count.
+    fn hold(&mut self, slot: OwnedSemaphorePermit) {
+        self.slot = Some(slot);
     }
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let mut map = self.runs.map();
-        if let Some(n) = map.get_mut(&self.database) {
-            *n -= 1;
-            if *n == 0 {
-                map.remove(&self.database);
-            }
+        // The slot first: a claim this wakes must see it free.
+        drop(self.slot.take());
+        let at_share = {
+            let mut c = self.runs.counts();
+            let database = decrement(&mut c.databases, &self.database);
+            let project = decrement(&mut c.projects, &self.project);
+            database >= chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE as usize
+                || project >= chelabase_metadata::MAX_IN_FLIGHT_PER_PROJECT as usize
+        };
+        if at_share {
+            self.runs.0.ended_at_share.notify_one();
         }
+    }
+}
+
+/// Where the loop claims: the metadata ([`MetadataClient::claim_due_schedules`]).
+#[async_trait::async_trait]
+pub trait Claimer: Send + Sync + 'static {
+    async fn claim(
+        &self,
+        limit: i64,
+        in_flight: &[(DatabaseId, usize)],
+    ) -> Result<Vec<ClaimedSchedule>, MetadataError>;
+}
+
+#[async_trait::async_trait]
+impl Claimer for MetadataClient {
+    async fn claim(
+        &self,
+        limit: i64,
+        in_flight: &[(DatabaseId, usize)],
+    ) -> Result<Vec<ClaimedSchedule>, MetadataError> {
+        self.claim_due_schedules(limit, in_flight).await
     }
 }
 
@@ -154,7 +232,7 @@ pub async fn start_runs(
     permits: &Arc<Semaphore>,
     runs: &DatabaseRuns,
     invoker: &Arc<dyn Invoker>,
-    claimed: &[chelabase_metadata::ClaimedSchedule],
+    claimed: &[ClaimedSchedule],
 ) {
     for s in claimed {
         let Some(tick) = s.run else {
@@ -162,15 +240,16 @@ pub async fn start_runs(
             continue;
         };
         // Counted before the wait for a slot, so the next claim sees this run.
-        let counted = runs.enter(s.database_id);
+        let mut counted = runs.enter(s.database_id, s.project_id);
         let Ok(slot) = permits.clone().acquire_owned().await else {
             return;
         };
+        counted.hold(slot);
         let invoker = invoker.clone();
         let (id, branch, name) = (s.id, s.branch_id, s.function_name.clone());
         let body = event_body(&s.cron, tick);
         tokio::spawn(async move {
-            let (_slot, _counted) = (slot, counted);
+            let _counted = counted;
             match invoker.invoke(branch, &name, body).await {
                 Ok(status) if (200..300).contains(&status) => {
                     debug!(schedule = %id, branch_id = %branch, function = %name, "scheduled run done");
@@ -190,31 +269,45 @@ pub async fn start_runs(
 /// starts the runs (without waiting for them). Whether it took as many as it could, so the
 /// loop claims again at once (`false` when no slot was free).
 pub async fn claim_once(
-    metadata: &MetadataClient,
+    claimer: &dyn Claimer,
     invoker: &Arc<dyn Invoker>,
     permits: &Arc<Semaphore>,
     runs: &DatabaseRuns,
-) -> Result<bool, chelabase_metadata::MetadataError> {
+) -> Result<bool, MetadataError> {
     let limit = claim_limit(permits);
     if limit == 0 {
         debug!("every scheduled-run slot is busy: claiming later");
         return Ok(false);
     }
-    let claimed = metadata.claim_due_schedules(limit, &runs.in_flight()).await?;
+    let claimed = claimer.claim(limit, &runs.in_flight()).await?;
     start_runs(permits, runs, invoker, &claimed).await;
     Ok(claimed.len() as i64 >= limit)
 }
 
-/// The loop: a claim every [`EVERY`], and again at once after a full one.
+/// The loop: a claim every [`EVERY`], again at once after a full one, and again at once when
+/// a run ends whose database or project was at its share (so it isn't held back until the
+/// tick; [`DatabaseRuns::ended_at_share`]).
 pub async fn schedule_loop(metadata: MetadataClient, invoker: Arc<dyn Invoker>) {
     let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-    let runs = DatabaseRuns::default();
+    run_loop(&metadata, &invoker, &permits, &DatabaseRuns::default()).await
+}
+
+/// [`schedule_loop`] over any [`Claimer`], with its slots and counts.
+pub async fn run_loop(
+    claimer: &dyn Claimer,
+    invoker: &Arc<dyn Invoker>,
+    permits: &Arc<Semaphore>,
+    runs: &DatabaseRuns,
+) {
     let mut every = tokio::time::interval(EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        every.tick().await;
+        tokio::select! {
+            _ = every.tick() => {}
+            () = runs.ended_at_share() => debug!("a run at its share ended: claiming again"),
+        }
         loop {
-            match claim_once(&metadata, &invoker, &permits, &runs).await {
+            match claim_once(claimer, invoker, permits, runs).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -360,10 +453,15 @@ mod tests {
     }
 
     fn claimed_in(database: DatabaseId, run: bool) -> chelabase_metadata::ClaimedSchedule {
+        in_project(ProjectId::new(), database, run)
+    }
+
+    fn in_project(project: ProjectId, database: DatabaseId, run: bool) -> chelabase_metadata::ClaimedSchedule {
         chelabase_metadata::ClaimedSchedule {
             id: uuid::Uuid::new_v4(),
             branch_id: BranchId::new(),
             database_id: database,
+            project_id: project,
             function_name: "f".into(),
             cron: "* * * * *".into(),
             run: run.then(Timestamp::now),
@@ -476,7 +574,7 @@ mod tests {
         let batch = [named(db, "block")];
         start_runs(&permits, &runs, &invoker, &batch).await;
         assert_eq!(runs.in_flight(), vec![(db, 1)]);
-        let guard = runs.enter(db);
+        let guard = runs.enter(db, ProjectId::new());
         assert_eq!(runs.in_flight(), vec![(db, 2)]);
         drop(guard);
         assert_eq!(runs.in_flight(), vec![(db, 1)]);
@@ -522,5 +620,136 @@ mod tests {
         while held.done.load(SeqCst) < 4 || !runs.in_flight().is_empty() {
             tokio::task::yield_now().await;
         }
+    }
+
+    /// #298: one claim as [`Scripted298`] saw it: when, with what limit and what in flight.
+    type Asked = (tokio::time::Instant, i64, Vec<(DatabaseId, usize)>);
+
+    /// #298: a [`Claimer`] that answers each claim with the next scripted batch (then
+    /// nothing) and reports when it was asked, with what limit and what in flight.
+    struct Scripted298 {
+        batches: Mutex<std::collections::VecDeque<Vec<ClaimedSchedule>>>,
+        asked: tokio::sync::mpsc::UnboundedSender<Asked>,
+    }
+
+    #[async_trait::async_trait]
+    impl Claimer for Scripted298 {
+        async fn claim(
+            &self,
+            limit: i64,
+            in_flight: &[(DatabaseId, usize)],
+        ) -> Result<Vec<ClaimedSchedule>, MetadataError> {
+            let _ = self.asked.send((tokio::time::Instant::now(), limit, in_flight.to_vec()));
+            Ok(self.batches.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+
+    /// #298: the loop over `first` (its first claim's batch) and `slots` run slots, with every
+    /// run held until released. Returns the invoker, the claims as they come, and the counts.
+    fn looping(
+        first: Vec<ClaimedSchedule>,
+        slots: usize,
+    ) -> (
+        Arc<Held>,
+        tokio::sync::mpsc::UnboundedReceiver<Asked>,
+        DatabaseRuns,
+    ) {
+        let held = Arc::new(Held {
+            now: 0.into(),
+            most: 0.into(),
+            done: 0.into(),
+            release: Semaphore::new(0),
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let claimer = Scripted298 {
+            batches: Mutex::new([first].into()),
+            asked: tx,
+        };
+        let runs = DatabaseRuns::default();
+        let invoker: Arc<dyn Invoker> = held.clone();
+        let permits = Arc::new(Semaphore::new(slots));
+        let r = runs.clone();
+        tokio::spawn(async move { run_loop(&claimer, &invoker, &permits, &r).await });
+        (held, rx, runs)
+    }
+
+    /// #298 AC2: with a database held at its share, one of its runs ending makes the loop claim
+    /// again at once, not at the next tick (paused time: the second claim is at the same
+    /// instant as the first), and the claim sees one run fewer.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_ending_at_the_share_wakes_the_loop() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let share = chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE as usize;
+        let db = DatabaseId::new();
+        let (held, mut asked, _runs) = looping((0..share).map(|_| claimed_in(db, true)).collect(), MAX_IN_FLIGHT);
+        let (t0, _, _) = asked.recv().await.unwrap();
+        while held.now.load(SeqCst) < share {
+            tokio::task::yield_now().await;
+        }
+        held.release.add_permits(1);
+        let (t1, _, in_flight) = asked.recv().await.unwrap();
+        assert_eq!(t1 - t0, Duration::ZERO, "claimed again at once, not after {EVERY:?}");
+        assert_eq!(in_flight, vec![(db, share - 1)]);
+    }
+
+    /// #298: the same for a project at its share, spread over databases each under theirs: a
+    /// run of any of them ending wakes the loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_ending_at_the_project_share_wakes_the_loop() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let share = chelabase_metadata::MAX_IN_FLIGHT_PER_PROJECT as usize;
+        let project = ProjectId::new();
+        let dbs: Vec<DatabaseId> = (0..8).map(|_| DatabaseId::new()).collect();
+        let batch = (0..share).map(|i| in_project(project, dbs[i % dbs.len()], true)).collect();
+        let (held, mut asked, _runs) = looping(batch, MAX_IN_FLIGHT);
+        let (t0, _, _) = asked.recv().await.unwrap();
+        while held.now.load(SeqCst) < share {
+            tokio::task::yield_now().await;
+        }
+        held.release.add_permits(1);
+        let (t1, _, in_flight) = asked.recv().await.unwrap();
+        assert_eq!(t1 - t0, Duration::ZERO, "claimed again at once, not after {EVERY:?}");
+        assert_eq!(in_flight.iter().map(|(_, n)| n).sum::<usize>(), share - 1);
+    }
+
+    /// #298: when the worker's last slot and a database's share are both taken, the woken
+    /// claim sees the slot the run gave back, so it claims one instead of skipping the claim
+    /// and waiting for the tick. (The guard gives the slot back before it wakes the loop; on
+    /// this single-threaded test runtime the woken loop can't run inside the drop, so the
+    /// order matters on the worker's multi-threaded runtime and isn't what this observes.)
+    #[tokio::test(start_paused = true)]
+    async fn a_woken_claim_sees_the_freed_slot() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let share = chelabase_metadata::MAX_IN_FLIGHT_PER_DATABASE as usize;
+        let db = DatabaseId::new();
+        let (held, mut asked, _runs) = looping((0..share).map(|_| claimed_in(db, true)).collect(), share);
+        let (t0, limit, _) = asked.recv().await.unwrap();
+        assert_eq!(limit, share as i64);
+        while held.now.load(SeqCst) < share {
+            tokio::task::yield_now().await;
+        }
+        held.release.add_permits(1);
+        let (t1, limit, _) = asked.recv().await.unwrap();
+        assert_eq!((t1 - t0, limit), (Duration::ZERO, 1));
+    }
+
+    /// #298 AC3: with no database or project at its share, a run ending makes no extra claim:
+    /// the next one is the tick's, exactly [`EVERY`] after the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_ending_below_the_share_does_not_wake() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let db = DatabaseId::new();
+        let (held, mut asked, runs) = looping((0..3).map(|_| claimed_in(db, true)).collect(), MAX_IN_FLIGHT);
+        let (t0, _, _) = asked.recv().await.unwrap();
+        while held.now.load(SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        held.release.add_permits(1);
+        while runs.in_flight() != vec![(db, 2)] {
+            tokio::task::yield_now().await;
+        }
+        let (t1, _, in_flight) = asked.recv().await.unwrap();
+        assert_eq!(t1 - t0, EVERY, "only the tick claims");
+        assert_eq!(in_flight, vec![(db, 2)]);
     }
 }
