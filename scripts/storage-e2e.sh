@@ -3,7 +3,8 @@
 # the stack (just workbench up); runs in its runner: `just storage-e2e [--backend s3]`.
 #
 #  1. a database, storage policies written by its owner, and a secret key (role `authenticated`);
-#  2. a bucket; an upload and its download; a resumable upload in two parts, byte for byte;
+#  2. a bucket; an upload and its download; a policy function's error without detail or hint
+#     for the public key (#320); a resumable upload in two parts, byte for byte;
 #  3. a signed URL serves without a key; the bucket made public serves the public path, and
 #     private again answers 404;
 #  4. a branch sees main's objects; a delete or an upload on the branch never reaches main;
@@ -313,6 +314,40 @@ expect "download hello.txt" 200 "$(st "$MAIN_KEY" GET /storage/v1/object/files/d
 [[ "$(cat "$tmp/sbody")" == 'hello storage' ]] || die "hello.txt came back as $(head -c 100 "$tmp/sbody")"
 expect "upload hello.txt again without upsert" 409 "$(st "$MAIN_KEY" POST /storage/v1/object/files/docs/hello.txt -H 'content-type: text/plain' --data-binary 'other')"
 pass "bucket files; docs/hello.txt uploaded and downloaded; a second upload without upsert is 409"
+
+# #320: a policy function's error, through the real download handler. The public key alone
+# gets `code`, `message` and `sqlstate` with no `detail` or `hint`; the secret key gets both.
+# (`anon` only reads storage, so the error comes from a read policy.) The guard raises only for
+# `guarded/…`, and its policies are dropped again before the object is deleted, so nothing
+# later in the story meets it.
+psql_main -c "
+  create function public.e2e_guard(object_name text) returns boolean language plpgsql as \$\$
+    begin
+      if object_name like 'guarded/%' then
+        raise exception 'refused by the policy' using detail = 'zq-storage-detail', hint = 'zq-storage-hint';
+      end if;
+      return true;
+    end \$\$;
+  grant execute on function public.e2e_guard(text) to anon, authenticated;
+  select storage.create_policy('e2e_anon_buckets', 'buckets', 'SELECT', array['anon']::name[], 'true', null);
+  select storage.create_policy('e2e_anon_read', 'objects', 'SELECT', array['anon']::name[], 'public.e2e_guard(name)', null);" >/dev/null
+expect "upload guarded/x.txt" 200 "$(st "$MAIN_KEY" POST /storage/v1/object/files/guarded/x.txt -H 'content-type: text/plain' --data-binary 'guarded')"
+# Restrictive, so it runs for `authenticated` too (permissive policies are OR'd with e2e_objects).
+psql_main -c "select storage.create_policy('e2e_guard', 'objects', 'SELECT', array['authenticated']::name[], 'public.e2e_guard(name)', null, false);" >/dev/null
+ok GET "/v1/databases/$db_id/branches/$db_id/keys" 200
+PUBLIC_KEY="$(jq -r 'map(select(.kind == "public")) | .[0].key // empty' "$tmp/body")"
+[[ "$PUBLIC_KEY" == chk_pub_* ]] || die "no public key in the key list"
+expect "the public key's refused download" 400 "$(st "$PUBLIC_KEY" GET /storage/v1/object/files/guarded/x.txt)"
+jq -e '.error.code == "raised" and .error.message == "refused by the policy" and .error.sqlstate == "P0001"
+  and (.error | has("detail") | not) and (.error | has("hint") | not)' "$tmp/sbody" >/dev/null ||
+  die "the public key's refused download carries more than code, message and sqlstate: $(cat "$tmp/sbody")"
+! grep -q 'zq-storage' "$tmp/sbody" || die "the public key's error leaks the function's detail: $(cat "$tmp/sbody")"
+expect "the secret key's refused download" 400 "$(st "$MAIN_KEY" GET /storage/v1/object/files/guarded/x.txt)"
+jq -e '.error.code == "raised" and .error.detail == "zq-storage-detail" and .error.hint == "zq-storage-hint"' "$tmp/sbody" >/dev/null ||
+  die "the secret key's refused download lost its detail or hint: $(cat "$tmp/sbody")"
+psql_main -c "select storage.drop_policy('e2e_guard', 'objects'); select storage.drop_policy('e2e_anon_read', 'objects');" >/dev/null
+expect "delete guarded/x.txt" 204 "$(st "$MAIN_KEY" DELETE /storage/v1/object/files/guarded/x.txt)"
+pass "a policy function's error: the public key gets no detail or hint, the secret key gets both (#320)"
 
 # A resumable upload: a 5 MiB part and a 1 MiB last part, sent last part first.
 head -c $((5 * 1024 * 1024)) /dev/urandom >"$tmp/p1"
