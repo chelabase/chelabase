@@ -33,6 +33,7 @@ Set these in `.env` (blank means the default). Those marked "compose" are alread
 | Variable | Default | What it does |
 |---|---|---|
 | `CHELABASE_FUNCTIONS_TIMEOUT_MS` | `30000` | An invocation's wall clock, in milliseconds. Past it: 504 `function_timeout`. A positive integer. |
+| `CHELABASE_FUNCTIONS_MAX_CONCURRENT` | `32` | Invocations of one function on one branch running at once (schedules and event deliveries included). One more answers 429 `too_many_requests` at once instead of queueing in the shared runtime. A positive integer. |
 | `CHELABASE_FUNCTIONS_ADDR` | `127.0.0.1:8091` | The public listener (behind the gateway). Comma-separated `host:port`s, names resolved at start. Compose: `functions-public:8091,127.0.0.1:8091`. |
 | `CHELABASE_FUNCTIONS_INTERNAL_ADDR` | `127.0.0.1:8092` | The internal listener's runtime side (bundle GETs). Compose: `functions-internal:8080`. |
 | `CHELABASE_FUNCTIONS_CONTROL_ADDR` | `127.0.0.1:8093` | The internal listener's control side (bundle uploads, invocations, and the container services' image resolving, rollovers and logs). Compose: `functions-control:8080`. |
@@ -96,7 +97,7 @@ The runner is the **third holder of the Docker socket**, after the orchestrator 
 
 ## Security notes for operators
 
-- **Functions share one runtime thread.** A function in a busy loop stalls every function until the watchdog restarts the runtime, about 6 to 9 seconds, and it can be repeated. Only people you trust should have Developer access to a database with functions. See [Auth modes and limits](/using/functions/auth-and-limits#a-busy-loop-stalls-every-function).
+- **Functions share one runtime thread.** A function in a busy loop stalls every function until the watchdog restarts the runtime, about 6 to 9 seconds, and it can be repeated until the functions service turns the function off (three restarts within 10 minutes with it running each time; the service logs a warning naming the branch and function, and the function's `last_error` says why). Only people you trust should have Developer access to a database with functions. See [Auth modes and limits](/using/functions/auth-and-limits#a-busy-loop-stalls-every-function).
 - **`env.CHELABASE` bypasses a reverse proxy** in front of the API host: it reaches the gateway directly. Filters, allow-lists and rate limits at your proxy don't see function traffic, and all of it shares one per-IP bucket at the gateway. If you list the runtime's network in `CHELABASE_GATEWAY_TRUSTED_PROXIES`, the binding already strips client-address headers, but don't trust ranges that cover the runtime.
 - **The runtime's `functions-egress` network is not internal**: it is the runtime's only way out, and nothing else is on it. The runtime refuses non-public addresses. Connections from it to a port that the host publishes arrive from the network's bridge gateway address, as do connections from the [compute egress](/self-hosting/compute-egress) network, so never list a bridge gateway address in `CHELABASE_GATEWAY_TRUSTED_PROXIES`; see [Behind a reverse proxy](/self-hosting/hosts#behind-a-reverse-proxy).
 - **A function can call itself** through the binding with no hop limit.

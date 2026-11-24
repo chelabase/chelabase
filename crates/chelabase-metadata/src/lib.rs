@@ -47,7 +47,7 @@ pub use storage_webhooks::{
 pub use ddl::DdlTx;
 pub use functions::{
     BranchFunction, ClaimedSchedule, ContainerTarget, DeploymentRecord, FunctionAuth, FunctionKind,
-    FunctionRecord, MAX_BUNDLE_SIZE, MAX_IN_FLIGHT_PER_DATABASE, MAX_LAST_ERROR_CHARS, MAX_SCHEDULES_PER_FUNCTION, MAX_TRIGGERS_PER_FUNCTION, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
+    FunctionRecord, MAX_BUNDLE_SIZE, MAX_IN_FLIGHT_PER_DATABASE, MAX_LAST_ERROR_CHARS, WATCHDOG_DISABLED_PREFIX, MAX_SCHEDULES_PER_FUNCTION, MAX_TRIGGERS_PER_FUNCTION, MAX_SECRET_BYTES, MAX_SECRETS_ENV_BYTES, NewDeployment,
     NewSchedule, NewTrigger, ResolvedFunction, RunAs, ScheduleRecord, ScheduleReportRow,
     ServiceTarget, RunAsMint, RunAsUnmintable, StorageTriggerTarget, TriggerDelivery, TriggerInstall, TriggerRecord, TriggerSource, TriggerState,
     secret_write_allowed, secrets_env_bytes, valid_function_name, valid_secret_name,

@@ -131,6 +131,17 @@ pub trait Directory: Send + Sync + 'static {
     async fn resolve(&self, branch: Uuid, name: &str) -> anyhow::Result<Option<Parts>>;
     /// Sets the function's `last_error` on the branch.
     async fn record_error(&self, branch: Uuid, function: Uuid, error: &str) -> anyhow::Result<()>;
+    /// #295: turns the function off on the branch with `reason` as its `last_error`, if it is
+    /// on and still runs the bundle `bundle_sha256`. False when nothing was written.
+    async fn disable_stalled(
+        &self,
+        _branch: Uuid,
+        _function: Uuid,
+        _bundle_sha256: &str,
+        _reason: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     /// The database exists and isn't deleting or deleted.
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool>;
     /// m9: the external services' deployments to health-check.
@@ -193,6 +204,16 @@ pub trait MetadataPort: Send + Sync + 'static {
         error: Option<&str>,
     ) -> Result<(), MetadataError>;
     async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError>;
+    /// #295: [`MetadataClient::disable_stalled_function`].
+    async fn disable_stalled_function(
+        &self,
+        _branch: BranchId,
+        _function: Uuid,
+        _bundle_sha256: &str,
+        _reason: &str,
+    ) -> Result<bool, MetadataError> {
+        Ok(false)
+    }
     /// m9: a service's signing secret, opened.
     async fn service_signing_secret(&self, _function: Uuid) -> Result<Option<String>, MetadataError> {
         Ok(None)
@@ -247,6 +268,15 @@ impl MetadataPort for MetadataClient {
     }
     async fn live_database(&self, database: DatabaseId) -> Result<bool, MetadataError> {
         MetadataClient::live_database(self, database).await
+    }
+    async fn disable_stalled_function(
+        &self,
+        branch: BranchId,
+        function: Uuid,
+        bundle_sha256: &str,
+        reason: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::disable_stalled_function(self, branch, function, bundle_sha256, reason).await
     }
     async fn service_signing_secret(&self, function: Uuid) -> Result<Option<String>, MetadataError> {
         MetadataClient::service_signing_secret(self, function).await
@@ -346,6 +376,19 @@ impl<P: MetadataPort> Directory for Metadata<P> {
 
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool> {
         Ok(self.client.live_database(DatabaseId(database)).await?)
+    }
+
+    async fn disable_stalled(
+        &self,
+        branch: Uuid,
+        function: Uuid,
+        bundle_sha256: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .client
+            .disable_stalled_function(BranchId(branch), function, bundle_sha256, reason)
+            .await?)
     }
 
     async fn service_targets(&self) -> anyhow::Result<Vec<ServiceTarget>> {

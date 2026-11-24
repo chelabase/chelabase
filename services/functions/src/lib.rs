@@ -20,5 +20,6 @@ pub mod config;
 pub mod directory;
 pub mod events;
 pub mod host;
+pub mod limits;
 pub mod resolver;
 pub mod services;

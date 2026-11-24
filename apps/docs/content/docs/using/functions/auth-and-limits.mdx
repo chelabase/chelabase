@@ -27,6 +27,7 @@ The mode only decides **who may call**. What the function may do to the database
 |---|---|
 | Wall clock per invocation | 30 s by default; past it, 504 `function_timeout`. An operator sets `CHELABASE_FUNCTIONS_TIMEOUT_MS`. |
 | Request body | 6 MiB (413 `payload_too_large`) |
+| Invocations running at once | 32 per function on a branch by default; one more answers 429 `too_many_requests` at once (with `Retry-After`), and other functions keep running. An operator sets `CHELABASE_FUNCTIONS_MAX_CONCURRENT`. Schedules and event deliveries count too; an event refused this way is retried like any failed delivery. |
 | Bundle | 10 MiB; a deploy request at most 12 MiB |
 | Secret | 64 KiB each |
 | Compatibility date | Capped by the runtime's pinned workerd release |
@@ -37,6 +38,8 @@ A 5xx from the function, a timeout, or a runtime that doesn't answer is recorded
 ### A busy loop stalls every function
 
 All functions of an install run in **one runtime, on one thread**. A function that never yields (`while (true) {}`) stalls every other function until a watchdog notices: the runtime is probed every 2 s and restarted after three failures in a row, so the stall lasts about 6 to 9 seconds, and **it can be repeated** by calling the function again. The 30 s timeout does not cut a loop short, because the loop blocks the thread that would enforce it. Per-invocation CPU and memory limits are not available in this runtime. Treat deploying a function as trusting it with the availability of every other function on the instance, and deploy only code you trust.
+
+A function that keeps doing it is turned off. When the runtime is restarted (by the watchdog, or by the kernel past its memory limit) three times within 10 minutes, and each time the same function, with the same deployment, was the one running when it got stuck, the functions service turns that function off on the branch. Its `last_error` starts `disabled by the runtime watchdog:` and its calls answer 404 `function_not_found`, like any disabled function's. To bring it back, deploy a fixed version: activating another deployment turns it back on. Turning it on again by hand (`chelabase functions enable`, or `enabled: true`) runs the same deployment again. Requests that only queued behind the stuck one are not counted against their functions, and nothing is turned off when the restarts don't share one function.
 
 ### What the sandbox keeps in
 

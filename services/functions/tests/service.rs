@@ -86,6 +86,15 @@ async fn runtime(seen: Arc<Mutex<Vec<Seen>>>) -> String {
                     "late".into_response()
                 }
                 "boom" => (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response(),
+                // #295: a head, one chunk, then a body that never ends.
+                "drip" => {
+                    use futures_util::StreamExt as _;
+                    let chunks = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"first"))
+                    })
+                    .chain(futures_util::stream::pending());
+                    axum::body::Body::from_stream(chunks).into_response()
+                }
                 "nostart" => (
                     StatusCode::BAD_GATEWAY,
                     [("x-chelabase-error", "bundle failed to start")],
@@ -129,6 +138,8 @@ struct Fake {
     functions: Mutex<HashMap<(Uuid, String), Entry>>,
     live: Mutex<HashSet<Uuid>>,
     errors: Mutex<Vec<(Uuid, Uuid, String)>>,
+    /// #295: `(branch, function, bundle, reason)` of each function turned off.
+    disabled: Mutex<Vec<(Uuid, Uuid, String, String)>>,
 }
 
 fn function_id(name: &str) -> Uuid {
@@ -165,6 +176,33 @@ impl Directory for Fake {
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool> {
         Ok(self.live.lock().unwrap().contains(&database))
     }
+    async fn disable_stalled(
+        &self,
+        branch: Uuid,
+        function: Uuid,
+        bundle_sha256: &str,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let mut functions = self.functions.lock().unwrap();
+        let Some(entry) = functions
+            .iter_mut()
+            .find(|((b, name), _)| *b == branch && function_id(name) == function)
+            .map(|(_, e)| e)
+        else {
+            return Ok(false);
+        };
+        if !entry.2 || bundle_sha256 != "b".repeat(64) {
+            return Ok(false);
+        }
+        entry.2 = false;
+        self.disabled.lock().unwrap().push((
+            branch,
+            function,
+            bundle_sha256.to_owned(),
+            reason.to_owned(),
+        ));
+        Ok(true)
+    }
 }
 
 struct H {
@@ -189,6 +227,16 @@ async fn harness() -> H {
 }
 
 async fn harness_with(runtime_url: Option<String>) -> H {
+    harness_tuned(runtime_url, Duration::from_millis(500), |s| s).await
+}
+
+/// The harness with the runtime at `runtime_url` (the fake one when `None`), the host's
+/// `timeout`, and the state as `tune` leaves it.
+async fn harness_tuned(
+    runtime_url: Option<String>,
+    timeout: Duration,
+    tune: impl FnOnce(AppState) -> AppState,
+) -> H {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let runtime_url = match runtime_url {
         Some(u) => u,
@@ -204,6 +252,10 @@ async fn harness_with(runtime_url: Option<String>) -> H {
         ("boom", FunctionAuth::Key),
         ("nostart", FunctionAuth::Key),
         ("bigenv", FunctionAuth::Key),
+        ("drip", FunctionAuth::Key),
+        ("hang", FunctionAuth::Key),
+        ("hang2", FunctionAuth::Key),
+        ("hang3", FunctionAuth::Key),
         ("users", FunctionAuth::AppUser),
         ("open", FunctionAuth::Public),
     ] {
@@ -222,14 +274,14 @@ async fn harness_with(runtime_url: Option<String>) -> H {
         "https://api.example".into(),
         TTL,
     ));
-    let state = Arc::new(AppState::new(
+    let state = Arc::new(tune(AppState::new(
         resolver,
-        Arc::new(Workerd::new(&runtime_url, Duration::from_millis(500)).unwrap()),
+        Arc::new(Workerd::new(&runtime_url, timeout).unwrap()),
         InternalVerifier::from_pem(public.as_bytes()).unwrap(),
         Bundles::new(store.clone()),
         ORCH.into(),
         WORKER.into(),
-    ));
+    )));
     H {
         public: serve(public_router(state.clone())).await,
         runtime: serve(runtime_router(state.clone())).await,
@@ -1190,4 +1242,226 @@ async fn each_internal_side_serves_only_its_own_calls() {
     assert_eq!(put(&h.control, ORCH).await.unwrap().status(), 204);
     assert_eq!(h.http.get(format!("{}{path}", h.control)).send().await.unwrap().status(), 404);
     assert_eq!(h.http.get(format!("{}{path}", h.runtime)).send().await.unwrap().status(), 200);
+}
+
+/// #295: the invocations of `name` running now.
+fn running(h: &H, name: &str) -> usize {
+    h.state.concurrency().running(h.branch, function_id(name))
+}
+
+/// #295 AC1: with `N` invocations of a function in flight the next one is 429 at once (nothing
+/// queues, the runtime never sees it), while another function on the branch still runs; once
+/// they end (here by timing out) the function runs again.
+#[tokio::test]
+async fn invoke_past_the_cap_answers_429() {
+    let h = Arc::new(harness_tuned(None, Duration::from_millis(800), |s| s.with_max_concurrent(2)).await);
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let h = h.clone();
+        held.push(tokio::spawn(async move {
+            h.call(reqwest::Method::GET, "/functions/v1/slow", Cred::Public)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    wait_for(|| h.calls() == 2).await;
+    let started = std::time::Instant::now();
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/slow", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    assert!(started.elapsed() < Duration::from_millis(400), "refused at once");
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "too_many_requests");
+    assert_eq!(h.calls(), 2, "the runtime never saw the refused call");
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/hello", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "another function still runs");
+    for t in held {
+        assert_eq!(t.await.unwrap(), 504);
+    }
+    wait_for(|| running(&h, "slow") == 0).await;
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/slow", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504, "a timed-out call freed its slot");
+    assert!(h.errors().iter().all(|e| !e.contains("429")), "a 429 is not the function's error");
+}
+
+/// #295 AC2: a slot comes back however the invocation ends: a failure, a client that hangs up
+/// before the answer, and one that drops a body still streaming (held until then). The
+/// host's timeout here is far away, so only the end itself frees the slot.
+#[tokio::test]
+async fn a_failed_or_dropped_invocation_frees_its_slot() {
+    let h = Arc::new(harness_tuned(None, Duration::from_secs(60), |s| s.with_max_concurrent(1)).await);
+    // A failure.
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/boom", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    resp.bytes().await.unwrap();
+    wait_for(|| running(&h, "boom") == 0).await;
+    // A client that hangs up while the function runs.
+    let call = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            h.call(reqwest::Method::GET, "/functions/v1/slow", Cred::Public)
+                .send()
+                .await
+        })
+    };
+    wait_for(|| h.calls() == 2).await;
+    assert_eq!(running(&h, "slow"), 1);
+    call.abort();
+    let _ = call.await;
+    wait_for(|| running(&h, "slow") == 0).await;
+    // A body still streaming holds the slot; dropping it frees it.
+    let mut resp = h
+        .call(reqwest::Method::GET, "/functions/v1/drip", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(&resp.chunk().await.unwrap().unwrap()[..], b"first");
+    assert_eq!(running(&h, "drip"), 1, "held while the body streams");
+    let refused = h
+        .call(reqwest::Method::GET, "/functions/v1/drip", Cred::Public)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 429);
+    drop(resp);
+    wait_for(|| running(&h, "drip") == 0).await;
+}
+
+/// #295: a runtime that takes a request and drops its connection without answering (what a
+/// watchdog kill does to every request in flight): `hang*` after `hold`, everything else 200.
+async fn dying_runtime(hold: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if head.starts_with(b"GET /hang") || head.starts_with(b"POST /hang") {
+                    tokio::time::sleep(hold).await;
+                    return; // dropped: the connection closes with no answer
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn quick_restarts() -> functions::limits::RestartPolicy {
+    functions::limits::RestartPolicy {
+        threshold: 3,
+        window: Duration::from_secs(60),
+        min_stall: Duration::from_millis(100),
+        span: Duration::from_millis(50),
+    }
+}
+
+async fn status(h: &H, name: &str) -> u16 {
+    h.call(reqwest::Method::GET, &format!("/functions/v1/{name}"), Cred::Public)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// #295 AC3: the runtime restarts three times within the window with the same function in
+/// flight each time: that function is turned off (only while it still runs that bundle) with
+/// a reason, and its calls answer as a disabled function's do (404) at once, not after the
+/// resolver's cache expires.
+#[tokio::test]
+async fn repeated_restarts_with_one_bundle_disable_it() {
+    let url = dying_runtime(Duration::from_millis(250)).await;
+    let h = harness_tuned(Some(url), Duration::from_secs(10), |s| {
+        s.with_restart_policy(quick_restarts())
+    })
+    .await;
+    for i in 0..3 {
+        assert_eq!(status(&h, "hello").await, 200, "restart {i}");
+        let resp = h
+            .call(reqwest::Method::GET, "/functions/v1/hang", Cred::Public)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 502, "restart {i}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "runtime_unavailable");
+    }
+    wait_for(|| !h.dir.disabled.lock().unwrap().is_empty()).await;
+    let disabled = h.dir.disabled.lock().unwrap().clone();
+    assert_eq!(disabled.len(), 1);
+    let (branch, function, bundle, reason) = &disabled[0];
+    assert_eq!((*branch, *function), (h.branch, function_id("hang")));
+    assert_eq!(bundle, &"b".repeat(64));
+    assert!(
+        reason.starts_with(chelabase_metadata::WATCHDOG_DISABLED_PREFIX),
+        "{reason}"
+    );
+    assert!(reason.len() <= 500, "fits the last_error column's checks");
+    assert_eq!(status(&h, "hang").await, 404, "turned off at once");
+    assert_eq!(status(&h, "hello").await, 200, "the others still run");
+}
+
+/// #295 AC4: restarts with a different function in flight each time, and runtime connections
+/// refused (a runtime down or restarting), never turn anything off.
+#[tokio::test]
+async fn restarts_without_a_common_bundle_disable_nothing() {
+    let url = dying_runtime(Duration::from_millis(250)).await;
+    let h = harness_tuned(Some(url), Duration::from_secs(10), |s| {
+        s.with_restart_policy(quick_restarts())
+    })
+    .await;
+    for name in ["hang", "hang2", "hang3", "hang", "hang2"] {
+        assert_eq!(status(&h, "hello").await, 200);
+        assert_eq!(status(&h, name).await, 502, "{name}");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.dir.disabled.lock().unwrap().is_empty());
+    for name in ["hang", "hang2", "hang3"] {
+        assert_eq!(status(&h, name).await, 502, "{name} still runs");
+    }
+
+    let refused = harness_tuned(Some("http://127.0.0.1:1".into()), Duration::from_secs(10), |s| {
+        s.with_restart_policy(functions::limits::RestartPolicy {
+            min_stall: Duration::ZERO,
+            ..quick_restarts()
+        })
+    })
+    .await;
+    for _ in 0..5 {
+        assert_eq!(status(&refused, "hello").await, 502);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(refused.dir.disabled.lock().unwrap().is_empty(), "a refused connect is no restart");
 }
