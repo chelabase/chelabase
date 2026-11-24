@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
+use chelabase_query::error::{ErrorDetail, PUBLIC_SHOWS_DETAIL};
 use chelabase_query::openapi::{QueryRequest, QueryResult};
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::table_api::ConsoleCellRequest;
@@ -216,6 +217,21 @@ fn public_failure(f: Failure, request_id: &str) -> Response {
     }
 }
 
+/// Who may see Postgres's `detail` and `hint` on a failure of `data`'s request.
+fn error_detail(data: &DataIdentity) -> ErrorDetail {
+    ErrorDetail::for_caller(data.kind, &data.claims, PUBLIC_SHOWS_DETAIL)
+}
+
+/// A failure on the query route (the one route a public key reaches), with Postgres's
+/// `detail` and `hint` only for a caller `shown` lets see them.
+fn query_failure(f: Failure, request_id: &str, shown: ErrorDetail) -> Response {
+    let f = match f {
+        Failure::Api(e) => Failure::Api(e.shown_to(shown)),
+        other => other,
+    };
+    public_failure(f, request_id)
+}
+
 /// A failure on the internal schema route, which the orchestrator passes on to Studio.
 fn internal_failure(f: Failure, request_id: &str) -> Response {
     match f {
@@ -275,7 +291,7 @@ async fn query<S: ConnSource>(
     };
     match state.engine.query(&data, &rid, &body).await {
         Ok(result) => json_response(result),
-        Err(f) => public_failure(f, &rid),
+        Err(f) => query_failure(f, &rid, error_detail(&data)),
     }
 }
 
@@ -715,6 +731,121 @@ mod tests {
                 !text.contains("10.9.8.7") && !text.contains("sending"),
                 "{text}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_detail_tests {
+    use super::*;
+    use chelabase_query::error::QueryFailure;
+
+    /// A row's values and a function's hint: what a public key's anonymous caller mustn't see.
+    const ROW: &str = "ann@example.com";
+    const HINT: &str = "ask support to merge the accounts";
+
+    /// A unique violation as the engine maps it (`QueryFailure::from_db`).
+    fn unique_violation() -> Failure {
+        let mut f = QueryFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "duplicate key value violates unique constraint \"users_email_key\"",
+        );
+        f.detail = Some(format!("Key (email)=({ROW}) already exists."));
+        f.hint = Some(HINT.into());
+        f.sqlstate = Some("23505".into());
+        f.into()
+    }
+
+    fn data(kind: DataKeyKind, role: &str, claims: Value) -> DataIdentity {
+        DataIdentity {
+            branch_id: Uuid::new_v4(),
+            key_id: Uuid::new_v4(),
+            kind,
+            role: role.into(),
+            claims,
+            databases: None,
+            project_id: Some(Uuid::new_v4()),
+            role_oid: None,
+            server_vouched: false,
+        }
+    }
+
+    /// The gateway's claims for a signed-in app user (`pipeline.rs`).
+    fn user_claims() -> Value {
+        json!({
+            "sub": Uuid::new_v4(), "sid": Uuid::new_v4(), "project": Uuid::new_v4(),
+            "email": "bob@example.com", "email_verified": true, "role": "authenticated", "exp": 1,
+        })
+    }
+
+    async fn body(response: Response) -> (StatusCode, Value, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        (status, serde_json::from_str(&text).unwrap(), text)
+    }
+
+    /// #320 AC 1: a public key's anonymous caller gets `code`, `message` and `sqlstate`, and
+    /// neither `detail` nor `hint`; no row value is anywhere in the body.
+    #[tokio::test]
+    async fn public_key_errors_omit_detail_and_hint() {
+        let anon = data(DataKeyKind::Public, "anon", json!({}));
+        let (status, json, text) =
+            body(query_failure(unique_violation(), "rid-1", error_detail(&anon))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let error = json["error"].as_object().unwrap();
+        let mut keys: Vec<&str> = error.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["code", "message", "sqlstate"], "{text}");
+        assert_eq!(error["code"], "conflict");
+        assert_eq!(
+            error["message"],
+            "duplicate key value violates unique constraint \"users_email_key\""
+        );
+        assert!(!text.contains(ROW) && !text.contains(HINT), "{text}");
+    }
+
+    /// #320 AC 2: a secret key's caller, and a signed-in app user on the public key, see
+    /// `detail` and `hint` as before.
+    #[tokio::test]
+    async fn secret_key_errors_keep_detail_and_hint() {
+        for caller in [
+            data(DataKeyKind::Secret, "svc", json!({})),
+            data(DataKeyKind::Public, "authenticated", user_claims()),
+        ] {
+            let (status, json, text) =
+                body(query_failure(unique_violation(), "rid-1", error_detail(&caller))).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{caller:?}");
+            assert_eq!(json["error"]["detail"], format!("Key (email)=({ROW}) already exists."), "{text}");
+            assert_eq!(json["error"]["hint"], HINT, "{text}");
+            assert_eq!(json["error"]["sqlstate"], "23505", "{text}");
+        }
+    }
+
+    /// #320 AC 3: with the database's choice to show them, a public key's anonymous caller
+    /// sees `detail` and `hint` too. (No setting carries the choice yet; this is the policy's
+    /// input the setting will feed.)
+    #[tokio::test]
+    async fn setting_restores_detail_for_public_keys() {
+        let anon = data(DataKeyKind::Public, "anon", json!({}));
+        let shown = ErrorDetail::for_caller(anon.kind, &anon.claims, true);
+        let (_, json, text) = body(query_failure(unique_violation(), "rid-1", shown)).await;
+        assert_eq!(json["error"]["detail"], format!("Key (email)=({ROW}) already exists."), "{text}");
+        assert_eq!(json["error"]["hint"], HINT, "{text}");
+    }
+
+    /// Failures that never carried Postgres's fields answer the same bytes either way.
+    #[tokio::test]
+    async fn other_failures_are_unchanged_for_public_keys() {
+        for f in [
+            || Failure::Api(ApiError::unknown_database()),
+            || Failure::Conn(ConnError::UnknownBranch),
+            || Failure::Api(ApiError::internal("rid-1", "boom")),
+        ] {
+            let hidden = body(query_failure(f(), "rid-1", ErrorDetail::Hidden)).await;
+            let shown = body(query_failure(f(), "rid-1", ErrorDetail::Shown)).await;
+            assert_eq!(hidden.2, shown.2);
         }
     }
 }

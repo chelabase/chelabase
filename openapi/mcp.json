@@ -3,10 +3,10 @@
     "title": "Chelabase MCP spec",
     "version": "1",
     "x-sources": {
-      "data": "b0eb5eecd27edf53307bd8cc1d4755ba25a860c16f4715c3455cfbdf9387f464",
+      "data": "2c19d513db77381e0405a346f59c082d6af798757a6d40a96ed7377efe3e5de4",
       "management": "327c50790a081dd4273dc5def1ed0fa9c58adb29bf529a557c1b1ffcacf19d4c"
     },
-    "x-spec-hash": "c6f1c0b740977913e4cac54770309a064bc636460f08c8d1320011fe089cb123"
+    "x-spec-hash": "a460bae6ed126e29c4dc789f71165132ba4a00dc10ef1d2090dfe97158f3b726"
   },
   "openapi": "3.1.0",
   "paths": {

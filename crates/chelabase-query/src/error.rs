@@ -2,6 +2,7 @@
 //! and SQLSTATE), and the mapping from Postgres SQLSTATEs to it (the spec's Errors table).
 //! No HTTP framework here: rest wraps [`QueryFailure`] in its own response type.
 
+use chelabase_types::data_key::DataKeyKind;
 use http::StatusCode;
 use tracing::{error, warn};
 
@@ -148,6 +149,23 @@ impl QueryFailure {
         }
     }
 
+    /// This failure without Postgres's `detail` and `hint`; the status, code, message and
+    /// SQLSTATE stay. The message of a mapped error is Postgres's primary text, which names
+    /// the constraint, column or table but never a row's values (those are in `detail`).
+    pub fn redacted(mut self) -> Self {
+        self.detail = None;
+        self.hint = None;
+        self
+    }
+
+    /// This failure as `shown` lets the caller see it.
+    pub fn shown_to(self, shown: ErrorDetail) -> Self {
+        match shown {
+            ErrorDetail::Shown => self,
+            ErrorDetail::Hidden => self.redacted(),
+        }
+    }
+
     /// An error from running a statement (after a connection was acquired): Postgres's error
     /// through [`Self::from_db`]; a closed connection or an I/O failure (the server gone, the
     /// network) a 503 [`UNREACHABLE`]; anything else (a value that doesn't encode or decode,
@@ -160,6 +178,46 @@ impl QueryFailure {
             Self::unreachable(request_id, format!("{err}: {err:?}"))
         } else {
             Self::internal(request_id, format!("{err}: {err:?}"))
+        }
+    }
+}
+
+/// Whether a database shows Postgres's `detail` and `hint` to anonymous public-key callers
+/// ([`ErrorDetail::for_caller`]'s `public_shows_detail`). No per-database setting carries the
+/// choice yet (it needs a column on `databases`), so rest and storage pass this: hidden.
+pub const PUBLIC_SHOWS_DETAIL: bool = false;
+
+/// Whether a caller sees Postgres's `detail` and `hint` on a failure (#320).
+///
+/// They can carry a row's values (`Key (email)=(…) already exists.`, `Failing row contains
+/// (…)`, columns the caller can't read among them) and whatever a function's `RAISE … USING
+/// DETAIL/HINT` puts there. A public key ships in browsers, so its anonymous callers don't see
+/// them unless the database allows it; a secret key's caller and a signed-in app user do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorDetail {
+    Shown,
+    Hidden,
+}
+
+impl ErrorDetail {
+    /// For a data key of `kind` whose request carries `claims` (the gateway's: `{}` for a key
+    /// alone, the app user's claims with their `sub` for a signed-in user).
+    /// `public_shows_detail` is the database's choice to show them to anonymous public-key
+    /// callers too. Anything that isn't a secret key or a public key with a user's `sub` is
+    /// anonymous: hidden.
+    pub fn for_caller(
+        kind: DataKeyKind,
+        claims: &serde_json::Value,
+        public_shows_detail: bool,
+    ) -> Self {
+        let signed_in = claims
+            .get("sub")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|sub| !sub.is_empty());
+        match kind {
+            DataKeyKind::Secret => ErrorDetail::Shown,
+            DataKeyKind::Public if signed_in || public_shows_detail => ErrorDetail::Shown,
+            DataKeyKind::Public => ErrorDetail::Hidden,
         }
     }
 }
@@ -421,6 +479,71 @@ pub(crate) mod tests {
             assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE, "{code}");
             assert_eq!(e.message, UNREACHABLE, "{code}");
             assert_eq!((e.detail, e.hint), (None, None), "{code}");
+        }
+    }
+
+    /// A unique violation as Postgres sends it, with a hint as a function's `RAISE` might add.
+    fn unique_violation() -> QueryFailure {
+        let db = FakeDb {
+            detail: Some("Key (email)=(ann@example.com) already exists."),
+            hint: Some("the users table keeps one row per email"),
+            constraint: Some("users_email_key"),
+            ..FakeDb::new(
+                "23505",
+                "duplicate key value violates unique constraint \"users_email_key\"",
+            )
+        };
+        QueryFailure::from_db(&db, "rid-1")
+    }
+
+    /// #320: `redacted` drops `detail` and `hint` and nothing else.
+    #[test]
+    fn redacted_drops_detail_and_hint_only() {
+        let full = unique_violation();
+        let redacted = full.clone().redacted();
+        assert_eq!((redacted.detail.as_deref(), redacted.hint.as_deref()), (None, None));
+        assert_eq!(
+            QueryFailure {
+                detail: None,
+                hint: None,
+                ..full.clone()
+            },
+            redacted
+        );
+        assert_eq!(full.clone().shown_to(ErrorDetail::Shown), full);
+        assert_eq!(full.clone().shown_to(ErrorDetail::Hidden), redacted);
+        // The retry mark isn't touched either.
+        let marked = QueryFailure::internal_on_another_connection("rid-1").redacted();
+        assert!(marked.retries_on_another_connection());
+    }
+
+    /// #320: who sees `detail` and `hint`. A public key alone is hidden unless the database
+    /// shows them; a signed-in app user (a `sub` in the gateway's claims) and a secret key see
+    /// them. Claims that don't name a user count as anonymous.
+    #[test]
+    fn error_detail_by_caller() {
+        use serde_json::json;
+        let user = json!({ "sub": "8d3f0c9e-5d1e-4f0b-9a49-0d1bd6f1c2aa", "role": "authenticated" });
+        let rows: &[(DataKeyKind, serde_json::Value, bool, ErrorDetail)] = &[
+            (DataKeyKind::Public, json!({}), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!({}), true, ErrorDetail::Shown),
+            (DataKeyKind::Public, user.clone(), false, ErrorDetail::Shown),
+            (DataKeyKind::Public, user.clone(), true, ErrorDetail::Shown),
+            (DataKeyKind::Secret, json!({}), false, ErrorDetail::Shown),
+            (DataKeyKind::Secret, json!({}), true, ErrorDetail::Shown),
+            (DataKeyKind::Public, json!({ "sub": "" }), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!({ "sub": 7 }), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!({ "sub": null }), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!({ "role": "authenticated" }), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!(null), false, ErrorDetail::Hidden),
+            (DataKeyKind::Public, json!("sub"), false, ErrorDetail::Hidden),
+        ];
+        for (kind, claims, setting, want) in rows {
+            assert_eq!(
+                ErrorDetail::for_caller(*kind, claims, *setting),
+                *want,
+                "{kind:?} {claims} setting={setting}"
+            );
         }
     }
 

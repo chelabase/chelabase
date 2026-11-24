@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chelabase_query::engine::{NO_SQL_PREPARED_SQL, POOLED_RESET_SQL, RunSettings};
+use chelabase_query::error::ErrorDetail;
 use chelabase_query::{QueryCache, QueryClient, QueryFailure, RunAs, run, with_transaction};
 use http::StatusCode;
 use sqlx::{Connection, PgConnection};
@@ -1324,4 +1325,63 @@ async fn failed_work_at_commit_still_closes_the_connection() {
         assert_eq!(state(&mut s.admin, s.pid).await, "idle");
         s.finish_any().await;
     }
+}
+
+/// #320 against Postgres's own errors: a public key's anonymous caller (hidden) keeps the
+/// code, message and SQLSTATE of each mapped failure and loses `detail` and `hint`, and no
+/// row value is in what is left (the message names a constraint, column or table, never a
+/// row; `detail` is where the values are). Shown keeps Postgres's detail.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn hidden_failures_carry_no_row_values() {
+    let (client, connection) = tokio_postgres::connect(&url(), tokio_postgres::NoTls)
+        .await
+        .expect("metadata Postgres (is the workbench stack up?)");
+    tokio::spawn(connection);
+    let run = Uuid::new_v4().simple().to_string();
+    let schema = format!("cq_redact_{}", &run[..12]);
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema};
+             SET search_path = {schema};
+             CREATE TABLE parents (id int PRIMARY KEY);
+             CREATE TABLE members (
+               email text UNIQUE,
+               tag text CHECK (tag = lower(tag)),
+               parent int REFERENCES parents (id),
+               note text NOT NULL DEFAULT 'zq-row-default');
+             INSERT INTO members (email) VALUES ('zq-dup@example.com');
+             CREATE FUNCTION refuse() RETURNS void LANGUAGE plpgsql AS $$
+               BEGIN RAISE EXCEPTION 'refused' USING DETAIL = 'zq-fn-detail', HINT = 'zq-fn-hint'; END $$;"
+        ))
+        .await
+        .unwrap();
+    let cases = [
+        ("INSERT INTO members (email) VALUES ('zq-dup@example.com')", "23505"),
+        ("INSERT INTO members (tag) VALUES ('ZQ-UPPER')", "23514"),
+        ("INSERT INTO members (parent) VALUES (4242)", "23503"),
+        ("INSERT INTO members (email, note) VALUES ('zq-null@example.com', NULL)", "23502"),
+        ("SELECT refuse()", "P0001"),
+    ];
+    for (sql, sqlstate) in cases {
+        let err = client.batch_execute(sql).await.unwrap_err();
+        let full = QueryFailure::from_pg(&err, "rid-1");
+        assert_eq!(full.sqlstate.as_deref(), Some(sqlstate), "{sql}: {full:?}");
+        assert!(full.detail.is_some(), "{sql}: Postgres sent no detail: {full:?}");
+        assert_eq!(full.clone().shown_to(ErrorDetail::Shown), full);
+        let hidden = full.clone().shown_to(ErrorDetail::Hidden);
+        assert_eq!((&hidden.detail, &hidden.hint), (&None, &None), "{sql}");
+        assert_eq!(
+            (hidden.status, hidden.code, &hidden.message, &hidden.sqlstate),
+            (full.status, full.code, &full.message, &full.sqlstate)
+        );
+        let left = format!("{} {:?}", hidden.message, hidden.sqlstate);
+        for leak in ["zq-dup", "ZQ-UPPER", "4242", "zq-row-default", "zq-null", "zq-fn-"] {
+            assert!(!left.contains(leak), "{sql}: {leak} in {left}");
+        }
+    }
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }

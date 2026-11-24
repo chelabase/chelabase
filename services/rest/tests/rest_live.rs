@@ -837,6 +837,74 @@ async fn anon_reads_and_cannot_write() {
     .await;
 }
 
+/// #320: a public key's anonymous caller gets Postgres's real constraint and `RAISE` errors
+/// with `code`, `message` and `sqlstate` only: no `detail`, no `hint`, and no row value
+/// anywhere in the body (the message names the constraint, never a row). A secret key's
+/// caller gets `detail` and `hint` for the same failures.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn public_key_errors_omit_detail_and_hint() {
+    live("redact", |l| async move {
+        l.owner(
+            "CREATE TABLE parents (id int PRIMARY KEY);
+             CREATE TABLE members (
+               email text UNIQUE,
+               tag text CHECK (tag = lower(tag)),
+               parent int REFERENCES parents (id),
+               note text NOT NULL DEFAULT 'zq-row-default');
+             GRANT INSERT ON members TO anon, authenticated;
+             CREATE FUNCTION refuse() RETURNS void LANGUAGE plpgsql AS $$
+               BEGIN RAISE EXCEPTION 'refused' USING DETAIL = 'zq-fn-detail', HINT = 'zq-fn-hint'; END $$;
+             GRANT EXECUTE ON FUNCTION refuse() TO anon, authenticated;",
+        )
+        .await;
+        l.auth(json!({"v":1,"op":"insert","into":"members","values":[{"email":"zq-dup@example.com"}]}))
+            .await
+            .ok();
+        let cases: [(Value, u16, &str, &str); 4] = [
+            (
+                json!({"v":1,"op":"insert","into":"members","values":[{"email":"zq-dup@example.com"}]}),
+                409,
+                "conflict",
+                "23505",
+            ),
+            (
+                json!({"v":1,"op":"insert","into":"members","values":[{"tag":"ZQ-UPPER"}]}),
+                400,
+                "invalid_value",
+                "23514",
+            ),
+            (
+                json!({"v":1,"op":"insert","into":"members","values":[{"parent":4242}]}),
+                409,
+                "conflict",
+                "23503",
+            ),
+            (json!({"v":1,"op":"call","fn":"refuse"}), 400, "raised", "P0001"),
+        ];
+        for (body, status, code, sqlstate) in &cases {
+            let anon = l.anon(body.clone()).await;
+            let error = anon.error(*status, code);
+            let mut keys: Vec<&str> = error.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["code", "message", "sqlstate"], "{anon:?}");
+            assert_eq!(error["sqlstate"], *sqlstate, "{anon:?}");
+            // Row values (the duplicate email, the rejected tag, the missing parent, the
+            // default no one sent) and the function's detail and hint are nowhere.
+            for leak in ["zq-dup", "ZQ-UPPER", "4242", "zq-row-default", "zq-fn-"] {
+                assert!(!anon.text.contains(leak), "{leak} in {anon:?}");
+            }
+            let secret = l.auth(body.clone()).await;
+            let error = secret.error(*status, code);
+            assert!(error["detail"].is_string(), "{secret:?}");
+            if *sqlstate == "P0001" {
+                assert_eq!((&error["detail"], &error["hint"]), (&json!("zq-fn-detail"), &json!("zq-fn-hint")));
+            }
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn secret_key_custom_role() {

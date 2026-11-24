@@ -11,7 +11,7 @@ Every error response is JSON with the same outer shape:
 
 `code` is stable and snake_case; match on it. `message` is for people and can change. A few codes add keys inside `error` (listed below). The HTTP status says the class of failure; the code says which one.
 
-The data API adds `detail`, `hint` and `sqlstate` to errors that come from Postgres. See [Data API errors](#data-api-errors).
+The data API adds `detail`, `hint` and `sqlstate` to errors that come from Postgres (no `detail` or `hint` for the public key alone). See [Data API errors](#data-api-errors).
 
 ## Management, login and gateway codes
 
@@ -276,6 +276,8 @@ The data API (`POST /data/v1/query`, `GET /data/v1/schema`) answers with:
 ```
 
 `detail`, `hint` and `sqlstate` are present only on a database error that Chelabase maps to a code, and carry Postgres's own text. Everything else has `code` and `message` only. A 503 and a 500 never show Postgres's text; the 500 message carries a request id and the details go to the log with it.
+
+A request made with the public key alone (no signed-in user) gets no `detail` or `hint`: they can carry row values, including columns the caller can't read (`Failing row contains (…)`), and whatever a function adds with `RAISE … USING DETAIL, HINT`. It still gets `code`, `message` and `sqlstate`. The message is Postgres's own text: it can name the table, column or constraint, never a row's values. Secret keys and signed-in app users get both fields as shown above. Object storage follows the same rule, and a signed upload URL never shows them, whichever key signed it. To give a public-key caller the full error, send the request from your server with a secret key, or with the user's token. There is no setting to show them to the public key yet.
 
 | Status | Code | Meaning |
 |---|---|---|
