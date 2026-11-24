@@ -913,7 +913,8 @@ mod tests {
     fn debug_redacts_the_hash_and_the_sealed_key() {
         let key = NewDataKey {
             id: Uuid::nil(),
-            branch_id: BranchId::new(),
+            // Fixed, so the "171" (0xab) check below can't match digits of a random id.
+            branch_id: BranchId(Uuid::nil()),
             kind: DataKeyKind::Public,
             role: "anon".into(),
             name: "default".into(),
