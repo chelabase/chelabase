@@ -41,6 +41,16 @@ const config :Workerd.Config = (
     (name = "probe", address = "127.0.0.1:9090", http = (),
      service = (name = "supervisor", entrypoint = "probe")),
   ],
+  # What a request leaves behind in the supervisor's long-lived isolate (Request, Response,
+  # streams, loader stubs) is a few bytes each to V8 but about 10 KiB of C++ memory, freed only by
+  # a major GC of that isolate. Left alone V8 runs one only after some 25000 requests, so memory
+  # climbs to about 300 MiB and saws around there; the watchdog's probe alone is a request every
+  # 2 s. This gate (cloudflare/workerd#8496, in 1.20261119.1, off by default while it rolls out)
+  # reports those objects' size to V8, so it collects in time: memory settles at about 155 MiB
+  # within 20000-30000 requests and stays level. workerd ignores a gate name it doesn't know, so
+  # tests/memory.test.mjs is what says the line still works after a workerd bump; drop it once a
+  # release has it on by default.
+  autogates = ["workerd-autogate-wrappable-external-memory"],
 );
 
 const supervisor :Workerd.Worker = (

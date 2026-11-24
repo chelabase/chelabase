@@ -126,6 +126,16 @@ export async function startRuntime(store, { restart = "no", gateway, apiHost = "
       const { stdout, stderr } = await run("docker", ["logs", id], { maxBuffer: 16 << 20 });
       return stdout + stderr;
     },
+    // Anonymous memory of the container's cgroup, in bytes (workerd's heap and its isolates).
+    anonBytes: async () => {
+      const stat = await docker("exec", id, "/usr/local/bin/busybox", "cat", "/sys/fs/cgroup/memory.stat");
+      return Number(/^anon (\d+)$/m.exec(stat)[1]);
+    },
+    // `n` requests to the probe socket (loopback only, so from inside the container), the
+    // watchdog's request, back to back. Throws unless every one answered.
+    probe: (n) =>
+      docker("exec", id, "/usr/local/bin/busybox", "sh", "-c",
+        `i=0; while [ $i -lt ${n} ]; do /usr/local/bin/busybox wget -q -T 5 -O /dev/null http://127.0.0.1:9090/ || exit 1; i=$((i+1)); done`),
     stop: () => docker("rm", "-f", id).catch(() => {}),
   };
   await waitReady(rt, 30_000);
