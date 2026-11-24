@@ -752,11 +752,34 @@ pub async fn signed_upload<S: ConnSource, M: ConnSource>(
         request,
     )
     .await
+    .map_err(url_bearer_failure)
+}
+
+/// A signed upload's failure (#320): whoever holds the URL isn't the key's holder, so it never
+/// carries Postgres's `detail` or `hint`, whichever key minted it.
+fn url_bearer_failure(f: Failure) -> Failure {
+    f.shown_to(chelabase_query::error::ErrorDetail::Hidden)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #320: a signed upload's failure loses `detail` and `hint`, even under a secret key.
+    #[test]
+    fn a_signed_upload_failure_hides_detail() {
+        let mut f = chelabase_query::QueryFailure::new(
+            axum::http::StatusCode::CONFLICT,
+            "conflict",
+            "duplicate key value violates unique constraint \"x\"",
+        );
+        f.detail = Some("Key (id)=(7) already exists.".into());
+        f.hint = Some("h".into());
+        f.sqlstate = Some("23505".into());
+        let out = url_bearer_failure(Failure(f.clone()));
+        assert_eq!((out.0.detail.as_deref(), out.0.hint.as_deref()), (None, None));
+        assert_eq!((out.0.code, &out.0.message, out.0.sqlstate.as_deref()), (f.code, &f.message, Some("23505")));
+    }
 
     /// AC: a TTL over 7 days (or not positive) is 400; the default is an hour.
     #[test]

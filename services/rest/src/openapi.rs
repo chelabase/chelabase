@@ -74,11 +74,13 @@ pub struct DataErrorBody {
     pub code: DataErrorCode,
     /// What went wrong, for a person; not stable.
     pub message: String,
-    /// Postgres's detail, on a mapped database error.
+    /// Postgres's detail, on a mapped database error; never for the public key without a
+    /// signed-in user.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub detail: Option<String>,
-    /// Postgres's hint, on a mapped database error.
+    /// Postgres's hint, on a mapped database error; never for the public key without a
+    /// signed-in user.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub hint: Option<String>,

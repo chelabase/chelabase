@@ -7,6 +7,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chelabase_pgsession::{AcquireError, ConnError};
 use chelabase_query::QueryFailure;
+use chelabase_query::error::ErrorDetail;
 use serde_json::{Map, Value, json};
 
 /// Seconds a 503 asks the client to wait.
@@ -302,6 +303,12 @@ impl Failure {
         )
     }
 
+    /// This failure as `shown` lets the caller see it: without Postgres's `detail` and `hint`
+    /// when hidden ([`QueryFailure::shown_to`], #320).
+    pub fn shown_to(self, shown: ErrorDetail) -> Self {
+        Failure(self.0.shown_to(shown))
+    }
+
     /// An object route's statement failure: RLS's 42501 becomes [`Self::not_allowed`], so a
     /// refusal can't be told apart from a bucket the caller can't see.
     pub fn refusal(self) -> Self {
@@ -432,6 +439,24 @@ mod tests {
         );
         let (status, _, _) = body(Failure::from_acquire(&AcquireError::NotServed, "r")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// #320: hidden drops Postgres's `detail` and `hint` from the body; shown keeps them.
+    #[tokio::test]
+    async fn shown_to_hides_only_detail_and_hint() {
+        let mut f = QueryFailure::new(StatusCode::CONFLICT, "conflict", "duplicate key");
+        f.detail = Some("Key (id)=(1) already exists.".into());
+        f.hint = Some("pick another id".into());
+        f.sqlstate = Some("23505".into());
+        let (_, _, shown) = body(Failure(f.clone()).shown_to(ErrorDetail::Shown)).await;
+        assert_eq!(shown["error"]["detail"], "Key (id)=(1) already exists.");
+        assert_eq!(shown["error"]["hint"], "pick another id");
+        let (status, _, hidden) = body(Failure(f).shown_to(ErrorDetail::Hidden)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            hidden,
+            json!({ "error": { "code": "conflict", "message": "duplicate key", "sqlstate": "23505" } })
+        );
     }
 
     /// A bucket the caller can't see (missing or hidden alike) and an RLS refusal of the object

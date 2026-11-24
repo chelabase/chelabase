@@ -1124,11 +1124,11 @@
           },
           "detail": {
             "type": "string",
-            "description": "Postgres's detail, on a mapped database error."
+            "description": "Postgres's detail, on a mapped database error; never for the public key without a\nsigned-in user."
           },
           "hint": {
             "type": "string",
-            "description": "Postgres's hint, on a mapped database error."
+            "description": "Postgres's hint, on a mapped database error; never for the public key without a\nsigned-in user."
           },
           "message": {
             "type": "string",

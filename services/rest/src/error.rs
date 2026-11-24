@@ -9,7 +9,7 @@ use deadpool_postgres::PoolError;
 use serde_json::{Map, Value, json};
 
 pub use chelabase_query::error::{DbFields, SCHEMA_MISSING, UNREACHABLE, classify};
-use chelabase_query::error::QueryFailure;
+use chelabase_query::error::{ErrorDetail, QueryFailure};
 use chelabase_query::query::QueryError;
 use chelabase_query::sql::PlanError;
 
@@ -121,6 +121,19 @@ impl ApiError {
         QueryFailure::from_pg(err, request_id).into()
     }
 
+    /// This error as `shown` lets the caller see it: without Postgres's `detail` and `hint`
+    /// when hidden ([`QueryFailure::shown_to`]).
+    pub fn shown_to(self, shown: ErrorDetail) -> Self {
+        match shown {
+            ErrorDetail::Shown => self,
+            ErrorDetail::Hidden => ApiError {
+                detail: None,
+                hint: None,
+                ..self
+            },
+        }
+    }
+
     /// The pool's failure to hand out a connection: waiting too long, or a pool closed under
     /// the request, is [`Self::unreachable`] (as sqlx's `PoolTimedOut` and `PoolClosed`
     /// were); a failure to connect goes through [`Self::from_pg`].
@@ -193,6 +206,26 @@ mod tests {
         let response = ApiError::invalid_query("bad").into_response();
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
+    /// #320: hidden drops `detail` and `hint` and keeps the rest; shown keeps everything.
+    #[test]
+    fn shown_to_hides_only_detail_and_hint() {
+        let full = ApiError {
+            detail: Some("Key (id)=(1) already exists.".into()),
+            hint: Some("pick another id".into()),
+            sqlstate: Some("23505".into()),
+            ..ApiError::new(StatusCode::CONFLICT, "conflict", "duplicate key")
+        };
+        assert_eq!(full.clone().shown_to(ErrorDetail::Shown), full);
+        assert_eq!(
+            full.clone().shown_to(ErrorDetail::Hidden),
+            ApiError {
+                detail: None,
+                hint: None,
+                ..full
+            }
+        );
+    }
+
     #[test]
     fn role_not_allowed_body() {
         let e = ApiError::role_not_allowed("svc");

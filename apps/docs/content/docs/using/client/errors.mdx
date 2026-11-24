@@ -3,7 +3,7 @@ title: Errors
 description: DataApiError, UnsafeIntegerError and what the client throws.
 ---
 
-A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …), `message`, and `detail`, `hint` and `sqlstate` when the server sends them. Every code is listed on [Error codes](/reference/errors).
+A failed request throws `DataApiError` with `status`, `code` (`invalid_query`, `unknown_table`, `permission_denied`, `conflict`, …), `message`, and `detail`, `hint` and `sqlstate` when the server sends them. With the public key and no signed-in user the server leaves out `detail` and `hint` (see [Data API errors](/reference/errors#data-api-errors)). Every code is listed on [Error codes](/reference/errors).
 
 ```ts twoslash
 import { createClient, DataApiError } from "@chelabase/client";

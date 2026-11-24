@@ -25,6 +25,7 @@ use chelabase_pgsession::{
     named_statement, storage_budget,
 };
 use chelabase_query::QueryFailure;
+use chelabase_query::error::{ErrorDetail, PUBLIC_SHOWS_DETAIL};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -71,6 +72,12 @@ pub fn managed_failure(f: QueryFailure, request_id: &str) -> Failure {
     } else {
         Failure::storage_unavailable()
     }
+}
+
+/// A caller's failure as `data` may see it (#320): without Postgres's `detail` and `hint` for
+/// a public key's anonymous caller ([`ErrorDetail::for_caller`]).
+pub fn caller_failure(f: Failure, data: &DataIdentity) -> Failure {
+    f.shown_to(ErrorDetail::for_caller(data.kind, &data.claims, PUBLIC_SHOWS_DETAIL))
 }
 
 /// Whether a `storage` schema owned by `owner` and stamped `stamp` may be served: Chelabase's
@@ -271,6 +278,20 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         if let Some(owner) = crate::internal::owner_mode() {
             return self.as_owner(owner, data, requested, request_id, on_commit, f).await;
         }
+        self.as_role(data, requested, request_id, on_commit, f)
+            .await
+            .map_err(|e| caller_failure(e, data))
+    }
+
+    /// [`Self::as_caller_mapped`] outside owner mode: a role session as `data`.
+    async fn as_role<T>(
+        &self,
+        data: &DataIdentity,
+        requested: Option<&str>,
+        request_id: &str,
+        on_commit: impl FnOnce(&tokio_postgres::Error) -> QueryFailure,
+        f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+    ) -> Result<(T, String), Failure> {
         let served = self.served_database(data, requested).await?;
         let branch = data.branch_id;
         self.check_schema(branch, &served.name, request_id).await?;
@@ -436,6 +457,47 @@ mod tests {
         }
         let none: Vec<String> = Vec::new();
         assert!(pick_database(&info, None, Some(&none)).is_err());
+    }
+
+    /// #320: a caller statement's failure loses Postgres's `detail` and `hint` for a public
+    /// key's anonymous caller; a secret key's caller and a signed-in app user keep them.
+    #[test]
+    fn a_caller_failure_hides_detail_from_anonymous_public_keys() {
+        use chelabase_types::data_key::DataKeyKind;
+        use serde_json::json;
+        let failure = || {
+            let mut f = QueryFailure::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_value",
+                "new row for relation \"objects\" violates check constraint \"owner_tag\"",
+            );
+            f.detail = Some("Failing row contains (secret-tag).".into());
+            f.hint = Some("tags are lowercase".into());
+            f.sqlstate = Some("23514".into());
+            Failure(f)
+        };
+        let data = |kind, role: &str, claims| DataIdentity {
+            branch_id: Uuid::new_v4(),
+            key_id: Uuid::new_v4(),
+            kind,
+            role: role.into(),
+            claims,
+            databases: None,
+            project_id: None,
+            role_oid: None,
+            server_vouched: false,
+        };
+        let anon = caller_failure(failure(), &data(DataKeyKind::Public, "anon", json!({})));
+        assert_eq!((anon.0.detail.as_deref(), anon.0.hint.as_deref()), (None, None));
+        assert_eq!((anon.0.code, anon.0.sqlstate.as_deref()), ("invalid_value", Some("23514")));
+        assert_eq!(anon.0.message, failure().0.message);
+        let user = json!({ "sub": Uuid::new_v4(), "role": "authenticated" });
+        for caller in [
+            data(DataKeyKind::Secret, "svc", json!({})),
+            data(DataKeyKind::Public, "authenticated", user),
+        ] {
+            assert_eq!(caller_failure(failure(), &caller), failure(), "{caller:?}");
+        }
     }
 
     /// SF1: a managed statement's own failure never reaches the caller: a constraint (a ticket
