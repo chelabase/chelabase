@@ -5,6 +5,7 @@ use gateway::config::GatewayConfig;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
 use gateway::proxy::Gateway;
+use gateway::request_limits::RequestLimits;
 use gateway::user_tokens::UserTokens;
 use chelabase_auth::app_token::AppTokenVerifier;
 use gateway::registry::{Registry, SharedRegistry};
@@ -49,7 +50,9 @@ fn main() -> anyhow::Result<()> {
         .map(|_| config.entry.api_base());
     let pipeline = Pipeline::new(registry, config.entry.studio_origin(), signer, keys, users)
         .with_member_tokens(members)
-        .with_mcp(mcp_api_base.as_deref());
+        .with_mcp(mcp_api_base.as_deref())
+        .with_request_limits(Arc::new(RequestLimits::new(&config.request_limits)));
+    info!(limits = ?config.request_limits, "data API and storage requests are limited per key and client");
 
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under Compose (the workbench) or k8s a process manager restarts us,

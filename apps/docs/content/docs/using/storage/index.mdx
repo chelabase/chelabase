@@ -93,5 +93,6 @@ Errors use the data API's envelope, `{"error": {"code", "message", …}}`. The c
 | 413 | `too_large` | Over the bucket's `file_size_limit`, or a part over 100 MiB |
 | 415 | `mime_not_allowed` | A type the bucket doesn't allow |
 | 416 | `range_not_satisfiable` | A `Range` outside the object |
+| 429 | `rate_limited` | Too many requests with this public key from this client (a signed-in user, or an address without a user token); wait `Retry-After` seconds. Self-hosted: `CHELABASE_GATEWAY_STORAGE_RATE_*` ([Gateway](/architecture/gateway#request-limits)) |
 | 429 | `too_many_uploads` | 100 resumable uploads are already open for this key and caller in the bucket |
 | 503 | `busy`, `unavailable`, `storage_unavailable` | Too many uploads in flight, or the database or storage isn't available right now; retry |

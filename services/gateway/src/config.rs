@@ -2,6 +2,7 @@
 
 use crate::client_addr::TrustedProxies;
 use crate::registry::Site;
+use crate::request_limits::{Budget, RequestLimitsConfig};
 use crate::upstreams::Upstreams;
 use chelabase_types::entry::{
     Entry, DEFAULT_DOCS_UPSTREAM, DEFAULT_LANDING_UPSTREAM, DEFAULT_MAIL_UPSTREAM, DEFAULT_STUDIO_UPSTREAM,
@@ -35,6 +36,10 @@ pub struct GatewayConfig {
     /// Reverse proxies whose forwarded client address is believed
     /// (`CHELABASE_GATEWAY_TRUSTED_PROXIES`, comma-separated CIDRs or addresses, default none).
     pub trusted_proxies: TrustedProxies,
+    /// Data API and storage requests per key and client (#322):
+    /// `CHELABASE_GATEWAY_{DATA,STORAGE}_RATE_{PER_SECOND,BURST}` (defaults 100 and 300) and
+    /// `CHELABASE_GATEWAY_STORAGE_RATE_SHARED` (default false).
+    pub request_limits: RequestLimitsConfig,
 }
 
 /// Everything but the token.
@@ -50,6 +55,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("app_sessions_token", &"<redacted>")
             .field("upstream_timeout", &self.upstream_timeout)
             .field("trusted_proxies", &self.trusted_proxies)
+            .field("request_limits", &self.request_limits)
             .finish()
     }
 }
@@ -138,6 +144,7 @@ impl GatewayConfig {
             upstream_timeout: parse_timeout_secs(&or("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "60"))
                 .map_err(anyhow::Error::msg)?,
             trusted_proxies: parse_trusted_proxies(&or(TRUSTED_PROXIES_ENV, ""))?,
+            request_limits: parse_request_limits(&get)?,
         })
     }
 }
@@ -162,6 +169,53 @@ fn parse_listen(raw: &str) -> anyhow::Result<Vec<String>> {
         seen.push(parsed);
     }
     Ok(listen)
+}
+
+/// The request limits' variables (#322).
+pub const REQUEST_LIMIT_VARS: &[&str] = &[
+    "CHELABASE_GATEWAY_DATA_RATE_PER_SECOND",
+    "CHELABASE_GATEWAY_DATA_RATE_BURST",
+    "CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND",
+    "CHELABASE_GATEWAY_STORAGE_RATE_BURST",
+    "CHELABASE_GATEWAY_STORAGE_RATE_SHARED",
+];
+
+/// The request limits' variables: blank or unset is the default; anything but a positive whole
+/// number (or `true`/`false` for the switch) refuses startup, naming the variable.
+fn parse_request_limits(get: &impl Fn(&str) -> Option<String>) -> anyhow::Result<RequestLimitsConfig> {
+    let set = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let number = |name: &str, default: u32| -> anyhow::Result<u32> {
+        match set(name) {
+            None => Ok(default),
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => anyhow::bail!("{name}: {raw:?} is not a positive whole number"),
+            },
+        }
+    };
+    const SHARED: &str = "CHELABASE_GATEWAY_STORAGE_RATE_SHARED";
+    let shared = match set(SHARED).map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        Some(other) => anyhow::bail!("{SHARED}: {other:?} is not true or false"),
+    };
+    let default = Budget::default();
+    let data = Budget {
+        per_second: number("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", default.per_second)?,
+        burst: number("CHELABASE_GATEWAY_DATA_RATE_BURST", default.burst)?,
+    };
+    let storage = Budget {
+        per_second: number("CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", default.per_second)?,
+        burst: number("CHELABASE_GATEWAY_STORAGE_RATE_BURST", default.burst)?,
+    };
+    if shared {
+        for name in ["CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", "CHELABASE_GATEWAY_STORAGE_RATE_BURST"] {
+            if set(name).is_some() {
+                anyhow::bail!("{name} has no effect with {SHARED}=true (storage uses the data API's budget); unset one");
+            }
+        }
+    }
+    Ok(RequestLimitsConfig { data, storage, shared })
 }
 
 /// The variable naming the reverse proxies the gateway trusts.
@@ -464,5 +518,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("CHELABASE_MCP_URL"), "{msg}");
+    }
+
+    // ---- #322: request limits ----
+
+    #[test]
+    fn request_limits_default_and_blank_is_the_default() {
+        use crate::request_limits::{DEFAULT_BURST, DEFAULT_PER_SECOND};
+        let default = Budget { per_second: DEFAULT_PER_SECOND, burst: DEFAULT_BURST };
+        let blank: Vec<(&'static str, &'static str)> = REQUEST_LIMIT_VARS.iter().map(|v| (*v, " ")).collect();
+        for pairs in [vec![], blank] {
+            let c = GatewayConfig::from_lookup(with(&pairs)).unwrap().request_limits;
+            assert_eq!(c, RequestLimitsConfig { data: default, storage: default, shared: false }, "{pairs:?}");
+        }
+        assert_eq!((DEFAULT_PER_SECOND, DEFAULT_BURST), (100, 300));
+    }
+
+    #[test]
+    fn request_limits_are_set_by_their_variables() {
+        let c = GatewayConfig::from_lookup(with(&[
+            ("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "5"),
+            ("CHELABASE_GATEWAY_DATA_RATE_BURST", " 7 "),
+            ("CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", "11"),
+            ("CHELABASE_GATEWAY_STORAGE_RATE_BURST", "13"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.request_limits,
+            RequestLimitsConfig {
+                data: Budget { per_second: 5, burst: 7 },
+                storage: Budget { per_second: 11, burst: 13 },
+                shared: false,
+            }
+        );
+        assert!(format!("{c:?}").contains("request_limits"));
+        for on in ["true", "TRUE", "1"] {
+            let c = GatewayConfig::from_lookup(with(&[("CHELABASE_GATEWAY_STORAGE_RATE_SHARED", on)])).unwrap();
+            assert!(c.request_limits.shared, "{on}");
+        }
+        for off in ["false", "0"] {
+            let c = GatewayConfig::from_lookup(with(&[("CHELABASE_GATEWAY_STORAGE_RATE_SHARED", off)])).unwrap();
+            assert!(!c.request_limits.shared, "{off}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_request_limit_refuses_startup_naming_the_variable() {
+        for var in REQUEST_LIMIT_VARS {
+            let bad: &[&'static str] = if *var == "CHELABASE_GATEWAY_STORAGE_RATE_SHARED" {
+                &["yes", "2", "on"]
+            } else {
+                &["0", "-1", "1.5", "lots", "4294967296"]
+            };
+            for value in bad {
+                let msg = match GatewayConfig::from_lookup(with(&[(var, value)])) {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => panic!("{var}={value} was accepted"),
+                };
+                assert!(msg.contains(var), "{var}={value}: {msg}");
+            }
+        }
+        // A shared budget has no storage settings of its own: setting them is a mistake.
+        for var in ["CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", "CHELABASE_GATEWAY_STORAGE_RATE_BURST"] {
+            let pairs = [("CHELABASE_GATEWAY_STORAGE_RATE_SHARED", "true"), (var, "5")];
+            let msg = match GatewayConfig::from_lookup(with(&pairs)) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("{var} was accepted with a shared budget"),
+            };
+            assert!(msg.contains(var) && msg.contains("CHELABASE_GATEWAY_STORAGE_RATE_SHARED"), "{msg}");
+        }
     }
 }

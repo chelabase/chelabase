@@ -1886,3 +1886,152 @@ async fn mcp_upstream_failures_never_count_as_refusals() {
         }
     }
 }
+
+// ---- #322: data API and storage requests, limited per key and client ----
+
+/// A gateway in front of one mock upstream for every service, with three keys known (two
+/// public, one secret, each its own id) and `extra` settings. The test client is 127.0.0.1:
+/// trusting it lets `X-Forwarded-For` stand for other clients.
+async fn spawn_limited_gateway(extra: &[(&str, &str)]) -> (String, [String; 3], GatewayProcess) {
+    use chelabase_types::data_key::{generate, DataKeyKind};
+    let jwks = MemberKeys::new();
+    let (upstream, _seen) = spawn_upstream().await;
+    let keys = [generate(DataKeyKind::Public).key, generate(DataKeyKind::Public).key, generate(DataKeyKind::Secret).key];
+    let answer = |n: u128, kind: &str, role: &str| {
+        serde_json::json!({
+            "key_id": uuid::Uuid::from_u128(n).to_string(),
+            "branch_id": "22222222-2222-4222-8222-222222222222",
+            "project_id": E2E_PROJECT,
+            "kind": kind,
+            "role": role,
+        })
+    };
+    let internal = spawn_key_listener(vec![
+        (keys[0].clone(), answer(1, "public", "anon")),
+        (keys[1].clone(), answer(2, "public", "anon")),
+        (keys[2].clone(), answer(3, "secret", "service")),
+    ])
+    .await;
+    let mut env = vec![
+        ("CHELABASE_REST_URL", upstream.as_str()),
+        ("CHELABASE_STORAGE_URL", upstream.as_str()),
+        ("CHELABASE_INTERNAL_URL", internal.as_str()),
+        ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8"),
+    ];
+    env.extend_from_slice(extra);
+    let (base, _verify, gateway) = spawn_gateway_with(&upstream, &jwks, &env).await;
+    (base, keys, gateway)
+}
+
+/// One request on its own connection (the gateway may close one after its own error answer)
+/// from client `from` with `key`.
+async fn keyed(base: &str, method: &str, path: &str, key: &str, from: &str) -> reqwest::Response {
+    let client = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+    let mut req = client
+        .request(method.clone(), format!("{base}{path}"))
+        .header("authorization", format!("Bearer {key}"))
+        .header("origin", "https://app.example")
+        .header("x-forwarded-for", from);
+    if method == reqwest::Method::POST {
+        req = req.body("{}");
+    }
+    req.send().await.unwrap()
+}
+
+/// After a client used up its burst: the next few requests (a token may refill in between on
+/// a slow run) include a 429 with `Retry-After`, the route's CORS headers and `rate_limited`.
+async fn expect_limited(base: &str, method: &str, path: &str, key: &str, from: &str) {
+    for _ in 0..3 {
+        let resp = keyed(base, method, path, key, from).await;
+        if resp.status() == 200 {
+            continue;
+        }
+        assert_eq!(resp.status(), 429, "{method} {path}");
+        let h = resp.headers();
+        assert_eq!(h["retry-after"], "1", "{method} {path}");
+        assert_eq!(h["access-control-allow-origin"], "*", "{method} {path}");
+        assert!(h["access-control-expose-headers"].to_str().unwrap().contains("retry-after"), "{method} {path}");
+        if method != "HEAD" {
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "rate_limited", "{method} {path}");
+        }
+        return;
+    }
+    panic!("{method} {path} from {from} was never limited");
+}
+
+const DATA_QUERY: &str = "/data/v1/query";
+const STORAGE_OBJECT: &str = "/storage/v1/object/files/a.txt";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_past_the_key_limit_get_429() {
+    let (base, [key, other, secret], _gateway) = spawn_limited_gateway(&[
+        ("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"),
+        ("CHELABASE_GATEWAY_DATA_RATE_BURST", "3"),
+        ("CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", "1"),
+        ("CHELABASE_GATEWAY_STORAGE_RATE_BURST", "3"),
+    ])
+    .await;
+    const A: &str = "203.0.113.9";
+    for (method, path) in [("POST", DATA_QUERY), ("GET", STORAGE_OBJECT)] {
+        for i in 0..3 {
+            assert_eq!(keyed(&base, method, path, &key, A).await.status(), 200, "{method} {path} request {i}");
+        }
+        expect_limited(&base, method, path, &key, A).await;
+    }
+    // A secret key is never limited.
+    for _ in 0..10 {
+        assert_eq!(keyed(&base, "POST", DATA_QUERY, &secret, A).await.status(), 200);
+    }
+    // Limits are per key and per client: another key from that client, and the key from
+    // another client, are served.
+    assert_eq!(keyed(&base, "POST", DATA_QUERY, &other, A).await.status(), 200);
+    assert_eq!(keyed(&base, "POST", DATA_QUERY, &key, "203.0.113.10").await.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limits_are_per_key() {
+    let (base, [key, other, _secret], _gateway) =
+        spawn_limited_gateway(&[("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"), ("CHELABASE_GATEWAY_DATA_RATE_BURST", "2")]).await;
+    const A: &str = "203.0.113.9";
+    for _ in 0..2 {
+        assert_eq!(keyed(&base, "POST", DATA_QUERY, &key, A).await.status(), 200);
+    }
+    expect_limited(&base, "POST", DATA_QUERY, &key, A).await;
+    for _ in 0..2 {
+        assert_eq!(keyed(&base, "POST", DATA_QUERY, &other, A).await.status(), 200);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_and_data_budgets() {
+    const A: &str = "203.0.113.9";
+    // Separate (the default): storage's budget is untouched by data API requests.
+    let (base, [key, ..], _gateway) = spawn_limited_gateway(&[
+        ("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"),
+        ("CHELABASE_GATEWAY_DATA_RATE_BURST", "2"),
+        ("CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND", "1"),
+        ("CHELABASE_GATEWAY_STORAGE_RATE_BURST", "2"),
+    ])
+    .await;
+    for _ in 0..2 {
+        assert_eq!(keyed(&base, "POST", DATA_QUERY, &key, A).await.status(), 200);
+    }
+    expect_limited(&base, "POST", DATA_QUERY, &key, A).await;
+    for _ in 0..2 {
+        assert_eq!(keyed(&base, "GET", STORAGE_OBJECT, &key, A).await.status(), 200);
+    }
+    // Shared: storage requests draw on the data API's budget.
+    let (base, [key, ..], _gateway) = spawn_limited_gateway(&[
+        ("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"),
+        ("CHELABASE_GATEWAY_DATA_RATE_BURST", "4"),
+        ("CHELABASE_GATEWAY_STORAGE_RATE_SHARED", "true"),
+    ])
+    .await;
+    for (method, path) in [("POST", DATA_QUERY), ("POST", DATA_QUERY), ("GET", STORAGE_OBJECT), ("GET", STORAGE_OBJECT)] {
+        assert_eq!(keyed(&base, method, path, &key, A).await.status(), 200, "{method} {path}");
+    }
+    expect_limited(&base, "GET", STORAGE_OBJECT, &key, A).await;
+}
