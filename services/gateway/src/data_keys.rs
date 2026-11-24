@@ -187,7 +187,7 @@ impl DataKeyResolver {
     }
 }
 
-fn limiter_key(ip: Option<IpAddr>) -> IpAddr {
+pub(crate) fn limiter_key(ip: Option<IpAddr>) -> IpAddr {
     match ip {
         None => IpAddr::from([0u8; 4]),
         Some(IpAddr::V4(v4)) => IpAddr::V4(v4),

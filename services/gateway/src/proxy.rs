@@ -294,6 +294,10 @@ impl ProxyHttp for Gateway {
     ) -> Result<()> {
         response.insert_header(REQUEST_ID_HEADER, ctx.request_id.as_str())?;
         if let Some(plan) = &ctx.plan {
+            // Once per response, at its header: a long-held `POST /mcp` holds no limiter state.
+            // `ctx.client_ip` is the address the request's check used.
+            self.pipeline
+                .upstream_answered(plan.endpoint, ctx.client_ip, response.status.as_u16());
             apply_response_headers(response, plan)?;
         }
         Ok(())

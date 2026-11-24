@@ -12,7 +12,7 @@ client -> bridge -> gateway -> mcp -> mcp-runtime -> mcp (callback) -> gateway -
 ```
 
 1. **Client and bridge.** A client speaks MCP over Streamable HTTP, usually through `chelabase mcp`, a stdio bridge that posts each message to `/mcp` with the member's token (refreshing it, and retrying once on a 401).
-2. **Gateway.** Routes `/mcp` to `mcp` and forwards the bearer unchecked. It needs `CHELABASE_MCP_URL`; unset, `/mcp` is 404.
+2. **Gateway.** Routes `/mcp` to `mcp` and forwards the bearer unchecked. It counts the 401s each client address gets and answers 429 to an address with too many. It needs `CHELABASE_MCP_URL`; unset, `/mcp` is 404.
 3. **`mcp`, the public listener.** The only check of the token. It then admits the call (rate and concurrency limits), and hands the code to the runtime.
 4. **`mcp-runtime`.** workerd runs the code in a fresh isolate. The isolate has no outbound access of its own. Its one way out is `chelabase.request`, which posts to `mcp`'s internal listener, named by the run's random 256-bit `exec_id`.
 5. **`mcp`, the callback.** Decides whether the call is an operation the run may make (below), and makes it as the member, to the gateway, with the member's token and a `Chelabase-Via-Mcp: 1` header. The gateway authenticates it like any other API call.
@@ -78,7 +78,7 @@ What does not hold:
 - **Table data isn't sealed.** The answers that return data the member stored (`console/query`, `sql`, object contents, a service's logs, SQL text in a merge plan, a table cell's `/value`, a saved query's `/sql`, a function's `last_error`) can hold anything the member put there, credentials included. The model reads them. This is the residual the credential tables can't close.
 - **Read-only isn't a sandbox for Postgres.** A read-only run still permits effects that aren't writes: row locks (`SELECT … FOR UPDATE`), advisory locks, `pg_sleep` and signalling the role's own backends. They are bounded by the role's rights, the 300 s cap and the connection closing. An extension that opens its own connection (`dblink`, a foreign-data wrapper) is outside the guarantee: with a valid login password, `dblink_exec` writes through a separate session.
 - **The `destructive` flag is a confirmation step the model sets itself.** The server checks that it was set; it can't check that the user asked. A client that confirms destructive tools with the user is the real guard. A read-only connection is the stronger one.
-- **Failed token checks aren't rate-limited in `mcp`.** A refusal costs one signature check, and a shared bucket would let bad tokens lock out good ones. Nothing limits them today: per-address limiting should sit at the gateway or in front of it (tracked in #395).
+- **Failed token checks are limited per address at the gateway, not in `mcp`.** A shared bucket in `mcp` would let bad tokens lock out good ones. The cost: an address over the limit is refused on every `/mcp` request, a good token from it included, until it has waited ([Gateway](/architecture/gateway#refused-mcp-bearers)).
 - **A resource attack on the runtime is bounded, not prevented.** A busy loop or a large buffer restarts the runtime, and runs in flight at that moment fail with `runtime_unavailable`.
 - **Excluded operations** (the binary routes) can be called by the member through the API, just not from the sandbox.
 

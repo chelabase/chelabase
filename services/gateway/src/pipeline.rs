@@ -4,6 +4,7 @@
 //! Pure over request parts; `proxy.rs` adapts it to Pingora. Nothing here is
 //! configurable per route except the typed `Policy` from `chelabase-routes`.
 
+use crate::bad_bearers::{retry_after_secs, BadBearerLimiter};
 use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
 use crate::user_tokens::{UserTokenError, UserTokens};
@@ -149,6 +150,8 @@ pub struct Pipeline {
     /// The `WWW-Authenticate` challenge `/mcp` answers a missing bearer with, when the gateway
     /// has an mcp upstream; `None` and the mcp routes don't exist.
     mcp_challenge: Option<String>,
+    /// Refused `/mcp` bearers per client address (#395).
+    bad_bearers: Arc<BadBearerLimiter>,
     /// The last readiness `/_gateway/ready` answered ([`READY_UNKNOWN`] before the first), so
     /// its reason is logged once per change, not per probe.
     ready_seen: std::sync::atomic::AtomicU8,
@@ -174,6 +177,7 @@ impl Pipeline {
             keys,
             users,
             mcp_challenge: None,
+            bad_bearers: Arc::new(BadBearerLimiter::default()),
             ready_seen: std::sync::atomic::AtomicU8::new(READY_UNKNOWN),
         }
     }
@@ -191,6 +195,20 @@ impl Pipeline {
             format!(r#"Bearer resource_metadata="{base}{}""#, chelabase_routes::mcp::PROTECTED_RESOURCE_MCP.path)
         });
         self
+    }
+
+    /// Replaces the refused-bearer limiter (tests use small limits and their own clock).
+    pub fn with_bad_bearer_limiter(mut self, limiter: Arc<BadBearerLimiter>) -> Self {
+        self.bad_bearers = limiter;
+        self
+    }
+
+    /// The upstream answered `status` to a request for `endpoint` from `client_ip` (called once
+    /// per response, at its header): a 401 from the mcp service counts against the address.
+    pub fn upstream_answered(&self, endpoint: &Endpoint, client_ip: Option<IpAddr>, status: u16) {
+        if endpoint.service == Service::Mcp && status == 401 {
+            self.bad_bearers.refused(client_ip);
+        }
     }
 
     /// Whether `service` is routed: every service but `mcp`, which needs its upstream.
@@ -304,7 +322,19 @@ impl Pipeline {
                     // Unreachable: without an upstream the mcp routes don't match.
                     return respond(404, Vec::new(), error_json("not_found", "no route"));
                 };
+                // An address over its refused-bearer limit (#395) is refused before its bearer
+                // is looked at, a good one included; the 429 itself never counts.
+                if let Err(wait) = self.bad_bearers.check(req.client_ip) {
+                    let mut resp = json_response(
+                        429,
+                        error_json("rate_limited", "too many refused bearers from this address; retry later"),
+                    );
+                    resp.headers.push(("retry-after", retry_after_secs(wait).to_string()));
+                    resp.headers.extend(cors);
+                    return Outcome::Respond(resp);
+                }
                 if !has_one_bearer(req.headers) {
+                    self.bad_bearers.refused(req.client_ip);
                     let mut resp = unauthorized(&AuthError::Unauthorized);
                     resp.headers.push(("www-authenticate", challenge.clone()));
                     resp.headers.extend(cors);
@@ -2758,6 +2788,109 @@ mod tests {
             if endpoint.policy.auth != Auth::Mcp {
                 assert_eq!(edits.remove, STRIPPED_REQUEST_HEADERS, "{}", endpoint.name);
             }
+        }
+    }
+
+    // ---- #395: refused `/mcp` bearers, limited per client address ----
+
+    /// An mcp harness whose refused-bearer limiter allows `burst` refusals and runs on a
+    /// frozen clock (a drained bucket stays drained however slow the run).
+    async fn limited_mcp_harness(burst: u32, capacity: usize) -> Harness {
+        let mut h = mcp_harness().await;
+        let frozen = std::time::Instant::now();
+        let limiter = crate::bad_bearers::BadBearerLimiter::with_limits(burst, std::time::Duration::from_secs(2), capacity)
+            .with_clock(move || frozen);
+        h.pipeline = h.pipeline.with_bad_bearer_limiter(Arc::new(limiter));
+        h
+    }
+
+    async fn mcp_from(h: &Harness, method: &str, path: &str, ip: &str, bearer: Option<&str>) -> Outcome {
+        let pairs: Vec<(&str, &str)> = bearer.map(|b| ("authorization", b)).into_iter().collect();
+        let headers = headers(&pairs);
+        h.pipeline
+            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()) })
+            .await
+            .outcome
+    }
+
+    fn assert_limited(outcome: Outcome, what: &str) {
+        let resp = expect_response(outcome);
+        assert_eq!(resp.status, 429, "{what}");
+        assert_eq!(header(&resp.headers, "retry-after"), Some("2"), "{what}");
+        assert_eq!(header(&resp.headers, "www-authenticate"), None, "{what}");
+        assert_eq!(error_code(&resp), Some("rate_limited"), "{what}");
+    }
+
+    #[tokio::test]
+    async fn repeated_bad_mcp_bearers_are_limited_per_client() {
+        let h = limited_mcp_harness(4, 100).await;
+        const BAD: &str = "203.0.113.9";
+        // Missing bearers (the gateway's own 401) and upstream refusals both count, once each.
+        for _ in 0..2 {
+            let resp = expect_response(mcp_from(&h, "POST", "/mcp", BAD, None).await);
+            assert_eq!(resp.status, 401);
+        }
+        for _ in 0..2 {
+            let plan = expect_plan(mcp_from(&h, "POST", "/mcp", BAD, Some("Bearer bad")).await);
+            h.pipeline.upstream_answered(plan.endpoint, Some(BAD.parse().unwrap()), 401);
+        }
+        // Over the limit: every `/mcp` method is refused before the bearer is looked at, a
+        // missing one included, and the 429 itself never counts.
+        for method in ["POST", "GET", "DELETE"] {
+            assert_limited(mcp_from(&h, method, "/mcp", BAD, Some("Bearer good")).await, method);
+            assert_limited(mcp_from(&h, method, "/mcp", BAD, None).await, method);
+        }
+        // The discovery documents stay open, so a client can still recover.
+        for path in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"] {
+            expect_plan(mcp_from(&h, "GET", path, BAD, None).await);
+        }
+        // Other routes are not this limiter's.
+        let resp = expect_response(mcp_from(&h, "GET", "/v1/me", BAD, None).await);
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn another_client_is_not_affected() {
+        let h = limited_mcp_harness(2, 100).await;
+        for _ in 0..2 {
+            mcp_from(&h, "POST", "/mcp", "203.0.113.9", None).await;
+        }
+        assert_limited(mcp_from(&h, "POST", "/mcp", "203.0.113.9", Some("Bearer good")).await, "the limited one");
+        let plan = expect_plan(mcp_from(&h, "POST", "/mcp", "203.0.113.10", Some("Bearer good")).await);
+        assert_eq!(plan.endpoint.service, Service::Mcp);
+    }
+
+    #[tokio::test]
+    async fn good_mcp_answers_and_other_services_never_count() {
+        let h = limited_mcp_harness(2, 100).await;
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        for _ in 0..50 {
+            let plan = expect_plan(mcp_from(&h, "POST", "/mcp", "203.0.113.9", Some("Bearer good")).await);
+            for status in [200, 202, 204, 400, 403, 404, 429, 500, 502, 504] {
+                h.pipeline.upstream_answered(plan.endpoint, Some(ip), status);
+            }
+            // A 401 from another service is that service's business.
+            h.pipeline.upstream_answered(&chelabase_routes::rest::QUERY, Some(ip), 401);
+        }
+        expect_plan(mcp_from(&h, "POST", "/mcp", "203.0.113.9", Some("Bearer good")).await);
+        // One 401 from the mcp service (a metadata route included) does count.
+        h.pipeline.upstream_answered(&chelabase_routes::mcp::PROTECTED_RESOURCE_MCP, Some(ip), 401);
+        h.pipeline.upstream_answered(&chelabase_routes::mcp::ENDPOINT_GET, Some(ip), 401);
+        assert_limited(mcp_from(&h, "POST", "/mcp", "203.0.113.9", Some("Bearer good")).await, "after two");
+    }
+
+    #[tokio::test]
+    async fn a_full_mcp_limiter_still_limits_new_clients() {
+        let h = limited_mcp_harness(2, 16).await;
+        for n in 0..16 {
+            mcp_from(&h, "POST", "/mcp", &format!("198.18.0.{n}"), None).await;
+        }
+        for n in 0..40 {
+            let ip = format!("198.18.1.{n}");
+            for _ in 0..2 {
+                assert_eq!(expect_response(mcp_from(&h, "POST", "/mcp", &ip, None).await).status, 401, "{ip}");
+            }
+            assert_limited(mcp_from(&h, "POST", "/mcp", &ip, Some("Bearer x")).await, &ip);
         }
     }
 }

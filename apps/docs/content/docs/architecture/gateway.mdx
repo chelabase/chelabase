@@ -43,6 +43,12 @@ A data API request carries `Authorization: Bearer <key>`. The gateway:
 
 Cache misses are rate limited to 20 per second per client address, and a request over the limit gets 429 `rate_limited`. The limiter keys on the connection's address, or on the client address forwarded by a proxy listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES`; it ignores `X-Forwarded-For` from anyone else, and groups IPv6 clients by their `/64` prefix. It remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds); past that it evicts entries, and an evicted address starts again with a full allowance. Behind a load balancer every client shares one address.
 
+## Refused MCP bearers
+
+The gateway passes the `/mcp` bearer to `mcp` unchecked, so it counts what `mcp` refuses instead. Every 401 a request to the MCP server gets, the gateway's own for a missing bearer and the one `mcp` answers for a bad, expired or revoked token, counts against the client's address (the same address as above: the connection's, or one forwarded by a trusted proxy, IPv6 grouped by `/64`). An address may have 30 refusals at once and earns one back every 2 seconds. Past that, every `/mcp` request from it gets 429 `rate_limited` with `Retry-After`, before its bearer is looked at, so a good token from that address waits too. Refusals that were already in flight when the allowance ran out still count, which stretches the wait to about a minute at most. Successful requests never count, and the discovery documents (`/.well-known/oauth-protected-resource…`) are never limited.
+
+Only addresses with a refusal not yet earned back are remembered, at most 100,000. When a new address needs room, those that have earned everything back go first, then the eighth with the most allowance left; a new address is always tracked, so a full table never stops limiting new clients, and a flood from many addresses can't free one that is limited. Behind a load balancer that isn't a trusted proxy, every client shares one address and one allowance.
+
 The gateway answers its own 404 and 405 under `/data/` with the data API's error body (code `invalid_query`), so a client sees one error shape for the whole prefix.
 
 ## Forwarding and CORS

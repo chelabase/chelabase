@@ -4,9 +4,10 @@
 //! A refused call is answered at once (`rate_limited` with `retry_after_ms`); nothing waits for
 //! a slot. Limits key on the member id from the verified credential.
 //!
-//! Failed bearer checks are not limited here. Behind the gateway there is no cheap per-client
-//! key, a refusal costs one local Ed25519 verify (no lookup, no body read), and a bucket shared
-//! by every client would let a flood of bad tokens lock out members with good ones.
+//! Failed bearer checks are not limited here: the gateway limits them per client address
+//! (#395, `services/gateway/src/bad_bearers.rs`). Behind the gateway there is no cheap
+//! per-client key, and a bucket shared by every client would let a flood of bad tokens lock out
+//! members with good ones.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

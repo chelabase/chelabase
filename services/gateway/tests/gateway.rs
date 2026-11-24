@@ -1694,3 +1694,108 @@ async fn www_authenticate_from_mcp_reaches_the_client() {
         r#"Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp""#
     );
 }
+
+// ---- #395: refused `/mcp` bearers, limited per client address ----
+
+/// An mcp upstream that refuses every bearer but `Bearer good` with a 401, and counts calls.
+async fn spawn_mcp_refusing_upstream() -> (String, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let count = calls.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let count = count.clone();
+        async move {
+            *count.lock().unwrap() += 1;
+            let good = req.headers().get("authorization").is_some_and(|v| v == "Bearer good");
+            if good {
+                (axum::http::StatusCode::OK, Json(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": {} })))
+            } else {
+                (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid_token" })))
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_bad_mcp_bearers_are_limited_per_client_through_the_gateway() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, calls) = spawn_mcp_refusing_upstream().await;
+    // The test client is 127.0.0.1: trusting it lets `X-Forwarded-For` stand for other clients.
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &api,
+        &keys,
+        &[("CHELABASE_MCP_URL", mcp.as_str()), ("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.1")],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let post = |from: &'static str, bearer: Option<&'static str>| {
+        let mut req = client.post(format!("{base}/mcp")).header("x-forwarded-for", from).body("{}");
+        if let Some(bearer) = bearer {
+            req = req.header("authorization", bearer);
+        }
+        async move { req.send().await.unwrap() }
+    };
+
+    const BAD: &str = "203.0.113.9";
+    // Half the burst missing bearers (the gateway's 401), half bad ones (the upstream's), with
+    // a good call between each: every refusal is a 401, so none was counted twice, and the
+    // good calls took nothing.
+    for i in 0..BURST {
+        let bearer = if i % 2 == 0 { None } else { Some("Bearer bad") };
+        assert_eq!(post(BAD, bearer).await.status(), 401, "refusal {i}");
+        if i + 1 < BURST {
+            assert_eq!(post(BAD, Some("Bearer good")).await.status(), 200, "good call after refusal {i}");
+        }
+    }
+    // Over the limit: refused at the gateway, a good bearer from that address included.
+    let upstream_calls = *calls.lock().unwrap();
+    for bearer in [Some("Bearer good"), Some("Bearer bad"), None] {
+        let resp = post(BAD, bearer).await;
+        assert_eq!(resp.status(), 429, "{bearer:?}");
+        let wait: u64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=2).contains(&wait), "{wait}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited");
+    }
+    assert_eq!(*calls.lock().unwrap(), upstream_calls, "a limited request never reaches mcp");
+
+    // Another client is served.
+    assert_eq!(post("203.0.113.10", Some("Bearer good")).await.status(), 200);
+    assert_eq!(post("203.0.113.10", Some("Bearer bad")).await.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoofed_forwarded_address_does_not_dodge_the_mcp_limit() {
+    const BURST: usize = gateway::bad_bearers::BURST as usize;
+    let keys = MemberKeys::new();
+    let (api, _) = spawn_upstream().await;
+    let (mcp, _calls) = spawn_mcp_refusing_upstream().await;
+    // No trusted proxy: the client's `X-Forwarded-For` is not believed.
+    let (base, _verify, _gateway) = spawn_gateway_with(&api, &keys, &[("CHELABASE_MCP_URL", mcp.as_str())]).await;
+    let client = reqwest::Client::new();
+    for i in 0..BURST {
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("x-forwarded-for", format!("198.18.0.{i}"))
+            .header("authorization", "Bearer bad")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "refusal {i}");
+    }
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("x-forwarded-for", "198.18.1.1")
+        .header("authorization", "Bearer good")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+}
