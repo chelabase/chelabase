@@ -2749,8 +2749,9 @@ fn member_valid_until_literal_is_unchanged() {
 }
 
 /// A finite expiry the time type can't hold (`9999-12-31` and beyond) reads as no expiry, as
-/// `infinity` (`-`) does; the line's other readings stay: a number is the instant, empty or
-/// non-numeric is refused.
+/// `infinity` (`-`) does; a far past (the SELECT prints `-infinity` as `0001-01-01`) reads as
+/// that floor, expired (#398); the line's other readings stay: a number is the instant, empty
+/// or non-numeric is refused.
 #[test]
 fn a_far_future_member_expiry_parses() {
     let line = |until: &str| {
@@ -2764,7 +2765,9 @@ fn a_far_future_member_expiry_parses() {
     }
     assert!(until("").is_err());
     assert!(until("soon").is_err());
-    assert!(until("-9223372036854775809").is_err());
+    for past in ["-62135596800000000", "-62135596800000001", "-210866803200000000", "-9223372036854775809"] {
+        assert_eq!(until(past), Ok(Some(Timestamp::PG_ROUND_TRIP_MIN)), "{past}");
+    }
 }
 
 /// D2: the record's `VALID UNTIL` is set back wherever the catalog differs (a copy, a restore,
@@ -2773,7 +2776,8 @@ fn a_far_future_member_expiry_parses() {
 fn valid_until_drift_is_repaired() {
     use MemberRoleStep::*;
     let wanted = personal_desired("alice", &["billing"], "SCRAM-alice", false);
-    for drifted in [Some(far() - days(1)), None] {
+    // #398: a login expired with `-infinity` reads as the floor and is set back too.
+    for drifted in [Some(far() - days(1)), None, Some(Timestamp::PG_ROUND_TRIP_MIN)] {
         let have = personal_actual("alice", vec![ours("billing")], "SCRAM-alice", drifted);
         let steps = plan_member_roles(std::slice::from_ref(&wanted), &[have]);
         assert_eq!(steps, vec![SetValidUntil { role: "alice".into(), valid_until: far() }], "{drifted:?}");

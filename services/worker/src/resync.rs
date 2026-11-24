@@ -404,7 +404,10 @@ pub struct Observed {
 
 /// One `r` line per role of `pg_authid a` (the caller adds the `WHERE`); `$OWNER` is the
 /// owner's name. Past the owner-attributes column: INHERIT, the connection limit, VALID UNTIL
-/// in microseconds since the epoch (empty when there's none or it's infinite), BYPASSRLS, and
+/// in microseconds since the epoch (empty when there's none, it's `infinity` or it's past
+/// [`Timestamp::PG_ROUND_TRIP_MAX`]; `-infinity` and anything before
+/// [`Timestamp::PG_ROUND_TRIP_MIN`] print as that floor, so an expired role reads as expired,
+/// #398), BYPASSRLS, and
 /// the direct memberships (`neon_superuser` left out) as `hex(name):o` (granted by the owner)
 /// or `hex(name):x`, then `n` when the grant lacks the SET option and `a` when it has the ADMIN
 /// option (I2), comma-separated.
@@ -422,7 +425,9 @@ const ROLE_SELECT: &str = "SELECT 'r',
                     WHERE s.member = a.oid AND s.roleid = 'neon_superuser'::regrole)),
        a.rolinherit,
        a.rolconnlimit,
-       coalesce(CASE WHEN isfinite(a.rolvaliduntil) AND a.rolvaliduntil <= '9999-12-30T22:00:00.999999Z'::timestamptz
+       coalesce(CASE WHEN a.rolvaliduntil < '0001-01-01T00:00:00Z'::timestamptz
+                     THEN (extract(epoch FROM '0001-01-01T00:00:00Z'::timestamptz) * 1000000)::bigint::text
+                     WHEN a.rolvaliduntil <= '9999-12-30T22:00:00.999999Z'::timestamptz
                      THEN (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END, ''),
        a.rolbypassrls,
        coalesce((SELECT string_agg(encode(convert_to(g.rolname, 'UTF8'), 'hex')
@@ -544,16 +549,26 @@ fn parse_memberships(field: &str) -> Option<Memberships> {
 /// none, as `infinity` is, so the catalog still parses and resync converges; the role is never
 /// taken as expired. The catalog SELECTs apply the same bound
 /// (`'9999-12-30T22:00:00.999999Z'`, tested equal to the constant), so Postgres never has to
-/// print a value past `i64` microseconds. `None` for anything else, a far past included.
+/// print a value past `i64` microseconds.
+///
+/// A far past is the other way round (#398): one before [`Timestamp::PG_ROUND_TRIP_MIN`]
+/// (`0001-01-01T00:00:00Z`) reads as that floor, so the role stays expired and its expiry can
+/// still be written back as a `VALID UNTIL` Postgres takes. The SELECTs print `-infinity` (which
+/// has no microseconds) and every earlier finite value as the floor themselves. A role Postgres
+/// takes as expired is never read as none. `None` (malformed) for anything that isn't a number.
 pub(crate) fn valid_until_from_micros(field: &str) -> Option<Option<Timestamp>> {
     let micros: i128 = field.parse().ok()?;
     if micros > i128::from(Timestamp::PG_ROUND_TRIP_MAX.timestamp_micros()) {
         return Some(None);
     }
+    if micros < i128::from(Timestamp::PG_ROUND_TRIP_MIN.timestamp_micros()) {
+        return Some(Some(Timestamp::PG_ROUND_TRIP_MIN));
+    }
     Timestamp::from_unix_micros(i64::try_from(micros).ok()?).map(Some)
 }
 
-/// A VALID UNTIL in microseconds since the epoch; empty is none.
+/// A VALID UNTIL in microseconds since the epoch; empty is none (no expiry or `infinity`, never
+/// `-infinity`, which [`ROLE_SELECT`] prints as the floor).
 fn parse_valid_until(field: &str) -> Option<Option<Timestamp>> {
     if field.is_empty() {
         return Some(None);
@@ -3610,8 +3625,8 @@ mod tests {
         for field in ["253402214400000000", "253402207201000000", "9223372036854775807", "9223372036854775808", "9300000000000000000"] {
             assert_eq!(parse_valid_until(field), Some(None), "{field}");
         }
-        // The far past isn't "no expiry": an unreadable one stays refused.
-        assert_eq!(parse_valid_until("-9223372036854775809"), None);
+        // The far past isn't "no expiry": it reads as the floor, expired (#398).
+        assert_eq!(parse_valid_until("-9223372036854775809"), Some(Some(Timestamp::PG_ROUND_TRIP_MIN)));
         let seen = role("r", None);
         let line = role_line(&seen).replacen("|-1||", "|-1|253402214400000000|", 1);
         assert!(line.contains("|253402214400000000|"), "{line}");
@@ -3734,6 +3749,201 @@ mod tests {
         ) {
             let at = from_nanos(nanos);
             assert_accepted_reads_back_equal(at);
+        }
+    }
+
+    // #398. The invariant: a role Postgres takes as expired is never read, recorded or shown
+    // as "no expiry", and what is read is a value that round trips through Postgres (so
+    // `VALID UNTIL` written back from it converges). Postgres takes a role as expired at `now`
+    // when `rolvaliduntil < now`: `-infinity` always, NULL and `infinity` never. Both catalog
+    // SELECTs print `-infinity` and every finite value before `0001-01-01T00:00:00Z`
+    // ([`Timestamp::PG_ROUND_TRIP_MIN`], the earliest instant that round trips) as that floor,
+    // which is in the past for every `now` after it; NULL, `infinity` and finite values past
+    // [`Timestamp::PG_ROUND_TRIP_MAX`] print as none. The one accepted gap is the far future:
+    // a finite expiry after `9999-12-30T22:00:00.999999Z` reads as none, which differs from
+    // Postgres only for a `now` past that instant.
+
+    /// A `rolvaliduntil` as the catalog holds it: NULL, `±infinity`, or finite microseconds
+    /// since the epoch.
+    #[derive(Debug, Clone, Copy)]
+    enum CatalogExpiry {
+        Null,
+        NegInfinity,
+        Infinity,
+        At(i128),
+    }
+
+    /// The first and last finite `timestamptz` Postgres keeps, in microseconds since the epoch:
+    /// `4714-11-24 00:00:00+00 BC` and `294276-12-31 23:59:59.999999+00`.
+    const PG_FIRST_MICROS: i128 = -210_866_803_200_000_000;
+    const PG_LAST_MICROS: i128 = 9_224_318_015_999_999_999;
+
+    fn us(t: Timestamp) -> i128 {
+        i128::from(t.timestamp_micros())
+    }
+
+    /// The bound a catalog SELECT applies after `marker`, if it has one.
+    fn optional_bound(sql: &str, marker: &str) -> Option<Timestamp> {
+        sql.contains(marker).then(|| sql_bound(sql, marker))
+    }
+
+    /// What a catalog SELECT prints for `c`, with the bounds read out of its text: below the
+    /// lower bound (`-infinity` included) the lower bound, up to the upper bound the value,
+    /// anything else (NULL, `infinity`, the far future) `none`. A SELECT without a lower bound
+    /// prints every non-finite value as `none`.
+    fn printed(c: CatalogExpiry, lower: Option<Timestamp>, upper: Timestamp, none: &str) -> String {
+        let lower = lower.map(us);
+        match c {
+            CatalogExpiry::Null | CatalogExpiry::Infinity => none.to_string(),
+            CatalogExpiry::NegInfinity => lower.map_or_else(|| none.to_string(), |l| l.to_string()),
+            CatalogExpiry::At(m) => match lower {
+                Some(l) if m < l => l.to_string(),
+                _ if m <= us(upper) => m.to_string(),
+                _ => none.to_string(),
+            },
+        }
+    }
+
+    /// What the resync's read ([`ROLE_SELECT`] and [`parse_valid_until`]) makes of `c`.
+    fn resync_reads(c: CatalogExpiry) -> Option<Timestamp> {
+        let lower = optional_bound(ROLE_SELECT, "a.rolvaliduntil < ");
+        let field = printed(c, lower, sql_bound(ROLE_SELECT, "a.rolvaliduntil <= "), "");
+        parse_valid_until(&field).unwrap_or_else(|| panic!("{c:?}: {field:?} isn't parsed"))
+    }
+
+    /// What the member-role read (`u` lines) makes of `c`.
+    fn member_reads(c: CatalogExpiry) -> Option<Timestamp> {
+        let sql = crate::member_roles::member_catalog_sql();
+        let lower = optional_bound(&sql, "a.rolvaliduntil < ");
+        let field = printed(c, lower, sql_bound(&sql, "a.rolvaliduntil > "), "-");
+        if field == "-" {
+            return None;
+        }
+        valid_until_from_micros(&field).unwrap_or_else(|| panic!("{c:?}: {field:?} isn't parsed"))
+    }
+
+    /// Whether Postgres refuses the role's password at `now` (microseconds since the epoch).
+    fn pg_expired(c: CatalogExpiry, now: i128) -> bool {
+        match c {
+            CatalogExpiry::Null | CatalogExpiry::Infinity => false,
+            CatalogExpiry::NegInfinity => true,
+            CatalogExpiry::At(m) => m < now,
+        }
+    }
+
+    /// Every catalog value at an edge: NULL, `±infinity`, and ±1 µs around Postgres' own
+    /// range, the round-trip range, the epoch, the time type's range and `i64` microseconds
+    /// (those outside what Postgres keeps left out).
+    fn catalog_edges() -> Vec<CatalogExpiry> {
+        let mut out = vec![CatalogExpiry::Null, CatalogExpiry::NegInfinity, CatalogExpiry::Infinity];
+        let edges = [
+            PG_FIRST_MICROS,
+            us(Timestamp::MIN),
+            us(Timestamp::PG_ROUND_TRIP_MIN),
+            0,
+            us(Timestamp::PG_ROUND_TRIP_MAX),
+            us(Timestamp::MAX),
+            i128::from(i64::MIN),
+            i128::from(i64::MAX),
+            PG_LAST_MICROS,
+        ];
+        for edge in edges {
+            for d in [-1, 0, 1] {
+                let m = edge + d;
+                if (PG_FIRST_MICROS..=PG_LAST_MICROS).contains(&m) {
+                    out.push(CatalogExpiry::At(m));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_role_expired_with_negative_infinity_is_read_as_expired() {
+        let floor = Timestamp::PG_ROUND_TRIP_MIN;
+        assert_eq!(optional_bound(ROLE_SELECT, "a.rolvaliduntil < "), Some(floor));
+        let member = crate::member_roles::member_catalog_sql();
+        assert_eq!(optional_bound(&member, "a.rolvaliduntil < "), Some(floor));
+        // The value the clamp prints is the same floor (its literal is the first `extract`).
+        assert_eq!(sql_bound(ROLE_SELECT, "extract(epoch FROM "), floor);
+        assert_eq!(sql_bound(&member, "extract(epoch FROM "), floor);
+        assert_eq!(resync_reads(CatalogExpiry::NegInfinity), Some(floor));
+        assert_eq!(member_reads(CatalogExpiry::NegInfinity), Some(floor));
+        // The resync records it as expired (a SQL role: the database wins).
+        let mut seen = role("r", Some(SCRAM_A));
+        seen.valid_until = resync_reads(CatalogExpiry::NegInfinity);
+        let (_, write) = plan_resync(OWNER_ROLE, &[], &observed(vec![seen]));
+        assert_eq!(upsert(&write, "r").unwrap().attributes.valid_until, Some(floor));
+    }
+
+    // A far-past field (a value before year 1, or one no Postgres prints) reads as the floor:
+    // expired, and a value that can be written back.
+    #[test]
+    fn a_far_past_expiry_field_reads_as_the_floor() {
+        let floor = Timestamp::PG_ROUND_TRIP_MIN;
+        for field in [
+            (us(floor) - 1).to_string(),
+            PG_FIRST_MICROS.to_string(),
+            (us(Timestamp::MIN) - 1).to_string(),
+            us(Timestamp::MIN).to_string(),
+            (us(Timestamp::MIN) + 1).to_string(),
+            "-9223372036854775809".to_string(),
+        ] {
+            assert_eq!(parse_valid_until(&field), Some(Some(floor)), "{field}");
+            assert_eq!(valid_until_from_micros(&field), Some(Some(floor)), "{field}");
+        }
+        assert_eq!(parse_valid_until(&us(floor).to_string()), Some(Some(floor)));
+    }
+
+    #[test]
+    fn every_catalog_expiry_reads_as_postgres_judges_it() {
+        let nows = [
+            us(Timestamp::PG_ROUND_TRIP_MIN) + 1,
+            0,
+            us(Timestamp::from_ymd_hms(2026, 11, 24, 0, 0, 0).unwrap()),
+            us(Timestamp::PG_ROUND_TRIP_MAX),
+        ];
+        let edges = catalog_edges();
+        assert!(edges.len() > 20, "{edges:?}");
+        for c in edges {
+            for (reader, read) in [("resync", resync_reads(c)), ("member", member_reads(c))] {
+                let none = match c {
+                    CatalogExpiry::Null | CatalogExpiry::Infinity => true,
+                    CatalogExpiry::NegInfinity => false,
+                    CatalogExpiry::At(m) => m > us(Timestamp::PG_ROUND_TRIP_MAX),
+                };
+                assert_eq!(read.is_none(), none, "{reader} {c:?}: {read:?}");
+                for now in nows {
+                    let expired = read.is_some_and(|t| us(t) < now);
+                    assert_eq!(expired, pg_expired(c, now), "{reader} {c:?} at {now}: {read:?}");
+                }
+                let Some(t) = read else { continue };
+                assert!(t.round_trips_through_pg(), "{reader} {c:?}: {t:?}");
+                let clamped = match c {
+                    CatalogExpiry::At(m) => m.max(us(Timestamp::PG_ROUND_TRIP_MIN)),
+                    _ => us(Timestamp::PG_ROUND_TRIP_MIN),
+                };
+                assert_eq!(us(t), clamped, "{reader} {c:?}");
+            }
+            // Written back, the resync's read is a `VALID UNTIL` Postgres takes, reads back as
+            // itself and is never re-applied; a SQL role is recorded with it.
+            let read = resync_reads(c);
+            let attributes = RoleAttributes { valid_until: read, ..RoleAttributes::default() };
+            let create = create_role_options(&wanted(&attributes), None);
+            assert_eq!(
+                create.iter().any(|o| o.starts_with("VALID UNTIL")),
+                read.is_some(),
+                "{c:?}: {create:?}"
+            );
+            if let Some(t) = read {
+                assert_eq!(written_and_read_back(t), Some(Some(t)), "{c:?}");
+            }
+            let mut seen = role("r", Some(SCRAM_A));
+            seen.valid_until = read;
+            assert_eq!(attributes_sql(&wanted(&attributes), &seen), None, "{c:?}");
+            let (repairs, write) = plan_resync(OWNER_ROLE, &[], &observed(vec![seen]));
+            assert!(repairs.is_empty(), "{c:?}: {repairs:?}");
+            assert_eq!(upsert(&write, "r").unwrap().attributes.valid_until, read, "{c:?}");
         }
     }
 }
