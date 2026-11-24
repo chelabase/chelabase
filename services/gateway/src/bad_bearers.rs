@@ -15,8 +15,9 @@
 //! - Only addresses with a refusal not yet refilled have an entry (a full bucket is no entry),
 //!   so a client that never sends a bad bearer has nothing to lose or evict.
 //! - At most [`CAPACITY`] entries. When a new address needs one and the map is full, refilled
-//!   entries are dropped first; if it is still full, the eighth with the most tokens left goes
-//!   (the least-limited addresses, which forgetting frees the least). A new address is always
+//!   entries are dropped first; then, down to seven eighths of the capacity, those with the
+//!   most tokens left go (the least-limited addresses, which forgetting frees the least). So a
+//!   full map costs one pass per `capacity / 8` new addresses, however many had refilled. A new address is always
 //!   admitted, so a full map never stops limiting new clients, and a limited address is only
 //!   forgotten once nearly every other entry is as limited as it is.
 
@@ -129,14 +130,17 @@ impl BadBearerLimiter {
         (bucket.tokens + refilled).min(self.burst)
     }
 
-    /// Frees at least one entry of a full map: drops refilled entries, then, if none was, the
-    /// eighth of the map with the most tokens left.
+    /// Makes room in a full map: drops refilled entries, then, while the map is still above
+    /// seven eighths of its capacity, the entries with the most tokens left. Always ending at
+    /// most there (however many entries had refilled) bounds the cost: a full pass happens at
+    /// most once per `capacity / 8` new addresses.
     fn make_room(&self, buckets: &mut HashMap<IpAddr, Bucket>, now: Instant) {
         buckets.retain(|_, bucket| self.tokens(bucket, now) < self.burst);
-        if buckets.len() < self.capacity {
+        let target = self.capacity - (self.capacity / 8).max(1);
+        if buckets.len() <= target {
             return;
         }
-        let evict = (self.capacity / 8).clamp(1, buckets.len());
+        let evict = buckets.len() - target;
         let mut by_tokens: Vec<(f64, IpAddr)> = buckets
             .iter()
             .map(|(key, bucket)| (self.tokens(bucket, now), *key))
@@ -345,6 +349,40 @@ mod tests {
         l.refused(nth(100));
         assert_eq!(l.tracked(), 2);
         assert!(l.check(attacker).is_err());
+    }
+
+    /// A full map scans all its entries at most once per `capacity / 8` new addresses, even
+    /// when only a few entries have refilled each time (refills spread out in time, as steady
+    /// traffic from many addresses gives).
+    #[test]
+    fn a_full_map_scans_at_most_once_per_eighth_of_new_addresses_under_staggered_refills() {
+        const CAPACITY: u32 = 1000;
+        const NEW: u32 = 5000;
+        let (l, clock) = limiter(3, CAPACITY as usize);
+        // One refusal each, spread over one refill: an entry refills every step from now on.
+        let step = Duration::from_secs(2) / CAPACITY;
+        for n in 0..CAPACITY {
+            l.refused(nth(n));
+            clock.advance(step);
+        }
+        assert_eq!(l.tracked(), CAPACITY as usize);
+        // A new address that doesn't grow the map is one that made room, a full scan.
+        let mut scans = 0;
+        for n in CAPACITY..CAPACITY + NEW {
+            let before = l.tracked();
+            l.refused(nth(n));
+            let after = l.tracked();
+            assert!(after <= CAPACITY as usize);
+            if after <= before {
+                scans += 1;
+            }
+            clock.advance(step);
+        }
+        let bound = NEW / (CAPACITY / 8) + 1;
+        assert!(
+            scans <= bound,
+            "{scans} of {NEW} new addresses ran a full scan (amortised bound {bound})"
+        );
     }
 
     #[test]

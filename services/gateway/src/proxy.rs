@@ -80,6 +80,8 @@ pub struct RequestCtx {
     attempt: usize,
     /// The client's address ([`client_address`]), set by `request_filter`.
     client_ip: Option<IpAddr>,
+    /// Set by `response_filter` once the upstream's response header was seen.
+    upstream_answered: bool,
 }
 
 #[async_trait]
@@ -96,6 +98,7 @@ impl ProxyHttp for Gateway {
             candidates: Vec::new(),
             attempt: 0,
             client_ip: None,
+            upstream_answered: false,
         }
     }
 
@@ -293,6 +296,7 @@ impl ProxyHttp for Gateway {
         ctx: &mut RequestCtx,
     ) -> Result<()> {
         response.insert_header(REQUEST_ID_HEADER, ctx.request_id.as_str())?;
+        ctx.upstream_answered = true;
         if let Some(plan) = &ctx.plan {
             // Once per response, at its header: a long-held `POST /mcp` holds no limiter state.
             // `ctx.client_ip` is the address the request's check used.
@@ -340,7 +344,15 @@ impl ProxyHttp for Gateway {
         format!("{} {}, Host: {}", req.method, req.uri.path(), host.as_deref().unwrap_or("-"))
     }
 
-    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut RequestCtx) {
+    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut RequestCtx) {
+        // A forwarded request whose client went away before the upstream's header was read:
+        // for `/mcp` that may be a refusal mcp made that `response_filter` never saw.
+        if let Some(plan) = &ctx.plan {
+            let client_went_away = e.is_some_and(|e| *e.esource() == ErrorSource::Downstream);
+            if client_went_away && !ctx.upstream_answered {
+                self.pipeline.abandoned_before_answer(plan.endpoint, ctx.client_ip);
+            }
+        }
         let req = session.req_header();
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
         let (route, service) = match (ctx.site, &ctx.plan) {

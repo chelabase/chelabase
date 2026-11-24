@@ -211,6 +211,16 @@ impl Pipeline {
         }
     }
 
+    /// A forwarded request for `endpoint` from `client_ip` ended without the upstream's answer
+    /// because the client went away (it hung up, or its body was cut short): on an mcp route
+    /// it counts as a refusal, since mcp may have refused it from the headers alone. Upstream
+    /// failures never come here.
+    pub fn abandoned_before_answer(&self, endpoint: &Endpoint, client_ip: Option<IpAddr>) {
+        if endpoint.policy.auth == Auth::Mcp {
+            self.bad_bearers.refused(client_ip);
+        }
+    }
+
     /// Whether `service` is routed: every service but `mcp`, which needs its upstream.
     fn serves(&self, service: Service) -> bool {
         service != Service::Mcp || self.mcp_challenge.is_some()
