@@ -35,9 +35,7 @@
 //! wait on it in a cycle; a tombstone's purge revokes the branches' managed keys the same way,
 //! after their state rows. `put_secret` takes a transaction advisory lock on its branch and
 //! function after the per-branch locks (so two writes can't pass the secrets' total cap
-//! together) and only secret rows after it. The functions service's
-//! [`MetadataClient::disable_stalled_function`] (#295) is a per-branch write like `set_enabled`
-//! (1 to 3, then its state row, 4). `set_function_last_error` updates its state row alone,
+//! together) and only secret rows after it. `set_function_last_error` updates its state row alone,
 //! `set_service_signing_secret` (m9) its function row (3) alone, and `set_service_health` (m9)
 //! takes a `service_health` row (beside 3, written by nobody else) and, inserting it, its
 //! deployment row `FOR KEY SHARE` (the foreign key), and nothing after either; the
@@ -94,12 +92,6 @@ pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 pub const MAX_SECRETS_ENV_BYTES: usize = 128 * 1024;
 /// A function's recorded last error is cut to this many characters.
 pub const MAX_LAST_ERROR_CHARS: usize = 1024;
-/// #295: how a function's `last_error` starts when the functions service turned it off because
-/// the runtime kept restarting while it ran ([`MetadataClient::disable_stalled_function`]).
-/// While it is off with this reason, nothing else overwrites the reason, and activating another
-/// deployment or turning it on again clears it (activating another deployment also turns it
-/// back on: a redeploy is the fix).
-pub const WATCHDOG_DISABLED_PREFIX: &str = "disabled by the runtime watchdog: ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
@@ -1260,12 +1252,7 @@ impl MetadataClient {
 
     /// Records the function's last invocation error on the branch (`None` clears it), cut to
     /// [`MAX_LAST_ERROR_CHARS`] characters. A branch or database that is deleting or deleted, or
-    /// a function without state there, is left as it is, and so is the reason of a function
-    /// the watchdog turned off ([`WATCHDOG_DISABLED_PREFIX`]) while it is off.
-    ///
-    /// The prefix is a convention every writer of `last_error` keeps: each writes a fixed
-    /// text of its own first (never member text at the start), so none can pass for the
-    /// watchdog's reason.
+    /// a function without state there, is left as it is.
     pub async fn set_function_last_error(
         &self,
         branch: BranchId,
@@ -1278,53 +1265,14 @@ impl MetadataClient {
              FROM branches b JOIN databases d ON d.id = b.database_id
              WHERE bf.branch_id = $1 AND bf.function_id = $2 AND b.id = bf.branch_id
                AND b.status NOT IN ('deleting', 'deleted')
-               AND d.status NOT IN ('deleting', 'deleted')
-               AND (bf.enabled OR bf.last_error IS NULL OR NOT starts_with(bf.last_error, $4))",
+               AND d.status NOT IN ('deleting', 'deleted')",
         )
         .bind(branch.as_uuid())
         .bind(function_id)
         .bind(error)
-        .bind(WATCHDOG_DISABLED_PREFIX)
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// #295: turns the function off on the branch with `reason` as its `last_error` (cut to
-    /// [`MAX_LAST_ERROR_CHARS`]), only while it is on and its active deployment's bundle is
-    /// `bundle_sha256`: a redeploy since the restarts were seen is left alone. False when
-    /// nothing was written (off already, another bundle, no state there, or the branch or its
-    /// database going away). The reason should start with [`WATCHDOG_DISABLED_PREFIX`].
-    pub async fn disable_stalled_function(
-        &self,
-        branch: BranchId,
-        function_id: Uuid,
-        bundle_sha256: &str,
-        reason: &str,
-    ) -> Result<bool, MetadataError> {
-        let reason: String = reason.chars().take(MAX_LAST_ERROR_CHARS).collect();
-        let mut tx = self.pool.begin().await?;
-        // The per-branch locks (1 to 3), then the state row (4), as `set_enabled`.
-        match lock_branch_function(&mut tx, branch, function_id).await {
-            Ok(_) => {}
-            Err(MetadataError::FunctionNotFound) => return Ok(false),
-            Err(e) => return Err(e),
-        }
-        let updated = sqlx::query(
-            "UPDATE branch_functions bf SET enabled = false, last_error = $4, updated_at = now()
-             FROM function_deployments d
-             WHERE bf.branch_id = $1 AND bf.function_id = $2 AND bf.enabled
-               AND d.id = bf.deployment_id AND d.bundle_sha256 = $3",
-        )
-        .bind(branch.as_uuid())
-        .bind(function_id)
-        .bind(bundle_sha256)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        Ok(updated == 1)
     }
 
     /// Changes a function's kind. False for an unknown function or one of another database;
@@ -1487,9 +1435,7 @@ impl MetadataClient {
     }
 
     /// Makes `deployment_id` the function's active deployment on the branch (a new branch
-    /// state starts disabled, auth `key`). #295: a function the watchdog turned off
-    /// ([`WATCHDOG_DISABLED_PREFIX`]) is turned back on by a deployment of another bundle (the
-    /// fix); the same bundle again leaves it off with its reason. A deployment of another function is
+    /// state starts disabled, auth `key`). A deployment of another function is
     /// [`MetadataError::InvalidFunction`].
     pub async fn set_active_deployment(
         &self,
@@ -1499,40 +1445,25 @@ impl MetadataClient {
     ) -> Result<(), MetadataError> {
         let mut tx = self.pool.begin().await?;
         lock_branch_function(&mut tx, branch, function_id).await?;
-        let owner: Option<(Uuid, Option<String>)> = sqlx::query_as(
-            "SELECT function_id, bundle_sha256 FROM function_deployments WHERE id = $1",
-        )
-        .bind(deployment_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((_, bundle)) = owner.filter(|(owner, _)| *owner == function_id) else {
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT function_id FROM function_deployments WHERE id = $1")
+                .bind(deployment_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owner != Some(function_id) {
             return Err(invalid("the deployment belongs to another function"));
-        };
+        }
         sqlx::query(
             "INSERT INTO branch_functions (branch_id, function_id, deployment_id)
              VALUES ($1, $2, $3)
              ON CONFLICT (branch_id, function_id)
-             DO UPDATE SET deployment_id = EXCLUDED.deployment_id,
-                           last_error = CASE
-                               WHEN NOT branch_functions.enabled
-                                    AND starts_with(coalesce(branch_functions.last_error, ''), $4)
-                                    AND (SELECT d.bundle_sha256 FROM function_deployments d
-                                         WHERE d.id = branch_functions.deployment_id)
-                                        IS NOT DISTINCT FROM $5
-                               THEN branch_functions.last_error END,
-                           enabled = branch_functions.enabled
-                               OR (starts_with(coalesce(branch_functions.last_error, ''), $4)
-                                   AND (SELECT d.bundle_sha256 FROM function_deployments d
-                                        WHERE d.id = branch_functions.deployment_id)
-                                       IS DISTINCT FROM $5),
+             DO UPDATE SET deployment_id = EXCLUDED.deployment_id, last_error = NULL,
                            deployment_generation = branch_functions.deployment_generation + 1,
                            updated_at = now()",
         )
         .bind(branch.as_uuid())
         .bind(function_id)
         .bind(deployment_id)
-        .bind(WATCHDOG_DISABLED_PREFIX)
-        .bind(bundle)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1599,8 +1530,6 @@ impl MetadataClient {
     }
 
     /// Turns the function on or off on the branch. False when it has no deployment there.
-    /// Either way it clears a watchdog's reason ([`WATCHDOG_DISABLED_PREFIX`]): turned off by
-    /// hand, the state is the caller's, and a redeploy doesn't turn it back on.
     pub async fn set_enabled(
         &self,
         branch: BranchId,
@@ -1610,15 +1539,12 @@ impl MetadataClient {
         let mut tx = self.pool.begin().await?;
         lock_branch_function(&mut tx, branch, function_id).await?;
         let updated = sqlx::query(
-            "UPDATE branch_functions SET enabled = $3, updated_at = now(),
-                    last_error = CASE WHEN starts_with(coalesce(last_error, ''), $4)
-                                      THEN NULL ELSE last_error END
+            "UPDATE branch_functions SET enabled = $3, updated_at = now()
              WHERE branch_id = $1 AND function_id = $2",
         )
         .bind(branch.as_uuid())
         .bind(function_id)
         .bind(enabled)
-        .bind(WATCHDOG_DISABLED_PREFIX)
         .execute(&mut *tx)
         .await?
         .rows_affected();

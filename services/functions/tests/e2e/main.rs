@@ -243,13 +243,6 @@ impl Stack {
     /// Creates the function if needed, deploys `source` as a one-module bundle (made active on
     /// the branch) and enables it, all through the management API.
     async fn deploy(&self, name: &str, source: &str) -> String {
-        let id = self.deploy_only(name, source).await;
-        self.patch(name, json!({ "enabled": true })).await;
-        id
-    }
-
-    /// [`Self::deploy`] without turning the function on (a redeploy as the CLI makes it).
-    async fn deploy_only(&self, name: &str, source: &str) -> String {
         let manifest = serde_json::to_string(&json!({
             "compatibilityDate": "2026-10-01",
             "compatibilityFlags": [],
@@ -278,6 +271,7 @@ impl Stack {
             )
             .await;
         assert_eq!(status, 201, "deploy {name}: {body}");
+        self.patch(name, json!({ "enabled": true })).await;
         body["id"].as_str().expect("the deployment's id").to_owned()
     }
 

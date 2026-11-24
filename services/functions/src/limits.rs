@@ -1,16 +1,18 @@
 //! Per-function limits on the shared runtime (#295).
 //!
 //! Every function runs in one workerd process, on one thread, with no CPU limit there
-//! (`infra/functions-runtime/watchdog.sh`). Two limits keep one function from taking every
-//! other one down with it:
+//! (`infra/functions-runtime/watchdog.sh`). A cap keeps one function from piling into it, and
+//! the restarts are attributed so the operator knows which function to turn off:
 //!
 //! - [`Concurrency`]: at most `max` invocations of one function on one branch at once from
 //!   outside callers (schedules, database events and storage triggers are bounded by their own
-//!   limits and exempt). One past it answers 429 `too_many_requests` at once; nothing queues. A slot is taken just before the
-//!   runtime is called (after the caller is checked and the body read, so a refused caller or a
+//!   limits and exempt). One past it answers 429 `too_many_requests` at once; nothing queues.
+//!   A slot is taken just before the runtime is called (after the caller is checked and the body read, so a refused caller or a
 //!   slow upload never holds one) and freed when the response body ends or is dropped: a
 //!   failure, a timeout and a client hang-up all free it.
-//! - [`Restarts`]: which function keeps the watchdog restarting the runtime. The supervisor
+//! - [`Restarts`]: which function keeps the watchdog restarting the runtime, reported to the
+//!   operator (a warning per restart counted, an error at `threshold`), never acted on: see the
+//!   last paragraph. The supervisor
 //!   can't say: the watchdog kills workerd because its one thread is stuck (in the culprit), so
 //!   nothing in it answers, and its state dies with it. This service knows what it forwarded.
 //!   A kill drops every connection in flight at once. The first such drop (a request sent, then
@@ -32,12 +34,14 @@
 //!   A restart counts only when it has exactly one suspect (a function on a branch with one
 //!   bundle); with none or several it counts for nobody, so an innocent function that happens
 //!   to be in flight at extra restarts never pulls ahead of the looper. A function that is the
-//!   only suspect of `threshold` restarts within `window` is disabled. A looper that always
-//!   overlaps a long-running function is never disabled.
+//!   only suspect of `threshold` restarts within `window` is reported at error level. A looper
+//!   that always overlaps a long-running function is never reported.
 //!
-//!   What it can't attribute: a function that answers and then keeps running (in
-//!   `ctx.waitUntil`, or after its body ended) has left nothing in flight, and the request
-//!   queued behind it looks like the culprit. Nothing here tells those apart.
+//!   Why nothing is turned off automatically: a function that answers and then keeps running
+//!   (in `ctx.waitUntil`, or after its body ended) has left nothing in flight, and the request
+//!   queued behind it, perhaps another tenant's function, looks exactly like a looper on a
+//!   quiet runtime. Acting on it would let one tenant get another's function disabled. Only the
+//!   runtime could say which request it was running when it got stuck.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -123,10 +127,22 @@ impl Drop for Slot {
 pub struct Suspect {
     pub branch: Uuid,
     pub function: Uuid,
+    /// The function's name on the branch (for the operator's `chelabase functions disable`).
+    pub name: String,
     pub bundle_sha256: String,
 }
 
-/// When [`Restarts`] disables a function.
+/// A restart counted against its only suspect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credit {
+    pub suspect: Suspect,
+    /// Restarts counted against it within the window, this one included.
+    pub count: usize,
+    /// `count` reached the policy's threshold (the count starts over after it).
+    pub reached: bool,
+}
+
+/// When [`Restarts`] counts a restart and when it reports a function at error level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
     /// Restarts a function must be suspected in.
@@ -219,11 +235,12 @@ impl Restarts {
             .retain(|_, (_, _, abandoned)| abandoned.is_none_or(|a| a >= now));
     }
 
-    /// The runtime dropped a request in flight at `now`: the function to disable, if this
-    /// restart is the `threshold`th one within `window` whose only suspect it was. A restart
+    /// The runtime dropped a request in flight at `now`: the credit, when this restart had
+    /// exactly one suspect, with the count of restarts counted against it within `window`
+    /// (`reached` at `threshold`, after which its count starts over). A restart
     /// with no suspect, or with several, counts for nobody (a long-running innocent in flight
     /// at an extra restart can then never pull ahead of the looper).
-    pub fn dropped(&self, now: Instant) -> Option<Suspect> {
+    pub fn dropped(&self, now: Instant) -> Option<Credit> {
         let p = self.policy;
         let mut st = lock(&self.state);
         if st
@@ -279,11 +296,16 @@ impl Restarts {
         {
             seen.pop_front();
         }
-        if seen.len() < p.threshold {
-            return None;
+        let count = seen.len();
+        let reached = count >= p.threshold;
+        if reached {
+            st.suspected.remove(&s);
         }
-        st.suspected.remove(&s);
-        Some(s)
+        Some(Credit {
+            suspect: s,
+            count,
+            reached,
+        })
     }
 }
 
@@ -349,8 +371,14 @@ mod tests {
         Suspect {
             branch: Uuid::from_u128(1),
             function: Uuid::from_u128(u128::from(n)),
+            name: format!("f{n}"),
             bundle_sha256: format!("{n:064x}"),
         }
+    }
+
+    /// The suspect whose count reached the threshold, if any.
+    fn reached(c: Option<Credit>) -> Option<Suspect> {
+        c.filter(|c| c.reached).map(|c| c.suspect)
     }
 
     fn policy() -> RestartPolicy {
@@ -376,7 +404,7 @@ mod tests {
             flights.push(r.start(s.clone(), at - *ago));
         }
         // Every flight is dropped; the first drop decides, the rest are the same restart.
-        let verdict = r.dropped(at);
+        let verdict = reached(r.dropped(at));
         for i in 1..flights.len() {
             assert_eq!(r.dropped(at + Duration::from_millis(i as u64)), None);
         }
@@ -411,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_restarts_with_one_bundle_disable_it() {
+    fn repeated_restarts_with_one_bundle_reach_the_threshold() {
         let r = Arc::new(Restarts::new(policy()));
         let base = Instant::now();
         let hung = suspect(1);
@@ -420,14 +448,14 @@ mod tests {
         assert_eq!(
             restart(&r, base + secs(180), &hung, &[]),
             Some(hung.clone()),
-            "the third restart within the window disables it"
+            "the third restart within the window reaches the threshold"
         );
-        // Counted afresh after a disable.
+        // Counted afresh after the threshold.
         assert_eq!(restart(&r, base + secs(240), &hung, &[]), None);
     }
 
     #[test]
-    fn restarts_without_a_common_bundle_disable_nothing() {
+    fn restarts_without_a_common_bundle_reach_nothing() {
         let r = Arc::new(Restarts::new(policy()));
         let base = Instant::now();
         for (i, n) in [1u8, 2, 3, 4, 5, 6].into_iter().enumerate() {
@@ -443,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn restarts_outside_the_window_disable_nothing() {
+    fn restarts_outside_the_window_reach_nothing() {
         let r = Arc::new(Restarts::new(policy()));
         let base = Instant::now();
         let hung = suspect(1);
@@ -492,8 +520,41 @@ mod tests {
         assert_eq!(restart(&r, base + secs(420), &hung, &[]), Some(hung));
     }
 
+    /// Warn-only (#295): every restart counted against its only suspect is reported with the
+    /// count in the window, so the operator sees it build up; the threshold is flagged, and the
+    /// count starts over after it.
+    #[test]
+    fn each_counted_restart_reports_its_count() {
+        let r = Arc::new(Restarts::new(policy()));
+        let base = Instant::now();
+        let hung = suspect(1);
+        let mut credits = Vec::new();
+        for i in 1..=4u64 {
+            r.answered(base + secs(60 * i) - secs(9));
+            let f = r.start(hung.clone(), base + secs(60 * i) - secs(8));
+            credits.push(r.dropped(base + secs(60 * i)).map(|c| (c.count, c.reached)));
+            f.end();
+        }
+        assert_eq!(
+            credits,
+            vec![
+                Some((1, false)),
+                Some((2, false)),
+                Some((3, true)),
+                Some((1, false))
+            ]
+        );
+        // A restart with two suspects reports nothing.
+        r.answered(base + secs(400) - secs(9));
+        let a = r.start(suspect(1), base + secs(400) - secs(8));
+        let b = r.start(suspect(2), base + secs(400) - secs(20));
+        assert_eq!(r.dropped(base + secs(400)), None);
+        a.end();
+        b.end();
+    }
+
     /// Review B2's example: a runtime death with a long-running innocent in flight alone (an
-    /// OOM kill another function caused) and two looper restarts disable nothing: the
+    /// OOM kill another function caused) and two looper restarts reach nothing: the
     /// innocent's restart doesn't add to the looper's, and the looper's (where the innocent
     /// was also in flight) don't add to the innocent's. Three restarts with the looper alone do.
     #[test]
@@ -506,7 +567,7 @@ mod tests {
         let at = base + secs(60);
         r.answered(at - Duration::from_millis(300));
         let i = r.start(innocent.clone(), at - secs(20));
-        assert_eq!(r.dropped(at), None);
+        assert_eq!(reached(r.dropped(at)), None);
         i.end();
         // Two looper restarts, the innocent in flight (since before the last answer) in both.
         let others = [(innocent.clone(), secs(25))];
@@ -532,7 +593,7 @@ mod tests {
             let l = r.start(looper.clone(), at - secs(8));
             l.abandon(at - secs(7));
             let q = r.start(queued.clone(), at - Duration::from_millis(6500));
-            let verdict = r.dropped(at);
+            let verdict = reached(r.dropped(at));
             q.end();
             let want = (i == 3).then(|| looper.clone());
             assert_eq!(
@@ -559,7 +620,7 @@ mod tests {
             g.abandon(at - secs(20));
             r.answered(at - secs(9));
             let l = r.start(looper.clone(), at - secs(8));
-            let verdict = r.dropped(at);
+            let verdict = reached(r.dropped(at));
             l.end();
             assert_eq!(verdict, (i == 3).then(|| looper.clone()), "restart {i}");
         }
@@ -580,7 +641,7 @@ mod tests {
     /// The attribution model (review B2): over random runs of restarts (a looper in flight or
     /// whose caller gave up, long-running innocents, requests queued behind it, young ones,
     /// abandoned ones, and runtime deaths with no looper while it was answering), a function is
-    /// disabled exactly when it is the sole suspect of its `threshold`th restart within the
+    /// reported at the threshold exactly when it is the sole suspect of its `threshold`th restart within the
     /// window, the sole suspect being worked out here from what each request was, not from the
     /// timings.
     mod model {
@@ -658,7 +719,7 @@ mod tests {
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(512))]
             #[test]
-            fn disables_exactly_the_sole_suspect_of_threshold_restarts(runs in runs()) {
+            fn reaches_exactly_the_sole_suspect_of_threshold_restarts(runs in runs()) {
                 let p = policy();
                 let r = Arc::new(Restarts::new(p));
                 let mut at = Instant::now() + secs(3600);
@@ -716,7 +777,7 @@ mod tests {
                             Ev::Answer(d) => r.answered(at - d),
                         }
                     }
-                    let got = r.dropped(at);
+                    let got = reached(r.dropped(at));
                     for (_, f) in flights {
                         f.end();
                     }
@@ -751,7 +812,7 @@ mod tests {
             let at = base + secs(60 * i);
             r.answered(at - secs(1));
             let _flight = r.start(f.clone(), at - Duration::from_millis(5));
-            assert_eq!(r.dropped(at), None);
+            assert_eq!(reached(r.dropped(at)), None);
         }
     }
 
@@ -765,7 +826,7 @@ mod tests {
             let mut flight = r.start(f.clone(), at - secs(8));
             flight.set_answered();
             drop(flight);
-            assert_eq!(r.dropped(at), None);
+            assert_eq!(reached(r.dropped(at)), None);
         }
         assert!(r.state.lock().unwrap().flights.is_empty());
     }

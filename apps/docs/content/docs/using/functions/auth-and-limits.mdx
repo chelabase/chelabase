@@ -39,16 +39,26 @@ A 5xx from the function, a timeout, or a runtime that doesn't answer is recorded
 
 All functions of an install run in **one runtime, on one thread**. A function that never yields (`while (true) {}`) stalls every other function until a watchdog notices: the runtime is probed every 2 s and restarted after three failures in a row, so the stall lasts about 6 to 9 seconds, and **it can be repeated** by calling the function again. The 30 s timeout does not cut a loop short, because the loop blocks the thread that would enforce it. Per-invocation CPU and memory limits are not available in this runtime. Treat deploying a function as trusting it with the availability of every other function on the instance, and deploy only code you trust.
 
-A function that keeps doing it is turned off. The functions service notes what was running each time the runtime dies with requests in flight. A restart counts against a function only when that function, with its current deployment, is the only one that could have been holding the runtime. That holds for a call still running, and for one whose caller gave up or timed out while the runtime kept running it. When a function is counted for three restarts within 10 minutes, the service turns it off on the branch. Its `last_error` starts `disabled by the runtime watchdog:`, and its calls answer 404 `function_not_found` like any disabled function's.
+Nothing turns such a function off automatically. Each time the runtime dies with requests in flight, the functions service notes which function was running. A restart is counted against a function only when that function, with its current deployment, is the only one that could have been holding the runtime. That includes a call whose caller gave up or timed out while the runtime kept running it.
 
-To bring it back, deploy a fixed version: activating a deployment with another bundle turns it back on. Redeploying the same bundle doesn't. Turning it on again by hand (`chelabase functions enable`, or `enabled: true`) runs the same code again. Turning it off by hand clears the watchdog's reason, so a later deploy leaves it off.
+The service log reports each counted restart:
+- a warning naming the branch, function and bundle, with the count so far;
+- at three within 10 minutes, an error saying the function would be disabled.
 
 What isn't counted:
 - Requests that only queued behind the stuck one.
-- A restart with more than one function running long enough to be the cause (a looper that always overlaps a long-running function is never turned off).
+- A restart with more than one function running long enough to be the cause. So a looper that always overlaps a long-running function is never named.
 - Restarts that don't share one function.
 
-The service can't attribute a function that answers and then keeps running, in `ctx.waitUntil` or after its body has ended. It no longer has a request in flight, so the request queued behind it can be counted in its place.
+A named function may still be innocent. A function that answers and then keeps running, in `ctx.waitUntil` or after its body has ended, no longer has a request in flight. The request queued behind it, possibly another project's function, looks just like a looper. Acting on the log automatically would let one function get another turned off, so the service only reports. Check the named function before you act.
+
+To stop a function that stalls the runtime, turn it off on its branch:
+
+```bash
+chelabase functions disable <name>
+```
+
+or `PATCH …/functions/{name}` with `{"enabled": false}`. Deploy a fix, then turn it back on with `chelabase functions enable <name>`.
 
 ### What the sandbox keeps in
 

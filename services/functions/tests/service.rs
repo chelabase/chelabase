@@ -138,8 +138,6 @@ struct Fake {
     functions: Mutex<HashMap<(Uuid, String), Entry>>,
     live: Mutex<HashSet<Uuid>>,
     errors: Mutex<Vec<(Uuid, Uuid, String)>>,
-    /// #295: `(branch, function, bundle, reason)` of each function turned off.
-    disabled: Mutex<Vec<(Uuid, Uuid, String, String)>>,
 }
 
 fn function_id(name: &str) -> Uuid {
@@ -175,33 +173,6 @@ impl Directory for Fake {
     }
     async fn database_live(&self, database: Uuid) -> anyhow::Result<bool> {
         Ok(self.live.lock().unwrap().contains(&database))
-    }
-    async fn disable_stalled(
-        &self,
-        branch: Uuid,
-        function: Uuid,
-        bundle_sha256: &str,
-        reason: &str,
-    ) -> anyhow::Result<bool> {
-        let mut functions = self.functions.lock().unwrap();
-        let Some(entry) = functions
-            .iter_mut()
-            .find(|((b, name), _)| *b == branch && function_id(name) == function)
-            .map(|(_, e)| e)
-        else {
-            return Ok(false);
-        };
-        if !entry.2 || bundle_sha256 != "b".repeat(64) {
-            return Ok(false);
-        }
-        entry.2 = false;
-        self.disabled.lock().unwrap().push((
-            branch,
-            function,
-            bundle_sha256.to_owned(),
-            reason.to_owned(),
-        ));
-        Ok(true)
     }
 }
 
@@ -1419,12 +1390,55 @@ async fn status(h: &H, name: &str) -> u16 {
         .as_u16()
 }
 
-/// #295 AC3: the runtime restarts three times within the window with the same function in
-/// flight each time: that function is turned off (only while it still runs that bundle) with
-/// a reason, and its calls answer as a disabled function's do (404) at once, not after the
-/// resolver's cache expires.
+/// #295: what the service logs on the test's thread (a `#[tokio::test]` runs every task on it).
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+
+impl Logs {
+    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// The lines at `level` (`WARN`, `ERROR`) that report a restart counted against a function.
+    fn restarts(&self, level: &str) -> Vec<String> {
+        let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+        text.lines()
+            .filter(|l| l.contains(&format!(" {level} ")) && l.contains("could have stalled it"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// #295 AC3, warn-only: the runtime restarts three times within the window with the same
+/// function the only one in flight each time. Each restart is a warning with its count; the
+/// third is an error naming the function (branch, id, name, bundle) and how to turn it off.
+/// Nothing is turned off.
 #[tokio::test]
-async fn repeated_restarts_with_one_bundle_disable_it() {
+async fn repeated_restarts_with_one_bundle_name_it() {
+    let (logs, _guard) = Logs::capture();
     let url = dying_runtime(Duration::from_millis(250)).await;
     let h = harness_tuned(Some(url), Duration::from_secs(10), |s| {
         s.with_restart_policy(quick_restarts())
@@ -1441,25 +1455,32 @@ async fn repeated_restarts_with_one_bundle_disable_it() {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["code"], "runtime_unavailable");
     }
-    wait_for(|| !h.dir.disabled.lock().unwrap().is_empty()).await;
-    let disabled = h.dir.disabled.lock().unwrap().clone();
-    assert_eq!(disabled.len(), 1);
-    let (branch, function, bundle, reason) = &disabled[0];
-    assert_eq!((*branch, *function), (h.branch, function_id("hang")));
-    assert_eq!(bundle, &"b".repeat(64));
-    assert!(
-        reason.starts_with(chelabase_metadata::WATCHDOG_DISABLED_PREFIX),
-        "{reason}"
-    );
-    assert!(reason.len() <= 500, "fits the last_error column's checks");
-    assert_eq!(status(&h, "hang").await, 404, "turned off at once");
+    let warns = logs.restarts("WARN");
+    assert_eq!(warns.len(), 2, "{warns:#?}");
+    assert!(warns[0].contains("restarts=1") && warns[1].contains("restarts=2"), "{warns:#?}");
+    let errors = logs.restarts("ERROR");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    let e = &errors[0];
+    for want in [
+        format!("branch={}", h.branch),
+        format!("function={}", function_id("hang")),
+        "name=hang".to_owned(),
+        format!("bundle={}", "b".repeat(64)),
+        "restarts=3".to_owned(),
+        "chelabase functions disable hang".to_owned(),
+    ] {
+        assert!(e.contains(&want), "{want} in {e}");
+    }
     assert_eq!(status(&h, "hello").await, 200, "the others still run");
+    assert_eq!(status(&h, "hang").await, 502, "nothing is turned off");
 }
 
 /// #295 AC4: restarts with a different function in flight each time, and runtime connections
-/// refused (a runtime down or restarting), never turn anything off.
+/// refused (a runtime down or restarting), never name anything at error level; a refused
+/// connect is no restart at all.
 #[tokio::test]
-async fn restarts_without_a_common_bundle_disable_nothing() {
+async fn restarts_without_a_common_bundle_name_nothing() {
+    let (logs, _guard) = Logs::capture();
     let url = dying_runtime(Duration::from_millis(250)).await;
     let h = harness_tuned(Some(url), Duration::from_secs(10), |s| {
         s.with_restart_policy(quick_restarts())
@@ -1469,11 +1490,8 @@ async fn restarts_without_a_common_bundle_disable_nothing() {
         assert_eq!(status(&h, "hello").await, 200);
         assert_eq!(status(&h, name).await, 502, "{name}");
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(h.dir.disabled.lock().unwrap().is_empty());
-    for name in ["hang", "hang2", "hang3"] {
-        assert_eq!(status(&h, name).await, 502, "{name} still runs");
-    }
+    assert_eq!(logs.restarts("WARN").len(), 5, "each restart is counted against its own");
+    assert!(logs.restarts("ERROR").is_empty(), "{:#?}", logs.restarts("ERROR"));
 
     let refused = harness_tuned(Some("http://127.0.0.1:1".into()), Duration::from_secs(10), |s| {
         s.with_restart_policy(functions::limits::RestartPolicy {
@@ -1486,15 +1504,16 @@ async fn restarts_without_a_common_bundle_disable_nothing() {
         assert_eq!(status(&refused, "hello").await, 502);
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(refused.dir.disabled.lock().unwrap().is_empty(), "a refused connect is no restart");
+    assert_eq!(logs.restarts("WARN").len(), 5, "a refused connect is no restart");
+    assert!(logs.restarts("ERROR").is_empty());
 }
 
 /// Review B1: the looper's caller hangs up before the kill, and a request queues behind it.
-/// The looper, no longer in flight here, is still the one turned off; the queued request's
+/// The looper, no longer in flight here, is still the one named; the queued request's
 /// function isn't, though it is the only one in flight at each kill.
 #[tokio::test]
-async fn an_abandoned_looper_is_still_the_one_turned_off() {
+async fn an_abandoned_looper_is_still_the_one_named() {
+    let (logs, _guard) = Logs::capture();
     let url = dying_runtime(Duration::from_millis(300)).await;
     let h = Arc::new(
         harness_tuned(Some(url), Duration::from_secs(10), |s| {
@@ -1514,10 +1533,11 @@ async fn an_abandoned_looper_is_still_the_one_turned_off() {
         assert_eq!(status(&h, "queued").await, 502, "restart {i}: queued behind it, killed");
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
-    wait_for(|| !h.dir.disabled.lock().unwrap().is_empty()).await;
-    let disabled: Vec<Uuid> = h.dir.disabled.lock().unwrap().iter().map(|d| d.1).collect();
-    assert_eq!(disabled, vec![function_id("hang")], "the looper, not the queued function");
-    assert_eq!(status(&h, "queued").await, 200);
+    let named = logs.restarts("ERROR");
+    assert_eq!(named.len(), 1, "{named:#?}");
+    assert!(named[0].contains("name=hang"), "the looper, not the queued function: {named:#?}");
+    let all = [logs.restarts("WARN"), named].concat();
+    assert!(all.iter().all(|l| !l.contains("name=queued")), "{all:#?}");
 }
 
 /// Review S3: internal callers (schedules, database events, storage triggers) are bounded by

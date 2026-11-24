@@ -15,7 +15,7 @@ mod functions {
         BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, FunctionAuth, FunctionKind,
         MAX_BUNDLE_SIZE, MetadataClient, MetadataConfig, MetadataError, NewBranch, NewDataKey,
         KeyRoleFix, NewDeployment, NewSchedule, NewTrigger, RunAs, RunAsMint, RunAsUnmintable,
-        Schedule, ScheduleError, ScheduleProblem, WATCHDOG_DISABLED_PREFIX,
+        Schedule, ScheduleError, ScheduleProblem,
         TriggerDelivery, TriggerInstall, TriggerSource,
         TriggerState,
     };
@@ -1584,89 +1584,6 @@ mod functions {
         s.finish().await;
     }
 
-    /// #295: the functions service turns off a function the runtime keeps restarting with,
-    /// only while it is on and still runs the bundle it named, with the reason as its
-    /// `last_error`. The reason stays while it is off (an invocation error landing late doesn't
-    /// overwrite it); activating another deployment turns it back on and clears it, activating
-    /// the same one doesn't, and turning it on clears the reason. A plain disable is untouched
-    /// by a redeploy.
-    #[tokio::test]
-    #[ignore]
-    async fn a_stalled_function_is_off_until_redeployed() {
-        let s = Scratch::new().await;
-        let (db, main) = s.database().await;
-        let f = s.active(db, main, "spin").await;
-        let first = s.client.active_deployment_generation(main, f).await.unwrap().unwrap().0;
-        let c = &s.client;
-        let state = || async {
-            sqlx::query_as::<_, (bool, Option<String>)>(
-                "SELECT enabled, last_error FROM branch_functions WHERE branch_id = $1 AND function_id = $2",
-            )
-            .bind(main.as_uuid())
-            .bind(f)
-            .fetch_one(s.pool())
-            .await
-            .unwrap()
-        };
-        let reason = format!("{WATCHDOG_DISABLED_PREFIX}restarted 3 times");
-        assert!(!c.disable_stalled_function(main, f, &sha('c'), &reason).await.unwrap(), "another bundle");
-        assert_eq!(state().await, (true, None));
-        assert!(c.disable_stalled_function(main, f, &sha('b'), &reason).await.unwrap());
-        assert_eq!(state().await, (false, Some(reason.clone())));
-        assert!(!c.disable_stalled_function(main, f, &sha('b'), &reason).await.unwrap(), "already off");
-        c.set_function_last_error(main, f, Some("the runtime didn't answer")).await.unwrap();
-        assert_eq!(state().await, (false, Some(reason.clone())), "the reason is kept");
-        c.set_active_deployment(main, f, first).await.unwrap();
-        assert_eq!(state().await, (false, Some(reason.clone())), "the same deployment again stays off");
-        let fixed = s.deployment(f, &sha('d')).await;
-        c.set_active_deployment(main, f, fixed).await.unwrap();
-        assert_eq!(state().await, (true, None), "a redeploy turns it back on");
-
-        // Turning it on by hand clears the reason.
-        assert!(c.disable_stalled_function(main, f, &sha('d'), &reason).await.unwrap());
-        assert!(c.set_enabled(main, f, true).await.unwrap());
-        assert_eq!(state().await, (true, None));
-
-        // A plain disable (another reason or none) stays off through a redeploy.
-        assert!(c.set_enabled(main, f, false).await.unwrap());
-        c.set_function_last_error(main, f, Some("boom")).await.unwrap();
-        let other = s.deployment(f, &sha('e')).await;
-        c.set_active_deployment(main, f, other).await.unwrap();
-        assert_eq!(state().await, (false, None));
-
-        // Review S2: an explicit disable owns the state: it drops the watchdog's reason, so a
-        // redeploy doesn't turn the function on against the operator.
-        assert!(c.set_enabled(main, f, true).await.unwrap());
-        assert!(c.disable_stalled_function(main, f, &sha('e'), &reason).await.unwrap());
-        assert!(c.set_enabled(main, f, false).await.unwrap());
-        assert_eq!(state().await, (false, None));
-        let after_off = s.deployment(f, &sha('f')).await;
-        c.set_active_deployment(main, f, after_off).await.unwrap();
-        assert_eq!(state().await, (false, None), "off by hand stays off through a redeploy");
-
-        // Review nit: a new deployment of the same bundle is no fix: it stays off, with its
-        // reason.
-        assert!(c.set_enabled(main, f, true).await.unwrap());
-        assert!(c.disable_stalled_function(main, f, &sha('f'), &reason).await.unwrap());
-        let same_bundle = s.deployment(f, &sha('f')).await;
-        c.set_active_deployment(main, f, same_bundle).await.unwrap();
-        assert_eq!(state().await, (false, Some(reason.clone())), "the same bundle again");
-        let fixed_again = s.deployment(f, &sha('a')).await;
-        c.set_active_deployment(main, f, fixed_again).await.unwrap();
-        assert_eq!(state().await, (true, None));
-
-        // A deleting branch isn't written.
-        assert!(c.set_enabled(main, f, true).await.unwrap());
-        sqlx::query("UPDATE branches SET status = 'deleting' WHERE id = $1")
-            .bind(main.as_uuid())
-            .execute(s.pool())
-            .await
-            .unwrap();
-        assert!(!c.disable_stalled_function(main, f, &sha('e'), &reason).await.unwrap());
-        assert_eq!(state().await, (true, None));
-        s.finish().await;
-    }
-
     /// m3a for m4: the functions service records a function's last error (at most 1,024
     /// characters) on a live branch; a tombstoned branch keeps what it had.
     #[tokio::test]
@@ -1915,11 +1832,6 @@ mod functions {
             ("put_secret", |c, x| Box::pin(async move { c.put_secret(x.main, x.f, "TOKEN", "t", true).await })),
             ("set_active_deployment", |c, x| Box::pin(async move { c.set_active_deployment(x.main, x.f, x.deployment).await })),
             ("set_function_last_error", |c, x| Box::pin(async move { c.set_function_last_error(x.main, x.f, Some("boom")).await })),
-            // #295: the functions service's watchdog disable (1 to 3, then 4, as set_enabled).
-            ("disable_stalled_function", |c, x| Box::pin(async move {
-                // The fixture's bundle (review S1): the write matches the state row and takes it.
-                c.disable_stalled_function(x.main, x.f, &sha('c'), "disabled by the runtime watchdog: test").await.map(drop)
-            })),
             // Review fix: the rest of the function writes.
             ("set_enabled", |c, x| Box::pin(async move { c.set_enabled(x.main, x.f, false).await.map(drop) })),
             ("delete_secret", |c, x| Box::pin(async move { c.delete_secret(x.main, x.f, "API_KEY", true).await.map(drop) })),
@@ -2114,22 +2026,6 @@ mod functions {
         } else {
             Err(format!("{dangling} dangling run-as keys, {orphans} orphaned managed keys"))
         }
-    }
-
-    /// Review S1: the lock-order test's `disable_stalled_function` names the fixture's active
-    /// bundle, so on its own it matches (and locks) the state row; the stalled runs wait on it.
-    #[tokio::test]
-    #[ignore]
-    async fn the_lock_order_fixture_runs_the_watchdog_disable_for_real() {
-        let s = Scratch::new().await;
-        let x = s.contended().await;
-        assert!(
-            s.client
-                .disable_stalled_function(x.main, x.f, &sha('c'), "disabled by the runtime watchdog: test")
-                .await
-                .unwrap()
-        );
-        s.finish().await;
     }
 
     /// The invariant behind audit B1 and m2's delete fix: every function write and every

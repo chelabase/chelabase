@@ -38,9 +38,8 @@ use crate::caller::{self, Caller, Form, Refusal};
 use crate::directory::Resolution;
 use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
 use crate::limits::{
-    Concurrency, DEFAULT_MAX_CONCURRENT, RestartPolicy, Restarts, Suspect, human,
+    Concurrency, Credit, DEFAULT_MAX_CONCURRENT, RestartPolicy, Restarts, Suspect, human,
 };
-use chelabase_metadata::WATCHDOG_DISABLED_PREFIX;
 use futures_util::StreamExt as _;
 use crate::resolver::Resolver;
 
@@ -112,7 +111,7 @@ impl AppState {
         self
     }
 
-    /// When a function the runtime keeps restarting with is disabled.
+    /// When a restart is counted against a function, and when it is reported at error level.
     pub fn with_restart_policy(mut self, policy: RestartPolicy) -> Self {
         self.restarts = Arc::new(Restarts::new(policy));
         self
@@ -501,6 +500,7 @@ async fn invoke(
         Suspect {
             branch,
             function: resolution.function_id,
+            name: name.to_owned(),
             bundle_sha256: resolution.bundle_sha256.clone(),
         },
         Instant::now(),
@@ -540,9 +540,9 @@ async fn invoke(
             record_error(s, branch, &resolution, "the runtime didn't answer".into());
             // The runtime died with this request in flight (`flight` still counts it).
             if e == HostError::Dropped
-                && let Some(suspect) = s.restarts.dropped(Instant::now())
+                && let Some(credit) = s.restarts.dropped(Instant::now())
             {
-                disable_stalled(s, suspect);
+                report_restart(&s.restarts.policy(), &credit);
             }
             // Either way the runtime isn't running it.
             flight.end();
@@ -581,36 +581,27 @@ fn held_until_the_body_ends(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-/// #295: turns off the function the runtime keeps restarting with, if it still runs that
-/// bundle, with the reason as its `last_error`, and forgets the branch's cached resolutions so
-/// its next call answers as a disabled function's. The operator sees the warning; the
-/// function's owner, its `last_error`.
-fn disable_stalled(s: &AppState, suspect: Suspect) {
-    let policy = s.restarts.policy();
-    let reason = format!(
-        "{WATCHDOG_DISABLED_PREFIX}the functions runtime was restarted {} times within {} while this deployment was running (a busy loop or runaway memory?); deploy a fix, or turn the function back on",
-        policy.threshold,
-        human(policy.window),
-    );
-    let resolver = s.resolver.clone();
-    tokio::spawn(async move {
-        let Suspect { branch, function, bundle_sha256 } = suspect;
-        match resolver
-            .directory()
-            .disable_stalled(branch, function, &bundle_sha256, &reason)
-            .await
-        {
-            Ok(true) => {
-                resolver.forget_branch(branch);
-                tracing::warn!(%branch, %function, bundle = %bundle_sha256, "turned the function off: {reason}");
-            }
-            Ok(false) => tracing::info!(
-                %branch, %function, bundle = %bundle_sha256,
-                "the functions runtime kept restarting while this function ran, but it is off or runs another bundle now; left as it is"
-            ),
-            Err(e) => tracing::warn!(%branch, %function, "couldn't turn off the function the runtime keeps restarting with: {e}"),
-        }
-    });
+/// #295: a runtime restart counted against its only suspect, for the operator. Nothing is
+/// turned off automatically: what the service sees can't tell a function that answered and
+/// then kept running (in `ctx.waitUntil`) from the request queued behind it, so a function
+/// named here may be innocent. A warning per counted restart, with the count in the window;
+/// an error at the threshold.
+fn report_restart(policy: &RestartPolicy, c: &Credit) {
+    let Suspect { branch, function, name, bundle_sha256 } = &c.suspect;
+    let window = human(policy.window);
+    if c.reached {
+        tracing::error!(
+            %branch, %function, name = %name, bundle = %bundle_sha256, restarts = c.count,
+            "the functions runtime was restarted {} times within {window}, each time with this function the only one that could have stalled it; it would be disabled: check it, and turn it off with `chelabase functions disable {name}` on its branch if it is the cause (a function that keeps running after it answers, in ctx.waitUntil, can't be told apart from the request queued behind it)",
+            c.count,
+        );
+    } else {
+        tracing::warn!(
+            %branch, %function, name = %name, bundle = %bundle_sha256, restarts = c.count,
+            "the functions runtime restarted with this function the only one that could have stalled it ({} of {} within {window})",
+            c.count, policy.threshold,
+        );
+    }
 }
 
 /// m13b: the dispatcher's invocations, in this process: the function's `fetch` handler as the
