@@ -1572,3 +1572,82 @@ async fn internal_calls_are_not_capped() {
     assert_eq!(h.calls(), 2);
     assert_eq!(public.await.unwrap(), 504);
 }
+
+/// #426: the original caller's address, as the gateway forwarded it, goes to the runtime in
+/// `x-chelabase-caller-ip` (the runtime's own header, never the function's), on the key and the
+/// public form. A caller's own copy is dropped; the gateway's original-address header (a
+/// function calling a function through its caller's binding) wins over `x-forwarded-for`.
+#[tokio::test]
+async fn the_original_callers_address_goes_to_the_runtime() {
+    let h = harness().await;
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/hello", Cred::Public)
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("x-chelabase-caller-ip", "198.51.100.66")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen = h.last();
+    assert_eq!(seen.header("x-chelabase-caller-ip"), Some("203.0.113.9"));
+    assert_eq!(seen.headers.get_all("x-chelabase-caller-ip").iter().count(), 1);
+
+    let url = format!("{}/functions/v1/public/{}/open", h.public, h.branch);
+    let resp = h
+        .http
+        .get(&url)
+        .header("x-forwarded-for", "2001:db8::7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("x-chelabase-caller-ip"), Some("2001:db8::7"));
+
+    // Through the binding: the peer was the runtime; the gateway forwards the original.
+    let resp = h
+        .call(reqwest::Method::GET, "/functions/v1/hello", Cred::Public)
+        .header("x-forwarded-for", "10.0.0.5")
+        .header("chelabase-original-client-ip", "198.51.100.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen = h.last();
+    assert_eq!(seen.header("x-chelabase-caller-ip"), Some("198.51.100.7"));
+    assert_eq!(seen.header("chelabase-original-client-ip"), None, "never the function's");
+}
+
+/// #426: no usable address from the gateway, no caller address: none, two lines, a list, a
+/// non-literal; and the worker's internal invocations never carry one.
+#[tokio::test]
+async fn no_caller_address_without_one_from_the_gateway() {
+    let h = harness().await;
+    let cases: &[&[(&str, &str)]] = &[
+        &[],
+        &[("x-forwarded-for", "203.0.113.9"), ("x-forwarded-for", "203.0.113.10")],
+        &[("x-forwarded-for", "203.0.113.9, 203.0.113.10")],
+        &[("x-forwarded-for", "not-an-address")],
+        &[("x-forwarded-for", "203.0.113.9:443")],
+        &[("chelabase-original-client-ip", "garbage")],
+    ];
+    for headers in cases {
+        let mut req = h.call(reqwest::Method::GET, "/functions/v1/hello", Cred::Public);
+        for (name, value) in *headers {
+            req = req.header(*name, *value);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 200);
+        assert_eq!(h.last().header("x-chelabase-caller-ip"), None, "{headers:?}");
+    }
+    let resp = h
+        .http
+        .post(format!("{}/internal/invoke/{}/users", h.control, h.branch))
+        .bearer_auth(WORKER)
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("chelabase-original-client-ip", "203.0.113.9")
+        .body(r#"{"event":1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.last().header("x-chelabase-caller-ip"), None);
+}

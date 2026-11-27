@@ -17,6 +17,10 @@ pub const ENV_HEADER: &str = "x-chelabase-env";
 /// `scheduled` handler with the body's `cron` and `scheduledTime`; `storage` (m14), it hands
 /// the body's `event` to `fetch`, marked `chelabase-event: storage`.
 pub const EVENT_HEADER: &str = "x-chelabase-event";
+/// #426: the original caller's address (the end user's, as the gateway saw it), on public and
+/// key-form invocations only. The runtime binds `ctx.props.CHELABASE` to it; the function never
+/// sees the header.
+pub const CALLER_IP_HEADER: &str = "x-chelabase-caller-ip";
 /// Why the runtime refused (a bundle that can't start, a bad manifest): the `last_error`.
 pub const ERROR_HEADER: &str = "x-chelabase-error";
 

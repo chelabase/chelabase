@@ -5,6 +5,7 @@
 //! configurable per route except the typed `Policy` from `chelabase-routes`.
 
 use crate::bad_bearers::{retry_after_secs, BadBearerLimiter};
+pub use crate::client_addr::ORIGINAL_CLIENT_IP_HEADER;
 use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
 use crate::request_limits::RequestLimits;
@@ -54,6 +55,7 @@ const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     CLIENT_IP_HEADER,
     FORWARDED_KEY_HEADER,
     FORWARDED_USER_HEADER,
+    ORIGINAL_CLIENT_IP_HEADER,
 ];
 /// An `Auth::Mcp` route's: the list less `authorization`, which the mcp service verifies itself.
 const BEARER_KEPT_REQUEST_HEADERS: &[&str] = STRIPPED_REQUEST_HEADERS.split_at(1).1;
@@ -77,6 +79,11 @@ pub struct RequestParts<'a> {
     /// proxy, the client address its `X-Forwarded-For` or `Forwarded` names
     /// ([`crate::client_addr::client_address`]). Per-IP limits key on it.
     pub client_ip: Option<IpAddr>,
+    /// #426: the original caller's address a function's caller-bound binding call carries,
+    /// believed only from the functions runtime's own peer address
+    /// ([`crate::client_addr::original_client`]). The request limits key on it instead of
+    /// `client_ip`; nothing else does.
+    pub original_client_ip: Option<IpAddr>,
 }
 
 /// A response the gateway writes itself, without calling an upstream.
@@ -98,7 +105,8 @@ pub struct ProxyPlan {
     /// The address `X-Forwarded-For` names upstream: the request's client address, or on an
     /// app auth route the one the app's server vouched for with its secret key.
     pub client_ip: Option<IpAddr>,
-    /// [`FORWARDED_KEY_HEADER`] and [`FORWARDED_USER_HEADER`], on a functions call only.
+    /// [`FORWARDED_KEY_HEADER`], [`FORWARDED_USER_HEADER`] and [`ORIGINAL_CLIENT_IP_HEADER`], on
+    /// a functions call only.
     pub forwarded: Vec<(&'static str, String)>,
 }
 
@@ -399,6 +407,13 @@ impl Pipeline {
             }
         };
 
+        // #426: a function calling a function through its caller's binding hands the original
+        // caller on; the functions service prefers it to `X-Forwarded-For` (the runtime's).
+        if endpoint.service == Service::Functions
+            && let Some(ip) = req.original_client_ip
+        {
+            forwarded.push((ORIGINAL_CLIENT_IP_HEADER, ip.to_string()));
+        }
         Outcome::Proxy(ProxyPlan {
             endpoint,
             identity,
@@ -542,7 +557,9 @@ impl Pipeline {
         };
         // #322: the request is about to be proxied (its key and user token, if any, checked):
         // it draws on its client's bucket. Refusals above never do.
-        if let Err(wait) = self.request_limits.check(service, &resolved, user, req.client_ip) {
+        // #426: a function's caller-bound binding call draws on its original caller's bucket.
+        let limited_as = req.original_client_ip.or(req.client_ip);
+        if let Err(wait) = self.request_limits.check(service, &resolved, user, limited_as) {
             let mut resp = data_error(429, "rate_limited", "too many requests from this client; retry later");
             resp.headers.push(("retry-after", retry_after_secs(wait).to_string()));
             return Err(resp);
@@ -898,6 +915,7 @@ mod tests {
                 host: host.or(Some(API)),
                 headers: &headers,
                 client_ip: None,
+                original_client_ip: None,
             })
             .await
     }
@@ -905,7 +923,7 @@ mod tests {
     async fn run_without_host(pipeline: &Pipeline, method: &str, path: &str) -> Handled {
         let headers = headers(&[]);
         pipeline
-            .handle(&RequestParts { method, path, host: None, headers: &headers, client_ip: None })
+            .handle(&RequestParts { method, path, host: None, headers: &headers, client_ip: None, original_client_ip: None })
             .await
     }
 
@@ -1603,6 +1621,7 @@ mod tests {
                     host: Some(API),
                     headers: &headers,
                     client_ip: Some("203.0.113.9".parse().unwrap()),
+                    original_client_ip: None,
                 })
                 .await;
             let resp = expect_response(handled.outcome);
@@ -2065,7 +2084,7 @@ mod tests {
         let bearer = format!("Bearer {}", case.key);
 
         let anon = headers(&[("authorization", &bearer)]);
-        let parts = |headers| RequestParts { method: "POST", path: "/", host: None, headers, client_ip: None };
+        let parts = |headers| RequestParts { method: "POST", path: "/", host: None, headers, client_ip: None, original_client_ip: None };
         let minted = h
             .pipeline
             .authenticate_key(Service::Auth, &parts(&anon), false, true, "rid")
@@ -2138,7 +2157,7 @@ mod tests {
         pairs.extend_from_slice(extra);
         let headers = headers(&pairs);
         h.pipeline
-            .handle(&RequestParts { method: "POST", path, host: Some(API), headers: &headers, client_ip: peer() })
+            .handle(&RequestParts { method: "POST", path, host: Some(API), headers: &headers, client_ip: peer(), original_client_ip: None })
             .await
             .outcome
     }
@@ -2371,7 +2390,7 @@ mod tests {
         let key = dk::new_key(DataKeyKind::Public);
         let headers = headers(&[("authorization", &format!("Bearer {key}"))]);
         let parts =
-            RequestParts { method: "POST", path: "/data/v1/query", host: Some(API), headers: &headers, client_ip: peer() };
+            RequestParts { method: "POST", path: "/data/v1/query", host: Some(API), headers: &headers, client_ip: peer(), original_client_ip: None };
         assert_eq!(expect_response(h.pipeline.handle(&parts).await.outcome).status, 429);
     }
 
@@ -2412,6 +2431,7 @@ mod tests {
                 host: Some(API),
                 headers: &headers,
                 client_ip: Some(ip.parse().unwrap()),
+                original_client_ip: None,
             };
             expect_response(h.pipeline.handle(&parts).await.outcome).status
         };
@@ -2669,7 +2689,7 @@ mod tests {
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         let handled = h
             .pipeline
-            .handle(&RequestParts { method: "POST", path: "/mcp", host: Some(API), headers: &headers, client_ip: Some(ip) })
+            .handle(&RequestParts { method: "POST", path: "/mcp", host: Some(API), headers: &headers, client_ip: Some(ip), original_client_ip: None })
             .await;
         assert_eq!(expect_plan(handled.outcome).client_ip, Some(ip));
     }
@@ -2837,7 +2857,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> = bearer.map(|b| ("authorization", b)).into_iter().collect();
         let headers = headers(&pairs);
         h.pipeline
-            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()) })
+            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()), original_client_ip: None })
             .await
             .outcome
     }
@@ -2945,7 +2965,7 @@ mod tests {
         pairs.extend_from_slice(extra);
         let headers = headers(&pairs);
         h.pipeline
-            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()) })
+            .handle(&RequestParts { method, path, host: Some(API), headers: &headers, client_ip: Some(ip.parse().unwrap()), original_client_ip: None })
             .await
             .outcome
     }
@@ -3057,5 +3077,86 @@ mod tests {
             expect_plan(keyed_from(&h, "POST", "/functions/v1/hello", &public, CLIENT, &[]).await);
             expect_plan(keyed_from(&h, "POST", "/auth/v1/app/sign-in", &public, CLIENT, &[]).await);
         }
+    }
+
+    // ---- #426: function traffic, limited per original caller ----
+
+    const RUNTIME: &str = "10.214.12.5";
+
+    /// A request from the functions runtime (its peer address) whose original caller the
+    /// runtime said was `original`, as `request_filter` hands it over once it believed it.
+    async fn via_runtime(h: &DataHarness, method: &str, path: &str, key: &str, original: Option<&str>) -> Outcome {
+        let bearer = format!("Bearer {key}");
+        let mut pairs = vec![("authorization", bearer.as_str())];
+        if let Some(o) = original {
+            pairs.push((ORIGINAL_CLIENT_IP_HEADER, o));
+        }
+        let headers = headers(&pairs);
+        h.pipeline
+            .handle(&RequestParts {
+                method,
+                path,
+                host: Some(API),
+                headers: &headers,
+                client_ip: Some(RUNTIME.parse().unwrap()),
+                original_client_ip: original.map(|o| o.parse().unwrap()),
+            })
+            .await
+            .outcome
+    }
+
+    #[tokio::test]
+    async fn function_traffic_is_limited_per_original_caller() {
+        let h = limited_data_harness(2).await;
+        let key = known(&h, DataKeyKind::Public);
+        let (y1, y2) = (Some("203.0.113.9"), Some("198.51.100.7"));
+        for _ in 0..2 {
+            expect_plan(via_runtime(&h, "POST", QUERY, &key, y1).await);
+        }
+        assert_request_limited_plain(via_runtime(&h, "POST", QUERY, &key, y1).await, "first caller");
+        // Another end user through the same runtime has their own bucket.
+        for _ in 0..2 {
+            expect_plan(via_runtime(&h, "POST", QUERY, &key, y2).await);
+        }
+        // So does traffic without an original caller (a scheduled run): the runtime's own.
+        for _ in 0..2 {
+            expect_plan(via_runtime(&h, "POST", QUERY, &key, None).await);
+        }
+        // The upstream still sees the runtime as the client: only the limiter's key changed.
+        let plan = expect_plan(via_runtime(&h, "POST", QUERY, &known(&h, DataKeyKind::Public), y1).await);
+        assert_eq!(plan.client_ip, Some(RUNTIME.parse().unwrap()));
+        assert!(plan.forwarded.is_empty(), "nothing extra for the data API");
+    }
+
+    fn assert_request_limited_plain(outcome: Outcome, what: &str) {
+        let resp = expect_response(outcome);
+        assert_eq!(resp.status, 429, "{what}");
+        assert_eq!(error_code(&resp), Some("rate_limited"), "{what}");
+    }
+
+    /// The original address goes on to the functions service (a function calling a function
+    /// through its caller's binding keeps the caller), on both forms; no other upstream gets it,
+    /// and a client's own copy is removed everywhere.
+    #[tokio::test]
+    async fn the_original_address_reaches_only_the_functions_service() {
+        let h = data_harness().await;
+        let key = known(&h, DataKeyKind::Public);
+        let public_form = format!("/functions/v1/public/{}/hello", TestUuid::new_v4());
+        for path in ["/functions/v1/hello", public_form.as_str()] {
+            let plan = expect_plan(via_runtime(&h, "POST", path, &key, Some("203.0.113.9")).await);
+            assert_eq!(plan.endpoint.service, Service::Functions);
+            let edits = plan.upstream_headers("rid");
+            assert!(edits.remove.contains(&ORIGINAL_CLIENT_IP_HEADER), "{path}");
+            assert_eq!(set_value(&edits, ORIGINAL_CLIENT_IP_HEADER), Some("203.0.113.9"), "{path}");
+            // Not believed (another peer): the client's copy is removed and nothing is set.
+            let outcome = keyed_from(&h, "POST", path, &key, CLIENT, &[(ORIGINAL_CLIENT_IP_HEADER, "198.51.100.7")]).await;
+            let edits = expect_plan(outcome).upstream_headers("rid");
+            assert!(edits.remove.contains(&ORIGINAL_CLIENT_IP_HEADER), "{path}");
+            assert_eq!(set_value(&edits, ORIGINAL_CLIENT_IP_HEADER), None, "{path}");
+        }
+        let plan = expect_plan(via_runtime(&h, "POST", QUERY, &key, Some("203.0.113.9")).await);
+        let edits = plan.upstream_headers("rid");
+        assert!(edits.remove.contains(&ORIGINAL_CLIENT_IP_HEADER));
+        assert_eq!(set_value(&edits, ORIGINAL_CLIENT_IP_HEADER), None);
     }
 }

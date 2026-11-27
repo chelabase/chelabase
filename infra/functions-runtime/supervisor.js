@@ -33,12 +33,28 @@
 // {"type": "storage", "event": {<the object event>}}. The supervisor hands the bundle's `fetch`
 // a POST whose body is the event alone (JSON) and which carries `chelabase-event: storage`; its
 // answer passes through as for any request. A body of another shape is 400 `storage event: ...`.
+//
+// The caller-bound binding (#426): on a public or key-form invocation the functions service sets
+//
+//   x-chelabase-caller-ip  the original caller's address (the end user's, as the gateway saw it)
+//
+// and every `fetch` gets `ctx.props.CHELABASE`: the gateway binding, bound to that address. Its
+// calls carry it to the gateway in `chelabase-original-client-ip`, which the gateway believes
+// from the runtime's address only and limits a public key's requests by (each end user their
+// own bucket, not one for the whole app). `env.CHELABASE` stays the app's binding, with no
+// address: a worker is loaded once per bundle and env and shared by concurrent invocations, so
+// only per-call props can name the caller.
 const BUNDLE_HEADER = "x-chelabase-bundle";
 const ENV_HEADER = "x-chelabase-env";
 const PRIVATE_PREFIX = "x-chelabase-";
 const ERROR_HEADER = "x-chelabase-error";
 const EVENT_HEADER = "x-chelabase-event";
 const STORAGE_EVENT_HEADER = "chelabase-event";
+const CALLER_IP_HEADER = "x-chelabase-caller-ip";
+const ORIGINAL_CLIENT_IP_HEADER = "chelabase-original-client-ip";
+// What an IP literal can hold; the functions service sends a parsed address, the gateway parses
+// it again.
+const CALLER_IP_RE = /^[0-9A-Fa-f.:]{2,45}$/;
 const MAX_EVENT_BYTES = 64 << 10;
 const START_FAILED = "bundle failed to start";
 const BUNDLE_RE = /^([A-Za-z0-9_-]{1,64})\/([0-9a-f]{64})$/;
@@ -257,9 +273,11 @@ export default {
       } else {
         forward = new Request(request, { headers });
       }
+      const callerIp = request.headers.get(CALLER_IP_HEADER) ?? "";
+      const props = { CHELABASE: gateway(ctx, CALLER_IP_RE.test(callerIp) ? callerIp : undefined) };
       let res;
       try {
-        res = await worker.getEntrypoint().fetch(forward);
+        res = await worker.getEntrypoint(undefined, { props }).fetch(forward);
       } catch (e) {
         // An exception from the handler comes back marked `remote` and stays a 500. Anything
         // else is the loader failing to start the worker (a syntax error, an unknown
@@ -289,16 +307,18 @@ export const probe = {
   },
 };
 
-// The binding a loaded worker gets as `env.CHELABASE`: this isolate's `chelabaseApi` entrypoint,
-// as a stub the loader can hand over (a bare loopback stub isn't serialisable).
-const gateway = (ctx) => ctx.exports.chelabaseApi({ props: {} });
+// The binding a loaded worker gets as `env.CHELABASE` (no caller) and, per invocation, as
+// `ctx.props.CHELABASE` (that invocation's caller, #426): this isolate's `chelabaseApi`
+// entrypoint, as a stub the loader can hand over (a bare loopback stub isn't serialisable).
+const gateway = (ctx, callerIp) => ctx.exports.chelabaseApi({ props: callerIp ? { callerIp } : {} });
 
 // The gateway binding (#183): what a loaded worker calls as `env.CHELABASE`. Its request goes to
 // the gateway (GATEWAY, on the `functions` network) on the API host and nowhere else: the path
 // and query are the caller's, the host is always CHELABASE_API_HOST (a Host header or another
 // host in the URL is ignored), and redirects come back to the caller. It adds nothing: the
 // gateway sees only the caller's own headers (less any x-chelabase-* or client-address one) and authenticates
-// them like any API request.
+// them like any API request. The one header it adds is the caller-bound binding's
+// `chelabase-original-client-ip` (#426); a function's own value for it is always dropped.
 // Headers that claim who the client is or how it connected. A function must never set them for the
 // gateway: where the operator trusts proxies covering the runtime's address, they would let member
 // code pose as any client address and get around per-IP limits (#183 audit S1).
@@ -313,7 +333,7 @@ const CLIENT_ADDRESS_HEADER = (name) =>
   name === "x-cluster-client-ip";
 
 export const chelabaseApi = {
-  async fetch(request, bindings) {
+  async fetch(request, bindings, ctx) {
     const host = bindings.API_HOST;
     if (typeof host !== "string" || host === "") {
       return new Response("the gateway binding has no API host\n", { status: 503 });
@@ -323,8 +343,11 @@ export const chelabaseApi = {
     for (const [k, v] of request.headers) {
       const name = k.toLowerCase();
       if (name === "host" || name.startsWith(PRIVATE_PREFIX) || CLIENT_ADDRESS_HEADER(name)) continue;
+      if (name === ORIGINAL_CLIENT_IP_HEADER) continue;
       headers.append(k, v);
     }
+    const callerIp = ctx?.props?.callerIp;
+    if (typeof callerIp === "string") headers.set(ORIGINAL_CLIENT_IP_HEADER, callerIp);
     return bindings.GATEWAY.fetch(
       new Request(`http://${host}${url.pathname}${url.search}`, {
         method: request.method,
