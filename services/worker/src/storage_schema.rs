@@ -2293,7 +2293,7 @@ mod tests {
     /// recorded total; both are installed and compared by the health check.
     #[test]
     fn record_part_checks_the_running_total() {
-        assert!(STORAGE_SCHEMA_VERSION >= 9);
+        const { assert!(STORAGE_SCHEMA_VERSION >= 9) };
         for part in [
             // Other parts only (the replaced part doesn't count), plus this one, at most the limit.
             "sum((e.value->>'size')::bigint) FROM jsonb_each(u.parts) e WHERE e.key <> p_part::text",
