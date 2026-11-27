@@ -33,7 +33,7 @@ allow = [
 [licenses.private]
 ignore = true
 
-# Time goes through `chelabase-time` (jiff underneath). These crates left the tree and may not
+# Time goes through `chelabase-time` (jiff underneath; the crate lives in chelabase/time). These crates left the tree and may not
 # come back, directly or through a dependency (`scripts/tests/deny-bans.sh` proves the ban
 # fires). Duplicate versions stay warnings.
 [bans]

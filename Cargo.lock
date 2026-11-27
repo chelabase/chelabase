@@ -1531,14 +1531,12 @@ dependencies = [
 [[package]]
 name = "chelabase-time"
 version = "0.1.0"
+source = "git+https://github.com/chelabase/time?rev=9504addde2c5d6469c1cd59c6c8fe8083980b17f#9504addde2c5d6469c1cd59c6c8fe8083980b17f"
 dependencies = [
  "jiff",
  "jiff-sqlx",
- "proptest",
  "serde",
- "serde_json",
  "sqlx",
- "tokio",
  "utoipa",
 ]
 
