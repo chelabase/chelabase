@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chelabase_query::Op;
+use chelabase_query::server_tls::ServerTls;
 use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, PREAMBLE_SQL, ResponseBudget};
 use chelabase_query::sql::{Bind, BindValue, Plan, resolve_bind};
 use futures_util::future::{MaybeDone, maybe_done};
@@ -596,7 +597,6 @@ fn text_result(row: Option<Row>) -> anyhow::Result<String> {
 fn tokio_config(info: &ConnInfo, application_name: &str) -> tokio_postgres::Config {
     let mut config = tokio_postgres::Config::new();
     config
-        .host(&info.host)
         .port(info.port)
         .user(&info.user)
         .password(&info.password)
@@ -605,18 +605,31 @@ fn tokio_config(info: &ConnInfo, application_name: &str) -> tokio_postgres::Conf
     config
 }
 
+/// C and D's pool. As rest's pools do (U15): a named compute (`server_name`) over TLS
+/// verified against `tls` (its IP dialled, its name verified); plain only for an unnamed
+/// target without a CA (the unit tests' unreachable one). Anything else is refused.
 fn deadpool(
     info: &ConnInfo,
     application_name: &str,
     pool_size: u32,
+    tls: Option<&ServerTls>,
 ) -> anyhow::Result<deadpool_postgres::Pool> {
-    let manager = deadpool_postgres::Manager::from_config(
-        tokio_config(info, application_name),
-        tokio_postgres::NoTls,
-        deadpool_postgres::ManagerConfig {
-            recycling_method: deadpool_postgres::RecyclingMethod::Fast,
-        },
-    );
+    let mut config = tokio_config(info, application_name);
+    let manager_config = deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+    };
+    let manager = match (&info.server_name, tls) {
+        (Some(name), Some(tls)) => {
+            tls.configure(&mut config, &info.host, name)?;
+            deadpool_postgres::Manager::from_config(config, tls.connector(), manager_config)
+        }
+        (None, None) => {
+            config.host(&info.host);
+            deadpool_postgres::Manager::from_config(config, tokio_postgres::NoTls, manager_config)
+        }
+        (Some(_), None) => anyhow::bail!("no CA to verify the compute's TLS against"),
+        (None, Some(_)) => anyhow::bail!("no certificate name to verify the compute's TLS against"),
+    };
     Ok(deadpool_postgres::Pool::builder(manager)
         .max_size(pool_size.max(1) as usize)
         .runtime(deadpool_postgres::Runtime::Tokio1)
@@ -643,9 +656,10 @@ impl Pipelined {
         max_rows: i64,
         timeout_ms: i64,
         make: fn(&Plan) -> anyhow::Result<Prepared>,
+        tls: Option<&ServerTls>,
     ) -> anyhow::Result<Pipelined> {
         Ok(Pipelined {
-            pool: deadpool(info, application_name, pool_size)?,
+            pool: deadpool(info, application_name, pool_size, tls)?,
             ctx: RunCtx::new(claims, max_rows, timeout_ms),
             expected_version,
             prepared: PreparedCache::new(make),
@@ -657,6 +671,7 @@ impl Pipelined {
 pub struct VariantC(pub Pipelined);
 
 impl VariantC {
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         info: &ConnInfo,
         pool_size: u32,
@@ -664,6 +679,7 @@ impl VariantC {
         expected_version: uuid::Uuid,
         max_rows: i64,
         timeout_ms: i64,
+        tls: Option<&ServerTls>,
     ) -> anyhow::Result<VariantC> {
         Pipelined::connect(
             info,
@@ -674,6 +690,7 @@ impl VariantC {
             max_rows,
             timeout_ms,
             prepared_c,
+            tls,
         )
         .map(VariantC)
     }
@@ -759,6 +776,7 @@ impl Exec for VariantC {
 pub struct VariantD(pub Pipelined);
 
 impl VariantD {
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         info: &ConnInfo,
         pool_size: u32,
@@ -766,6 +784,7 @@ impl VariantD {
         expected_version: uuid::Uuid,
         max_rows: i64,
         timeout_ms: i64,
+        tls: Option<&ServerTls>,
     ) -> anyhow::Result<VariantD> {
         Pipelined::connect(
             info,
@@ -776,6 +795,7 @@ impl VariantD {
             max_rows,
             timeout_ms,
             prepared_d,
+            tls,
         )
         .map(VariantD)
     }
@@ -905,12 +925,16 @@ pub struct VariantR {
 }
 
 impl VariantR {
-    pub fn connect(target: &RTarget, pool_size: u32) -> VariantR {
+    /// `tls`: the platform CA every compute is verified against, as rest's own engine has
+    /// it; `None` only for the unit tests' unreachable target.
+    pub fn connect(target: &RTarget, pool_size: u32, tls: Option<&ServerTls>) -> VariantR {
+        let source = InternalSource::new(&target.internal_url, &target.internal_token);
+        let max = pool_size.max(1) as usize;
         VariantR {
-            engine: Engine::new(
-                InternalSource::new(&target.internal_url, &target.internal_token),
-                pool_size.max(1) as usize,
-            ),
+            engine: match tls {
+                Some(tls) => Engine::with_server_tls(source, max, tls.clone()),
+                None => Engine::new(source, max),
+            },
             identity: r_identity(target.branch),
         }
     }
@@ -984,6 +1008,7 @@ impl AnyVariant {
         expected_version: uuid::Uuid,
         max_rows: i64,
         timeout_ms: i64,
+        tls: Option<&ServerTls>,
     ) -> anyhow::Result<AnyVariant> {
         Ok(match kind {
             VariantKind::A => AnyVariant::A(VariantA::connect(
@@ -999,6 +1024,7 @@ impl AnyVariant {
                 expected_version,
                 max_rows,
                 timeout_ms,
+                tls,
             )?),
             VariantKind::D => AnyVariant::D(VariantD::connect(
                 info,
@@ -1007,8 +1033,9 @@ impl AnyVariant {
                 expected_version,
                 max_rows,
                 timeout_ms,
+                tls,
             )?),
-            VariantKind::R => AnyVariant::R(Box::new(VariantR::connect(target, pool_size))),
+            VariantKind::R => AnyVariant::R(Box::new(VariantR::connect(target, pool_size, tls))),
         })
     }
 
@@ -1041,6 +1068,7 @@ impl Variants {
         expected_version: uuid::Uuid,
         max_rows: i64,
         timeout_ms: i64,
+        tls: Option<&ServerTls>,
     ) -> anyhow::Result<Variants> {
         let all = kinds
             .iter()
@@ -1054,6 +1082,7 @@ impl Variants {
                     expected_version,
                     max_rows,
                     timeout_ms,
+                    tls,
                 )
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1355,6 +1384,7 @@ mod tests {
                 uuid::Uuid::nil(),
                 1000,
                 8000,
+                None,
             )
             .unwrap();
             assert_eq!(v.kind(), kind);
@@ -1382,6 +1412,7 @@ mod tests {
             uuid::Uuid::nil(),
             1000,
             8000,
+            None,
         )
         .await
         .unwrap();
