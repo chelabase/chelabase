@@ -1523,7 +1523,7 @@ services:
   # the internal `services-control` network (the functions service and the worker, each with its
   # own bearer) and loopback; it reads the metadata (desired state) on the default network.
   service-runner:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:0125d800f6e857ef1a7763dd618aa69c134f2d7aa43d7706c9c45e9788a08ebb}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/service-runner:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:b76e1a69819f49517d61f598777bc48ccedf42cb724007d81981a071c21733f3}
     profiles: ["services"]
     restart: unless-stopped
     user: "0"
