@@ -5578,11 +5578,13 @@ async fn session_count_uses_the_index_live() {
         let key = "00000000-0000-0000-0000-000000000007";
         let bucket = "00000000-0000-0000-0000-0000000000b1";
         // 30000 live sessions of one key and bucket over 3000 owners, plus 10 with no owner.
-        fx.admin(&format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, timeline_id, expires_at)
+        // As chelabase_storage: guard_sessions refuses any other writer (and stamps the timeline).
+        fx.as_role_commit("chelabase_storage", &format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at)
             SELECT gen_random_uuid(), '{bucket}', 'n' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated',
               CASE WHEN g <= 10 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad((g % 3000)::text, 12, '0'))::uuid END,
-              '{key}', '{{}}', 't', clock_timestamp() + interval '1 hour'
-            FROM generate_series(1, 30000) g; ANALYZE storage.upload_sessions")).await;
+              '{key}', '{{}}', clock_timestamp() + interval '1 hour'
+            FROM generate_series(1, 30000) g")).await;
+        fx.admin("ANALYZE storage.upload_sessions").await;
         for owner_match in ["s.owner = '00000000-0000-0000-0000-000000000005'::uuid", "s.owner IS NULL"] {
             let plan = fx.admin(&format!("EXPLAIN SELECT count(*) FROM storage.upload_sessions s WHERE s.key_id = '{key}' AND s.bucket_id = '{bucket}' AND {owner_match} AND s.expires_at > clock_timestamp()")).await;
             assert!(plan.contains("upload_sessions_live_idx") && !plan.contains("Seq Scan"), "{owner_match}: {plan}");
