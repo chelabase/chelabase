@@ -8635,6 +8635,59 @@ async fn confirm_clears_attributes_by_change_id() {
     assert_eq!(after_confirm, (false, false));
 }
 
+// #425: `attributes_named` records the fields a pending change named. A create names every
+// field; a PATCH over a settled row names only its own; one over a still-pending change joins
+// it, so neither is lost; a field outside the vocabulary is refused.
+#[tokio::test]
+#[ignore]
+async fn a_pending_change_records_the_fields_it_named() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let plain = RoleAttributes::default();
+    let first = uuid::Uuid::new_v4();
+    let role = NewApiRole { name: "app", owner_level: false, login: false, attributes: &plain, verifier: None, password_enc: None, change_id: first };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let named = |client: MetadataClient, ep: String| async move {
+        let (copies, _) = client.role_copies(&ep).await.unwrap();
+        let app = copies.into_iter().find(|c| c.name == "app").unwrap();
+        (app.attributes_pending, app.attributes_named)
+    };
+    let created = named(client.clone(), ep.clone()).await;
+    let patch = |fields: &[RoleField]| ApiRoleChange {
+        owner_level: false,
+        login: false,
+        attributes: plain.clone(),
+        secret: SecretChange::Keep,
+        change_id: uuid::Uuid::new_v4(),
+        named: fields.iter().copied().collect(),
+    };
+    // Over the pending create: still every field.
+    client.update_api_role(&ep, "app", &patch(&[RoleField::ConnectionLimit]), 10).await.unwrap();
+    let over_create = named(client.clone(), ep.clone()).await;
+    // Settled, then a PATCH of the limit alone, then one of the expiry before it's applied.
+    let limit = patch(&[RoleField::ConnectionLimit]);
+    sqlx::query("UPDATE neon_roles SET attributes_pending = false WHERE endpoint_id = $1 AND name = 'app'")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    client.update_api_role(&ep, "app", &limit, 10).await.unwrap();
+    let alone = named(client.clone(), ep.clone()).await;
+    client.update_api_role(&ep, "app", &patch(&[RoleField::ValidUntil]), 10).await.unwrap();
+    let joined = named(client.clone(), ep.clone()).await;
+    let unknown = sqlx::query("UPDATE neon_roles SET attributes_named = ARRAY['password'] WHERE endpoint_id = $1 AND name = 'app'")
+        .bind(&ep)
+        .execute(client.pool())
+        .await;
+    cleanup(&client, id).await;
+    assert_eq!(created, (true, RoleField::all()), "a create names every field");
+    assert_eq!(over_create, (true, RoleField::all()), "joined to the create's");
+    assert_eq!(alone, (true, [RoleField::ConnectionLimit].into()), "only the PATCH's own");
+    assert_eq!(joined, (true, [RoleField::ConnectionLimit, RoleField::ValidUntil].into()), "both pending changes'");
+    assert!(unknown.is_err(), "the vocabulary is checked: {unknown:?}");
+}
+
 // F2 fix round M7: only a secret key can be marked as bypassing RLS.
 #[tokio::test]
 #[ignore]

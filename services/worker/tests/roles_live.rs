@@ -27,6 +27,7 @@ use chelabase_metadata::{
     BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus,
     MetadataClient, NewBranch, RoleLevel, RoleOrigin,
 };
+use chelabase_metadata::{ApiRoleChange, RoleAttributes, RoleField, SecretChange};
 use chelabase_nats::{BranchJob, PointInTime};
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{Purpose, open_credential, open_role_password};
@@ -3132,6 +3133,46 @@ async fn a_negative_infinity_valid_until_is_recorded_as_expired() {
             assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "{until} after the PATCH");
             fx.sql("ALTER ROLE app CONNECTION LIMIT -1;").await;
         }
+    })
+    .await;
+}
+
+// #425: a PATCH stored but not applied yet (a failed script, or a confirm lost to a
+// concurrent write) that changed only the connection limit, then the role expired in SQL
+// (`VALID UNTIL '-infinity'`): the resync applies the limit and records the SQL expiry,
+// never setting the expiry the row still holds ("no expiry") back.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_pending_patch_leaves_an_expiry_set_in_sql_since() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let app = rows.iter().find(|r| r.name == "app").unwrap().clone();
+        assert!(!app.attributes_pending);
+        assert_eq!(app.attributes.valid_until, None);
+        let change = ApiRoleChange {
+            owner_level: app.api_owner_level,
+            login: app.login,
+            attributes: RoleAttributes { connection_limit: 4, ..app.attributes.clone() },
+            secret: SecretChange::Keep,
+            change_id: uuid::Uuid::new_v4(),
+            named: [RoleField::ConnectionLimit].into(),
+        };
+        fx.metadata.update_api_role(&fx.ep, "app", &change, 50).await.unwrap();
+        fx.sql("ALTER ROLE app VALID UNTIL '-infinity';").await;
+        let at = "SELECT rolvaliduntil::text || ',' || rolconnlimit::text FROM pg_roles WHERE rolname = 'app';";
+        let set = fx.value(&fx.ep, at).await;
+        assert!(set.ends_with(",-1"), "{set}");
+
+        fx.worker.resync(fx.main).await.unwrap();
+
+        let until = set.trim_end_matches(",-1");
+        assert_eq!(fx.value(&fx.ep, at).await, format!("{until},4"), "the limit applied, the expiry left");
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let app = rows.iter().find(|r| r.name == "app").unwrap();
+        assert!(!app.attributes_pending, "applied");
+        assert_eq!(app.attributes.connection_limit, 4);
+        assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "the SQL expiry recorded");
     })
     .await;
 }
