@@ -1,6 +1,7 @@
 //! Live checks of the four variants against a seeded bench database (`setup::seed` already
 //! run). Ignored by default; run through `just workbench run` with `BENCH_OWNER_URL`, `BENCH_BRANCH`,
-//! `CHELABASE_INTERNAL_URL` and `CHELABASE_REST_INTERNAL_TOKEN` set.
+//! `CHELABASE_INTERNAL_URL`, `CHELABASE_REST_INTERNAL_TOKEN` and `CHELABASE_COMPUTE_CA_FILE`
+//! set (the runner sets the last).
 
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use bench_data_api::variants::{
 };
 use bench_data_api::workload::{ALL_OPS, BenchOp, INSERT_ID_BASE, OpKind, Workload};
 use chelabase_query::Op;
+use chelabase_query::server_tls::ServerTls;
 use chelabase_query::sql::Plan;
 use rand::SeedableRng;
 use rest::conn::{ConnInfo, ConnSource, InternalSource};
@@ -21,6 +23,8 @@ const MAX_ROWS: i64 = 1000;
 struct Env {
     info: ConnInfo,
     target: RTarget,
+    /// The platform CA every compute connection is verified against.
+    tls: ServerTls,
     owner: sqlx::PgConnection,
     version: uuid::Uuid,
     workload: Workload,
@@ -38,6 +42,9 @@ async fn env() -> Env {
         &var("CHELABASE_REST_INTERNAL_TOKEN"),
     );
     let info = source.fetch(branch).await.expect("connection info");
+    let tls = ServerTls::from_ca_file(std::path::Path::new(&var("CHELABASE_COMPUTE_CA_FILE")))
+        .expect("the platform CA certificate");
+    let server_name = info.server_name.clone().expect("the compute's certificate name");
     let mut owner = sqlx::PgConnection::connect(&var("BENCH_OWNER_URL"))
         .await
         .expect("the owner connection");
@@ -49,7 +56,7 @@ async fn env() -> Env {
         .served(&info.database)
         .map_or("public", |d| d.default_schema.as_str())
         .to_owned();
-    let workload = Workload::build(&var("BENCH_OWNER_URL"), &default_schema)
+    let workload = Workload::build(&var("BENCH_OWNER_URL"), &server_name, &tls, &default_schema)
         .await
         .expect("the workload");
     let timeout_ms = info.settings.statement_timeout_ms;
@@ -61,6 +68,7 @@ async fn env() -> Env {
     Env {
         info,
         target,
+        tls,
         owner,
         version,
         workload,
@@ -85,6 +93,7 @@ impl Env {
             version,
             MAX_ROWS,
             self.timeout_ms,
+            Some(&self.tls),
         )
         .expect("C")
     }
@@ -97,6 +106,7 @@ impl Env {
             version,
             MAX_ROWS,
             self.timeout_ms,
+            Some(&self.tls),
         )
         .expect("D")
     }
@@ -163,6 +173,7 @@ async fn variants_agree() {
         e.version,
         MAX_ROWS,
         e.timeout_ms,
+        Some(&e.tls),
     )
     .await
     .expect("the variants");

@@ -12,6 +12,7 @@ use bench_data_api::variants::{
 };
 use bench_data_api::workload::{ALL_OPS, BenchOp, OpKind, Workload};
 use bench_data_api::{netem, rtt, setup, stats};
+use chelabase_query::server_tls::ServerTls;
 use clap::Parser;
 use rest::conn::{ConnSource, InternalSource};
 use sqlx::Connection;
@@ -29,6 +30,10 @@ struct Args {
     internal_token: String,
     #[arg(long)]
     compute_container: String,
+    /// The platform CA certificate (`ca.crt`) every compute connection is verified against,
+    /// as rest's pools verify it.
+    #[arg(long, env = "CHELABASE_COMPUTE_CA_FILE")]
+    compute_ca: Option<std::path::PathBuf>,
     #[arg(long, value_delimiter = ',', default_value = "0,0.5,2")]
     rtts_ms: Vec<f64>,
     #[arg(long)]
@@ -135,8 +140,8 @@ fn expected_apps(kinds: &[VariantKind]) -> Vec<&'static str> {
     kinds.iter().map(|k| k.application_name()).collect()
 }
 
-/// Prints each bench session's TLS state, as the compute sees it (a fairness check: A and B
-/// connect with `Prefer`, C and D with `NoTls`).
+/// Prints each bench session's TLS state, as the compute sees it (a fairness check: every
+/// variant runs over TLS; A and B with `Prefer`, C, D and R verified against the platform CA).
 async fn print_tls(owner: &mut sqlx::PgConnection) -> anyhow::Result<()> {
     let rows: Vec<(String, Option<bool>, i64)> = sqlx::query_as(
         "SELECT a.application_name, s.ssl, count(*) \
@@ -198,7 +203,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .served(&info.database)
         .map_or("public", |d| d.default_schema.as_str())
         .to_owned();
-    let workload = Arc::new(Workload::build(&args.owner_url, &default_schema).await?);
+    let compute_ca = args
+        .compute_ca
+        .as_deref()
+        .context("--compute-ca (or CHELABASE_COMPUTE_CA_FILE) is required")?;
+    let tls = ServerTls::from_ca_file(compute_ca)?;
+    let server_name = info
+        .server_name
+        .as_deref()
+        .context("the branch's connection info names no compute certificate")?;
+    let workload = Arc::new(Workload::build(&args.owner_url, server_name, &tls, &default_schema).await?);
     let claims = fixed_claims();
     let (max_rows, timeout_ms) = (info.settings.max_rows, info.settings.statement_timeout_ms);
     let target = RTarget {
@@ -216,6 +230,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             version,
             max_rows,
             timeout_ms,
+            Some(&tls),
         )
         .await?,
     );
@@ -298,6 +313,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
                     version,
                     max_rows,
                     timeout_ms,
+                    Some(&tls),
                 )?);
                 let rps = runner::throughput(v.clone(), op, &plan.throughput, next.clone()).await;
                 v.close().await;

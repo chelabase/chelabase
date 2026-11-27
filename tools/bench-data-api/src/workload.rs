@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::Context;
+use chelabase_query::server_tls::ServerTls;
 use chelabase_query::sql::{Catalog, Plan};
 use rand::RngExt;
 use serde_json::{Value, json};
@@ -59,9 +60,29 @@ pub struct Workload {
 impl Workload {
     /// Introspects the database as the owner (a tokio-postgres connection to `owner_url`, as
     /// `chelabase_query` takes), takes the `authenticated` role's view of it and plans every op
-    /// with `default_schema` for unqualified names.
-    pub async fn build(owner_url: &str, default_schema: &str) -> anyhow::Result<Workload> {
-        let (owner, connection) = tokio_postgres::connect(owner_url, tokio_postgres::NoTls)
+    /// with `default_schema` for unqualified names. The connection is TLS verified against
+    /// `tls` as `server_name` (the compute's certificate name), dialling `owner_url`'s
+    /// address: a compute takes a non-loopback password login only over TLS.
+    pub async fn build(
+        owner_url: &str,
+        server_name: &str,
+        tls: &ServerTls,
+        default_schema: &str,
+    ) -> anyhow::Result<Workload> {
+        let url: tokio_postgres::Config = owner_url.parse().context("parsing the owner URL")?;
+        let host = match url.get_hosts() {
+            [tokio_postgres::config::Host::Tcp(host)] => host.clone(),
+            _ => anyhow::bail!("the owner URL must name one TCP host (the compute's IP)"),
+        };
+        let mut config = tokio_postgres::Config::new();
+        config
+            .port(url.get_ports().first().copied().unwrap_or(5432))
+            .user(url.get_user().context("the owner URL names no user")?)
+            .password(url.get_password().context("the owner URL has no password")?)
+            .dbname(url.get_dbname().context("the owner URL names no database")?);
+        tls.configure(&mut config, &host, server_name)?;
+        let (owner, connection) = config
+            .connect(tls.connector())
             .await
             .context("connecting as the owner (tokio-postgres)")?;
         let connection = tokio::spawn(connection);

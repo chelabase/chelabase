@@ -3607,21 +3607,39 @@ fn is_cutoff(record: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// A relay in front of main's Postgres for one connection. It passes the client's startup
-/// packet and the server's first answer (its authentication request, sent once the server
-/// has read the role's verifier), reports that on `requested`, and holds everything the
-/// client sends next until `release` fires.
+/// A relay in front of main's Postgres for one connection. The client side is plain (a
+/// loopback listener in this process); the relay reaches the compute over TLS verified
+/// against the platform CA as `server_name` (a compute takes a non-loopback password login
+/// only over TLS, #248), so it still sees the protocol in the clear. It passes the client's
+/// startup packet and the server's first answer (its authentication request, sent once the
+/// server has read the role's verifier), reports that on `requested`, and holds everything
+/// the client sends next until `release` fires.
 async fn held_handshake_relay(
     upstream: SocketAddr,
+    server_name: String,
     requested: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
 ) -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+    let tls = chelabase_query::server_tls::ServerTls::from_ca_file(std::path::Path::new(
+        &std::env::var("CHELABASE_COMPUTE_CA_FILE").expect("CHELABASE_COMPUTE_CA_FILE"),
+    ))
+    .expect("the platform CA certificate");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut client, _) = listener.accept().await.unwrap();
-        let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let mut tcp = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        // SSLRequest: length 8, code 80877103; the server answers one byte, `S` to go on.
+        tcp.write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]).await.unwrap();
+        let mut answer = [0u8; 1];
+        tcp.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer[0], b'S', "the compute takes TLS");
+        let mut make = tls.connector();
+        let connect = MakeTlsConnect::<tokio::net::TcpStream>::make_tls_connect(&mut make, &server_name)
+            .unwrap();
+        let mut server = connect.connect(tcp).await.expect("TLS to the compute, verified");
         // The startup packet: its length (which counts itself), then the rest.
         let mut length = [0u8; 4];
         client.read_exact(&mut length).await.unwrap();
@@ -3629,6 +3647,7 @@ async fn held_handshake_relay(
         client.read_exact(&mut startup).await.unwrap();
         server.write_all(&length).await.unwrap();
         server.write_all(&startup).await.unwrap();
+        server.flush().await.unwrap();
         let mut answer = [0u8; 1024];
         let n = server.read(&mut answer).await.unwrap();
         assert_eq!(answer.first(), Some(&b'R'), "the server's authentication request");
@@ -3638,6 +3657,14 @@ async fn held_handshake_relay(
         let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
     });
     addr
+}
+
+/// Whether `session`'s own backend runs over TLS (`pg_stat_ssl`): the relay's upstream hop.
+async fn over_tls(session: &mut sqlx::PgConnection) -> bool {
+    sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+        .fetch_one(session)
+        .await
+        .expect("pg_stat_ssl")
 }
 
 /// A connection as the elevated login whose handshake starts under a password the bootstrap
@@ -3656,13 +3683,14 @@ async fn a_handshake_spanning_the_bootstrap_does_not_keep_the_replaced_password(
         let upstream = l.worker.computes.postgres_addr(ep).await.unwrap().expect("a published Postgres port");
         let (requested_tx, requested) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
-        let relay = held_handshake_relay(upstream, requested_tx, release_rx).await;
+        let relay = held_handshake_relay(upstream, chelabase_neon::compute_tls::server_name(ep), requested_tx, release_rx).await;
         let options = sqlx::postgres::PgConnectOptions::new()
             .host(&relay.ip().to_string())
             .port(relay.port())
             .username(ELEVATED)
             .password(REPLACED)
             .database(&l.database_name)
+            // The relay is a plain loopback listener; its hop to the compute is TLS.
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let connecting = tokio::spawn(async move { sqlx::PgConnection::connect_with(&options).await });
         tokio::time::timeout(Duration::from_secs(20), requested)
@@ -3674,6 +3702,7 @@ async fn a_handshake_spanning_the_bootstrap_does_not_keep_the_replaced_password(
         release.send(()).unwrap();
         let mut session = connecting.await.unwrap().expect("the handshake finishes after the bootstrap");
         sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+        assert!(over_tls(&mut session).await, "the relay reaches the compute over TLS");
 
         assert!(!l.healthy().await, "the health check sees a session from before the lockdown");
         l.bootstrap().await;
@@ -3773,7 +3802,7 @@ async fn a_session_listed_long_after_the_lockdown_is_still_void() {
         let upstream = l.worker.computes.postgres_addr(ep).await.unwrap().expect("a published Postgres port");
         let (requested_tx, requested) = tokio::sync::oneshot::channel();
         let (release, release_rx) = tokio::sync::oneshot::channel();
-        let relay = held_handshake_relay(upstream, requested_tx, release_rx).await;
+        let relay = held_handshake_relay(upstream, chelabase_neon::compute_tls::server_name(ep), requested_tx, release_rx).await;
         let options = sqlx::postgres::PgConnectOptions::new()
             .host(&relay.ip().to_string())
             .port(relay.port())
@@ -3781,6 +3810,7 @@ async fn a_session_listed_long_after_the_lockdown_is_still_void() {
             .password(REPLACED)
             .database(&l.database_name)
             .options([("post_auth_delay", UNLISTED_SECS)])
+            // The relay is a plain loopback listener; its hop to the compute is TLS.
             .ssl_mode(sqlx::postgres::PgSslMode::Disable);
         let connecting = tokio::spawn(async move { sqlx::PgConnection::connect_with(&options).await });
         // The server has read the replaced verifier; the rest of the handshake goes straight
@@ -3805,6 +3835,7 @@ async fn a_session_listed_long_after_the_lockdown_is_still_void() {
 
         let mut session = connecting.await.unwrap().expect("authenticated under the replaced password");
         sqlx::query("SELECT 1").execute(&mut session).await.expect("the session is open");
+        assert!(over_tls(&mut session).await, "the relay reaches the compute over TLS");
         assert!(!l.healthy().await, "the health check sees a session from before the lockdown");
         l.bootstrap().await;
         assert!(
