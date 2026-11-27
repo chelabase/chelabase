@@ -162,7 +162,7 @@ services:
   # `docker compose run --rm --no-deps --user 10001:10001 --entrypoint chelabase-init init-secrets setup-code --dir /var/lib/chelabase/secrets`
   # (the code is in the logs of the container that made it; a recreated init-secrets has none).
   init-secrets:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:9f7db753d97189d33c5bee892c1fb72d70e3542fa1819627e93116fc43404ad4}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:23570dd7ccee722d9586ee677b64f841817d8fd7b232838f0c6b070402ebe1ea}
     restart: "no"
     user: "0"
     network_mode: none
@@ -287,7 +287,7 @@ services:
   # migrated the metadata database (chelabase-init bootstrap); retries readiness on its own and
   # is never restarted, so `up --wait` reports a failure. Writes only bootstrap/ (its lock).
   init-bootstrap:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:9f7db753d97189d33c5bee892c1fb72d70e3542fa1819627e93116fc43404ad4}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:23570dd7ccee722d9586ee677b64f841817d8fd7b232838f0c6b070402ebe1ea}
     restart: "no"
     group_add: ["70"]
     command: ["chelabase-init", "bootstrap", "--out", "/run/chelabase/secrets/bootstrap"]
