@@ -3993,3 +3993,37 @@ async fn dropped_password_change_still_opens_the_new_session() {
     assert!(h.identity_session_live(body["identity_session_id"].as_str().unwrap()).await);
     assert_eq!(h.fake.session_count(&h.pool()), 1);
 }
+
+/// #311 audit: a password reset whose connection closes after identity stored the new password
+/// still revokes the user's app sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_reset_confirm_still_ends_sessions() {
+    let h = harness().await;
+    let id = h.add_user("ada@example.com", true).await;
+    let s = h.sign_in("ada@example.com", PW).await;
+    h.post("password-reset", json!({"email": "ada@example.com"}), None).await;
+    let sent = h.last_code(&id, CodeKind::Reset);
+    // The password is set in identity; the revoke call is held until the client is gone.
+    let mut hold = h.iproxy.hold(&format!("POST /internal/app/users/{id}/revoke-sessions"));
+    let send = h
+        .http
+        .post(format!("{}/auth/v1/app/password-reset/confirm", h.base))
+        .header(IDENTITY_HEADER, h.identity_for(None, DataKeyKind::Public))
+        .json(&json!({"email": "ada@example.com", "code": sent, "password": NEW_PW}))
+        .send();
+    tokio::select! {
+        r = send => panic!("answered before the revoke call: {r:?}"),
+        () = hold.started() => {}
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    hold.release();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while h.user_revokes(&id).is_empty() {
+        assert!(Instant::now() < deadline, "the password was reset but the user's app sessions were not revoked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(hold);
+    h.proxy.clear();
+    assert!(h.password_is("ada@example.com", NEW_PW).await);
+    assert!(h.internal.session(h.session_id(&s)).unwrap().revoked);
+}

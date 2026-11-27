@@ -1507,9 +1507,11 @@ async fn password_reset(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Fl
 /// The code sets the password and ends the user's identity sessions in one step (identity's
 /// `verify_code`), then the app sessions are revoked. If that revocation fails, the answer is
 /// still 204: each old app session is refused at its next refresh, because the identity session
-/// behind it is gone. A retry can't redo it (the code is spent), and needn't.
+/// behind it is gone. A retry can't redo it (the code is spent), and needn't. From identity's
+/// check of the code on, the steps run [`to_the_end`]: a connection closed after the password
+/// is set still gets the revoke (the check's slot is then not given back).
 async fn password_reset_confirm(
-    s: &AppState,
+    s: &Arc<AppState>,
     caller: &AppCaller,
     b: AppPasswordResetConfirmBody,
 ) -> Flow {
@@ -1531,45 +1533,52 @@ async fn password_reset_confirm(
     let Some((user_id, _)) = find_user(s, &info, &email).await? else {
         return Err(bad_code());
     };
-    match s
-        .identity
-        .verify_code(
-            &pool(&info),
-            &user_id.to_string(),
-            CodeKind::Reset,
-            b.code.trim(),
-            Some(&b.password),
-        )
-        .await
-    {
-        Ok(_) => slot.refund(),
-        Err(e) if is_weak(&e) => return Err(weak_password()),
-        // The stored guess budget is spent: no code is checked, a right one included. The email's
-        // own check bound refuses first, so this answers only after an auth restart lost its count.
-        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
-        // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
-        Err(
-            IdentityError::CodeInvalid
-            | IdentityError::Invalid { .. }
-            | IdentityError::NotFound(Missing::User),
-        ) => return Err(bad_code()),
-        Err(e) => return Err(identity_down(&e)),
-    }
-    if let Err(e) = app
-        .internal
-        .revoke_user_sessions(
-            user_id,
-            &RevokeUserSessions {
-                project_id: info.project_id,
-                keep_session_id: None,
-                created_before: None,
-            },
-        )
-        .await
-    {
-        warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed; their refresh is refused anyway");
-    }
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let s = s.clone();
+    let answer = to_the_end("password reset", async move {
+        match s
+            .identity
+            .verify_code(
+                &pool(&info),
+                &user_id.to_string(),
+                CodeKind::Reset,
+                b.code.trim(),
+                Some(&b.password),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if is_weak(&e) => return Err(weak_password()),
+            // The stored guess budget is spent: no code is checked, a right one included. The email's
+            // own check bound refuses first, so this answers only after an auth restart lost its count.
+            Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
+            // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
+            Err(
+                IdentityError::CodeInvalid
+                | IdentityError::Invalid { .. }
+                | IdentityError::NotFound(Missing::User),
+            ) => return Err(bad_code()),
+            Err(e) => return Err(identity_down(&e)),
+        }
+        if let Err(e) = self::app(&s)
+            .internal
+            .revoke_user_sessions(
+                user_id,
+                &RevokeUserSessions {
+                    project_id: info.project_id,
+                    keep_session_id: None,
+                    created_before: None,
+                },
+            )
+            .await
+        {
+            warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed; their refresh is refused anyway");
+        }
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await?;
+    // Only a right code answers `Ok`.
+    slot.refund();
+    Ok(answer)
 }
 
 /// Changes the email, behind the current password. In order:
