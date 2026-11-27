@@ -21,7 +21,7 @@
 //! | 3 | `functions` | `FOR KEY SHARE` (per-branch writes), `FOR UPDATE` (kind change, delete) | none |
 //! | 4 | `branch_functions` | `FOR NO KEY UPDATE` or `UPDATE` (per-branch writes; a rollover's guarded switch) | branch create copies (insert), tombstone purge (delete) |
 //! | 4a | `function_schedules` | `FOR UPDATE` (schedule update, delete); the worker's claim `FOR UPDATE SKIP LOCKED`, alone; `record_schedule_errors` `FOR UPDATE SKIP LOCKED`, alone (no branch or function row), then updates only the rows it locked: it waits on no row lock, so it closes no wait cycle with any writer, a tombstone purge's `DELETE` (physical order) included | branch create copies (insert), tombstone purge (delete) |
-//! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
+//! | 4b | `function_triggers` | `INSERT` (add); `UPDATE` (m13 enable/disable), `DELETE` (m13 trigger delete; function delete's cascade); #301 `set_run_as`'s and an unmintable `settle_run_as_mint`'s pend `UPDATE` (after 4, before 5); the worker's settle `UPDATE` and the delivery record `UPDATE` (the dispatcher's, and m13b the worker's count of the events its cleanup dropped), each alone | branch create copies (insert), a reset's or restore's switch `UPDATE` (after its database and branch rows, before the endpoint), tombstone purge (delete) |
 //! | 4c | `function_trigger_drops` (m13) | `INSERT` (trigger disable and delete, after 4b; function delete, before its cascade): no foreign key, so it locks no other row; the worker's clear `DELETE`, alone | tombstone purge (delete) |
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
 //! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync; tombstone purge (revokes the branches' managed keys, after 4) |
@@ -775,6 +775,33 @@ pub(crate) async fn pend_table_triggers(
     Ok(())
 }
 
+/// #301: in a transaction that changed (or cleared, or settled unmintable) `function`'s run-as
+/// role on `branch`, holding its branch-function locks and state row: every enabled table
+/// trigger of the function there that is `installed` or `failed` goes back to
+/// `pending_install` with a new `enabled_since` and no error. The dispatcher holds a pending
+/// trigger's events, so nothing captured under the previous role is delivered; the worker's
+/// next sync replaces the database trigger for the new role (removing what the old one
+/// queued) or settles the row, and a `failed` row is checked again. A disabled row is pended
+/// when it is turned on. Lock order (module docs): trigger rows (4b) after the state row (4),
+/// before the endpoint (5).
+async fn pend_function_table_triggers(
+    tx: &mut PgConnection,
+    branch: BranchId,
+    function_id: Uuid,
+) -> Result<(), MetadataError> {
+    sqlx::query(
+        "UPDATE function_triggers
+         SET state = 'pending_install', enabled_since = clock_timestamp(), last_error = NULL
+         WHERE branch_id = $1 AND function_id = $2 AND source = 'table' AND enabled
+           AND state IN ('installed', 'failed')",
+    )
+    .bind(branch.as_uuid())
+    .bind(function_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
 /// Copies `parent`'s function state onto `child`, a branch row inserted in the same
 /// transaction (`create_branch`, which holds the database row `FOR NO KEY UPDATE`, so no
 /// function write on the parent runs meanwhile). The child gets the same active deployment,
@@ -1019,11 +1046,14 @@ impl MetadataClient {
     /// transaction: every live key the function manages on the branch is revoked (its sealed
     /// value dropped), then for `Some` a secret key bound to the role's identity is stored with
     /// `managed_by_function_id`, its plaintext sealed with `Purpose::DataKey` and the key's id
-    /// as AAD (the public key's seal), and `run_as_role` and `run_as_key_id` name it. False,
-    /// nothing written, when the function has no deployment on the branch.
+    /// as AAD (the public key's seal), and `run_as_role` and `run_as_key_id` name it. The
+    /// function's enabled table triggers on the branch are pended again (#301,
+    /// [`pend_function_table_triggers`]). False, nothing written, when the function has no
+    /// deployment on the branch.
     ///
     /// Lock order (module docs): the branch-function locks ([`lock_branch_function`]), the
-    /// state row, then the branch's endpoint row `FOR SHARE` before any key row (the DDL
+    /// state row, the function's trigger rows, then the branch's endpoint row `FOR SHARE`
+    /// before any key row (the DDL
     /// receiver, a role drop and a rename hold it `FOR UPDATE` and then write key rows, so a
     /// DROP after this commit sees the key). A wait over 5 s for it is
     /// [`MetadataError::EndpointLockTimeout`].
@@ -1055,6 +1085,9 @@ impl MetadataClient {
         let Some(name) = name else {
             return Ok(false);
         };
+        // #301: the function's table triggers stop delivering what they captured under the
+        // previous role, and are installed (or settled) for the new one at the next sync.
+        pend_function_table_triggers(&mut tx, branch, function_id).await?;
         // Before any key row (audit B1): a role drop or rename holds the endpoint `FOR UPDATE`
         // and then writes key rows.
         lock_endpoint_share(&mut tx, branch).await?;
@@ -1115,9 +1148,11 @@ impl MetadataClient {
     /// doesn't match: a member changed or cleared the run-as role meanwhile, or another worker
     /// settled it first. So the worker never overrides a member's run-as choice.
     ///
+    /// An `Unmintable` also pends the function's enabled table triggers on the branch (#301).
+    ///
     /// Lock order (module docs): `set_run_as`'s. The branch-function locks, the state row
-    /// `FOR NO KEY UPDATE`, then (a key only) the branch's endpoint row `FOR SHARE` before any
-    /// key row.
+    /// `FOR NO KEY UPDATE`, then (an unmintable outcome) the function's trigger rows, or (a
+    /// key) the branch's endpoint row `FOR SHARE` before any key row.
     pub async fn settle_run_as_mint(
         &self,
         branch: BranchId,
@@ -1200,6 +1235,9 @@ impl MetadataClient {
                 .await?;
             }
             RunAsMint::Unmintable(why, error) => {
+                // #301: no working identity here, so the function's table triggers stop
+                // delivering and the next sync settles them `run_as_role_required`.
+                pend_function_table_triggers(&mut tx, branch, function_id).await?;
                 let error: String = error.chars().take(MAX_LAST_ERROR_CHARS).collect();
                 sqlx::query(
                     "UPDATE branch_functions
@@ -2608,8 +2646,8 @@ impl MetadataClient {
     /// Up to `limit` ready branches (of live databases) with a table trigger the worker's
     /// sweep looks at (edge functions m8): `pending_install` (to install) or `installed` (to
     /// check for drift), each with whether it has a pending one. A `failed` row never comes
-    /// back here until it is pended again (a reset, a restore, or a change to the trigger), so
-    /// a refusal is terminal. A page in id order after `after` (#302: a keyset, so the worker
+    /// back here until it is pended again (a reset, a restore, a change to the trigger, or
+    /// #301 a change to its function's run-as role), so a refusal is otherwise terminal. A page in id order after `after` (#302: a keyset, so the worker
     /// pages through every candidate however many there are, and a branch added or removed
     /// meanwhile moves no other); the worker orders a page by its own last attempt. A read.
     pub async fn trigger_sweep_branches(

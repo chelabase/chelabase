@@ -117,6 +117,13 @@
 //! A trigger that fails it is dropped, its queued events are removed (counted in
 //! `dropped_count`), and it settles [`RUN_AS_CANNOT_READ_TABLE`] or [`RUN_AS_SUBJECT_TO_RLS`].
 //!
+//! #301: changing or clearing a function's run-as role (or the worker settling it unmintable)
+//! pends its table triggers in the same transaction, so the dispatcher holds their events. The
+//! next sync removes (and counts) the events of each pending row whose database trigger isn't
+//! exactly in place (`stale`: captured by a previous form of it, under a role that may no
+//! longer be its function's), then installs it for the new role or settles it. A function
+//! whose run-as role is unmintable on the branch has no run-as OID ([`run_as_oids`]).
+//!
 //! The script answers one line per wanted trigger: `fn_trigger <id> ok`, `… no_select`,
 //! `… subject_to_rls`, `… not_a_plain_table` or `… table_missing`. The worker settles the rows
 //! it read, by the `enabled_since` it read (`MetadataClient::settle_trigger_installs`): only
@@ -552,9 +559,9 @@ pub fn sweep_pass(
     sweep_order(page, &state.attempts, n)
 }
 
-/// A table trigger to install: its row's id, table and events, and (m17) its function's
-/// approved run-as role OID on the branch, which the install and `enqueue()` check with
-/// [`run_as_reads`].
+/// A table trigger to install: its row's id, table and events, (m17) its function's approved
+/// run-as role OID on the branch, which the install and `enqueue()` check with
+/// [`run_as_reads`], and (#301) whether its row is `pending_install`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wanted {
     pub id: Uuid,
@@ -562,18 +569,22 @@ pub struct Wanted {
     pub table: String,
     pub events: Vec<String>,
     pub run_as_oid: u32,
+    pub pending: bool,
 }
 
 /// m17: each function's approved run-as role OID on the branch (`run_as_role_oid`, while a
-/// `run_as_role` is set), by function id. A function missing here has none.
+/// `run_as_role` is set and, #301, the worker hasn't settled it unmintable there), by function
+/// id. A function missing here has none.
 pub type RunAsOids = std::collections::HashMap<Uuid, u32>;
 
 /// m17: [`RunAsOids`] from the branch's functions. An OID outside Postgres's range can name no
-/// role and is left out (so its triggers are never wanted).
+/// role and is left out (so its triggers are never wanted); so (#301) is a function whose
+/// run-as role is unmintable on the branch (`run_as_unmintable`): it has no working identity
+/// there, so its triggers settle [`RUN_AS_ROLE_REQUIRED`].
 pub fn run_as_oids(functions: &[chelabase_metadata::BranchFunction]) -> RunAsOids {
     functions
         .iter()
-        .filter(|f| f.run_as_role.is_some())
+        .filter(|f| f.run_as_role.is_some() && f.run_as_unmintable.is_none())
         .filter_map(|f| Some((f.function_id, u32::try_from(f.run_as_role_oid?).ok()?)))
         .collect()
 }
@@ -671,6 +682,7 @@ pub fn wanted_in(triggers: &[TriggerRecord], db: &str, run_as: &RunAsOids) -> Ve
                 table: t.table_name.clone()?,
                 events: t.events.clone(),
                 run_as_oid: *run_as.get(&t.function_id)?,
+                pending: t.state == TriggerState::PendingInstall,
             })
         })
         .collect()
@@ -1055,13 +1067,14 @@ pub fn sync_sql(wanted: &[Wanted], truncate: bool, roles: Roles) -> String {
         .filter_map(|w| {
             let (events, tgtype) = trigger_events(&w.events)?;
             Some(format!(
-                "({}, {}, {}, {}, {}, {tgtype}, {})",
+                "({}, {}, {}, {}, {}, {tgtype}, {}, {})",
                 literal(&trigger_name(w.id)),
                 literal(&w.id.to_string()),
                 literal(&w.schema),
                 literal(&w.table),
                 literal(&events),
                 w.run_as_oid,
+                w.pending,
             ))
         })
         .collect();
@@ -1106,7 +1119,7 @@ DO $chelabase_fn$ BEGIN
     RAISE EXCEPTION '{BUSY_MARK}: another sync of this database holds the lock';
   END IF;
 END $chelabase_fn$;
-CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2, run_as oid) ON COMMIT DROP;
+CREATE TEMP TABLE chelabase_fn_wanted (name text, trigger_id uuid, schema_name text, table_name text, events text, tgtype int2, run_as oid, pending bool, stale bool NOT NULL DEFAULT false) ON COMMIT DROP;
 {insert}-- After the lock. `fresh`: none of this branch's wanted triggers (its own trigger ids) is
 -- exactly in place, so the database holds only what it came with (the source's triggers, under
 -- the source's ids) and its outbox only the source's rows: a create, reset or restore truncates
@@ -1117,6 +1130,14 @@ SELECT pg_catalog.set_config('chelabase_fn.fresh', (NOT EXISTS (SELECT FROM pg_t
   JOIN pg_catalog.pg_namespace n ON n.nspname = w.schema_name
   JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
   JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = c.oid WHERE {EXACT}))::pg_catalog.text, true) IS NULL;
+-- #301: `stale`: a pending row with no database trigger exactly in place (its run-as OID
+-- changed, or the old one is gone) has events, if any, that a previous form of it captured,
+-- under a role that may no longer be its function's. The dispatcher held them while the row
+-- was pending; the cleanup below removes and counts them, so they are never delivered. Read
+-- before the loops replace the trigger.
+UPDATE pg_temp.chelabase_fn_wanted w SET stale = w.pending AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n
+  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
+  JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = c.oid WHERE n.nspname = w.schema_name AND {EXACT});
 {check}{repair}{install_objects}{revoke}DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
   t record;
@@ -1147,9 +1168,10 @@ DO $chelabase_fn$ DECLARE
   ours pg_catalog.oid := {ours};
   dropped pg_catalog.text;
   -- m17: the wanted triggers whose events stay: all but those whose table is there and
-  -- whose run-as role may not read it (read here, as the superuser, before the role switch).
+  -- whose run-as role may not read it (read here, as the superuser, before the role switch),
+  -- and (#301) the stale ones.
   keep pg_catalog.uuid[] := ARRAY(SELECT w.trigger_id FROM pg_temp.chelabase_fn_wanted w
-    WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid
+    WHERE NOT w.stale AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid
       WHERE n.nspname = w.schema_name AND c.relname = w.table_name AND NOT {reads}));
 BEGIN
   IF ours IS NULL OR pg_catalog.to_regclass('{FUNCTIONS_SCHEMA}.outbox') IS NULL THEN
@@ -1869,6 +1891,7 @@ mod tests {
             table: table.into(),
             events: events.iter().map(|e| e.to_string()).collect(),
             run_as_oid: 16500,
+            pending: false,
         }
     }
 
@@ -1918,7 +1941,7 @@ mod tests {
         assert_eq!(
             row.trim(),
             format!(
-                "('chelabase_fn_0123456789abcdef0123456789abcdef', '01234567-89ab-cdef-0123-456789abcdef', 'public', {}, 'INSERT', 5, 16500);",
+                "('chelabase_fn_0123456789abcdef0123456789abcdef', '01234567-89ab-cdef-0123-456789abcdef', 'public', {}, 'INSERT', 5, 16500, false);",
                 literal(nasty)
             )
         );
@@ -1969,6 +1992,12 @@ mod tests {
             sql.contains("IF pg_catalog.current_setting('chelabase_fn.fresh', true) = 'true' THEN")
         );
         assert!(sql.contains("REVOKE ALL ON ROUTINE %s FROM chelabase_functions_owner CASCADE"));
+        // #301: a pending row's stale events are marked before the loops replace its trigger,
+        // and the cleanup doesn't keep them.
+        let stale = sql.find("UPDATE pg_temp.chelabase_fn_wanted w SET stale = w.pending").unwrap();
+        assert!(sql.find("pg_try_advisory_xact_lock").unwrap() < stale);
+        assert!(stale < sql.find("EXECUTE pg_catalog.format('DROP TRIGGER").unwrap());
+        assert!(sql.contains("WHERE NOT w.stale AND NOT EXISTS ("));
         assert!(drop_triggers_sql().contains("pg_catalog.format('DROP TRIGGER %I ON %I.%I'"));
         let role = sql
             .find("SET LOCAL ROLE chelabase_functions_owner;")
@@ -2434,7 +2463,7 @@ mod tests {
         for site in rule_sites(&sql) {
             assert!(site.contains(select), "{site}");
         }
-        assert!(sql.contains("run_as oid) ON COMMIT DROP;"));
+        assert!(sql.contains("run_as oid, pending bool, stale bool NOT NULL DEFAULT false) ON COMMIT DROP;"));
         assert!(sql.contains("THEN ' no_select'"));
         assert!(sql.contains("OR trigger_id <> ALL (keep)"));
         // A column grant is not table-level SELECT: no column privilege check stands in.
@@ -2523,5 +2552,35 @@ mod tests {
         ];
         run_as = run_as_oids(&fs);
         assert_eq!(run_as, RunAsOids::from([(fs[0].function_id, 16500)]));
+    }
+
+    /// #301 AC 3: a function whose run-as role the worker settled unmintable on the branch has
+    /// no working identity there, so it has no run-as OID: its triggers are never wanted
+    /// (nothing is installed) and an installable row settles `run_as_role_required`.
+    #[test]
+    fn unmintable_run_as_installs_nothing() {
+        for why in [RunAsUnmintable::Missing, RunAsUnmintable::Changed, RunAsUnmintable::Refused] {
+            let f = chelabase_metadata::BranchFunction {
+                function_id: Uuid::new_v4(),
+                name: "f".into(),
+                kind: chelabase_metadata::FunctionKind::Function,
+                deployment_id: Uuid::new_v4(),
+                enabled: true,
+                auth: chelabase_metadata::FunctionAuth::Key,
+                run_as_role: Some("reader".into()),
+                run_as_key_id: None,
+                run_as_role_oid: Some(16500),
+                run_as_unmintable: Some(why),
+                last_error: None,
+                updated_at: Timestamp::now(),
+                health: None,
+            };
+            let run_as = run_as_oids(std::slice::from_ref(&f));
+            assert!(run_as.is_empty(), "{why:?}");
+            let mut t = record(true, TriggerState::Installed);
+            t.function_id = f.function_id;
+            assert!(wanted_in(std::slice::from_ref(&t), "app", &run_as).is_empty(), "{why:?}");
+            assert_eq!(run_as_refusal(&t, &run_as), Some(RUN_AS_ROLE_REQUIRED), "{why:?}");
+        }
     }
 }

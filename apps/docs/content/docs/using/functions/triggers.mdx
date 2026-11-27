@@ -50,13 +50,13 @@ The worker checks this every time it syncs the branch's triggers, and the trigge
 
 | `last_error` | Cause | Fix |
 |---|---|---|
-| `run_as_role_required` | The function has no run-as role on the branch, or its role has no approved identity. | Set the run-as role (again). |
+| `run_as_role_required` | The function has no run-as role on the branch, its role has no approved identity, or (on a child branch) its run-as key couldn't be made there. | Set the run-as role (again). |
 | `run_as_role_cannot_read_table` | The run-as role no longer exists (by identity), lacks table-level `SELECT`, or lacks `USAGE` on the table's schema. | `GRANT SELECT ON <table> TO <role>` and `GRANT USAGE ON SCHEMA <schema> TO <role>`, or set the run-as role again. |
 | `run_as_role_subject_to_rls` | The table has row level security that applies to the run-as role. | Use a `BYPASSRLS` run-as role, or the table's owner on a table without `FORCE ROW LEVEL SECURITY`. |
 
-A missing grant is reported before row level security. `failed` is final: after fixing the cause, turn the trigger off and on so it installs again.
+A missing grant is reported before row level security. `failed` is final until something changes on Chelabase's side: after granting in SQL, set the function's run-as role again (the same role is fine) or turn the trigger off and on, and the next sync checks it again.
 
-Changing or clearing the function's run-as role takes effect at the next sync, not at once: each trigger records the role it was installed for, and until the next sync it keeps capturing as long as that previously approved role could read the table, and those events can be delivered. The next sync checks the new role (or the missing one), and if it fails the rules above, the trigger is uninstalled, its queued events are dropped and it settles `failed`. The wait is at most one sweep, about 30 seconds, and longer when more than 20 branches have table triggers, since each sweep visits 20 branches.
+Changing or clearing the function's run-as role stops delivery at once: the function's table triggers go back to `pending_install`, including `failed` ones, and their queued events are held. At the next sync each trigger is installed again for the new role and every event it captured before the change is dropped (counted in `dropped_count`), so no event captured under the previous role is delivered. If the new role fails the rules above, or the run-as role was cleared, the trigger is uninstalled and settles `failed` instead. Until that sync, nothing is delivered and changes are still captured under the previous role, then dropped. The wait is usually one sweep, about 30 seconds; pending branches go first, so it is longer only when more than 20 branches have pending table triggers, since each sweep visits 20 branches.
 
 <Callout type="warn">
 **Upgrading:** table triggers that worked before this check fail at their next sync when the function has no run-as role, its role can't `SELECT` the table, or the table has row level security and the role is subject to it. Their queued events are dropped. Fix the cause as in the table above, then turn each trigger off and on.

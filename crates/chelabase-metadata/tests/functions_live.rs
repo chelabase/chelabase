@@ -1305,6 +1305,102 @@ mod functions {
         s.finish().await;
     }
 
+    /// #301: `(state, last_error, enabled_since)` of each trigger, by id.
+    async fn trigger_states(
+        c: &MetadataClient,
+        branch: BranchId,
+    ) -> std::collections::HashMap<Uuid, (TriggerState, Option<String>, Timestamp)> {
+        c.list_triggers(branch)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.id, (t.state, t.last_error, t.enabled_since)))
+            .collect()
+    }
+
+    /// #301: sets trigger `id`'s state (and error) by hand, as the worker's settle would.
+    async fn force_trigger_state(s: &Scratch, id: Uuid, state: &str, error: Option<&str>) {
+        sqlx::query("UPDATE function_triggers SET state = $2, last_error = $3 WHERE id = $1")
+            .bind(id)
+            .bind(state)
+            .bind(error)
+            .execute(s.pool())
+            .await
+            .unwrap();
+    }
+
+    /// #301 AC 1, 2: changing or clearing a function's run-as role pends its enabled table
+    /// triggers on that branch (installed and failed alike), with a new `enabled_since` and no
+    /// error, in the same transaction, so the dispatcher holds what they captured under the
+    /// previous role and the next sync installs them for the new one. A disabled trigger, a
+    /// storage trigger, another function's trigger and the same function's trigger on another
+    /// branch are left alone.
+    #[tokio::test]
+    #[ignore]
+    async fn set_run_as_pends_the_functions_table_triggers() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let g = s.active(db, main, "other").await;
+        let c = &s.client;
+        assert!(c.set_run_as(main, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        let installed = c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        let failed = c.add_trigger(&table_trigger(main, f, &["update"])).await.unwrap();
+        let disabled = c.add_trigger(&table_trigger(main, f, &["delete"])).await.unwrap();
+        let storage = c.add_trigger(&storage_trigger(main, f, &["object.created"])).await.unwrap();
+        let others = c.add_trigger(&table_trigger(main, g, &["insert"])).await.unwrap();
+        let child = s.branch(db, main, "dev").await;
+        install_all(c, child).await;
+        let child_before = trigger_states(c, child).await;
+        for change in [Some(run_as("writer", 5151)), None] {
+            install_all(c, main).await;
+            force_trigger_state(&s, failed, "failed", Some("run_as_role_cannot_read_table")).await;
+            c.update_trigger(main, f, disabled, false).await.unwrap().expect("disabled");
+            let before = trigger_states(c, main).await;
+            assert_eq!(before[&installed].0, TriggerState::Installed);
+            assert!(c.set_run_as(main, f, change.as_ref()).await.unwrap());
+            let after = trigger_states(c, main).await;
+            for t in [installed, failed] {
+                let (state, error, since) = &after[&t];
+                assert_eq!((*state, error.as_deref()), (TriggerState::PendingInstall, None), "{change:?}");
+                assert!(*since > before[&t].2, "a new enabled_since: {change:?}");
+            }
+            for t in [disabled, storage, others] {
+                assert_eq!(after[&t], before[&t], "left alone: {change:?}");
+            }
+            assert_eq!(trigger_states(c, child).await, child_before, "another branch: {change:?}");
+            c.update_trigger(main, f, disabled, true).await.unwrap();
+        }
+        s.finish().await;
+    }
+
+    /// #301 AC 3: a child mint that settles the run-as role unmintable pends the function's
+    /// table triggers there in the same transaction, so nothing they captured is delivered and
+    /// the next sync settles them `run_as_role_required`. A mint that stores a key leaves them.
+    #[tokio::test]
+    #[ignore]
+    async fn set_run_as_unmintable_mint_pends_table_triggers() {
+        let s = Scratch::new().await;
+        let (db, main) = s.database().await;
+        let f = s.active(db, main, "hello").await;
+        let c = &s.client;
+        assert!(c.set_run_as(main, f, Some(&run_as("reporter", 4242))).await.unwrap());
+        c.add_trigger(&table_trigger(main, f, &["insert"])).await.unwrap();
+        let minted = s.branch(db, main, "minted").await;
+        let refused = s.branch(db, main, "refused").await;
+        for b in [minted, refused] {
+            install_all(c, b).await;
+        }
+        assert!(c.settle_run_as_mint(minted, f, "reporter", Some(4242), RunAsMint::Key(&run_as("reporter", 4242))).await.unwrap());
+        assert!(c.settle_run_as_mint(refused, f, "reporter", Some(4242), RunAsMint::Unmintable(RunAsUnmintable::Missing, "run_as_role_missing")).await.unwrap());
+        let state = |b: BranchId| async move {
+            c.list_triggers(b).await.unwrap().into_iter().map(|t| t.state).collect::<Vec<_>>()
+        };
+        assert_eq!(state(minted).await, vec![TriggerState::Installed]);
+        assert_eq!(state(refused).await, vec![TriggerState::PendingInstall]);
+        s.finish().await;
+    }
+
     #[tokio::test]
     #[ignore]
     async fn delete_and_kind_refused_on_protected_branch() {
