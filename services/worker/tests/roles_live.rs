@@ -3137,6 +3137,43 @@ async fn a_negative_infinity_valid_until_is_recorded_as_expired() {
     .await;
 }
 
+// Taking owner level away also removes BYPASSRLS, which came with it, unless the change keeps
+// it (`bypass_rls: true`); a resync afterwards records what the compute has.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn taking_owner_level_away_removes_bypassrls_unless_the_change_keeps_it() {
+    live(|fx| async move {
+        let at = |role: &str| {
+            format!(
+                "SELECT rolcreaterole::text || ',' || rolbypassrls::text || ',' || \
+                 pg_has_role('{role}', 'neon_superuser', 'MEMBER')::text \
+                 FROM pg_roles WHERE rolname = '{role}';"
+            )
+        };
+        for (role, keep, bypass) in [("dropped", None, false), ("kept", Some(true), true)] {
+            fx.create(fx.main, role, true).await;
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, "true,true,true", "{role}");
+            let patch = RolePatch {
+                owner_level: Some(false),
+                bypass_rls: keep,
+                ..RolePatch::default()
+            };
+
+            assert_eq!(fx.worker.update_role(fx.main, role, &patch).await, RoleOutcome::Ok, "{role}");
+
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},false"), "{role}");
+            fx.worker.resync(fx.main).await.unwrap();
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},false"), "{role}");
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let row = rows.iter().find(|r| r.name == role).unwrap();
+            assert!(!row.api_owner_level, "{role}");
+            assert_eq!(row.attributes.bypass_rls, bypass, "{role}");
+            assert!(!row.attributes_pending, "{role}");
+        }
+    })
+    .await;
+}
+
 // #425: a PATCH stored but not applied yet (a failed script, or a confirm lost to a
 // concurrent write) that changed only the connection limit, then the role expired in SQL
 // (`VALID UNTIL '-infinity'`): the resync applies the limit and records the SQL expiry,

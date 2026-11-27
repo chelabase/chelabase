@@ -726,10 +726,16 @@ fn retried_reset(row: &RoleCopy) -> bool {
 /// the change named (`attributes_named`) from the row, every other one from `o`, so a change
 /// made in SQL since is kept. `(owner_level, login, attributes)`; owner level is the row's
 /// wanted one or the catalog's owner attributes, memberships (with their options) the row's
-/// or the catalog's.
+/// or the catalog's. A change that takes owner level away also removes the BYPASSRLS that
+/// came with it, unless it names `bypass_rls` itself.
 pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, RoleAttributes) {
     let named = |f: RoleField| row.attributes_named.contains(&f);
     let (r, c) = (&row.attributes, o.attributes());
+    let owner_level = if named(RoleField::OwnerLevel) {
+        row.api_owner_level
+    } else {
+        o.owner_attributes
+    };
     let members = named(RoleField::MemberOf);
     let attributes = RoleAttributes {
         inherit: if named(RoleField::Inherit) { r.inherit } else { c.inherit },
@@ -739,15 +745,14 @@ pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, R
             c.connection_limit
         },
         valid_until: if named(RoleField::ValidUntil) { r.valid_until } else { c.valid_until },
-        bypass_rls: if named(RoleField::BypassRls) { r.bypass_rls } else { c.bypass_rls },
+        bypass_rls: if named(RoleField::BypassRls) {
+            r.bypass_rls
+        } else {
+            c.bypass_rls && !(o.owner_attributes && !owner_level)
+        },
         member_of: if members { r.member_of.clone() } else { c.member_of },
         member_no_set: if members { r.member_no_set.clone() } else { c.member_no_set },
         member_admin: if members { r.member_admin.clone() } else { c.member_admin },
-    };
-    let owner_level = if named(RoleField::OwnerLevel) {
-        row.api_owner_level
-    } else {
-        o.owner_attributes
     };
     let login = if named(RoleField::Login) { row.login } else { o.login };
     (owner_level, login, attributes)
@@ -2825,8 +2830,10 @@ mod tests {
     // #425 invariant: a pending API change drives onto the compute only the fields it named.
     // A named field is driven (when the catalog differs) and recorded from the row; an
     // unnamed one gets no statement and is recorded from the catalog. Driving the result
-    // again changes nothing. Exhaustive over every subset of the fields × owner level turned
-    // on or off; every field differs between the row and the catalog.
+    // again changes nothing. Taking owner level away also removes the BYPASSRLS owner level
+    // gave, unless the change names `bypass_rls: true`. Exhaustive over every subset of the
+    // fields × owner level turned on or off × the row's BYPASSRLS; every other field differs
+    // between the row and the catalog.
     #[test]
     fn a_pending_change_drives_only_the_fields_it_named_exhaustively() {
         use chelabase_metadata::RoleField;
@@ -2839,7 +2846,7 @@ mod tests {
                 .map(|(_, f)| f)
                 .collect();
             let has = |f: RoleField| named.contains(&f);
-            for seen_owner in [false, true] {
+            for (seen_owner, row_bypass) in [(false, false), (false, true), (true, false), (true, true)] {
                 let mut row = copy("r", RoleOrigin::Api, None);
                 row.login = false;
                 row.password_enc = None;
@@ -2853,9 +2860,7 @@ mod tests {
                     connection_limit: 3,
                     // A recorded "no expiry" against a later SQL `-infinity` (the audit's case).
                     valid_until: None,
-                    // Plain: BYPASSRLS on its own, which the catalog hasn't; owner level
-                    // taken away: without it.
-                    bypass_rls: !seen_owner,
+                    bypass_rls: row_bypass,
                     member_of: vec!["g".into()],
                     member_no_set: vec![],
                     member_admin: vec![],
@@ -2872,7 +2877,7 @@ mod tests {
                 let (repairs, write) =
                     plan_resync(OWNER_ROLE, std::slice::from_ref(&row), &roles(o.clone()));
                 let statements = flat(&repairs);
-                let case = format!("named={named:?} seen_owner={seen_owner}: {statements:?}");
+                let case = format!("named={named:?} seen_owner={seen_owner} row_bypass={row_bypass}: {statements:?}");
                 let tokens: Vec<String> = statements
                     .iter()
                     .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == ';'))
@@ -2890,12 +2895,24 @@ mod tests {
                     has(RoleField::OwnerLevel),
                     "{case}"
                 );
-                if !seen_owner && !has(RoleField::OwnerLevel) {
-                    assert_eq!(
-                        mentions(&["BYPASSRLS", "NOBYPASSRLS"]),
-                        has(RoleField::BypassRls),
-                        "{case}"
-                    );
+                let kept = has(RoleField::BypassRls) && row_bypass;
+                match (seen_owner, has(RoleField::OwnerLevel)) {
+                    // Plain, staying plain: BYPASSRLS only when named and differing.
+                    (false, false) => {
+                        assert_eq!(mentions(&["BYPASSRLS", "NOBYPASSRLS"]), kept, "{case}")
+                    }
+                    // Owner-level, staying so: owner level holds it; nothing to say.
+                    (true, false) => {
+                        assert!(!mentions(&["BYPASSRLS", "NOBYPASSRLS"]), "{case}")
+                    }
+                    // Owner level taken away: dropped unless the change keeps it.
+                    (true, true) => {
+                        let word = if kept { "BYPASSRLS" } else { "NOBYPASSRLS" };
+                        assert!(mentions(&[word]), "{case}");
+                        assert!(!mentions(&[if kept { "NOBYPASSRLS" } else { "BYPASSRLS" }]), "{case}");
+                    }
+                    // Owner level turned on: the owner's attributes carry it.
+                    (false, true) => {}
                 }
 
                 // Recorded: the named fields from the row, the rest from the catalog.
@@ -2909,7 +2926,12 @@ mod tests {
                         o.connection_limit
                     },
                     valid_until: if pick(RoleField::ValidUntil) { row.attributes.valid_until } else { o.valid_until },
-                    bypass_rls: if pick(RoleField::BypassRls) { row.attributes.bypass_rls } else { o.bypass_rls },
+                    bypass_rls: if pick(RoleField::BypassRls) {
+                        row.attributes.bypass_rls
+                    } else {
+                        // Owner level's BYPASSRLS goes with it.
+                        o.bypass_rls && wanted_owner
+                    },
                     member_of: if pick(RoleField::MemberOf) { row.attributes.member_of.clone() } else { o.member_of.clone() },
                     member_no_set: vec![],
                     member_admin: vec![],
@@ -2939,7 +2961,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 128 * 2);
+        assert_eq!(checked, 128 * 4);
     }
 
     fn level_of(owner_level: bool) -> RoleLevel {

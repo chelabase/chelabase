@@ -487,7 +487,8 @@ pub struct ObservedDatabase {
 
 /// Insert-or-update one row. `origin` is used only on insert; an existing row keeps its origin.
 /// `verifier: None` stores NULL (MD5). The row's `attributes_pending` becomes false (the
-/// resync applied or recorded them). Debug redacts the verifier.
+/// resync applied or recorded them) and its `attributes_named` every field again (#425). Debug
+/// redacts the verifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CopyUpsert {
     pub name: String,
@@ -1615,7 +1616,8 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// Confirms one row's applied write. `attributes_pending` is cleared when `attributes_change`
+    /// Confirms one row's applied write. `attributes_pending` is cleared (and `attributes_named`
+    /// set back to every field, #425) when `attributes_change`
     /// names the row's current `attributes_change_id` (the API write just applied), whatever
     /// `roles_version` says: another write (a forwarded DDL) bumping it meanwhile doesn't make
     /// this change stale, while a newer API change keeps its own flag. `pending` (the password
@@ -1639,7 +1641,7 @@ impl MetadataClient {
         .await?;
         if let Some(change) = attributes_change {
             sqlx::query(
-                "UPDATE neon_roles SET attributes_pending = false
+                "UPDATE neon_roles SET attributes_pending = false, attributes_named = DEFAULT
                  WHERE endpoint_id = $1 AND name = $2 AND attributes_pending
                    AND attributes_change_id = $3 AND origin <> 'personal'",
             )
@@ -1912,6 +1914,7 @@ impl MetadataClient {
                      member_no_set = EXCLUDED.member_no_set,
                      member_admin = EXCLUDED.member_admin,
                      attributes_pending = false,
+                     attributes_named = DEFAULT,
                      api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
                                             THEN $15 ELSE r.api_owner_level END,
                      password_unreadable = CASE WHEN NOT {held}

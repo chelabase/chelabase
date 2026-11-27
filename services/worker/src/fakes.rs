@@ -1570,6 +1570,7 @@ impl WorkerMetadata for FakeMetadata {
             && login.attributes_change_id == Some(change)
         {
             login.attributes_pending = false;
+            login.attributes_named = RoleField::all();
         }
         if ep.roles_version != version {
             return Ok(false);
@@ -1671,6 +1672,7 @@ impl WorkerMetadata for FakeMetadata {
             row.pending = up.pending;
             row.attributes = up.attributes.clone();
             row.attributes_pending = false;
+            row.attributes_named = RoleField::all();
             if row.origin == RoleOrigin::Api
                 && let Some(owner_level) = up.api_owner_level
             {

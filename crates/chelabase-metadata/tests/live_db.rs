@@ -8637,7 +8637,8 @@ async fn confirm_clears_attributes_by_change_id() {
 
 // #425: `attributes_named` records the fields a pending change named. A create names every
 // field; a PATCH over a settled row names only its own; one over a still-pending change joins
-// it, so neither is lost; a field outside the vocabulary is refused.
+// it, so neither is lost; applying it (a confirm or a resync) resets it to every field; a
+// field outside the vocabulary is refused.
 #[tokio::test]
 #[ignore]
 async fn a_pending_change_records_the_fields_it_named() {
@@ -8674,8 +8675,22 @@ async fn a_pending_change_records_the_fields_it_named() {
         .unwrap();
     client.update_api_role(&ep, "app", &limit, 10).await.unwrap();
     let alone = named(client.clone(), ep.clone()).await;
-    client.update_api_role(&ep, "app", &patch(&[RoleField::ValidUntil]), 10).await.unwrap();
+    let expiry = patch(&[RoleField::ValidUntil]);
+    client.update_api_role(&ep, "app", &expiry, 10).await.unwrap();
     let joined = named(client.clone(), ep.clone()).await;
+    // Applied (the confirm of the latest change): back to every field.
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    client.confirm_role(&ep, "app", v, Some(expiry.change_id)).await.unwrap();
+    let confirmed = named(client.clone(), ep.clone()).await;
+    // Applied by a resync: the same.
+    client.update_api_role(&ep, "app", &patch(&[RoleField::Inherit]), 10).await.unwrap();
+    let narrowed = named(client.clone(), ep.clone()).await;
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let mut row = upsert("app", RoleOrigin::Api, SQL_VERIFIER);
+    row.login = false;
+    let write = ResyncWrite { upserts: vec![row], removals: vec![], databases: vec![observed("db", "postgres", false)] };
+    client.apply_resync(&ep, main_of(id), read, &write).await.unwrap();
+    let resynced = named(client.clone(), ep.clone()).await;
     let unknown = sqlx::query("UPDATE neon_roles SET attributes_named = ARRAY['password'] WHERE endpoint_id = $1 AND name = 'app'")
         .bind(&ep)
         .execute(client.pool())
@@ -8685,6 +8700,9 @@ async fn a_pending_change_records_the_fields_it_named() {
     assert_eq!(over_create, (true, RoleField::all()), "joined to the create's");
     assert_eq!(alone, (true, [RoleField::ConnectionLimit].into()), "only the PATCH's own");
     assert_eq!(joined, (true, [RoleField::ConnectionLimit, RoleField::ValidUntil].into()), "both pending changes'");
+    assert_eq!(confirmed, (false, RoleField::all()), "a confirm resets the set");
+    assert_eq!(narrowed, (true, [RoleField::Inherit].into()));
+    assert_eq!(resynced, (false, RoleField::all()), "a resync's apply resets the set");
     assert!(unknown.is_err(), "the vocabulary is checked: {unknown:?}");
 }
 

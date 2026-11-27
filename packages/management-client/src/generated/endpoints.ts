@@ -5666,7 +5666,7 @@ export const getUpdateRoleUrl = (id: string,
 }
 
 /**
- * Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.
+ * Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Taking owner level away also removes BYPASSRLS unless the same change sets `bypass_rls: true`. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.
  * @summary Change a role
  */
 export const updateRole = async (id: string,

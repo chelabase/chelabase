@@ -251,8 +251,11 @@ impl RolePatch {
         .collect()
     }
 
-    /// `current` with this change.
-    pub fn apply(&self, current: &RoleAttributes) -> RoleAttributes {
+    /// `current` (a role whose owner level is `owner_level`) with this change. Taking owner
+    /// level away also removes BYPASSRLS, which came with it, unless the change keeps it
+    /// (`bypass_rls: true`).
+    pub fn apply(&self, owner_level: bool, current: &RoleAttributes) -> RoleAttributes {
+        let demoted = owner_level && self.owner_level == Some(false);
         let member_of = match &self.member_of {
             Some(members) => sorted(members),
             None => current.member_of.clone(),
@@ -270,7 +273,7 @@ impl RolePatch {
                 Some(at) => at.map(to_micros),
                 None => current.valid_until,
             },
-            bypass_rls: self.bypass_rls.unwrap_or(current.bypass_rls),
+            bypass_rls: self.bypass_rls.unwrap_or(current.bypass_rls && !demoted),
             member_of,
         }
     }
@@ -846,7 +849,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         {
             return outcome;
         }
-        let wanted_attributes = patch.apply(&attributes);
+        let wanted_attributes = patch.apply(owner_level, &attributes);
         let wanted_login = patch.login.unwrap_or(login);
         let wanted_owner_level = patch.owner_level.unwrap_or(owner_level);
         // Turning LOGIN on gives the role a password, and a row without a verifier a new copy,
@@ -3817,6 +3820,115 @@ mod tests {
         }
     }
 
+    /// Taking owner level away also removes the BYPASSRLS owner level gave, unless the change
+    /// keeps it (`bypass_rls: true`).
+    #[tokio::test]
+    async fn taking_owner_level_away_removes_bypassrls_unless_the_change_keeps_it() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", true)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        let owner = || {
+            let mut o = observed("app", true, verifier.as_deref());
+            o.owner_level = true;
+            o.owner_attributes = true;
+            o.bypass_rls = true;
+            o
+        };
+        let strip = |bypass: &str| {
+            format!(
+                "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" NOCREATEROLE NOCREATEDB NOREPLICATION {bypass};\nREVOKE neon_superuser FROM \"app\";"
+            )
+        };
+        for (keep, bypass) in [(None, "NOBYPASSRLS"), (Some(false), "NOBYPASSRLS"), (Some(true), "BYPASSRLS")] {
+            in_catalog(&w, &owner());
+            w.computes.sql.lock().unwrap().clear();
+            let patch = RolePatch {
+                owner_level: Some(false),
+                bypass_rls: keep,
+                ..RolePatch::default()
+            };
+
+            assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok, "{keep:?}");
+
+            assert_eq!(sql(&w).last().unwrap(), &strip(bypass), "{keep:?}");
+            let row = w.metadata.state().endpoints[&ep].logins["app"].clone();
+            assert!(!row.api_owner_level, "{keep:?}");
+            assert_eq!(row.attributes.bypass_rls, keep == Some(true), "{keep:?}");
+            assert!(!row.attributes_pending, "{keep:?}");
+        }
+        // A change that leaves owner level alone doesn't touch BYPASSRLS.
+        in_catalog(&w, &owner());
+        w.computes.sql.lock().unwrap().clear();
+        let limit = RolePatch {
+            connection_limit: Some(4),
+            ..RolePatch::default()
+        };
+        assert_eq!(w.update_role(branch, "app", &limit).await, RoleOutcome::Ok);
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" CONNECTION LIMIT 4;"
+        );
+    }
+
+    /// The same over a change that turned owner level on, reached the compute and wasn't
+    /// confirmed yet (the white-room audit's case).
+    #[tokio::test]
+    async fn taking_owner_level_away_over_an_unconfirmed_promote_removes_bypassrls() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        {
+            let mut state = w.metadata.state();
+            let row = state.endpoints.get_mut(&ep).unwrap().logins.get_mut("app").unwrap();
+            row.api_owner_level = true;
+            row.attributes_pending = true;
+            row.attributes_named = [RoleField::OwnerLevel].into();
+        }
+        let mut o = observed("app", true, verifier.as_deref());
+        o.owner_level = true;
+        o.owner_attributes = true;
+        o.bypass_rls = true;
+        in_catalog(&w, &o);
+        let patch = RolePatch {
+            owner_level: Some(false),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+
+        let script = sql(&w).last().unwrap().clone();
+        assert!(script.contains("NOBYPASSRLS"), "{script}");
+        assert!(!attributes(&w, &ep, "app").bypass_rls);
+    }
+
+    /// `RolePatch::apply` over every start and change: BYPASSRLS is the change's when it names
+    /// it; else it's dropped when the change takes owner level away, and kept otherwise.
+    #[test]
+    fn a_patch_drops_the_owner_levels_bypassrls_exhaustively() {
+        for start_owner in [false, true] {
+            for current in [false, true] {
+                for owner_level in [None, Some(false), Some(true)] {
+                    for bypass_rls in [None, Some(false), Some(true)] {
+                        let patch = RolePatch { owner_level, bypass_rls, ..RolePatch::default() };
+                        let start = chelabase_metadata::RoleAttributes {
+                            bypass_rls: current,
+                            ..Default::default()
+                        };
+                        let got = patch.apply(start_owner, &start).bypass_rls;
+                        let demoted = start_owner && owner_level == Some(false);
+                        let want = bypass_rls.unwrap_or(current && !demoted);
+                        assert_eq!(
+                            got, want,
+                            "start_owner={start_owner} current={current} {owner_level:?} {bypass_rls:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn update_role_refuses_roles_the_owner_does_not_administer() {
         let (w, journal) = worker();
@@ -4153,8 +4265,8 @@ mod tests {
 
     /// #425: a PATCH over an earlier one the compute hasn't confirmed, which named only the
     /// connection limit, starts from the catalog for every other field: an expiry set in SQL
-    /// since (`-infinity`) is left alone, the earlier limit is still driven, and the row's
-    /// named fields join both changes'.
+    /// since (`-infinity`) is left alone and the earlier limit is still driven. Once applied,
+    /// the row names every field again.
     #[tokio::test]
     async fn a_patch_over_a_pending_one_leaves_what_neither_named() {
         let (w, journal) = worker();
@@ -4172,7 +4284,8 @@ mod tests {
         expired.valid_until = Some(Timestamp::PG_ROUND_TRIP_MIN);
         in_catalog(&w, &expired);
         w.computes.sql.lock().unwrap().clear();
-        // The confirm loses (a receiver write meanwhile): the row stays as written.
+        // The confirm loses `pending` (a receiver write meanwhile); the attributes are confirmed
+        // by the change's id.
         w.metadata.state().confirm_version_moves = true;
         let patch = RolePatch {
             inherit: Some(false),
@@ -4187,59 +4300,108 @@ mod tests {
         );
         let row = w.metadata.state().endpoints[&ep].logins["app"].clone();
         assert_eq!(row.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "the SQL expiry");
-        assert_eq!(
-            row.attributes_named,
-            [RoleField::Inherit, RoleField::ConnectionLimit].into(),
-            "both changes' fields"
-        );
+        assert!(!row.attributes_pending);
+        assert_eq!(row.attributes_named, RoleField::all(), "applied: every field again");
     }
 
-    /// I3/I4 helpers for the merge (F3): the stored-or-catalog starting point, exhaustively.
+    /// I3/I4 helpers for the merge (F3): the stored-or-catalog starting point, exhaustively,
+    /// over every set of fields a pending change can name (#425): those from the row, the rest
+    /// from the catalog. BYPASSRLS that only came with owner level isn't kept when the pending
+    /// change takes owner level away and doesn't name BYPASSRLS.
     #[test]
     fn a_roles_current_state_follows_the_catalog_unless_a_change_is_pending() {
-        let row = |origin: RoleOrigin, pending: bool| chelabase_metadata::RoleCopy {
-            name: "r".into(),
-            origin,
-            scram_verifier: None,
-            password_enc: None,
-            login: true,
-            level: RoleLevel::Plain,
-            api_owner_level: true,
-            pending,
-            attributes_pending: pending,
-            attributes_named: chelabase_metadata::RoleField::all(),
-            created_at: Timestamp::now(),
-            attributes: chelabase_metadata::RoleAttributes {
-                connection_limit: 7,
-                ..Default::default()
-            },
+        use chelabase_metadata::RoleField;
+        let every: Vec<RoleField> = RoleField::all().into_iter().collect();
+        let subsets: Vec<std::collections::BTreeSet<RoleField>> = (0..1u32 << every.len())
+            .map(|bits| {
+                every
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| bits & (1 << i) != 0)
+                    .map(|(_, f)| *f)
+                    .collect()
+            })
+            .collect();
+        let row = |origin: RoleOrigin, pending: bool, stored_owner: bool, named: &std::collections::BTreeSet<RoleField>| {
+            chelabase_metadata::RoleCopy {
+                name: "r".into(),
+                origin,
+                scram_verifier: None,
+                password_enc: None,
+                login: true,
+                level: RoleLevel::Plain,
+                api_owner_level: stored_owner,
+                pending,
+                attributes_pending: pending,
+                attributes_named: named.clone(),
+                created_at: Timestamp::now(),
+                attributes: chelabase_metadata::RoleAttributes {
+                    connection_limit: 7,
+                    bypass_rls: true,
+                    ..Default::default()
+                },
+            }
         };
-        let catalog = |owner_admin: bool| crate::resync::ObservedRole {
+        let catalog = |owner_admin: bool, seen_owner: bool| crate::resync::ObservedRole {
             owner_admin,
             login: false,
             connection_limit: 3,
+            owner_level: seen_owner,
+            owner_attributes: seen_owner,
+            bypass_rls: seen_owner,
             ..crate::resync::ObservedRole::plain("r")
         };
-        let stored = (true, true, 7);
-        let seen = (false, false, 3);
+        let mut checked = 0;
         for origin in [None, Some(RoleOrigin::Sql), Some(RoleOrigin::Api)] {
             for pending in [false, true] {
                 for observed in [None, Some(false), Some(true)] {
-                    let r = origin.map(|o| row(o, pending));
-                    let o = observed.map(catalog);
-                    let got = current_role_state(r.as_ref(), o.as_ref())
-                        .map(|s| (s.owner_level, s.login, s.attributes.connection_limit));
-                    let api = origin == Some(RoleOrigin::Api);
-                    let want = match (api, pending, observed) {
-                        (true, true, _) | (true, _, None) => Ok(stored),
-                        (true, false, Some(_)) => Ok(seen),
-                        (false, _, Some(true)) => Ok(seen),
-                        (false, _, _) => Err(RoleOutcome::NotFound),
-                    };
-                    assert_eq!(got, want, "{origin:?} pending={pending} observed={observed:?}");
+                    for seen_owner in [false, true] {
+                        for stored_owner in [false, true] {
+                            let all = [RoleField::all()];
+                            let sets = if pending { &subsets[..] } else { &all[..] };
+                            for named in sets {
+                                let r = origin.map(|o| row(o, pending, stored_owner, named));
+                                let o = observed.map(|admin| catalog(admin, seen_owner));
+                                let got = current_role_state(r.as_ref(), o.as_ref()).map(|s| {
+                                    (s.owner_level, s.login, s.attributes.connection_limit, s.attributes.bypass_rls)
+                                });
+                                let has = |f: RoleField| named.contains(&f);
+                                let stored = (stored_owner, true, 7, true);
+                                let seen = (seen_owner, false, 3, seen_owner);
+                                let merged = {
+                                    let owner = if has(RoleField::OwnerLevel) { stored_owner } else { seen_owner };
+                                    let bypass = if has(RoleField::BypassRls) {
+                                        true
+                                    } else {
+                                        seen_owner && owner
+                                    };
+                                    (
+                                        owner,
+                                        has(RoleField::Login),
+                                        if has(RoleField::ConnectionLimit) { 7 } else { 3 },
+                                        bypass,
+                                    )
+                                };
+                                let api = origin == Some(RoleOrigin::Api);
+                                let want = match (api, pending, observed) {
+                                    (true, _, None) => Ok(stored),
+                                    (true, true, Some(_)) => Ok(merged),
+                                    (true, false, Some(_)) => Ok(seen),
+                                    (false, _, Some(true)) => Ok(seen),
+                                    (false, _, _) => Err(RoleOutcome::NotFound),
+                                };
+                                assert_eq!(
+                                    got, want,
+                                    "{origin:?} pending={pending} observed={observed:?} seen_owner={seen_owner} stored_owner={stored_owner} named={named:?}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
+        assert!(checked > 128 * 4, "{checked}");
     }
 
     /// I4 helper for the merge (F3): the membership check runs as SQL alone on any compute

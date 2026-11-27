@@ -828,7 +828,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(refused)?;
         }
-        let attributes = patch.apply(&o.attributes());
+        let attributes = patch.apply(o.owner_attributes, &o.attributes());
         let wanted = WantedRole {
             name,
             owner_level: patch.owner_level.unwrap_or(o.owner_attributes),
