@@ -20,8 +20,8 @@ axum = { workspace = true }
 chelabase-auth = { workspace = true }
 chelabase-types = { workspace = true }
 # The protocol's types and its stateless Streamable HTTP server.
-# chelabase/rmcp at upstream PR #1474 (chrono behind a default feature; drop the fork once a release has it).
-rmcp = { git = "https://github.com/chelabase/rmcp", rev = "9043cdfa8694d83bf506c2f3eb0313ec173edd7e", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# chrono is an optional default feature since 3.12, so default features stay off.
+rmcp = { version = "3.12", default-features = false, features = ["server", "transport-streamable-http-server"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
