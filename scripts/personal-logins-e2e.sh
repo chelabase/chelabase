@@ -309,8 +309,12 @@ connects "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "a new login after the grant came bac
 ok POST "/v1/members/$MEMBER_ID/suspend" 200
 jq -e '.status == "suspended"' "$tmp/body" >/dev/null || die "suspend: $(cat "$tmp/body")"
 refused "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "the login of a suspended member"
+# The member has no other active membership, so suspend also ends their identity sessions. The
+# orchestrator caches session liveness for 15 s, so the old token is refused one of two ways:
+# 403 member_suspended while the cached "live" holds, 401 once the ended session is seen.
 s="$(uapi "$DEV_TOKEN" GET "/v1/projects/$project_id")"
-[[ "$s" == 403 && "$(jq -r '.error.code' "$tmp/body")" == member_suspended ]] ||
+code="$(jq -r '.error.code' "$tmp/body" 2>/dev/null || true)"
+[[ ("$s" == 403 && "$code" == member_suspended) || ("$s" == 401 && "$code" == unauthorized) ]] ||
   die "a suspended member's API call: $s $(cat "$tmp/body")"
 ok POST "/v1/members/$MEMBER_ID/reinstate" 200
 jq -e '.status == "active"' "$tmp/body" >/dev/null || die "reinstate: $(cat "$tmp/body")"
@@ -321,7 +325,7 @@ done
 DEV_TOKEN="$(member_token)"
 new_login "$DEV_TOKEN" "$LOGIN"
 connects "$LOGIN" "$LOGIN_PW" "$MAIN_HOST" "a new login after reinstate"
-pass "suspend refuses the login and the API (member_suspended); reinstate keeps it refused until dev makes a new one"
+pass "suspend refuses the login and the API (member_suspended or session ended); reinstate keeps it refused until dev makes a new one"
 
 # --- 7. Revoke Postgres access now -----------------------------------------------------------------
 
