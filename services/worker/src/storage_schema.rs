@@ -105,10 +105,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 9;
+pub const STORAGE_SCHEMA_VERSION: u32 = 10;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 9";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 10";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -345,6 +345,14 @@ DO $$ BEGIN
   END IF;
 END $$;
 ALTER TABLE storage.upload_sessions ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_index i WHERE i.indexrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions_live_idx')
+      AND (i.indrelid OPERATOR(pg_catalog.<>) 'storage.upload_sessions'::pg_catalog.regclass OR NOT i.indisvalid
+        OR pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.<>) '{SESSION_INDEX_DEF}')) THEN
+    DROP INDEX storage.upload_sessions_live_idx;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS upload_sessions_live_idx ON storage.upload_sessions (key_id, bucket_id, owner, expires_at);
 ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS write_once boolean NOT NULL DEFAULT false;
 ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
 DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
@@ -609,6 +617,9 @@ pub fn storage_check_sql(owner_role: &str, verifier: Option<&str>) -> String {
                  AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets', 'objects']::pg_catalog.name[]) \
                  AND c.relowner OPERATOR(pg_catalog.=) r.oid AND c.relrowsecurity AND c.relforcerowsecurity) \
                OPERATOR(pg_catalog.=) 2 \
+             AND EXISTS (SELECT FROM pg_catalog.pg_index i WHERE i.indexrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions_live_idx') \
+               AND i.indrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions') AND i.indisvalid \
+               AND pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.=) '{SESSION_INDEX_DEF}') \
              AND NOT EXISTS ({objects}) \
              AND NOT EXISTS ({acl}) \
              AND NOT EXISTS (SELECT FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
@@ -667,7 +678,7 @@ UNION ALL SELECT pg_catalog.format('DROP %s IF EXISTS %s CASCADE', CASE c.relkin
     WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, c.oid::pg_catalog.regclass) \
   FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} \
     AND NOT ((c.relkind OPERATOR(pg_catalog.=) 'r' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets', 'objects', 'upload_tickets', 'upload_sessions']::pg_catalog.name[])) \
-      OR (c.relkind OPERATOR(pg_catalog.=) 'i' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets_pkey', 'buckets_name_key', 'objects_pkey', 'objects_bucket_id_name_key', 'upload_tickets_pkey', 'upload_sessions_pkey']::pg_catalog.name[])) \
+      OR (c.relkind OPERATOR(pg_catalog.=) 'i' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets_pkey', 'buckets_name_key', 'objects_pkey', 'objects_bucket_id_name_key', 'upload_tickets_pkey', 'upload_sessions_pkey', 'upload_sessions_live_idx']::pg_catalog.name[])) \
       OR (c.relkind OPERATOR(pg_catalog.=) 'c' AND c.relname OPERATOR(pg_catalog.=) 'object_ref')) \
 UNION ALL SELECT pg_catalog.format('DROP TYPE IF EXISTS %s CASCADE', t.oid::pg_catalog.regtype) FROM pg_catalog.pg_type t \
   WHERE t.typnamespace OPERATOR(pg_catalog.=) {ns} AND t.typrelid OPERATOR(pg_catalog.=) 0::pg_catalog.oid AND t.typtype OPERATOR(pg_catalog.<>) 'm' \
@@ -882,6 +893,9 @@ BEGIN
 END
 ";
 
+/// The live-session count's index (#336), as `pg_get_indexdef` prints it.
+pub const SESSION_INDEX_DEF: &str = "CREATE INDEX upload_sessions_live_idx ON storage.upload_sessions USING btree (key_id, bucket_id, owner, expires_at)";
+
 /// `chelabase_storage`'s oid, as the check reads it.
 const STORAGE_ROLE_OID: &str = "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')";
 
@@ -1059,6 +1073,7 @@ mod tests {
             assert!(
                 line.starts_with("CREATE SCHEMA IF NOT EXISTS ")
                     || line.starts_with("CREATE TABLE IF NOT EXISTS ")
+                    || line.starts_with("CREATE INDEX IF NOT EXISTS ")
                     || line.starts_with("CREATE OR REPLACE FUNCTION ")
                     || line.starts_with("CREATE OR REPLACE TRIGGER ")
                     // Inside a block that checks first.
@@ -1269,7 +1284,7 @@ mod tests {
         // #102's grant came with version 8, so a version-7 schema is reinstalled.
         assert_eq!(
             (STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP),
-            (9, "chelabase storage schema 9")
+            (10, "chelabase storage schema 10")
         );
         let sql = sql();
         assert!(
@@ -2243,11 +2258,32 @@ mod tests {
         assert!(EXPECTED_CONSTRAINTS.contains(&"upload_sessions.upload_sessions_pkey"));
     }
 
-    /// m14: the schema is version 9 with the bodies that cap live sessions and check the
+    /// #336: the live-session count has an index; the install makes it (healing a same-named
+    /// one that differs), the check requires exactly it, and cleanup leaves it alone.
+    #[test]
+    fn install_creates_the_session_index() {
+        assert_eq!(SESSION_INDEX_DEF, "CREATE INDEX upload_sessions_live_idx ON storage.upload_sessions USING btree (key_id, bucket_id, owner, expires_at)");
+        let sql = sql();
+        assert!(sql.contains("CREATE INDEX IF NOT EXISTS upload_sessions_live_idx ON storage.upload_sessions (key_id, bucket_id, owner, expires_at);"), "{sql}");
+        // A same-named index that differs (or is invalid) is dropped first, so it can't linger.
+        let drop = sql.find("DROP INDEX storage.upload_sessions_live_idx;").expect("the heal");
+        let create = sql.find("CREATE INDEX IF NOT EXISTS upload_sessions_live_idx").expect("the index");
+        assert!(drop < create, "{sql}");
+        // The index follows the table and its key_id column, which a pre-key_id table lacks.
+        assert!(sql.find("ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;").unwrap() < drop, "{sql}");
+        let check = storage_check_sql("postgres", Some(VERIFIER));
+        assert!(check.contains(&format!("AND i.indisvalid AND pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.=) '{SESSION_INDEX_DEF}'")), "{check}");
+        assert!(check.contains("pg_catalog.to_regclass('storage.upload_sessions_live_idx')"), "{check}");
+        assert!(foreign_objects_sql().contains("'upload_sessions_live_idx'"));
+        assert_eq!(STORAGE_SCHEMA_VERSION, 10);
+        assert_eq!(STORAGE_SCHEMA_STAMP, "chelabase storage schema 10");
+    }
+
+    /// m14: the schema was version 9 with the bodies that cap live sessions and check the
     /// recorded total; both are installed and compared by the health check.
     #[test]
     fn record_part_checks_the_running_total() {
-        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (9, "chelabase storage schema 9"));
+        assert!(STORAGE_SCHEMA_VERSION >= 9);
         for part in [
             // Other parts only (the replaced part doesn't count), plus this one, at most the limit.
             "sum((e.value->>'size')::bigint) FROM jsonb_each(u.parts) e WHERE e.key <> p_part::text",

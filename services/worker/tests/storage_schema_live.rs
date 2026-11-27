@@ -5522,3 +5522,64 @@ async fn record_part_holds_the_bucket_limit_live() {
         std::panic::resume_unwind(panic.into_panic());
     }
 }
+
+/// The healthy check, as the reconciler runs it.
+async fn storage_healthy(fx: &Fx) -> String {
+    last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await)
+}
+
+const SESSION_INDEX_SQL: &str = "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid = to_regclass('storage.upload_sessions_live_idx')";
+
+/// #336 AC 1: a fresh install has the index and the health check expects it (a database
+/// without it, or with another definition under the name, is unhealthy).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn install_makes_the_session_index_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF);
+        assert_eq!(storage_healthy(fx).await, "t");
+        fx.admin("DROP INDEX storage.upload_sessions_live_idx").await;
+        assert_eq!(storage_healthy(fx).await, "f", "no index");
+        fx.admin("CREATE INDEX upload_sessions_live_idx ON storage.upload_sessions (expires_at)").await;
+        assert_eq!(storage_healthy(fx).await, "f", "another definition");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF, "healed");
+        assert_eq!(storage_healthy(fx).await, "t");
+    }))
+    .await;
+}
+
+/// #336 AC 2: a database at the previous version (stamp 9, no index) is unhealthy, and the
+/// worker's install adds the index and the new stamp.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn upgrade_adds_the_session_index() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        fx.admin("DROP INDEX storage.upload_sessions_live_idx; COMMENT ON SCHEMA storage IS 'chelabase storage schema 9'").await;
+        assert_eq!(storage_healthy(fx).await, "f");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF);
+        assert_eq!(fx.value("SELECT obj_description('storage'::regnamespace, 'pg_namespace')").await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_eq!(storage_healthy(fx).await, "t");
+    }))
+    .await;
+}
+
+/// #336 AC 3: the guard's count, explained on a table of many rows, uses the index.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn session_count_uses_the_index_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        // 20000 live sessions over 200 keys; the guard's key and bucket match few of them.
+        fx.admin("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, timeline_id, expires_at)
+            SELECT gen_random_uuid(), '00000000-0000-0000-0000-0000000000b1', 'n' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', NULL,
+              ('00000000-0000-0000-0000-' || lpad((g % 200)::text, 12, '0'))::uuid, '{}', 't', clock_timestamp() + interval '1 hour'
+            FROM generate_series(1, 20000) g; ANALYZE storage.upload_sessions").await;
+        let plan = fx.admin("EXPLAIN SELECT count(*) FROM storage.upload_sessions s WHERE s.key_id = '00000000-0000-0000-0000-000000000007' AND s.owner IS NOT DISTINCT FROM NULL::uuid AND s.bucket_id = '00000000-0000-0000-0000-0000000000b1' AND s.expires_at > clock_timestamp()").await;
+        assert!(plan.contains("upload_sessions_live_idx") && !plan.contains("Seq Scan"), "{plan}");
+    }))
+    .await;
+}
