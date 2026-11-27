@@ -30,7 +30,6 @@ members = [
     "crates/chelabase-typegen",
     "crates/chelabase-storage",
     "crates/chelabase-pgsession",
-    "crates/chelabase-time",
 ]
 
 [workspace.package]
@@ -55,7 +54,7 @@ chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
 chelabase-storage = { path = "crates/chelabase-storage" }
 chelabase-pgsession = { path = "crates/chelabase-pgsession" }
-chelabase-time = { path = "crates/chelabase-time" }
+chelabase-time = { git = "https://github.com/chelabase/time", rev = "9504addde2c5d6469c1cd59c6c8fe8083980b17f", features = ["sqlx", "openapi"] }  # v0.1.0
 
 axum = "0.8.9"
 # `jiff_0_2` only teaches the macros the names `Timestamp` and `Date` (no extra crate).
