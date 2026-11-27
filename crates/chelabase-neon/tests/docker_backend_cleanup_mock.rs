@@ -832,6 +832,7 @@ async fn the_engine_receives_the_resolver_and_no_capability() {
     let bodies = bodies.lock().unwrap();
     let host = &bodies[0]["HostConfig"];
     assert_eq!(host["Dns"], serde_json::json!(["10.214.8.2"]), "{host}");
+    assert_eq!(host["DnsOptions"], serde_json::json!(["timeout:1", "attempts:1"]), "{host}");
     assert_eq!(host["CapDrop"], serde_json::json!(["ALL"]), "{host}");
     assert!(host.get("ExtraHosts").is_none_or(|h| h.is_null()), "{host}");
 }

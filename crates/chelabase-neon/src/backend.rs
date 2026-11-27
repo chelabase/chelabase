@@ -372,12 +372,21 @@ pub fn create_body(
             memory: Some(MEMORY_BYTES),
             nano_cpus: Some(NANO_CPUS),
             dns: docker.egress_dns.map(|ip| vec![ip.to_string()]),
+            dns_options: docker.egress_dns.map(|_| resolver_options()),
             cap_drop: Some(vec!["ALL".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// glibc resolver options for a compute with a pinned resolver. Docker's embedded resolver forwards
+/// to the pinned address, and with glibc's defaults (5 s, 2 attempts) a lookup of an outside name
+/// in the default install, where nothing listens there, takes about 32 s to fail; with these it
+/// takes about 4 s. A live egress answers in milliseconds, so allowed names are unaffected.
+fn resolver_options() -> Vec<String> {
+    vec!["timeout:1".to_string(), "attempts:1".to_string()]
 }
 
 /// psql as cloud_admin against `database` on the compute's own Postgres, with terse errors
@@ -1952,6 +1961,10 @@ mod tests {
             .host_config
             .unwrap();
         assert_eq!(host.dns, Some(vec!["10.214.8.2".to_string()]));
+        assert_eq!(
+            host.dns_options,
+            Some(vec!["timeout:1".to_string(), "attempts:1".to_string()])
+        );
         assert_eq!(host.extra_hosts, None);
     }
 
@@ -1961,6 +1974,7 @@ mod tests {
             .host_config
             .unwrap();
         assert_eq!(host.dns, None);
+        assert_eq!(host.dns_options, None);
         assert_eq!(host.extra_hosts, None);
     }
 
