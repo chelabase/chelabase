@@ -1380,7 +1380,7 @@ services:
   # Its image is a release image like the apps', pinned the same way (CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick it too).
   storage:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:3077175b8853643c493f293cfebeb971a951622e3e93ea2a76a8f018663a2d79}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/storage:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:d73bb52aa5a47cd757aec8c803dfd2b7d3adc6caa1a3e251974af612019ebad6}
     restart: unless-stopped
     read_only: true
     environment:
