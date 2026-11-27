@@ -711,9 +711,9 @@ impl MetadataClient {
     /// user in its project, in this transaction (`revoke_reused`).
     ///
     /// A transaction that Postgres aborts as a deadlock victim (only reuse takes more than its
-    /// own row) wrote nothing and is run once more, from the start: the other writer has
-    /// committed by then, so the second run finds the session revoked (`Invalid`) or revokes it
-    /// (`Reused`). A second deadlock is the caller's error.
+    /// own row) wrote nothing and is run once more, from the start. The second run waits for
+    /// the session row until the other writer ends, then finds the session revoked (`Invalid`)
+    /// or revokes it (`Reused`). A second deadlock is the caller's error.
     pub async fn refresh_app_session(
         &self,
         id: Uuid,
