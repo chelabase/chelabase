@@ -175,7 +175,7 @@ export const getAppChangeEmailUrl = () => {
 }
 
 /**
- * Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.
+ * Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies, and every other session of the user ends.
  */
 export const appChangeEmail = async (appChangeEmailBody: AppChangeEmailBody, options?: Parameters<typeof customFetch>[1]): Promise<AppEmailChangePending | void> => {
 
@@ -260,7 +260,7 @@ export const getAppConfirmEmailChangeUrl = () => {
 }
 
 /**
- * Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.
+ * Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, the previous address is told, and every other session of the user ends.
  */
 export const appConfirmEmailChange = async (appChangeEmailConfirmBody: AppChangeEmailConfirmBody, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
 
@@ -698,7 +698,7 @@ export const getAppRefreshUrl = () => {
 }
 
 /**
- * Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later revokes the session).
+ * Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later ends every session of the user).
  */
 export const appRefresh = async (appRefreshBody: AppRefreshBody, options?: Parameters<typeof customFetch>[1]): Promise<AppSession> => {
 

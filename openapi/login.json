@@ -134,7 +134,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.",
+        "description": "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies, and every other session of the user ends.",
         "operationId": "appChangeEmail",
         "requestBody": {
           "content": {
@@ -248,7 +248,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.",
+        "description": "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, the previous address is told, and every other session of the user ends.",
         "operationId": "appConfirmEmailChange",
         "requestBody": {
           "content": {
@@ -702,7 +702,7 @@
         "tags": [
           "app-users"
         ],
-        "description": "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later revokes the session).",
+        "description": "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later ends every session of the user).",
         "operationId": "appRefresh",
         "requestBody": {
           "content": {
@@ -736,7 +736,7 @@
             }
           },
           "401": {
-            "description": "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; the session is revoked), or no valid public key (`unauthorized`)",
+            "description": "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; every session of the user is revoked), or no valid public key (`unauthorized`)",
             "content": {
               "application/json": {
                 "schema": {

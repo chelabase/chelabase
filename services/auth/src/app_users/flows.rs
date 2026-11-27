@@ -269,12 +269,12 @@ async fn app_sign_in(
     path = "/auth/v1/app/refresh",
     operation_id = "appRefresh",
     tag = TAG,
-    description = "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later revokes the session).",
+    description = "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later ends every session of the user).",
     request_body = AppRefreshBody,
     responses(
         (status = 200, description = "The new session", body = SessionResponse),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
-        (status = 401, description = "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; the session is revoked), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
+        (status = 401, description = "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; every session of the user is revoked), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
         (status = 403, description = "The user is deactivated or locked: `user_inactive`", body = ErrorEnvelope),
         (status = 409, description = "App users are off: `app_users_disabled`", body = ErrorEnvelope),
         (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
@@ -473,7 +473,7 @@ async fn app_password_reset_confirm(
     path = "/auth/v1/app/change-email",
     operation_id = "appChangeEmail",
     tag = TAG,
-    description = "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.",
+    description = "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies, and every other session of the user ends.",
     request_body = AppChangeEmailBody,
     responses(
         (status = 202, description = "Verification is on: a code went to the new address; nothing changed yet", body = EmailChangePending),
@@ -506,7 +506,7 @@ async fn app_change_email(
     path = "/auth/v1/app/change-email/confirm",
     operation_id = "appConfirmEmailChange",
     tag = TAG,
-    description = "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.",
+    description = "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, the previous address is told, and every other session of the user ends.",
     request_body = AppChangeEmailConfirmBody,
     responses(
         (status = 204, description = "Changed"),
@@ -804,6 +804,19 @@ fn session_response(
     })
 }
 
+/// Runs the steps of a flow from its write in identity onward as their own task, and waits for
+/// the answer. A request whose connection closes drops its future, but the task goes on: once
+/// identity has stored the change, the steps after it (the sync, ending the user's sessions,
+/// the new session) still run, where a retry could not redo them (#311). Nothing before the
+/// write runs in it, so a request dropped earlier changes nothing. `what` names the flow in
+/// the log.
+async fn to_the_end(what: &'static str, steps: impl Future<Output = Flow> + Send + 'static) -> Flow {
+    tokio::spawn(steps).await.unwrap_or_else(|e| {
+        warn!(error = %e, flow = what, "a flow's task failed after its write may have been made");
+        Err(unavailable())
+    })
+}
+
 /// Ends one identity session; one already gone is fine, a failure is only logged (the app
 /// session it would back was never made, or is revoked).
 async fn end_identity_session(s: &AppState, pool: &Pool, session_id: &str) {
@@ -811,6 +824,52 @@ async fn end_identity_session(s: &AppState, pool: &Pool, session_id: &str) {
         Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
         Err(e) => warn!(error = %e, "ending an identity session failed"),
     }
+}
+
+/// Checks a user's current password with an identity sign-in and ends the session that sign-in
+/// made, whatever the verdict's caller does next: the answer is the sign-in's, its session
+/// already ended.
+///
+/// The two calls run as their own task. A request dropped mid-way (the client hung up) drops
+/// its future, and identity may have made the session by then; the task still ends it, so no
+/// identity session of the user outlives a cancelled check (#311).
+async fn check_password(s: &AppState, pool: &Pool, email: &str, password: &str) -> Result<SignedIn, IdentityError> {
+    let identity = s.identity.clone();
+    let (pool, email, password) = (*pool, email.to_string(), password.to_string());
+    let task = tokio::spawn(async move {
+        let signed = identity.sign_in(&pool, &email, &password).await?;
+        match identity.revoke_session(&pool, &signed.session_id).await {
+            Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
+            Err(e) => warn!(error = %e, "ending a password check's identity session failed"),
+        }
+        Ok(signed)
+    });
+    task.await.unwrap_or_else(|e| {
+        warn!(error = %e, "the password check task failed");
+        Err(IdentityError::Unavailable(e.to_string()))
+    })
+}
+
+/// Ends every other app session of the user after an email change, and the identity session
+/// behind each (the orchestrator ends those); the caller's session `keep` and its identity
+/// session go on. A failure is 503: the address is changed already, and a retry of the change
+/// can't redo this (it answers 409, or `invalid_code` for a spent code), so it is never
+/// answered as done (#311).
+async fn end_other_sessions(app: &AppUsers, info: &AppBranchInfo, user: Uuid, keep: Uuid) -> Flow<()> {
+    app.internal
+        .revoke_user_sessions(
+            user,
+            &RevokeUserSessions {
+                project_id: info.project_id,
+                keep_session_id: Some(keep),
+                created_before: None,
+            },
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, user = %user, "the email changed but the user's other sessions were not ended");
+            unavailable()
+        })
 }
 
 /// With the password checked (`signed`, a new identity session): the user's state, then the
@@ -1185,14 +1244,16 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
 ///   into reuse (#59 audit B1). A fault after that answers 503; the client keeps a grace
 ///   token, which works again only until its grace ends.
 /// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
-///   revokes on reuse); a session that `refresh` names but peek didn't check is checked after.
+///   revokes on reuse, and then every session of the user: #311); a session that `refresh`
+///   names but peek didn't check is checked after.
 ///
 /// A request that peeked a current token just before a parallel one rotated it reaches
 /// `refresh` holding a grace token. [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP) caps
 /// the lookup at half of [`APP_REFRESH_GRACE`](chelabase_auth::app_token::APP_REFRESH_GRACE)
 /// or less, so it gets the grace answer provided the peek's reply, the `refresh` call and its
 /// row lock take under the rest. If they take longer, the grace has ended: `refresh` answers
-/// `refresh_token_reused` and revokes the session, an accepted residual (#59 second audit).
+/// `refresh_token_reused` and revokes the user's sessions, an accepted residual (#59 second
+/// audit; all of the user's sessions since #311).
 /// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
 /// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
@@ -1225,7 +1286,7 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
             return Err(fail(
                 401,
                 ErrorCode::RefreshTokenReused,
-                "This refresh token was used already; the session is ended, sign in again",
+                "This refresh token was used already; the user's sessions are ended, sign in again",
             ));
         }
         // Only the orchestrator's own verdict ends the session: clients drop their cookies on
@@ -1446,9 +1507,11 @@ async fn password_reset(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Fl
 /// The code sets the password and ends the user's identity sessions in one step (identity's
 /// `verify_code`), then the app sessions are revoked. If that revocation fails, the answer is
 /// still 204: each old app session is refused at its next refresh, because the identity session
-/// behind it is gone. A retry can't redo it (the code is spent), and needn't.
+/// behind it is gone. A retry can't redo it (the code is spent), and needn't. From identity's
+/// check of the code on, the steps run [`to_the_end`]: a connection closed after the password
+/// is set still gets the revoke (the check's slot is then not given back).
 async fn password_reset_confirm(
-    s: &AppState,
+    s: &Arc<AppState>,
     caller: &AppCaller,
     b: AppPasswordResetConfirmBody,
 ) -> Flow {
@@ -1470,61 +1533,71 @@ async fn password_reset_confirm(
     let Some((user_id, _)) = find_user(s, &info, &email).await? else {
         return Err(bad_code());
     };
-    match s
-        .identity
-        .verify_code(
-            &pool(&info),
-            &user_id.to_string(),
-            CodeKind::Reset,
-            b.code.trim(),
-            Some(&b.password),
-        )
-        .await
-    {
-        Ok(_) => slot.refund(),
-        Err(e) if is_weak(&e) => return Err(weak_password()),
-        // The stored guess budget is spent: no code is checked, a right one included. The email's
-        // own check bound refuses first, so this answers only after an auth restart lost its count.
-        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
-        // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
-        Err(
-            IdentityError::CodeInvalid
-            | IdentityError::Invalid { .. }
-            | IdentityError::NotFound(Missing::User),
-        ) => return Err(bad_code()),
-        Err(e) => return Err(identity_down(&e)),
-    }
-    if let Err(e) = app
-        .internal
-        .revoke_user_sessions(
-            user_id,
-            &RevokeUserSessions {
-                project_id: info.project_id,
-                keep_session_id: None,
-                created_before: None,
-            },
-        )
-        .await
-    {
-        warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed; their refresh is refused anyway");
-    }
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let s = s.clone();
+    let answer = to_the_end("password reset", async move {
+        match s
+            .identity
+            .verify_code(
+                &pool(&info),
+                &user_id.to_string(),
+                CodeKind::Reset,
+                b.code.trim(),
+                Some(&b.password),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if is_weak(&e) => return Err(weak_password()),
+            // The stored guess budget is spent: no code is checked, a right one included. The email's
+            // own check bound refuses first, so this answers only after an auth restart lost its count.
+            Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
+            // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
+            Err(
+                IdentityError::CodeInvalid
+                | IdentityError::Invalid { .. }
+                | IdentityError::NotFound(Missing::User),
+            ) => return Err(bad_code()),
+            Err(e) => return Err(identity_down(&e)),
+        }
+        if let Err(e) = self::app(&s)
+            .internal
+            .revoke_user_sessions(
+                user_id,
+                &RevokeUserSessions {
+                    project_id: info.project_id,
+                    keep_session_id: None,
+                    created_before: None,
+                },
+            )
+            .await
+        {
+            warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed; their refresh is refused anyway");
+        }
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })
+    .await?;
+    // Only a right code answers `Ok`.
+    slot.refund();
+    Ok(answer)
 }
 
 /// Changes the email, behind the current password. In order:
 ///
 /// 1. rate limits, the address's shape, the branch;
 /// 2. the current password, checked with an identity sign-in against the current address. The
-///    check's identity session is ended at once, whatever comes next;
+///    check's identity session is ended at once, whatever comes next, a dropped request
+///    included ([`check_password`]);
 /// 3. an address another user holds is 409 `email_taken`, the user's own 409 `conflict`;
 /// 4. verification on: a code goes to the new address (within [`reserve_code_issue`]; 429
 ///    while a code sent under a minute ago stands) and the answer is 202 with nothing changed;
 ///    `change-email/confirm` makes the change. Verification off: the address is set, verified,
-///    the previous address is told, and the change is synced.
+///    the previous address is told, the change is synced, and the user's other sessions end
+///    ([`end_other_sessions`]).
 ///
-/// Sessions continue. Nothing is written before step 4, so any refusal changes nothing. A lost
-/// sync is the reconcile's.
-async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -> Flow {
+/// The caller's session continues. Nothing is written and no session ends before step 4, so
+/// any refusal changes nothing. A lost sync is the reconcile's. From the swap on, the steps
+/// run [`to_the_end`]: a connection closed after it still gets the sync and the revoke.
+async fn change_email(s: &Arc<AppState>, caller: &AppCaller, b: AppChangeEmailBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
         return Err(no_user());
@@ -1553,13 +1626,9 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
         Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
         Err(e) => return Err(identity_down(&e)),
     };
-    match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
-        Ok(signed) => {
-            end_identity_session(s, &pool, &signed.session_id).await;
-            if signed.user.id != sub {
-                return Err(refused());
-            }
-        }
+    match check_password(s, &pool, &current.email, &b.current_password).await {
+        Ok(signed) if signed.user.id == sub => {}
+        Ok(_) => return Err(refused()),
         Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
             return Err(refused());
         }
@@ -1593,19 +1662,31 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
             Err(e) => Err(email_write_refused(e)),
         };
     }
-    if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true, mail_name(&info)).await {
-        return Err(email_write_refused(e));
-    }
+    let (s, user, keep) = (s.clone(), claims.sub, claims.sid);
+    to_the_end("email change", async move {
+        if let Err(e) = s.identity.set_email_notifying(&pool, &sub, &email, true, mail_name(&info)).await {
+            return Err(email_write_refused(e));
+        }
+        email_changed(&s, &info, user, keep).await
+    })
+    .await
+}
+
+/// After identity swapped a user's address in: the change is synced and the user's other
+/// sessions end, `keep` (the caller's) going on.
+async fn email_changed(s: &AppState, info: &AppBranchInfo, user: Uuid, keep: Uuid) -> Flow {
+    let app = app(s);
     publish_sync(
         app,
         SyncRequest {
             project_id: info.project_id,
-            user_id: claims.sub,
+            user_id: user,
             data: None,
             origin_branch_id: None,
         },
     )
     .await;
+    end_other_sessions(app, info, user, keep).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1631,9 +1712,12 @@ fn email_write_refused(e: IdentityError) -> ApiError {
 /// Finishes a pending email change for the token's user (never one named in the body): the
 /// code must have been mailed to `email` for this user, while their current address is the one
 /// it was issued under. Identity swaps the address in, verified, and tells the previous one;
-/// then the change is synced.
+/// then the change is synced and the user's other sessions end ([`end_other_sessions`]). A
+/// refused code changes nothing and ends no session. From identity's check of the code on, the
+/// steps run [`to_the_end`]: a connection closed after the swap still gets the sync and the
+/// revoke.
 async fn change_email_confirm(
-    s: &AppState,
+    s: &Arc<AppState>,
     caller: &AppCaller,
     b: AppChangeEmailConfirmBody,
 ) -> Flow {
@@ -1657,42 +1741,36 @@ async fn change_email_confirm(
     if !valid_email(&email) {
         return Err(bad_code());
     }
-    match s
-        .identity
-        .confirm_email_change(&pool(&info), &sub, &email, b.code.trim(), mail_name(&info))
-        .await
-    {
-        Ok(_) => {}
-        // The stored guess budget is spent: no code is checked, a right one included.
-        Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
-        // A wrong, used, expired or locked code, one for another address, or a current
-        // address changed since it was issued.
-        Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. }) => return Err(bad_code()),
-        // Another user took the address since the code was issued (the code is spent).
-        Err(IdentityError::Conflict(_)) => {
-            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
+    let (s, user, keep) = (s.clone(), claims.sub, claims.sid);
+    to_the_end("email change confirmation", async move {
+        match s
+            .identity
+            .confirm_email_change(&pool(&info), &sub, &email, b.code.trim(), mail_name(&info))
+            .await
+        {
+            Ok(_) => {}
+            // The stored guess budget is spent: no code is checked, a right one included.
+            Err(IdentityError::CodeBudgetSpent) => return Err(too_many()),
+            // A wrong, used, expired or locked code, one for another address, or a current
+            // address changed since it was issued.
+            Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. }) => return Err(bad_code()),
+            // Another user took the address since the code was issued (the code is spent).
+            Err(IdentityError::Conflict(_)) => {
+                return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
+            }
+            Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
+            Err(e) => return Err(identity_down(&e)),
         }
-        Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
-        Err(e) => return Err(identity_down(&e)),
-    }
-    publish_sync(
-        app,
-        SyncRequest {
-            project_id: info.project_id,
-            user_id: claims.sub,
-            data: None,
-            origin_branch_id: None,
-        },
-    )
-    .await;
-    Ok(StatusCode::NO_CONTENT.into_response())
+        email_changed(&s, &info, user, keep).await
+    })
+    .await
 }
 
 /// Changes the password and returns a new session; every other session ends. In order:
 ///
-/// 1. the current password is checked with an identity sign-in;
-/// 2. `set_password`. A failure up to here changes nothing (the check's identity session is
-///    ended), and a retry works;
+/// 1. the current password is checked with an identity sign-in, whose session is ended at
+///    once, a dropped request included ([`check_password`]);
+/// 2. `set_password`. A failure up to here changes nothing, and a retry works;
 /// 3. the user's sessions end in both stores, identity's then the app sessions, each attempted
 ///    whatever the other did. Either alone refuses every old refresh token: a revoked app
 ///    session directly, one whose identity session is gone at its next refresh. Only when both
@@ -1700,8 +1778,10 @@ async fn change_email_confirm(
 /// 4. a sign-in with the new password, and its app session. If that fails, the answer is 503
 ///    with the change done and every session ended: the user signs in with the new password.
 ///
-/// After step 2, a retry with the same body is refused (the current password is the new one).
-async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordBody) -> Flow {
+/// After step 2, a retry with the same body is refused (the current password is the new one),
+/// so steps 2 to 4 run [`to_the_end`]: a connection closed after the password is stored still
+/// gets steps 3 and 4. The session step 4 makes then has no holder and runs out unused.
+async fn change_password(s: &Arc<AppState>, caller: &AppCaller, b: AppChangePasswordBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
         return Err(no_user());
@@ -1731,57 +1811,57 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         return Err(fail(403, ErrorCode::EmailNotVerified, text::NOT_VERIFIED));
     }
     // 1.
-    let check = match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
-        Ok(signed) if signed.user.id == sub => signed,
-        Ok(signed) => {
-            end_identity_session(s, &pool, &signed.session_id).await;
-            return Err(refused());
-        }
+    match check_password(s, &pool, &current.email, &b.current_password).await {
+        Ok(signed) if signed.user.id == sub => {}
+        Ok(_) => return Err(refused()),
         Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
             return Err(refused());
         }
         Err(e) => return Err(identity_down(&e)),
-    };
-    // 2.
-    if let Err(e) = s.identity.set_password(&pool, &sub, &b.password).await {
-        end_identity_session(s, &pool, &check.session_id).await;
-        return Err(match e {
-            e if is_weak(&e) => weak_password(),
-            IdentityError::NotFound(Missing::User) => no_user(),
-            e => identity_down(&e),
-        });
     }
-    // 3.
-    let identity_ended = s.identity.revoke_user_sessions(&pool, &sub).await;
-    let app_ended = app
-        .internal
-        .revoke_user_sessions(
-            claims.sub,
-            &RevokeUserSessions {
-                project_id: info.project_id,
-                keep_session_id: None,
-                created_before: None,
-            },
-        )
-        .await;
-    match (&identity_ended, &app_ended) {
-        (Err(i), Err(a)) => {
-            warn!(identity = %i, app = %a, user = %sub, "the password changed but no session was ended");
-            return Err(unavailable());
+    let (s, user, email) = (s.clone(), claims.sub, current.email);
+    to_the_end("password change", async move {
+        // 2.
+        if let Err(e) = s.identity.set_password(&pool, &sub, &b.password).await {
+            return Err(match e {
+                e if is_weak(&e) => weak_password(),
+                IdentityError::NotFound(Missing::User) => no_user(),
+                e => identity_down(&e),
+            });
         }
-        (Err(e), Ok(())) => {
-            warn!(error = %e, user = %sub, "ending the identity sessions after a password change failed");
+        // 3.
+        let identity_ended = s.identity.revoke_user_sessions(&pool, &sub).await;
+        let app_ended = self::app(&s)
+            .internal
+            .revoke_user_sessions(
+                user,
+                &RevokeUserSessions {
+                    project_id: info.project_id,
+                    keep_session_id: None,
+                    created_before: None,
+                },
+            )
+            .await;
+        match (&identity_ended, &app_ended) {
+            (Err(i), Err(a)) => {
+                warn!(identity = %i, app = %a, user = %sub, "the password changed but no session was ended");
+                return Err(unavailable());
+            }
+            (Err(e), Ok(())) => {
+                warn!(error = %e, user = %sub, "ending the identity sessions after a password change failed");
+            }
+            (Ok(()), Err(e)) => {
+                warn!(error = %e, user = %sub, "revoking the app sessions after a password change failed; their refresh is refused anyway");
+            }
+            (Ok(()), Ok(())) => {}
         }
-        (Ok(()), Err(e)) => {
-            warn!(error = %e, user = %sub, "revoking the app sessions after a password change failed; their refresh is refused anyway");
-        }
-        (Ok(()), Ok(())) => {}
-    }
-    // 4.
-    let signed = match s.identity.sign_in(&pool, &current.email, &b.password).await {
-        Ok(signed) => signed,
-        Err(e) => return Err(identity_down(&e)),
-    };
-    let (session, _) = open_session(s, &info, signed).await?;
-    Ok(Json(session).into_response())
+        // 4.
+        let signed = match s.identity.sign_in(&pool, &email, &b.password).await {
+            Ok(signed) => signed,
+            Err(e) => return Err(identity_down(&e)),
+        };
+        let (session, _) = open_session(&s, &info, signed).await?;
+        Ok(Json(session).into_response())
+    })
+    .await
 }

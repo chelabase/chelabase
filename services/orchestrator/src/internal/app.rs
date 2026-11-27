@@ -408,9 +408,15 @@ where
                 Err(e) => return internal("opening the grace refresh token", e),
             }
         }
-        RefreshOutcome::Reused(session) => {
-            warn!(session_id = %id, "an earlier refresh token was reused; the session is revoked");
-            end_identity_sessions_later(&state, vec![session]);
+        // The user and project are the token's own session's, read under its lock: a reused
+        // token ends that user's sessions in that project and nobody else's (#311).
+        RefreshOutcome::Reused(sessions) => {
+            warn!(
+                session_id = %id,
+                revoked = sessions.len(),
+                "an earlier refresh token was reused; every session of its user is revoked"
+            );
+            end_identity_sessions_later(&state, sessions);
             return ApiError::new(
                 401,
                 ErrorCode::RefreshTokenReused,

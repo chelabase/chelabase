@@ -106,7 +106,7 @@ An opaque string that starts with the session id. It expires on a sliding schedu
 
 - Every refresh rotates it.
 - Within 10 seconds of a rotation, presenting the previous token returns the same new pair (two tabs refreshing at once).
-- After that, presenting it revokes the session: 401 `refresh_token_reused`. The same goes for any earlier refresh token of the session, not only the last one.
+- After that, presenting it revokes every session of the user: 401 `refresh_token_reused`. The same goes for any earlier refresh token of the session, not only the last one.
 
 The client refreshes 60 seconds before the access token expires, refreshes first when a request would carry a token with under 5 seconds left, and refreshes once after a data request answers 401 `user_token_expired`. It signs out locally (and emits `signed_out`) when a refresh answers `refresh_token_reused`, `refresh_token_invalid`, `user_session_revoked` or `user_inactive`, or when any request answers `user_session_revoked`.
 
@@ -117,7 +117,7 @@ The client refreshes 60 seconds before the access token expires, refreshes first
 - **Verification on:** the answer is 202 `{ "confirmation_required": true }` and a code goes to the new address. The account keeps its current, verified address until `change-email/confirm` with `{ email, code }` (the same new address and the code). Then the address changes, verified. A wrong code, or one for another address, is 422 `invalid_code`; an address another user took meanwhile is 409 `email_taken`. The code needs mail: without SMTP configured, `change-email` answers 503 `unavailable` and changes nothing. A second ask within a minute of a code is 429 `rate_limited`.
 - **Verification off:** the answer is 204 and the new address applies at once, verified.
 
-When the address changes, the previous one gets a notice (when SMTP is configured). Sessions continue; tokens carry the new `email` claim from their next refresh.
+When the address changes, the previous one gets a notice (when SMTP is configured). The session that made the change continues, and its tokens carry the new `email` claim from the next refresh; the user's other sessions end.
 
 ```ts twoslash
 import { createClient } from '@chelabase/client';
