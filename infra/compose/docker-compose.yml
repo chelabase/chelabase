@@ -1443,7 +1443,7 @@ services:
   # run-as key) and the bundles bucket as the `functions` S3 identity, and listens for
   # `chelabase.fn.changed.*` as its own NATS user. On by default, with the runtime.
   functions:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:117e14a52bcf0d2e4e911fb3519d3b89df539537405f54f44012936614561328}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:12d0b2de78b92f58ef55b81e20cb6160a01f896dea79db50586a629ccddf4d36}
     restart: unless-stopped
     read_only: true
     environment:
