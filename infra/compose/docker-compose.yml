@@ -1005,7 +1005,7 @@ services:
         condition: service_healthy
 
   orchestrator:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:7a1c1ef39c3baf017e7d6a6704cd806276f3174ca363cdddd4cded58a197163f}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:920418122a8bf3c48eefe8f29075e43e6b344d7b87149ee07cbed05b760f0b05}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
