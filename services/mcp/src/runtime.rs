@@ -110,7 +110,10 @@ impl Runtime {
             }
         }
         match serde_json::from_slice::<Answer>(&bytes) {
-            Ok(answer) => answer.into_ran(),
+            Ok(answer) => {
+                run.journal.unreceived(&answer.unreceived);
+                answer.into_ran()
+            }
             Err(_) => unavailable("the code runtime's answer is malformed".into()),
         }
     }
@@ -125,6 +128,9 @@ struct Answer {
     error: Option<AnswerError>,
     #[serde(default)]
     logs: Vec<String>,
+    /// `execute`: the runner's numbers of the calls whose answer never reached the code.
+    #[serde(default)]
+    unreceived: Vec<u32>,
 }
 
 #[derive(Deserialize)]

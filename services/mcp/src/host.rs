@@ -60,10 +60,15 @@
 //!    - *upstream-unavailable*: the host handed the code `upstream_unavailable` (the API's
 //!      connection failed; the call may or may not have run);
 //!    - *unanswered*: the code never got its outcome (cut at the deadline or the run's end,
-//!      or its handler dropped). It may have been applied.
+//!      its handler dropped, or its answer never reached the code). It may have been applied.
 //!
-//!    The entry is marked when the handler hands its answer back, the last synchronous step
-//!    before the answer goes out; a call answered `timeout` stays unanswered.
+//!    The entry is marked answered when the handler hands its answer back, the last
+//!    synchronous step on the host; a call answered `timeout` stays unanswered. The answer can
+//!    still miss the code after that: the code settles before the runner reads an un-awaited
+//!    call's answer, or the answer fails on its way to the runner. The runner numbers each
+//!    call ([`CALL_HEADER`]) and, when the run ends, reports the numbers whose answer it never
+//!    handed back (`unreceived`, [`Journal::unreceived`]); those entries are unanswered again,
+//!    and stay so if the handler's mark comes later.
 //! 3. **Unanswered calls make the result an error with `calls`.** Whenever an entry is
 //!    unanswered, the tool result is an error, whatever the code returned or threw: the run's
 //!    refusal if it was refused, `timeout` if the host's deadline passed or the runner timed
@@ -77,6 +82,7 @@
 //! Calls are never kept running past the run to learn their outcome: unanswered is the end
 //! state, reported as `unknown`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -84,7 +90,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde::Deserialize;
@@ -97,6 +103,9 @@ use crate::sandbox::Kind;
 use crate::secret_fields;
 
 pub const DEFAULT_MAX_CALLS: u32 = 50;
+/// The runner's number for a call (1, 2, … per run), on the callback request; the runner's
+/// `unreceived` names calls by it.
+pub const CALL_HEADER: &str = "chelabase-call";
 /// The tool error when the code returned while a call it made had no answer yet.
 pub const CALLS_UNFINISHED: &str = "calls_unfinished";
 pub const DEFAULT_RESPONSE_MAX_BYTES: usize = 1 << 20;
@@ -113,8 +122,8 @@ pub const ANSWER_HEADERS: [&str; 3] = ["content-type", "retry-after", "x-request
 /// body over [`MAX_REQUEST_BODY_BYTES`] reaches the host and answers `request_too_large`.
 pub const MAX_ENVELOPE_BYTES: usize = 4 << 20;
 /// The largest answer the runner reads (`MAX_HOST_ANSWER_BYTES` in `runner.js`). An answer
-/// whose JSON text is larger is refused `response_too_large` here, so every answer the host
-/// marks delivered reaches the code.
+/// whose JSON text is larger is refused `response_too_large` here, so the runner can read every
+/// answer the host sends.
 pub const RUNNER_ANSWER_MAX_BYTES: usize = 8 << 20;
 
 /// The callback's settings.
@@ -335,6 +344,10 @@ struct Calls {
     made: Vec<Made>,
     /// The host's deadline passed during the run (a call was cut at it, or came after it).
     timed_out: bool,
+    /// The entry of each answered call, by the runner's number.
+    delivered: HashMap<u32, usize>,
+    /// The runner's numbers of calls whose answer never reached the code.
+    unreceived: HashSet<u32>,
 }
 
 /// What a run's API calls did, shared by the tool call and the host.
@@ -385,11 +398,34 @@ impl Journal {
         self.state().timed_out = true;
     }
 
-    /// Marks entry `index` answered: the code is getting its outcome.
-    fn deliver(&self, delivery: Delivery) {
-        if let Some(made) = self.state().made.get_mut(delivery.index) {
+    /// Marks entry `index` answered: the code is getting its outcome. `call` is the runner's
+    /// number for it; a call the runner already reported unreceived stays unanswered.
+    fn deliver(&self, delivery: Delivery, call: Option<u32>) {
+        let mut state = self.state();
+        if call.is_some_and(|n| state.unreceived.contains(&n)) {
+            return;
+        }
+        if let Some(made) = state.made.get_mut(delivery.index) {
             made.answered = true;
             made.upstream_unavailable = delivery.upstream_unavailable;
+            if let Some(n) = call {
+                state.delivered.insert(n, delivery.index);
+            }
+        }
+    }
+
+    /// Marks the calls the runner numbered `calls` unanswered: their answer never reached the
+    /// code. A number that names no forwarded call (a refused one) changes nothing.
+    pub fn unreceived(&self, calls: &[u32]) {
+        let mut state = self.state();
+        for &n in calls {
+            state.unreceived.insert(n);
+            if let Some(index) = state.delivered.get(&n).copied()
+                && let Some(made) = state.made.get_mut(index)
+            {
+                made.answered = false;
+                made.upstream_unavailable = false;
+            }
         }
     }
 
@@ -550,6 +586,7 @@ fn not_found() -> Response {
 async fn callback(
     State(host): State<Arc<Host>>,
     Path(exec_id): Path<String>,
+    headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
     let Some(exec) = host.registry.get(&exec_id) else {
@@ -593,7 +630,11 @@ async fn callback(
     let (response, delivery) = handle(&host, &exec, &envelope, exact, &mut audited.line).await;
     audited.finished = true;
     if let Some(delivery) = delivery {
-        exec.journal.deliver(delivery);
+        let call = headers
+            .get(CALL_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+        exec.journal.deliver(delivery, call);
     }
     response
 }
@@ -1095,6 +1136,52 @@ mod tests {
         assert_eq!(Journal::new("\"x y\"").request_id(1), "xy.1");
         assert_eq!(Journal::new("\"\"").request_id(1), "mcp.1");
         assert!(Journal::new(&"a".repeat(500)).request_id(50).len() <= 128);
+    }
+
+    /// A call the runner reports unreceived ends unanswered whichever comes first, the host's
+    /// mark or the report; other calls keep their mark.
+    #[test]
+    fn an_unreceived_call_stays_unanswered_in_either_order() {
+        let journal = || {
+            let journal = Journal::new("req");
+            for operation in ["a", "b"] {
+                journal.state().made.push(Made {
+                    operation: operation.into(),
+                    status: Some(200),
+                    answered: false,
+                    upstream_unavailable: false,
+                });
+            }
+            journal
+        };
+        let deliver = |j: &Journal, index: usize, call: Option<u32>, upstream: bool| {
+            let delivery = Delivery {
+                index,
+                upstream_unavailable: upstream,
+            };
+            j.deliver(delivery, call);
+        };
+        let answered = |j: &Journal| j.made().iter().map(|m| m.answered).collect::<Vec<_>>();
+        for upstream in [false, true] {
+            let first = journal();
+            deliver(&first, 0, Some(1), upstream);
+            deliver(&first, 1, Some(2), upstream);
+            first.unreceived(&[2, 9]);
+            assert_eq!(answered(&first), [true, false]);
+            assert_eq!(first.made()[1].label(), json!("unknown"));
+
+            let late = journal();
+            late.unreceived(&[2]);
+            deliver(&late, 0, Some(1), upstream);
+            deliver(&late, 1, Some(2), upstream);
+            assert_eq!(answered(&late), [true, false]);
+
+            // A callback without the runner's number keeps the host's mark.
+            let unnumbered = journal();
+            deliver(&unnumbered, 0, None, upstream);
+            unnumbered.unreceived(&[1]);
+            assert_eq!(answered(&unnumbered), [true, false]);
+        }
     }
 
     #[test]

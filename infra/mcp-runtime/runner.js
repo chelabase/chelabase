@@ -7,9 +7,10 @@
 //   timeout_ms  1..60000
 //   spec_hash   search only: sha256 (lowercase hex) of the spec bundle's bytes
 // The answer (200) is {ok: true, result, logs} or {ok: false, error: {code, message, stack?},
-// logs}, with codes invalid_code (does not parse, or is not a function), threw, timeout and
-// not_serializable (a function, symbol, bigint or cycle in the value, or over 4 MiB). A request
-// the runner can't take is 400/405/413; a spec it can't get from the host (within 10 s) is 502.
+// logs}, and for execute also `unreceived` (below), with codes invalid_code (does not parse, or
+// is not a function), threw, timeout and not_serializable (a function, symbol, bigint or cycle
+// in the value, or over 4 MiB). A request the runner can't take is 400/405/413 (409 for the
+// exec_id of a run still in progress); a spec it can't get from the host (within 10 s) is 502.
 //
 // Each run goes through LOADER.load(): an anonymous worker, never cached or reused, so no
 // isolate, global or module state is shared between runs or callers, and the isolate is
@@ -23,6 +24,11 @@
 //            /internal/exec/{exec_id}/request and returns {status, ok, headers, body} from the
 //            host's 200 answer {status, headers, body}. The code chooses none of host, path or
 //            id; the request's own headers (a caller's credential) never reach the sandbox.
+//            Each call is numbered (1, 2, … in the order the code makes it) and its callback
+//            carries the number as `chelabase-call`. When the run ends, however it ends,
+//            `unreceived` lists the numbers of the calls sent to the host whose answer the runner
+//            had not handed back yet: a call cut when the code settled, or one whose answer
+//            failed or couldn't be read. The host reports those as `unknown`.
 // The pinned workerd accepts the loader's `limits` but doesn't enforce them, and offers no
 // memory limit for loaded workers; the timeout, the watchdog (busy loops), the V8 heap cap in
 // config.capnp (unbounded JS heap) and the container's memory limit (ArrayBuffer memory, which
@@ -110,6 +116,10 @@ async function parseRun(request) {
   }
   return { exec_id, kind, code, timeout_ms, spec_hash };
 }
+
+// exec_id -> the execute run's calls: {next: the last call number, sent: numbers sent to the
+// host whose answer hasn't been handed back}. Lives while the run does.
+const execs = new Map();
 
 // spec_hash -> Promise of the spec's JSON text (checked once, kept for later runs).
 const specs = new Map();
@@ -259,12 +269,33 @@ function checkAnswer(text) {
   return { ok: false, error, logs };
 }
 
+// Runs the job; an execute run's outcome carries `unreceived`.
 async function run(env, ctx, job, spec) {
+  if (job.kind !== "execute") return runJob(env, ctx, job, spec, () => {});
+  if (execs.has(job.exec_id)) throw new Refused(409, "a run with this exec_id is in progress");
+  const calls = { next: 0, sent: new Set() };
+  execs.set(job.exec_id, calls);
+  let unreceived;
+  // Taken the moment the run's end is known, before a call settling later can count as received.
+  const settled = () => {
+    unreceived ??= [...calls.sent].sort((a, b) => a - b);
+  };
+  try {
+    const outcome = await runJob(env, ctx, job, spec, settled);
+    settled();
+    return { ...outcome, unreceived };
+  } finally {
+    execs.delete(job.exec_id);
+  }
+}
+
+async function runJob(env, ctx, job, spec, settled) {
   const worker = env.LOADER.load(workerCode(job, spec, ctx));
   const abort = new AbortController();
   let timer;
   const timedOut = new Promise((resolve) => {
     timer = setTimeout(() => {
+      settled();
       abort.abort();
       resolve({ ok: false, error: { code: "timeout", message: `the run took over ${job.timeout_ms} ms` }, logs: [] });
     }, job.timeout_ms);
@@ -273,7 +304,9 @@ async function run(env, ctx, job, spec) {
     let res;
     try {
       res = await worker.getEntrypoint().fetch("http://sandbox/", { method: "POST", signal: abort.signal });
+      settled();
     } catch (e) {
+      settled();
       if (abort.signal.aborted) return null;
       // workerd ends a run early when it can prove it never settles (awaiting nothing that can
       // resolve): that is the timeout too, just known sooner. A run that calls abortIsolate()
@@ -348,9 +381,14 @@ async function hostRequest(env, execId, opts) {
   if (new TextEncoder().encode(envelope).byteLength > MAX_HOST_REQUEST_BYTES) {
     throw new RangeError("chelabase.request: the request is over 4 MiB");
   }
+  // Numbered once it is sent; un-numbered again only when its answer is handed back.
+  const calls = execs.get(execId);
+  if (!calls) throw new Error("chelabase.request: this run has ended");
+  const n = ++calls.next;
+  calls.sent.add(n);
   const res = await env.HOST.fetch(`http://mcp-internal/internal/exec/${execId}/request`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "chelabase-call": String(n) },
     body: envelope,
     redirect: "manual",
   });
@@ -369,6 +407,7 @@ async function hostRequest(env, execId, opts) {
   if (!isObject(a) || !Number.isInteger(a.status) || a.status < 100 || a.status > 599) {
     throw new Error("chelabase.request: the host's answer has no status");
   }
+  calls.sent.delete(n);
   return { status: a.status, ok: a.status >= 200 && a.status < 300, headers: isObject(a.headers) ? a.headers : {}, body: a.body ?? null };
 }
 

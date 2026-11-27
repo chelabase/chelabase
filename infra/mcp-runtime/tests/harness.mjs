@@ -17,8 +17,8 @@ export const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 
 // The stub host. `spec` is the JSON text /internal/spec serves; `requests` records every request
 // as "METHOD /path" with its parsed JSON body; `reply` answers an exec callback
-// ({status, headers, body} by default 200 with an echo of what the runner sent). With `stallSpec`
-// set, /internal/spec never answers.
+// ({status, headers, body} by default 200 with an echo of what the runner sent), after
+// `replyDelayMs` when set. With `stallSpec` set, /internal/spec never answers.
 export async function startHost({ spec = { paths: {} } } = {}) {
   const host = {
     specText: JSON.stringify(spec),
@@ -45,8 +45,12 @@ export async function startHost({ spec = { paths: {} } } = {}) {
         return;
       }
       if (req.method === "POST" && /^\/internal\/exec\/[^/]+\/request$/.test(req.url)) {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(host.reply(body)));
+        const send = () => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(host.reply(body)));
+        };
+        if (host.replyDelayMs) setTimeout(send, host.replyDelayMs);
+        else send();
         return;
       }
       res.writeHead(404);
