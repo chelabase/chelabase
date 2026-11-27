@@ -345,14 +345,6 @@ DO $$ BEGIN
   END IF;
 END $$;
 ALTER TABLE storage.upload_sessions ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;
-DO $$ BEGIN
-  IF EXISTS (SELECT FROM pg_catalog.pg_index i WHERE i.indexrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions_live_idx')
-      AND (i.indrelid OPERATOR(pg_catalog.<>) 'storage.upload_sessions'::pg_catalog.regclass OR NOT i.indisvalid
-        OR pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.<>) '{SESSION_INDEX_DEF}')) THEN
-    DROP INDEX storage.upload_sessions_live_idx;
-  END IF;
-END $$;
-CREATE INDEX IF NOT EXISTS upload_sessions_live_idx ON storage.upload_sessions (key_id, bucket_id, owner, expires_at);
 ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS write_once boolean NOT NULL DEFAULT false;
 ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
 DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
@@ -368,6 +360,14 @@ DO $$ DECLARE d pg_catalog.text; BEGIN
     EXECUTE d;
   END LOOP;
 END $$;
+DO $$ BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_index i WHERE i.indexrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions_live_idx')
+      AND (i.indrelid OPERATOR(pg_catalog.<>) 'storage.upload_sessions'::pg_catalog.regclass OR NOT i.indisvalid
+        OR pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.<>) '{SESSION_INDEX_DEF}')) THEN
+    DROP INDEX storage.upload_sessions_live_idx;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS upload_sessions_live_idx ON storage.upload_sessions (key_id, bucket_id, owner, expires_at);
 DO $$ DECLARE d record; k record; BEGIN
   FOR d IN SELECT c.oid::pg_catalog.regclass AS rel, a.attname AS att FROM pg_catalog.pg_attrdef x
       JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid
@@ -807,9 +807,17 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_sessions: a session expires within 24 hours';
   END IF;
   PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(NEW.key_id::pg_catalog.text || ':' || COALESCE(NEW.owner::pg_catalog.text, '') || ':' || NEW.bucket_id::pg_catalog.text, 0));
-  IF (SELECT pg_catalog.count(*) FROM storage.upload_sessions s
-        WHERE s.key_id = NEW.key_id AND s.owner IS NOT DISTINCT FROM NEW.owner AND s.bucket_id = NEW.bucket_id
-          AND s.expires_at > pg_catalog.clock_timestamp()) >= 100 THEN
+  -- Two plain equalities (a btree cannot use a null-safe comparison), so the count walks
+  -- upload_sessions_live_idx on key_id, bucket_id and owner.
+  IF NEW.owner IS NULL THEN
+    IF (SELECT pg_catalog.count(*) FROM storage.upload_sessions s
+          WHERE s.key_id = NEW.key_id AND s.bucket_id = NEW.bucket_id AND s.owner IS NULL
+            AND s.expires_at > pg_catalog.clock_timestamp()) >= 100 THEN
+      RAISE EXCEPTION USING ERRCODE = 'CB006', MESSAGE = 'storage.upload_sessions: too many live upload sessions for this key and caller in the bucket';
+    END IF;
+  ELSIF (SELECT pg_catalog.count(*) FROM storage.upload_sessions s
+          WHERE s.key_id = NEW.key_id AND s.bucket_id = NEW.bucket_id AND s.owner = NEW.owner
+            AND s.expires_at > pg_catalog.clock_timestamp()) >= 100 THEN
     RAISE EXCEPTION USING ERRCODE = 'CB006', MESSAGE = 'storage.upload_sessions: too many live upload sessions for this key and caller in the bucket';
   END IF;
   RETURN NEW;
@@ -2271,6 +2279,8 @@ mod tests {
         assert!(drop < create, "{sql}");
         // The index follows the table and its key_id column, which a pre-key_id table lacks.
         assert!(sql.find("ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;").unwrap() < drop, "{sql}");
+        // And after the cleanup of unknown objects, so a same-named table is gone first (N1).
+        assert!(sql.find("  FOR d IN SELECT pg_catalog.format('DROP ROUTINE").unwrap() < drop, "{sql}");
         let check = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.contains(&format!("AND i.indisvalid AND pg_catalog.pg_get_indexdef(i.indexrelid) OPERATOR(pg_catalog.=) '{SESSION_INDEX_DEF}'")), "{check}");
         assert!(check.contains("pg_catalog.to_regclass('storage.upload_sessions_live_idx')"), "{check}");
@@ -2318,12 +2328,18 @@ mod tests {
         assert!(update_return < lock && lock < count && count < raise, "{GUARD_SESSIONS_BODY}");
         for part in [
             "s.key_id = NEW.key_id",
-            "s.owner IS NOT DISTINCT FROM NEW.owner",
             "s.bucket_id = NEW.bucket_id",
+            "s.owner IS NULL",
+            "s.owner = NEW.owner",
             "s.expires_at > pg_catalog.clock_timestamp()",
         ] {
             assert!(GUARD_SESSIONS_BODY.contains(part), "{part}");
         }
+        // #336 B1: the owner match is a plain equality (or IS NULL) in each branch, so the
+        // count can use all of the index's leading columns; IS NOT DISTINCT FROM never can.
+        assert!(!GUARD_SESSIONS_BODY.contains("NOT DISTINCT"), "{GUARD_SESSIONS_BODY}");
+        assert_eq!(GUARD_SESSIONS_BODY.matches(&format!(">= {MAX_LIVE_SESSIONS} THEN")).count(), 2);
+        assert!(GUARD_SESSIONS_BODY.contains("IF NEW.owner IS NULL THEN"), "{GUARD_SESSIONS_BODY}");
         assert!(sql().contains(&format!("$f${GUARD_SESSIONS_BODY}$f$")));
     }
 

@@ -5567,19 +5567,36 @@ async fn upgrade_adds_the_session_index() {
     .await;
 }
 
-/// #336 AC 3: the guard's count, explained on a table of many rows, uses the index.
+/// #336 AC 3 (B1): the guard's two count shapes, explained on one key and bucket with many
+/// distinct owners (the normal case: owner is the JWT sub), use the index on `owner` and
+/// never scan the table; a trigger-path insert still counts and refuses at the cap.
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn session_count_uses_the_index_live() {
     with_fx(|fx| Box::pin(async move {
         let fx = &*fx;
-        // 20000 live sessions over 200 keys; the guard's key and bucket match few of them.
-        fx.admin("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, timeline_id, expires_at)
-            SELECT gen_random_uuid(), '00000000-0000-0000-0000-0000000000b1', 'n' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', NULL,
-              ('00000000-0000-0000-0000-' || lpad((g % 200)::text, 12, '0'))::uuid, '{}', 't', clock_timestamp() + interval '1 hour'
-            FROM generate_series(1, 20000) g; ANALYZE storage.upload_sessions").await;
-        let plan = fx.admin("EXPLAIN SELECT count(*) FROM storage.upload_sessions s WHERE s.key_id = '00000000-0000-0000-0000-000000000007' AND s.owner IS NOT DISTINCT FROM NULL::uuid AND s.bucket_id = '00000000-0000-0000-0000-0000000000b1' AND s.expires_at > clock_timestamp()").await;
-        assert!(plan.contains("upload_sessions_live_idx") && !plan.contains("Seq Scan"), "{plan}");
+        let key = "00000000-0000-0000-0000-000000000007";
+        let bucket = "00000000-0000-0000-0000-0000000000b1";
+        // 30000 live sessions of one key and bucket over 3000 owners, plus 10 with no owner.
+        fx.admin(&format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, timeline_id, expires_at)
+            SELECT gen_random_uuid(), '{bucket}', 'n' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated',
+              CASE WHEN g <= 10 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad((g % 3000)::text, 12, '0'))::uuid END,
+              '{key}', '{{}}', 't', clock_timestamp() + interval '1 hour'
+            FROM generate_series(1, 30000) g; ANALYZE storage.upload_sessions")).await;
+        for owner_match in ["s.owner = '00000000-0000-0000-0000-000000000005'::uuid", "s.owner IS NULL"] {
+            let plan = fx.admin(&format!("EXPLAIN SELECT count(*) FROM storage.upload_sessions s WHERE s.key_id = '{key}' AND s.bucket_id = '{bucket}' AND {owner_match} AND s.expires_at > clock_timestamp()")).await;
+            assert!(plan.contains("upload_sessions_live_idx") && !plan.contains("Seq Scan"), "{owner_match}: {plan}");
+            let cond = plan.lines().find(|l| l.contains("Index Cond")).unwrap_or_else(|| panic!("{plan}"));
+            assert!(cond.contains("owner"), "{owner_match}: owner is not an index condition: {plan}");
+        }
+        // The trigger path: an owner at the cap is refused (CB006), another owner is not.
+        let owner = "'00000000-0000-0000-0000-0000000000a9'";
+        let open = |o: &str| format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) VALUES (gen_random_uuid(), '{bucket}', 'x', gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', {o}, '{key}', '{{}}', clock_timestamp() + interval '1 hour')");
+        for _ in 0..storage_schema::MAX_LIVE_SESSIONS {
+            fx.as_role_commit("chelabase_storage", &open(owner)).await;
+        }
+        assert_eq!(fx.code("chelabase_storage", &open(owner)).await, "CB006");
+        assert_eq!(fx.code("chelabase_storage", &open("NULL")).await, "ok");
     }))
     .await;
 }
