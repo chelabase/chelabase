@@ -794,11 +794,13 @@ done
 ((checked >= 15)) || die "only $checked services with secrets were checked"
 pass "$checked running services read all their mounted secrets as their own uid and groups"
 
-step "auth starts without a mode warning"
-if compose "$PROJECT" logs --no-color auth 2>&1 | grep -F 'readable by other users'; then
-  die "auth warns that a secret it reads is readable by other users"
+# #308: the services refuse a key or token file that is a symlink, not a regular file, or too
+# open ("refusing <path>: …"); the install's files pass, so no service ever logged one.
+step "no service refused a key or token file"
+if compose "$PROJECT" logs --no-color 2>&1 | grep -E 'refusing ([A-Z_]+=)?/run/chelabase/secrets/'; then
+  die "a service refused one of its key or token files (above)"
 fi
-pass "auth logs no mode warning"
+pass "no service logged a refused key or token file"
 
 # ---- 11. a rerun changes nothing -----------------------------------------------------------------
 

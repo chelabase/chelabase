@@ -411,19 +411,25 @@ pub fn check_control_plane_uri(uri: &str) -> anyhow::Result<()> {
 
 /// The identity service's client, when both settings are given and the token file reads;
 /// otherwise `None` (logged), and app users and project delete jobs fail and are retried until
-/// it's configured.
-pub fn identity_client(config: &WorkerConfig) -> Option<chelabase_identity::Identity> {
+/// it's configured. A token file that is there but unsafe to read (a symlink, not a regular
+/// file, readable by its group or others: #308) is an error, and the worker doesn't start.
+pub fn identity_client(
+    config: &WorkerConfig,
+) -> anyhow::Result<Option<chelabase_identity::Identity>> {
     let (Some(url), Some(file)) = (&config.identity_url, &config.identity_token_file) else {
         tracing::warn!(
             "CHELABASE_IDENTITY_URL or CHELABASE_IDENTITY_TOKEN_FILE is unset: app users and project delete jobs wait until both are set"
         );
-        return None;
+        return Ok(None);
     };
     match chelabase_identity::Identity::from_token_file(url, file) {
-        Ok(identity) => Some(identity),
+        Ok(identity) => Ok(Some(identity)),
+        Err(e @ chelabase_identity::IdentityError::TokenFileRefused(_)) => {
+            Err(anyhow::anyhow!("CHELABASE_IDENTITY_TOKEN_FILE: {e}"))
+        }
         Err(e) => {
             tracing::warn!("{e}; app users and project delete jobs wait until it's readable");
-            None
+            Ok(None)
         }
     }
 }
@@ -570,7 +576,7 @@ pub fn build_with(
         login_rollout_retry: Default::default(),
         recreate_backoff: Default::default(),
         fn_sweeps: Default::default(),
-        identity: identity_client(config),
+        identity: identity_client(config)?,
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,
         remove_orphans: config.remove_orphans,
@@ -679,6 +685,7 @@ mod tests {
     use chelabase_types::mode::Mode;
     use chelabase_types::role_settings::RoleSettings;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -1143,7 +1150,7 @@ mod tests {
     fn identity_client_needs_url_and_token_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
-        assert!(identity_client(&c).is_none());
+        assert!(identity_client(&c).unwrap().is_none());
         let token = dir.path().join("worker-identity.token");
         let c2 = WorkerConfig::from_lookup(lookup(&[
             IMAGE,
@@ -1154,13 +1161,51 @@ mod tests {
         assert_eq!(c2.identity_url.as_deref(), Some("http://identity:8080"));
         assert_eq!(c2.identity_token_file.as_deref(), Some(token.as_path()));
         // Missing, then empty: no client.
-        assert!(identity_client(&c2).is_none());
+        assert!(identity_client(&c2).unwrap().is_none());
         std::fs::write(&token, " \n").unwrap();
-        assert!(identity_client(&c2).is_none());
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(identity_client(&c2).unwrap().is_none());
         std::fs::write(&token, "secret\n").unwrap();
-        assert!(identity_client(&c2).is_some());
+        assert!(identity_client(&c2).unwrap().is_some());
         c.identity_token_file = Some(token);
-        assert!(identity_client(&c).is_none(), "the URL is needed too");
+        assert!(
+            identity_client(&c).unwrap().is_none(),
+            "the URL is needed too"
+        );
+    }
+
+    /// #308: a token file that is there but unsafe (a symlink, a group-readable file) stops
+    /// the worker at start, naming the setting and the file; it is never "not yet".
+    #[test]
+    fn identity_client_refuses_an_unsafe_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.token");
+        std::fs::write(&real, "secret\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("worker-identity.token");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let loose = dir.path().join("loose.token");
+        std::fs::write(&loose, "secret\n").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o640)).unwrap();
+        for (file, what) in [(&link, "symlink"), (&loose, "0640")] {
+            let c = WorkerConfig::from_lookup(lookup(&[
+                IMAGE,
+                ("CHELABASE_IDENTITY_URL", "http://identity:8080"),
+                ("CHELABASE_IDENTITY_TOKEN_FILE", file.to_str().unwrap()),
+            ]))
+            .unwrap();
+            let Err(err) = identity_client(&c) else {
+                panic!("{} should be refused", file.display())
+            };
+            let err = err.to_string();
+            assert!(
+                err.contains("CHELABASE_IDENTITY_TOKEN_FILE")
+                    && err.contains(&file.display().to_string())
+                    && err.contains(what),
+                "{err}"
+            );
+            assert!(!err.contains("secret\n"), "{err}");
+        }
     }
 
     #[test]

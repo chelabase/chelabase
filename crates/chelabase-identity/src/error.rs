@@ -73,9 +73,14 @@ pub enum IdentityError {
     /// this is not `Unavailable`; the caller decides whether to try again.
     #[error("email send failed: {0}")]
     EmailSendFailed(String),
-    /// The client could not be set up (token file, URL).
+    /// The client could not be set up (an unset URL, a missing or empty token file).
     #[error("identity client config: {0}")]
     Config(String),
+    /// The token file is there but unsafe to read (a symlink, not a regular file, or readable
+    /// or writable by its group or others): a misconfiguration a service refuses to start
+    /// with, never a "not yet". The message names the file and what's wrong.
+    #[error("identity client config: {0}")]
+    TokenFileRefused(String),
 }
 
 impl IdentityError {

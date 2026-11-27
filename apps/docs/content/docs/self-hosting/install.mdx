@@ -109,6 +109,21 @@ Everything `init-secrets` makes lives in the `secrets` volume, each file mounted
 
 None of them is ever rewritten once it exists.
 
+The services check their key and token files before they read them: `secrets/secrets.key`, `auth/cookie.key`, the private keys `auth/member-jwt.key`, `auth/app-jwt.key` and `gateway/internal-signing.pem`, the public keys `auth/member-jwt.pub`, `auth/app-jwt.pub` and `gateway/internal-verify.pem`, and the `tokens/*-identity.token` files. Each one has to be a regular file, not a symlink, a directory or a FIFO. A secret has to be readable only by its owner (mode 0600 or 0400). A public key can be readable by anyone, but writable only by its owner (mode 0644). A file that breaks one of these rules stops the service at start, and `docker compose up --wait` fails. The error names the file and the fix, for example:
+
+```text
+refusing /run/chelabase/secrets/auth/cookie.key: it holds a secret but is readable by its group or others (mode 0640); chmod 600 it
+```
+
+`init-secrets` makes every one of these files at the right mode and checks them again on each `up`, so a stack you haven't changed by hand already passes. If you copied or restored the volume with other modes, `init-secrets` fails first and names each file. Put the modes back from the volume's own tooling, for example:
+
+```bash
+docker compose run --rm --no-deps --user 10001:10001 --entrypoint sh init-secrets -c \
+  'cd /var/lib/chelabase/secrets && chmod 600 secrets/secrets.key auth/cookie.key auth/*-jwt.key gateway/internal-signing.pem tokens/*.token && chmod 644 auth/*-jwt.pub gateway/internal-verify.pem'
+```
+
+If you run the images without this compose file, mount each key or token file on its own (a bind mount or volume sub-path of the file itself). Don't use a mechanism that puts a symlink at the path, such as a Kubernetes Secret volume. Give each file to the service's uid at the modes above. Never make a secret readable by a group.
+
 Never delete the `secrets` volume while the database volumes exist: the databases keep the old passwords, and new ones would not match.
 
 ## Settings people change

@@ -53,17 +53,19 @@ impl Identity {
     }
 
     /// The caller's token read from a file (trailing whitespace dropped).
+    /// `token_file` must be a regular file only its owner can read (0600 or 0400), never a
+    /// symlink (#308). A missing or empty file is [`IdentityError::Config`] (not configured
+    /// yet); one that is there but unsafe to read is [`IdentityError::TokenFileRefused`]. Both
+    /// name the file, never the token.
     pub fn from_token_file(base: &str, token_file: &Path) -> Result<Self, IdentityError> {
-        let token = std::fs::read_to_string(token_file)
-            .map_err(|e| IdentityError::Config(format!("{}: {e}", token_file.display())))?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(IdentityError::Config(format!(
-                "{} is empty",
-                token_file.display()
-            )));
-        }
-        Ok(Self::new(base, token))
+        use chelabase_types::file_value::{FileError, Sensitivity, read_private_file};
+        let token = read_private_file(token_file, Sensitivity::Secret).map_err(|e| match e {
+            FileError::Missing { .. } | FileError::Empty { .. } => {
+                IdentityError::Config(e.to_string())
+            }
+            FileError::Refused { .. } => IdentityError::TokenFileRefused(e.to_string()),
+        })?;
+        Ok(Self::new(base, token.trim()))
     }
 
     /// From `CHELABASE_IDENTITY_URL` and `CHELABASE_IDENTITY_TOKEN_FILE`.

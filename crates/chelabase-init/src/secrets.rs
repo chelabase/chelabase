@@ -139,6 +139,26 @@ pub const VALKEY_GID: u32 = 1000;
 /// The Neon storage image's own user is 1000:1000.
 pub const NEON_GID: u32 = 1000;
 
+/// The layout files the services read through `chelabase_types::file_value::read_private_file`
+/// at start (#308): each must be a regular file, never writable by its group or others, and
+/// (all but the public keys) readable by its owner only, or the service refuses to start. So
+/// no legacy mode lets one through with group write ([`InitSecrets::legacy_modes`]), and an
+/// owners override can't make a private one group- or world-readable.
+pub const STRICT_READ: &[&str] = &[
+    "secrets/secrets.key",
+    "gateway/internal-signing.pem",
+    "gateway/internal-verify.pem",
+    "auth/cookie.key",
+    "auth/app-jwt.key",
+    "auth/app-jwt.pub",
+    "auth/member-jwt.key",
+    "auth/member-jwt.pub",
+    "tokens/auth-identity.token",
+    "tokens/orchestrator-identity.token",
+    "tokens/worker-identity.token",
+    "tokens/bootstrap-identity.token",
+];
+
 const fn e(path: &'static str, part: Part, make: Gen, spec: Spec) -> Entry {
     Entry {
         path,
@@ -328,7 +348,8 @@ pub struct InitSecrets {
     pub owners: OwnershipMap,
     /// Accept a directory or public file that already exists with group bits other than the
     /// map's (never world-writable, executable or set-id), as the workbench's shared keys dir
-    /// has them from before this check (made under the user's umask). Secrets stay exact.
+    /// has them from before this check (made under the user's umask). Secrets stay exact, and
+    /// a [`STRICT_READ`] public key is never accepted group-writable (the services refuse it).
     pub legacy_modes: bool,
     /// Chosen values for plain generated files ([`crate::seed`]), written instead of a generated
     /// value when the file is missing. Empty: everything is generated.
@@ -642,12 +663,17 @@ impl Run<'_> {
     }
 
     /// Whether `actual` is acceptable for `want` (see [`InitSecrets::legacy_modes`]).
-    fn acceptable(&self, actual: Perm, want: Perm, is_dir: bool) -> bool {
+    fn acceptable(&self, actual: Perm, want: Perm, is_dir: bool, strict: bool) -> bool {
         if actual == want {
             return true;
         }
         let public = is_dir || want.mode & 0o004 != 0;
-        let forbidden = if is_dir { 0o7002 } else { 0o7113 };
+        // A file a service reads strictly at start (STRICT_READ) never gets group write.
+        let forbidden = match (is_dir, strict) {
+            (true, _) => 0o7002,
+            (false, false) => 0o7113,
+            (false, true) => 0o7133,
+        };
         self.opts.legacy_modes
             && public
             && actual.uid == want.uid
@@ -768,7 +794,7 @@ impl Run<'_> {
                     continue;
                 }
                 let want = self.dir_perm(part, &rel);
-                if !self.acceptable(st.perm, want, true) {
+                if !self.acceptable(st.perm, want, true, false) {
                     problems.push(describe(&path, "wrong owner or mode", want, st.perm));
                 }
             }
@@ -799,8 +825,18 @@ impl Run<'_> {
                     continue;
                 }
             }
-            if !self.acceptable(st.perm, want, false) {
-                problems.push(describe(&path, "wrong owner or mode", want, st.perm));
+            let strict = STRICT_READ.contains(&entry.path);
+            if !self.acceptable(st.perm, want, false, strict) {
+                let mut problem = describe(&path, "wrong owner or mode", want, st.perm);
+                if strict && st.perm.uid == want.uid && st.perm.mode & 0o022 != 0 {
+                    // The services refuse it too; the fix is one command.
+                    problem.push_str(&format!(
+                        " (the services refuse a key or token file its group or others can write: chmod {:o} {})",
+                        want.mode,
+                        path.display()
+                    ));
+                }
+                problems.push(problem);
                 continue;
             }
             if st.size == 0 {
@@ -1525,7 +1561,7 @@ mod tests {
         let owners = t.path().join("owners.json");
         std::fs::write(
             &owners,
-            format!(r#"{{"all": {{"uid": {uid}, "gid": {gid}}}, "files": {{"secrets/secrets.key": {{"gid": {gid}, "mode": "0640"}}}}}}"#),
+            format!(r#"{{"all": {{"uid": {uid}, "gid": {gid}}}, "files": {{"setup/setup.code": {{"gid": {gid}, "mode": "0640"}}}}}}"#),
         )
         .unwrap();
         let map =
@@ -1542,8 +1578,10 @@ mod tests {
         };
         // A consumer-group file of the defaults, and one the override made group-readable.
         check("db/metadata.password", 0o640);
-        check("secrets/secrets.key", 0o640);
-        check("secrets", 0o750);
+        check("setup/setup.code", 0o640);
+        check("setup", 0o750);
+        // A file the services read strictly (#308) stays its owner's alone.
+        check("secrets/secrets.key", 0o600);
         check("tokens/app-auth.token", 0o600);
         check("tokens", 0o700);
         check("auth/app-jwt.pub", 0o644);
@@ -1685,16 +1723,33 @@ mod tests {
         for p in ["auth", "gateway", "neon", "secrets"] {
             std::fs::set_permissions(keys.join(p), std::fs::Permissions::from_mode(0o775)).unwrap();
         }
-        for p in [
-            "compute-ca/ca.crt",
-            "neon/compute-jwt.pub",
-            "gateway/internal-verify.pem",
-        ] {
+        for p in ["compute-ca/ca.crt", "neon/compute-jwt.pub"] {
             std::fs::set_permissions(keys.join(p), std::fs::Permissions::from_mode(0o664)).unwrap();
         }
         let before = snapshot(&keys);
         ensure_secrets(&keys, &InitSecrets::workbench(&state)).unwrap();
         assert_eq!(snapshot(&keys), before);
+        // #308: a public key the services read strictly is never group-writable, legacy or not:
+        // the run fails naming the file and the one-line fix, and changes nothing.
+        for p in STRICT_READ
+            .iter()
+            .filter(|p| p.ends_with(".pub") || p.ends_with("verify.pem"))
+        {
+            let path = keys.join(p);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+            let before = snapshot(&keys);
+            let err = format!(
+                "{:#}",
+                ensure_secrets(&keys, &InitSecrets::workbench(&state)).unwrap_err()
+            );
+            assert!(
+                err.contains(&path.display().to_string())
+                    && err.contains(&format!("chmod 644 {}", path.display())),
+                "{p}: {err}"
+            );
+            assert_eq!(snapshot(&keys), before, "{p}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         // Never a loose secret, nor a world-writable public file.
         std::fs::set_permissions(
             keys.join("compute-ca/ca.crt"),
@@ -1724,6 +1779,46 @@ mod tests {
             ..InitSecrets::self_hosted(OwnershipMap::writer_only())
         };
         assert!(ensure_secrets(&keys, &strict).is_err());
+    }
+
+    // #308: what the services read through the strict reader is made the way it accepts:
+    // every STRICT_READ file is in the layout, the private ones 0600 and the public keys 0644,
+    // in the self-hosted defaults and in the workbench's map; a fresh run writes them so (regular
+    // files, never symlinks) and the strict reader takes each one.
+    #[test]
+    fn strict_read_files_are_made_private_regular_files() {
+        use chelabase_types::file_value::{Sensitivity, read_private_file};
+        let public = |p: &str| p.ends_with(".pub") || p.ends_with("verify.pem");
+        for map in [OwnershipMap::default(), OwnershipMap::writer_only()] {
+            for p in STRICT_READ {
+                let want = if public(p) { 0o644 } else { 0o600 };
+                assert_eq!(map.spec(p).mode, want, "{p}");
+            }
+        }
+        let t = tmp();
+        let (keys, state) = (t.path().join("keys"), t.path().join("state"));
+        for opts in [
+            InitSecrets::workbench(&state),
+            InitSecrets {
+                install_dir: Some(state.clone()),
+                ..InitSecrets::self_hosted(OwnershipMap::writer_only())
+            },
+        ] {
+            let _ = std::fs::remove_dir_all(&keys);
+            let _ = std::fs::remove_dir_all(&state);
+            ensure_secrets(&keys, &opts).unwrap();
+            for p in STRICT_READ {
+                let path = keys.join(p);
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                assert!(meta.file_type().is_file(), "{p}");
+                let s = if public(p) {
+                    Sensitivity::Public
+                } else {
+                    Sensitivity::Secret
+                };
+                read_private_file(&path, s).unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
     }
 
     #[test]

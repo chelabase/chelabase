@@ -157,6 +157,16 @@ impl OwnershipMap {
                         "{what}: mode {mode} must be read-write for the owner and at most readable by others"
                     );
                 }
+                // A file a service reads at start through the strict reader (#308): a
+                // private one stays its owner's alone, or the service refuses to start.
+                if crate::secrets::STRICT_READ.contains(&what)
+                    && spec.mode & 0o077 == 0
+                    && m & 0o077 != 0
+                {
+                    bail!(
+                        "{what}: mode {mode} would let its group or others read it, and the services refuse such a key or token file; give it the reading service's uid instead (\"uid\")"
+                    );
+                }
                 spec.mode = m;
             }
             Ok(())
@@ -199,6 +209,28 @@ mod tests {
         assert_eq!(map.spec("secrets/secrets.key").gid, Id::Writer);
     }
 
+    // #308: a public key the services read strictly may stay 0644 or tighten; a private one
+    // may change owner (the reading service's uid) but never open up.
+    #[test]
+    fn an_override_keeps_strict_read_files_private() {
+        let map = OwnershipMap::from_override_json(
+            r#"{"files": {"secrets/secrets.key": {"uid": 5, "mode": "0600"},
+                          "auth/app-jwt.pub": {"mode": "0600"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(map.spec("secrets/secrets.key").uid, Id::Is(5));
+        assert_eq!(map.spec("auth/app-jwt.pub").mode, 0o600);
+        let err = OwnershipMap::from_override_json(
+            r#"{"files": {"secrets/secrets.key": {"mode": "0640"}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("secrets/secrets.key") && err.contains("0640"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn an_override_refuses_unknown_paths_and_loose_modes() {
         for bad in [
@@ -206,6 +238,11 @@ mod tests {
             r#"{"files": {"db/metadata.password": {"mode": "0666"}}}"#,
             r#"{"files": {"db/metadata.password": {"mode": "0400"}}}"#,
             r#"{"all": {"mode": "0600"}}"#,
+            // #308: the services refuse a group-readable key or token file.
+            r#"{"files": {"secrets/secrets.key": {"mode": "0640"}}}"#,
+            r#"{"files": {"auth/cookie.key": {"gid": 70, "mode": "0640"}}}"#,
+            r#"{"files": {"tokens/worker-identity.token": {"mode": "0644"}}}"#,
+            r#"{"files": {"gateway/internal-signing.pem": {"mode": "0640"}}}"#,
             r#"{"other": 1}"#,
         ] {
             assert!(OwnershipMap::from_override_json(bad).is_err(), "{bad}");

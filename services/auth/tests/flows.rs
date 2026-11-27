@@ -80,6 +80,8 @@ pub async fn harness_on_identity(
         ttl: Duration::from_secs(300),
     };
     std::fs::write(&member_config.private_key, &private).unwrap();
+    // Only its owner may read a private key (#308).
+    std::fs::set_permissions(&member_config.private_key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     std::fs::write(&member_config.public_key, &member_public).unwrap();
     let cookie_key = SecretKey::generate();
     let mut config = Config {

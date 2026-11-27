@@ -449,3 +449,42 @@ async fn the_orchestrator_probe_fails_on_a_500() {
     }
 }
 
+// #308: the bootstrap's identity token is one of the files the services read strictly: a
+// regular file only its owner can read (0600, as init makes it), never 0640 or a symlink.
+#[test]
+fn the_identity_token_file_is_read_strictly() {
+    let t = private_dir();
+    let pw = t.path().join("db.password");
+    std::fs::write(&pw, "pw-secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let token = t.path().join("bootstrap-identity.token");
+    let cfg = |token: &Path| {
+        let env: HashMap<String, String> = [
+            ("CHELABASE_IDENTITY_URL", "http://identity:8080".to_string()),
+            ("CHELABASE_IDENTITY_TOKEN_FILE", token.display().to_string()),
+            (
+                "CHELABASE_IDENTITY_DB_PASSWORD_FILE",
+                pw.display().to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        identity::IdentityConfig::from_lookup(move |k| env.get(k).cloned())
+    };
+    std::fs::write(&token, "tok-secret\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(cfg(&token).is_ok());
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let err = format!("{:#}", cfg(&token).err().unwrap());
+    assert!(
+        err.contains(&token.display().to_string()) && err.contains("0640"),
+        "{err}"
+    );
+    assert!(!err.contains("tok-secret"), "{err}");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = t.path().join("link.token");
+    std::os::unix::fs::symlink(&token, &link).unwrap();
+    let err = format!("{:#}", cfg(&link).err().unwrap());
+    assert!(err.contains("symlink"), "{err}");
+}

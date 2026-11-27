@@ -4,6 +4,7 @@
 use crate::AuthError;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use chelabase_types::file_value::{Sensitivity, read_private_file};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
@@ -76,8 +77,13 @@ pub(crate) fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
     Ok(raw)
 }
 
-pub(crate) fn read(path: &Path) -> Result<Vec<u8>, AuthError> {
-    std::fs::read(path).map_err(|e| AuthError::Config(format!("read {}: {e}", path.display())))
+/// A private key (`Sensitivity::Secret`: a regular file only its owner can read, 0600) or a
+/// public key (`Sensitivity::Public`: a regular file only its owner can write, 0644), never
+/// through a symlink (#308). The error names the file and what's wrong, never the contents.
+pub(crate) fn read(path: &Path, sensitivity: Sensitivity) -> Result<Vec<u8>, AuthError> {
+    read_private_file(path, sensitivity)
+        .map(String::into_bytes)
+        .map_err(|e| AuthError::Config(e.to_string()))
 }
 
 pub struct AppTokenSigner {
@@ -96,7 +102,10 @@ impl AppTokenSigner {
     }
 
     pub fn from_pem_files(private: &Path, public: &Path) -> Result<Self, AuthError> {
-        Self::from_pem(&read(private)?, &read(public)?)
+        Self::from_pem(
+            &read(private, Sensitivity::Secret)?,
+            &read(public, Sensitivity::Public)?,
+        )
     }
 
     pub fn kid(&self) -> &str {
@@ -137,7 +146,7 @@ impl AppTokenVerifier {
     }
 
     pub fn from_pem_file(public: &Path) -> Result<Self, AuthError> {
-        Self::from_pem(&read(public)?)
+        Self::from_pem(&read(public, Sensitivity::Public)?)
     }
 
     /// Verify `kid` (required, equal to this key's), signature, issuer,

@@ -56,7 +56,14 @@ impl IdentityConfig {
         )?;
         Ok(Self {
             url: url.trim_end_matches('/').to_string(),
-            token: read_secret_file("CHELABASE_IDENTITY_TOKEN_FILE", &token_file)?,
+            // One of the files the services read strictly (#308, STRICT_READ): 0600, never
+            // a symlink.
+            token: chelabase_types::file_value::read_private_file(
+                std::path::Path::new(&token_file),
+                chelabase_types::file_value::Sensitivity::Secret,
+            )
+            .map(|t| t.trim().to_string())
+            .map_err(|e| anyhow::anyhow!("CHELABASE_IDENTITY_TOKEN_FILE: {e}"))?,
             db_password: read_secret_file("CHELABASE_IDENTITY_DB_PASSWORD_FILE", &password_file)?,
         })
     }
