@@ -2064,27 +2064,28 @@ async fn served_with_new_originals(base: &str, key: &str, from: &str, n: u32) ->
     ok
 }
 
-/// The test client (127.0.0.1, the TCP peer) is the runtime: each original caller it names
+/// The test client (loopback, the TCP peer) is the runtime: each original caller it names
 /// has their own bucket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_runtimes_original_caller_has_their_own_bucket() {
+    let peer = std::net::Ipv4Addr::LOCALHOST.to_string();
     let (base, [key, ..], _gateway) = spawn_limited_gateway(&[
         ("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"),
         ("CHELABASE_GATEWAY_DATA_RATE_BURST", "2"),
         ("CHELABASE_GATEWAY_TRUSTED_PROXIES", ""),
-        ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "127.0.0.1"),
+        ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", &peer),
     ])
     .await;
-    const PEER: &str = "127.0.0.1";
+    let peer = peer.as_str();
     for _ in 0..2 {
-        assert_eq!(keyed_original(&base, &key, PEER, "203.0.113.9").await.status(), 200);
+        assert_eq!(keyed_original(&base, &key, peer, "203.0.113.9").await.status(), 200);
     }
     let mut limited = false;
     for _ in 0..3 {
-        limited |= keyed_original(&base, &key, PEER, "203.0.113.9").await.status() == 429;
+        limited |= keyed_original(&base, &key, peer, "203.0.113.9").await.status() == 429;
     }
     assert!(limited, "the first caller's bucket ran out");
-    assert_eq!(served_with_new_originals(&base, &key, PEER, 6).await, 6, "each new caller is served");
+    assert_eq!(served_with_new_originals(&base, &key, peer, 6).await, 6, "each new caller is served");
 }
 
 /// Refusals: the header from a peer that isn't the runtime (none configured, or another
@@ -2093,10 +2094,12 @@ async fn the_runtimes_original_caller_has_their_own_bucket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_original_caller_header_is_ignored_from_any_other_peer() {
     let limits = [("CHELABASE_GATEWAY_DATA_RATE_PER_SECOND", "1"), ("CHELABASE_GATEWAY_DATA_RATE_BURST", "2")];
+    let loopback = std::net::Ipv4Addr::LOCALHOST.to_string();
+    let loopback = loopback.as_str();
     type Case<'a> = (&'a str, [(&'a str, &'a str); 2], &'a str);
     let cases: [Case; 3] = [
-        ("no runtime configured", [("CHELABASE_GATEWAY_TRUSTED_PROXIES", ""), ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "")], "127.0.0.1"),
-        ("another peer", [("CHELABASE_GATEWAY_TRUSTED_PROXIES", ""), ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "192.0.2.1")], "127.0.0.1"),
+        ("no runtime configured", [("CHELABASE_GATEWAY_TRUSTED_PROXIES", ""), ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "")], loopback),
+        ("another peer", [("CHELABASE_GATEWAY_TRUSTED_PROXIES", ""), ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "192.0.2.1")], loopback),
         // The peer is a trusted proxy whose forwarded client is the runtime's address.
         ("a forwarded runtime address", [("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8"), ("CHELABASE_GATEWAY_FUNCTIONS_RUNTIME", "192.0.2.1")], "192.0.2.1"),
     ];
