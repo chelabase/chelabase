@@ -1603,7 +1603,7 @@ services:
   # gateway's alias); the internal one (8096) on `mcp-sandbox`, the only address the runtime has
   # (the spec bundle and the runs' callbacks).
   mcp:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/mcp:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:09fab727687833249ec332e02d499ed96e5d3ee6e487b6a5736c85e039e9c0d4}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/mcp:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:38154f4de90d753365e2aa04d7c26d3830102d30f1a5bd70e10b723d911cf211}
     profiles: ["mcp"]
     restart: unless-stopped
     read_only: true
