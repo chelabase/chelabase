@@ -276,8 +276,17 @@ fn role_patch(m: &RolePatchModel) -> Result<RolePatch, Fail> {
     })
 }
 
+/// A plan's VALID UNTIL as an instant. `-infinity`, a BC time and anything before
+/// [`Timestamp::PG_ROUND_TRIP_MIN`] are that floor (#424), as resync reads them (#398): the
+/// role stays expired at a value Postgres reads back. The schema crate plans the floor itself;
+/// the catalog's text comes through only in a plan stored before it did.
 fn timestamp(at: &str) -> Result<Timestamp, Fail> {
+    let floor = Timestamp::PG_ROUND_TRIP_MIN;
+    if at == "-infinity" || at.ends_with(" BC") {
+        return Ok(floor);
+    }
     Timestamp::parse_rfc3339(at)
+        .map(|t| t.max(floor))
         .map_err(|e| Fail::failed(format!("VALID UNTIL {at:?}: {e}")))
 }
 
@@ -1559,6 +1568,52 @@ mod tests {
         assert_eq!(again.steps[0].outcome, StepOutcome::Ok, "driven, not skipped");
         assert_eq!(ran(&w, "CREATE ROLE \"reporter\""), 2, "the resync made it again");
         assert!(!w.metadata.state().endpoints[&t.endpoint].logins["reporter"].attributes_pending);
+    }
+
+    // #424: a plan that creates a role expired with `-infinity` or a BC time applies, and the
+    // role is expired at the floor resync reads it as (#398). The plan carries the floor in
+    // RFC 3339 now; a plan stored before that carries the catalog's text as is.
+    #[tokio::test]
+    async fn a_role_expired_before_year_one_applies_at_the_floor() {
+        for stored in ["0001-01-01T00:00:00+00:00", "-infinity", "0044-03-15T12:00:00+00 BC"] {
+            let (w, _journal) = worker();
+            let (t, opts) = target(&w).await;
+            let mut create = role_step("r1", "reporter", true);
+            let Some(RoleOp::Create(spec)) = &mut create.role_op else { unreachable!() };
+            spec.valid_until = Some(stored.into());
+            let report = w
+                .run_phases(&t, &plan(vec![create]), &opts, DIGEST, RunMode::Real)
+                .await
+                .unwrap_or_else(|f| panic!("{stored}: {}", f.error));
+            assert_eq!(report.steps[0].outcome, StepOutcome::Ok, "{stored}");
+            let state = w.metadata.state();
+            let row = &state.endpoints[&t.endpoint].logins["reporter"];
+            assert_eq!(row.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "{stored}");
+        }
+    }
+
+    #[test]
+    fn an_expiry_before_year_one_reads_as_the_floor() {
+        let floor = Timestamp::PG_ROUND_TRIP_MIN;
+        for at in [
+            "-infinity",
+            "0044-03-15T12:00:00+00 BC",
+            "0001-01-01T00:00:00+00:00",
+            "0001-01-01T00:00:00Z",
+            "0000-06-01T00:00:00Z",
+        ] {
+            assert_eq!(timestamp(at).ok(), Some(floor), "{at}");
+        }
+        let patch = RolePatchModel {
+            valid_until: Some(Some("-infinity".into())),
+            ..Default::default()
+        };
+        assert_eq!(role_patch(&patch).ok().unwrap().valid_until, Some(Some(floor)));
+        // In range, as before; `infinity` was never sent as text (it's `None`) and stays refused.
+        let at = Timestamp::from_ymd_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(timestamp("2030-01-01T00:00:00+00:00").ok(), Some(at));
+        assert!(timestamp("infinity").is_err());
+        assert!(timestamp("soon").is_err());
     }
 
     fn rename_step(from: &str, to: &str) -> Step {

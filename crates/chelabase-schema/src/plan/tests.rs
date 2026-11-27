@@ -695,6 +695,86 @@ fn roles_are_phase0_role_ops() {
     assert!(p.steps.iter().all(|s| !s.sql.contains("PASSWORD")));
 }
 
+// #424: a role expired with `-infinity` or a BC time is created or patched expired at the
+// floor resync reads it as (#398); a target already there isn't patched again; `infinity` and
+// in-range values plan as before.
+#[test]
+fn an_expiry_before_year_one_plans_as_the_floor() {
+    const FLOOR: &str = "0001-01-01T00:00:00+00:00";
+    for source in ["-infinity", "0044-03-15 12:00:00+00 BC"] {
+        let target = model(vec![]);
+        let mut m = model(vec![]);
+        let mut gone = role(700, "gone");
+        gone.valid_until = Some(source.into());
+        m.roles = vec![gone];
+        let p = plan_of(&target, &m);
+        let Some(RoleOp::Create(spec)) = &p.steps[0].role_op else {
+            panic!("{source}: {:#?}", sqls(&p));
+        };
+        assert_eq!(spec.valid_until.as_deref(), Some(FLOOR), "{source}");
+        assert!(p.steps[0].sql.contains(&format!("VALID UNTIL '{FLOOR}'")), "{}", p.steps[0].sql);
+
+        let mut target = model(vec![]);
+        let mut live = role(401, "app");
+        live.valid_until = Some("2030-01-01 00:00:00+00".into());
+        target.roles = vec![live];
+        let mut m = model(vec![]);
+        let mut expired = role(401, "app");
+        expired.valid_until = Some(source.into());
+        m.roles = vec![expired.clone()];
+        let p = plan_of(&target, &m);
+        assert_eq!(
+            p.steps[0].role_op,
+            Some(RoleOp::Update {
+                name: "app".into(),
+                patch: RolePatchModel {
+                    valid_until: Some(Some(FLOOR.into())),
+                    ..Default::default()
+                }
+            }),
+            "{source}"
+        );
+        assert_eq!(p.steps[0].sql, format!("ALTER ROLE app WITH VALID UNTIL '{FLOOR}'"));
+
+        // What the merge left (the floor, as Postgres prints it) is the same expiry.
+        let mut target = model(vec![]);
+        let mut floored = role(401, "app");
+        floored.valid_until = Some("0001-01-01 00:00:00+00".into());
+        target.roles = vec![floored];
+        let mut m = model(vec![]);
+        m.roles = vec![expired];
+        assert!(plan_of(&target, &m).steps.is_empty(), "{source}");
+    }
+    // `infinity` and an in-range value, as before.
+    for (from, to, want) in [
+        (Some("-infinity"), Some("infinity"), None),
+        (None, Some("infinity"), None),
+        (Some("-infinity"), None, None),
+        (None, Some("2030-01-01 00:00:00+00"), Some("2030-01-01T00:00:00+00:00")),
+    ] {
+        let mut target = model(vec![]);
+        let mut t = role(401, "app");
+        t.valid_until = from.map(Into::into);
+        target.roles = vec![t];
+        let mut m = model(vec![]);
+        let mut r = role(401, "app");
+        r.valid_until = to.map(Into::into);
+        m.roles = vec![r];
+        let p = plan_of(&target, &m);
+        assert_eq!(
+            p.steps[0].role_op,
+            Some(RoleOp::Update {
+                name: "app".into(),
+                patch: RolePatchModel {
+                    valid_until: Some(want.map(Into::into)),
+                    ..Default::default()
+                }
+            }),
+            "{from:?} -> {to:?}"
+        );
+    }
+}
+
 // E22: the owner's memberships are never planned, even when the merged model's owner differs
 // from the target's in them.
 #[test]

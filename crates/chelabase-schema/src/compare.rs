@@ -410,7 +410,8 @@ impl Cmp<'_> {
 /// memberships the roles path makes, by role) and nothing it reports "apply by hand" (E30: other
 /// attributes, the comment, refused memberships, a membership's options and grantor). The owner
 /// is never merged: only its memberships, which the expected model simulates exactly (E22), are
-/// compared, in full (role, grantor, options; T14 minor 8).
+/// compared, in full (role, grantor, options; T14 minor 8). An expiry at or before the floor
+/// compares as the floor, which is what the merge makes of it (#424).
 fn role_canon(r: &crate::model::Role) -> String {
     if r.name == OWNER_ROLE {
         let mut rows: Vec<(&str, &str, bool, bool, bool)> = r
@@ -435,7 +436,7 @@ fn role_canon(r: &crate::model::Role) -> String {
             r.login,
             r.inherit,
             r.connection_limit,
-            &r.valid_until,
+            crate::plan::ddl::expiry_key(r.valid_until.as_deref()),
             r.bypass_rls,
             members
         )
@@ -945,6 +946,25 @@ mod tests {
         let mut changed = expected.clone();
         changed.roles.iter_mut().find(|r| r.name == "app").unwrap().login = true;
         assert_eq!(compare(&expected, &changed, &[]).len(), 1);
+    }
+
+    // #424: a role the merge makes expired at the floor (from `-infinity` or a BC time) reads
+    // back as the floor, which is no drift; any other expiry still is.
+    #[test]
+    fn an_expiry_before_year_one_is_no_drift_at_the_floor() {
+        for source in ["-infinity", "0044-03-15 12:00:00+00 BC"] {
+            let mut expected = model(vec![]);
+            let mut app = role(401, "app");
+            app.valid_until = Some(source.into());
+            expected.roles = vec![app];
+            let mut actual = expected.clone();
+            actual.roles[0].valid_until = Some("0001-01-01 00:00:00+00".into());
+            assert_eq!(compare(&expected, &actual, &[]), Vec::new(), "{source}");
+            for other in [None, Some("infinity"), Some("0001-01-01 00:00:00.000001+00")] {
+                actual.roles[0].valid_until = other.map(Into::into);
+                assert_eq!(compare(&expected, &actual, &[]).len(), 1, "{source} {other:?}");
+            }
+        }
     }
 
     // T14 I2 (E31), fix round M4: a target object following a rename the merge makes is
