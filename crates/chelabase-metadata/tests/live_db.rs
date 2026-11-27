@@ -9092,3 +9092,85 @@ async fn search_path_migration_refuses_a_chelabase_schema_with_objects() {
     assert!(err.to_string().contains("must contain no objects"), "{err}");
     drop(tx); // rolls back
 }
+
+// #311 audit: a rotation of the user's other session in flight when a reused
+// token is presented doesn't save that session: the reuse waits for the row and revokes it.
+#[tokio::test]
+#[ignore]
+async fn reuse_revokes_a_session_that_is_rotating() {
+    let client = client().await;
+    let project = new_project(&client, "audit-reuse-rotating").await;
+    let user = uuid::Uuid::new_v4();
+    let (s1, s2) = (new_session(project, user, 1), new_session(project, user, 10));
+    for s in [&s1, &s2] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    client.refresh_app_session(s1.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s1.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    // The rotation of s2, holding its row.
+    let mut tx = client.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM app_sessions WHERE id = $1 FOR UPDATE").bind(s2.id).execute(&mut *tx).await.unwrap();
+    let c = client.clone();
+    let (sid, n) = (s1.id, next(5, 60));
+    let reuse = tokio::spawn(async move { c.refresh_app_session(sid, project, hash(1), Issued, &n).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let waiting = !reuse.is_finished();
+    sqlx::query("UPDATE app_sessions SET prev_refresh_hash = refresh_hash, refresh_hash = $2 WHERE id = $1")
+        .bind(s2.id)
+        .bind(hash(11).as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let reused = reuse.await.unwrap();
+    let row2 = client.app_session(s2.id).await.unwrap().unwrap();
+    let s2_new = client.refresh_app_session(s2.id, project, hash(11), Issued, &next(12, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    assert!(waiting, "the reuse waits for the rotating row");
+    let Ok(RefreshOutcome::Reused(revoked)) = reused else { panic!("{reused:?}") };
+    assert_eq!(revoked.len(), 2, "{revoked:?}");
+    assert!(row2.revoked_at.is_some());
+    assert_eq!(s2_new, RefreshOutcome::Invalid, "the token the rotation just issued is refused");
+}
+
+// #311 audit S1: two reused tokens of one user presented at once (one of s1, one
+// of s2) both answer `Reused`/`Invalid`; neither fails.
+#[tokio::test]
+#[ignore]
+async fn two_reuses_of_one_user_at_once_both_answer() {
+    let client = client().await;
+    let project = new_project(&client, "audit-reuse-twice").await;
+    let user = uuid::Uuid::new_v4();
+    let (s1, s2) = (new_session(project, user, 1), new_session(project, user, 10));
+    for s in [&s1, &s2] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    client.refresh_app_session(s1.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s1.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    // The other reuse (of s2), as `refresh_app_session` runs it: its own row locked first.
+    let mut tx = client.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM app_sessions WHERE id = $1 FOR UPDATE").bind(s2.id).execute(&mut *tx).await.unwrap();
+    let c = client.clone();
+    let (sid, n) = (s1.id, next(5, 60));
+    let reuse = tokio::spawn(async move { c.refresh_app_session(sid, project, hash(1), Issued, &n).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let other = sqlx::query(
+        "UPDATE app_sessions SET revoked_at = now()
+         WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(project.as_uuid())
+    .bind(user)
+    .execute(&mut *tx)
+    .await;
+    let other_ok = other.is_ok();
+    if other_ok {
+        tx.commit().await.unwrap();
+    } else {
+        drop(tx);
+    }
+    let reused = reuse.await.unwrap();
+    let live = client.list_user_sessions(project, user).await.unwrap().len();
+    cleanup_project(&client, project, &[]).await;
+    assert_eq!(live, 0, "every session of the user is revoked whichever one wins");
+    assert!(reused.is_ok() && other_ok, "one of the two failed: reuse(s1) = {reused:?}, other ok = {other_ok}");
+}

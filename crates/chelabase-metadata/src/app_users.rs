@@ -225,12 +225,16 @@ pub enum PeekOutcome {
     /// it is reuse once the grace ends, so a caller acts on it before the grace runs out.
     Live { session: AppSession, grace: bool },
     /// The previous token after its grace, or a [`RefreshProof::Issued`] token that matches
-    /// neither: a refresh would revoke the session.
+    /// neither: a refresh would revoke the session and every other live session of its user in
+    /// its project.
     Reused,
     /// Unknown session, another project's, revoked, expired, or a [`RefreshProof::Unproven`]
     /// token that matches neither.
     Invalid,
 }
+
+/// SQLSTATE `deadlock_detected`: Postgres aborted this transaction to break a lock cycle.
+const DEADLOCK_DETECTED: &str = "40P01";
 
 /// Whether a session created at `created_at` has reached its `cap` at `now`. A `cap` too large
 /// to add to `created_at` counts as reached, never as "no cap".
@@ -243,10 +247,13 @@ fn cap_reached(now: Timestamp, created_at: Timestamp, cap: Duration) -> bool {
 /// row's, never the caller's, so only that user's sessions end.
 ///
 /// Lock order: the transaction holds the token's session row and then takes the user's other
-/// rows. Two of these for one user at once, or one beside
-/// [`MetadataClient::revoke_user_sessions`], can deadlock; Postgres then aborts one, its caller
-/// gets the error, and the one that commits has revoked every session all the same. A rotation
-/// holds only its own row, so it only waits.
+/// rows. Beside another writer of several of that user's rows (a second reuse,
+/// [`MetadataClient::revoke_user_sessions`], [`MetadataClient::revoke_project_sessions`], the
+/// purge) it can deadlock, and Postgres aborts one of the two (SQLSTATE 40P01). The writer that
+/// commits need not have revoked the token's own session (an email change keeps the caller's;
+/// the purge revokes none), so an aborted reuse is not left at that:
+/// [`MetadataClient::refresh_app_session`] runs it once more. A rotation holds only its own
+/// row, so it only waits.
 async fn revoke_reused(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: &AppSession,
@@ -702,7 +709,29 @@ impl MetadataClient {
     /// is [`RefreshProof::Issued`], and is `Invalid` and changes nothing when it is
     /// [`RefreshProof::Unproven`]. Reuse revokes the session and every other live session of its
     /// user in its project, in this transaction (`revoke_reused`).
+    ///
+    /// A transaction that Postgres aborts as a deadlock victim (only reuse takes more than its
+    /// own row) wrote nothing and is run once more, from the start: the other writer has
+    /// committed by then, so the second run finds the session revoked (`Invalid`) or revokes it
+    /// (`Reused`). A second deadlock is the caller's error.
     pub async fn refresh_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        proof: RefreshProof,
+        next: &RefreshNext,
+    ) -> Result<RefreshOutcome, MetadataError> {
+        match self.refresh_app_session_once(id, project, presented, proof, next).await {
+            Err(MetadataError::Database(sqlx::Error::Database(e))) if e.code().as_deref() == Some(DEADLOCK_DETECTED) => {
+                self.refresh_app_session_once(id, project, presented, proof, next).await
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// One run of [`MetadataClient::refresh_app_session`]'s transaction.
+    async fn refresh_app_session_once(
         &self,
         id: Uuid,
         project: ProjectId,

@@ -2063,7 +2063,7 @@ async fn refresh_of_a_current_token_rotated_during_the_lookup_gets_the_grace_ans
 
 /// #59 second audit S1, the accepted residual: as above, but the parallel rotation's grace
 /// also ends before this request reaches `refresh`. Its token is reuse now: 401
-/// `refresh_token_reused`, and the orchestrator revokes the session.
+/// `refresh_token_reused`, and the orchestrator revokes the user's sessions.
 #[tokio::test]
 async fn refresh_of_a_current_token_rotated_and_past_its_grace_during_the_lookup_is_reuse() {
     let h = harness().await;
@@ -3878,4 +3878,118 @@ async fn a_project_named_only_a_byte_order_mark_mails_under_the_default_name() {
         let notices: Vec<_> = h.fake.change_notices_sent().into_iter().map(|n| n.project).collect();
         assert_eq!(notices, vec![None], "{name:?}");
     }
+}
+
+/// #311 audit B1: an email change whose connection closes after identity made the swap still
+/// ends the user's other sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_email_change_still_ends_other_sessions() {
+    for verification in [true, false] {
+        let h = harness_opts(verification, 1, true).await;
+        let id = h.add_user("ada@example.com", true).await;
+        let s1 = h.sign_in("ada@example.com", PW).await;
+        let s2 = h.sign_in("ada@example.com", PW).await;
+        let (path, body) = if verification {
+            assert_eq!(h.change_email("ada@new.example", access(&s1)).await.status, StatusCode::ACCEPTED);
+            let sent = h.email_change_codes().pop().unwrap().2;
+            ("change-email/confirm", json!({"email": "ada@new.example", "code": sent}))
+        } else {
+            ("change-email", json!({"email": "ada@new.example", "current_password": PW}))
+        };
+        // The swap is done in identity; the next step (the sync call) is held until the client
+        // is gone.
+        let mut hold = h.iproxy.hold("POST /internal/app/sync");
+        let send = h
+            .http
+            .post(format!("{}/auth/v1/app/{path}", h.base))
+            .header(IDENTITY_HEADER, h.identity_for(Some(access(&s1)), DataKeyKind::Public))
+            .json(&body)
+            .send();
+        tokio::select! {
+            r = send => panic!("{path}: answered before the sync call: {r:?}"),
+            () = hold.started() => {}
+        }
+        assert_eq!(h.user(&id).await.unwrap().email, "ada@new.example", "{path}: the address is changed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hold.release();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while h.user_revokes(&id).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "{path}: the address changed but the user's other sessions were never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(hold);
+        assert!(h.internal.session(h.session_id(&s2)).unwrap().revoked, "{path}");
+        assert!(!h.internal.session(h.session_id(&s1)).unwrap().revoked, "{path}");
+    }
+}
+
+/// #311 audit: a password change whose connection closes after identity stored the new
+/// password still ends the user's sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_password_change_still_ends_sessions() {
+    let h = harness().await;
+    let id = h.add_user("ada@example.com", true).await;
+    let s1 = h.sign_in("ada@example.com", PW).await;
+    let s2 = h.sign_in("ada@example.com", PW).await;
+    let mut hold = h.proxy.hold_answer(&format!("PUT {}/users/{id}/password", h.pool_path()));
+    let send = h
+        .http
+        .post(format!("{}/auth/v1/app/change-password", h.base))
+        .header(IDENTITY_HEADER, h.identity_for(Some(access(&s1)), DataKeyKind::Public))
+        .json(&json!({"current_password": PW, "password": NEW_PW}))
+        .send();
+    tokio::select! {
+        r = send => panic!("answered before the password write came back: {r:?}"),
+        () = hold.started() => {}
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    hold.release();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while h.user_revokes(&id).is_empty() {
+        assert!(Instant::now() < deadline, "the password changed but no session of the user was ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(hold);
+    h.proxy.clear();
+    assert!(h.password_is("ada@example.com", NEW_PW).await);
+    assert!(h.internal.session(h.session_id(&s2)).unwrap().revoked);
+}
+
+/// #311 audit: a password change whose connection closes between the new sign-in and its app
+/// session still makes that app session, so the sign-in's identity session is not left with
+/// nothing behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_password_change_still_opens_the_new_session() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    let s1 = h.sign_in("ada@example.com", PW).await;
+    let made = || h.internal.bodies("POST /internal/app/sessions").len();
+    assert_eq!(made(), 1);
+    // The new sign-in is done in identity; the app session call is held until the client is gone.
+    let mut hold = h.iproxy.hold("POST /internal/app/sessions");
+    let send = h
+        .http
+        .post(format!("{}/auth/v1/app/change-password", h.base))
+        .header(IDENTITY_HEADER, h.identity_for(Some(access(&s1)), DataKeyKind::Public))
+        .json(&json!({"current_password": PW, "password": NEW_PW}))
+        .send();
+    tokio::select! {
+        r = send => panic!("answered before the app session call: {r:?}"),
+        () = hold.started() => {}
+    }
+    assert_eq!(h.fake.session_count(&h.pool()), 1, "only the new sign-in's identity session is live");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    hold.release();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while made() != 2 {
+        assert!(Instant::now() < deadline, "the new sign-in's identity session has no app session");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(hold);
+    let body = &h.internal.bodies("POST /internal/app/sessions")[1];
+    assert!(h.identity_session_live(body["identity_session_id"].as_str().unwrap()).await);
+    assert_eq!(h.fake.session_count(&h.pool()), 1);
 }
