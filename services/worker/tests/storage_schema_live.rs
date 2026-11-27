@@ -5522,3 +5522,83 @@ async fn record_part_holds_the_bucket_limit_live() {
         std::panic::resume_unwind(panic.into_panic());
     }
 }
+
+/// The healthy check, as the reconciler runs it.
+async fn storage_healthy(fx: &Fx) -> String {
+    last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await), Some(&fx.elevated_verifier().await))).await)
+}
+
+const SESSION_INDEX_SQL: &str = "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid = to_regclass('storage.upload_sessions_live_idx')";
+
+/// #336 AC 1: a fresh install has the index and the health check expects it (a database
+/// without it, or with another definition under the name, is unhealthy).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn install_makes_the_session_index_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF);
+        assert_eq!(storage_healthy(fx).await, "t");
+        fx.admin("DROP INDEX storage.upload_sessions_live_idx").await;
+        assert_eq!(storage_healthy(fx).await, "f", "no index");
+        fx.admin("CREATE INDEX upload_sessions_live_idx ON storage.upload_sessions (expires_at)").await;
+        assert_eq!(storage_healthy(fx).await, "f", "another definition");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF, "healed");
+        assert_eq!(storage_healthy(fx).await, "t");
+    }))
+    .await;
+}
+
+/// #336 AC 2: a database at the previous version (stamp 9, no index) is unhealthy, and the
+/// worker's install adds the index and the new stamp.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn upgrade_adds_the_session_index() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        fx.admin("DROP INDEX storage.upload_sessions_live_idx; COMMENT ON SCHEMA storage IS 'chelabase storage schema 9'").await;
+        assert_eq!(storage_healthy(fx).await, "f");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(SESSION_INDEX_SQL).await, storage_schema::SESSION_INDEX_DEF);
+        assert_eq!(fx.value("SELECT obj_description('storage'::regnamespace, 'pg_namespace')").await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_eq!(storage_healthy(fx).await, "t");
+    }))
+    .await;
+}
+
+/// #336 AC 3 (B1): the guard's two count shapes, explained on one key and bucket with many
+/// distinct owners (the normal case: owner is the JWT sub), use the index on `owner` and
+/// never scan the table; a trigger-path insert still counts and refuses at the cap.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn session_count_uses_the_index_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let key = "00000000-0000-0000-0000-000000000007";
+        let bucket = "00000000-0000-0000-0000-0000000000b1";
+        // 30000 live sessions of one key and bucket over 3000 owners, plus 10 with no owner.
+        // As chelabase_storage: guard_sessions refuses any other writer (and stamps the timeline).
+        fx.as_role_commit("chelabase_storage", &format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at)
+            SELECT gen_random_uuid(), '{bucket}', 'n' || g, gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated',
+              CASE WHEN g <= 10 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad((g % 3000)::text, 12, '0'))::uuid END,
+              '{key}', '{{}}', clock_timestamp() + interval '1 hour'
+            FROM generate_series(1, 30000) g")).await;
+        fx.admin("ANALYZE storage.upload_sessions").await;
+        for owner_match in ["s.owner = '00000000-0000-0000-0000-000000000005'::uuid", "s.owner IS NULL"] {
+            let plan = fx.admin(&format!("EXPLAIN SELECT count(*) FROM storage.upload_sessions s WHERE s.key_id = '{key}' AND s.bucket_id = '{bucket}' AND {owner_match} AND s.expires_at > clock_timestamp()")).await;
+            assert!(plan.contains("upload_sessions_live_idx") && !plan.contains("Seq Scan"), "{owner_match}: {plan}");
+            let cond = plan.lines().find(|l| l.contains("Index Cond")).unwrap_or_else(|| panic!("{plan}"));
+            assert!(cond.contains("owner"), "{owner_match}: owner is not an index condition: {plan}");
+        }
+        // The trigger path: an owner at the cap is refused (CB006), another owner is not.
+        let owner = "'00000000-0000-0000-0000-0000000000a9'";
+        let open = |o: &str| format!("INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) VALUES (gen_random_uuid(), '{bucket}', 'x', gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', {o}, '{key}', '{{}}', clock_timestamp() + interval '1 hour')");
+        for _ in 0..storage_schema::MAX_LIVE_SESSIONS {
+            fx.as_role_commit("chelabase_storage", &open(owner)).await;
+        }
+        assert_eq!(fx.code("chelabase_storage", &open(owner)).await, "CB006");
+        assert_eq!(fx.code("chelabase_storage", &open("NULL")).await, "ok");
+    }))
+    .await;
+}
