@@ -38,6 +38,9 @@
 #    the step; it removes everything it made on every exit path and checks they are gone.
 #    COMPUTE_NETWORK_E2E_SKIP_MIGRATION=1 skips it and the run then ends "incomplete" with exit 1
 #    unless COMPUTE_NETWORK_E2E_ALLOW_INCOMPLETE=1 is also set; KEEP=1 leaves its database.
+# 4. hostssl (#248): on that database's compute, before the migration moves it, a password login
+#    from the probe straight to the compute's address is refused with sslmode=disable (pg_hba, "no
+#    encryption") and accepted with sslmode=require, over TLS. Skipped with the migration.
 #
 # Collects every failure, then exits 1 if there was one.
 set -euo pipefail
@@ -548,6 +551,32 @@ done
 [[ -n "$egress53_audited" ]] || fail "the audit never classified compute-egress:53 (no listener of the egress container was found on $compute_net)"
 [[ "$listed" -gt 0 ]] || fail "no listener found on the compute network (the audit read nothing)"
 
+# --- 4. computes take non-loopback password logins over TLS only (#248) -------------------------
+# hostssl_check <compute container> <password> <dbname>: from the probe (another container on the
+# compute network, attached like a compute), a password login straight to the compute's address
+# with a valid password is refused by pg_hba with sslmode=disable and accepted with
+# sslmode=require, over TLS (pg_stat_ssl).
+hostssl_check() {
+  local cid="$1" pw="$2" dbname="$3" addr out
+  addr="$(docker inspect -f "{{with index .NetworkSettings.Networks \"$compute_net\"}}{{.IPAddress}}{{end}}" "$cid")"
+  [[ -n "$addr" ]] || { fail "hostssl: compute ${cid:0:12} has no address on $compute_net"; return; }
+  out="$(in_probe env PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql \
+    "host=$addr port=5432 user=postgres dbname=$dbname sslmode=disable" -w -Atc 'select 1' 2>&1 || true)"
+  if grep -q 'pg_hba.conf' <<<"$out" && grep -q 'no encryption' <<<"$out"; then
+    ok "hostssl: a plaintext password login to the compute ($addr) is refused by pg_hba"
+  else
+    fail "hostssl: a plaintext password login to the compute ($addr) wasn't refused by pg_hba: $out"
+  fi
+  out="$(in_probe env PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql \
+    "host=$addr port=5432 user=postgres dbname=$dbname sslmode=require" -w -Atc \
+    'select ssl from pg_stat_ssl where pid = pg_backend_pid()' 2>&1 || true)"
+  if [[ "$out" == t ]]; then
+    ok "hostssl: the same login with sslmode=require is accepted, over TLS"
+  else
+    fail "hostssl: the same login with sslmode=require wasn't accepted over TLS: $out"
+  fi
+}
+
 # --- 3. the worker's network migration ---------------------------------------------------------
 migration() {
   local worker legacy stack w1 w2 since status ep host pw dbname compute old_id new_id nets want i
@@ -597,6 +626,8 @@ migration() {
   old_id="$(docker ps -q --no-trunc --filter "label=chelabase.dev/endpoint-id=$ep" --filter "label=chelabase.dev/stack=$stack" | head -n1)"
   [[ -n "$old_id" ]] || { fail "migration: no running compute for $ep"; return; }
   ok "database $mig_db's compute ${old_id:0:12} answers and holds a marker row"
+
+  hostssl_check "$old_id" "$pw" "$dbname"
 
   # Attach it to the first legacy network. A worker pass can remove the empty network between the
   # create and the connect: retry the pair.

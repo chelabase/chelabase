@@ -35,9 +35,9 @@
 # Pinned by digest; `chelabase workbench up` overrides these with a local `just neon-build` when
 # present. The packages are public on ghcr.io (infra/neon/README.md).
 x-neon-images:
-  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:31ad01be6a88-dev@sha256:51ed734c5f67aebc673467239c8254df3ec72b9756628dc7729ba9903cecde3d}
+  neon: &neon-image ${NEON_IMAGE:-ghcr.io/chelabase/neon-storage:38600f9c88ab-dev@sha256:5619206808fefcb8bd74da0251441452239d3e0cde54f2b26908a1ec26baad1e}
   # The image of the compute containers the worker starts (CHELABASE_COMPUTE_IMAGE); pinned here.
-  compute: &compute-image ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:31ad01be6a88-dev@sha256:a174e0e4003517139e345246f67be6e6f68abec80e38a3fd3b9b93af541045c9}
+  compute: &compute-image ${COMPUTE_NODE_IMAGE:-ghcr.io/chelabase/neon-compute-v17:38600f9c88ab-dev@sha256:6f0988b5451a3de87d5ab7747b5f8ae7f99f77abef8a6942352feecde8226bd8}
 
 # The S3 credentials for SeaweedFS, from their files: exported into the process environment by
 # the entrypoint (never Compose's `environment:`, so `docker inspect` doesn't show them). The Neon

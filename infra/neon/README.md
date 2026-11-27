@@ -27,6 +27,10 @@ unreadable. Never roll the pageserver back to a pre-round-2 pin once a round-2 i
 
 **Round 5 (published 2026-10-29, `31ad01be6a88-dev`):** `NEON_REF` pins `chelabase/neon` `31ad01be6a882c4073bf285ebef1541061ffc0c4` (Postgres v17 unchanged at `chelabase/postgres` `7812d66fe85`). The proxy verifies JWTs with jsonwebtoken 11 on aws-lc-rs (`jose-jwk` dropped), refuses JWTs with a `crit` header and accepts RSA `n` values with leading zeros. aws-sigv4 is 1.6.4, and zstd, zstd-safe, zstd-sys and ctutils are bumped to clear RUSTSEC-2026-0385 and RUSTSEC-2026-0395 through 0410.
 
+**Round 6 (published 2026-11-27, `38600f9c88ab-dev`):** `NEON_REF` pins `chelabase/neon` `38600f9c88ab68f5593b2de3c57967cda2a0671b` (Postgres v17 unchanged at `chelabase/postgres` `7812d66fe85`). The proxy refuses a wake_compute answer whose `server_name` is missing or blank (it logs the refusal and never connects without TLS), and the cancel it sends when a /sql client disconnects goes over the compute TLS config with a time limit (#247). compute_ctl writes the password catch-all as `hostssl`, so a compute accepts a password login from anywhere but loopback only over TLS; the loopback rules are unchanged (#248). astral-tokio-tar is replaced by async-tar behind a wrapper (`libs/utils/src/tar_archive.rs`), and a safekeeper snapshot now ends with an end-of-archive marker. url is 2.5.9, parquet 60.2.0, and pulldown-cmark and pin-utils are bumped; the fork's CI checks advisories.
+
+**Release note (round 6): upgrade the safekeepers together.** A safekeeper on this image refuses a snapshot pulled from an older one, because older safekeepers never sent the end-of-archive marker. Move every safekeeper to this image at once (Compose recreates them together), and don't run a mixed set that pulls timelines between versions.
+
 ## Pull (default)
 
 `just workbench up` pulls `ghcr.io/chelabase/neon-storage` and `ghcr.io/chelabase/neon-compute-v17`
